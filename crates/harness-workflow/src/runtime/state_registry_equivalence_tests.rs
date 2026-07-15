@@ -1,12 +1,69 @@
 use super::*;
+use crate::runtime::{WorkflowCommand, WorkflowCommandType};
+use serde_json::json;
 use std::collections::BTreeSet;
 
 type ExpectedRule = (Option<&'static str>, &'static str, &'static [&'static str]);
 
-struct ExpectedDefinition {
+struct ExpectedDefinition<'a> {
     id: &'static str,
-    states: &'static [(&'static str, Option<WorkflowTerminalState>)],
+    states: &'a [(
+        &'static str,
+        Option<WorkflowProgressMode>,
+        Option<WorkflowTerminalState>,
+    )],
     rules: &'static [ExpectedRule],
+}
+
+const fn command_driven(
+    state: &'static str,
+) -> (
+    &'static str,
+    Option<WorkflowProgressMode>,
+    Option<WorkflowTerminalState>,
+) {
+    (state, Some(WorkflowProgressMode::CommandDriven), None)
+}
+
+const fn external_wait(
+    state: &'static str,
+) -> (
+    &'static str,
+    Option<WorkflowProgressMode>,
+    Option<WorkflowTerminalState>,
+) {
+    (state, Some(WorkflowProgressMode::ExternalWait), None)
+}
+
+const fn operator_gate(
+    state: &'static str,
+) -> (
+    &'static str,
+    Option<WorkflowProgressMode>,
+    Option<WorkflowTerminalState>,
+) {
+    (state, Some(WorkflowProgressMode::OperatorGate), None)
+}
+
+const fn parent_handoff(
+    state: &'static str,
+) -> (
+    &'static str,
+    Option<WorkflowProgressMode>,
+    Option<WorkflowTerminalState>,
+) {
+    (state, Some(WorkflowProgressMode::ParentHandoff), None)
+}
+
+const fn terminal_state(
+    state: &'static str,
+    terminal_state: WorkflowTerminalState,
+) -> (
+    &'static str,
+    Option<WorkflowProgressMode>,
+    Option<WorkflowTerminalState>,
+) {
+    (state, None, Some(terminal_state))
 }
 
 #[test]
@@ -15,63 +72,63 @@ fn builtins_preserve_literal_states_terminal_mappings_and_transition_rules() {
         ExpectedDefinition {
             id: "github_issue_pr",
             states: &[
-                ("discovered", None),
-                ("awaiting_dependencies", None),
-                ("scheduled", None),
-                ("planning", None),
-                ("implementing", None),
-                ("replanning", None),
-                ("pr_open", None),
-                ("local_review_gate", None),
-                ("awaiting_feedback", None),
-                ("addressing_feedback", None),
-                ("quality_gate_pending", None),
-                ("ready_to_merge", None),
-                ("merging", None),
-                ("blocked", None),
-                ("done", Some(WorkflowTerminalState::Succeeded)),
-                ("failed", Some(WorkflowTerminalState::Failed)),
-                ("cancelled", Some(WorkflowTerminalState::Cancelled)),
+                command_driven("discovered"),
+                external_wait("awaiting_dependencies"),
+                command_driven("scheduled"),
+                command_driven("planning"),
+                command_driven("implementing"),
+                command_driven("replanning"),
+                external_wait("pr_open"),
+                command_driven("local_review_gate"),
+                external_wait("awaiting_feedback"),
+                command_driven("addressing_feedback"),
+                parent_handoff("quality_gate_pending"),
+                operator_gate("ready_to_merge"),
+                command_driven("merging"),
+                operator_gate("blocked"),
+                terminal_state("done", WorkflowTerminalState::Succeeded),
+                terminal_state("failed", WorkflowTerminalState::Failed),
+                terminal_state("cancelled", WorkflowTerminalState::Cancelled),
             ],
             rules: GITHUB_ISSUE_PR_RULES,
         },
         ExpectedDefinition {
             id: "prompt_task",
             states: &[
-                ("submitted", None),
-                ("awaiting_dependencies", None),
-                ("implementing", None),
-                ("blocked", None),
-                ("done", Some(WorkflowTerminalState::Succeeded)),
-                ("failed", Some(WorkflowTerminalState::Failed)),
-                ("cancelled", Some(WorkflowTerminalState::Cancelled)),
+                command_driven("submitted"),
+                external_wait("awaiting_dependencies"),
+                command_driven("implementing"),
+                operator_gate("blocked"),
+                terminal_state("done", WorkflowTerminalState::Succeeded),
+                terminal_state("failed", WorkflowTerminalState::Failed),
+                terminal_state("cancelled", WorkflowTerminalState::Cancelled),
             ],
             rules: PROMPT_TASK_RULES,
         },
         ExpectedDefinition {
             id: "quality_gate",
             states: &[
-                ("pending", None),
-                ("checking", None),
-                ("blocked", None),
-                ("passed", Some(WorkflowTerminalState::Succeeded)),
-                ("failed", Some(WorkflowTerminalState::Failed)),
-                ("cancelled", Some(WorkflowTerminalState::Cancelled)),
+                command_driven("pending"),
+                command_driven("checking"),
+                operator_gate("blocked"),
+                terminal_state("passed", WorkflowTerminalState::Succeeded),
+                terminal_state("failed", WorkflowTerminalState::Failed),
+                terminal_state("cancelled", WorkflowTerminalState::Cancelled),
             ],
             rules: QUALITY_GATE_RULES,
         },
         ExpectedDefinition {
             id: "pr_feedback",
             states: &[
-                ("pending", None),
-                ("inspecting", None),
-                ("feedback_found", None),
-                ("no_actionable_feedback", None),
-                ("ready_to_merge", None),
-                ("blocked", None),
-                ("done", Some(WorkflowTerminalState::Succeeded)),
-                ("failed", Some(WorkflowTerminalState::Failed)),
-                ("cancelled", Some(WorkflowTerminalState::Cancelled)),
+                command_driven("pending"),
+                command_driven("inspecting"),
+                parent_handoff("feedback_found"),
+                parent_handoff("no_actionable_feedback"),
+                parent_handoff("ready_to_merge"),
+                operator_gate("blocked"),
+                terminal_state("done", WorkflowTerminalState::Succeeded),
+                terminal_state("failed", WorkflowTerminalState::Failed),
+                terminal_state("cancelled", WorkflowTerminalState::Cancelled),
             ],
             rules: PR_FEEDBACK_RULES,
         },
@@ -90,7 +147,7 @@ fn builtins_preserve_literal_states_terminal_mappings_and_transition_rules() {
             .expect("literal built-in definition should be registered");
         assert_eq!(actual.id, expected_definition.id);
         assert_eq!(actual.states.len(), expected_definition.states.len());
-        for (actual_state, (expected_state, expected_terminal)) in
+        for (actual_state, (expected_state, expected_progress, expected_terminal)) in
             actual.states.iter().zip(expected_definition.states)
         {
             assert_eq!(
@@ -98,6 +155,7 @@ fn builtins_preserve_literal_states_terminal_mappings_and_transition_rules() {
                 expected_definition.id
             );
             assert_eq!(actual_state.key.state.as_ref(), *expected_state);
+            assert_eq!(actual_state.progress_mode, *expected_progress);
             assert_eq!(actual_state.terminal_state, *expected_terminal);
         }
 
@@ -116,6 +174,230 @@ fn builtins_preserve_literal_states_terminal_mappings_and_transition_rules() {
                     .collect::<BTreeSet<_>>(),
                 expected_commands.iter().copied().collect::<BTreeSet<_>>()
             );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProgressOwner {
+    RuntimeJobDriver(WorkflowCommandType),
+    ExternalObserver(&'static str),
+    OperatorAction(&'static str),
+    ParentPropagation(&'static str),
+}
+
+#[test]
+fn progress_mode_semantics_match_authoritative_ownership_matrix() {
+    use WorkflowCommandType::{EnqueueActivity, StartChildWorkflow};
+    use WorkflowProgressMode::{CommandDriven, ExternalWait, OperatorGate, ParentHandoff};
+
+    let expected = [
+        (
+            "github_issue_pr",
+            "discovered",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "github_issue_pr",
+            "awaiting_dependencies",
+            ExternalWait,
+            ProgressOwner::ExternalObserver("runtime_dependency_release_observer"),
+        ),
+        (
+            "github_issue_pr",
+            "scheduled",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "github_issue_pr",
+            "planning",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "github_issue_pr",
+            "implementing",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "github_issue_pr",
+            "replanning",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "github_issue_pr",
+            "pr_open",
+            ExternalWait,
+            ProgressOwner::ExternalObserver("pr_feedback_sweeper_local_review_selector"),
+        ),
+        (
+            "github_issue_pr",
+            "local_review_gate",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "github_issue_pr",
+            "awaiting_feedback",
+            ExternalWait,
+            ProgressOwner::ExternalObserver("pr_feedback_sweeper_feedback_selector"),
+        ),
+        (
+            "github_issue_pr",
+            "addressing_feedback",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(StartChildWorkflow),
+        ),
+        (
+            "github_issue_pr",
+            "quality_gate_pending",
+            ParentHandoff,
+            ProgressOwner::ParentPropagation("quality_gate_child_completion"),
+        ),
+        (
+            "github_issue_pr",
+            "ready_to_merge",
+            OperatorGate,
+            ProgressOwner::OperatorAction("merge_approval"),
+        ),
+        (
+            "github_issue_pr",
+            "merging",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "github_issue_pr",
+            "blocked",
+            OperatorGate,
+            ProgressOwner::OperatorAction("authorized_recovery"),
+        ),
+        (
+            "prompt_task",
+            "submitted",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "prompt_task",
+            "awaiting_dependencies",
+            ExternalWait,
+            ProgressOwner::ExternalObserver("runtime_dependency_release_observer"),
+        ),
+        (
+            "prompt_task",
+            "implementing",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "prompt_task",
+            "blocked",
+            OperatorGate,
+            ProgressOwner::OperatorAction("authorized_recovery"),
+        ),
+        (
+            "quality_gate",
+            "pending",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "quality_gate",
+            "checking",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "quality_gate",
+            "blocked",
+            OperatorGate,
+            ProgressOwner::OperatorAction("authorized_recovery"),
+        ),
+        (
+            "pr_feedback",
+            "pending",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "pr_feedback",
+            "inspecting",
+            CommandDriven,
+            ProgressOwner::RuntimeJobDriver(EnqueueActivity),
+        ),
+        (
+            "pr_feedback",
+            "feedback_found",
+            ParentHandoff,
+            ProgressOwner::ParentPropagation("pr_feedback_child_completion"),
+        ),
+        (
+            "pr_feedback",
+            "no_actionable_feedback",
+            ParentHandoff,
+            ProgressOwner::ParentPropagation("pr_feedback_child_completion"),
+        ),
+        (
+            "pr_feedback",
+            "ready_to_merge",
+            ParentHandoff,
+            ProgressOwner::ParentPropagation("pr_feedback_child_completion"),
+        ),
+        (
+            "pr_feedback",
+            "blocked",
+            OperatorGate,
+            ProgressOwner::OperatorAction("authorized_recovery"),
+        ),
+    ];
+
+    let actual = known_workflow_definition_ids()
+        .into_iter()
+        .flat_map(|definition_id| {
+            workflow_states_for_definition(&definition_id)
+                .into_iter()
+                .filter_map(move |state| {
+                    state
+                        .progress_mode
+                        .map(|mode| (definition_id.clone(), state.key.state.to_string(), mode))
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), expected.len());
+
+    for ((definition_id, state, mode, owner), (actual_definition, actual_state, actual_mode)) in
+        expected.iter().zip(&actual)
+    {
+        assert_eq!(actual_definition, definition_id);
+        assert_eq!(actual_state, state);
+        assert_eq!(actual_mode, mode);
+        match (mode, owner) {
+            (CommandDriven, ProgressOwner::RuntimeJobDriver(command_type)) => {
+                let command = WorkflowCommand::new(*command_type, "semantic-fixture", json!({}));
+                assert!(
+                    command.requires_runtime_job(),
+                    "{definition_id}.{state} must name a runtime-job-producing driver"
+                );
+            }
+            (ExternalWait, ProgressOwner::ExternalObserver(observer)) => assert!(matches!(
+                *observer,
+                "runtime_dependency_release_observer"
+                    | "pr_feedback_sweeper_local_review_selector"
+                    | "pr_feedback_sweeper_feedback_selector"
+            )),
+            (OperatorGate, ProgressOwner::OperatorAction(action)) => {
+                assert!(matches!(*action, "merge_approval" | "authorized_recovery"))
+            }
+            (ParentHandoff, ProgressOwner::ParentPropagation(hook)) => assert!(matches!(
+                *hook,
+                "quality_gate_child_completion" | "pr_feedback_child_completion"
+            )),
+            _ => panic!("{definition_id}.{state} has a mode/owner category mismatch"),
         }
     }
 }

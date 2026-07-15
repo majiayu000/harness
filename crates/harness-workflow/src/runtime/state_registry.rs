@@ -17,6 +17,15 @@ pub enum WorkflowTerminalState {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowProgressMode {
+    CommandDriven,
+    ExternalWait,
+    OperatorGate,
+    ParentHandoff,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorkflowStateKey {
     pub definition_id: Arc<str>,
@@ -26,16 +35,22 @@ pub struct WorkflowStateKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowStateDefinition {
     pub key: WorkflowStateKey,
+    pub progress_mode: Option<WorkflowProgressMode>,
     pub terminal_state: Option<WorkflowTerminalState>,
 }
 
 impl WorkflowStateDefinition {
-    pub fn active(definition_id: impl Into<Arc<str>>, state: impl Into<Arc<str>>) -> Self {
+    pub fn active(
+        definition_id: impl Into<Arc<str>>,
+        state: impl Into<Arc<str>>,
+        progress_mode: WorkflowProgressMode,
+    ) -> Self {
         Self {
             key: WorkflowStateKey {
                 definition_id: definition_id.into(),
                 state: state.into(),
             },
+            progress_mode: Some(progress_mode),
             terminal_state: None,
         }
     }
@@ -50,8 +65,13 @@ impl WorkflowStateDefinition {
                 definition_id: definition_id.into(),
                 state: state.into(),
             },
+            progress_mode: None,
             terminal_state: Some(terminal_state),
         }
+    }
+
+    fn has_complete_progress_contract(&self) -> bool {
+        self.progress_mode.is_some() != self.terminal_state.is_some()
     }
 }
 
@@ -118,6 +138,17 @@ impl WorkflowDefinitionRegistry {
             anyhow::bail!(
                 "workflow definition '{}' is already registered",
                 definition.id
+            );
+        }
+        if let Some(state) = definition
+            .states
+            .iter()
+            .find(|state| !state.has_complete_progress_contract())
+        {
+            anyhow::bail!(
+                "workflow definition '{}' state '{}' must declare exactly one of progress_mode or terminal_state",
+                definition.id,
+                state.key.state
             );
         }
         self.definition_ids.push(definition.id.clone());
@@ -244,6 +275,13 @@ pub fn workflow_state_terminal_state(
     workflow_state_definition(definition_id, state)?.terminal_state
 }
 
+pub fn workflow_state_progress_mode(
+    definition_id: &str,
+    state: &str,
+) -> Option<WorkflowProgressMode> {
+    workflow_state_definition(definition_id, state)?.progress_mode
+}
+
 fn builtin_definitions() -> [RegisteredWorkflowDefinition; 4] {
     [
         github_issue_pr_definition(),
@@ -254,75 +292,163 @@ fn builtin_definitions() -> [RegisteredWorkflowDefinition; 4] {
 }
 
 fn github_issue_pr_definition() -> RegisteredWorkflowDefinition {
+    use WorkflowProgressMode::{CommandDriven, ExternalWait, OperatorGate, ParentHandoff};
+
     definition(
         GITHUB_ISSUE_PR_DEFINITION_ID,
-        &[
-            ("discovered", None),
-            ("awaiting_dependencies", None),
-            ("scheduled", None),
-            ("planning", None),
-            ("implementing", None),
-            ("replanning", None),
-            ("pr_open", None),
-            ("local_review_gate", None),
-            ("awaiting_feedback", None),
-            ("addressing_feedback", None),
-            ("quality_gate_pending", None),
-            ("ready_to_merge", None),
-            ("merging", None),
-            ("blocked", None),
-            ("done", Some(WorkflowTerminalState::Succeeded)),
-            ("failed", Some(WorkflowTerminalState::Failed)),
-            ("cancelled", Some(WorkflowTerminalState::Cancelled)),
+        vec![
+            active(GITHUB_ISSUE_PR_DEFINITION_ID, "discovered", CommandDriven),
+            active(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                "awaiting_dependencies",
+                ExternalWait,
+            ),
+            active(GITHUB_ISSUE_PR_DEFINITION_ID, "scheduled", CommandDriven),
+            active(GITHUB_ISSUE_PR_DEFINITION_ID, "planning", CommandDriven),
+            active(GITHUB_ISSUE_PR_DEFINITION_ID, "implementing", CommandDriven),
+            active(GITHUB_ISSUE_PR_DEFINITION_ID, "replanning", CommandDriven),
+            active(GITHUB_ISSUE_PR_DEFINITION_ID, "pr_open", ExternalWait),
+            active(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                "local_review_gate",
+                CommandDriven,
+            ),
+            active(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                "awaiting_feedback",
+                ExternalWait,
+            ),
+            active(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                "addressing_feedback",
+                CommandDriven,
+            ),
+            active(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                "quality_gate_pending",
+                ParentHandoff,
+            ),
+            active(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                "ready_to_merge",
+                OperatorGate,
+            ),
+            active(GITHUB_ISSUE_PR_DEFINITION_ID, "merging", CommandDriven),
+            active(GITHUB_ISSUE_PR_DEFINITION_ID, "blocked", OperatorGate),
+            terminal(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                "done",
+                WorkflowTerminalState::Succeeded,
+            ),
+            terminal(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                "failed",
+                WorkflowTerminalState::Failed,
+            ),
+            terminal(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                "cancelled",
+                WorkflowTerminalState::Cancelled,
+            ),
         ],
         TransitionAllowlist::github_issue_pr_defaults(),
     )
 }
 
 fn prompt_task_definition() -> RegisteredWorkflowDefinition {
+    use WorkflowProgressMode::{CommandDriven, ExternalWait, OperatorGate};
+
     definition(
         PROMPT_TASK_DEFINITION_ID,
-        &[
-            ("submitted", None),
-            ("awaiting_dependencies", None),
-            ("implementing", None),
-            ("blocked", None),
-            ("done", Some(WorkflowTerminalState::Succeeded)),
-            ("failed", Some(WorkflowTerminalState::Failed)),
-            ("cancelled", Some(WorkflowTerminalState::Cancelled)),
+        vec![
+            active(PROMPT_TASK_DEFINITION_ID, "submitted", CommandDriven),
+            active(
+                PROMPT_TASK_DEFINITION_ID,
+                "awaiting_dependencies",
+                ExternalWait,
+            ),
+            active(PROMPT_TASK_DEFINITION_ID, "implementing", CommandDriven),
+            active(PROMPT_TASK_DEFINITION_ID, "blocked", OperatorGate),
+            terminal(
+                PROMPT_TASK_DEFINITION_ID,
+                "done",
+                WorkflowTerminalState::Succeeded,
+            ),
+            terminal(
+                PROMPT_TASK_DEFINITION_ID,
+                "failed",
+                WorkflowTerminalState::Failed,
+            ),
+            terminal(
+                PROMPT_TASK_DEFINITION_ID,
+                "cancelled",
+                WorkflowTerminalState::Cancelled,
+            ),
         ],
         TransitionAllowlist::prompt_task_defaults(),
     )
 }
 
 fn quality_gate_definition() -> RegisteredWorkflowDefinition {
+    use WorkflowProgressMode::{CommandDriven, OperatorGate};
+
     definition(
         QUALITY_GATE_DEFINITION_ID,
-        &[
-            ("pending", None),
-            ("checking", None),
-            ("blocked", None),
-            ("passed", Some(WorkflowTerminalState::Succeeded)),
-            ("failed", Some(WorkflowTerminalState::Failed)),
-            ("cancelled", Some(WorkflowTerminalState::Cancelled)),
+        vec![
+            active(QUALITY_GATE_DEFINITION_ID, "pending", CommandDriven),
+            active(QUALITY_GATE_DEFINITION_ID, "checking", CommandDriven),
+            active(QUALITY_GATE_DEFINITION_ID, "blocked", OperatorGate),
+            terminal(
+                QUALITY_GATE_DEFINITION_ID,
+                "passed",
+                WorkflowTerminalState::Succeeded,
+            ),
+            terminal(
+                QUALITY_GATE_DEFINITION_ID,
+                "failed",
+                WorkflowTerminalState::Failed,
+            ),
+            terminal(
+                QUALITY_GATE_DEFINITION_ID,
+                "cancelled",
+                WorkflowTerminalState::Cancelled,
+            ),
         ],
         TransitionAllowlist::quality_gate_defaults(),
     )
 }
 
 fn pr_feedback_definition() -> RegisteredWorkflowDefinition {
+    use WorkflowProgressMode::{CommandDriven, OperatorGate, ParentHandoff};
+
     definition(
         PR_FEEDBACK_DEFINITION_ID,
-        &[
-            ("pending", None),
-            ("inspecting", None),
-            ("feedback_found", None),
-            ("no_actionable_feedback", None),
-            ("ready_to_merge", None),
-            ("blocked", None),
-            ("done", Some(WorkflowTerminalState::Succeeded)),
-            ("failed", Some(WorkflowTerminalState::Failed)),
-            ("cancelled", Some(WorkflowTerminalState::Cancelled)),
+        vec![
+            active(PR_FEEDBACK_DEFINITION_ID, "pending", CommandDriven),
+            active(PR_FEEDBACK_DEFINITION_ID, "inspecting", CommandDriven),
+            active(PR_FEEDBACK_DEFINITION_ID, "feedback_found", ParentHandoff),
+            active(
+                PR_FEEDBACK_DEFINITION_ID,
+                "no_actionable_feedback",
+                ParentHandoff,
+            ),
+            active(PR_FEEDBACK_DEFINITION_ID, "ready_to_merge", ParentHandoff),
+            active(PR_FEEDBACK_DEFINITION_ID, "blocked", OperatorGate),
+            terminal(
+                PR_FEEDBACK_DEFINITION_ID,
+                "done",
+                WorkflowTerminalState::Succeeded,
+            ),
+            terminal(
+                PR_FEEDBACK_DEFINITION_ID,
+                "failed",
+                WorkflowTerminalState::Failed,
+            ),
+            terminal(
+                PR_FEEDBACK_DEFINITION_ID,
+                "cancelled",
+                WorkflowTerminalState::Cancelled,
+            ),
         ],
         TransitionAllowlist::pr_feedback_defaults(),
     )
@@ -330,22 +456,26 @@ fn pr_feedback_definition() -> RegisteredWorkflowDefinition {
 
 fn definition(
     id: &'static str,
-    states: &[(&'static str, Option<WorkflowTerminalState>)],
+    states: Vec<WorkflowStateDefinition>,
     allowlist: TransitionAllowlist,
 ) -> RegisteredWorkflowDefinition {
-    RegisteredWorkflowDefinition::new(
-        id,
-        states
-            .iter()
-            .map(|(state, terminal_state)| match terminal_state {
-                Some(terminal_state) => {
-                    WorkflowStateDefinition::terminal(id, *state, *terminal_state)
-                }
-                None => WorkflowStateDefinition::active(id, *state),
-            })
-            .collect(),
-        allowlist,
-    )
+    RegisteredWorkflowDefinition::new(id, states, allowlist)
+}
+
+fn active(
+    definition_id: &'static str,
+    state: &'static str,
+    progress_mode: WorkflowProgressMode,
+) -> WorkflowStateDefinition {
+    WorkflowStateDefinition::active(definition_id, state, progress_mode)
+}
+
+fn terminal(
+    definition_id: &'static str,
+    state: &'static str,
+    terminal_state: WorkflowTerminalState,
+) -> WorkflowStateDefinition {
+    WorkflowStateDefinition::terminal(definition_id, state, terminal_state)
 }
 
 #[cfg(test)]
@@ -430,6 +560,15 @@ mod tests {
         ];
 
         for (definition_id, allowlist) in allowlists {
+            let definition = workflow_definition(definition_id)
+                .expect("built-in workflow definition should be registered");
+            for state in &definition.states {
+                assert!(
+                    state.has_complete_progress_contract(),
+                    "{definition_id}.{} must declare exactly one progress or terminal contract",
+                    state.key.state
+                );
+            }
             for rule in allowlist.rules() {
                 if let Some(from_state) = rule.from_state.as_deref() {
                     assert!(
@@ -438,12 +577,33 @@ mod tests {
                     );
                 }
                 assert!(
-                    workflow_state_exists(definition_id, &rule.to_state),
-                    "{definition_id} missing to_state {}",
-                    rule.to_state
+                    workflow_state_definition(definition_id, &rule.to_state)
+                        .is_some_and(|state| state.has_complete_progress_contract()),
+                    "{definition_id} to_state {} is missing a complete contract",
+                    rule.to_state,
                 );
             }
         }
+    }
+
+    #[test]
+    fn progress_mode_lookup_fails_closed_for_terminal_and_unknown_states() {
+        assert_eq!(
+            workflow_state_progress_mode(GITHUB_ISSUE_PR_DEFINITION_ID, "implementing"),
+            Some(WorkflowProgressMode::CommandDriven)
+        );
+        assert_eq!(
+            workflow_state_progress_mode(GITHUB_ISSUE_PR_DEFINITION_ID, "done"),
+            None
+        );
+        assert_eq!(
+            workflow_state_progress_mode(GITHUB_ISSUE_PR_DEFINITION_ID, "unknown"),
+            None
+        );
+        assert_eq!(
+            workflow_state_progress_mode("unknown_definition", "implementing"),
+            None
+        );
     }
 
     #[test]
@@ -461,12 +621,20 @@ mod tests {
         let mut registry = WorkflowDefinitionRegistry::new_for_tests();
         let first = definition(
             "fixture",
-            &[("pending", None)],
+            vec![active(
+                "fixture",
+                "pending",
+                WorkflowProgressMode::ExternalWait,
+            )],
             TransitionAllowlist::default(),
         );
         let duplicate = definition(
             "fixture",
-            &[("other", None)],
+            vec![active(
+                "fixture",
+                "other",
+                WorkflowProgressMode::ExternalWait,
+            )],
             TransitionAllowlist::default(),
         );
 
@@ -492,7 +660,11 @@ mod tests {
         let error = registry
             .register(definition(
                 "late",
-                &[("pending", None)],
+                vec![active(
+                    "late",
+                    "pending",
+                    WorkflowProgressMode::ExternalWait,
+                )],
                 TransitionAllowlist::default(),
             ))
             .expect_err("post-freeze registration should fail");
@@ -500,5 +672,41 @@ mod tests {
         assert!(registry.is_frozen());
         assert!(error.to_string().contains("is frozen"));
         assert!(registry.definition("late").is_none());
+    }
+
+    #[test]
+    fn registration_rejects_incomplete_or_conflicting_progress_contracts() {
+        let invalid_states = [
+            WorkflowStateDefinition {
+                key: WorkflowStateKey {
+                    definition_id: Arc::from("fixture"),
+                    state: Arc::from("missing"),
+                },
+                progress_mode: None,
+                terminal_state: None,
+            },
+            WorkflowStateDefinition {
+                key: WorkflowStateKey {
+                    definition_id: Arc::from("fixture"),
+                    state: Arc::from("conflicting"),
+                },
+                progress_mode: Some(WorkflowProgressMode::OperatorGate),
+                terminal_state: Some(WorkflowTerminalState::Failed),
+            },
+        ];
+
+        for state in invalid_states {
+            let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+            let error = registry
+                .register(RegisteredWorkflowDefinition::new(
+                    "fixture",
+                    vec![state],
+                    TransitionAllowlist::default(),
+                ))
+                .expect_err("invalid state contract should fail registration");
+
+            assert!(error.to_string().contains("exactly one"));
+            assert!(registry.definition("fixture").is_none());
+        }
     }
 }
