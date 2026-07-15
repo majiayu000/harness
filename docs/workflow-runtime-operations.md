@@ -3,6 +3,73 @@
 This guide covers manual recovery for stopped GitHub issue workflows and the
 watchdog/retention sweepers used to operate the workflow runtime safely.
 
+## Declarative Workflow Definitions
+
+A repository can add an optional `definition` block to its `WORKFLOW.md` front
+matter. The block is an atomic state-machine declaration: a repository-level
+value replaces a central-base declaration wholesale instead of merging states
+field by field. Every activity state must reference an entry in `activities`.
+
+```yaml
+definition:
+  id: docs_review
+  initial: review
+  states:
+    review:
+      activity: review_docs
+      on_success: publish
+      on_failure: failed
+      on_blocked: blocked
+      on_signal:
+        needs_approval: blocked
+    blocked:
+      progress: operator_gate
+    publish:
+      activity: publish_docs
+      on_success: done
+      on_failure: failed
+      on_blocked: blocked
+  terminal:
+    done: succeeded
+    failed: failed
+    cancelled: cancelled
+  evidence_required:
+    done:
+      - release_url
+  recovery_targets:
+    - publish
+activities:
+  review_docs:
+    prompt: Review the documentation and emit `needs_approval` when required.
+    validation:
+      - cargo test -p docs-checks
+  publish_docs:
+    prompt: Publish the approved documentation.
+    validation:
+      - cargo test -p docs-checks
+```
+
+Harness validates the entire declaration before server dispatch starts. It
+rejects undeclared or unreachable states, incomplete terminal mappings,
+driverless active states, unknown activities, invalid recovery targets, and
+definition-id collisions. Each instance is pinned to the declaration's SHA-256
+content hash; an instance whose pinned version is unavailable blocks with
+`definition_version_missing` instead of running under a changed shape.
+
+Submit the registered workflow through the normal task endpoint. Declarative
+v1 submissions do not support `depends_on`.
+
+```bash
+curl -sS -X POST http://127.0.0.1:9800/tasks \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "definition_id": "docs_review",
+    "project": "/absolute/path/to/repository",
+    "prompt": "Review and publish the current documentation"
+  }'
+```
+
 ## Manual Recovery
 
 Use the recovery API after an operator resolves the external condition that
@@ -39,15 +106,29 @@ curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/retry \
     "workflow_id": "github-issue-workflow-id",
     "reason": "the transient backend outage has been repaired"
   }'
+
+# Declarative workflows require an explicit declared recovery target.
+curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/unblock \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "declarative-workflow-id",
+    "reason": "the release was approved",
+    "target_state": "publish"
+  }'
 ```
 
 | Route | Required current state | Additional rules |
 |-------|------------------------|------------------|
-| `POST /api/workflows/runtime/unblock` | `blocked` | The stopped activity must be recoverable. |
+| `POST /api/workflows/runtime/unblock` | Built-in `blocked`, or the declaration's operator-blocking state | Built-ins reconstruct the stopped activity. Declarative workflows require `target_state` to name an active state listed in `recovery_targets`. |
 | `POST /api/workflows/runtime/retry` | `failed` | Failures classified as `fatal` or `configuration` are not retryable. |
 
-The first implementation supports only `github_issue_pr` workflow instances.
-`cancelled` and active workflows are not supported by either action. A legacy
+Retry supports only `github_issue_pr` workflow instances. Declarative workflows
+support explicit operator unblocking but are excluded from automated recovery.
+Their pinned definition version and full hash must still match the loaded
+declaration, and Harness derives the target state's driver command instead of
+replaying or guessing a stopped activity. `cancelled` and active workflows are
+not supported by either action. A legacy
 stopped instance with no structured stop metadata resumes at `implement_issue`;
 partial, malformed, or unsupported stop metadata fails closed without mutating
 the workflow.

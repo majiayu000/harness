@@ -11,6 +11,7 @@ mod candidate_selection;
 mod candidate_terminal;
 mod command_record;
 pub mod declarative;
+mod declarative_interpreter;
 mod declarative_pinning;
 mod dispatch_barrier;
 pub mod dispatcher;
@@ -65,6 +66,9 @@ pub use candidate_selection::{
     CandidateSelectionRecord, CANDIDATE_SELECTION_RECORD_TYPE, CANDIDATE_SELECTION_SCHEMA,
 };
 pub use declarative::{build_declarative_definition, DeclarativeWorkflowDefinition};
+pub use declarative_interpreter::{
+    build_declarative_submission_decision, DECLARATIVE_SUBMISSION_DECISION,
+};
 pub use declarative_pinning::{
     declarative_definition_identity, hydrate_declarative_definition,
     persisted_declarative_definition,
@@ -148,16 +152,18 @@ pub use repo_memory::{
     REPO_MEMORY_DEGRADATION_ARTIFACT,
 };
 pub use state_registry::{
-    decision_validator_for_definition, freeze_workflow_definition_registry,
-    known_workflow_definition_ids, register_declarative_workflow_definitions,
+    current_declarative_workflow_definition, decision_validator_for_definition,
+    decision_validator_for_instance, declarative_workflow_definition_for_instance,
+    freeze_workflow_definition_registry, known_workflow_definition_ids,
+    register_declarative_workflow_definitions,
     register_historical_declarative_workflow_definitions, register_workflow_definition,
     workflow_declarative_definition, workflow_definition, workflow_definition_for_version,
-    workflow_state_definition, workflow_state_definition_for_instance,
-    workflow_state_definition_for_version, workflow_state_exists, workflow_state_progress_mode,
-    workflow_state_progress_mode_for_version, workflow_state_terminal_state_for_version,
-    workflow_states_for_definition, workflow_terminal_state_names_for_definition,
-    RegisteredWorkflowDefinition, WorkflowDefinitionRegistry, WorkflowProgressMode,
-    WorkflowStateDefinition, WorkflowStateKey,
+    workflow_instance_is_declarative, workflow_state_definition,
+    workflow_state_definition_for_instance, workflow_state_definition_for_version,
+    workflow_state_exists, workflow_state_progress_mode, workflow_state_progress_mode_for_version,
+    workflow_state_terminal_state_for_version, workflow_states_for_definition,
+    workflow_terminal_state_names_for_definition, RegisteredWorkflowDefinition,
+    WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowStateDefinition, WorkflowStateKey,
 };
 pub use status::WorkflowCommandStatus;
 pub use store::{

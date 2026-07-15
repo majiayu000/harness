@@ -1,7 +1,6 @@
 use super::{
     apply_inline_command_side_effect, command_store, insert_decision_record_tx, insert_event_tx,
-    select_instance_for_update_tx, upsert_instance_tx, validator_for_definition,
-    WorkflowRuntimeStore,
+    select_instance_for_update_tx, upsert_instance_tx, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowDecision, WorkflowDecisionRecord,
@@ -11,6 +10,7 @@ use crate::runtime::prompt_task::{
     prompt_continuation_state_from_data, PromptContinuationState, PROMPT_TASK_DEFINITION_ID,
 };
 use crate::runtime::reducer::reduce_runtime_job_completed;
+use crate::runtime::state_registry::decision_validator_for_instance;
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
 use serde_json::Value;
@@ -184,7 +184,7 @@ fn driverless_structured_completion_decision(
     else {
         return Ok(None);
     };
-    let Some(validator) = validator_for_definition(&instance.definition_id) else {
+    let Some(validator) = decision_validator_for_instance(instance) else {
         return Ok(None);
     };
     let rejection = validator.validate(
@@ -207,7 +207,7 @@ async fn persist_runtime_completion_decision_tx(
     event: &WorkflowEvent,
     decision: WorkflowDecision,
 ) -> anyhow::Result<WorkflowDecisionRecord> {
-    let record = match validator_for_definition(&instance.definition_id) {
+    let record = match decision_validator_for_instance(&instance) {
         Some(validator) => match validator.validate(
             &instance,
             &decision,

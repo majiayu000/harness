@@ -299,6 +299,24 @@ fn validate_targets(
                 evidence_target
             );
         }
+        let mut kinds = BTreeSet::new();
+        for kind in &policy.evidence_required[evidence_target] {
+            if kind.trim().is_empty() {
+                anyhow::bail!(
+                    "declarative workflow definition '{}' evidence requirement for '{}' contains an empty kind",
+                    policy.id,
+                    evidence_target
+                );
+            }
+            if !kinds.insert(kind) {
+                anyhow::bail!(
+                    "declarative workflow definition '{}' evidence requirement for '{}' contains duplicate kind '{}'",
+                    policy.id,
+                    evidence_target,
+                    kind
+                );
+            }
+        }
     }
 
     let mut recovery_targets = BTreeSet::new();
@@ -347,6 +365,10 @@ fn validate_reachability(
         }
         // Any active state can enter the runtime's invalid-output blocked fallback.
         pending.push_back("blocked");
+        // Runtime completion supplies terminal fallbacks even when the declaration
+        // does not spell out failure or cancellation edges.
+        pending.push_back(terminal_state_for_class(policy, "failed"));
+        pending.push_back(terminal_state_for_class(policy, "cancelled"));
         if state_name == "blocked" {
             pending.extend(policy.recovery_targets.iter().map(String::as_str));
         }
@@ -407,13 +429,55 @@ fn compile_allowlist(
     let mut rules = edges
         .into_iter()
         .map(|(source, target)| {
-            TransitionRule::new(
-                source,
+            rule_with_required_evidence(
+                policy,
+                TransitionRule::new(
+                    source,
+                    target,
+                    allowed_commands_for_target(policy, terminal_states, target),
+                ),
                 target,
-                allowed_commands_for_target(policy, terminal_states, target),
             )
         })
         .collect::<Vec<_>>();
+    rules.push(rule_with_required_evidence(
+        policy,
+        TransitionRule::new(
+            "__submission__",
+            policy.initial.as_str(),
+            allowed_commands_for_target(policy, terminal_states, &policy.initial),
+        ),
+        &policy.initial,
+    ));
+    for target in &policy.recovery_targets {
+        rules.push(rule_with_required_evidence(
+            policy,
+            TransitionRule::new(
+                "blocked",
+                target,
+                allowed_commands_for_target(policy, terminal_states, target),
+            ),
+            target,
+        ));
+    }
+    for source in policy.states.keys() {
+        for class in ["failed", "cancelled"] {
+            let target = terminal_state_for_class(policy, class);
+            if !rules.iter().any(|rule| {
+                rule.from_state.as_deref() == Some(source.as_str()) && rule.to_state == target
+            }) {
+                rules.push(rule_with_required_evidence(
+                    policy,
+                    TransitionRule::new(
+                        source,
+                        target,
+                        allowed_commands_for_target(policy, terminal_states, target),
+                    ),
+                    target,
+                ));
+            }
+        }
+    }
     rules.push(TransitionRule::from_any(
         "blocked",
         [
@@ -423,6 +487,27 @@ fn compile_allowlist(
         ],
     ));
     TransitionAllowlist::new(rules)
+}
+
+fn rule_with_required_evidence(
+    policy: &WorkflowDefinitionPolicy,
+    mut rule: TransitionRule,
+    target: &str,
+) -> TransitionRule {
+    if let Some(kinds) = policy.evidence_required.get(target) {
+        for kind in kinds {
+            rule = rule.require_evidence(kind);
+        }
+    }
+    rule
+}
+
+fn terminal_state_for_class<'a>(policy: &'a WorkflowDefinitionPolicy, class: &str) -> &'a str {
+    policy
+        .terminal
+        .iter()
+        .find_map(|(state, declared_class)| (declared_class == class).then_some(state.as_str()))
+        .expect("terminal class coverage was validated")
 }
 
 fn allowed_commands_for_target(

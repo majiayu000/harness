@@ -220,6 +220,21 @@ impl WorkflowDefinitionRegistry {
         })
     }
 
+    pub fn decision_validator_for_instance(
+        &self,
+        instance: &WorkflowInstance,
+    ) -> Option<DecisionValidator> {
+        if let Some(definition) = self.declarative_definition_for_instance(instance) {
+            return Some(DecisionValidator::for_declarative_definition(
+                definition.registered().allowlist.clone(),
+            ));
+        }
+        if self.is_declarative_instance(instance) {
+            return Some(DecisionValidator::definition_version_missing());
+        }
+        self.decision_validator_for_definition(&instance.definition_id)
+    }
+
     pub fn known_definition_ids(&self) -> Vec<String> {
         self.definition_ids.clone()
     }
@@ -288,6 +303,31 @@ pub fn workflow_declarative_definition(
         .declarative_definition(definition_id, definition_version)
 }
 
+pub fn current_declarative_workflow_definition(
+    definition_id: &str,
+) -> Option<Arc<DeclarativeWorkflowDefinition>> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .current_declarative_definition(definition_id)
+}
+
+pub fn declarative_workflow_definition_for_instance(
+    instance: &WorkflowInstance,
+) -> Option<Arc<DeclarativeWorkflowDefinition>> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .declarative_definition_for_instance(instance)
+}
+
+pub fn workflow_instance_is_declarative(instance: &WorkflowInstance) -> bool {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .is_declarative_instance(instance)
+}
+
 pub fn workflow_definition_for_version(
     definition_id: &str,
     definition_version: u32,
@@ -303,6 +343,13 @@ pub fn decision_validator_for_definition(definition_id: &str) -> Option<Decision
         .read()
         .expect("workflow definition registry lock poisoned")
         .decision_validator_for_definition(definition_id)
+}
+
+pub fn decision_validator_for_instance(instance: &WorkflowInstance) -> Option<DecisionValidator> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .decision_validator_for_instance(instance)
 }
 
 pub fn known_workflow_definition_ids() -> Vec<String> {

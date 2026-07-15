@@ -70,7 +70,7 @@ pub(super) fn retry_failed_activity_decision(
     if !is_retryable_error_kind(result.error_kind) {
         return None;
     }
-    if !supports_same_state_activity_retry(&instance.definition_id, &instance.state) {
+    if !supports_same_state_activity_retry(instance) {
         return None;
     }
     let retry_attempt = failed_activity_retry_attempt(event);
@@ -299,9 +299,20 @@ fn retry_command(
     )
 }
 
-fn supports_same_state_activity_retry(definition_id: &str, state: &str) -> bool {
+fn supports_same_state_activity_retry(instance: &WorkflowInstance) -> bool {
+    if crate::runtime::declarative_workflow_definition_for_instance(instance).is_some_and(
+        |definition| {
+            definition
+                .policy()
+                .states
+                .get(&instance.state)
+                .is_some_and(|state| state.activity.is_some())
+        },
+    ) {
+        return true;
+    }
     matches!(
-        (definition_id, state),
+        (instance.definition_id.as_str(), instance.state.as_str()),
         (
             GITHUB_ISSUE_PR_DEFINITION_ID,
             "planning"

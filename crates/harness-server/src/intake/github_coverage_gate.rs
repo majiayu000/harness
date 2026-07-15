@@ -221,6 +221,7 @@ mod tests {
                     action,
                     reason: "external blocker resolved",
                     actor: "operator",
+                    target_state: None,
                 })
                 .await?;
             assert!(matches!(

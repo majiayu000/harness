@@ -218,6 +218,9 @@ async fn process_instance(
     instance: &WorkflowInstance,
     now: DateTime<Utc>,
 ) -> anyhow::Result<InstanceOutcome> {
+    if !supports_auto_recovery(instance) {
+        return Ok(InstanceOutcome::Skipped);
+    }
     let policy = &github.auto_recovery;
     let Some(repo) = data_string(&instance.data, "repo") else {
         return Ok(InstanceOutcome::Skipped);
@@ -274,6 +277,10 @@ async fn process_instance(
         stop_reason_code.as_deref(),
     )
     .await
+}
+
+fn supports_auto_recovery(instance: &WorkflowInstance) -> bool {
+    instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
 }
 
 /// A prior attempt crashed between its audit event and its outcome event.
@@ -395,6 +402,7 @@ async fn run_recovery_attempt(
             action,
             reason: &reason,
             actor: AUTO_RECOVERY_ACTOR,
+            target_state: None,
         })
         .await;
 
@@ -479,6 +487,22 @@ async fn run_recovery_attempt(
                 attempt_state,
                 attempt_number,
                 "workflow definition does not support runtime recovery",
+            )
+            .await
+        }
+        WorkflowRuntimeRecoveryOutcome::MissingRecoveryTarget { .. }
+        | WorkflowRuntimeRecoveryOutcome::InvalidRecoveryTarget { .. }
+        | WorkflowRuntimeRecoveryOutcome::DefinitionPinMismatch { .. }
+        | WorkflowRuntimeRecoveryOutcome::DeclarativeWrongState { .. }
+        | WorkflowRuntimeRecoveryOutcome::UnsupportedRecoveryAction { .. } => {
+            record_terminal_recheck(
+                store,
+                policy,
+                alerts,
+                instance,
+                attempt_state,
+                attempt_number,
+                "declarative workflow recovery outcome reached the GitHub-only scheduler",
             )
             .await
         }

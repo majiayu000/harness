@@ -11,6 +11,9 @@ pub const MAX_TASK_PRIORITY: u8 = 2;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateTaskRequest {
+    /// Registered declarative workflow definition to submit.
+    #[serde(default)]
+    pub definition_id: Option<String>,
     /// Free-text task description (prompt, issue URL, etc.).
     pub prompt: Option<String>,
     /// GitHub issue number to implement from.
@@ -130,6 +133,8 @@ impl SystemTaskInput {
 /// guardrails instead of silently falling back to server-wide defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PersistedRequestSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_id: Option<String>,
     /// Structured issue identifier for restart recovery.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<u64>,
@@ -182,6 +187,7 @@ pub struct PersistedRequestSettings {
 impl PersistedRequestSettings {
     pub(crate) fn from_req(req: &CreateTaskRequest) -> Self {
         Self {
+            definition_id: req.definition_id.clone(),
             issue: req.issue,
             pr: req.pr,
             agent: req.agent.clone(),
@@ -217,6 +223,9 @@ impl PersistedRequestSettings {
     }
 
     pub(crate) fn apply_to_req(&self, req: &mut CreateTaskRequest) {
+        if req.definition_id.is_none() {
+            req.definition_id = self.definition_id.clone();
+        }
         if req.issue.is_none() {
             req.issue = self.issue;
         }
@@ -250,6 +259,7 @@ impl PersistedRequestSettings {
 impl Default for CreateTaskRequest {
     fn default() -> Self {
         Self {
+            definition_id: None,
             prompt: None,
             issue: None,
             skip_triage: false,
@@ -288,6 +298,9 @@ pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<S
     }
     if let Some(n) = req.pr {
         return Some(format!("PR #{n}"));
+    }
+    if let Some(definition_id) = req.definition_id.as_deref() {
+        return Some(format!("workflow {definition_id}"));
     }
     if req.prompt.is_some() {
         return task_kind.prompt_task_label().map(str::to_string);
@@ -452,6 +465,24 @@ mod tests {
         let mut restored = CreateTaskRequest::default();
         settings.apply_to_req(&mut restored);
         assert_eq!(restored.continuation, req.continuation);
+    }
+
+    #[test]
+    fn create_task_request_roundtrip_preserves_declarative_definition_id() {
+        let req: CreateTaskRequest = serde_json::from_str(
+            r#"{"definition_id":"release_workflow","prompt":"Prepare the release."}"#,
+        )
+        .expect("deserialize declarative workflow request");
+        assert_eq!(req.definition_id.as_deref(), Some("release_workflow"));
+        assert_eq!(
+            summarize_request_description(&req).as_deref(),
+            Some("workflow release_workflow")
+        );
+
+        let settings = PersistedRequestSettings::from_req(&req);
+        let mut restored = CreateTaskRequest::default();
+        settings.apply_to_req(&mut restored);
+        assert_eq!(restored.definition_id, req.definition_id);
     }
 
     #[test]

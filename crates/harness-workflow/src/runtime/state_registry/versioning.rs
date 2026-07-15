@@ -146,6 +146,47 @@ impl WorkflowDefinitionRegistry {
         self.declarative_definition(definition_id, version)
     }
 
+    pub fn declarative_definition_for_instance(
+        &self,
+        instance: &WorkflowInstance,
+    ) -> Option<Arc<DeclarativeWorkflowDefinition>> {
+        let definition =
+            self.declarative_definition(&instance.definition_id, instance.definition_version)?;
+        match instance.data.get("definition_hash") {
+            Some(serde_json::Value::String(expected_hash))
+                if !expected_hash.trim().is_empty()
+                    && definition.definition_hash() == expected_hash =>
+            {
+                Some(definition)
+            }
+            Some(_) => None,
+            None => Some(definition),
+        }
+    }
+
+    pub fn is_declarative_definition_id(&self, definition_id: &str) -> bool {
+        self.current_declarative_versions
+            .contains_key(definition_id)
+            || self
+                .declarative_versions
+                .keys()
+                .any(|(registered_id, _)| registered_id == definition_id)
+    }
+
+    pub fn is_declarative_instance(&self, instance: &WorkflowInstance) -> bool {
+        if self.is_declarative_definition_id(&instance.definition_id) {
+            return true;
+        }
+        if self.definitions.contains_key(&instance.definition_id) {
+            return false;
+        }
+        instance
+            .data
+            .get("definition_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|hash| !hash.trim().is_empty())
+    }
+
     pub fn declarative_definition(
         &self,
         definition_id: &str,
@@ -179,25 +220,8 @@ impl WorkflowDefinitionRegistry {
             return self.definition(&instance.definition_id);
         }
 
-        match instance.data.get("definition_hash") {
-            Some(serde_json::Value::String(expected_hash)) if !expected_hash.trim().is_empty() => {
-                let definition = self
-                    .declarative_definition(&instance.definition_id, instance.definition_version)?;
-                if definition.definition_hash() != expected_hash {
-                    return None;
-                }
-                Some(Arc::new(definition.registered().clone()))
-            }
-            Some(_) => None,
-            None => {
-                if let Some(definition) = self
-                    .declarative_definition(&instance.definition_id, instance.definition_version)
-                {
-                    return Some(Arc::new(definition.registered().clone()));
-                }
-                None
-            }
-        }
+        self.declarative_definition_for_instance(instance)
+            .map(|definition| Arc::new(definition.registered().clone()))
     }
 
     pub fn state_definition_for_version(

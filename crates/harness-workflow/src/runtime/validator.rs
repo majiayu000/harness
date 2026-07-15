@@ -4,107 +4,21 @@ use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::fmt;
 
+#[path = "validator_declarative.rs"]
+mod declarative_validation;
 #[path = "validator_github_issue_pr.rs"]
 mod github_issue_pr_validation;
 #[path = "validator_prompt_task.rs"]
 mod prompt_task_validation;
+#[path = "validator_rules.rs"]
+mod rules;
+pub use rules::{TransitionAllowlist, TransitionRule};
 
 #[cfg(test)]
 #[path = "validator_tests.rs"]
 mod tests;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransitionRule {
-    pub from_state: Option<String>,
-    pub to_state: String,
-    pub allowed_commands: BTreeSet<WorkflowCommandType>,
-}
-
-impl TransitionRule {
-    pub fn new(
-        from_state: impl Into<String>,
-        to_state: impl Into<String>,
-        allowed_commands: impl IntoIterator<Item = WorkflowCommandType>,
-    ) -> Self {
-        Self {
-            from_state: Some(from_state.into()),
-            to_state: to_state.into(),
-            allowed_commands: allowed_commands.into_iter().collect(),
-        }
-    }
-
-    pub fn from_any(
-        to_state: impl Into<String>,
-        allowed_commands: impl IntoIterator<Item = WorkflowCommandType>,
-    ) -> Self {
-        Self {
-            from_state: None,
-            to_state: to_state.into(),
-            allowed_commands: allowed_commands.into_iter().collect(),
-        }
-    }
-
-    fn matches(&self, from_state: &str, to_state: &str) -> bool {
-        self.to_state == to_state
-            && self
-                .from_state
-                .as_deref()
-                .is_none_or(|rule_from| rule_from == from_state)
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TransitionAllowlist {
-    rules: Vec<TransitionRule>,
-}
-
 impl TransitionAllowlist {
-    pub fn new(rules: Vec<TransitionRule>) -> Self {
-        Self { rules }
-    }
-
-    pub fn allow(
-        mut self,
-        from_state: impl Into<String>,
-        to_state: impl Into<String>,
-        allowed_commands: impl IntoIterator<Item = WorkflowCommandType>,
-    ) -> Self {
-        self.rules
-            .push(TransitionRule::new(from_state, to_state, allowed_commands));
-        self
-    }
-
-    pub fn allow_from_any(
-        mut self,
-        to_state: impl Into<String>,
-        allowed_commands: impl IntoIterator<Item = WorkflowCommandType>,
-    ) -> Self {
-        self.rules
-            .push(TransitionRule::from_any(to_state, allowed_commands));
-        self
-    }
-
-    pub fn rule_for(&self, from_state: &str, to_state: &str) -> Option<&TransitionRule> {
-        self.rules
-            .iter()
-            .find(|rule| rule.matches(from_state, to_state))
-    }
-
-    pub fn rules(&self) -> impl Iterator<Item = &TransitionRule> {
-        self.rules.iter()
-    }
-
-    pub fn rules_from<'a>(
-        &'a self,
-        from_state: &'a str,
-    ) -> impl Iterator<Item = &'a TransitionRule> + 'a {
-        self.rules.iter().filter(move |rule| {
-            rule.from_state
-                .as_deref()
-                .is_none_or(|rule_from| rule_from == from_state)
-        })
-    }
-
     pub fn github_issue_pr_defaults() -> Self {
         use WorkflowCommandType::{
             BindPr, EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
@@ -397,6 +311,7 @@ pub enum WorkflowDecisionRejectionKind {
     InvalidDecisionContract,
     ProgressDriverMissing,
     MissingTerminalEvidence,
+    MissingRequiredEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,6 +346,8 @@ pub struct DecisionValidator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecisionValidatorKind {
     Generic,
+    Declarative,
+    DefinitionVersionMissing,
     GithubIssuePr,
     PromptTask,
 }
@@ -478,6 +395,26 @@ impl DecisionValidator {
             _ => DecisionValidatorKind::Generic,
         };
         Self { allowlist, kind }
+    }
+
+    pub(crate) fn for_declarative_definition(allowlist: TransitionAllowlist) -> Self {
+        Self {
+            allowlist,
+            kind: DecisionValidatorKind::Declarative,
+        }
+    }
+
+    pub(crate) fn definition_version_missing() -> Self {
+        Self {
+            allowlist: TransitionAllowlist::default().allow_from_any(
+                "blocked",
+                [
+                    WorkflowCommandType::MarkBlocked,
+                    WorkflowCommandType::RequestOperatorAttention,
+                ],
+            ),
+            kind: DecisionValidatorKind::DefinitionVersionMissing,
+        }
     }
 
     pub fn validate(
@@ -559,7 +496,11 @@ impl DecisionValidator {
             prompt_task_validation::validate_decision(decision)?;
         }
         self.validate_commands(rule, decision, context)?;
+        if self.kind == DecisionValidatorKind::DefinitionVersionMissing {
+            return declarative_validation::validate_definition_version_missing(decision);
+        }
         validator_progress::validate_target_progress_contract(instance, decision)?;
+        self.validate_required_evidence(rule, decision)?;
         self.validate_workflow_specific_rules(decision, context)
     }
 
@@ -570,7 +511,7 @@ impl DecisionValidator {
         self.allowlist.rules_from(from_state)
     }
 
-    fn validate_commands(
+    pub(super) fn validate_commands(
         &self,
         rule: &TransitionRule,
         decision: &WorkflowDecision,
@@ -649,6 +590,36 @@ impl DecisionValidator {
         Ok(())
     }
 
+    fn validate_required_evidence(
+        &self,
+        rule: &TransitionRule,
+        decision: &WorkflowDecision,
+    ) -> Result<(), WorkflowDecisionRejection> {
+        let present = decision
+            .evidence
+            .iter()
+            .map(|evidence| evidence.kind.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = rule
+            .required_evidence
+            .iter()
+            .filter(|kind| !present.contains(kind.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(WorkflowDecisionRejection::new(
+                WorkflowDecisionRejectionKind::MissingRequiredEvidence,
+                format!(
+                    "transition '{}' -> '{}' is missing required evidence kinds: {}",
+                    decision.observed_state,
+                    decision.next_state,
+                    missing.join(", ")
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_workflow_specific_rules(
         &self,
         decision: &WorkflowDecision,
@@ -662,6 +633,9 @@ impl DecisionValidator {
         {
             prompt_task_validation::validate_decision(decision)?;
         }
+        if self.kind == DecisionValidatorKind::Declarative {
+            declarative_validation::validate_decision(decision, context)?;
+        }
         Ok(())
     }
 
@@ -671,6 +645,11 @@ impl DecisionValidator {
         decision: &WorkflowDecision,
         context: &ValidationContext,
     ) -> Result<bool, WorkflowDecisionRejection> {
+        if self.kind == DecisionValidatorKind::Declarative
+            && declarative_validation::validate_retry(self, instance, decision, context)?
+        {
+            return Ok(true);
+        }
         if self.kind != DecisionValidatorKind::GithubIssuePr
             || !github_issue_pr_validation::is_reconciliation_only_pr_merge_done_transition(
                 decision,
