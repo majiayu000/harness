@@ -20,9 +20,16 @@ Related: GH-1609 (declarative definitions reuse the signal-mapping shape), GH-16
   `crates/harness-workflow/src/runtime/model.rs:679-683` (`ActivitySignal`),
   `model.rs:718-732` (`ActivityResult.signals`), `model.rs:76-91`
   (`WorkflowInstance.data` for persisted loop state).
-- Validator allowlist: `crates/harness-workflow/src/runtime/validator.rs:297`
-  (`prompt_task_defaults`) — currently no `implementing → implementing`
-  rule; selection at `reducer.rs:459`.
+- Validator contract:
+  `crates/harness-workflow/src/runtime/validator.rs:13-50`
+  (`TransitionRule`) matches only the from/to states and allowed command
+  types; it has no decision-name predicate. `prompt_task_defaults()` at
+  `validator.rs:297-323` already permits `implementing → implementing`
+  with `EnqueueActivity` or `Wait` at line 316, so that rule is broader
+  than this feature's intended continuation decision. Validator selection
+  remains at `reducer.rs:459`; workflow-specific validation currently
+  distinguishes only `GithubIssuePr` from `Generic` at
+  `validator.rs:425-456,613-621`.
 - Server submission path:
   `crates/harness-server/src/workflow_runtime_submission.rs:198` (calls
   `build_prompt_submission_decision`).
@@ -112,13 +119,32 @@ atomicity with the transition, B-004/B-009).
 
 ### Validator changes (`validator.rs`)
 
-`prompt_task_defaults()` gains:
+The state-only `TransitionRule` cannot express the required decision-level
+guard. Extend the existing workflow-specific validation path instead:
 
-- `implementing → implementing` allowed only for decision
-  `continue_prompt_task` with an `enqueue_activity` command present
-  (satisfies GH-1603 progress ownership: the self-transition always
-  carries its driver).
-- `implementing → blocked` for the three continuation-block decisions.
+1. Add `PromptTask` to `DecisionValidatorKind`; make
+   `DecisionValidator::prompt_task()` construct that kind rather than the
+   current generic validator.
+2. Route `PromptTask` through a dedicated
+   `validator_prompt_task.rs::validate_decision`, following the existing
+   `validator_github_issue_pr.rs` module boundary.
+3. For every `implementing → implementing` prompt-task decision, validate
+   fail closed: the decision ID must be exactly `continue_prompt_task`, and
+   it must contain exactly one `EnqueueActivity` command whose payload
+   names `implement_prompt`. Any other decision ID, a missing command, a
+   `Wait`-only command list, an enqueue for another activity, or multiple
+   enqueue commands is rejected before commit with a dedicated
+   `InvalidDecisionContract` rejection. Future self-loop decisions remain
+   rejected until explicitly added to this validator.
+4. Narrow the existing allowlist entry at `validator.rs:316` from
+   `[EnqueueActivity, Wait]` to `[EnqueueActivity]`; the workflow-specific
+   rule supplies the decision-name, exact-count, and activity-payload
+   constraints that the allowlist cannot represent.
+
+The three continuation block decisions continue to use the existing
+`allow_from_any("blocked", ...)` rule at `validator.rs:320`; the existing
+`required_command_for_transition` mapping at `validator.rs:723-736`
+requires `MarkBlocked`. No duplicate transition rule is added.
 
 ### Attempt context injection (harness-server)
 
@@ -169,7 +195,9 @@ scheduler.
 - Unit (`cargo test -p harness-workflow`): policy validation bounds
   (B-002); reducer branches — no policy, settled, continue, malformed
   signal, exhaustion, no-progress (B-001, B-004..B-008); validator
-  self-transition rules (driver command required).
+  self-transition contract. Named validator tests prove the positive
+  `continue_prompt_task` case and reject an arbitrary decision ID, no
+  command, `Wait` only, wrong activity, and multiple enqueue commands.
 - Persistence (`cargo test -p harness-workflow store`): counters and
   policy survive a store round-trip; attempt-scoped dedupe key idempotency
   (B-009).
@@ -194,7 +222,7 @@ reducer branch and validator rules; single-shot arm is restored verbatim.
 | B-001 | reducer no-policy branch | `cargo test -p harness-workflow prompt_task` (single-shot unchanged) |
 | B-002 | `PromptContinuationPolicy::validate` + submission | `cargo test -p harness-workflow prompt_task::policy` + `cargo test -p harness-server workflow_runtime_submission` |
 | B-003 | design-level (no tracker client added) | review gate: no new HTTP/tracker dependency in diff |
-| B-004 | continue branch + same-transaction command | `cargo test -p harness-workflow reducer::prompt_continuation` (decision carries enqueue command) |
+| B-004 | continue branch + same-transaction command + prompt-task decision validator | `cargo test -p harness-workflow reducer::prompt_continuation` and `cargo test -p harness-workflow prompt_task_validator` (only `continue_prompt_task` with exactly one `implement_prompt` enqueue self-loops) |
 | B-005 | settled branch reuses done path | `cargo test -p harness-workflow reducer::prompt_continuation` |
 | B-006 | malformed-signal branch | `cargo test -p harness-workflow reducer::prompt_continuation` (blocked, not done) |
 | B-007 | exhaustion branch | same module (attempt cap) |
