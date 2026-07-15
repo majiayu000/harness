@@ -84,6 +84,64 @@ pub struct WorkflowActivityPolicy {
     pub validation: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredProgressMode {
+    ExternalWait,
+    OperatorGate,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DeclaredState {
+    pub activity: Option<String>,
+    pub progress: Option<DeclaredProgressMode>,
+    pub on_success: Option<String>,
+    pub on_failure: Option<String>,
+    pub on_blocked: Option<String>,
+    pub on_signal: BTreeMap<String, String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowDefinitionPolicy {
+    pub id: String,
+    pub initial: String,
+    #[serde(default)]
+    pub states: BTreeMap<String, DeclaredState>,
+    #[serde(default)]
+    pub terminal: BTreeMap<String, String>,
+    #[serde(default)]
+    pub evidence_required: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub recovery_targets: Vec<String>,
+}
+impl WorkflowDefinitionPolicy {
+    fn validate_identifiers(&self) -> anyhow::Result<()> {
+        if self.id.trim().is_empty() {
+            anyhow::bail!("definition id must not be empty");
+        }
+        if self.initial.trim().is_empty() {
+            anyhow::bail!("definition initial state must not be empty");
+        }
+        for (name, state) in &self.states {
+            if name.trim().is_empty() {
+                anyhow::bail!("definition state name must not be empty");
+            }
+            if state
+                .activity
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                anyhow::bail!("definition state `{name}` activity must not be empty");
+            }
+            for signal_type in state.on_signal.keys() {
+                if signal_type.trim().is_empty() {
+                    anyhow::bail!("definition state `{name}` signal type must not be empty");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueWorkflowPolicy {
     #[serde(default = "default_force_execute_label")]
@@ -237,6 +295,8 @@ pub struct WorkflowMemoryPolicy {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkflowConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<WorkflowDefinitionPolicy>,
     #[serde(default)]
     pub workflow: WorkflowIdentityPolicy,
     #[serde(default)]
@@ -576,18 +636,26 @@ fn read_workflow_file(path: &Path) -> anyhow::Result<Option<(serde_yaml::Value, 
     Ok(Some((value, body.trim().to_string())))
 }
 
-/// Recursively merge `over` onto `base`. Mappings are merged key-by-key
-/// (recursing into nested mappings); a YAML `null` override keeps the base
-/// value; every other scalar/sequence override replaces the base value. This
-/// gives field-level override semantics for nested workflow policy.
+/// Recursively merge `over` onto `base`, except for an atomic root-level
+/// `definition`. A YAML `null` keeps the base; other non-mappings replace it.
 fn deep_merge_yaml(base: serde_yaml::Value, over: serde_yaml::Value) -> serde_yaml::Value {
+    deep_merge_yaml_at(base, over, true)
+}
+
+fn deep_merge_yaml_at(
+    base: serde_yaml::Value,
+    over: serde_yaml::Value,
+    root: bool,
+) -> serde_yaml::Value {
     use serde_yaml::Value;
     match (base, over) {
         (Value::Mapping(mut base_map), Value::Mapping(over_map)) => {
             for (key, over_value) in over_map {
-                let merged = match base_map.remove(&key) {
-                    Some(base_value) => deep_merge_yaml(base_value, over_value),
-                    None => over_value,
+                let atomic = root && key.as_str() == Some("definition") && !over_value.is_null();
+                let merged = match (atomic, base_map.remove(&key)) {
+                    (true, _) => over_value,
+                    (false, Some(base_value)) => deep_merge_yaml_at(base_value, over_value, false),
+                    (false, None) => over_value,
                 };
                 base_map.insert(key, merged);
             }
@@ -657,6 +725,9 @@ fn load_workflow_document_with_base(
             anyhow::anyhow!("failed to parse merged workflow front matter ({source_path}): {e}")
         })?,
     };
+    if let Some(definition) = &config.definition {
+        definition.validate_identifiers()?;
+    }
     config.runtime_dispatch.apply_default_activity_profiles();
     let defer_floor = config.runtime_dispatch.defer_backoff_secs;
     let defer_ceiling = config.runtime_dispatch.defer_backoff_max_secs;
