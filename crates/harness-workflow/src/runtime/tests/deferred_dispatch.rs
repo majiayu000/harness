@@ -6,6 +6,11 @@ fn test_dispatch_barrier(reason: &str) -> DispatchBarrierInput {
     )
 }
 
+fn postgres_timestamp_precision(value: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_micros(value.timestamp_micros())
+        .expect("valid PostgreSQL timestamp precision")
+}
+
 async fn claimed_deferred_test_command(
     store: &WorkflowRuntimeStore,
     suffix: &str,
@@ -324,7 +329,9 @@ async fn deferred_command_backoff_database() -> anyhow::Result<()> {
     let (_, command_id, first_claim) =
         claimed_deferred_test_command(&store, "backoff", "backoff-1").await?;
     let policy = DispatchBackoffPolicy::from_seconds(2, 5)?;
-    let first_now = Utc::now();
+    let first_now = Utc::now()
+        .with_nanosecond(123_456_789)
+        .expect("valid non-microsecond timestamp");
     let first = store
         .defer_claimed_command_if_owned(
             &command_id,
@@ -338,7 +345,10 @@ async fn deferred_command_backoff_database() -> anyhow::Result<()> {
     let DeferClaimedCommandOutcome::Deferred(first) = first else {
         panic!("first attempt should defer")
     };
-    assert_eq!(first.next_dispatch_at, first_now + Duration::seconds(2));
+    assert_eq!(
+        first.next_dispatch_at,
+        postgres_timestamp_precision(first_now + Duration::seconds(2))
+    );
     assert!(store
         .claim_pending_commands("too-early", Utc::now() + Duration::minutes(1), 10)
         .await?
@@ -353,7 +363,9 @@ async fn deferred_command_backoff_database() -> anyhow::Result<()> {
             .into_iter()
             .find(|record| record.id == command_id)
             .expect("due command should be reclaimed");
-        let now = Utc::now();
+        let now = Utc::now()
+            .with_nanosecond(123_456_789)
+            .expect("valid non-microsecond timestamp");
         let outcome = store
             .defer_claimed_command_if_owned(
                 &command_id,
@@ -368,7 +380,10 @@ async fn deferred_command_backoff_database() -> anyhow::Result<()> {
             panic!("due attempt should defer")
         };
         assert_eq!(barrier.attempt, attempt);
-        assert_eq!(barrier.next_dispatch_at, now + Duration::seconds(expected_delay));
+        assert_eq!(
+            barrier.next_dispatch_at,
+            postgres_timestamp_precision(now + Duration::seconds(expected_delay))
+        );
     }
     Ok(())
 }
