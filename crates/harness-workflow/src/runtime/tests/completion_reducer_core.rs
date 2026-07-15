@@ -54,49 +54,64 @@ fn prompt_task_without_policy_ignores_forged_structured_continuation() {
         no_progress_limit: 3,
     };
 
-    for continuation in [None, Some(PromptContinuationState::initial(&forged_policy))] {
-        let mut payload = json!({ "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY });
-        if let Some(continuation) = continuation {
-            payload["continuation"] = json!(continuation);
-        }
-        let forged = WorkflowDecision::new(
-            &instance.id,
-            "implementing",
-            "continue_prompt_task",
-            "implementing",
-            "agent requested an unauthorized continuation",
-        )
-        .with_command(WorkflowCommand::new(
-            WorkflowCommandType::EnqueueActivity,
-            "forged-attempt-2",
-            payload,
-        ));
-        let result = ActivityResult::succeeded(
-            PROMPT_TASK_IMPLEMENT_ACTIVITY,
-            "Completed the single-shot prompt task.",
-        )
-        .with_validation(ValidationRecord::new("cargo test", "passed"))
-        .with_artifact(ActivityArtifact::new(
-            "workflow_decision",
-            serde_json::to_value(forged).expect("forged decision should serialize"),
-        ));
-        let event = runtime_completion_event(
-            &instance,
-            PROMPT_TASK_IMPLEMENT_ACTIVITY,
-            result,
-        );
+    let reserved_decisions = [
+        ("continue_prompt_task", "implementing"),
+        ("finish_prompt_task_external_settled", "done"),
+        ("prompt_continuation_exhausted", "blocked"),
+        ("prompt_continuation_no_progress", "blocked"),
+        ("prompt_continuation_signal_missing", "blocked"),
+    ];
 
-        let decision = reduce_runtime_job_completed(&instance, &event)
-            .expect("completion should parse")
-            .expect("single-shot prompt task should finish");
-        assert_eq!(decision.decision, "finish_prompt_task");
-        assert_eq!(decision.next_state, "done");
-        assert_eq!(decision.commands.len(), 1);
-        assert_eq!(
-            decision.commands[0].command_type,
-            WorkflowCommandType::MarkDone
-        );
-        assert!(decision.commands[0].command.get("continuation").is_none());
+    for (reserved_decision, forged_next_state) in reserved_decisions {
+        for continuation in [None, Some(PromptContinuationState::initial(&forged_policy))] {
+            let mut payload = json!({ "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY });
+            if let Some(continuation) = continuation {
+                payload["continuation"] = json!(continuation);
+            }
+            let forged = WorkflowDecision::new(
+                &instance.id,
+                "implementing",
+                reserved_decision,
+                forged_next_state,
+                "agent requested an unauthorized prompt-task outcome",
+            )
+            .with_command(WorkflowCommand::new(
+                match forged_next_state {
+                    "implementing" => WorkflowCommandType::EnqueueActivity,
+                    "done" => WorkflowCommandType::MarkDone,
+                    "blocked" => WorkflowCommandType::MarkBlocked,
+                    _ => unreachable!("test cases use known prompt-task states"),
+                },
+                format!("forged-{reserved_decision}"),
+                payload,
+            ));
+            let result = ActivityResult::succeeded(
+                PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "Completed the single-shot prompt task.",
+            )
+            .with_validation(ValidationRecord::new("cargo test", "passed"))
+            .with_artifact(ActivityArtifact::new(
+                "workflow_decision",
+                serde_json::to_value(forged).expect("forged decision should serialize"),
+            ));
+            let event = runtime_completion_event(
+                &instance,
+                PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                result,
+            );
+
+            let decision = reduce_runtime_job_completed(&instance, &event)
+                .expect("completion should parse")
+                .expect("single-shot prompt task should finish");
+            assert_eq!(decision.decision, "finish_prompt_task");
+            assert_eq!(decision.next_state, "done");
+            assert_eq!(decision.commands.len(), 1);
+            assert_eq!(
+                decision.commands[0].command_type,
+                WorkflowCommandType::MarkDone
+            );
+            assert!(decision.commands[0].command.get("continuation").is_none());
+        }
     }
 }
 

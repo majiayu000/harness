@@ -448,10 +448,9 @@ fn structured_decision_validates(
     result: &ActivityResult,
     decision: &WorkflowDecision,
 ) -> bool {
-    if prompt_task_activity_matches(instance, result)
-        && (instance.data.get("continuation").is_some()
-            || decision.decision == "continue_prompt_task")
-    {
+    if prompt_task_activity_matches(instance, result) {
+        // Prompt-task outcomes are derived from the persisted policy and activity evidence.
+        // Agent-provided decisions must not override or bootstrap that runtime-owned state.
         return false;
     }
     if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
