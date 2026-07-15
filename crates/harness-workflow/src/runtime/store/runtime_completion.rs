@@ -7,7 +7,9 @@ use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowEvent,
     WorkflowEvidence, WorkflowInstance,
 };
-use crate::runtime::prompt_task::{PromptContinuationState, PROMPT_TASK_DEFINITION_ID};
+use crate::runtime::prompt_task::{
+    prompt_continuation_state_from_data, PromptContinuationState, PROMPT_TASK_DEFINITION_ID,
+};
 use crate::runtime::reducer::reduce_runtime_job_completed;
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
@@ -262,6 +264,14 @@ fn apply_prompt_continuation_side_effect(
     {
         return Ok(());
     }
+    let previous = prompt_continuation_state_from_data(&instance.data)
+        .map_err(anyhow::Error::msg)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "prompt continuation decision `{}` requires authoritative persisted continuation state",
+                decision.decision
+            )
+        })?;
     let continuation_values = decision
         .commands
         .iter()
@@ -276,6 +286,27 @@ fn apply_prompt_continuation_side_effect(
     let continuation: PromptContinuationState =
         serde_json::from_value(continuation_values[0].clone())?;
     continuation.policy.validate()?;
+    if continuation.policy != previous.policy {
+        anyhow::bail!(
+            "prompt continuation decision `{}` cannot replace the persisted policy",
+            decision.decision
+        );
+    }
+    let expected_attempt = if decision.decision == "continue_prompt_task" {
+        previous.attempt.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("prompt continuation attempt overflowed the persisted counter")
+        })?
+    } else {
+        previous.attempt
+    };
+    if continuation.attempt != expected_attempt {
+        anyhow::bail!(
+            "prompt continuation decision `{}` expected attempt {}, got {}",
+            decision.decision,
+            expected_attempt,
+            continuation.attempt
+        );
+    }
     if continuation.attempt == 0 || continuation.attempt > continuation.policy.max_attempts {
         anyhow::bail!(
             "prompt continuation decision `{}` has invalid attempt {}",

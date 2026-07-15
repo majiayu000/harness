@@ -448,7 +448,9 @@ fn structured_decision_validates(
     result: &ActivityResult,
     decision: &WorkflowDecision,
 ) -> bool {
-    if prompt_task_activity_matches(instance, result) && instance.data.get("continuation").is_some()
+    if prompt_task_activity_matches(instance, result)
+        && (instance.data.get("continuation").is_some()
+            || decision.decision == "continue_prompt_task")
     {
         return false;
     }

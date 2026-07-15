@@ -185,3 +185,133 @@ async fn cancelled_prompt_continuation_does_not_enqueue_another_attempt() -> any
         .all(|command| command.status != WorkflowCommandStatus::Pending));
     Ok(())
 }
+
+#[tokio::test]
+async fn prompt_continuation_exhaustion_and_malformed_signal_block_without_new_attempt(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = open_continuation_runtime_store(dir.path()).await?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+
+    let exhausted_task_id = TaskId::from_str("continuation-exhausted");
+    let exhausted_policy = continuation_policy(1);
+    let exhausted_submission = record_prompt_submission(
+        &store,
+        PromptSubmissionRuntimeContext {
+            project_root: &project_root,
+            task_id: &exhausted_task_id,
+            prompt: "Continue until the attempt bound is reached.",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: Some("dashboard"),
+            external_id: Some("TEAM-EXHAUSTED"),
+            continuation: Some(&exhausted_policy),
+        },
+    )
+    .await?;
+    let exhausted_initial = store
+        .commands_for(&exhausted_submission.workflow_id)
+        .await?;
+    let exhausted_result = ActivityResult::succeeded(
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "The subject is still active.",
+    )
+    .with_signal(ActivitySignal::new(
+        "external_state",
+        json!({ "state": "In Progress", "subject": "TEAM-EXHAUSTED" }),
+    ));
+    let exhausted = store
+        .commit_parent_runtime_completion(
+            &exhausted_submission.workflow_id,
+            "runtime-1",
+            json!({
+                "command_id": exhausted_initial[0].id,
+                "runtime_job_id": "continuation-exhausted-job",
+                "activity_result": exhausted_result,
+            }),
+        )
+        .await?
+        .expect("attempt exhaustion should produce a blocked decision");
+    assert!(exhausted.accepted);
+    assert_eq!(exhausted.decision.decision, "prompt_continuation_exhausted");
+    assert_eq!(exhausted.decision.next_state, "blocked");
+    assert!(exhausted
+        .decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "external_state"));
+    let exhausted_instance = store
+        .get_instance(&exhausted_submission.workflow_id)
+        .await?
+        .expect("exhausted instance");
+    assert_eq!(exhausted_instance.state, "blocked");
+    assert!(store
+        .commands_for(&exhausted_submission.workflow_id)
+        .await?
+        .iter()
+        .all(|command| !command.command.dedupe_key.ends_with(":attempt:2")));
+
+    let malformed_task_id = TaskId::from_str("continuation-malformed");
+    let malformed_policy = continuation_policy(4);
+    let malformed_submission = record_prompt_submission(
+        &store,
+        PromptSubmissionRuntimeContext {
+            project_root: &project_root,
+            task_id: &malformed_task_id,
+            prompt: "Block if the external-state contract is missing.",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: Some("dashboard"),
+            external_id: Some("TEAM-MALFORMED"),
+            continuation: Some(&malformed_policy),
+        },
+    )
+    .await?;
+    let malformed_initial = store
+        .commands_for(&malformed_submission.workflow_id)
+        .await?;
+    let malformed_result = ActivityResult::succeeded(
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "No structured external state was reported.",
+    );
+    let malformed = store
+        .commit_parent_runtime_completion(
+            &malformed_submission.workflow_id,
+            "runtime-1",
+            json!({
+                "command_id": malformed_initial[0].id,
+                "runtime_job_id": "continuation-malformed-job",
+                "activity_result": malformed_result,
+            }),
+        )
+        .await?
+        .expect("malformed signal should produce a blocked decision");
+    assert!(malformed.accepted);
+    assert_eq!(
+        malformed.decision.decision,
+        "prompt_continuation_signal_missing"
+    );
+    assert_eq!(malformed.decision.next_state, "blocked");
+    assert!(malformed
+        .decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "external_state"));
+    let malformed_instance = store
+        .get_instance(&malformed_submission.workflow_id)
+        .await?
+        .expect("malformed instance");
+    assert_eq!(malformed_instance.state, "blocked");
+    assert!(store
+        .commands_for(&malformed_submission.workflow_id)
+        .await?
+        .iter()
+        .all(|command| !command.command.dedupe_key.ends_with(":attempt:2")));
+    Ok(())
+}
