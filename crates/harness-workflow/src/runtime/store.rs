@@ -1,3 +1,6 @@
+use super::command_record::{
+    from_row as workflow_command_record_from_row, WorkflowCommandRecordRow,
+};
 use super::errors::RuntimeJobNotFoundError;
 use super::model::{
     ActivityResult, ActivityStatus, RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind,
@@ -149,17 +152,6 @@ pub struct WorkflowRejectedDecisionTransition<'a> {
     pub decision: &'a WorkflowDecision,
     pub reason: &'a str,
 }
-type WorkflowCommandRecordRow = (
-    String,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    Option<DateTime<Utc>>,
-    String,
-    DateTime<Utc>,
-    DateTime<Utc>,
-);
 type RuntimeEventSummaryRow = (
     String,
     i64,
@@ -196,32 +188,6 @@ pub struct RuntimeActivityCompletion {
     pub workflow_event: Option<WorkflowEvent>,
     pub decision: Option<WorkflowDecisionRecord>,
 }
-fn workflow_command_record_from_row(
-    (
-        id,
-        workflow_id,
-        decision_id,
-        status,
-        dispatch_owner,
-        dispatch_lease_expires_at,
-        data,
-        created_at,
-        updated_at,
-    ): WorkflowCommandRecordRow,
-) -> anyhow::Result<WorkflowCommandRecord> {
-    Ok(WorkflowCommandRecord {
-        id,
-        workflow_id,
-        decision_id,
-        status: WorkflowCommandStatus::try_from(status.as_str())?,
-        dispatch_owner,
-        dispatch_lease_expires_at,
-        command: serde_json::from_str(&data)?,
-        created_at,
-        updated_at,
-    })
-}
-
 fn workflow_instance_from_row(
     data: String,
     updated_at: DateTime<Utc>,
@@ -642,7 +608,9 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
-                    dispatch_lease_expires_at, data::text, created_at, updated_at
+                    dispatch_lease_expires_at, dispatch_not_before,
+                    dispatch_attempt_count, dispatch_claim_generation,
+                    dispatch_barrier::text, data::text, created_at, updated_at
                  FROM workflow_commands
                  WHERE workflow_id = $1
                  ORDER BY created_at ASC",
@@ -664,7 +632,9 @@ impl WorkflowRuntimeStore {
         }
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
-                    dispatch_lease_expires_at, data::text, created_at, updated_at
+                    dispatch_lease_expires_at, dispatch_not_before,
+                    dispatch_attempt_count, dispatch_claim_generation,
+                    dispatch_barrier::text, data::text, created_at, updated_at
              FROM workflow_commands
              WHERE workflow_id = ANY($1::text[])
              ORDER BY workflow_id ASC, created_at ASC",
@@ -694,12 +664,18 @@ impl WorkflowRuntimeStore {
         let per_workflow_limit = per_workflow_limit.clamp(1, 50);
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT command.id, command.workflow_id, command.decision_id, command.status,
-                    command.dispatch_owner, command.dispatch_lease_expires_at, command.data,
+                    command.dispatch_owner, command.dispatch_lease_expires_at,
+                    command.dispatch_not_before, command.dispatch_attempt_count,
+                    command.dispatch_claim_generation, command.dispatch_barrier,
+                    command.data,
                     command.created_at, command.updated_at
              FROM unnest($1::text[]) AS selected(workflow_id)
              JOIN LATERAL (
                  SELECT id, workflow_id, decision_id, status, dispatch_owner,
-                        dispatch_lease_expires_at, data::text AS data, created_at, updated_at
+                        dispatch_lease_expires_at, dispatch_not_before,
+                        dispatch_attempt_count, dispatch_claim_generation,
+                        dispatch_barrier::text AS dispatch_barrier,
+                        data::text AS data, created_at, updated_at
                  FROM workflow_commands
                  WHERE workflow_id = selected.workflow_id
                  ORDER BY created_at DESC
@@ -728,7 +704,9 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Option<WorkflowCommandRecord>> {
         let row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
-                    dispatch_lease_expires_at, data::text, created_at, updated_at
+                    dispatch_lease_expires_at, dispatch_not_before,
+                    dispatch_attempt_count, dispatch_claim_generation,
+                    dispatch_barrier::text, data::text, created_at, updated_at
              FROM workflow_commands
              WHERE id = $1",
         )
@@ -743,6 +721,8 @@ impl WorkflowRuntimeStore {
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT command.id, command.workflow_id, command.decision_id, command.status,
                     command.dispatch_owner, command.dispatch_lease_expires_at,
+                    command.dispatch_not_before, command.dispatch_attempt_count,
+                    command.dispatch_claim_generation, command.dispatch_barrier::text,
                     command.data::text, command.created_at, command.updated_at
              FROM workflow_commands AS command
              JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
@@ -789,6 +769,8 @@ impl WorkflowRuntimeStore {
              WHERE command.id = candidates.id
              RETURNING command.id, command.workflow_id, command.decision_id, command.status,
                        command.dispatch_owner, command.dispatch_lease_expires_at,
+                       command.dispatch_not_before, command.dispatch_attempt_count,
+                       command.dispatch_claim_generation, command.dispatch_barrier::text,
                        command.data::text, command.created_at, command.updated_at",
         )
         .bind(owner)
@@ -1302,7 +1284,9 @@ impl WorkflowRuntimeStore {
         };
         let command_row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
-                    dispatch_lease_expires_at, data::text, created_at, updated_at
+                    dispatch_lease_expires_at, dispatch_not_before,
+                    dispatch_attempt_count, dispatch_claim_generation,
+                    dispatch_barrier::text, data::text, created_at, updated_at
              FROM workflow_commands
              WHERE id = $1
              FOR UPDATE",

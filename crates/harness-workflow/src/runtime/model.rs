@@ -1,9 +1,10 @@
-use super::status::WorkflowCommandStatus;
 use super::terminal_state::{workflow_terminal_state, WorkflowTerminalState};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+pub use super::command_record::WorkflowCommandRecord;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowDefinition {
@@ -324,22 +325,6 @@ impl WorkflowCommand {
         self.activity_name()
             .unwrap_or_else(|| self.command_type.as_str())
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct WorkflowCommandRecord {
-    pub id: String,
-    pub workflow_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decision_id: Option<String>,
-    pub status: WorkflowCommandStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatch_owner: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatch_lease_expires_at: Option<DateTime<Utc>>,
-    pub command: WorkflowCommand,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
