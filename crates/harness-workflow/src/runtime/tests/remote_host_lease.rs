@@ -207,7 +207,7 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
             .renew_remote_host_runtime_job_lease(renewal(
                 &claimed,
                 "host-a",
-                original_expiry,
+                short_target_expiry,
                 extended_id,
                 120,
                 now,
