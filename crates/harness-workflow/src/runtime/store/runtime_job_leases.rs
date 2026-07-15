@@ -1,6 +1,6 @@
 use super::{enum_str, to_jsonb_string, WorkflowRuntimeStore};
 use crate::runtime::model::{RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind};
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Timelike, Utc};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
@@ -66,6 +66,21 @@ pub struct RuntimeJobLeaseRenewalRequest<'a> {
 
 type ReceiptRow = (String, DateTime<Utc>, DateTime<Utc>, i64);
 
+pub fn postgres_timestamp_floor(value: DateTime<Utc>) -> DateTime<Utc> {
+    let microsecond_nanos = value.nanosecond() / 1_000 * 1_000;
+    value.with_nanosecond(microsecond_nanos).unwrap_or(value)
+}
+
+pub fn postgres_timestamp_ceil(value: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let remainder = value.nanosecond() % 1_000;
+    if remainder == 0 {
+        return Some(value);
+    }
+    value
+        .checked_add_signed(TimeDelta::nanoseconds(i64::from(1_000 - remainder)))
+        .map(postgres_timestamp_floor)
+}
+
 impl WorkflowRuntimeStore {
     pub async fn renew_remote_host_runtime_job_lease(
         &self,
@@ -82,6 +97,7 @@ impl WorkflowRuntimeStore {
             return Ok(RuntimeJobLeaseRenewalOutcome::NotFound);
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        let request_previous_expires_at = postgres_timestamp_floor(request.previous_expires_at);
 
         sqlx::query(
             "DELETE FROM runtime_job_lease_renewal_receipts
@@ -139,7 +155,7 @@ impl WorkflowRuntimeStore {
         .await?;
         if let Some((owner, previous_expires_at, renewed_expires_at, lease_secs)) = receipt {
             if owner != request.owner
-                || previous_expires_at != request.previous_expires_at
+                || previous_expires_at != request_previous_expires_at
                 || lease_secs != request.lease_secs
             {
                 return reject_renewal_tx(
@@ -160,7 +176,7 @@ impl WorkflowRuntimeStore {
         let Some(current_expires_at) = job.lease.as_ref().map(|lease| lease.expires_at) else {
             return reject_renewal_tx(tx, &request, RuntimeJobLeaseRenewalRejection::Revoked).await;
         };
-        if current_expires_at != request.previous_expires_at {
+        if postgres_timestamp_floor(current_expires_at) != request_previous_expires_at {
             return reject_renewal_tx(tx, &request, RuntimeJobLeaseRenewalRejection::StaleExpiry)
                 .await;
         }
@@ -180,7 +196,11 @@ impl WorkflowRuntimeStore {
             )
             .await;
         };
-        let Some(max_expires_at) = request.now.checked_add_signed(max_duration) else {
+        let Some(max_expires_at) = request
+            .now
+            .checked_add_signed(max_duration)
+            .and_then(postgres_timestamp_ceil)
+        else {
             return reject_renewal_tx(
                 tx,
                 &request,
@@ -188,7 +208,16 @@ impl WorkflowRuntimeStore {
             )
             .await;
         };
-        if current_expires_at > max_expires_at {
+        let Some(normalized_current_expires_at) = postgres_timestamp_ceil(current_expires_at)
+        else {
+            return reject_renewal_tx(
+                tx,
+                &request,
+                RuntimeJobLeaseRenewalRejection::InvariantViolation,
+            )
+            .await;
+        };
+        if normalized_current_expires_at > max_expires_at {
             return reject_renewal_tx(
                 tx,
                 &request,
@@ -204,7 +233,11 @@ impl WorkflowRuntimeStore {
             )
             .await;
         };
-        let Some(target_expires_at) = request.now.checked_add_signed(target_duration) else {
+        let Some(target_expires_at) = request
+            .now
+            .checked_add_signed(target_duration)
+            .and_then(postgres_timestamp_ceil)
+        else {
             return reject_renewal_tx(
                 tx,
                 &request,
@@ -212,7 +245,7 @@ impl WorkflowRuntimeStore {
             )
             .await;
         };
-        let renewed_expires_at = current_expires_at.max(target_expires_at);
+        let renewed_expires_at = normalized_current_expires_at.max(target_expires_at);
         job.renew_lease(request.owner, renewed_expires_at);
         job.updated_at = request.now;
         let updated = to_jsonb_string(&job)?;
@@ -239,7 +272,7 @@ impl WorkflowRuntimeStore {
         .bind(request.renewal_id)
         .bind(request.owner)
         .bind(generation)
-        .bind(request.previous_expires_at)
+        .bind(request_previous_expires_at)
         .bind(renewed_expires_at)
         .bind(request.lease_secs)
         .bind(request.now)
@@ -252,7 +285,7 @@ impl WorkflowRuntimeStore {
             json!({
                 "owner": request.owner,
                 "lease_generation": request.lease_generation,
-                "previous_expires_at": request.previous_expires_at,
+                "previous_expires_at": request_previous_expires_at,
                 "lease_expires_at": renewed_expires_at,
                 "lease_secs": request.lease_secs,
                 "renewal_id": request.renewal_id,

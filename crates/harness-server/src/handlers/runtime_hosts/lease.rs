@@ -7,7 +7,7 @@ use axum::{
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use harness_workflow::runtime::store::runtime_job_leases::{
-    RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRequest,
+    postgres_timestamp_ceil, RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -138,6 +138,7 @@ fn runtime_host_lease_expires_at_at(
     let lease_secs = validated_runtime_host_lease_secs(lease_secs)?;
     let duration = TimeDelta::try_seconds(lease_secs).ok_or_else(invalid_duration_response)?;
     now.checked_add_signed(duration)
+        .and_then(postgres_timestamp_ceil)
         .ok_or_else(invalid_duration_response)
 }
 
@@ -198,6 +199,22 @@ mod tests {
                 .expect("maximum duration must be valid"),
             now + TimeDelta::seconds(3600)
         );
+    }
+
+    #[test]
+    fn runtime_job_lease_duration_ceils_submicrosecond_server_time() {
+        use chrono::Timelike;
+
+        let now = DateTime::parse_from_rfc3339("2026-07-16T00:00:00.123456789Z")
+            .expect("fixed timestamp must parse")
+            .to_utc();
+        let raw_expiry = now + TimeDelta::seconds(60);
+        let expiry = runtime_host_lease_expires_at_at(now, Some(60))
+            .expect("normalized duration must be valid");
+
+        assert!(expiry >= raw_expiry);
+        assert!(expiry - raw_expiry < TimeDelta::microseconds(1));
+        assert_eq!(expiry.nanosecond() % 1_000, 0);
     }
 
     #[test]
