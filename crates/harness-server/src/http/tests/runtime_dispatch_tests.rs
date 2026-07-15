@@ -92,7 +92,8 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
 }
 
 #[tokio::test]
-async fn runtime_command_dispatch_tick_refuses_unavailable_isolation_tier() -> anyhow::Result<()> {
+async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fallback(
+) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
@@ -163,20 +164,35 @@ async fn runtime_command_dispatch_tick_refuses_unavailable_isolation_tier() -> a
 
     assert_eq!(tick.enqueued, 0);
     assert_eq!(tick.already_dispatched, 0);
-    assert_eq!(tick.skipped, 1);
+    assert_eq!(tick.deferred, 1);
+    assert_eq!(tick.skipped, 0);
     assert!(store
         .runtime_jobs_for_command(&command_id)
         .await?
         .is_empty());
-    assert_eq!(store.commands_for(&workflow.id).await?[0].status, "failed");
+    let persisted = &store.commands_for(&workflow.id).await?[0];
+    assert_eq!(persisted.status, "deferred");
+    assert_eq!(persisted.dispatch_attempt_count, 1);
+    assert_eq!(persisted.dispatch_claim_generation, 1);
+    assert!(persisted.dispatch_not_before.is_some());
+    let barrier = persisted
+        .dispatch_barrier
+        .as_ref()
+        .expect("isolation barrier should be persisted");
+    assert_eq!(barrier.reason_code.as_str(), "isolation_tier_unavailable");
+    assert_eq!(barrier.required_tier.as_deref(), Some("container"));
+    assert_eq!(barrier.trust_class.as_deref(), Some("non_collaborator"));
     let events = store.events_for(&workflow.id).await?;
     let event = events
         .iter()
-        .find(|event| event.event_type == "WorkflowRuntimeIsolationUnavailable")
-        .expect("isolation refusal event should be recorded");
-    assert_eq!(event.event["command_id"], command_id);
-    assert_eq!(event.event["tier"], "container");
-    assert!(event.event["reason"]
+        .find(|event| event.event_type == "WorkflowRuntimeDispatchDeferred")
+        .expect("atomic dispatch deferral event should be recorded");
+    assert_eq!(event.event["dispatch_barrier"]["command_id"], command_id);
+    assert_eq!(
+        event.event["dispatch_barrier"]["required_tier"],
+        "container"
+    );
+    assert!(event.event["dispatch_barrier"]["reason"]
         .as_str()
         .expect("reason should be a string")
         .contains("docker missing"));
@@ -184,8 +200,7 @@ async fn runtime_command_dispatch_tick_refuses_unavailable_isolation_tier() -> a
 }
 
 #[tokio::test]
-async fn runtime_command_dispatch_tick_fails_command_when_workflow_config_is_malformed(
-) -> anyhow::Result<()> {
+async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
@@ -232,19 +247,36 @@ async fn runtime_command_dispatch_tick_fails_command_when_workflow_config_is_mal
 
     assert_eq!(tick.enqueued, 0);
     assert_eq!(tick.already_dispatched, 0);
-    assert_eq!(tick.skipped, 1);
+    assert_eq!(tick.deferred, 1);
+    assert_eq!(tick.skipped, 0);
     assert!(store
         .runtime_jobs_for_command(&command_id)
         .await?
         .is_empty());
-    assert_eq!(store.commands_for(&workflow.id).await?[0].status, "failed");
+    let persisted = &store.commands_for(&workflow.id).await?[0];
+    assert_eq!(persisted.status, "deferred");
+    assert_eq!(persisted.dispatch_attempt_count, 1);
+    assert_eq!(persisted.dispatch_claim_generation, 1);
+    assert!(persisted.dispatch_not_before.is_some());
+    assert_eq!(
+        persisted
+            .dispatch_barrier
+            .as_ref()
+            .expect("config barrier should be persisted")
+            .reason_code
+            .as_str(),
+        "workflow_config_invalid"
+    );
     let events = store.events_for(&workflow.id).await?;
     let config_event = events
         .iter()
-        .find(|event| event.event_type == "WorkflowRuntimeConfigError")
-        .expect("config error event should be recorded");
-    assert_eq!(config_event.event["command_id"], command_id);
-    assert!(config_event.event["reason"]
+        .find(|event| event.event_type == "WorkflowRuntimeDispatchDeferred")
+        .expect("atomic config deferral event should be recorded");
+    assert_eq!(
+        config_event.event["dispatch_barrier"]["command_id"],
+        command_id
+    );
+    assert!(config_event.event["dispatch_barrier"]["reason"]
         .as_str()
         .expect("reason should be a string")
         .contains("failed to load WORKFLOW.md"));
@@ -631,7 +663,7 @@ async fn runtime_command_dispatch_tick_uses_command_project_policy_when_server_r
 }
 
 #[tokio::test]
-async fn runtime_command_dispatch_tick_skips_when_command_project_runtime_disabled(
+async fn runtime_command_dispatch_tick_defers_disabled_policy_without_agent_metrics(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -679,12 +711,25 @@ async fn runtime_command_dispatch_tick_skips_when_command_project_runtime_disabl
 
     assert_eq!(tick.enqueued, 0);
     assert_eq!(tick.already_dispatched, 0);
-    assert_eq!(tick.skipped, 1);
+    assert_eq!(tick.deferred, 1);
+    assert_eq!(tick.skipped, 0);
     assert!(store
         .runtime_jobs_for_command(&command_id)
         .await?
         .is_empty());
-    assert_eq!(store.commands_for(&workflow.id).await?[0].status, "skipped");
+    let persisted = &store.commands_for(&workflow.id).await?[0];
+    assert_eq!(persisted.status, "deferred");
+    assert_eq!(persisted.dispatch_attempt_count, 1);
+    assert_eq!(persisted.dispatch_claim_generation, 1);
+    assert_eq!(
+        persisted
+            .dispatch_barrier
+            .as_ref()
+            .expect("policy barrier should be persisted")
+            .reason_code
+            .as_str(),
+        "runtime_policy_disabled"
+    );
     assert!(state.intake.github_token_dispatch_snapshot().is_empty());
     Ok(())
 }

@@ -7,6 +7,15 @@ pub struct DispatchBackoffPolicy {
     ceiling: chrono::Duration,
 }
 
+impl Default for DispatchBackoffPolicy {
+    fn default() -> Self {
+        Self {
+            floor: chrono::Duration::seconds(30),
+            ceiling: chrono::Duration::minutes(15),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchClaim<'a> {
     pub owner: &'a str,

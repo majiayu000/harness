@@ -142,6 +142,7 @@ async fn cancel_submission_instance(
             command.status,
             WorkflowCommandStatus::Pending
                 | WorkflowCommandStatus::Dispatching
+                | WorkflowCommandStatus::Deferred
                 | WorkflowCommandStatus::Dispatched
         ) {
             store

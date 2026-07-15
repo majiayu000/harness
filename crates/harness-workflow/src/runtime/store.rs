@@ -806,6 +806,8 @@ impl WorkflowRuntimeStore {
              SET status = $1,
                  dispatch_owner = NULL,
                  dispatch_lease_expires_at = NULL,
+                 dispatch_not_before = NULL,
+                 dispatch_barrier = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $2",
         )
@@ -1295,7 +1297,7 @@ impl WorkflowRuntimeStore {
                      WHERE workflow_id = $1
                        AND id <> $2
                        AND command_type = $3
-                       AND status IN ($4, $5, $6)",
+                       AND status IN ($4, $5, $6, $7)",
                 )
                 .bind(&command.workflow_id)
                 .bind(&command.id)
@@ -1303,6 +1305,7 @@ impl WorkflowRuntimeStore {
                 .bind(WorkflowCommandStatus::Pending.as_str())
                 .bind(WorkflowCommandStatus::Dispatching.as_str())
                 .bind(WorkflowCommandStatus::Dispatched.as_str())
+                .bind(WorkflowCommandStatus::Deferred.as_str())
                 .fetch_one(&mut *tx)
                 .await?;
                 count as usize
@@ -1631,15 +1634,18 @@ impl WorkflowRuntimeStore {
              SET status = $2,
                  dispatch_owner = NULL,
                  dispatch_lease_expires_at = NULL,
+                 dispatch_not_before = NULL,
+                 dispatch_barrier = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $1
-               AND status IN ($3, $4, $5)",
+               AND status IN ($3, $4, $5, $6)",
         )
         .bind(command_id)
         .bind(WorkflowCommandStatus::Cancelled.as_str())
         .bind(WorkflowCommandStatus::Pending.as_str())
         .bind(WorkflowCommandStatus::Dispatching.as_str())
         .bind(WorkflowCommandStatus::Dispatched.as_str())
+        .bind(WorkflowCommandStatus::Deferred.as_str())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

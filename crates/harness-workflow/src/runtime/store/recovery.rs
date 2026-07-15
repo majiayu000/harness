@@ -389,12 +389,13 @@ async fn skip_superseded_active_commands_tx(
     workflow_id: &str,
 ) -> anyhow::Result<(u64, u64)> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id, status, data::text FROM workflow_commands WHERE workflow_id = $1 AND status IN ($2, $3, $4) FOR UPDATE",
+        "SELECT id, status, data::text FROM workflow_commands WHERE workflow_id = $1 AND status IN ($2, $3, $4, $5) FOR UPDATE",
     )
     .bind(workflow_id)
     .bind(WorkflowCommandStatus::Pending.as_str())
     .bind(WorkflowCommandStatus::Dispatching.as_str())
     .bind(WorkflowCommandStatus::Dispatched.as_str())
+    .bind(WorkflowCommandStatus::Deferred.as_str())
     .fetch_all(&mut **tx)
     .await?;
 
@@ -414,7 +415,9 @@ async fn skip_superseded_active_commands_tx(
             WorkflowCommandStatus::Skipped
         };
         sqlx::query(
-            "UPDATE workflow_commands SET status = $2, dispatch_owner = NULL, dispatch_lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+            "UPDATE workflow_commands SET status = $2, dispatch_owner = NULL,
+                dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,
+                dispatch_barrier = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
         )
         .bind(command_id)
         .bind(next_status.as_str())
