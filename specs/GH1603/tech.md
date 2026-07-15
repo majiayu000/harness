@@ -16,6 +16,7 @@ See [`product.md`](product.md).
 | State registry | `crates/harness-workflow/src/runtime/state_registry.rs:21` | `WorkflowStateDefinition` records only state identity and optional terminal classification; the four definition tables begin at lines 60, 92, 114, and 135. |
 | Transition policy | `crates/harness-workflow/src/runtime/validator.rs:13` | `TransitionRule` records allowed commands, but not whether a target requires a progress driver. Several command-driven transitions are declared at lines 127-191. |
 | Command validation | `crates/harness-workflow/src/runtime/validator.rs:541` | Existing commands are validated individually; `required_command_for_transition` at lines 723-737 covers selected PR/batch/terminal transitions rather than all command-driven states. |
+| Command provenance | `crates/harness-workflow/src/runtime/model.rs:329` | `WorkflowCommandRecord.decision_id` identifies the creating decision; the runtime tables persist that link in `store_migrations.rs:41-72`, and accepted completion commands receive the new record id in `store/runtime_completion.rs:90-103`. |
 | Agent decision ingestion | `crates/harness-workflow/src/runtime/reducer.rs:414` | A `workflow_decision` artifact is deserialized and accepted when the definition validator returns success at lines 455-468. |
 | Atomic completion | `crates/harness-workflow/src/runtime/store/runtime_completion.rs:59` | Accepted follow-up commands are inserted at lines 90-101 and the next state is persisted at lines 102-104; an accepted empty list therefore creates no outbox work. |
 | Historical diagnostics | `crates/harness-workflow/src/runtime/store/instances.rs:458` | The current store can list aged instances for a caller-supplied state list, but it does not classify driverless command-driven instances. |
@@ -39,6 +40,13 @@ Enumerate the mode for every state in all four definition tables. Expose a looku
 helper beside `workflow_state_definition`; unknown definitions/states return no
 contract and fail validation. Keep the enum internal to the workflow crate unless
 the operator projection needs a serialized display value.
+
+The exhaustive assignment is the Authoritative Progress Ownership Matrix in
+`product.md`; implementation must encode that matrix directly. In particular,
+`quality_gate.pending` and `pr_feedback.pending` are command-driven bootstrap states,
+the three PR-feedback result states are parent handoffs, and the two definitions'
+`blocked` states are operator gates. An allowlist accepting `Wait` or an empty command
+list does not change a state's mode.
 
 ### 2. Validate the target's driver contract
 
@@ -68,10 +76,22 @@ artifact/reason to the blocked outcome so the two decisions are not conflated.
 
 ### 4. Detect historical violations
 
-Add a read-only store query for registered `CommandDriven` instances that have no
-active workflow command (`pending`, `dispatching`, or `dispatched`) and no unfinished
-runtime job. Use `NOT EXISTS` predicates inside one snapshot query to avoid a
-commands/jobs observation race. Bound and order results by age and id.
+Add a read-only store query for registered `CommandDriven` instances. For each row,
+derive state-entry provenance from the newest accepted workflow decision, ordered by
+persisted decision creation order: it must name the instance's current state as
+`decision.next_state`. A missing newest accepted decision, or one whose target does
+not match the persisted current state, is `missing_state_entry_provenance` and is
+reported conservatively.
+
+Only a runtime-job-producing command whose `workflow_commands.decision_id` equals
+that state-entry decision id may prove ownership. The command must be active
+(`pending`, `dispatching`, or `dispatched`) or have an unfinished joined runtime job
+(`pending` or `running`). Commands linked to rejected/older decisions, commands with
+`decision_id IS NULL`, jobs reached through those commands, terminal work, and rows
+that merely share workflow id, command type, activity, or dedupe key do not count.
+This also makes a dedupe conflict that retained an older `decision_id` visible rather
+than healthy. Use decision-scoped `NOT EXISTS` predicates inside one snapshot query
+to avoid a commands/jobs observation race. Bound and order results by age and id.
 
 Surface these rows through the existing operator-monitor/watchdog evidence path with
 workflow id, definition, state, age, and a stable classification such as
@@ -81,10 +101,16 @@ enforce new decisions, because validation is the correctness boundary.
 
 ### 5. Exhaustive contract tests
 
-Extend the registry completeness test to enumerate every allowlist target and assert
-that it has either terminal metadata or exactly one progress mode. Add table-driven
-validator tests across the four definitions, reducer tests for structured agent
-output, store transaction tests, recovery tests, and operator diagnostic tests.
+Extend the registry completeness test to enumerate every registry entry and
+allowlist source/target and assert that it has either terminal metadata or exactly
+one progress mode. Add a table-driven semantic fixture that reproduces every row in
+the product matrix and proves that the named owner/wake path is real: eligible
+command family for `CommandDriven`, registered observer and selector for
+`ExternalWait`, callable authorized action for `OperatorGate`, and recorded parent
+identity plus propagation hook for `ParentHandoff`. A nonempty enum value alone is
+not sufficient. Add validator tests across the four definitions, reducer tests for
+structured agent output, store transaction tests, recovery tests, and provenance-
+aware operator diagnostic tests.
 
 ## Data Flow
 
@@ -97,7 +123,8 @@ activity/submission/recovery decision
   -> rejected: auditable reason; requested state/outbox unchanged
 
 existing workflow rows
-  -> read-only NOT EXISTS command/job diagnostic
+  -> newest accepted current-state-entry decision
+  -> decision_id-scoped NOT EXISTS command/job diagnostic
   -> bounded operator evidence + error log
   -> explicit existing recovery API when an operator chooses
 ```
@@ -117,8 +144,9 @@ workflow, command, and runtime-job tables.
 | B-006 recovery cannot bypass the contract | recovery validator/store tests | `cargo test -p harness-workflow runtime_recovery_requires_progress_driver -- --nocapture` |
 | B-007 rejection is atomic and auditable | `store/runtime_completion.rs` DB transaction tests | `cargo test -p harness-workflow driverless_completion_is_rejected_atomically -- --nocapture` |
 | B-008 concurrency/replay cannot borrow stale work | validator dedupe + DB snapshot tests | `cargo test -p harness-workflow stale_active_work_does_not_satisfy_progress -- --nocapture` |
-| B-009 historical rows are reported, not mutated | store diagnostic + operator monitor tests | `cargo test -p harness-server driverless_progress -- --nocapture` |
+| B-009 historical rows use current-state-entry provenance and are reported, not mutated | store diagnostic + operator monitor tests, including older/null/unrelated `decision_id` fixtures | `cargo test -p harness-server driverless_progress -- --nocapture` |
 | B-010 allowlist/registry completeness | exhaustive registry test | `cargo test -p harness-workflow registry_covers_validator_transition_states -- --nocapture` |
+| B-011 every mode has its declared executable wake path | registry semantic matrix plus observer/action/propagation tests | `cargo test -p harness-workflow progress_mode_semantics -- --nocapture` and `cargo test -p harness-server progress_wake_paths -- --nocapture` |
 
 ## Alternatives Considered
 
@@ -153,18 +181,22 @@ workflow, command, and runtime-job tables.
 
 ## Test Plan
 
-- [ ] Unit: progress-mode lookup, all-state completeness, missing/empty command
-      equivalence, driver/non-driver matrix, unknown definition/state fail-closed.
+- [ ] Unit: progress-mode lookup, all-state completeness, exact authoritative matrix,
+      missing/empty command equivalence, driver/non-driver matrix, unknown
+      definition/state fail-closed.
 - [ ] Unit: positive external-wait, operator-gate, parent-handoff, and terminal
-      transition matrix across all four definitions.
+      transition matrix across all four definitions; each row proves the named
+      observer, authorized action, or propagation hook rather than only enum shape.
 - [ ] Unit: structured `workflow_decision` with `implementing -> replanning` and no
       driver is rejected or converted into an auditable blocked policy decision.
 - [ ] Integration: runtime completion rejection preserves instance state/version,
       inserts no requested command/job, and persists the rejection reason.
 - [ ] Integration: recovery/replay with no driver is rejected even for an authorized
       actor; a valid driver succeeds exactly once.
-- [ ] Integration: historical diagnostic returns only command-driven rows with no
-      active command/unfinished job and does not mutate them.
+- [ ] Integration: historical diagnostic recognizes only active/unfinished work
+      linked to the newest accepted decision that establishes the current state;
+      stale, unrelated, rejected, null-provenance, dedupe-colliding, terminal, and
+      state-mismatched fixtures remain reportable and no row is mutated.
 - [ ] Server: operator evidence includes stable `driverless_progress` classification
       and remains bounded.
 - [ ] Compile and policy checks:

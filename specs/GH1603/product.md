@@ -70,12 +70,56 @@ that have no active command or runtime job so they can be recovered deliberately
 8. **B-008** Concurrent completion, retry, and replay cannot use a stale, terminal,
    unrelated, or merely dedupe-colliding command/job as a substitute for the driver
    required in the decision being committed.
-9. **B-009** Preexisting command-driven instances with no active command or runtime
-   job are reported with workflow id, definition, state, and age for explicit
-   recovery; rollout does not silently change their state or erase their history.
+9. **B-009** Preexisting command-driven instances are healthy only when the accepted
+   decision that established the current state has an eligible active command or
+   unfinished runtime job linked to that decision. Missing or ambiguous state-entry
+   provenance, and work linked only to an older or unrelated decision, are reported
+   with workflow id, definition, state, age, and provenance status for explicit
+   recovery; rollout does not silently change state or erase history.
 10. **B-010** Every transition target in every registered definition has progress
     metadata, and adding a state or allowlisted transition without that metadata
     fails a deterministic completeness check.
+11. **B-011** The authoritative state matrix below is verified semantically: every
+    command-driven row names an eligible durable-driver family, every external wait
+    names an enabled deterministic observer, every operator gate names its explicit
+    resolution action, and every parent handoff names its propagation path. A
+    structurally present mode with no executable wake path fails verification.
+
+## Authoritative Progress Ownership Matrix
+
+This matrix exhausts the nonterminal entries in the current four-definition state
+registry. It is the behavioral authority for `ProgressMode`; implementation must not
+infer a different mode from an individual transition's optional command allowlist.
+
+| Definition | Registered state(s) | `ProgressMode` | Concrete owner and deterministic wake/resolution path |
+| --- | --- | --- | --- |
+| `github_issue_pr` | `discovered` | `command_driven` | Submission bootstrap owns this initial-only state and must atomically commit the accepted submission decision that selects `planning`, `implementing`, or `awaiting_dependencies`; `discovered` is not a valid driverless steady state. |
+| `github_issue_pr` | `scheduled`, `planning` | `command_driven` | The state-entry decision owns an `EnqueueActivity` driver for issue planning or implementation; runtime command dispatch creates the claimable job. |
+| `github_issue_pr` | `implementing` | `command_driven` | The state-entry decision owns an `EnqueueActivity` driver for `implement_issue` (including a candidate command when fanout is used). |
+| `github_issue_pr` | `replanning` | `command_driven` | The state-entry decision owns an `EnqueueActivity` driver for `replan_issue`. |
+| `github_issue_pr` | `local_review_gate` | `command_driven` | The state-entry decision owns an `EnqueueActivity` driver for `run_local_review`. |
+| `github_issue_pr` | `addressing_feedback` | `command_driven` | The state-entry decision owns `EnqueueActivity(address_pr_feedback)` or the declared PR-feedback child workflow. |
+| `github_issue_pr` | `quality_gate_pending` | `parent_handoff` | A quality-gate child linked to this parent owns resolution; child completion is propagated to the parent and produces `ready_to_merge` or an explicit stopped outcome. |
+| `github_issue_pr` | `merging` | `command_driven` | The authorized state-entry decision owns `EnqueueActivity(merge_pr)`. |
+| `github_issue_pr` | `awaiting_dependencies` | `external_wait` | The runtime dependency-release observer re-evaluates persisted dependency identities and commits a release/failure decision. |
+| `github_issue_pr` | `pr_open` | `external_wait` | The PR-feedback sweeper observes the bound PR and requests `run_local_review`. |
+| `github_issue_pr` | `awaiting_feedback` | `external_wait` | The PR-feedback sweeper observes remote PR facts and requests a feedback sweep or PR-feedback child. |
+| `github_issue_pr` | `ready_to_merge` | `operator_gate` | The explicit merge-approval action resolves the gate; configured auto-merge policy may invoke the same approval path but is not required for validity. |
+| `github_issue_pr` | `blocked` | `operator_gate` | An authorized retry, unblock, recovery, cancellation, or failure-resolution action resolves the gate. |
+| `prompt_task` | `submitted` | `command_driven` | Submission bootstrap atomically selects `implementing` or `awaiting_dependencies`; `submitted` is not a valid driverless steady state. |
+| `prompt_task` | `implementing` | `command_driven` | The state-entry decision owns `EnqueueActivity(implement_prompt)`. |
+| `prompt_task` | `awaiting_dependencies` | `external_wait` | The runtime dependency-release observer re-evaluates persisted dependency identities and commits release/failure. |
+| `prompt_task` | `blocked` | `operator_gate` | An authorized retry, unblock, recovery, cancellation, or failure-resolution action resolves the gate. |
+| `quality_gate` | `pending`, `checking` | `command_driven` | Child bootstrap/replay and the accepted run decision own `EnqueueActivity(run_quality_gate)`; `pending` may not remain after bootstrap without that decision-linked driver. |
+| `quality_gate` | `blocked` | `operator_gate` | An authorized retry, recovery, cancellation, or failure-resolution action resolves the gate and the child outcome propagates to its parent when present. |
+| `pr_feedback` | `pending`, `inspecting` | `command_driven` | Child bootstrap/replay and the accepted inspect decision own `EnqueueActivity(inspect_pr_feedback)`; `pending` may not remain after bootstrap without that decision-linked driver. |
+| `pr_feedback` | `feedback_found`, `no_actionable_feedback`, `ready_to_merge` | `parent_handoff` | The runtime worker propagates the completed child result through the recorded `parent_workflow_id`; the names describe child outcomes, not parent gates. |
+| `pr_feedback` | `blocked` | `operator_gate` | An authorized retry, recovery, cancellation, or failure-resolution action resolves the child gate and any terminal/stopped result is propagated explicitly. |
+
+Terminal registry entries carry terminal metadata rather than a `ProgressMode`:
+`github_issue_pr` and `prompt_task` use `done`, `failed`, and `cancelled`;
+`quality_gate` uses `passed`, `failed`, and `cancelled`; `pr_feedback` uses `done`,
+`failed`, and `cancelled`.
 
 ## Boundary Checklist
 
@@ -89,7 +133,7 @@ that have no active command or runtime job so they can be recovered deliberately
 | Illegal state transitions | B-001, B-002, and B-010 make missing progress ownership invalid. |
 | Compatibility / migration | B-009 preserves and reports historical rows without silent repair. |
 | Degradation / fallback | B-005 and B-007 prevent a reason or fallback marker from looking like progress. |
-| Evidence and audit integrity | B-007 and B-009 require durable rejection and diagnostic evidence. |
+| Evidence and audit integrity | B-007, B-009, and B-011 require durable rejection, provenance-scoped diagnostics, and semantically valid ownership. |
 | Cancellation / interruption / partial completion | Terminal cancellation is unchanged; B-006 applies if an authorized reopen targets command-driven work, and B-005 covers partial parent handoff. |
 
 ## Acceptance Criteria
@@ -104,8 +148,11 @@ that have no active command or runtime job so they can be recovered deliberately
 - [ ] Recovery tests prove authorized recovery into command-driven work includes an
       eligible durable driver.
 - [ ] A deterministic completeness test covers every state and allowlist target.
+- [ ] A table-driven semantic test matches every nonterminal registry row to the
+      authoritative mode, owner, and executable wake/resolution path in this spec.
 - [ ] Operator diagnostics report preexisting driverless progress instances without
-      mutating them.
+      mutating them, and negative fixtures prove stale or unrelated commands/jobs do
+      not hide a driverless current state.
 - [ ] Focused workflow and server tests plus the cross-workspace compile check pass.
 
 ## Edge Cases
@@ -117,8 +164,13 @@ that have no active command or runtime job so they can be recovered deliberately
   valid only if that command is otherwise allowed; progress metadata does not widen
   the command allowlist.
 - A prior command for the workflow is still active when a completion proposes the
-  next state: it cannot substitute for the new decision's driver unless the
-  transition contract explicitly identifies it as the same durable ownership path.
+  next state: it cannot substitute for the new decision's driver. A reusable durable
+  ownership path must be explicitly re-associated with the accepted state-entry
+  decision; workflow identity, command type, or a matching dedupe key alone is not
+  provenance.
+- The latest accepted decision cannot be shown to establish the persisted current
+  state: the diagnostic reports missing/ambiguous state-entry provenance rather than
+  treating any workflow command as proof of health.
 - A child outcome is persisted before parent propagation: it is classified as
   `parent_handoff`, not `command_driven`; propagation atomicity remains separately
   governed.
