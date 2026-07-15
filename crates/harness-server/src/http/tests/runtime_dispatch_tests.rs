@@ -199,7 +199,70 @@ async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fall
 
     sqlx::query(
         "UPDATE workflow_commands
-         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second'
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
+             dispatch_barrier = jsonb_set(
+                 dispatch_barrier, '{next_dispatch_at}',
+                 to_jsonb(to_char(
+                     CURRENT_TIMESTAMP - INTERVAL '1 second',
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                 ))
+             )
+         WHERE id = $1",
+    )
+    .bind(&command_id)
+    .execute(store.pool())
+    .await?;
+    let still_blocked = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+    assert_eq!(still_blocked.enqueued, 0);
+    assert_eq!(still_blocked.deferred, 1);
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    assert!(state.intake.github_token_dispatch_snapshot().is_empty());
+    let retried = store
+        .get_command(&command_id)
+        .await?
+        .expect("command exists");
+    assert_eq!(retried.status, "deferred");
+    assert_eq!(retried.dispatch_attempt_count, 2);
+    assert_eq!(retried.dispatch_claim_generation, 2);
+    let retry_barrier = retried
+        .dispatch_barrier
+        .as_ref()
+        .expect("retry isolation barrier should be persisted");
+    assert_eq!(retry_barrier.required_tier.as_deref(), Some("container"));
+    assert_eq!(
+        retry_barrier.trust_class.as_deref(),
+        Some("non_collaborator")
+    );
+    assert_eq!(
+        store
+            .events_for(&workflow.id)
+            .await?
+            .iter()
+            .filter(|event| event.event_type == "WorkflowRuntimeDispatchDeferred")
+            .count(),
+        2
+    );
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
+             dispatch_barrier = jsonb_set(
+                 dispatch_barrier, '{next_dispatch_at}',
+                 to_jsonb(to_char(
+                     CURRENT_TIMESTAMP - INTERVAL '1 second',
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                 ))
+             )
          WHERE id = $1",
     )
     .bind(&command_id)
@@ -235,13 +298,14 @@ async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fall
     let jobs = store.runtime_jobs_for_command(&command_id).await?;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].command_id, command_id);
+    assert_eq!(jobs[0].input["isolation"]["tier"], "container");
     let repaired_command = store
         .get_command(&command_id)
         .await?
         .expect("command exists");
     assert_eq!(repaired_command.status, "dispatched");
-    assert_eq!(repaired_command.dispatch_attempt_count, 1);
-    assert_eq!(repaired_command.dispatch_claim_generation, 2);
+    assert_eq!(repaired_command.dispatch_attempt_count, 2);
+    assert_eq!(repaired_command.dispatch_claim_generation, 3);
     assert!(repaired_command.dispatch_barrier.is_none());
     assert!(repaired_command.dispatch_not_before.is_none());
     Ok(())
@@ -335,7 +399,14 @@ async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> any
     )?;
     sqlx::query(
         "UPDATE workflow_commands
-         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second'
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
+             dispatch_barrier = jsonb_set(
+                 dispatch_barrier, '{next_dispatch_at}',
+                 to_jsonb(to_char(
+                     CURRENT_TIMESTAMP - INTERVAL '1 second',
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                 ))
+             )
          WHERE id = $1",
     )
     .bind(&command_id)
@@ -822,7 +893,14 @@ async fn runtime_command_dispatch_tick_defers_disabled_policy_without_agent_metr
     )?;
     sqlx::query(
         "UPDATE workflow_commands
-         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second'
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
+             dispatch_barrier = jsonb_set(
+                 dispatch_barrier, '{next_dispatch_at}',
+                 to_jsonb(to_char(
+                     CURRENT_TIMESTAMP - INTERVAL '1 second',
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                 ))
+             )
          WHERE id = $1",
     )
     .bind(&command_id)

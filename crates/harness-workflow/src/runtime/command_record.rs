@@ -63,6 +63,11 @@ pub(super) fn from_row(
 ) -> anyhow::Result<WorkflowCommandRecord> {
     use anyhow::Context;
 
+    let status = WorkflowCommandStatus::try_from(status.as_str())?;
+    let dispatch_attempt_count = u64::try_from(dispatch_attempt_count)
+        .context("workflow command dispatch attempt count is negative")?;
+    let dispatch_claim_generation = u64::try_from(dispatch_claim_generation)
+        .context("workflow command dispatch claim generation is negative")?;
     let dispatch_barrier: Option<DispatchBarrier> = dispatch_barrier
         .map(|data| serde_json::from_str(&data))
         .transpose()
@@ -70,18 +75,38 @@ pub(super) fn from_row(
     if let Some(barrier) = dispatch_barrier.as_ref() {
         barrier.validate()?;
     }
+    if status == WorkflowCommandStatus::Deferred {
+        let barrier = dispatch_barrier
+            .as_ref()
+            .context("deferred workflow command is missing dispatch barrier evidence")?;
+        let due = dispatch_not_before
+            .as_ref()
+            .context("deferred workflow command is missing dispatch schedule evidence")?;
+        if dispatch_owner.is_some() || dispatch_lease_expires_at.is_some() {
+            anyhow::bail!("deferred workflow command must have a released dispatch claim");
+        }
+        if dispatch_attempt_count == 0 || dispatch_claim_generation == 0 {
+            anyhow::bail!("deferred workflow command attempt and generation must be positive");
+        }
+        if barrier.command_id != id
+            || barrier.workflow_id != workflow_id
+            || barrier.attempt != dispatch_attempt_count
+            || barrier.claim_generation != dispatch_claim_generation
+            || &barrier.next_dispatch_at != due
+        {
+            anyhow::bail!("deferred workflow command barrier evidence does not match its row");
+        }
+    }
     Ok(WorkflowCommandRecord {
         id,
         workflow_id,
         decision_id,
-        status: WorkflowCommandStatus::try_from(status.as_str())?,
+        status,
         dispatch_owner,
         dispatch_lease_expires_at,
         dispatch_not_before,
-        dispatch_attempt_count: u64::try_from(dispatch_attempt_count)
-            .context("workflow command dispatch attempt count is negative")?,
-        dispatch_claim_generation: u64::try_from(dispatch_claim_generation)
-            .context("workflow command dispatch claim generation is negative")?,
+        dispatch_attempt_count,
+        dispatch_claim_generation,
         dispatch_barrier,
         command: serde_json::from_str(&data)?,
         created_at,

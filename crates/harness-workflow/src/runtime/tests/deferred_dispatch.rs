@@ -31,7 +31,15 @@ async fn claimed_deferred_test_command(
 async fn force_deferred_due(store: &WorkflowRuntimeStore, command_id: &str) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE workflow_commands
-         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second'
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
+             dispatch_barrier = jsonb_set(
+                 dispatch_barrier,
+                 '{next_dispatch_at}',
+                 to_jsonb(to_char(
+                     CURRENT_TIMESTAMP - INTERVAL '1 second',
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                 ))
+             )
          WHERE id = $1",
     )
     .bind(command_id)

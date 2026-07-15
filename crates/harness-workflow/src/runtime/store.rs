@@ -183,6 +183,15 @@ pub enum RuntimeJobEnqueueOutcome {
     WorkflowTerminal { status: WorkflowCommandStatus },
     CommandNotPending { status: WorkflowCommandStatus },
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimedCommandTerminalOutcome {
+    NotTerminal,
+    StaleClaim,
+    WorkflowTerminal {
+        status: WorkflowCommandStatus,
+        workflow_state: String,
+    },
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeActivityCompletion {
     pub runtime_job: RuntimeJob,
@@ -747,6 +756,7 @@ impl WorkflowRuntimeStore {
         limit: i64,
     ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
         let limit = limit.clamp(1, 500);
+        let mut tx = self.pool.begin().await?;
         let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
             "WITH candidates AS (
                  SELECT command.id
@@ -761,6 +771,23 @@ impl WorkflowRuntimeStore {
                     OR (
                         command.status = $5
                         AND command.dispatch_not_before <= CURRENT_TIMESTAMP
+                        AND command.dispatch_owner IS NULL
+                        AND command.dispatch_lease_expires_at IS NULL
+                        AND command.dispatch_attempt_count > 0
+                        AND command.dispatch_claim_generation > 0
+                        AND command.dispatch_barrier IS NOT NULL
+                        AND jsonb_typeof(command.dispatch_barrier) = 'object'
+                        AND NULLIF(BTRIM(command.dispatch_barrier->>'reason'), '') IS NOT NULL
+                        AND NULLIF(BTRIM(command.dispatch_barrier->>'project_id'), '') IS NOT NULL
+                        AND NULLIF(BTRIM(command.dispatch_barrier->>'dispatch_owner'), '') IS NOT NULL
+                        AND command.dispatch_barrier->>'command_id' = command.id
+                        AND command.dispatch_barrier->>'workflow_id' = command.workflow_id
+                        AND (command.dispatch_barrier->>'attempt')::BIGINT
+                            = command.dispatch_attempt_count
+                        AND (command.dispatch_barrier->>'claim_generation')::BIGINT
+                            = command.dispatch_claim_generation
+                        AND (command.dispatch_barrier->>'next_dispatch_at')::TIMESTAMPTZ
+                            = command.dispatch_not_before
                     )
                  ORDER BY command.created_at ASC
                  LIMIT $6
@@ -786,12 +813,20 @@ impl WorkflowRuntimeStore {
         .bind(WorkflowCommandStatus::Dispatching.as_str())
         .bind(WorkflowCommandStatus::Deferred.as_str())
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        let mut records: Vec<_> = rows
+        let records: anyhow::Result<Vec<_>> = rows
             .into_iter()
             .map(workflow_command_record_from_row)
-            .collect::<anyhow::Result<_>>()?;
+            .collect();
+        let mut records = match records {
+            Ok(records) => records,
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error);
+            }
+        };
+        tx.commit().await?;
         records.sort_by_key(|record| record.created_at);
         Ok(records)
     }

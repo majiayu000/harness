@@ -494,6 +494,42 @@ fn load_workflow_config_reads_crlf_front_matter() -> anyhow::Result<()> {
 }
 
 #[test]
+fn load_workflow_config_accepts_max_chrono_dispatch_backoff() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let max = chrono::Duration::MAX.num_seconds();
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        format!(
+            "---\nruntime_dispatch:\n  defer_backoff_secs: {max}\n  defer_backoff_max_secs: {max}\n---\n"
+        ),
+    )?;
+    let config = load_workflow_config(dir.path())?;
+    assert_eq!(
+        config.runtime_dispatch.defer_backoff_secs,
+        u64::try_from(max)?
+    );
+    Ok(())
+}
+
+#[test]
+fn load_workflow_config_rejects_out_of_range_chrono_dispatch_backoff() -> anyhow::Result<()> {
+    let max = u64::try_from(chrono::Duration::MAX.num_seconds())?;
+    for value in [max + 1, u64::MAX] {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            format!(
+                "---\nruntime_dispatch:\n  defer_backoff_secs: {value}\n  defer_backoff_max_secs: {value}\n---\n"
+            ),
+        )?;
+        let error = load_workflow_config(dir.path())
+            .expect_err("out-of-range dispatch backoff must fail closed");
+        assert!(format!("{error:#}").contains("Chrono-compatible"));
+    }
+    Ok(())
+}
+
+#[test]
 fn load_workflow_config_reads_front_matter_delimiter_at_eof() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(

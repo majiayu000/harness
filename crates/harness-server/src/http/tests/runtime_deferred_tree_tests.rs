@@ -57,10 +57,9 @@ async fn runtime_tree_reports_deferred_command() -> anyhow::Result<()> {
             harness_workflow::runtime::DispatchBackoffPolicy::from_seconds(5, 20)?,
         )
         .await?;
-    assert!(matches!(
-        outcome,
-        harness_workflow::runtime::DeferClaimedCommandOutcome::Deferred(_)
-    ));
+    let harness_workflow::runtime::DeferClaimedCommandOutcome::Deferred(barrier) = outcome else {
+        panic!("command should be deferred")
+    };
 
     let response = workflow_runtime_app(state.clone())
         .oneshot(
@@ -94,6 +93,29 @@ async fn runtime_tree_reports_deferred_command() -> anyhow::Result<()> {
         command_node["dispatch_barrier"]["trust_class"],
         "non_collaborator"
     );
+
+    sqlx::query("UPDATE workflow_commands SET dispatch_barrier = NULL WHERE id = $1")
+        .bind(&command_id)
+        .execute(store.pool())
+        .await?;
+    let missing_response = workflow_runtime_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/tree?project_id=%2Fproject-deferred-tree&detail=full")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(missing_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let missing_body = response_json(missing_response).await?;
+    assert!(missing_body["error"]
+        .as_str()
+        .expect("missing evidence error should be visible")
+        .contains("missing dispatch barrier evidence"));
+    sqlx::query("UPDATE workflow_commands SET dispatch_barrier = $2::jsonb WHERE id = $1")
+        .bind(&command_id)
+        .bind(serde_json::to_string(&barrier)?)
+        .execute(store.pool())
+        .await?;
 
     sqlx::query(
         "UPDATE workflow_commands

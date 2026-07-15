@@ -35,10 +35,12 @@ impl DispatchBackoffPolicy {
             .map_err(|_| anyhow::anyhow!("dispatch defer backoff floor exceeds i64"))?;
         let ceiling = i64::try_from(ceiling)
             .map_err(|_| anyhow::anyhow!("dispatch defer backoff ceiling exceeds i64"))?;
-        Self::new(
-            chrono::Duration::seconds(floor),
-            chrono::Duration::seconds(ceiling),
-        )
+        let floor = chrono::Duration::try_seconds(floor)
+            .ok_or_else(|| anyhow::anyhow!("dispatch defer backoff floor exceeds Chrono range"))?;
+        let ceiling = chrono::Duration::try_seconds(ceiling).ok_or_else(|| {
+            anyhow::anyhow!("dispatch defer backoff ceiling exceeds Chrono range")
+        })?;
+        Self::new(floor, ceiling)
     }
 
     pub fn delay_for_attempt(self, attempt: u64) -> chrono::Duration {

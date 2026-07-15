@@ -1,4 +1,7 @@
-use super::{enum_str, runtime_job_for_command_tx, to_jsonb_string, RuntimeJobEnqueueOutcome};
+use super::{
+    enum_str, runtime_job_for_command_tx, to_jsonb_string, ClaimedCommandTerminalOutcome,
+    RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
+};
 use crate::runtime::{
     DispatchClaim, RuntimeJob, RuntimeKind, WorkflowCommand, WorkflowCommandStatus,
     WorkflowInstance,
@@ -7,6 +10,86 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
 use uuid::Uuid;
+
+impl WorkflowRuntimeStore {
+    pub async fn finish_claimed_command_for_terminal_workflow(
+        &self,
+        command_id: &str,
+        dispatch_claim: DispatchClaim<'_>,
+    ) -> anyhow::Result<ClaimedCommandTerminalOutcome> {
+        let generation = i64::try_from(dispatch_claim.generation)
+            .map_err(|_| anyhow::anyhow!("dispatch claim generation exceeds PostgreSQL BIGINT"))?;
+        let workflow_id: Option<(String,)> =
+            sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                .bind(command_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((workflow_id,)) = workflow_id else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+
+        let mut tx = self.pool.begin().await?;
+        let workflow_data: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
+                .bind(&workflow_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let workflow = workflow_data
+            .map(|(data,)| serde_json::from_str::<WorkflowInstance>(&data))
+            .transpose()?;
+        let command_claim: Option<(String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT status, dispatch_owner, dispatch_claim_generation
+             FROM workflow_commands WHERE id = $1 FOR UPDATE",
+        )
+        .bind(command_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((status, owner, current_generation)) = command_claim else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+        if status != WorkflowCommandStatus::Dispatching.as_str()
+            || owner.as_deref() != Some(dispatch_claim.owner)
+            || current_generation != generation
+        {
+            tx.rollback().await?;
+            return Ok(ClaimedCommandTerminalOutcome::StaleClaim);
+        }
+        let Some(workflow) = workflow.filter(WorkflowInstance::is_terminal) else {
+            tx.rollback().await?;
+            return Ok(ClaimedCommandTerminalOutcome::NotTerminal);
+        };
+        let terminal_status = if workflow.state == "cancelled" {
+            WorkflowCommandStatus::Cancelled
+        } else {
+            WorkflowCommandStatus::Skipped
+        };
+        let result = sqlx::query(
+            "UPDATE workflow_commands
+             SET status = $2, dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,
+                 dispatch_barrier = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND status = $3 AND dispatch_owner = $4
+               AND dispatch_claim_generation = $5",
+        )
+        .bind(command_id)
+        .bind(terminal_status.as_str())
+        .bind(WorkflowCommandStatus::Dispatching.as_str())
+        .bind(dispatch_claim.owner)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(ClaimedCommandTerminalOutcome::StaleClaim);
+        }
+        let workflow_state = workflow.state;
+        tx.commit().await?;
+        Ok(ClaimedCommandTerminalOutcome::WorkflowTerminal {
+            status: terminal_status,
+            workflow_state,
+        })
+    }
+}
 
 pub(super) async fn insert(
     pool: &PgPool,

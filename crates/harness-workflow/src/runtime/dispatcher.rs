@@ -1,6 +1,6 @@
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
 use super::status::WorkflowCommandStatus;
-use super::store::{RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
+use super::store::{ClaimedCommandTerminalOutcome, RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
 use super::tier_resolution::{
     resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution,
 };
@@ -18,7 +18,6 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const COMMAND_STATUS_SKIPPED: WorkflowCommandStatus = WorkflowCommandStatus::Skipped;
-const COMMAND_STATUS_CANCELLED: WorkflowCommandStatus = WorkflowCommandStatus::Cancelled;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandDispatchOutcome {
@@ -224,26 +223,38 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             });
         }
 
-        let instance = self.store.get_instance(&command.workflow_id).await?;
-        if let Some(instance) = instance.as_ref() {
-            if instance.is_terminal() {
-                let command_status = if instance.state == "cancelled" {
-                    COMMAND_STATUS_CANCELLED
-                } else {
-                    COMMAND_STATUS_SKIPPED
-                };
-                self.store
-                    .mark_command_status(&command.id, command_status)
-                    .await?;
+        match self
+            .store
+            .finish_claimed_command_for_terminal_workflow(
+                &command.id,
+                super::DispatchClaim {
+                    owner: &self.dispatcher_id,
+                    generation: command.dispatch_claim_generation,
+                },
+            )
+            .await?
+        {
+            ClaimedCommandTerminalOutcome::NotTerminal => {}
+            ClaimedCommandTerminalOutcome::StaleClaim => {
+                return Ok(CommandDispatchOutcome::Skipped {
+                    command_id: command.id,
+                    reason: "dispatch claim became stale before terminal check".to_string(),
+                });
+            }
+            ClaimedCommandTerminalOutcome::WorkflowTerminal {
+                status,
+                workflow_state,
+            } => {
                 return Ok(CommandDispatchOutcome::Skipped {
                     command_id: command.id,
                     reason: format!(
-                        "workflow {} is terminal ({}) before dispatch",
-                        instance.id, instance.state
+                        "workflow {} is terminal ({workflow_state}) before dispatch; command is `{status}`",
+                        command.workflow_id
                     ),
                 });
             }
         }
+        let instance = self.store.get_instance(&command.workflow_id).await?;
 
         let activity = command.command.runtime_activity_key().to_string();
         let mut runtime_profile = self.profile_for_command(&command).await?;
