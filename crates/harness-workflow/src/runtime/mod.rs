@@ -9,6 +9,8 @@ mod candidate_fanout;
 mod candidate_promotion;
 mod candidate_selection;
 mod candidate_terminal;
+mod command_record;
+mod dispatch_barrier;
 pub mod dispatcher;
 pub mod errors;
 pub mod eval;
@@ -58,6 +60,10 @@ pub use candidate_selection::{
     select_candidate, CandidateCheckConclusion, CandidateDiffScope, CandidateEvidence,
     CandidateOutcome, CandidatePromotionRecord, CandidateRankingRecord, CandidateSelectionInput,
     CandidateSelectionRecord, CANDIDATE_SELECTION_RECORD_TYPE, CANDIDATE_SELECTION_SCHEMA,
+};
+pub use dispatch_barrier::{
+    DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrier, DispatchBarrierInput,
+    DispatchBarrierReasonCode, DispatchClaim,
 };
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
 pub use errors::RuntimeJobNotFoundError;

@@ -1340,6 +1340,7 @@ fn is_active_pr_feedback_command_status(status: WorkflowCommandStatus) -> bool {
         status,
         WorkflowCommandStatus::Pending
             | WorkflowCommandStatus::Dispatching
+            | WorkflowCommandStatus::Deferred
             | WorkflowCommandStatus::Dispatched
     )
 }

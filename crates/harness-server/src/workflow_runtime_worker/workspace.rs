@@ -371,7 +371,9 @@ async fn run_workflow_hook(
 pub(super) fn is_active_pr_feedback_inspect_command(record: &WorkflowCommandRecord) -> bool {
     matches!(
         record.status,
-        WorkflowCommandStatus::Pending | WorkflowCommandStatus::Dispatched
+        WorkflowCommandStatus::Pending
+            | WorkflowCommandStatus::Deferred
+            | WorkflowCommandStatus::Dispatched
     ) && is_pr_feedback_inspect_command(record)
 }
 

@@ -477,4 +477,35 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_runtime_usage_events_workflow
           ON runtime_usage_events (workflow_id)",
     },
+    Migration {
+        version: 19,
+        description: "persist deferred workflow command dispatch evidence",
+        sql: "ALTER TABLE workflow_commands
+              ADD COLUMN IF NOT EXISTS dispatch_not_before TIMESTAMPTZ;
+              ALTER TABLE workflow_commands
+              ADD COLUMN IF NOT EXISTS dispatch_attempt_count BIGINT NOT NULL DEFAULT 0;
+              ALTER TABLE workflow_commands
+              ADD COLUMN IF NOT EXISTS dispatch_claim_generation BIGINT NOT NULL DEFAULT 0;
+              ALTER TABLE workflow_commands
+              ADD COLUMN IF NOT EXISTS dispatch_barrier JSONB;
+              ALTER TABLE workflow_commands
+              DROP CONSTRAINT IF EXISTS workflow_commands_status_check;
+              ALTER TABLE workflow_commands
+              ADD CONSTRAINT workflow_commands_status_check
+              CHECK (status IN (
+                'pending', 'dispatching', 'deferred', 'dispatched', 'handled_inline',
+                'completed', 'failed', 'blocked', 'cancelled', 'skipped'
+              ));
+              ALTER TABLE workflow_commands
+              DROP CONSTRAINT IF EXISTS workflow_commands_dispatch_claim_generation_check;
+              ALTER TABLE workflow_commands
+              ADD CONSTRAINT workflow_commands_dispatch_claim_generation_check
+              CHECK (dispatch_claim_generation >= 0);
+              DROP INDEX IF EXISTS idx_workflow_commands_dispatch_claim;
+              CREATE INDEX idx_workflow_commands_dispatch_claim
+              ON workflow_commands (
+                status, dispatch_not_before, dispatch_lease_expires_at, created_at
+              )
+              WHERE status IN ('pending', 'dispatching', 'deferred')",
+    },
 ];

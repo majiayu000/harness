@@ -6,9 +6,9 @@ use crate::runtime_projection::{
 use crate::task_runner;
 use harness_workflow::runtime::store::{RuntimeEventSummary, RuntimeJobCompactRecord};
 use harness_workflow::runtime::{
-    runtime_job_running_lease_state_at, RuntimeEvent, RuntimeJob, RuntimeJobStatus,
-    WorkflowCommand, WorkflowCommandRecord, WorkflowDecisionRecord, WorkflowEvent,
-    WorkflowInstance, WorkflowLease,
+    runtime_job_running_lease_state_at, DispatchBarrier, RuntimeEvent, RuntimeJob,
+    RuntimeJobStatus, WorkflowCommand, WorkflowCommandRecord, WorkflowDecisionRecord,
+    WorkflowEvent, WorkflowInstance, WorkflowLease,
 };
 
 pub(super) const ACTIVITY_RESULT_ENVELOPE_ARTIFACT_TYPE: &str = "activity_result_envelope";
@@ -21,6 +21,12 @@ pub(super) struct WorkflowRuntimeCommandNode {
     pub workflow_id: String,
     pub decision_id: Option<String>,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_not_before: Option<chrono::DateTime<chrono::Utc>>,
+    pub dispatch_attempt_count: u64,
+    pub dispatch_claim_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_barrier: Option<DispatchBarrier>,
     pub command: WorkflowCommand,
     pub runtime_job_count: usize,
     pub runtime_jobs: Vec<WorkflowRuntimeJobNode>,
@@ -39,6 +45,10 @@ impl WorkflowRuntimeCommandNode {
             workflow_id: record.workflow_id,
             decision_id: record.decision_id,
             status: record.status.to_string(),
+            dispatch_not_before: record.dispatch_not_before,
+            dispatch_attempt_count: record.dispatch_attempt_count,
+            dispatch_claim_generation: record.dispatch_claim_generation,
+            dispatch_barrier: record.dispatch_barrier,
             command: record.command,
             runtime_job_count,
             runtime_jobs,

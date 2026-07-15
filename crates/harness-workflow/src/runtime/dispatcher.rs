@@ -1,8 +1,12 @@
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
 use super::status::WorkflowCommandStatus;
-use super::store::{RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
+use super::store::{ClaimedCommandTerminalOutcome, RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
 use super::tier_resolution::{
     resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution,
+};
+use super::{
+    DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrier, DispatchBarrierInput,
+    DispatchBarrierReasonCode,
 };
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
@@ -14,8 +18,6 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const COMMAND_STATUS_SKIPPED: WorkflowCommandStatus = WorkflowCommandStatus::Skipped;
-const COMMAND_STATUS_CANCELLED: WorkflowCommandStatus = WorkflowCommandStatus::Cancelled;
-const COMMAND_STATUS_FAILED: WorkflowCommandStatus = WorkflowCommandStatus::Failed;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandDispatchOutcome {
@@ -26,6 +28,10 @@ pub enum CommandDispatchOutcome {
     AlreadyDispatched {
         command_id: String,
         runtime_job: RuntimeJob,
+    },
+    Deferred {
+        command_id: String,
+        barrier: DispatchBarrier,
     },
     Skipped {
         command_id: String,
@@ -117,6 +123,7 @@ pub struct RuntimeCommandDispatcher<'a> {
     batch_limit: i64,
     dispatcher_id: String,
     lease_duration: Duration,
+    defer_backoff: DispatchBackoffPolicy,
 }
 
 impl<'a> RuntimeCommandDispatcher<'a> {
@@ -136,6 +143,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             batch_limit: 25,
             dispatcher_id: format!("dispatcher:{}", Uuid::new_v4()),
             lease_duration: Duration::seconds(30),
+            defer_backoff: DispatchBackoffPolicy::default(),
         }
     }
 
@@ -164,6 +172,11 @@ impl<'a> RuntimeCommandDispatcher<'a> {
 
     pub fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
         self.lease_duration = lease_duration.max(Duration::seconds(1));
+        self
+    }
+
+    pub fn with_defer_backoff(mut self, defer_backoff: DispatchBackoffPolicy) -> Self {
+        self.defer_backoff = defer_backoff;
         self
     }
 
@@ -210,26 +223,38 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             });
         }
 
-        let instance = self.store.get_instance(&command.workflow_id).await?;
-        if let Some(instance) = instance.as_ref() {
-            if instance.is_terminal() {
-                let command_status = if instance.state == "cancelled" {
-                    COMMAND_STATUS_CANCELLED
-                } else {
-                    COMMAND_STATUS_SKIPPED
-                };
-                self.store
-                    .mark_command_status(&command.id, command_status)
-                    .await?;
+        match self
+            .store
+            .finish_claimed_command_for_terminal_workflow(
+                &command.id,
+                super::DispatchClaim {
+                    owner: &self.dispatcher_id,
+                    generation: command.dispatch_claim_generation,
+                },
+            )
+            .await?
+        {
+            ClaimedCommandTerminalOutcome::NotTerminal => {}
+            ClaimedCommandTerminalOutcome::StaleClaim => {
+                return Ok(CommandDispatchOutcome::Skipped {
+                    command_id: command.id,
+                    reason: "dispatch claim became stale before terminal check".to_string(),
+                });
+            }
+            ClaimedCommandTerminalOutcome::WorkflowTerminal {
+                status,
+                workflow_state,
+            } => {
                 return Ok(CommandDispatchOutcome::Skipped {
                     command_id: command.id,
                     reason: format!(
-                        "workflow {} is terminal ({}) before dispatch",
-                        instance.id, instance.state
+                        "workflow {} is terminal ({workflow_state}) before dispatch; command is `{status}`",
+                        command.workflow_id
                     ),
                 });
             }
         }
+        let instance = self.store.get_instance(&command.workflow_id).await?;
 
         let activity = command.command.runtime_activity_key().to_string();
         let mut runtime_profile = self.profile_for_command(&command).await?;
@@ -247,33 +272,42 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             .ensure_tier_available(isolation.tier)
         {
             let reason = error.to_string();
-            self.store
-                .mark_command_status(&command.id, COMMAND_STATUS_FAILED)
-                .await?;
-            self.store
-                .append_event(
-                    &command.workflow_id,
-                    "WorkflowRuntimeIsolationUnavailable",
-                    "workflow_runtime_command_dispatcher",
-                    json!({
-                        "command_id": command.id.clone(),
-                        "tier": isolation.tier,
-                        "trust_class": isolation.trust_class,
-                        "reason": reason.clone(),
-                    }),
-                )
-                .await?;
-            return Ok(CommandDispatchOutcome::Skipped {
-                command_id: command.id,
+            let project_id = command_project_id(instance.as_ref(), &command)?;
+            let barrier = DispatchBarrierInput::new(
+                DispatchBarrierReasonCode::IsolationTierUnavailable,
                 reason,
-            });
+                project_id,
+            )
+            .with_isolation(
+                isolation.tier.as_str(),
+                match isolation.trust_class {
+                    IsolationTrustClass::Trusted => "trusted",
+                    IsolationTrustClass::NonCollaborator => "non_collaborator",
+                },
+            );
+            return dispatch_deferral_outcome(
+                &command,
+                self.store
+                    .defer_claimed_command_if_owned(
+                        &command.id,
+                        &self.dispatcher_id,
+                        command.dispatch_claim_generation,
+                        barrier,
+                        Utc::now(),
+                        self.defer_backoff,
+                    )
+                    .await?,
+            );
         }
         let not_before = retry_not_before_for_command(&command)?;
         match self
             .store
             .enqueue_runtime_job_for_claimed_command(
                 &command.id,
-                &self.dispatcher_id,
+                super::DispatchClaim {
+                    owner: &self.dispatcher_id,
+                    generation: command.dispatch_claim_generation,
+                },
                 runtime_profile.kind,
                 &runtime_profile.name,
                 json!({
@@ -308,6 +342,16 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                     reason: format!("command status changed to `{status}` before dispatch"),
                 })
             }
+            RuntimeJobEnqueueOutcome::StaleClaim => Ok(CommandDispatchOutcome::Skipped {
+                command_id: command.id,
+                reason: "dispatch claim became stale before enqueue".to_string(),
+            }),
+            RuntimeJobEnqueueOutcome::WorkflowTerminal { status } => {
+                Ok(CommandDispatchOutcome::Skipped {
+                    command_id: command.id,
+                    reason: format!("workflow became terminal; command is `{status}`"),
+                })
+            }
         }
     }
 
@@ -326,6 +370,45 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             )
             .clone())
     }
+}
+
+fn command_project_id(
+    instance: Option<&super::model::WorkflowInstance>,
+    command: &WorkflowCommandRecord,
+) -> anyhow::Result<String> {
+    instance
+        .and_then(|instance| instance.data.get("project_id"))
+        .or_else(|| command.command.command.get("project_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("runtime dispatch barrier requires a project identity"))
+}
+
+fn dispatch_deferral_outcome(
+    command: &WorkflowCommandRecord,
+    outcome: DeferClaimedCommandOutcome,
+) -> anyhow::Result<CommandDispatchOutcome> {
+    Ok(match outcome {
+        DeferClaimedCommandOutcome::Deferred(barrier)
+        | DeferClaimedCommandOutcome::AlreadyDeferred(barrier) => {
+            CommandDispatchOutcome::Deferred {
+                command_id: command.id.clone(),
+                barrier,
+            }
+        }
+        DeferClaimedCommandOutcome::StaleClaim => CommandDispatchOutcome::Skipped {
+            command_id: command.id.clone(),
+            reason: "dispatch claim became stale before deferral".to_string(),
+        },
+        DeferClaimedCommandOutcome::WorkflowTerminal { status } => {
+            CommandDispatchOutcome::Skipped {
+                command_id: command.id.clone(),
+                reason: format!("workflow became terminal; command is `{status}`"),
+            }
+        }
+    })
 }
 
 fn apply_candidate_runtime_budget(

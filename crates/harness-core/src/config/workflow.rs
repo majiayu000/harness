@@ -137,6 +137,10 @@ pub struct RuntimeDispatchPolicy {
     pub interval_secs: u64,
     #[serde(default = "default_runtime_dispatch_batch_limit")]
     pub batch_limit: u32,
+    #[serde(default = "default_runtime_dispatch_defer_backoff_secs")]
+    pub defer_backoff_secs: u64,
+    #[serde(default = "default_runtime_dispatch_defer_backoff_max_secs")]
+    pub defer_backoff_max_secs: u64,
     #[serde(default)]
     pub runtime_kind: Option<String>,
     #[serde(default)]
@@ -307,6 +311,8 @@ impl Default for RuntimeDispatchPolicy {
             enabled: true,
             interval_secs: default_runtime_dispatch_interval_secs(),
             batch_limit: default_runtime_dispatch_batch_limit(),
+            defer_backoff_secs: default_runtime_dispatch_defer_backoff_secs(),
+            defer_backoff_max_secs: default_runtime_dispatch_defer_backoff_max_secs(),
             runtime_kind: None,
             runtime_profile: None,
             model: None,
@@ -492,6 +498,14 @@ fn default_runtime_dispatch_batch_limit() -> u32 {
     25
 }
 
+fn default_runtime_dispatch_defer_backoff_secs() -> u64 {
+    30
+}
+
+fn default_runtime_dispatch_defer_backoff_max_secs() -> u64 {
+    15 * 60
+}
+
 fn default_runtime_dispatch_activity_profiles() -> BTreeMap<String, RuntimeDispatchProfileOverride>
 {
     BTreeMap::new()
@@ -644,6 +658,24 @@ fn load_workflow_document_with_base(
         })?,
     };
     config.runtime_dispatch.apply_default_activity_profiles();
+    let defer_floor = config.runtime_dispatch.defer_backoff_secs;
+    let defer_ceiling = config.runtime_dispatch.defer_backoff_max_secs;
+    let chrono_seconds = |seconds: u64| {
+        i64::try_from(seconds)
+            .ok()
+            .and_then(chrono::Duration::try_seconds)
+            .is_some()
+    };
+    if defer_floor == 0
+        || config.runtime_dispatch.defer_backoff_max_secs
+            < config.runtime_dispatch.defer_backoff_secs
+        || !chrono_seconds(defer_floor)
+        || !chrono_seconds(defer_ceiling)
+    {
+        anyhow::bail!(
+            "runtime_dispatch defer backoff requires positive Chrono-compatible seconds and max >= floor"
+        );
+    }
 
     Ok(WorkflowDocument {
         config,

@@ -4,6 +4,7 @@ use super::*;
 pub(in crate::http) struct RuntimeCommandDispatchTick {
     pub enqueued: usize,
     pub already_dispatched: usize,
+    pub deferred: usize,
     pub skipped: usize,
 }
 
@@ -14,6 +15,7 @@ impl RuntimeCommandDispatchTick {
             match outcome {
                 CommandDispatchOutcome::Enqueued { .. } => tick.enqueued += 1,
                 CommandDispatchOutcome::AlreadyDispatched { .. } => tick.already_dispatched += 1,
+                CommandDispatchOutcome::Deferred { .. } => tick.deferred += 1,
                 CommandDispatchOutcome::Skipped { .. } => tick.skipped += 1,
             }
         }
@@ -21,7 +23,7 @@ impl RuntimeCommandDispatchTick {
     }
 
     fn touched_anything(&self) -> bool {
-        self.enqueued > 0 || self.already_dispatched > 0 || self.skipped > 0
+        self.enqueued > 0 || self.already_dispatched > 0 || self.deferred > 0 || self.skipped > 0
     }
 }
 
@@ -102,6 +104,10 @@ async fn dispatch_runtime_command_with_project_policy(
             .await;
     }
 
+    let project_root = runtime_command_project_root(store, &command, &state.core.project_root)
+        .await
+        .context("failed to resolve runtime command project")?;
+
     let profile_selector = match runtime_dispatch_profile_selector_for_command(
         state,
         store,
@@ -112,32 +118,39 @@ async fn dispatch_runtime_command_with_project_policy(
     {
         Ok(Some(profile_selector)) => profile_selector,
         Ok(None) => {
-            let command_id = command.id.clone();
-            store
-                .mark_command_status(&command_id, WorkflowCommandStatus::Skipped)
-                .await?;
             let reason = "workflow runtime dispatch or worker is disabled for the command project"
                 .to_string();
-            return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
+            let workflow_cfg = load_runtime_workflow_config(
+                &project_root,
+                "workflow runtime command dispatcher backoff",
+            )?;
+            return defer_server_dispatch_barrier(
+                store,
+                &command,
+                dispatch_owner,
+                DispatchBarrierInput::new(
+                    DispatchBarrierReasonCode::RuntimePolicyDisabled,
+                    reason,
+                    project_root.display().to_string(),
+                ),
+                dispatch_backoff(&workflow_cfg.runtime_dispatch)?,
+            )
+            .await;
         }
         Err(RuntimeDispatchProfileSelectionError::WorkflowConfig(error)) => {
-            let command_id = command.id.clone();
             let reason = format!("workflow runtime project config failed to load: {error}");
-            store
-                .mark_command_status(&command_id, WorkflowCommandStatus::Failed)
-                .await?;
-            store
-                .append_event(
-                    &command.workflow_id,
-                    "WorkflowRuntimeConfigError",
-                    "workflow_runtime_command_dispatcher",
-                    serde_json::json!({
-                        "command_id": command_id.clone(),
-                        "reason": reason.clone(),
-                    }),
-                )
-                .await?;
-            return Ok(CommandDispatchOutcome::Skipped { command_id, reason });
+            return defer_server_dispatch_barrier(
+                store,
+                &command,
+                dispatch_owner,
+                DispatchBarrierInput::new(
+                    DispatchBarrierReasonCode::WorkflowConfigInvalid,
+                    reason,
+                    project_root.display().to_string(),
+                ),
+                DispatchBackoffPolicy::default(),
+            )
+            .await;
         }
         Err(RuntimeDispatchProfileSelectionError::Other(error)) => {
             return Err(error.context("failed to select runtime dispatch profile"));
@@ -154,6 +167,13 @@ async fn dispatch_runtime_command_with_project_policy(
         .with_isolation_config(isolation_config)
         .with_isolation_availability(state.isolation_availability.clone())
         .with_dispatcher_id(dispatch_owner)
+        .with_defer_backoff(dispatch_backoff(
+            &load_runtime_workflow_config(
+                &project_root,
+                "workflow runtime command dispatcher backoff",
+            )?
+            .runtime_dispatch,
+        )?)
         .dispatch_command(command)
         .await?;
     record_runtime_agent_dispatch_counter(
@@ -241,8 +261,55 @@ fn record_runtime_agent_dispatch_counter(
             );
         }
         CommandDispatchOutcome::AlreadyDispatched { .. }
+        | CommandDispatchOutcome::Deferred { .. }
         | CommandDispatchOutcome::Skipped { .. } => {}
     }
+}
+
+fn dispatch_backoff(
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+) -> anyhow::Result<DispatchBackoffPolicy> {
+    DispatchBackoffPolicy::from_seconds(policy.defer_backoff_secs, policy.defer_backoff_max_secs)
+}
+
+async fn defer_server_dispatch_barrier(
+    store: &WorkflowRuntimeStore,
+    command: &WorkflowCommandRecord,
+    dispatch_owner: &str,
+    barrier: DispatchBarrierInput,
+    backoff: DispatchBackoffPolicy,
+) -> anyhow::Result<CommandDispatchOutcome> {
+    Ok(
+        match store
+            .defer_claimed_command_if_owned(
+                &command.id,
+                dispatch_owner,
+                command.dispatch_claim_generation,
+                barrier,
+                chrono::Utc::now(),
+                backoff,
+            )
+            .await?
+        {
+            DeferClaimedCommandOutcome::Deferred(barrier)
+            | DeferClaimedCommandOutcome::AlreadyDeferred(barrier) => {
+                CommandDispatchOutcome::Deferred {
+                    command_id: command.id.clone(),
+                    barrier,
+                }
+            }
+            DeferClaimedCommandOutcome::StaleClaim => CommandDispatchOutcome::Skipped {
+                command_id: command.id.clone(),
+                reason: "dispatch claim became stale before deferral".to_string(),
+            },
+            DeferClaimedCommandOutcome::WorkflowTerminal { status } => {
+                CommandDispatchOutcome::Skipped {
+                    command_id: command.id.clone(),
+                    reason: format!("workflow became terminal; command is `{status}`"),
+                }
+            }
+        },
+    )
 }
 
 fn token_dispatch_metric_for_activity(

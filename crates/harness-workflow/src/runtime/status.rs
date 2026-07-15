@@ -6,6 +6,7 @@ use std::fmt;
 pub enum WorkflowCommandStatus {
     Pending,
     Dispatching,
+    Deferred,
     Dispatched,
     HandledInline,
     Completed,
@@ -20,6 +21,7 @@ impl WorkflowCommandStatus {
         match self {
             Self::Pending => "pending",
             Self::Dispatching => "dispatching",
+            Self::Deferred => "deferred",
             Self::Dispatched => "dispatched",
             Self::HandledInline => "handled_inline",
             Self::Completed => "completed",
@@ -50,6 +52,7 @@ impl TryFrom<&str> for WorkflowCommandStatus {
         match value {
             "pending" => Ok(Self::Pending),
             "dispatching" => Ok(Self::Dispatching),
+            "deferred" => Ok(Self::Deferred),
             "dispatched" => Ok(Self::Dispatched),
             "handled_inline" => Ok(Self::HandledInline),
             "completed" => Ok(Self::Completed),

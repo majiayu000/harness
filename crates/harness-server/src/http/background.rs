@@ -14,8 +14,9 @@ use harness_workflow::issue_lifecycle::{
     is_feedback_claim_placeholder, IssueLifecycleState, IssueWorkflowInstance,
 };
 use harness_workflow::runtime::{
-    CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeKind, RuntimeProfile,
-    RuntimeProfileSelector, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowCommandType,
+    CommandDispatchOutcome, DeferClaimedCommandOutcome, DispatchBackoffPolicy,
+    DispatchBarrierInput, DispatchBarrierReasonCode, RuntimeCommandDispatcher, RuntimeKind,
+    RuntimeProfile, RuntimeProfileSelector, WorkflowCommandRecord, WorkflowCommandType,
     WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
 };
 use sha2::{Digest, Sha256};

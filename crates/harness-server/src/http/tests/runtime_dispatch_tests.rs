@@ -92,7 +92,8 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
 }
 
 #[tokio::test]
-async fn runtime_command_dispatch_tick_refuses_unavailable_isolation_tier() -> anyhow::Result<()> {
+async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fallback(
+) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
@@ -163,29 +164,155 @@ async fn runtime_command_dispatch_tick_refuses_unavailable_isolation_tier() -> a
 
     assert_eq!(tick.enqueued, 0);
     assert_eq!(tick.already_dispatched, 0);
-    assert_eq!(tick.skipped, 1);
+    assert_eq!(tick.deferred, 1);
+    assert_eq!(tick.skipped, 0);
     assert!(store
         .runtime_jobs_for_command(&command_id)
         .await?
         .is_empty());
-    assert_eq!(store.commands_for(&workflow.id).await?[0].status, "failed");
+    let persisted = &store.commands_for(&workflow.id).await?[0];
+    assert_eq!(persisted.status, "deferred");
+    assert_eq!(persisted.dispatch_attempt_count, 1);
+    assert_eq!(persisted.dispatch_claim_generation, 1);
+    assert!(persisted.dispatch_not_before.is_some());
+    let barrier = persisted
+        .dispatch_barrier
+        .as_ref()
+        .expect("isolation barrier should be persisted");
+    assert_eq!(barrier.reason_code.as_str(), "isolation_tier_unavailable");
+    assert_eq!(barrier.required_tier.as_deref(), Some("container"));
+    assert_eq!(barrier.trust_class.as_deref(), Some("non_collaborator"));
     let events = store.events_for(&workflow.id).await?;
     let event = events
         .iter()
-        .find(|event| event.event_type == "WorkflowRuntimeIsolationUnavailable")
-        .expect("isolation refusal event should be recorded");
-    assert_eq!(event.event["command_id"], command_id);
-    assert_eq!(event.event["tier"], "container");
-    assert!(event.event["reason"]
+        .find(|event| event.event_type == "WorkflowRuntimeDispatchDeferred")
+        .expect("atomic dispatch deferral event should be recorded");
+    assert_eq!(event.event["dispatch_barrier"]["command_id"], command_id);
+    assert_eq!(
+        event.event["dispatch_barrier"]["required_tier"],
+        "container"
+    );
+    assert!(event.event["dispatch_barrier"]["reason"]
         .as_str()
         .expect("reason should be a string")
         .contains("docker missing"));
+
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
+             dispatch_barrier = jsonb_set(
+                 dispatch_barrier, '{next_dispatch_at}',
+                 to_jsonb(to_char(
+                     CURRENT_TIMESTAMP - INTERVAL '1 second',
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                 ))
+             )
+         WHERE id = $1",
+    )
+    .bind(&command_id)
+    .execute(store.pool())
+    .await?;
+    let still_blocked = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+    assert_eq!(still_blocked.enqueued, 0);
+    assert_eq!(still_blocked.deferred, 1);
+    assert!(store
+        .runtime_jobs_for_command(&command_id)
+        .await?
+        .is_empty());
+    assert!(state.intake.github_token_dispatch_snapshot().is_empty());
+    let retried = store
+        .get_command(&command_id)
+        .await?
+        .expect("command exists");
+    assert_eq!(retried.status, "deferred");
+    assert_eq!(retried.dispatch_attempt_count, 2);
+    assert_eq!(retried.dispatch_claim_generation, 2);
+    let retry_barrier = retried
+        .dispatch_barrier
+        .as_ref()
+        .expect("retry isolation barrier should be persisted");
+    assert_eq!(retry_barrier.required_tier.as_deref(), Some("container"));
+    assert_eq!(
+        retry_barrier.trust_class.as_deref(),
+        Some("non_collaborator")
+    );
+    assert_eq!(
+        store
+            .events_for(&workflow.id)
+            .await?
+            .iter()
+            .filter(|event| event.event_type == "WorkflowRuntimeDispatchDeferred")
+            .count(),
+        2
+    );
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
+             dispatch_barrier = jsonb_set(
+                 dispatch_barrier, '{next_dispatch_at}',
+                 to_jsonb(to_char(
+                     CURRENT_TIMESTAMP - INTERVAL '1 second',
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                 ))
+             )
+         WHERE id = $1",
+    )
+    .bind(&command_id)
+    .execute(store.pool())
+    .await?;
+    Arc::get_mut(&mut state)
+        .expect("state remains unique during the test")
+        .isolation_availability =
+        harness_core::config::isolation::IsolationAvailability::new(vec![
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Host,
+            ),
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Container,
+            ),
+        ]);
+    let repaired = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+    assert_eq!(repaired.enqueued, 1);
+    assert_eq!(repaired.deferred, 0);
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should remain configured");
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].command_id, command_id);
+    assert_eq!(jobs[0].input["isolation"]["tier"], "container");
+    let repaired_command = store
+        .get_command(&command_id)
+        .await?
+        .expect("command exists");
+    assert_eq!(repaired_command.status, "dispatched");
+    assert_eq!(repaired_command.dispatch_attempt_count, 2);
+    assert_eq!(repaired_command.dispatch_claim_generation, 3);
+    assert!(repaired_command.dispatch_barrier.is_none());
+    assert!(repaired_command.dispatch_not_before.is_none());
     Ok(())
 }
 
 #[tokio::test]
-async fn runtime_command_dispatch_tick_fails_command_when_workflow_config_is_malformed(
-) -> anyhow::Result<()> {
+async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
@@ -232,22 +359,81 @@ async fn runtime_command_dispatch_tick_fails_command_when_workflow_config_is_mal
 
     assert_eq!(tick.enqueued, 0);
     assert_eq!(tick.already_dispatched, 0);
-    assert_eq!(tick.skipped, 1);
+    assert_eq!(tick.deferred, 1);
+    assert_eq!(tick.skipped, 0);
     assert!(store
         .runtime_jobs_for_command(&command_id)
         .await?
         .is_empty());
-    assert_eq!(store.commands_for(&workflow.id).await?[0].status, "failed");
+    let persisted = &store.commands_for(&workflow.id).await?[0];
+    assert_eq!(persisted.status, "deferred");
+    assert_eq!(persisted.dispatch_attempt_count, 1);
+    assert_eq!(persisted.dispatch_claim_generation, 1);
+    assert!(persisted.dispatch_not_before.is_some());
+    assert_eq!(
+        persisted
+            .dispatch_barrier
+            .as_ref()
+            .expect("config barrier should be persisted")
+            .reason_code
+            .as_str(),
+        "workflow_config_invalid"
+    );
     let events = store.events_for(&workflow.id).await?;
     let config_event = events
         .iter()
-        .find(|event| event.event_type == "WorkflowRuntimeConfigError")
-        .expect("config error event should be recorded");
-    assert_eq!(config_event.event["command_id"], command_id);
-    assert!(config_event.event["reason"]
+        .find(|event| event.event_type == "WorkflowRuntimeDispatchDeferred")
+        .expect("atomic config deferral event should be recorded");
+    assert_eq!(
+        config_event.event["dispatch_barrier"]["command_id"],
+        command_id
+    );
+    assert!(config_event.event["dispatch_barrier"]["reason"]
         .as_str()
         .expect("reason should be a string")
         .contains("failed to load WORKFLOW.md"));
+
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
+             dispatch_barrier = jsonb_set(
+                 dispatch_barrier, '{next_dispatch_at}',
+                 to_jsonb(to_char(
+                     CURRENT_TIMESTAMP - INTERVAL '1 second',
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                 ))
+             )
+         WHERE id = $1",
+    )
+    .bind(&command_id)
+    .execute(store.pool())
+    .await?;
+    let repaired = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+    assert_eq!(repaired.enqueued, 1);
+    assert_eq!(repaired.deferred, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].command_id, command_id);
+    let repaired_command = store
+        .get_command(&command_id)
+        .await?
+        .expect("command exists");
+    assert_eq!(repaired_command.status, "dispatched");
+    assert_eq!(repaired_command.dispatch_attempt_count, 1);
+    assert_eq!(repaired_command.dispatch_claim_generation, 2);
+    assert!(repaired_command.dispatch_barrier.is_none());
     Ok(())
 }
 
@@ -631,7 +817,7 @@ async fn runtime_command_dispatch_tick_uses_command_project_policy_when_server_r
 }
 
 #[tokio::test]
-async fn runtime_command_dispatch_tick_skips_when_command_project_runtime_disabled(
+async fn runtime_command_dispatch_tick_defers_disabled_policy_without_agent_metrics(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -679,13 +865,73 @@ async fn runtime_command_dispatch_tick_skips_when_command_project_runtime_disabl
 
     assert_eq!(tick.enqueued, 0);
     assert_eq!(tick.already_dispatched, 0);
-    assert_eq!(tick.skipped, 1);
+    assert_eq!(tick.deferred, 1);
+    assert_eq!(tick.skipped, 0);
     assert!(store
         .runtime_jobs_for_command(&command_id)
         .await?
         .is_empty());
-    assert_eq!(store.commands_for(&workflow.id).await?[0].status, "skipped");
-    assert!(state.intake.github_token_dispatch_snapshot().is_empty());
+    let persisted = &store.commands_for(&workflow.id).await?[0];
+    assert_eq!(persisted.status, "deferred");
+    assert_eq!(persisted.dispatch_attempt_count, 1);
+    assert_eq!(persisted.dispatch_claim_generation, 1);
+    assert_eq!(
+        persisted
+            .dispatch_barrier
+            .as_ref()
+            .expect("policy barrier should be persisted")
+            .reason_code
+            .as_str(),
+        "runtime_policy_disabled"
+    );
+    let metrics_while_disabled = state.intake.github_token_dispatch_snapshot();
+    assert!(metrics_while_disabled.is_empty());
+
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\n  runtime_profile: project-runtime\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET dispatch_not_before = CURRENT_TIMESTAMP - INTERVAL '1 second',
+             dispatch_barrier = jsonb_set(
+                 dispatch_barrier, '{next_dispatch_at}',
+                 to_jsonb(to_char(
+                     CURRENT_TIMESTAMP - INTERVAL '1 second',
+                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+                 ))
+             )
+         WHERE id = $1",
+    )
+    .bind(&command_id)
+    .execute(store.pool())
+    .await?;
+    let repaired = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-fallback",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+    assert_eq!(repaired.enqueued, 1);
+    assert_eq!(repaired.deferred, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].command_id, command_id);
+    assert_eq!(jobs[0].runtime_profile, "project-runtime");
+    let repaired_command = store
+        .get_command(&command_id)
+        .await?
+        .expect("command exists");
+    assert_eq!(repaired_command.status, "dispatched");
+    assert_eq!(repaired_command.dispatch_attempt_count, 1);
+    assert_eq!(repaired_command.dispatch_claim_generation, 2);
+    assert!(repaired_command.dispatch_barrier.is_none());
+    let metrics_after_repair = state.intake.github_token_dispatch_snapshot();
+    assert_eq!(metrics_after_repair.len(), 1);
+    assert_eq!(metrics_after_repair[0].agent_implement_issue_count, 1);
     Ok(())
 }
 
