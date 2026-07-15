@@ -4,6 +4,25 @@ pub fn workflow_terminal_state(definition_id: &str, state: &str) -> Option<Workf
     super::state_registry::workflow_state_terminal_state(definition_id, state)
 }
 
+pub fn workflow_terminal_state_for_version(
+    definition_id: &str,
+    definition_version: u32,
+    state: &str,
+) -> Option<WorkflowTerminalState> {
+    super::state_registry::workflow_state_terminal_state_for_version(
+        definition_id,
+        definition_version,
+        state,
+    )
+}
+
+pub fn workflow_terminal_state_for_instance(
+    instance: &super::model::WorkflowInstance,
+) -> Option<WorkflowTerminalState> {
+    super::state_registry::workflow_state_definition_for_instance(instance, &instance.state)?
+        .terminal_state
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

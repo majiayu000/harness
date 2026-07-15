@@ -1,4 +1,6 @@
 use super::{
+    declarative::DeclarativeWorkflowDefinition,
+    model::WorkflowInstance,
     pr_feedback::PR_FEEDBACK_DEFINITION_ID,
     prompt_task::PROMPT_TASK_DEFINITION_ID,
     quality_gate::QUALITY_GATE_DEFINITION_ID,
@@ -8,6 +10,8 @@ use super::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
+
+mod versioning;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -96,9 +100,11 @@ impl RegisteredWorkflowDefinition {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WorkflowDefinitionRegistry {
     definitions: HashMap<String, Arc<RegisteredWorkflowDefinition>>,
+    declarative_versions: HashMap<(String, u32), Arc<DeclarativeWorkflowDefinition>>,
+    current_declarative_versions: HashMap<String, u32>,
     definition_ids: Vec<String>,
     frozen: bool,
 }
@@ -107,6 +113,8 @@ impl WorkflowDefinitionRegistry {
     pub fn new() -> Self {
         Self {
             definitions: HashMap::new(),
+            declarative_versions: HashMap::new(),
+            current_declarative_versions: HashMap::new(),
             definition_ids: Vec::new(),
             frozen: false,
         }
@@ -128,18 +136,55 @@ impl WorkflowDefinitionRegistry {
     }
 
     pub fn register(&mut self, definition: RegisteredWorkflowDefinition) -> anyhow::Result<()> {
-        if self.frozen {
-            anyhow::bail!(
-                "workflow definition registry is frozen; cannot register '{}'",
-                definition.id
-            );
-        }
+        self.ensure_mutable(&definition.id)?;
         if self.definitions.contains_key(&definition.id) {
             anyhow::bail!(
                 "workflow definition '{}' is already registered",
                 definition.id
             );
         }
+        if self
+            .declarative_versions
+            .keys()
+            .any(|(definition_id, _)| definition_id == &definition.id)
+        {
+            anyhow::bail!(
+                "workflow definition '{}' has registered declarative history",
+                definition.id
+            );
+        }
+        Self::validate_registered_definition(&definition)?;
+        self.definition_ids.push(definition.id.clone());
+        self.definitions
+            .insert(definition.id.clone(), Arc::new(definition));
+        Ok(())
+    }
+
+    pub fn register_batch(
+        &mut self,
+        definitions: impl IntoIterator<Item = RegisteredWorkflowDefinition>,
+    ) -> anyhow::Result<()> {
+        let mut staged = self.clone();
+        for definition in definitions {
+            staged.register(definition)?;
+        }
+        *self = staged;
+        Ok(())
+    }
+
+    fn ensure_mutable(&self, definition_id: &str) -> anyhow::Result<()> {
+        if self.frozen {
+            anyhow::bail!(
+                "workflow definition registry is frozen; cannot register '{}'",
+                definition_id
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_registered_definition(
+        definition: &RegisteredWorkflowDefinition,
+    ) -> anyhow::Result<()> {
         if let Some(state) = definition
             .states
             .iter()
@@ -151,9 +196,6 @@ impl WorkflowDefinitionRegistry {
                 state.key.state
             );
         }
-        self.definition_ids.push(definition.id.clone());
-        self.definitions
-            .insert(definition.id.clone(), Arc::new(definition));
         Ok(())
     }
 
@@ -204,6 +246,24 @@ pub fn register_workflow_definition(
         .register(definition)
 }
 
+pub fn register_declarative_workflow_definitions(
+    definitions: impl IntoIterator<Item = DeclarativeWorkflowDefinition>,
+) -> anyhow::Result<()> {
+    registry()
+        .write()
+        .expect("workflow definition registry lock poisoned")
+        .register_declarative_current_batch(definitions)
+}
+
+pub fn register_historical_declarative_workflow_definitions(
+    definitions: impl IntoIterator<Item = DeclarativeWorkflowDefinition>,
+) -> anyhow::Result<()> {
+    registry()
+        .write()
+        .expect("workflow definition registry lock poisoned")
+        .register_declarative_historical_batch(definitions)
+}
+
 pub fn freeze_workflow_definition_registry() {
     registry()
         .write()
@@ -216,6 +276,26 @@ pub fn workflow_definition(definition_id: &str) -> Option<Arc<RegisteredWorkflow
         .read()
         .expect("workflow definition registry lock poisoned")
         .definition(definition_id)
+}
+
+pub fn workflow_declarative_definition(
+    definition_id: &str,
+    definition_version: u32,
+) -> Option<Arc<DeclarativeWorkflowDefinition>> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .declarative_definition(definition_id, definition_version)
+}
+
+pub fn workflow_definition_for_version(
+    definition_id: &str,
+    definition_version: u32,
+) -> Option<Arc<RegisteredWorkflowDefinition>> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .definition_for_version(definition_id, definition_version)
 }
 
 pub fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionValidator> {
@@ -264,6 +344,27 @@ pub fn workflow_state_definition(
     })
 }
 
+pub fn workflow_state_definition_for_version(
+    definition_id: &str,
+    definition_version: u32,
+    state: &str,
+) -> Option<WorkflowStateDefinition> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .state_definition_for_version(definition_id, definition_version, state)
+}
+
+pub fn workflow_state_definition_for_instance(
+    instance: &WorkflowInstance,
+    state: &str,
+) -> Option<WorkflowStateDefinition> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .state_definition_for_instance(instance, state)
+}
+
 pub fn workflow_state_exists(definition_id: &str, state: &str) -> bool {
     workflow_state_definition(definition_id, state).is_some()
 }
@@ -280,6 +381,22 @@ pub fn workflow_state_progress_mode(
     state: &str,
 ) -> Option<WorkflowProgressMode> {
     workflow_state_definition(definition_id, state)?.progress_mode
+}
+
+pub fn workflow_state_progress_mode_for_version(
+    definition_id: &str,
+    definition_version: u32,
+    state: &str,
+) -> Option<WorkflowProgressMode> {
+    workflow_state_definition_for_version(definition_id, definition_version, state)?.progress_mode
+}
+
+pub fn workflow_state_terminal_state_for_version(
+    definition_id: &str,
+    definition_version: u32,
+    state: &str,
+) -> Option<WorkflowTerminalState> {
+    workflow_state_definition_for_version(definition_id, definition_version, state)?.terminal_state
 }
 
 fn builtin_definitions() -> [RegisteredWorkflowDefinition; 4] {
@@ -481,232 +598,3 @@ fn terminal(
 #[cfg(test)]
 #[path = "state_registry_equivalence_tests.rs"]
 mod equivalence_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::runtime::validator::TransitionAllowlist;
-
-    #[test]
-    fn registry_scopes_success_states_to_workflow_definitions() {
-        assert_eq!(
-            workflow_state_terminal_state(QUALITY_GATE_DEFINITION_ID, "passed"),
-            Some(WorkflowTerminalState::Succeeded)
-        );
-        assert_eq!(
-            workflow_state_terminal_state(GITHUB_ISSUE_PR_DEFINITION_ID, "passed"),
-            None
-        );
-        assert_eq!(
-            workflow_state_terminal_state(QUALITY_GATE_DEFINITION_ID, "done"),
-            None
-        );
-    }
-
-    #[test]
-    fn registry_lists_only_known_definition_states() {
-        assert_eq!(
-            known_workflow_definition_ids(),
-            vec![
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                PROMPT_TASK_DEFINITION_ID,
-                QUALITY_GATE_DEFINITION_ID,
-                PR_FEEDBACK_DEFINITION_ID,
-            ]
-        );
-        assert!(workflow_states_for_definition("unknown_workflow").is_empty());
-        assert!(workflow_state_exists(
-            GITHUB_ISSUE_PR_DEFINITION_ID,
-            "awaiting_feedback"
-        ));
-        assert!(!workflow_state_exists(
-            GITHUB_ISSUE_PR_DEFINITION_ID,
-            "inspecting"
-        ));
-    }
-
-    #[test]
-    fn registry_lists_terminal_state_names_by_definition() {
-        assert_eq!(
-            workflow_terminal_state_names_for_definition(GITHUB_ISSUE_PR_DEFINITION_ID),
-            vec!["done", "failed", "cancelled"]
-        );
-        assert_eq!(
-            workflow_terminal_state_names_for_definition(QUALITY_GATE_DEFINITION_ID),
-            vec!["passed", "failed", "cancelled"]
-        );
-        assert!(workflow_terminal_state_names_for_definition("unknown_workflow").is_empty());
-    }
-
-    #[test]
-    fn registry_covers_validator_transition_states() {
-        let allowlists = [
-            (
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                TransitionAllowlist::github_issue_pr_defaults(),
-            ),
-            (
-                PROMPT_TASK_DEFINITION_ID,
-                TransitionAllowlist::prompt_task_defaults(),
-            ),
-            (
-                QUALITY_GATE_DEFINITION_ID,
-                TransitionAllowlist::quality_gate_defaults(),
-            ),
-            (
-                PR_FEEDBACK_DEFINITION_ID,
-                TransitionAllowlist::pr_feedback_defaults(),
-            ),
-        ];
-
-        for (definition_id, allowlist) in allowlists {
-            let definition = workflow_definition(definition_id)
-                .expect("built-in workflow definition should be registered");
-            for state in &definition.states {
-                assert!(
-                    state.has_complete_progress_contract(),
-                    "{definition_id}.{} must declare exactly one progress or terminal contract",
-                    state.key.state
-                );
-            }
-            for rule in allowlist.rules() {
-                if let Some(from_state) = rule.from_state.as_deref() {
-                    assert!(
-                        workflow_state_exists(definition_id, from_state),
-                        "{definition_id} missing from_state {from_state}"
-                    );
-                }
-                assert!(
-                    workflow_state_definition(definition_id, &rule.to_state)
-                        .is_some_and(|state| state.has_complete_progress_contract()),
-                    "{definition_id} to_state {} is missing a complete contract",
-                    rule.to_state,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn progress_mode_lookup_fails_closed_for_terminal_and_unknown_states() {
-        assert_eq!(
-            workflow_state_progress_mode(GITHUB_ISSUE_PR_DEFINITION_ID, "implementing"),
-            Some(WorkflowProgressMode::CommandDriven)
-        );
-        assert_eq!(
-            workflow_state_progress_mode(GITHUB_ISSUE_PR_DEFINITION_ID, "done"),
-            None
-        );
-        assert_eq!(
-            workflow_state_progress_mode(GITHUB_ISSUE_PR_DEFINITION_ID, "unknown"),
-            None
-        );
-        assert_eq!(
-            workflow_state_progress_mode("unknown_definition", "implementing"),
-            None
-        );
-    }
-
-    #[test]
-    fn state_key_clones_reuse_owned_string_allocations() {
-        let state = workflow_state_definition(PROMPT_TASK_DEFINITION_ID, "implementing")
-            .expect("prompt task implementing state should exist");
-        let cloned = state.key.clone();
-
-        assert!(Arc::ptr_eq(&state.key.definition_id, &cloned.definition_id));
-        assert!(Arc::ptr_eq(&state.key.state, &cloned.state));
-    }
-
-    #[test]
-    fn duplicate_registration_fails_without_replacing_the_first_definition() {
-        let mut registry = WorkflowDefinitionRegistry::new_for_tests();
-        let first = definition(
-            "fixture",
-            vec![active(
-                "fixture",
-                "pending",
-                WorkflowProgressMode::ExternalWait,
-            )],
-            TransitionAllowlist::default(),
-        );
-        let duplicate = definition(
-            "fixture",
-            vec![active(
-                "fixture",
-                "other",
-                WorkflowProgressMode::ExternalWait,
-            )],
-            TransitionAllowlist::default(),
-        );
-
-        registry
-            .register(first)
-            .expect("first registration should pass");
-        let error = registry
-            .register(duplicate)
-            .expect_err("duplicate registration should fail");
-
-        assert!(error.to_string().contains("already registered"));
-        assert!(registry
-            .definition("fixture")
-            .is_some_and(|definition| definition.states[0].key.state.as_ref() == "pending"));
-    }
-
-    #[test]
-    fn freeze_is_idempotent_and_rejects_late_registration() {
-        let mut registry = WorkflowDefinitionRegistry::new_for_tests();
-        registry.freeze();
-        registry.freeze();
-
-        let error = registry
-            .register(definition(
-                "late",
-                vec![active(
-                    "late",
-                    "pending",
-                    WorkflowProgressMode::ExternalWait,
-                )],
-                TransitionAllowlist::default(),
-            ))
-            .expect_err("post-freeze registration should fail");
-
-        assert!(registry.is_frozen());
-        assert!(error.to_string().contains("is frozen"));
-        assert!(registry.definition("late").is_none());
-    }
-
-    #[test]
-    fn registration_rejects_incomplete_or_conflicting_progress_contracts() {
-        let invalid_states = [
-            WorkflowStateDefinition {
-                key: WorkflowStateKey {
-                    definition_id: Arc::from("fixture"),
-                    state: Arc::from("missing"),
-                },
-                progress_mode: None,
-                terminal_state: None,
-            },
-            WorkflowStateDefinition {
-                key: WorkflowStateKey {
-                    definition_id: Arc::from("fixture"),
-                    state: Arc::from("conflicting"),
-                },
-                progress_mode: Some(WorkflowProgressMode::OperatorGate),
-                terminal_state: Some(WorkflowTerminalState::Failed),
-            },
-        ];
-
-        for state in invalid_states {
-            let mut registry = WorkflowDefinitionRegistry::new_for_tests();
-            let error = registry
-                .register(RegisteredWorkflowDefinition::new(
-                    "fixture",
-                    vec![state],
-                    TransitionAllowlist::default(),
-                ))
-                .expect_err("invalid state contract should fail registration");
-
-            assert!(error.to_string().contains("exactly one"));
-            assert!(registry.definition("fixture").is_none());
-        }
-    }
-}

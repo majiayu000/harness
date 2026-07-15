@@ -5,7 +5,7 @@ use super::errors::RuntimeJobNotFoundError;
 use super::model::{
     ActivityResult, ActivityStatus, RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind,
     WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision,
-    WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowInstance, WorkflowLease,
+    WorkflowDecisionRecord, WorkflowEvent, WorkflowInstance, WorkflowLease,
 };
 use super::status::WorkflowCommandStatus;
 use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
@@ -21,6 +21,8 @@ use std::path::Path;
 
 #[path = "store/commands.rs"]
 mod command_store;
+#[path = "store/definitions.rs"]
+mod definitions;
 #[path = "store/driverless_progress.rs"]
 mod driverless_progress;
 #[path = "store/instance_helpers.rs"]
@@ -246,42 +248,6 @@ impl WorkflowRuntimeStore {
     }
     pub fn pool(&self) -> &PgPool {
         &self.pool
-    }
-    pub async fn upsert_definition(&self, definition: &WorkflowDefinition) -> anyhow::Result<()> {
-        let data = to_jsonb_string(definition)?;
-        sqlx::query(
-            "INSERT INTO workflow_definitions (id, version, data, active)
-             VALUES ($1, $2, $3::jsonb, $4)
-             ON CONFLICT (id, version) DO UPDATE SET
-                data = EXCLUDED.data,
-                active = EXCLUDED.active,
-                updated_at = CURRENT_TIMESTAMP",
-        )
-        .bind(&definition.id)
-        .bind(definition.version as i64)
-        .bind(&data)
-        .bind(definition.active)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn get_definition(
-        &self,
-        id: &str,
-        version: u32,
-    ) -> anyhow::Result<Option<WorkflowDefinition>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT data::text FROM workflow_definitions
-             WHERE id = $1 AND version = $2",
-        )
-        .bind(id)
-        .bind(version as i64)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|(data,)| serde_json::from_str(&data))
-            .transpose()
-            .map_err(Into::into)
     }
     pub async fn upsert_prompt_payload(
         &self,

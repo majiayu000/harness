@@ -10,6 +10,8 @@ mod candidate_promotion;
 mod candidate_selection;
 mod candidate_terminal;
 mod command_record;
+pub mod declarative;
+mod declarative_pinning;
 mod dispatch_barrier;
 pub mod dispatcher;
 pub mod errors;
@@ -61,6 +63,11 @@ pub use candidate_selection::{
     select_candidate, CandidateCheckConclusion, CandidateDiffScope, CandidateEvidence,
     CandidateOutcome, CandidatePromotionRecord, CandidateRankingRecord, CandidateSelectionInput,
     CandidateSelectionRecord, CANDIDATE_SELECTION_RECORD_TYPE, CANDIDATE_SELECTION_SCHEMA,
+};
+pub use declarative::{build_declarative_definition, DeclarativeWorkflowDefinition};
+pub use declarative_pinning::{
+    declarative_definition_identity, hydrate_declarative_definition,
+    persisted_declarative_definition,
 };
 pub use dispatch_barrier::{
     DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrier, DispatchBarrierInput,
@@ -142,8 +149,12 @@ pub use repo_memory::{
 };
 pub use state_registry::{
     decision_validator_for_definition, freeze_workflow_definition_registry,
-    known_workflow_definition_ids, register_workflow_definition, workflow_definition,
-    workflow_state_definition, workflow_state_exists, workflow_state_progress_mode,
+    known_workflow_definition_ids, register_declarative_workflow_definitions,
+    register_historical_declarative_workflow_definitions, register_workflow_definition,
+    workflow_declarative_definition, workflow_definition, workflow_definition_for_version,
+    workflow_state_definition, workflow_state_definition_for_instance,
+    workflow_state_definition_for_version, workflow_state_exists, workflow_state_progress_mode,
+    workflow_state_progress_mode_for_version, workflow_state_terminal_state_for_version,
     workflow_states_for_definition, workflow_terminal_state_names_for_definition,
     RegisteredWorkflowDefinition, WorkflowDefinitionRegistry, WorkflowProgressMode,
     WorkflowStateDefinition, WorkflowStateKey,
@@ -161,7 +172,10 @@ pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,
     IssueSubmissionWorkflowAction, SubmissionMode,
 };
-pub use terminal_state::{workflow_terminal_state, WorkflowTerminalState};
+pub use terminal_state::{
+    workflow_terminal_state, workflow_terminal_state_for_instance,
+    workflow_terminal_state_for_version, WorkflowTerminalState,
+};
 pub use tier_resolution::{resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution};
 pub use validator::{
     DecisionValidator, TransitionAllowlist, TransitionRule, ValidationContext,

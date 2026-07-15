@@ -402,6 +402,229 @@ fn progress_mode_semantics_match_authoritative_ownership_matrix() {
     }
 }
 
+#[test]
+fn registry_scopes_success_states_to_workflow_definitions() {
+    assert_eq!(
+        workflow_state_terminal_state(QUALITY_GATE_DEFINITION_ID, "passed"),
+        Some(WorkflowTerminalState::Succeeded)
+    );
+    assert_eq!(
+        workflow_state_terminal_state(GITHUB_ISSUE_PR_DEFINITION_ID, "passed"),
+        None
+    );
+    assert_eq!(
+        workflow_state_terminal_state(QUALITY_GATE_DEFINITION_ID, "done"),
+        None
+    );
+}
+
+#[test]
+fn registry_lists_only_known_definition_states() {
+    assert_eq!(
+        known_workflow_definition_ids(),
+        vec![
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            PROMPT_TASK_DEFINITION_ID,
+            QUALITY_GATE_DEFINITION_ID,
+            PR_FEEDBACK_DEFINITION_ID,
+        ]
+    );
+    assert!(workflow_states_for_definition("unknown_workflow").is_empty());
+    assert!(workflow_state_exists(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        "awaiting_feedback"
+    ));
+    assert!(!workflow_state_exists(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        "inspecting"
+    ));
+}
+
+#[test]
+fn registry_lists_terminal_state_names_by_definition() {
+    assert_eq!(
+        workflow_terminal_state_names_for_definition(GITHUB_ISSUE_PR_DEFINITION_ID),
+        vec!["done", "failed", "cancelled"]
+    );
+    assert_eq!(
+        workflow_terminal_state_names_for_definition(QUALITY_GATE_DEFINITION_ID),
+        vec!["passed", "failed", "cancelled"]
+    );
+    assert!(workflow_terminal_state_names_for_definition("unknown_workflow").is_empty());
+}
+
+#[test]
+fn registry_covers_validator_transition_states() {
+    let allowlists = [
+        (
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            TransitionAllowlist::github_issue_pr_defaults(),
+        ),
+        (
+            PROMPT_TASK_DEFINITION_ID,
+            TransitionAllowlist::prompt_task_defaults(),
+        ),
+        (
+            QUALITY_GATE_DEFINITION_ID,
+            TransitionAllowlist::quality_gate_defaults(),
+        ),
+        (
+            PR_FEEDBACK_DEFINITION_ID,
+            TransitionAllowlist::pr_feedback_defaults(),
+        ),
+    ];
+
+    for (definition_id, allowlist) in allowlists {
+        let definition = workflow_definition(definition_id)
+            .expect("built-in workflow definition should be registered");
+        for state in &definition.states {
+            assert!(
+                state.has_complete_progress_contract(),
+                "{definition_id}.{} must declare exactly one progress or terminal contract",
+                state.key.state
+            );
+        }
+        for rule in allowlist.rules() {
+            if let Some(from_state) = rule.from_state.as_deref() {
+                assert!(
+                    workflow_state_exists(definition_id, from_state),
+                    "{definition_id} missing from_state {from_state}"
+                );
+            }
+            assert!(
+                workflow_state_definition(definition_id, &rule.to_state)
+                    .is_some_and(|state| state.has_complete_progress_contract()),
+                "{definition_id} to_state {} is missing a complete contract",
+                rule.to_state,
+            );
+        }
+    }
+}
+
+#[test]
+fn progress_mode_lookup_fails_closed_for_terminal_and_unknown_states() {
+    assert_eq!(
+        workflow_state_progress_mode(GITHUB_ISSUE_PR_DEFINITION_ID, "implementing"),
+        Some(WorkflowProgressMode::CommandDriven)
+    );
+    assert_eq!(
+        workflow_state_progress_mode(GITHUB_ISSUE_PR_DEFINITION_ID, "done"),
+        None
+    );
+    assert_eq!(
+        workflow_state_progress_mode(GITHUB_ISSUE_PR_DEFINITION_ID, "unknown"),
+        None
+    );
+    assert_eq!(
+        workflow_state_progress_mode("unknown_definition", "implementing"),
+        None
+    );
+}
+
+#[test]
+fn state_key_clones_reuse_owned_string_allocations() {
+    let state = workflow_state_definition(PROMPT_TASK_DEFINITION_ID, "implementing")
+        .expect("prompt task implementing state should exist");
+    let cloned = state.key.clone();
+
+    assert!(Arc::ptr_eq(&state.key.definition_id, &cloned.definition_id));
+    assert!(Arc::ptr_eq(&state.key.state, &cloned.state));
+}
+
+#[test]
+fn duplicate_registration_fails_without_replacing_the_first_definition() {
+    let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+    let first = definition(
+        "fixture",
+        vec![active(
+            "fixture",
+            "pending",
+            WorkflowProgressMode::ExternalWait,
+        )],
+        TransitionAllowlist::default(),
+    );
+    let duplicate = definition(
+        "fixture",
+        vec![active(
+            "fixture",
+            "other",
+            WorkflowProgressMode::ExternalWait,
+        )],
+        TransitionAllowlist::default(),
+    );
+
+    registry
+        .register(first)
+        .expect("first registration should pass");
+    let error = registry
+        .register(duplicate)
+        .expect_err("duplicate registration should fail");
+
+    assert!(error.to_string().contains("already registered"));
+    assert!(registry
+        .definition("fixture")
+        .is_some_and(|definition| definition.states[0].key.state.as_ref() == "pending"));
+}
+
+#[test]
+fn freeze_is_idempotent_and_rejects_late_registration() {
+    let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+    registry.freeze();
+    registry.freeze();
+
+    let error = registry
+        .register(definition(
+            "late",
+            vec![active(
+                "late",
+                "pending",
+                WorkflowProgressMode::ExternalWait,
+            )],
+            TransitionAllowlist::default(),
+        ))
+        .expect_err("post-freeze registration should fail");
+
+    assert!(registry.is_frozen());
+    assert!(error.to_string().contains("is frozen"));
+    assert!(registry.definition("late").is_none());
+}
+
+#[test]
+fn registration_rejects_incomplete_or_conflicting_progress_contracts() {
+    let invalid_states = [
+        WorkflowStateDefinition {
+            key: WorkflowStateKey {
+                definition_id: Arc::from("fixture"),
+                state: Arc::from("missing"),
+            },
+            progress_mode: None,
+            terminal_state: None,
+        },
+        WorkflowStateDefinition {
+            key: WorkflowStateKey {
+                definition_id: Arc::from("fixture"),
+                state: Arc::from("conflicting"),
+            },
+            progress_mode: Some(WorkflowProgressMode::OperatorGate),
+            terminal_state: Some(WorkflowTerminalState::Failed),
+        },
+    ];
+
+    for state in invalid_states {
+        let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+        let error = registry
+            .register(RegisteredWorkflowDefinition::new(
+                "fixture",
+                vec![state],
+                TransitionAllowlist::default(),
+            ))
+            .expect_err("invalid state contract should fail registration");
+
+        assert!(error.to_string().contains("exactly one"));
+        assert!(registry.definition("fixture").is_none());
+    }
+}
+
 const E: &str = "enqueue_activity";
 const S: &str = "start_child_workflow";
 const B: &str = "bind_pr";

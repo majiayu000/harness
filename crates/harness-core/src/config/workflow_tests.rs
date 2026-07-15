@@ -80,6 +80,7 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert_eq!(cfg.storage.task_retention_interval_secs, 3600);
     assert!(!cfg.issue_workflow.require_human_gate_before_merge);
     assert!(cfg.activities.is_empty());
+    assert!(cfg.definition.is_none());
     Ok(())
 }
 
@@ -596,6 +597,112 @@ fn deep_merge_yaml_null_override_keeps_base() {
     let over: serde_yaml::Value = serde_yaml::from_str("a: ~\n").unwrap();
     let merged = deep_merge_yaml(base, over);
     assert_eq!(merged["a"].as_u64(), Some(1));
+}
+
+#[test]
+fn load_workflow_document_parses_and_atomically_replaces_definition() -> anyhow::Result<()> {
+    let base_dir = tempfile::tempdir()?;
+    let base_path = base_dir.path().join("WORKFLOW.md");
+    std::fs::write(
+        &base_path,
+        "---\ndefinition:\n  id: base\n  initial: base_start\n  states:\n    base_start: {}\n  recovery_targets: [base_start]\n---\n",
+    )?;
+    let repo_dir = tempfile::tempdir()?;
+    std::fs::write(
+        repo_dir.path().join("WORKFLOW.md"),
+        r#"---
+definition:
+  id: docs_review
+  initial: review
+  states:
+    review:
+      activity: inspect_docs
+      on_success: approval
+      on_failure: failed
+      on_blocked: approval
+      on_signal:
+        changes_requested: review
+    approval:
+      progress: operator_gate
+    external_input:
+      progress: external_wait
+    done: {}
+    failed: {}
+    cancelled: {}
+  terminal:
+    done: succeeded
+    failed: failed
+    cancelled: cancelled
+  evidence_required:
+    done: [validation_report]
+  recovery_targets: [review]
+---
+"#,
+    )?;
+
+    let definition = load_workflow_document_with_base(repo_dir.path(), Some(&base_path))?
+        .config
+        .definition
+        .expect("repo definition should parse");
+    assert_eq!(definition.id, "docs_review");
+    assert_eq!(definition.initial, "review");
+    assert_eq!(
+        definition.states["review"].activity.as_deref(),
+        Some("inspect_docs")
+    );
+    assert_eq!(
+        definition.states["approval"].progress,
+        Some(DeclaredProgressMode::OperatorGate)
+    );
+    assert_eq!(
+        definition.states["external_input"].progress,
+        Some(DeclaredProgressMode::ExternalWait)
+    );
+    assert_eq!(
+        definition.states["review"].on_signal["changes_requested"],
+        "review"
+    );
+    assert_eq!(definition.terminal["done"], "succeeded");
+    assert_eq!(definition.evidence_required["done"], ["validation_report"]);
+    assert_eq!(definition.recovery_targets, ["review"]);
+    assert!(!definition.states.contains_key("base_start"));
+    Ok(())
+}
+
+#[test]
+fn load_workflow_document_rejects_empty_definition_identifiers() -> anyhow::Result<()> {
+    let cases = [
+        ("  id: ' '\n  initial: start\n  states: {start: {}}", "id"),
+        (
+            "  id: docs\n  initial: ' '\n  states: {start: {}}",
+            "initial state",
+        ),
+        (
+            "  id: docs\n  initial: start\n  states: {' ': {}}",
+            "state name",
+        ),
+        (
+            "  id: docs\n  initial: start\n  states:\n    start: {activity: ' '}",
+            "activity",
+        ),
+        (
+            "  id: docs\n  initial: start\n  states:\n    start:\n      on_signal: {' ': done}",
+            "signal type",
+        ),
+    ];
+    for (definition, expected) in cases {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            format!("---\ndefinition:\n{definition}\n---\n"),
+        )?;
+        let error = load_workflow_document(dir.path()).expect_err("empty identifier must fail");
+        assert!(
+            format!("{error:#}").contains(expected),
+            "unexpected error: {error:#}"
+        );
+    }
+    Ok(())
 }
 
 #[test]
