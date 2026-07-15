@@ -388,3 +388,312 @@ async fn durable_store_lists_nonterminal_instances_by_definition() -> anyhow::Re
     assert!(!ids.contains(&other_project.id));
     Ok(())
 }
+
+#[tokio::test]
+async fn driverless_completion_is_rejected_atomically() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = issue_instance("replanning")
+        .with_id("issue-driverless-completion")
+        .with_data(json!({ "marker": "must-remain" }));
+    store.upsert_instance(&instance).await?;
+
+    let stale_command = WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        "stale-active-work-from-an-older-decision",
+    );
+    let stale_command_id = store
+        .enqueue_command(&instance.id, None, &stale_command)
+        .await?;
+    let stale_job = store
+        .enqueue_runtime_job(
+            &stale_command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            json!({ "workflow_id": instance.id, "activity": "implement_issue" }),
+        )
+        .await?;
+    let driverless = WorkflowDecision::new(
+        &instance.id,
+        "replanning",
+        "resume_implementation_after_replan",
+        "implementing",
+        "Resume implementation without durable work.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "Waiting is not a progress driver.",
+        "driverless-completion-wait",
+    ));
+
+    let first_completion = store.commit_runtime_completion_decision_for_test(
+        &instance.id,
+        "runtime-1",
+        json!({
+            "command_id": "completed-command",
+            "runtime_job_id": "completed-job",
+        }),
+        &driverless,
+    );
+    let replayed_completion = store.commit_runtime_completion_decision_for_test(
+        &instance.id,
+        "runtime-2",
+        json!({
+            "command_id": "replayed-command",
+            "runtime_job_id": "replayed-job",
+        }),
+        &driverless,
+    );
+    let (first_record, replayed_record) = tokio::join!(first_completion, replayed_completion);
+    let record = first_record?
+        .expect("completion should persist a rejected decision");
+    let replayed_record = replayed_record?
+        .expect("replayed completion should persist a rejected decision");
+
+    for rejected in [&record, &replayed_record] {
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.decision, driverless);
+        assert!(rejected
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("ProgressDriverMissing:")));
+    }
+    let after = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("workflow instance should remain visible");
+    assert_eq!(after.state, instance.state);
+    assert_eq!(after.version, instance.version);
+    assert_eq!(after.data, instance.data);
+
+    let decisions = store.decisions_for(&instance.id).await?;
+    assert_eq!(decisions.len(), 2);
+    assert!(decisions.iter().all(|decision| !decision.accepted));
+    assert!(decisions
+        .iter()
+        .any(|decision| decision.id == record.id));
+    assert!(decisions
+        .iter()
+        .any(|decision| decision.id == replayed_record.id));
+    assert_eq!(store.events_for(&instance.id).await?.len(), 2);
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].id, stale_command_id);
+    assert_eq!(commands[0].decision_id, None);
+    let jobs = store.runtime_jobs_for_command(&stale_command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, stale_job.id);
+    assert_eq!(jobs[0].status, RuntimeJobStatus::Pending);
+    let counts = store
+        .detail_counts_for_workflows(std::slice::from_ref(&instance.id))
+        .await?
+        .remove(&instance.id)
+        .expect("workflow detail counts should be present");
+    assert_eq!(counts.rejected_decision_count, 2);
+    assert_eq!(counts.command_count, 1);
+    assert_eq!(counts.runtime_job_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = issue_instance("replanning")
+        .with_id("issue-driverless-production-completion")
+        .with_data(json!({ "marker": "must-remain" }));
+    store.upsert_instance(&instance).await?;
+
+    let state_entry = WorkflowDecision::new(
+        &instance.id,
+        "implementing",
+        "run_replan",
+        "replanning",
+        "Replan before resuming implementation.",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "replan_issue",
+        "driverless-production-replan",
+    ));
+    let state_entry_record = WorkflowDecisionRecord::accepted(state_entry.clone(), None);
+    store.record_decision(&state_entry_record).await?;
+    let command_id = store
+        .enqueue_command(
+            &instance.id,
+            Some(&state_entry_record.id),
+            &state_entry.commands[0],
+        )
+        .await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-high",
+            json!({ "workflow_id": instance.id, "activity": "replan_issue" }),
+        )
+        .await?;
+    let claimed = store
+        .claim_next_runtime_job("runtime-1", Utc::now() + Duration::minutes(5))
+        .await?
+        .expect("runtime job should be claimable");
+    assert_eq!(claimed.id, job.id);
+    let lease_expires_at = claimed
+        .lease
+        .as_ref()
+        .expect("claimed runtime job should have a lease")
+        .expires_at;
+
+    let driverless = WorkflowDecision::new(
+        &instance.id,
+        "replanning",
+        "resume_implementation_after_replan",
+        "implementing",
+        "Resume implementation without durable work.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "Waiting is not a progress driver.",
+        "driverless-production-wait",
+    ));
+    let result = ActivityResult::succeeded("replan_issue", "Replan completed.").with_artifact(
+        ActivityArtifact::new(
+            "workflow_decision",
+            serde_json::to_value(&driverless)?,
+        ),
+    );
+
+    let first = store.commit_runtime_activity_completion_if_owned(
+        &claimed.id,
+        "runtime-1",
+        lease_expires_at,
+        &result,
+    );
+    let replay = store.commit_runtime_activity_completion_if_owned(
+        &claimed.id,
+        "runtime-1",
+        lease_expires_at,
+        &result,
+    );
+    let (first, replay) = tokio::join!(first, replay);
+    let first = first?;
+    let replay = replay?;
+    assert!(
+        first.is_some() ^ replay.is_some(),
+        "the runtime job lease must admit exactly one completion"
+    );
+    let winner = first.or(replay).expect("one completion should win");
+    let rejected = winner
+        .decision
+        .expect("the winning completion should persist a decision");
+    assert!(!rejected.accepted);
+    assert_eq!(rejected.decision, driverless);
+    assert!(rejected
+        .rejection_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("ProgressDriverMissing:")));
+
+    let after = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("workflow instance should remain visible");
+    assert_eq!(after.state, instance.state);
+    assert_eq!(after.version, instance.version);
+    assert_eq!(after.data, instance.data);
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].id, command_id);
+    assert_eq!(
+        commands[0].decision_id.as_deref(),
+        Some(state_entry_record.id.as_str())
+    );
+    assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, RuntimeJobStatus::Succeeded);
+    assert_eq!(store.events_for(&instance.id).await?.len(), 1);
+    let decisions = store.decisions_for(&instance.id).await?;
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions.iter().filter(|decision| decision.accepted).count(), 1);
+    assert_eq!(
+        decisions.iter().filter(|decision| !decision.accepted).count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = issue_instance("implementing").with_id("issue-closed-domain-winner");
+    store.upsert_instance(&instance).await?;
+    let driverless = WorkflowDecision::new(
+        &instance.id,
+        "implementing",
+        "run_replan",
+        "replanning",
+        "The agent requested replanning without durable work.",
+    )
+    .with_command(WorkflowCommand::wait(
+        "Waiting is not a progress driver.",
+        "closed-domain-driverless-wait",
+    ));
+    let result = ActivityResult::succeeded(
+        "implement_issue",
+        "The issue was already closed before implementation completed.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/123"
+        }),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&driverless)?,
+    ));
+
+    let record = store
+        .commit_parent_runtime_completion(
+            &instance.id,
+            "runtime-1",
+            json!({
+                "command_id": "closed-domain-command",
+                "runtime_job_id": "closed-domain-job",
+                "activity_result": result,
+            }),
+        )
+        .await?
+        .expect("closed issue evidence should produce a domain decision");
+
+    assert!(record.accepted);
+    assert_eq!(record.decision.decision, "finish_closed_issue");
+    assert_eq!(record.decision.next_state, "done");
+    assert_eq!(record.rejection_reason, None);
+    let after = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("workflow instance should remain visible");
+    assert_eq!(after.state, "done");
+    assert_eq!(after.version, instance.version.saturating_add(1));
+    let decisions = store.decisions_for(&instance.id).await?;
+    assert_eq!(decisions.len(), 1);
+    assert!(decisions[0].accepted);
+    let commands = store.commands_for(&instance.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.command_type, WorkflowCommandType::MarkDone);
+    assert_eq!(commands[0].decision_id.as_deref(), Some(record.id.as_str()));
+    Ok(())
+}
