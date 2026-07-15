@@ -69,6 +69,65 @@ async fn terminal_dispatcher_fast_path_rejects_reclaimed_generation() -> anyhow:
 }
 
 #[tokio::test]
+async fn non_runtime_dispatch_rejects_reclaimed_generation() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = project_issue_instance("/project-a", 1601, "pr_open");
+    store.upsert_instance(&workflow).await?;
+    let command = WorkflowCommand::bind_pr(
+        1617,
+        "https://github.com/majiayu000/harness/pull/1617",
+        "issue-1601-pr-1617",
+    );
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let old_claim = store
+        .claim_pending_commands("reused-owner", Utc::now() + Duration::minutes(1), 10)
+        .await?
+        .into_iter()
+        .find(|record| record.id == command_id)
+        .expect("pending command should be claimed");
+    let current_claim = reclaim_claim_with_same_owner(&store, &command_id, "reused-owner").await?;
+    assert_eq!(
+        current_claim.dispatch_claim_generation,
+        old_claim.dispatch_claim_generation + 1
+    );
+
+    let dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc),
+    )
+    .with_dispatcher_id("reused-owner");
+    let stale_outcome = dispatcher.dispatch_command(old_claim).await?;
+    assert!(matches!(stale_outcome, CommandDispatchOutcome::Skipped { .. }));
+    let after_stale = store.get_command(&command_id).await?.expect("command exists");
+    assert_eq!(after_stale.status, WorkflowCommandStatus::Dispatching);
+    assert_eq!(
+        after_stale.dispatch_claim_generation,
+        current_claim.dispatch_claim_generation
+    );
+    assert_eq!(after_stale.dispatch_owner.as_deref(), Some("reused-owner"));
+
+    let current_outcome = dispatcher.dispatch_command(current_claim).await?;
+    assert!(matches!(
+        current_outcome,
+        CommandDispatchOutcome::Skipped { .. }
+    ));
+    assert_eq!(
+        store
+            .get_command(&command_id)
+            .await?
+            .expect("command exists")
+            .status,
+        WorkflowCommandStatus::Skipped
+    );
+    assert!(store.runtime_jobs_for_command(&command_id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn same_owner_newer_generation_rejects_stale_deferral() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
