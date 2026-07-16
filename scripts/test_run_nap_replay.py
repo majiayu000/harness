@@ -217,6 +217,97 @@ class ReplayerTests(unittest.TestCase):
         self.assertEqual(_estimate_tokens("ab"), 1)
         self.assertEqual(_estimate_tokens("x" * 400), 100)
 
+    def test_failed_summarize_does_not_consume_sampling_seq(self) -> None:
+        # Mirrors PromptCompressor: seq increments only after a successful
+        # summarize, so transport failures must not shift later sampling.
+        class SummarizeFailsOnce(FakeChannel):
+            def __init__(self) -> None:
+                super().__init__()
+                self.failed = False
+
+            def complete(self, prompt: str) -> ChannelReply:
+                if '"intent"' not in prompt and not self.failed:
+                    self.failed = True
+                    raise ChannelError("injected summarize failure")
+                return super().complete(prompt)
+
+        manifest, sources = self._manifest_and_sources(observations=2)
+        recorded: list[int] = []
+
+        class RecordingSampler(SeededRateSampler):
+            def should_verify(self, seq: int) -> bool:
+                recorded.append(seq)
+                return False
+
+        replayer = self._replayer(SummarizeFailsOnce())
+        original = run_nap_replay.SeededRateSampler
+        run_nap_replay.SeededRateSampler = RecordingSampler
+        try:
+            result = replayer.replay(sources[0])
+        finally:
+            run_nap_replay.SeededRateSampler = original
+        # Two observations, first summarize fails: only one seq consumed.
+        self.assertEqual(recorded, [1])
+        self.assertGreater(result["untouched_raw_tokens"], 0)
+
+
+class ChannelArgvTests(unittest.TestCase):
+    def _capture_argv(self, channel, reply: bytes = b"ok") -> list[str]:
+        captured: dict[str, object] = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["input"] = kwargs.get("input")
+
+            class Result:
+                returncode = 0
+                stdout = reply
+                stderr = b""
+
+            for arg in argv:
+                if str(arg).endswith(".txt"):
+                    Path(str(arg)).write_bytes(reply)
+            return Result()
+
+        original = run_nap_replay.subprocess.run
+        run_nap_replay.subprocess.run = fake_run
+        try:
+            channel.complete("PROMPT")
+        finally:
+            run_nap_replay.subprocess.run = original
+            channel.close()
+        return captured["argv"], captured["input"]
+
+    def test_codex_argv_shape(self) -> None:
+        argv, stdin = self._capture_argv(run_nap_replay.CodexChannel("gpt-5.6-luna"))
+        self.assertEqual(argv[:2], ["codex", "exec"])
+        for flag in ("--sandbox", "--ephemeral", "--skip-git-repo-check"):
+            self.assertIn(flag, argv)
+        self.assertEqual(argv[-1], "-")
+        self.assertEqual(stdin, b"PROMPT")
+
+    def test_claude_argv_shape(self) -> None:
+        argv, stdin = self._capture_argv(run_nap_replay.ClaudeChannel("haiku"))
+        self.assertEqual(argv[0:2], ["claude", "-p"])
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertIn("--output-format", argv)
+        self.assertNotIn("--tools", argv)
+        self.assertEqual(stdin, b"PROMPT")
+
+
+class StateResumeTests(unittest.TestCase):
+    def test_corrupt_state_is_discarded_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            os.chmod(state_dir, 0o700)
+            bad = state_dir / "session_deadbeefdeadbeefdeadbeefdeadbeef.json"
+            bad.write_text("{truncated", encoding="utf-8")
+            result = run_nap_replay._load_state(
+                state_dir, "session_deadbeefdeadbeefdeadbeefdeadbeef"
+            )
+            self.assertIsNone(result)
+            self.assertFalse(bad.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

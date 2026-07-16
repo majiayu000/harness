@@ -268,9 +268,20 @@ class ClaudeChannel:
         self.workdir = Path(tempfile.mkdtemp(prefix="nap-replay-claude-"))
 
     def complete(self, prompt: str) -> ChannelReply:
+        # Prompt goes through stdin: observations can exceed ARG_MAX, so the
+        # argv form used by claude_adapter.rs is not viable here. `claude -p`
+        # reads piped stdin when no prompt argument follows the flag.
         try:
             result = subprocess.run(
-                [self.binary, "-p", "--model", self.model, "--tools", ""],
+                [
+                    self.binary,
+                    "-p",
+                    "--output-format",
+                    "text",
+                    "--model",
+                    self.model,
+                    "--dangerously-skip-permissions",
+                ],
                 input=prompt.encode("utf-8"),
                 capture_output=True,
                 timeout=AGENT_TIMEOUT_SECS,
@@ -393,7 +404,6 @@ class SessionReplayer:
         self.max_observation_bytes = max_observation_bytes
 
     def replay(self, source: SessionSource) -> dict[str, Any]:
-        self._session_key = source.session_key
         sampler = SeededRateSampler(self.nap_sample_rate, source.session_key)
         digest_key = hmac.new(
             self.salt, b"harness.nap-replay.source-content.v1", hashlib.sha256
@@ -441,8 +451,9 @@ class SessionReplayer:
                     )
                     totals["untouched_raw_tokens"] += raw_tokens
                     continue
-                seq += 1
-                self._replay_observation(text, raw_tokens, seq, sampler, totals)
+                seq = self._replay_observation(
+                    text, raw_tokens, seq, sampler, totals, source.session_key
+                )
                 breaker_tripped = self._breaker_open(totals)
         if not hmac.compare_digest(digest.hexdigest(), source.source_hmac):
             raise ReplayValidationError(
@@ -457,12 +468,11 @@ class SessionReplayer:
             "candidate_success": not breaker_tripped,
         }
 
-    def _warn(self, stage: str, seq: int, exc: Exception) -> None:
+    def _warn(self, stage: str, session_key: str, seq: int, exc: Exception) -> None:
         # Errors fall back to raw text (production semantics), but the
         # degradation must stay observable per run for gate review.
-        key = getattr(self, "_session_key", "unknown")
         print(
-            f"warn: {stage} failed for {key} obs#{seq}: {str(exc)[:200]}",
+            f"warn: {stage} failed for {session_key} obs#{seq}: {str(exc)[:200]}",
             file=sys.stderr,
         )
 
@@ -485,19 +495,27 @@ class SessionReplayer:
         seq: int,
         sampler: SeededRateSampler,
         totals: dict[str, int],
-    ) -> None:
+        session_key: str,
+    ) -> int:
+        """Replay one observation and return the (possibly consumed) seq.
+
+        Mirrors ``PromptCompressor::compress``: the sampling sequence number
+        is consumed only after a successful summarize call, so transport
+        failures do not shift which later observations get NAP-verified.
+        """
         try:
             compressed = self._complete(
                 _summarize_prompt(text, self.task_summary), totals
             )
         except ChannelError as exc:
-            self._warn("summarize", seq, exc)
+            self._warn("summarize", session_key, seq + 1, exc)
             totals["untouched_raw_tokens"] += raw_tokens
-            return
+            return seq
+        seq += 1
         compressed_tokens = _estimate_tokens(compressed)
         if not sampler.should_verify(seq):
             totals["compressed_tokens"] += compressed_tokens
-            return
+            return seq
         try:
             raw_sketch = _parse_sketch(
                 self._complete(_sketch_prompt(text, self.task_summary), totals)
@@ -506,15 +524,16 @@ class SessionReplayer:
                 self._complete(_sketch_prompt(compressed, self.task_summary), totals)
             )
         except (ChannelError, ReplayValidationError) as exc:
-            self._warn("sketch", seq, exc)
+            self._warn("sketch", session_key, seq, exc)
             totals["untouched_raw_tokens"] += raw_tokens
-            return
+            return seq
         totals["nap_checked"] += 1
         if _sketch_agreement(raw_sketch, compressed_sketch) >= SKETCH_AGREEMENT_MIN:
             totals["compressed_tokens"] += compressed_tokens
         else:
             totals["nap_failed"] += 1
             totals["fallback_raw_tokens"] += raw_tokens
+        return seq
 
 
 def _manifest_window(manifest: dict[str, Any]) -> tuple[date | None, date | None]:
@@ -555,7 +574,17 @@ def _load_state(state_dir: Path, session_key: str) -> dict[str, Any] | None:
     path = state_dir / f"{session_key}.json"
     if not path.exists():
         return None
-    state = _strict_json_load(path)
+    try:
+        state = _strict_json_load(path)
+    except ReplayValidationError as exc:
+        # A crash mid-write can leave a truncated file; replay the session
+        # instead of aborting the whole resumed run.
+        print(
+            f"warn: discarding corrupt replay state for {session_key}: {exc}",
+            file=sys.stderr,
+        )
+        path.unlink()
+        return None
     if not isinstance(state, dict) or set(state) != STATE_KEYS:
         raise ReplayValidationError(f"corrupt replay state for {session_key}")
     return state
@@ -645,7 +674,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--salt-env", default=DEFAULT_SALT_ENV)
     parser.add_argument("--channel", choices=("codex", "claude", "api"), default="codex")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="model id for the selected channel; the default fits --channel "
+        "codex, so override it when using claude or api",
+    )
     parser.add_argument("--min-size-bytes", type=int, default=DEFAULT_MIN_SIZE_BYTES)
     parser.add_argument(
         "--max-observation-bytes",
