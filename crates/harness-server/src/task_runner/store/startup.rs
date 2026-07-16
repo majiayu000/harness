@@ -1,0 +1,152 @@
+use super::*;
+
+impl TaskStore {
+    pub async fn open(db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
+        Self::open_with_database_url(db_path, None).await
+    }
+
+    pub async fn open_with_database_url(
+        db_path: &std::path::Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_with_database_url(db_path, configured_database_url).await?;
+        Self::from_task_db(db, db_path).await
+    }
+
+    pub async fn open_with_context(
+        db_path: &std::path::Path,
+        context: &PgStoreContext,
+        setup_pool: &sqlx::postgres::PgPool,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_with_context(context, setup_pool).await?;
+        Self::from_task_db(db, db_path).await
+    }
+
+    pub async fn open_shared_with_data_dir(
+        db_path: &std::path::Path,
+        context: &PgStoreContext,
+        setup_pool: &sqlx::postgres::PgPool,
+        data_dir: &std::path::Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_shared_with_data_dir(context, setup_pool, data_dir).await?;
+        crate::task_db::migrate_legacy_task_db_if_needed(db_path, configured_database_url, &db)
+            .await?;
+        Self::from_task_db(db, db_path).await
+    }
+
+    pub async fn open_shared_for_reconciliation_with_data_dir(
+        db_path: &std::path::Path,
+        context: &PgStoreContext,
+        setup_pool: &sqlx::postgres::PgPool,
+        data_dir: &std::path::Path,
+        configured_database_url: Option<&str>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let db = TaskDb::open_shared_with_data_dir(context, setup_pool, data_dir).await?;
+        crate::task_db::migrate_legacy_task_db_if_needed(db_path, configured_database_url, &db)
+            .await?;
+        Self::from_task_db_without_startup_recovery(db, db_path).await
+    }
+
+    async fn from_task_db(db: TaskDb, db_path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
+        Self::from_task_db_with_startup_recovery(db, db_path, true).await
+    }
+
+    async fn from_task_db_without_startup_recovery(
+        db: TaskDb,
+        db_path: &std::path::Path,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::from_task_db_with_startup_recovery(db, db_path, false).await
+    }
+
+    async fn from_task_db_with_startup_recovery(
+        db: TaskDb,
+        db_path: &std::path::Path,
+        run_startup_recovery: bool,
+    ) -> anyhow::Result<Arc<Self>> {
+        // 1. Event replay: runs BEFORE recover_in_progress so event-sourced
+        //    data (pr_url, terminal status) wins over checkpoint data.
+        let event_log_path = db_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("task-events.jsonl");
+        if run_startup_recovery {
+            if let Err(e) = crate::event_replay::replay_and_recover(&db, &event_log_path).await {
+                tracing::warn!("startup: event replay failed (non-fatal): {e}");
+            }
+
+            // 2. Legacy checkpoint-based recovery as fallback.
+            let recovery = db.recover_in_progress().await?;
+            if recovery.resumed > 0 {
+                tracing::info!(
+                    "startup recovery: resumed {} task(s) from checkpoint",
+                    recovery.resumed
+                );
+            }
+            if recovery.failed > 0 {
+                tracing::warn!(
+                    "startup recovery: marked {} interrupted task(s) as failed (no fresh checkpoint)",
+                    recovery.failed
+                );
+            }
+        }
+
+        // 3. Open the event log for appending during this server session.
+        let event_log = match crate::event_replay::TaskEventLog::open(&event_log_path) {
+            Ok(log) => {
+                tracing::debug!("task event log: {}", event_log_path.display());
+                Some(Arc::new(log))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to open task event log at {}: {e}",
+                    event_log_path.display()
+                );
+                None
+            }
+        };
+
+        let cache = DashMap::new();
+        let persist_locks = DashMap::new();
+        // Only load active (non-terminal) tasks into the in-memory cache to prevent
+        // unbounded memory growth from historical completed tasks.
+        let active_statuses = &[
+            "pending",
+            "awaiting_deps",
+            "triaging",
+            "planning",
+            "implementing",
+            "review_generating",
+            "review_waiting",
+            "planner_generating",
+            "planner_waiting",
+            "agent_review",
+            "waiting",
+            "reviewing",
+        ];
+        for task in db.list_by_status(active_statuses).await? {
+            persist_locks.insert(task.id.clone(), Arc::new(Mutex::new(())));
+            cache.insert(task.id.clone(), task);
+        }
+        let store = Arc::new(Self {
+            cache,
+            db,
+            persist_locks,
+            stream_txs: DashMap::new(),
+            abort_handles: DashMap::new(),
+            rate_limit_until: RwLock::new(None),
+            event_log,
+        });
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_db_schema_for_test(&self) -> &str {
+        self.db.schema()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_db_store_key_for_test(&self) -> &str {
+        self.db.store_key()
+    }
+}
