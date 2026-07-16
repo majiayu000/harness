@@ -295,8 +295,12 @@ async fn declarative_submission_mapped_signal_reaches_terminal_state() -> anyhow
         anyhow::bail!("mapped signal completion did not produce a workflow decision");
     };
     assert!(decision.accepted);
-    assert_eq!(decision.decision.decision, "declarative_signal_transition");
+    assert_eq!(decision.decision.decision, "apply_declarative_transition");
     assert_eq!(decision.decision.next_state, "cancelled");
+    assert_eq!(
+        decision.decision.reason,
+        "declarative activity 'perform_work' completed with Succeeded; on_signal 'cancel' selected state 'cancelled'"
+    );
     assert_eq!(
         decision.decision.commands[0].command_type,
         WorkflowCommandType::MarkCancelled
