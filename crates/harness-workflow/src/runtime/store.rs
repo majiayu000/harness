@@ -9,7 +9,6 @@ use super::model::{
 };
 use super::status::WorkflowCommandStatus;
 use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
-use super::validator::DecisionValidator;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use harness_core::db::PgStoreContext;
@@ -2211,8 +2210,4 @@ fn command_status_for_activity(status: ActivityStatus) -> WorkflowCommandStatus 
         ActivityStatus::Blocked => WorkflowCommandStatus::Blocked,
         ActivityStatus::Cancelled => WorkflowCommandStatus::Cancelled,
     }
-}
-
-fn validator_for_definition(definition_id: &str) -> Option<DecisionValidator> {
-    super::state_registry::decision_validator_for_definition(definition_id)
 }

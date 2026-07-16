@@ -395,6 +395,8 @@ async fn run_recovery_attempt(
             action,
             reason: &reason,
             actor: AUTO_RECOVERY_ACTOR,
+            target_state: None,
+            evidence: &[],
         })
         .await;
 
@@ -479,6 +481,33 @@ async fn run_recovery_attempt(
                 attempt_state,
                 attempt_number,
                 "workflow definition does not support runtime recovery",
+            )
+            .await
+        }
+        WorkflowRuntimeRecoveryOutcome::InvalidDefinitionPin { error, .. } => {
+            record_terminal_recheck(
+                store,
+                policy,
+                alerts,
+                instance,
+                attempt_state,
+                attempt_number,
+                &format!("declarative definition pin is invalid: {error:?}"),
+            )
+            .await
+        }
+        WorkflowRuntimeRecoveryOutcome::OperatorRequired { .. }
+        | WorkflowRuntimeRecoveryOutcome::TargetRequired { .. }
+        | WorkflowRuntimeRecoveryOutcome::TargetNotAllowed { .. }
+        | WorkflowRuntimeRecoveryOutcome::MissingRequiredEvidence { .. } => {
+            record_terminal_recheck(
+                store,
+                policy,
+                alerts,
+                instance,
+                attempt_state,
+                attempt_number,
+                "declarative recovery requires an explicit operator-selected target",
             )
             .await
         }

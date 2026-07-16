@@ -1,3 +1,4 @@
+pub(crate) mod declarative_completion;
 mod github_issue_completion;
 mod plan_issue_completion;
 mod pr_feedback_completion;
@@ -6,6 +7,9 @@ mod quality_gate_completion;
 mod runtime_failure;
 mod support;
 
+use self::declarative_completion::{
+    definition_pin_blocked_decision, reduce_declarative_completion,
+};
 use self::github_issue_completion::{
     bind_pr_from_activity_result, closed_issue_evidence_from_activity_result,
     closed_issue_evidence_from_activity_result_value, closed_issue_evidence_from_value,
@@ -28,9 +32,9 @@ use self::runtime_failure::{
     retry_failed_activity_decision, runtime_blocked_decision, runtime_cancelled_decision,
     runtime_failed_decision,
 };
+pub(crate) use self::support::invalid_agent_output_blocked_decision;
 use self::support::{
-    event_command_type, event_field_string, event_workflow_command,
-    invalid_agent_output_blocked_decision, runtime_completion_evidence,
+    event_command_type, event_field_string, event_workflow_command, runtime_completion_evidence,
 };
 use super::candidate_promotion::{
     build_candidate_promotion_decision, candidate_promotion_failure_decision,
@@ -49,6 +53,7 @@ use super::prompt_task::{
 };
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use super::state_registry::decision_validator_for_definition;
+use super::state_registry::{resolve_declarative_definition, DeclarativeDefinitionResolution};
 use super::validator::ValidationContext;
 use serde_json::{json, Value};
 
@@ -83,6 +88,23 @@ pub fn reduce_runtime_job_completed(
         serde_json::from_value(event.event.get("activity_result").cloned().ok_or_else(|| {
             anyhow::anyhow!("RuntimeJobCompleted event missing activity_result")
         })?)?;
+
+    match resolve_declarative_definition(instance) {
+        DeclarativeDefinitionResolution::Resolved(definition) => {
+            return Ok(Some(reduce_declarative_completion(
+                &definition,
+                instance,
+                event,
+                &result,
+            )));
+        }
+        DeclarativeDefinitionResolution::PinError(error) => {
+            return Ok(Some(definition_pin_blocked_decision(
+                instance, event, &result, error,
+            )));
+        }
+        DeclarativeDefinitionResolution::NotDeclarative => {}
+    }
 
     let decision = match result.status {
         ActivityStatus::Succeeded => reduce_success(instance, event, &result),

@@ -1,6 +1,6 @@
 use super::{
     declarative_pinning::declarative_definition_identity,
-    model::WorkflowCommandType,
+    model::{ActivityArtifact, WorkflowCommandType, WorkflowEvidence},
     pr_feedback::PR_FEEDBACK_DEFINITION_ID,
     prompt_task::PROMPT_TASK_DEFINITION_ID,
     quality_gate::QUALITY_GATE_DEFINITION_ID,
@@ -90,6 +90,30 @@ pub fn build_declarative_definition(
     })
 }
 
+/// Converts completed activity artifacts into exact, case-sensitive evidence kinds.
+///
+/// Signals, summaries, and the agent-authored workflow decision artifact are not evidence.
+pub fn workflow_evidence_from_activity_artifacts(
+    artifacts: &[ActivityArtifact],
+) -> anyhow::Result<Vec<WorkflowEvidence>> {
+    let mut evidence = Vec::new();
+    for artifact in artifacts {
+        if artifact.artifact_type.trim().is_empty() {
+            anyhow::bail!(
+                "activity artifact_type must not be empty when deriving workflow evidence"
+            );
+        }
+        if artifact.artifact_type == "workflow_decision" {
+            continue;
+        }
+        evidence.push(WorkflowEvidence::new(
+            artifact.artifact_type.clone(),
+            format!("activity produced '{}' artifact", artifact.artifact_type),
+        ));
+    }
+    Ok(evidence)
+}
+
 fn validate_top_level(policy: &WorkflowDefinitionPolicy) -> anyhow::Result<()> {
     if policy.id.trim().is_empty() {
         anyhow::bail!("declarative workflow definition id must not be empty");
@@ -161,6 +185,12 @@ fn validate_top_level(policy: &WorkflowDefinitionPolicy) -> anyhow::Result<()> {
     if blocked.activity.is_some() || blocked.progress != Some(DeclaredProgressMode::OperatorGate) {
         anyhow::bail!(
             "declarative workflow definition '{}' state 'blocked' must declare exactly progress 'operator_gate' and no activity",
+            policy.id
+        );
+    }
+    if !transition_targets(blocked).is_empty() {
+        anyhow::bail!(
+            "declarative workflow definition '{}' state 'blocked' must not declare outgoing routes; recovery_targets are operator-authorized separately",
             policy.id
         );
     }
@@ -292,12 +322,38 @@ fn validate_targets(
     }
 
     for evidence_target in policy.evidence_required.keys() {
+        if evidence_target == "blocked" {
+            anyhow::bail!(
+                "declarative workflow definition '{}' must not require evidence for safety fallback state 'blocked'",
+                policy.id
+            );
+        }
         if !is_declared(evidence_target) {
             anyhow::bail!(
                 "declarative workflow definition '{}' evidence requirement target '{}' is undeclared",
                 policy.id,
                 evidence_target
             );
+        }
+    }
+    for (target, evidence_kinds) in &policy.evidence_required {
+        let mut seen = BTreeSet::new();
+        for evidence_kind in evidence_kinds {
+            if evidence_kind.trim().is_empty() {
+                anyhow::bail!(
+                    "declarative workflow definition '{}' evidence requirement target '{}' contains an empty evidence kind",
+                    policy.id,
+                    target
+                );
+            }
+            if !seen.insert(evidence_kind) {
+                anyhow::bail!(
+                    "declarative workflow definition '{}' evidence requirement target '{}' repeats evidence kind '{}'",
+                    policy.id,
+                    target,
+                    evidence_kind
+                );
+            }
         }
     }
 
@@ -321,6 +377,13 @@ fn validate_targets(
                 policy.id,
                 target,
                 kind
+            );
+        }
+        if target == "blocked" {
+            anyhow::bail!(
+                "declarative workflow definition '{}' recovery target '{}' must differ from 'blocked'",
+                policy.id,
+                target
             );
         }
     }
@@ -402,16 +465,42 @@ fn compile_allowlist(
         for (_, target) in transition_targets(state) {
             edges.insert((source.as_str(), target));
         }
+        if state.activity.is_some() {
+            edges.insert((source.as_str(), source.as_str()));
+        }
     }
+    edges.extend(
+        policy
+            .recovery_targets
+            .iter()
+            .map(|target| ("blocked", target.as_str())),
+    );
 
     let mut rules = edges
         .into_iter()
         .map(|(source, target)| {
-            TransitionRule::new(
+            let mut rule = TransitionRule::new(
                 source,
                 target,
                 allowed_commands_for_target(policy, terminal_states, target),
-            )
+            );
+            rule.required_command =
+                Some(required_command_for_target(policy, terminal_states, target));
+            if target != "blocked" {
+                rule.required_evidence = policy
+                    .evidence_required
+                    .get(target)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .collect();
+            }
+            rule.operator_recovery_only = source == "blocked"
+                && policy
+                    .recovery_targets
+                    .iter()
+                    .any(|recovery_target| recovery_target == target);
+            rule
         })
         .collect::<Vec<_>>();
     rules.push(TransitionRule::from_any(
@@ -423,6 +512,32 @@ fn compile_allowlist(
         ],
     ));
     TransitionAllowlist::new(rules)
+}
+
+fn required_command_for_target(
+    policy: &WorkflowDefinitionPolicy,
+    terminal_states: &BTreeMap<String, WorkflowTerminalState>,
+    target: &str,
+) -> WorkflowCommandType {
+    if let Some(terminal_state) = terminal_states.get(target) {
+        return match terminal_state {
+            WorkflowTerminalState::Succeeded => WorkflowCommandType::MarkDone,
+            WorkflowTerminalState::Failed => WorkflowCommandType::MarkFailed,
+            WorkflowTerminalState::Cancelled => WorkflowCommandType::MarkCancelled,
+        };
+    }
+    let state = &policy.states[target];
+    if state.activity.is_some() {
+        WorkflowCommandType::EnqueueActivity
+    } else {
+        match state.progress {
+            Some(DeclaredProgressMode::ExternalWait) => WorkflowCommandType::Wait,
+            Some(DeclaredProgressMode::OperatorGate) => {
+                WorkflowCommandType::RequestOperatorAttention
+            }
+            None => unreachable!("validated active state must declare a progress driver"),
+        }
+    }
 }
 
 fn allowed_commands_for_target(

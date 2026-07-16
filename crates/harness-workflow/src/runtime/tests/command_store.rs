@@ -469,6 +469,8 @@ async fn recover(
             action,
             reason: "operator fixed transient failure",
             actor: "operator",
+            target_state: None,
+            evidence: &[],
         })
         .await
 }

@@ -1,7 +1,8 @@
 use super::{
-    DeclarativeWorkflowDefinition, RegisteredWorkflowDefinition, WorkflowDefinitionRegistry,
-    WorkflowStateDefinition, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
-    PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
+    DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, DeclarativeWorkflowDefinition,
+    RegisteredWorkflowDefinition, WorkflowDefinitionRegistry, WorkflowStateDefinition,
+    GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
+    QUALITY_GATE_DEFINITION_ID,
 };
 use crate::runtime::declarative_pinning::declarative_definition_identity;
 use crate::runtime::model::WorkflowInstance;
@@ -171,33 +172,72 @@ impl WorkflowDefinitionRegistry {
         &self,
         instance: &WorkflowInstance,
     ) -> Option<Arc<RegisteredWorkflowDefinition>> {
+        match self.resolve_declarative_definition(instance) {
+            DeclarativeDefinitionResolution::Resolved(definition) => {
+                Some(Arc::new(definition.registered().clone()))
+            }
+            DeclarativeDefinitionResolution::PinError(_) => None,
+            DeclarativeDefinitionResolution::NotDeclarative => {
+                self.definition(&instance.definition_id)
+            }
+        }
+    }
+
+    pub fn resolve_declarative_definition(
+        &self,
+        instance: &WorkflowInstance,
+    ) -> DeclarativeDefinitionResolution {
         if self.definitions.contains_key(&instance.definition_id)
             && !self
                 .current_declarative_versions
                 .contains_key(&instance.definition_id)
         {
-            return self.definition(&instance.definition_id);
+            return DeclarativeDefinitionResolution::NotDeclarative;
         }
-
-        match instance.data.get("definition_hash") {
-            Some(serde_json::Value::String(expected_hash)) if !expected_hash.trim().is_empty() => {
-                let definition = self
-                    .declarative_definition(&instance.definition_id, instance.definition_version)?;
-                if definition.definition_hash() != expected_hash {
-                    return None;
-                }
-                Some(Arc::new(definition.registered().clone()))
+        let definition =
+            self.declarative_definition(&instance.definition_id, instance.definition_version);
+        let is_declarative = definition.is_some()
+            || self
+                .declarative_versions
+                .keys()
+                .any(|(definition_id, _)| definition_id == &instance.definition_id);
+        if !is_declarative {
+            if is_builtin_definition_id(&instance.definition_id) {
+                return DeclarativeDefinitionResolution::NotDeclarative;
             }
-            Some(_) => None,
-            None => {
-                if let Some(definition) = self
-                    .declarative_definition(&instance.definition_id, instance.definition_version)
-                {
-                    return Some(Arc::new(definition.registered().clone()));
-                }
-                None
+            if instance.data.get("definition_hash").is_some() {
+                return DeclarativeDefinitionResolution::PinError(
+                    DeclarativeDefinitionPinError::MissingVersion,
+                );
             }
+            return DeclarativeDefinitionResolution::NotDeclarative;
         }
+        let Some(definition) = definition else {
+            return DeclarativeDefinitionResolution::PinError(
+                DeclarativeDefinitionPinError::MissingVersion,
+            );
+        };
+        let Some(expected_hash) = instance.data.get("definition_hash") else {
+            return DeclarativeDefinitionResolution::PinError(
+                DeclarativeDefinitionPinError::MissingHash,
+            );
+        };
+        let Some(expected_hash) = expected_hash.as_str() else {
+            return DeclarativeDefinitionResolution::PinError(
+                DeclarativeDefinitionPinError::InvalidHash,
+            );
+        };
+        if !is_canonical_definition_hash(expected_hash) {
+            return DeclarativeDefinitionResolution::PinError(
+                DeclarativeDefinitionPinError::InvalidHash,
+            );
+        }
+        if definition.definition_hash() != expected_hash {
+            return DeclarativeDefinitionResolution::PinError(
+                DeclarativeDefinitionPinError::HashMismatch,
+            );
+        }
+        DeclarativeDefinitionResolution::Resolved(definition)
     }
 
     pub fn state_definition_for_version(
@@ -221,6 +261,15 @@ impl WorkflowDefinitionRegistry {
     }
 }
 
+fn is_canonical_definition_hash(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 fn state_definition(
     definition: Arc<RegisteredWorkflowDefinition>,
     state: &str,
@@ -241,3 +290,7 @@ fn is_builtin_definition_id(definition_id: &str) -> bool {
     ]
     .contains(&definition_id)
 }
+
+#[cfg(test)]
+#[path = "versioning_tests.rs"]
+mod tests;

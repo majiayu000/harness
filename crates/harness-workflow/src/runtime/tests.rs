@@ -53,6 +53,8 @@ include!("tests/deferred_dispatch.rs");
 include!("tests/deferred_dispatch_review.rs");
 include!("tests/declarative_pinning.rs");
 include!("tests/declarative_validation.rs");
+include!("tests/declarative_interpreter.rs");
+include!("tests/declarative_recovery_integration.rs");
 include!("tests/driverless_progress.rs");
 
 mod issue_planning;

@@ -57,6 +57,14 @@ pub(crate) struct RuntimeStoppedStateProjection {
     pub(crate) last_stop: Option<Value>,
     pub(crate) can_unblock: bool,
     pub(crate) can_retry: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) recovery_targets: Vec<RuntimeRecoveryTargetProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct RuntimeRecoveryTargetProjection {
+    pub(crate) state: String,
+    pub(crate) required_evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -152,6 +160,7 @@ impl RuntimeStoppedStateProjection {
                 .and_then(Value::as_bool),
             can_unblock: false,
             can_retry: false,
+            recovery_targets: stopped_actions::pinned_recovery_targets(workflow),
             error_kind,
             last_stop,
         }
