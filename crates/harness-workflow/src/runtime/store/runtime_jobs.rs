@@ -146,3 +146,154 @@ impl WorkflowRuntimeStore {
             .collect())
     }
 }
+
+impl WorkflowRuntimeStore {
+    pub async fn enqueue_runtime_job(
+        &self,
+        command_id: &str,
+        runtime_kind: RuntimeKind,
+        runtime_profile: &str,
+        input: Value,
+    ) -> anyhow::Result<RuntimeJob> {
+        self.enqueue_runtime_job_with_not_before(
+            command_id,
+            runtime_kind,
+            runtime_profile,
+            input,
+            None,
+        )
+        .await
+    }
+
+    pub async fn enqueue_runtime_job_with_not_before(
+        &self,
+        command_id: &str,
+        runtime_kind: RuntimeKind,
+        runtime_profile: &str,
+        input: Value,
+        not_before: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<RuntimeJob> {
+        let mut job = RuntimeJob::pending(command_id, runtime_kind, runtime_profile, input);
+        job.not_before = not_before;
+        let data = to_jsonb_string(&job)?;
+        let status = enum_str(&job.status)?;
+        let runtime_kind = enum_str(&job.runtime_kind)?;
+        sqlx::query(
+            "INSERT INTO runtime_jobs
+                (id, command_id, runtime_kind, runtime_profile, status, not_before, data)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+        )
+        .bind(&job.id)
+        .bind(&job.command_id)
+        .bind(&runtime_kind)
+        .bind(&job.runtime_profile)
+        .bind(&status)
+        .bind(job.not_before)
+        .bind(&data)
+        .execute(&self.pool)
+        .await?;
+        Ok(job)
+    }
+
+    pub async fn enqueue_runtime_job_for_pending_command(
+        &self,
+        command_id: &str,
+        runtime_kind: RuntimeKind,
+        runtime_profile: &str,
+        input: Value,
+        not_before: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
+        command_store::enqueue_runtime_job_for_command(
+            &self.pool,
+            command_id,
+            None,
+            runtime_kind,
+            runtime_profile,
+            input,
+            not_before,
+        )
+        .await
+    }
+
+    pub async fn enqueue_runtime_job_for_claimed_command(
+        &self,
+        command_id: &str,
+        dispatch_claim: super::super::DispatchClaim<'_>,
+        runtime_kind: RuntimeKind,
+        runtime_profile: &str,
+        input: Value,
+        not_before: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
+        command_store::enqueue_runtime_job_for_command(
+            &self.pool,
+            command_id,
+            Some(dispatch_claim),
+            runtime_kind,
+            runtime_profile,
+            input,
+            not_before,
+        )
+        .await
+    }
+
+    pub async fn claim_next_runtime_job(
+        &self,
+        owner: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Option<RuntimeJob>> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT job.id, job.data::text
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+             WHERE (
+                 job.status = 'pending'
+                 AND (job.not_before IS NULL OR job.not_before <= CURRENT_TIMESTAMP)
+             ) OR (
+                 job.status = 'running'
+                 AND job.data ? 'lease'
+                 AND (job.data->'lease' ? 'expires_at')
+                 AND (job.data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
+             )
+             ORDER BY
+                 CASE
+                     WHEN COALESCE(job.data #>> '{input,activity}', '') IN (
+                         'implement_issue',
+                         'implement_prompt',
+                         'inspect_pr_feedback',
+                         'address_pr_feedback'
+                     ) THEN 0
+                     ELSE 1
+                 END ASC,
+                 job.created_at ASC
+             LIMIT 1
+             FOR UPDATE OF job SKIP LOCKED",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((id, data)) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+
+        let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        job.claim(owner, expires_at);
+        let updated = to_jsonb_string(&job)?;
+        let status = enum_str(&job.status)?;
+        sqlx::query(
+            "UPDATE runtime_jobs
+             SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $4",
+        )
+        .bind(&status)
+        .bind(job.not_before)
+        .bind(&updated)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(job))
+    }
+}
