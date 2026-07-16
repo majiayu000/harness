@@ -182,6 +182,21 @@ class ReplayerTests(unittest.TestCase):
         self.assertFalse(result["candidate_success"])
         self.assertGreater(result["untouched_raw_tokens"], 0)
 
+    def test_oversized_observation_skips_model_call(self) -> None:
+        manifest, sources = self._manifest_and_sources(observations=1, payload=8192)
+        channel = FakeChannel()
+        replayer = SessionReplayer(
+            channel,
+            SALT,
+            min_size_bytes=2048,
+            nap_sample_rate=1.0,
+            task_summary="test",
+            max_observation_bytes=4096,
+        )
+        result = replayer.replay(sources[0])
+        self.assertEqual(channel.calls, [])
+        self.assertEqual(result["untouched_raw_tokens"], result["baseline_tokens"])
+
     def test_channel_error_keeps_raw(self) -> None:
         manifest, sources = self._manifest_and_sources(observations=1)
         channel = FakeChannel(sketch_replies=["ERROR"])

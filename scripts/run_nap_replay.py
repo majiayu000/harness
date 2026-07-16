@@ -63,6 +63,10 @@ from nap_replay_safety import (
 
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_MIN_SIZE_BYTES = 2048
+# Observations above this size exceed compressor-model context in practice
+# (pilot: multi-MB base64 blobs). They stay untouched raw either way; the
+# cap only avoids burning a full agent timeout on a doomed call.
+DEFAULT_MAX_OBSERVATION_BYTES = 1024 * 1024
 DEFAULT_NAP_SAMPLE_RATE = 0.10
 BREAKER_MIN_CHECKS = 5
 BREAKER_FAILURE_RATE = 0.15
@@ -184,6 +188,16 @@ class ChannelError(RuntimeError):
     """The model channel failed for one call; the caller keeps raw text."""
 
 
+def _extract_error(stdout: bytes, stderr: bytes) -> str:
+    """Prefer explicit ERROR lines over raw tails that echo prompt content."""
+    for stream in (stderr, stdout):
+        text = stream.decode("utf-8", "replace")
+        for line in text.splitlines():
+            if line.startswith("ERROR") or '"error"' in line:
+                return line[:300]
+    return stderr.decode("utf-8", "replace")[-300:]
+
+
 @dataclass
 class ChannelReply:
     text: str
@@ -229,8 +243,10 @@ class CodexChannel:
                 timeout=AGENT_TIMEOUT_SECS,
             )
             if result.returncode != 0:
-                stderr = result.stderr.decode("utf-8", "replace")[-500:]
-                raise ChannelError(f"codex exec failed rc={result.returncode}: {stderr}")
+                raise ChannelError(
+                    f"codex exec failed rc={result.returncode}: "
+                    f"{_extract_error(result.stdout, result.stderr)}"
+                )
             if out_path.stat().st_size > MAX_MODEL_REPLY_BYTES:
                 raise ChannelError("model reply exceeds the size limit")
             return ChannelReply(out_path.read_text("utf-8").strip())
@@ -367,12 +383,14 @@ class SessionReplayer:
         min_size_bytes: int,
         nap_sample_rate: float,
         task_summary: str,
+        max_observation_bytes: int = DEFAULT_MAX_OBSERVATION_BYTES,
     ) -> None:
         self.channel = channel
         self.salt = salt
         self.min_size_bytes = min_size_bytes
         self.nap_sample_rate = nap_sample_rate
         self.task_summary = task_summary
+        self.max_observation_bytes = max_observation_bytes
 
     def replay(self, source: SessionSource) -> dict[str, Any]:
         self._session_key = source.session_key
@@ -411,7 +429,16 @@ class SessionReplayer:
                     continue
                 raw_tokens = _estimate_tokens(text)
                 totals["baseline_tokens"] += raw_tokens
-                if len(text.encode("utf-8")) < self.min_size_bytes or breaker_tripped:
+                text_bytes = len(text.encode("utf-8"))
+                if text_bytes < self.min_size_bytes or breaker_tripped:
+                    totals["untouched_raw_tokens"] += raw_tokens
+                    continue
+                if text_bytes > self.max_observation_bytes:
+                    print(
+                        f"warn: oversized observation kept raw for "
+                        f"{source.session_key} ({text_bytes} bytes)",
+                        file=sys.stderr,
+                    )
                     totals["untouched_raw_tokens"] += raw_tokens
                     continue
                 seq += 1
@@ -564,6 +591,7 @@ def run(args: argparse.Namespace) -> int:
         min_size_bytes=args.min_size_bytes,
         nap_sample_rate=args.nap_sample_rate,
         task_summary=args.task_summary,
+        max_observation_bytes=args.max_observation_bytes,
     )
 
     def replay_one(source: SessionSource) -> str:
@@ -619,6 +647,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel", choices=("codex", "claude", "api"), default="codex")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--min-size-bytes", type=int, default=DEFAULT_MIN_SIZE_BYTES)
+    parser.add_argument(
+        "--max-observation-bytes",
+        type=int,
+        default=DEFAULT_MAX_OBSERVATION_BYTES,
+        help="observations above this stay untouched raw without a model call",
+    )
     parser.add_argument("--nap-sample-rate", type=float, default=DEFAULT_NAP_SAMPLE_RATE)
     parser.add_argument("--session-limit", type=int, default=None)
     parser.add_argument(
