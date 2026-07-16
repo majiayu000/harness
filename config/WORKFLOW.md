@@ -7,6 +7,29 @@
 # field-by-field, so a repo only needs a WORKFLOW.md to override repo-specific
 # fields such as `source.repo` or per-language `activities.*.validation`
 # commands. A repo with no WORKFLOW.md inherits this base entirely.
+#
+# Exception: a repo-level `definition` block (declarative workflow shape)
+# replaces the base's declaration wholesale — state machines are never
+# merged field-by-field. Repos can also opt prompt tasks into bounded
+# external-state continuation loops. Both features, with validated
+# examples, are documented in docs/workflow-declarative-definitions.md.
+# Skeleton of a repo-level declarative definition:
+#
+#   definition:
+#     id: my_custom_flow
+#     initial: implementing
+#     states:
+#       implementing:
+#         activity: implement_issue
+#         on_success: done
+#       blocked:
+#         progress: operator_gate   # required safety fallback state
+#     terminal:
+#       done: succeeded
+#       failed: failed
+#       cancelled: cancelled
+#     recovery_targets:
+#       - implementing
 workflow:
   id: github_issue_pr
   version: 1
