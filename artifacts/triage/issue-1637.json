@@ -1,0 +1,21 @@
+{
+  "issue": 1637,
+  "route": "triage_issue",
+  "state": "ready_to_spec",
+  "classification": "reliability",
+  "security_private": false,
+  "duplicate": false,
+  "related_work": [
+    "GH-1635",
+    "PR-1332"
+  ],
+  "search_summary": "No active issue or pull request covers parallel macOS timeout failures among the harness-agents child and descendant lifecycle fixtures.",
+  "proposed_labels": [
+    "bug",
+    "ci",
+    "agent_generated",
+    "ready_to_spec"
+  ],
+  "decision": "allowed",
+  "human_gate_evidence": "Maintainer standing authorization recorded in the 2026-07-16 Codex goal thread."
+}
