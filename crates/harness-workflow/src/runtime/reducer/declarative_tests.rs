@@ -49,9 +49,10 @@ fn declarative_failure_without_route_uses_configured_generic_retry() -> anyhow::
             WorkflowActivityPolicy::default(),
         )]),
     )?;
+    let version = definition.definition_version();
     super::super::state_registry::register_declarative_workflow_definitions([definition])?;
     let definition =
-        super::super::state_registry::current_declarative_workflow_definition(DEFINITION_ID)
+        super::super::state_registry::workflow_declarative_definition(DEFINITION_ID, version)
             .ok_or_else(|| anyhow::anyhow!("generic-retry definition should resolve"))?;
     let instance = WorkflowInstance::new(
         DEFINITION_ID,
@@ -66,7 +67,12 @@ fn declarative_failure_without_route_uses_configured_generic_retry() -> anyhow::
     let result = ActivityResult::failed("perform_work", "failed", "transient failure")
         .with_error_kind(ActivityErrorKind::Timeout);
     let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-test")
-        .with_payload(json!({ "activity_result": result }));
+        .with_payload(json!({
+            "command_id": "command-1",
+            "runtime_job_id": "job-1",
+            "command": WorkflowCommand::enqueue_activity("perform_work", "source-command"),
+            "activity_result": result,
+        }));
 
     let decision = reduce_runtime_job_completed(&instance, &event)?
         .ok_or_else(|| anyhow::anyhow!("generic retry should produce a decision"))?;
@@ -78,6 +84,7 @@ fn declarative_failure_without_route_uses_configured_generic_retry() -> anyhow::
     );
     assert_eq!(decision.commands[0].command["retry_attempt"], 1);
     super::super::state_registry::decision_validator_for_instance(&instance)
+        .map_err(|error| anyhow::anyhow!("declarative definition pin failed: {error:?}"))?
         .ok_or_else(|| anyhow::anyhow!("generic retry validator should resolve"))?
         .validate(
             &instance,

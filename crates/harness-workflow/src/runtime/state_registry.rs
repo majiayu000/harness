@@ -13,6 +13,21 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 mod versioning;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclarativeDefinitionPinError {
+    MissingVersion,
+    MissingHash,
+    InvalidHash,
+    HashMismatch,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeclarativeDefinitionResolution {
+    NotDeclarative,
+    Resolved(Arc<DeclarativeWorkflowDefinition>),
+    PinError(DeclarativeDefinitionPinError),
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowTerminalState {
@@ -223,16 +238,19 @@ impl WorkflowDefinitionRegistry {
     pub fn decision_validator_for_instance(
         &self,
         instance: &WorkflowInstance,
-    ) -> Option<DecisionValidator> {
-        if let Some(definition) = self.declarative_definition_for_instance(instance) {
-            return Some(DecisionValidator::for_declarative_definition(
-                definition.registered().allowlist.clone(),
-            ));
+    ) -> Result<Option<DecisionValidator>, DeclarativeDefinitionPinError> {
+        match self.resolve_declarative_definition(instance) {
+            DeclarativeDefinitionResolution::Resolved(definition) => {
+                Ok(Some(DecisionValidator::for_definition(
+                    &instance.definition_id,
+                    definition.registered().allowlist.clone(),
+                )))
+            }
+            DeclarativeDefinitionResolution::PinError(error) => Err(error),
+            DeclarativeDefinitionResolution::NotDeclarative => {
+                Ok(self.decision_validator_for_definition(&instance.definition_id))
+            }
         }
-        if self.is_declarative_instance(instance) {
-            return Some(DecisionValidator::definition_version_missing());
-        }
-        self.decision_validator_for_definition(&instance.definition_id)
     }
 
     pub fn known_definition_ids(&self) -> Vec<String> {
@@ -315,17 +333,18 @@ pub fn current_declarative_workflow_definition(
 pub fn declarative_workflow_definition_for_instance(
     instance: &WorkflowInstance,
 ) -> Option<Arc<DeclarativeWorkflowDefinition>> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .declarative_definition_for_instance(instance)
+    match resolve_declarative_definition(instance) {
+        DeclarativeDefinitionResolution::Resolved(definition) => Some(definition),
+        DeclarativeDefinitionResolution::NotDeclarative
+        | DeclarativeDefinitionResolution::PinError(_) => None,
+    }
 }
 
 pub fn workflow_instance_is_declarative(instance: &WorkflowInstance) -> bool {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .is_declarative_instance(instance)
+    !matches!(
+        resolve_declarative_definition(instance),
+        DeclarativeDefinitionResolution::NotDeclarative
+    )
 }
 
 pub fn workflow_definition_for_version(
@@ -345,7 +364,18 @@ pub fn decision_validator_for_definition(definition_id: &str) -> Option<Decision
         .decision_validator_for_definition(definition_id)
 }
 
-pub fn decision_validator_for_instance(instance: &WorkflowInstance) -> Option<DecisionValidator> {
+pub fn resolve_declarative_definition(
+    instance: &WorkflowInstance,
+) -> DeclarativeDefinitionResolution {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .resolve_declarative_definition(instance)
+}
+
+pub fn decision_validator_for_instance(
+    instance: &WorkflowInstance,
+) -> Result<Option<DecisionValidator>, DeclarativeDefinitionPinError> {
     registry()
         .read()
         .expect("workflow definition registry lock poisoned")

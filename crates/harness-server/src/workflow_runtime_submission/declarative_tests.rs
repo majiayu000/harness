@@ -120,6 +120,7 @@ fn declarative_submission_decision_validates_against_the_registered_submission_r
         harness_workflow::runtime::build_declarative_submission_decision(&definition, &instance)
             .expect("submission decision should build");
     let validator = harness_workflow::runtime::decision_validator_for_instance(&instance)
+        .expect("pinned definition should be valid")
         .expect("pinned definition should resolve a validator");
 
     validator

@@ -248,6 +248,10 @@ mod declarative_pinning {
         let raw_with_unrelated_hash = raw_instance
             .clone()
             .with_data(json!({ "definition_hash": v1.definition_hash() }));
+        assert!(matches!(
+            raw_registry.resolve_declarative_definition(&raw_with_unrelated_hash),
+            DeclarativeDefinitionResolution::NotDeclarative
+        ));
         assert!(raw_registry
             .state_definition_for_instance(&raw_with_unrelated_hash, "done")
             .is_some());

@@ -9,11 +9,27 @@ use crate::runtime::model::{
 use crate::runtime::prompt_task::{
     prompt_continuation_state_from_data, PromptContinuationState, PROMPT_TASK_DEFINITION_ID,
 };
-use crate::runtime::reducer::reduce_runtime_job_completed;
-use crate::runtime::state_registry::decision_validator_for_instance;
+use crate::runtime::reducer::{
+    invalid_agent_output_blocked_decision, reduce_runtime_job_completed,
+};
+use crate::runtime::state_registry::{
+    resolve_declarative_definition, DeclarativeDefinitionResolution,
+};
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
 use serde_json::Value;
+
+pub(super) fn validator_for_instance(
+    instance: &WorkflowInstance,
+) -> anyhow::Result<Option<crate::runtime::validator::DecisionValidator>> {
+    crate::runtime::state_registry::decision_validator_for_instance(instance).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid declarative definition pin for workflow '{}': {:?}",
+            instance.id,
+            error
+        )
+    })
+}
 
 impl WorkflowRuntimeStore {
     pub async fn commit_parent_runtime_completion(
@@ -150,9 +166,79 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         }
     }
 
+    if declarative_decision_missing_required_evidence(&instance, source, event, &decision) {
+        let rejected =
+            persist_runtime_completion_decision_tx(tx, instance.clone(), source, event, decision)
+                .await?;
+        if rejected.accepted {
+            anyhow::bail!("missing-evidence declarative decision unexpectedly passed validation");
+        }
+        let result: ActivityResult =
+            serde_json::from_value(event.event.get("activity_result").cloned().ok_or_else(
+                || anyhow::anyhow!("RuntimeJobCompleted event missing activity_result"),
+            )?)?;
+        let rejection_reason = rejected
+            .rejection_reason
+            .as_deref()
+            .unwrap_or("missing rejection reason");
+        let policy_decision = invalid_agent_output_blocked_decision(
+            &instance,
+            event,
+            &result,
+            &format!(
+                "declarative transition was rejected for missing evidence: {rejection_reason}"
+            ),
+        )
+        .with_evidence(WorkflowEvidence::new(
+            "rejected_workflow_decision",
+            format!(
+                "Rejected decision record `{}` before applying blocked policy: {rejection_reason}",
+                rejected.id
+            ),
+        ));
+        let policy =
+            persist_runtime_completion_decision_tx(tx, instance, source, event, policy_decision)
+                .await?;
+        if !policy.accepted {
+            anyhow::bail!(
+                "blocked policy decision was rejected after missing declarative evidence: {}",
+                policy
+                    .rejection_reason
+                    .as_deref()
+                    .unwrap_or("missing rejection reason")
+            );
+        }
+        return Ok(Some(policy));
+    }
+
     persist_runtime_completion_decision_tx(tx, instance, source, event, decision)
         .await
         .map(Some)
+}
+
+fn declarative_decision_missing_required_evidence(
+    instance: &WorkflowInstance,
+    source: &str,
+    event: &WorkflowEvent,
+    decision: &WorkflowDecision,
+) -> bool {
+    if !matches!(
+        resolve_declarative_definition(instance),
+        DeclarativeDefinitionResolution::Resolved(_)
+    ) {
+        return false;
+    }
+    let Ok(Some(validator)) = validator_for_instance(instance) else {
+        return false;
+    };
+    matches!(
+        validator.validate(
+            instance,
+            decision,
+            &ValidationContext::new(source, event.created_at),
+        ),
+        Err(error) if error.kind == WorkflowDecisionRejectionKind::MissingRequiredEvidence
+    )
 }
 
 fn is_generic_invalid_structured_fallback(decision: &WorkflowDecision) -> bool {
@@ -184,7 +270,7 @@ fn driverless_structured_completion_decision(
     else {
         return Ok(None);
     };
-    let Some(validator) = decision_validator_for_instance(instance) else {
+    let Ok(Some(validator)) = validator_for_instance(instance) else {
         return Ok(None);
     };
     let rejection = validator.validate(
@@ -207,8 +293,8 @@ async fn persist_runtime_completion_decision_tx(
     event: &WorkflowEvent,
     decision: WorkflowDecision,
 ) -> anyhow::Result<WorkflowDecisionRecord> {
-    let record = match decision_validator_for_instance(&instance) {
-        Some(validator) => match validator.validate(
+    let record = match validator_for_instance(&instance) {
+        Ok(Some(validator)) => match validator.validate(
             &instance,
             &decision,
             &ValidationContext::new(source, event.created_at),
@@ -220,11 +306,17 @@ async fn persist_runtime_completion_decision_tx(
                 error.to_string(),
             ),
         },
-        None => WorkflowDecisionRecord::rejected(
+        Ok(None) => WorkflowDecisionRecord::rejected(
             decision,
             Some(event.id.clone()),
             "unknown workflow definition for runtime completion",
         ),
+        Err(_error) if is_definition_pin_safety_decision(&instance, source, event, &decision) => {
+            WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()))
+        }
+        Err(error) => {
+            WorkflowDecisionRecord::rejected(decision, Some(event.id.clone()), error.to_string())
+        }
     };
     insert_decision_record_tx(tx, &record).await?;
 
@@ -253,11 +345,47 @@ async fn persist_runtime_completion_decision_tx(
     Ok(record)
 }
 
+fn is_definition_pin_safety_decision(
+    instance: &WorkflowInstance,
+    source: &str,
+    event: &WorkflowEvent,
+    decision: &WorkflowDecision,
+) -> bool {
+    if source.trim().is_empty()
+        || event.source != source
+        || event.event_type != "RuntimeJobCompleted"
+        || decision.workflow_id != instance.id
+        || decision.observed_state != instance.state
+        || decision.next_state != "blocked"
+        || decision.decision != "definition_version_missing"
+        || decision.commands.len() != 2
+    {
+        return false;
+    }
+    let expected = [
+        crate::runtime::model::WorkflowCommandType::MarkBlocked,
+        crate::runtime::model::WorkflowCommandType::RequestOperatorAttention,
+    ];
+    decision
+        .commands
+        .iter()
+        .zip(expected)
+        .all(|(command, command_type)| {
+            command.command_type == command_type
+                && !command.dedupe_key.trim().is_empty()
+                && command.command.is_object()
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptContinuationSideEffect {
     Applied,
     DurableReplay,
 }
+
+#[cfg(test)]
+#[path = "runtime_completion_tests.rs"]
+mod tests;
 
 async fn apply_prompt_continuation_side_effect(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

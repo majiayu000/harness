@@ -5,7 +5,8 @@ use crate::workflow_runtime_submission::{
 use axum::{extract::State, http::StatusCode, Json};
 use harness_workflow::issue_lifecycle::IssueMergeApprovalOutcome;
 use harness_workflow::runtime::{
-    WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
+    WorkflowEvidence, WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,
+    WorkflowRuntimeRecoveryRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -27,6 +28,8 @@ pub(super) struct WorkflowRuntimeRecoveryRouteRequest {
     pub reason: String,
     #[serde(default)]
     pub target_state: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<WorkflowEvidence>,
 }
 
 /// POST /tasks/{id}/merge — human-gate approval to transition a `ready_to_merge`
@@ -260,6 +263,7 @@ async fn recover_workflow_runtime(
             reason,
             actor: "operator",
             target_state: request.target_state.as_deref(),
+            evidence: &request.evidence,
         })
         .await
     {
@@ -338,57 +342,6 @@ fn runtime_recovery_response(
                 "last_stop_activity": activity,
             }),
         ),
-        WorkflowRuntimeRecoveryOutcome::MissingRecoveryTarget { workflow } => (
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "target_state is required for declarative workflow unblock",
-                "workflow_id": workflow.id,
-                "definition_id": workflow.definition_id,
-                "state": workflow.state,
-            }),
-        ),
-        WorkflowRuntimeRecoveryOutcome::InvalidRecoveryTarget {
-            workflow,
-            target_state,
-        } => (
-            StatusCode::CONFLICT,
-            json!({
-                "error": "target_state is not an active declared recovery target",
-                "workflow_id": workflow.id,
-                "definition_id": workflow.definition_id,
-                "state": workflow.state,
-                "target_state": target_state,
-            }),
-        ),
-        WorkflowRuntimeRecoveryOutcome::DefinitionPinMismatch { workflow } => (
-            StatusCode::CONFLICT,
-            json!({
-                "error": "workflow declarative definition pin does not match a loaded version",
-                "workflow_id": workflow.id,
-                "definition_id": workflow.definition_id,
-                "definition_version": workflow.definition_version,
-                "state": workflow.state,
-            }),
-        ),
-        WorkflowRuntimeRecoveryOutcome::DeclarativeWrongState { workflow } => (
-            StatusCode::CONFLICT,
-            json!({
-                "error": "declarative workflow is not in blocked state",
-                "workflow_id": workflow.id,
-                "definition_id": workflow.definition_id,
-                "state": workflow.state,
-            }),
-        ),
-        WorkflowRuntimeRecoveryOutcome::UnsupportedRecoveryAction { workflow, action } => (
-            StatusCode::CONFLICT,
-            json!({
-                "error": "declarative workflow recovery supports only unblock",
-                "workflow_id": workflow.id,
-                "definition_id": workflow.definition_id,
-                "state": workflow.state,
-                "action": action.as_str(),
-            }),
-        ),
         WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition { workflow } => (
             StatusCode::CONFLICT,
             json!({
@@ -397,6 +350,34 @@ fn runtime_recovery_response(
                 "definition_id": workflow.definition_id,
                 "state": workflow.state,
             }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::InvalidDefinitionPin { workflow, error } => (
+            StatusCode::CONFLICT,
+            json!({
+                "error": "workflow declarative definition pin is invalid",
+                "workflow_id": workflow.id,
+                "state": workflow.state,
+                "pin_error": format!("{error:?}"),
+            }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::OperatorRequired { workflow } => (
+            StatusCode::FORBIDDEN,
+            json!({ "error": "declarative workflow recovery requires an operator", "workflow_id": workflow.id }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::TargetRequired { workflow } => (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "target_state is required when multiple recovery targets are declared", "workflow_id": workflow.id }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::TargetNotAllowed {
+            workflow,
+            target_state,
+        } => (
+            StatusCode::CONFLICT,
+            json!({ "error": "target_state is not an allowed pinned recovery target", "workflow_id": workflow.id, "target_state": target_state }),
+        ),
+        WorkflowRuntimeRecoveryOutcome::MissingRequiredEvidence { workflow, detail } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "error": "declarative workflow recovery is missing required evidence", "workflow_id": workflow.id, "detail": detail }),
         ),
         WorkflowRuntimeRecoveryOutcome::NotFound => (
             StatusCode::NOT_FOUND,
@@ -558,37 +539,24 @@ mod recovery_response_tests {
         let declarative = || workflow("release_workflow", "blocked");
         let (status, Json(body)) = runtime_recovery_response(
             WorkflowRuntimeRecoveryAction::Unblock,
-            WorkflowRuntimeRecoveryOutcome::MissingRecoveryTarget {
+            WorkflowRuntimeRecoveryOutcome::TargetRequired {
                 workflow: declarative(),
             },
         );
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             body["error"],
-            json!("target_state is required for declarative workflow unblock")
+            json!("target_state is required when multiple recovery targets are declared")
         );
 
-        for outcome in [
-            WorkflowRuntimeRecoveryOutcome::InvalidRecoveryTarget {
-                workflow: declarative(),
-                target_state: "done".to_string(),
-            },
-            WorkflowRuntimeRecoveryOutcome::DefinitionPinMismatch {
-                workflow: declarative(),
-            },
-            WorkflowRuntimeRecoveryOutcome::DeclarativeWrongState {
-                workflow: declarative(),
-            },
-            WorkflowRuntimeRecoveryOutcome::UnsupportedRecoveryAction {
-                workflow: declarative(),
-                action: WorkflowRuntimeRecoveryAction::Retry,
-            },
-        ] {
-            assert_eq!(
-                runtime_recovery_response(WorkflowRuntimeRecoveryAction::Unblock, outcome).0,
-                StatusCode::CONFLICT
-            );
-        }
+        let outcome = WorkflowRuntimeRecoveryOutcome::TargetNotAllowed {
+            workflow: declarative(),
+            target_state: "done".to_string(),
+        };
+        assert_eq!(
+            runtime_recovery_response(WorkflowRuntimeRecoveryAction::Unblock, outcome).0,
+            StatusCode::CONFLICT
+        );
     }
 
     #[test]

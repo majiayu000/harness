@@ -1,3 +1,4 @@
+pub(crate) mod declarative_completion;
 mod github_issue_completion;
 mod plan_issue_completion;
 mod pr_feedback_completion;
@@ -6,6 +7,9 @@ mod quality_gate_completion;
 mod runtime_failure;
 mod support;
 
+use self::declarative_completion::{
+    definition_pin_blocked_decision, reduce_declarative_completion,
+};
 use self::github_issue_completion::{
     bind_pr_from_activity_result, closed_issue_evidence_from_activity_result,
     closed_issue_evidence_from_activity_result_value, closed_issue_evidence_from_value,
@@ -28,9 +32,9 @@ use self::runtime_failure::{
     retry_failed_activity_decision, runtime_blocked_decision, runtime_cancelled_decision,
     runtime_failed_decision,
 };
+pub(crate) use self::support::invalid_agent_output_blocked_decision;
 use self::support::{
-    event_command_type, event_field_string, event_workflow_command,
-    invalid_agent_output_blocked_decision, runtime_completion_evidence,
+    event_command_type, event_field_string, event_workflow_command, runtime_completion_evidence,
 };
 use super::candidate_promotion::{
     build_candidate_promotion_decision, candidate_promotion_failure_decision,
@@ -48,10 +52,8 @@ use super::prompt_task::{
     PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
-use super::state_registry::{
-    decision_validator_for_instance, declarative_workflow_definition_for_instance,
-    workflow_instance_is_declarative,
-};
+use super::state_registry::decision_validator_for_definition;
+use super::state_registry::{resolve_declarative_definition, DeclarativeDefinitionResolution};
 use super::validator::ValidationContext;
 use serde_json::{json, Value};
 
@@ -87,25 +89,21 @@ pub fn reduce_runtime_job_completed(
             anyhow::anyhow!("RuntimeJobCompleted event missing activity_result")
         })?)?;
 
-    if let Some(definition) = declarative_workflow_definition_for_instance(instance) {
-        let has_explicit_failure_route = definition
-            .policy()
-            .states
-            .get(&instance.state)
-            .and_then(|state| state.on_failure.as_deref())
-            .is_some();
-        if result.status == ActivityStatus::Failed && !has_explicit_failure_route {
-            if let Some(decision) = retry_failed_activity_decision(instance, event, &result) {
-                return Ok(Some(decision));
-            }
+    match resolve_declarative_definition(instance) {
+        DeclarativeDefinitionResolution::Resolved(definition) => {
+            return Ok(Some(reduce_declarative_completion(
+                &definition,
+                instance,
+                event,
+                &result,
+            )));
         }
-        return super::declarative_interpreter::reduce(&definition, instance, event, &result)
-            .map(Some);
-    }
-    if workflow_instance_is_declarative(instance) {
-        return Ok(Some(
-            super::declarative_interpreter::definition_version_missing_decision(instance, event),
-        ));
+        DeclarativeDefinitionResolution::PinError(error) => {
+            return Ok(Some(definition_pin_blocked_decision(
+                instance, event, &result, error,
+            )));
+        }
+        DeclarativeDefinitionResolution::NotDeclarative => {}
     }
 
     let decision = match result.status {
@@ -498,7 +496,7 @@ fn structured_decision_validates(
         return false;
     }
 
-    let Some(validator) = decision_validator_for_instance(instance) else {
+    let Some(validator) = decision_validator_for_definition(&instance.definition_id) else {
         return true;
     };
     validator
@@ -564,82 +562,7 @@ mod tests {
     };
     use crate::runtime::validator::{DecisionValidator, ValidationContext};
     use chrono::Utc;
-    use harness_core::config::workflow::{
-        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
-    };
     use serde_json::json;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn declarative_on_failure_route_precedes_generic_retry() -> anyhow::Result<()> {
-        const DEFINITION_ID: &str = "declarative_failure_route_test";
-        let policy = WorkflowDefinitionPolicy {
-            id: DEFINITION_ID.to_string(),
-            initial: "working".to_string(),
-            states: BTreeMap::from([
-                (
-                    "working".to_string(),
-                    DeclaredState {
-                        activity: Some("perform_work".to_string()),
-                        on_success: Some("done".to_string()),
-                        on_failure: Some("failed".to_string()),
-                        on_signal: BTreeMap::from([(
-                            "cancel".to_string(),
-                            "cancelled".to_string(),
-                        )]),
-                        ..DeclaredState::default()
-                    },
-                ),
-                (
-                    "blocked".to_string(),
-                    DeclaredState {
-                        progress: Some(DeclaredProgressMode::OperatorGate),
-                        ..DeclaredState::default()
-                    },
-                ),
-            ]),
-            terminal: BTreeMap::from([
-                ("done".to_string(), "succeeded".to_string()),
-                ("failed".to_string(), "failed".to_string()),
-                ("cancelled".to_string(), "cancelled".to_string()),
-            ]),
-            evidence_required: BTreeMap::new(),
-            recovery_targets: Vec::new(),
-        };
-        let definition = super::super::declarative::build_declarative_definition(
-            &policy,
-            &BTreeMap::from([(
-                "perform_work".to_string(),
-                WorkflowActivityPolicy::default(),
-            )]),
-        )?;
-        super::super::state_registry::register_declarative_workflow_definitions([definition])?;
-        let definition =
-            super::super::state_registry::current_declarative_workflow_definition(DEFINITION_ID)
-                .ok_or_else(|| anyhow::anyhow!("failure-route definition should resolve"))?;
-        let instance = WorkflowInstance::new(
-            DEFINITION_ID,
-            definition.definition_version(),
-            "working",
-            WorkflowSubject::new("test", "failure-route"),
-        )
-        .with_data(json!({ "definition_hash": definition.definition_hash() }));
-        let result = ActivityResult::failed("perform_work", "failed", "transient failure")
-            .with_error_kind(ActivityErrorKind::Timeout);
-        let event =
-            WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-test")
-                .with_payload(json!({ "activity_result": result }));
-
-        let decision = reduce_runtime_job_completed(&instance, &event)?
-            .expect("mapped failure should produce a decision");
-        assert_eq!(decision.decision, "declarative_activity_failed");
-        assert_eq!(decision.next_state, "failed");
-        assert_eq!(
-            decision.commands[0].command_type,
-            WorkflowCommandType::MarkFailed
-        );
-        Ok(())
-    }
 
     #[test]
     fn prompt_task_success_without_validation_evidence_blocks() -> anyhow::Result<()> {

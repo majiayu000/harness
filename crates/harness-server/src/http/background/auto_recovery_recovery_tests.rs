@@ -37,6 +37,7 @@ async fn auto_recovery_transition_matches_manual_unblock_except_actor() -> anyho
             reason: "operator resolved the rate limit",
             actor: "operator",
             target_state: None,
+            evidence: &[],
         })
         .await?;
     assert!(matches!(

@@ -113,13 +113,21 @@ async fn persist_new_submission(
         prompt_ref_for_submission(project_id, ctx.external_id, ctx.task_id, ctx.prompt);
     let instance = submission_instance(ctx, project_id, &workflow_id, &prompt_ref, definition);
     let decision = build_declarative_submission_decision(definition, &instance)?;
-    let validator = decision_validator_for_instance(&instance).ok_or_else(|| {
-        anyhow::anyhow!(
-            "declarative workflow '{}@{}' has no registered decision validator",
-            definition.policy().id,
-            definition.definition_version()
-        )
-    })?;
+    let validator = decision_validator_for_instance(&instance)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "declarative workflow '{}@{}' has an invalid definition pin: {error:?}",
+                definition.policy().id,
+                definition.definition_version()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "declarative workflow '{}@{}' has no registered decision validator",
+                definition.policy().id,
+                definition.definition_version()
+            )
+        })?;
     validator
         .validate(
             &instance,

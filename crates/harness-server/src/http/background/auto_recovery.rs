@@ -403,6 +403,7 @@ async fn run_recovery_attempt(
             reason: &reason,
             actor: AUTO_RECOVERY_ACTOR,
             target_state: None,
+            evidence: &[],
         })
         .await;
 
@@ -490,11 +491,7 @@ async fn run_recovery_attempt(
             )
             .await
         }
-        WorkflowRuntimeRecoveryOutcome::MissingRecoveryTarget { .. }
-        | WorkflowRuntimeRecoveryOutcome::InvalidRecoveryTarget { .. }
-        | WorkflowRuntimeRecoveryOutcome::DefinitionPinMismatch { .. }
-        | WorkflowRuntimeRecoveryOutcome::DeclarativeWrongState { .. }
-        | WorkflowRuntimeRecoveryOutcome::UnsupportedRecoveryAction { .. } => {
+        WorkflowRuntimeRecoveryOutcome::InvalidDefinitionPin { error, .. } => {
             record_terminal_recheck(
                 store,
                 policy,
@@ -502,7 +499,22 @@ async fn run_recovery_attempt(
                 instance,
                 attempt_state,
                 attempt_number,
-                "declarative workflow recovery outcome reached the GitHub-only scheduler",
+                &format!("declarative definition pin is invalid: {error:?}"),
+            )
+            .await
+        }
+        WorkflowRuntimeRecoveryOutcome::OperatorRequired { .. }
+        | WorkflowRuntimeRecoveryOutcome::TargetRequired { .. }
+        | WorkflowRuntimeRecoveryOutcome::TargetNotAllowed { .. }
+        | WorkflowRuntimeRecoveryOutcome::MissingRequiredEvidence { .. } => {
+            record_terminal_recheck(
+                store,
+                policy,
+                alerts,
+                instance,
+                attempt_state,
+                attempt_number,
+                "declarative recovery requires an explicit operator-selected target",
             )
             .await
         }

@@ -1,6 +1,6 @@
 use harness_core::config::workflow::WorkflowDocument;
 use harness_workflow::runtime::{
-    decision_validator_for_definition, ActivityArtifact, DecisionValidator,
+    decision_validator_for_instance, ActivityArtifact, DecisionValidator,
     RetrievedRepoMemoryRecord, RuntimeJob, RuntimeProfile, WorkflowInstance,
     CANDIDATE_BRANCH_ARTIFACT, CANDIDATE_CLEANUP_ACTIVITY, CANDIDATE_PROMOTION_ACTIVITY,
     ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT,
@@ -400,7 +400,9 @@ fn workflow_decision_command_examples(_workflow_definition: &str, _activity: &st
 }
 
 fn workflow_decision_contract(workflow: Option<&WorkflowInstance>) -> Value {
-    workflow_decision_contract_with_resolver(workflow, decision_validator_for_definition)
+    workflow_decision_contract_with_resolver(workflow, |_| {
+        decision_validator_for_instance(workflow?).ok().flatten()
+    })
 }
 
 fn workflow_decision_contract_with_resolver(
@@ -434,6 +436,9 @@ fn workflow_decision_contract_with_resolver(
                 "from_state": rule.from_state.as_deref().unwrap_or("*"),
                 "next_state": rule.to_state.as_str(),
                 "allowed_commands": allowed_commands,
+                "required_command": rule.required_command.map(|command| command.as_str()),
+                "required_evidence": rule.required_evidence,
+                "operator_recovery_only": rule.operator_recovery_only,
             })
         })
         .collect::<Vec<_>>();
@@ -757,3 +762,7 @@ where
 #[cfg(test)]
 #[path = "prompt_packet_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "prompt_packet_pinning_tests.rs"]
+mod pinning_tests;

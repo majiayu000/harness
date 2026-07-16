@@ -549,6 +549,7 @@ async fn auto_recovery_recover_race_records_superseded_without_consuming_attempt
             reason: "manual unblock during pending recheck",
             actor: "operator",
             target_state: None,
+            evidence: &[],
         })
         .await?;
     assert!(matches!(
@@ -618,6 +619,7 @@ async fn auto_recovery_manual_unblock_wins_during_pending_backoff() -> anyhow::R
             reason: "manual unblock while backoff pending",
             actor: "operator",
             target_state: None,
+            evidence: &[],
         })
         .await?;
     assert!(matches!(
