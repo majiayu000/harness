@@ -1308,15 +1308,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "harness-eval"
-version = "0.6.34"
-dependencies = [
- "harness-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "harness-exec"
 version = "0.6.34"
 dependencies = [
@@ -1428,7 +1419,6 @@ dependencies = [
  "harness-agents",
  "harness-context",
  "harness-core",
- "harness-eval",
  "harness-exec",
  "harness-gc",
  "harness-observe",

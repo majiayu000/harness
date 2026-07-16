@@ -60,9 +60,6 @@ pub struct CoreServices {
     /// project roots against `$HOME` in concurrent requests.
     pub home_dir: std::path::PathBuf,
     pub tasks: Arc<task_runner::TaskStore>,
-    /// Eval persistence store for runs, artifacts, and quality snapshots.
-    #[cfg(not(test))]
-    pub eval_store: Option<Arc<crate::eval_store::EvalStore>>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
     /// In-memory plan cache hydrated from `plan_db` on startup.

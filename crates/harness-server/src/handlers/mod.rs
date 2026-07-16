@@ -4,7 +4,6 @@ pub mod cross_review;
 pub mod dashboard;
 mod dashboard_active_counts;
 pub mod error;
-pub mod evals;
 pub mod exec;
 pub mod gc;
 pub mod health;

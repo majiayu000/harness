@@ -3,35 +3,26 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::http::state::StoreStartupResult;
-use crate::{
-    eval_store::{migrate_legacy_eval_store_if_needed, EvalStore},
-    task_runner::TaskStore,
-};
+use crate::task_runner::TaskStore;
 
 /// Outputs of the storage initialization phase.
 pub(crate) struct StorageBundle {
     pub tasks: Option<Arc<TaskStore>>,
-    pub eval_store: Option<Arc<EvalStore>>,
     pub startup_results: Vec<StoreStartupResult>,
 }
 
 fn failed_storage_startup_results(error: &str) -> Vec<StoreStartupResult> {
-    vec![
-        StoreStartupResult::critical("tasks").failed(error),
-        StoreStartupResult::optional("eval_store").failed(error),
-    ]
+    vec![StoreStartupResult::critical("tasks").failed(error)]
 }
 
 fn failed_storage_bundle(error: &str) -> StorageBundle {
     StorageBundle {
         tasks: None,
-        eval_store: None,
         startup_results: failed_storage_startup_results(error),
     }
 }
 
-/// Initialize persistent storage: validate `data_dir`, open the task DB and
-/// optional eval store.
+/// Initialize persistent storage: validate `data_dir` and open the task DB.
 ///
 /// On Unix this function refuses to proceed if `data_dir` is a symbolic link
 /// to prevent symlink-hijacking attacks on the persistent data directory.
@@ -66,8 +57,6 @@ pub(crate) async fn build_storage_with_database_url(
 
     let db_path = harness_core::config::dirs::default_db_path(data_dir, "tasks");
     tracing::debug!("task db: {}", db_path.display());
-    let eval_db_path = harness_core::config::dirs::default_db_path(data_dir, "evals");
-    tracing::debug!("eval db: {}", eval_db_path.display());
 
     let database_url = match harness_core::db::resolve_database_url(configured_database_url) {
         Ok(database_url) => database_url,
@@ -105,49 +94,11 @@ pub(crate) async fn build_storage_with_database_url(
         },
     };
 
-    let (eval_store, eval_result) = match super::forced_startup_error("eval_store") {
-        Some(error) => (
-            None,
-            StoreStartupResult::optional("eval_store").failed(error),
-        ),
-        None => {
-            match async {
-                let eval_context = EvalStore::shared_schema_context(Some(&database_url))?;
-                super::ensure_startup_context_not_path_derived("eval_store", &eval_context)?;
-                let store =
-                    EvalStore::open_shared_with_data_dir(&eval_context, &setup_pool, data_dir)
-                        .await?;
-                migrate_legacy_eval_store_if_needed(&eval_db_path, Some(&database_url), &store)
-                    .await?;
-                Ok::<_, anyhow::Error>(store)
-            }
-            .await
-            {
-                Ok(store) => (
-                    Some(Arc::new(store)),
-                    StoreStartupResult::optional("eval_store"),
-                ),
-                Err(error) => (
-                    None,
-                    StoreStartupResult::optional("eval_store").failed(error.to_string()),
-                ),
-            }
-        }
-    };
-
-    if let Some(error) = eval_result.error.as_deref() {
-        tracing::warn!(
-            path = %eval_db_path.display(),
-            "eval store init failed, eval persistence APIs will be disabled: {error}"
-        );
-    }
-
     setup_pool.close().await;
 
     Ok(StorageBundle {
         tasks,
-        eval_store,
-        startup_results: vec![task_result, eval_result],
+        startup_results: vec![task_result],
     })
 }
 
@@ -168,11 +119,6 @@ mod tests {
         assert!(
             bundle.tasks.is_some(),
             "tasks store should be ready: {:?}",
-            bundle.startup_results
-        );
-        assert!(
-            bundle.eval_store.is_some(),
-            "eval store should be ready: {:?}",
             bundle.startup_results
         );
     }
@@ -199,35 +145,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn build_storage_opens_eval_store_from_shared_schema() {
-        let database_url = match harness_core::db::resolve_test_database_url(None) {
-            Ok(url) => url,
-            Err(_) => return,
-        };
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bundle = build_storage_with_database_url(dir.path(), Some(&database_url))
-            .await
-            .expect("build_storage should succeed");
-        let eval_store = bundle.eval_store.expect("eval store should be ready");
-
-        assert_eq!(eval_store.schema(), crate::eval_store::EVAL_STORE_SCHEMA);
-        assert_eq!(
-            eval_store.store_key(),
-            crate::eval_store::EvalStore::store_key_for_data_dir(dir.path()).expect("store key")
-        );
-    }
-
     #[test]
     fn bootstrap_failure_records_all_storage_statuses() {
         let statuses = failed_storage_startup_results("database unavailable");
-        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].name, "tasks");
         assert!(statuses[0].is_critical());
         assert!(!statuses[0].ready);
-        assert_eq!(statuses[1].name, "eval_store");
-        assert!(!statuses[1].is_critical());
-        assert!(!statuses[1].ready);
     }
 
     #[cfg(unix)]
