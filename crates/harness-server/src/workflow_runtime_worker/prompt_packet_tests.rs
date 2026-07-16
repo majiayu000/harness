@@ -3,11 +3,11 @@ use harness_core::config::workflow::{
     DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
 };
 use harness_workflow::runtime::{
-    build_declarative_definition, RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome,
-    RepoMemoryRecord, RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
-    WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowRuntimeRecoveryAction,
-    WorkflowRuntimeStore, WorkflowStateDefinition, WorkflowSubject, ISSUE_PLAN_ACTIVITY,
-    ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    build_declarative_definition, DeclarativeDefinitionResolution, RegisteredWorkflowDefinition,
+    RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, RetrievedRepoMemoryRecord, RuntimeKind,
+    TransitionAllowlist, TransitionRule, WorkflowDefinitionRegistry, WorkflowProgressMode,
+    WorkflowRuntimeRecoveryAction, WorkflowRuntimeStore, WorkflowStateDefinition, WorkflowSubject,
+    ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use std::collections::BTreeMap;
@@ -434,7 +434,8 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
         &runtime_profile,
         &workflow_document,
         &[],
-    );
+    )
+    .expect("built-in prompt packet should build");
     assert_eq!(packet["project"]["root"], "/workspaces/job-1");
     assert_eq!(packet["project"]["source_root"], "/repo");
     assert_eq!(
@@ -485,7 +486,8 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
         &runtime_profile,
         &WorkflowDocument::default(),
         &[],
-    );
+    )
+    .expect("continuation prompt packet should build");
 
     assert_eq!(packet["continuation_context"]["attempt"], 2);
     assert_eq!(
@@ -531,7 +533,8 @@ fn runtime_prompt_packet_describes_deferred_candidate_submission_contract() {
         &runtime_profile,
         &workflow_document,
         &[],
-    );
+    )
+    .expect("candidate prompt packet should build");
 
     assert_eq!(packet["runtime_contract"]["submission_mode"], "deferred");
     assert!(packet["runtime_contract"]["deferred_submission_contract"]
@@ -582,7 +585,8 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
         &runtime_profile,
         &workflow_document,
         &repo_memory,
-    );
+    )
+    .expect("repo-memory prompt packet should build");
 
     assert_eq!(
         packet["repo_memory"]["schema"],
@@ -632,7 +636,8 @@ fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
         &runtime_profile,
         &workflow_document,
         &[],
-    );
+    )
+    .expect("fresh-repo prompt packet should build");
 
     assert!(packet.get("repo_memory").is_none());
     let prompt = build_runtime_job_prompt(&packet, None);
@@ -684,7 +689,7 @@ fn compiled_activity_policy_definition() -> harness_workflow::runtime::Declarati
 }
 
 #[test]
-fn declarative_activity_policy_binds_prompt_and_validation_to_the_pinned_activity() {
+fn declarative_activity_policy_binds_exactly_and_missing_policy_fails_closed() {
     let definition = Arc::new(compiled_activity_policy_definition());
     let workflow = WorkflowInstance::new(
         definition.policy().id.clone(),
@@ -718,8 +723,9 @@ fn declarative_activity_policy_binds_prompt_and_validation_to_the_pinned_activit
         &job,
         Some(&workflow),
         &workflow_document,
-        |_| Some(definition.clone()),
-    );
+        |_| DeclarativeDefinitionResolution::Resolved(definition.clone()),
+    )
+    .expect("exact declarative activity policy should bind");
 
     assert_eq!(
         packet["activity_policy"]["prompt"],
@@ -733,6 +739,20 @@ fn declarative_activity_policy_binds_prompt_and_validation_to_the_pinned_activit
     assert!(prompt.contains("Activity policy instructions:"));
     assert!(prompt.contains("Inspect only the declared repository surface."));
     assert!(prompt.contains("cargo check -p harness-server --all-targets"));
+
+    workflow_document.config.activities.clear();
+    let error = super::activity_policy::apply_activity_policy_with_resolver(
+        &mut json!({
+            "activity_result_schema": {},
+            "required_structured_output": {},
+        }),
+        &job,
+        Some(&workflow),
+        &workflow_document,
+        |_| DeclarativeDefinitionResolution::Resolved(definition.clone()),
+    )
+    .expect_err("a missing declared activity policy must fail closed");
+    assert!(error.to_string().contains("missing from WORKFLOW.md"));
 }
 
 #[test]
@@ -767,8 +787,9 @@ fn built_in_or_unmatched_activity_does_not_bind_declarative_activity_policy() {
         &job,
         Some(&workflow),
         &workflow_document,
-        |_| None,
-    );
+        |_| DeclarativeDefinitionResolution::NotDeclarative,
+    )
+    .expect("built-in workflows should not bind declarative activity policy");
 
     assert!(packet.get("activity_policy").is_none());
     assert!(packet["activity_result_schema"]

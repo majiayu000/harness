@@ -380,6 +380,15 @@ impl DefaultExecutionService {
                     "definition_id must not be empty".to_string(),
                 ));
             }
+            if req
+                .prompt
+                .as_deref()
+                .is_none_or(|prompt| prompt.trim().is_empty())
+            {
+                return Err(EnqueueTaskError::BadRequest(
+                    "declarative workflow submissions require a non-empty prompt".to_string(),
+                ));
+            }
             if req.issue.is_some() || req.pr.is_some() {
                 return Err(EnqueueTaskError::BadRequest(
                     "declarative workflow submissions cannot include issue or pr".to_string(),
@@ -861,7 +870,11 @@ impl DefaultExecutionService {
                 project_root,
                 definition_id,
                 task_id: &task_id,
-                prompt: prepared.req.prompt.as_deref().unwrap_or_default(),
+                prompt: prepared.req.prompt.as_deref().ok_or_else(|| {
+                    EnqueueTaskError::BadRequest(
+                        "declarative workflow submissions require a non-empty prompt".to_string(),
+                    )
+                })?,
                 depends_on: &prepared.req.depends_on,
                 serialization_depends_on: &prepared.req.serialization_depends_on,
                 source: prepared.req.source.as_deref(),
@@ -1398,3 +1411,7 @@ mod tests;
 #[cfg(test)]
 #[path = "execution_continuation_tests.rs"]
 mod continuation_tests;
+
+#[cfg(test)]
+#[path = "execution_declarative_tests.rs"]
+mod declarative_tests;

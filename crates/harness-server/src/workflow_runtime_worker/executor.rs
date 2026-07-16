@@ -127,7 +127,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 &runtime_profile,
                 &workflow_document,
                 &repo_memory.records,
-            );
+            )?;
             let prompt_packet_digest = prompt_packet_digest(&prompt_packet);
             self.record_prompt_packet_prepared(&job, &prompt_packet, &prompt_packet_digest)
                 .await?;

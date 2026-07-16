@@ -242,17 +242,41 @@ fn prompt_submission_dependency_ids(ctx: &PromptSubmissionRuntimeContext<'_>) ->
 
 async fn commit_runtime_decision(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     decision: WorkflowDecision,
     event_id: String,
     accepted_data: Option<serde_json::Value>,
 ) -> anyhow::Result<WorkflowInstance> {
-    let validation_context = if instance.is_terminal() {
+    let validator = decision_validator_for_instance(&instance)?;
+    commit_runtime_decision_with_validator(
+        store,
+        instance,
+        decision,
+        event_id,
+        accepted_data,
+        validator,
+        false,
+    )
+    .await
+}
+
+async fn commit_runtime_decision_with_validator(
+    store: &WorkflowRuntimeStore,
+    mut instance: WorkflowInstance,
+    decision: WorkflowDecision,
+    event_id: String,
+    accepted_data: Option<serde_json::Value>,
+    validator: DecisionValidator,
+    allow_missing_pinned_cancel: bool,
+) -> anyhow::Result<WorkflowInstance> {
+    let mut validation_context = if instance.is_terminal() {
         ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
     } else {
         ValidationContext::new("workflow-policy", chrono::Utc::now())
     };
-    let validator = decision_validator_for_instance(&instance)?;
+    if allow_missing_pinned_cancel {
+        validation_context = validation_context.allow_missing_pinned_cancel();
+    }
     if let Err(error) = validator.validate(&instance, &decision, &validation_context) {
         let reason = error.to_string();
         let record = WorkflowDecisionRecord::rejected(decision, Some(event_id), &reason);
@@ -283,7 +307,15 @@ fn decision_validator_for_instance(
     match instance.definition_id.as_str() {
         GITHUB_ISSUE_PR_DEFINITION_ID => Ok(DecisionValidator::github_issue_pr()),
         PROMPT_TASK_DEFINITION_ID => Ok(DecisionValidator::prompt_task()),
-        other => anyhow::bail!("workflow definition `{other}` cannot be committed by submission"),
+        other => harness_workflow::runtime::decision_validator_for_instance(instance)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "workflow definition `{other}` has an invalid definition pin: {error:?}"
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!("workflow definition `{other}` cannot be committed by submission")
+            }),
     }
 }
 
@@ -663,6 +695,9 @@ mod identity_tests;
 #[path = "workflow_runtime_submission/dependency_tests.rs"]
 mod dependency_tests;
 
+#[cfg(test)]
+#[path = "workflow_runtime_submission/declarative_cancel_tests.rs"]
+mod declarative_cancel_tests;
 #[cfg(test)]
 #[path = "workflow_runtime_submission/declarative_tests.rs"]
 mod declarative_tests;

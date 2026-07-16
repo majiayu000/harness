@@ -112,7 +112,7 @@ fn declarative_submission_decision_validates_against_the_registered_submission_r
     let instance = WorkflowInstance::new(
         TEST_DEFINITION_ID,
         definition.definition_version(),
-        "__submission__",
+        definition.policy().initial.clone(),
         WorkflowSubject::new("declarative", "task:validation"),
     )
     .with_data(json!({ "definition_hash": definition.definition_hash() }));
@@ -309,6 +309,44 @@ async fn declarative_submission_mapped_signal_reaches_terminal_state() -> anyhow
         anyhow::bail!("declarative workflow disappeared after completion");
     };
     assert_eq!(instance.state, "cancelled");
+    Ok(())
+}
+
+#[tokio::test]
+async fn declarative_submission_can_be_cancelled_by_an_operator() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    register_test_definition();
+    let dir = tempfile::tempdir()?;
+    let store = open_declarative_runtime_store(dir.path()).await?;
+    let project_root = create_test_project(dir.path())?;
+    let task_id = TaskId::from_str("declarative-operator-cancel");
+    let record = record_declarative_submission(
+        &store,
+        DeclarativeSubmissionRuntimeContext {
+            project_root: &project_root,
+            definition_id: TEST_DEFINITION_ID,
+            task_id: &task_id,
+            prompt: "cancel the declared work",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            source: Some("operator-test"),
+            external_id: Some("cancel-1"),
+        },
+    )
+    .await?;
+
+    let outcome = cancel_submission_by_workflow_id(&store, &record.workflow_id).await?;
+    let RuntimeSubmissionCancelOutcome::Cancelled(instance) = outcome else {
+        anyhow::bail!("declarative submission did not report a cancelled outcome");
+    };
+    assert_eq!(instance.state, "cancelled");
+    assert_eq!(instance.data["cancelled"], true);
+    assert_eq!(
+        instance.data["last_decision"],
+        "cancel_declarative_submission"
+    );
     Ok(())
 }
 

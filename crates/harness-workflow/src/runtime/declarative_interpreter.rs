@@ -9,9 +9,15 @@ pub fn build_declarative_submission_decision(
     definition: &DeclarativeWorkflowDefinition,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<WorkflowDecision> {
+    let initial = definition.policy().initial.as_str();
     if instance.definition_id != definition.policy().id
         || instance.definition_version != definition.definition_version()
-        || instance.state != "__submission__"
+        || instance.state != initial
+        || instance
+            .data
+            .get("definition_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(definition.definition_hash())
     {
         anyhow::bail!(
             "declarative submission instance does not match definition '{}@{}'",
@@ -19,18 +25,17 @@ pub fn build_declarative_submission_decision(
             definition.definition_version()
         );
     }
-    let target = definition.policy().initial.as_str();
     let commands = commands_for_target(
         definition,
-        target,
-        format!("{}:{}:submit", instance.id, target),
+        initial,
+        format!("{}:{}:submit", instance.id, initial),
     )?;
     let mut decision = WorkflowDecision::new(
         &instance.id,
-        "__submission__",
+        initial,
         DECLARATIVE_SUBMISSION_DECISION,
-        target,
-        format!("declarative workflow entered initial state '{target}'"),
+        initial,
+        format!("declarative workflow entered initial state '{initial}'"),
     )
     .high_confidence();
     decision.commands = commands;
@@ -146,12 +151,14 @@ mod tests {
         let instance = WorkflowInstance::new(
             definition.policy().id.clone(),
             definition.definition_version(),
-            "__submission__",
+            definition.policy().initial.clone(),
             WorkflowSubject::new("test", "submission"),
-        );
+        )
+        .with_data(json!({ "definition_hash": definition.definition_hash() }));
 
         let decision = build_declarative_submission_decision(&definition, &instance)?;
         assert_eq!(decision.decision, DECLARATIVE_SUBMISSION_DECISION);
+        assert_eq!(decision.observed_state, "working");
         assert_eq!(decision.next_state, "working");
         assert_eq!(
             decision.commands[0].command_type,
@@ -170,9 +177,10 @@ mod tests {
         let instance = WorkflowInstance::new(
             "wrong_definition",
             definition.definition_version(),
-            "__submission__",
+            definition.policy().initial.clone(),
             WorkflowSubject::new("test", "submission-mismatch"),
-        );
+        )
+        .with_data(json!({ "definition_hash": definition.definition_hash() }));
 
         assert!(build_declarative_submission_decision(&definition, &instance).is_err());
     }

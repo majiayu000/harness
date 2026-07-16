@@ -469,7 +469,7 @@ fn compile_allowlist(
         for (_, target) in transition_targets(state) {
             edges.insert((source.as_str(), target));
         }
-        if state.activity.is_some() {
+        if source == &policy.initial || state.activity.is_some() {
             edges.insert((source.as_str(), source.as_str()));
         }
     }
@@ -484,12 +484,6 @@ fn compile_allowlist(
         .into_iter()
         .map(|(source, target)| transition_rule_for_target(policy, terminal_states, source, target))
         .collect::<Vec<_>>();
-    rules.push(transition_rule_for_target(
-        policy,
-        terminal_states,
-        "__submission__",
-        &policy.initial,
-    ));
     for source in policy.states.keys() {
         for class in ["failed", "cancelled"] {
             let target = terminal_state_for_class(policy, class);
