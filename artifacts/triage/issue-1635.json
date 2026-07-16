@@ -1,0 +1,23 @@
+{
+  "issue": 1635,
+  "route": "triage_issue",
+  "state": "ready_to_spec",
+  "classification": "reliability",
+  "security_private": false,
+  "duplicate": false,
+  "related_work": [
+    "GH-1464",
+    "PR-1553",
+    "GH-1602",
+    "PR-1622"
+  ],
+  "search_summary": "No active issue or pull request covers the pre-push interaction between DB environment isolation and mandatory GH1602 workflow PostgreSQL tests.",
+  "proposed_labels": [
+    "bug",
+    "ci",
+    "agent_generated",
+    "ready_to_spec"
+  ],
+  "decision": "allowed",
+  "human_gate_evidence": "Maintainer standing authorization recorded in the 2026-07-16 Codex goal thread."
+}
