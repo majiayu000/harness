@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 
+#[path = "execution/declarative_submission.rs"]
+mod declarative_submission;
+use declarative_submission::PreparedRuntimeDeclarativeSubmission;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueDomain {
     Primary,
@@ -161,6 +165,7 @@ const WORKFLOW_FEEDBACK_SOURCE: &str = "workflow_feedback";
 
 enum PreparedEnqueueResult {
     Existing(TaskId),
+    RuntimeDeclarativeSubmission(Box<PreparedRuntimeDeclarativeSubmission>),
     RuntimeIssueSubmission(Box<PreparedRuntimeIssueSubmission>),
     RuntimePromptSubmission(Box<PreparedRuntimePromptSubmission>),
     RuntimePrFeedbackSubmission(Box<PreparedRuntimePrFeedbackSubmission>),
@@ -370,6 +375,28 @@ impl DefaultExecutionService {
                 req.priority,
                 task_runner::MAX_TASK_PRIORITY,
             )));
+        }
+        if let Some(definition_id) = req.definition_id.as_deref() {
+            if definition_id.trim().is_empty() {
+                return Err(EnqueueTaskError::BadRequest(
+                    "definition_id must not be empty".to_string(),
+                ));
+            }
+            if req.prompt.is_none() || req.issue.is_some() || req.pr.is_some() {
+                return Err(EnqueueTaskError::BadRequest(
+                    "definition_id is only supported for prompt tasks".to_string(),
+                ));
+            }
+            if !req.depends_on.is_empty() || !req.serialization_depends_on.is_empty() {
+                return Err(EnqueueTaskError::BadRequest(format!(
+                    "declarative workflow '{definition_id}' does not support depends_on in v1"
+                )));
+            }
+            if req.continuation.is_some() {
+                return Err(EnqueueTaskError::BadRequest(
+                    "continuation is not supported with definition_id".to_string(),
+                ));
+            }
         }
         if let Some(policy) = req.continuation.as_ref() {
             if req.issue.is_some() || req.pr.is_some() || req.prompt.is_none() {
@@ -924,6 +951,30 @@ impl DefaultExecutionService {
         task_runner::fill_missing_repo_from_project(&mut req).await;
         Self::populate_external_id(&mut req);
 
+        if let Some(definition_id) = req.definition_id.as_deref() {
+            if self.workflow_runtime_store.is_none() {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime store is required for declarative submissions".to_string(),
+                ));
+            }
+            if !self.runtime_prompt_submission_enabled(&canonical)? {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime dispatch and worker must be enabled for declarative submissions"
+                        .to_string(),
+                ));
+            }
+            self.validate_project_declarative_definition(&canonical, definition_id)?;
+            if let Some(existing_id) = self
+                .check_runtime_declarative_duplicate(&project_id, &req)
+                .await?
+            {
+                return Ok(PreparedEnqueueResult::Existing(existing_id));
+            }
+            return Ok(PreparedEnqueueResult::RuntimeDeclarativeSubmission(
+                Box::new(PreparedRuntimeDeclarativeSubmission { req, project_id }),
+            ));
+        }
+
         if let Some(existing_id) = self.check_workflow_duplicate(&project_id, &req).await {
             return Ok(PreparedEnqueueResult::Existing(existing_id));
         }
@@ -1088,6 +1139,9 @@ impl ExecutionService for DefaultExecutionService {
     ) -> Result<TaskId, EnqueueTaskError> {
         let prepared = match self.prepare_enqueue(req).await? {
             PreparedEnqueueResult::Existing(task_id) => return Ok(task_id),
+            PreparedEnqueueResult::RuntimeDeclarativeSubmission(prepared) => {
+                return self.submit_declarative_to_workflow_runtime(*prepared).await;
+            }
             PreparedEnqueueResult::RuntimeIssueSubmission(prepared) => {
                 return self.submit_issue_to_workflow_runtime(*prepared).await;
             }
@@ -1152,6 +1206,9 @@ impl ExecutionService for DefaultExecutionService {
     ) -> Result<TaskId, EnqueueTaskError> {
         let prepared = match self.prepare_enqueue(req).await? {
             PreparedEnqueueResult::Existing(task_id) => return Ok(task_id),
+            PreparedEnqueueResult::RuntimeDeclarativeSubmission(prepared) => {
+                return self.submit_declarative_to_workflow_runtime(*prepared).await;
+            }
             PreparedEnqueueResult::RuntimeIssueSubmission(prepared) => {
                 return self.submit_issue_to_workflow_runtime(*prepared).await;
             }
@@ -1282,3 +1339,7 @@ mod tests;
 #[cfg(test)]
 #[path = "execution_continuation_tests.rs"]
 mod continuation_tests;
+
+#[cfg(test)]
+#[path = "execution/declarative_submission_tests.rs"]
+mod declarative_submission_tests;

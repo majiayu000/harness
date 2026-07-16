@@ -1,6 +1,9 @@
 use super::{
     declarative_pinning::declarative_definition_identity,
-    model::{ActivityArtifact, WorkflowCommandType, WorkflowEvidence},
+    model::{
+        ActivityArtifact, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence,
+        WorkflowInstance,
+    },
     pr_feedback::PR_FEEDBACK_DEFINITION_ID,
     prompt_task::PROMPT_TASK_DEFINITION_ID,
     quality_gate::QUALITY_GATE_DEFINITION_ID,
@@ -15,6 +18,8 @@ use harness_core::config::workflow::{
     DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use serde_json::json;
 
 /// A structurally validated declaration and the registry definition compiled from it.
 ///
@@ -88,6 +93,89 @@ pub fn build_declarative_definition(
         definition_version,
         definition_hash,
     })
+}
+
+/// Builds the audited self-transition that starts a declarative workflow.
+///
+/// The instance must already be pinned to this exact declaration. The command
+/// uses a submission-scoped dedupe key because no activity completion event
+/// exists yet.
+pub fn build_declarative_submission_decision(
+    definition: &DeclarativeWorkflowDefinition,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<WorkflowDecision> {
+    let policy = definition.policy();
+    if instance.definition_id != policy.id
+        || instance.definition_version != definition.definition_version()
+        || instance
+            .data
+            .get("definition_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(definition.definition_hash())
+    {
+        anyhow::bail!(
+            "declarative workflow instance '{}' is not pinned to definition '{}@{}'",
+            instance.id,
+            policy.id,
+            definition.definition_version()
+        );
+    }
+    if instance.state != policy.initial {
+        anyhow::bail!(
+            "declarative workflow instance '{}' must start in initial state '{}', got '{}'",
+            instance.id,
+            policy.initial,
+            instance.state
+        );
+    }
+    let initial = policy.states.get(&policy.initial).ok_or_else(|| {
+        anyhow::anyhow!(
+            "declarative workflow definition '{}' has no active initial state '{}'",
+            policy.id,
+            policy.initial
+        )
+    })?;
+    let dedupe_key = format!("{}:{}:submit", instance.id, policy.initial);
+    let command = if let Some(activity) = initial.activity.as_deref() {
+        WorkflowCommand::enqueue_activity(activity, dedupe_key)
+    } else {
+        match initial.progress {
+            Some(DeclaredProgressMode::ExternalWait) => WorkflowCommand::wait(
+                format!(
+                    "declarative workflow '{}' entered initial external wait state '{}'",
+                    policy.id, policy.initial
+                ),
+                dedupe_key,
+            ),
+            Some(DeclaredProgressMode::OperatorGate) => WorkflowCommand::new(
+                WorkflowCommandType::RequestOperatorAttention,
+                dedupe_key,
+                json!({
+                    "reason": "declarative workflow entered its initial operator gate",
+                    "definition_id": policy.id,
+                    "target_state": policy.initial,
+                }),
+            ),
+            None => anyhow::bail!(
+                "declarative workflow definition '{}' initial state '{}' has no progress driver",
+                policy.id,
+                policy.initial
+            ),
+        }
+    };
+
+    Ok(WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "submit_declarative_workflow",
+        &instance.state,
+        format!(
+            "submitted declarative workflow '{}' in initial state '{}'",
+            policy.id, policy.initial
+        ),
+    )
+    .with_command(command)
+    .high_confidence())
 }
 
 /// Converts completed activity artifacts into exact, case-sensitive evidence kinds.
@@ -465,7 +553,10 @@ fn compile_allowlist(
         for (_, target) in transition_targets(state) {
             edges.insert((source.as_str(), target));
         }
-        if state.activity.is_some() {
+        // Submission starts in the declared initial state and emits that
+        // state's driver as an audited self-transition. Activity states also
+        // retain their existing validator-controlled retry self-transition.
+        if source == &policy.initial || state.activity.is_some() {
             edges.insert((source.as_str(), source.as_str()));
         }
     }

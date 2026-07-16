@@ -414,11 +414,18 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
             "runtime_profile": RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc)
         }),
     );
-    let workflow_document = WorkflowDocument {
+    let mut workflow_document = WorkflowDocument {
         prompt_template: "Follow the repository workflow prompt.".to_string(),
         source_path: Some("/repo/WORKFLOW.md".to_string()),
         ..Default::default()
     };
+    workflow_document.config.activities.insert(
+        "implement_issue".to_string(),
+        harness_core::config::workflow::WorkflowActivityPolicy {
+            prompt: Some("Apply the issue-specific review policy.".to_string()),
+            validation: vec!["cargo test -p harness-server".to_string()],
+        },
+    );
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
 
     let packet = build_runtime_prompt_packet(
@@ -436,8 +443,20 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
         packet["workflow_file"]["prompt_template"],
         "Follow the repository workflow prompt."
     );
+    assert_eq!(
+        packet["workflow_file"]["activity_prompt"],
+        "Apply the issue-specific review policy."
+    );
+    assert_eq!(
+        packet["workflow_file"]["activity_validation"],
+        json!(["cargo test -p harness-server"])
+    );
 
     let prompt = build_runtime_job_prompt(&packet, None);
+    assert!(prompt.contains("Repository workflow activity prompt:"));
+    assert!(prompt.contains("Apply the issue-specific review policy."));
+    assert!(prompt.contains("Repository workflow activity validation commands:"));
+    assert!(prompt.contains("- cargo test -p harness-server"));
     assert!(prompt.contains("Repository workflow prompt template:"));
     assert!(prompt.contains("Follow the repository workflow prompt."));
 }

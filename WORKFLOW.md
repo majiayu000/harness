@@ -125,3 +125,53 @@ Final response:
 
 - Include changed files, validation commands, and remaining blockers.
 - End with a fenced `harness-activity-result` JSON block matching the prompt packet schema.
+
+## Declarative workflow example
+
+A repository can declare one custom workflow in this file's frontmatter. Harness validates and
+registers the definition at startup, pins its content hash on each submitted instance, and selects
+the declared activity prompt and validation commands when dispatching the activity.
+
+```yaml
+definition:
+  id: docs_review_flow
+  initial: reviewing
+  states:
+    reviewing:
+      activity: review_docs
+      on_success: done
+      on_failure: failed
+      on_blocked: blocked
+      on_signal:
+        cancel: cancelled
+    blocked:
+      progress: operator_gate
+  terminal:
+    done: succeeded
+    failed: failed
+    cancelled: cancelled
+  evidence_required:
+    done: [review_report]
+  recovery_targets: [reviewing]
+activities:
+  review_docs:
+    prompt: Review the submitted documentation and emit a review_report artifact.
+    validation:
+      - cargo test -p docs
+```
+
+After restarting Harness with the definition registered, submit it through the normal task API:
+
+```bash
+curl -X POST http://127.0.0.1:3000/tasks \
+  -H 'content-type: application/json' \
+  -d '{
+    "project": "/absolute/path/to/repository",
+    "definition_id": "docs_review_flow",
+    "prompt": "Review the release documentation.",
+    "external_id": "release-2026-07"
+  }'
+```
+
+Declarative workflow submissions are prompt-only in v1 and reject `depends_on`, continuation,
+issue, and PR fields.

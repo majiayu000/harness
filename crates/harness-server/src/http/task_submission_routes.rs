@@ -238,7 +238,19 @@ fn is_runtime_submission_definition(definition_id: &str) -> bool {
         definition_id,
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID
             | harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID
-    )
+    ) || harness_workflow::runtime::current_declarative_workflow_definition(definition_id).is_some()
+}
+
+fn matches_persisted_declarative_definition(
+    workflow: &harness_workflow::runtime::WorkflowInstance,
+    definition: Option<&harness_workflow::runtime::WorkflowDefinition>,
+) -> bool {
+    let Some(definition) = definition else {
+        return false;
+    };
+    definition.metadata.get("kind").and_then(Value::as_str) == Some("declarative_workflow")
+        && workflow.data.get("definition_hash").and_then(Value::as_str)
+            == Some(definition.definition_hash.as_str())
 }
 
 async fn runtime_workflow_by_handle(
@@ -254,7 +266,15 @@ async fn runtime_workflow_by_handle(
     else {
         return Ok(None);
     };
-    if is_runtime_submission_definition(&workflow.definition_id) {
+    let is_runtime_submission = if is_runtime_submission_definition(&workflow.definition_id) {
+        true
+    } else {
+        let definition = store
+            .get_definition(&workflow.definition_id, workflow.definition_version)
+            .await?;
+        matches_persisted_declarative_definition(&workflow, definition.as_ref())
+    };
+    if is_runtime_submission {
         Ok(Some(workflow))
     } else {
         Ok(None)
@@ -537,6 +557,33 @@ mod tests {
             runtime_submission_handle(&workflow, &fallback),
             "stable-submission"
         );
+    }
+
+    #[test]
+    fn declarative_workflow_remains_runtime_visible_from_its_persisted_definition_pin() {
+        let definition_hash =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let workflow = WorkflowInstance::new(
+            "retired_declarative_definition",
+            7,
+            "reviewing",
+            WorkflowSubject::new("declarative", "docs-1"),
+        )
+        .with_data(json!({
+            "definition_hash": definition_hash
+        }));
+        let definition = harness_workflow::runtime::WorkflowDefinition::new(
+            "retired_declarative_definition",
+            7,
+            "retired_declarative_definition",
+        )
+        .with_definition_hash(definition_hash)
+        .with_metadata(json!({ "kind": "declarative_workflow" }));
+
+        assert!(matches_persisted_declarative_definition(
+            &workflow,
+            Some(&definition)
+        ));
     }
 
     #[test]

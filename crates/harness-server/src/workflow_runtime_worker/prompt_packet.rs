@@ -28,6 +28,19 @@ pub(super) fn build_runtime_prompt_packet(
     workflow_document: &WorkflowDocument,
     repo_memory: &[RetrievedRepoMemoryRecord],
 ) -> Value {
+    let activity = activity_name(job);
+    let activity_prompt = workflow_document
+        .config
+        .activities
+        .get(&activity)
+        .and_then(|policy| policy.prompt.as_deref())
+        .filter(|prompt| !prompt.trim().is_empty());
+    let activity_validation = workflow_document
+        .config
+        .activities
+        .get(&activity)
+        .map(|policy| policy.validation.as_slice())
+        .unwrap_or_default();
     let mut packet = json!({
         "schema": "harness.runtime.prompt_packet.v1",
         "runtime_job": {
@@ -35,7 +48,7 @@ pub(super) fn build_runtime_prompt_packet(
             "command_id": job.command_id,
             "runtime_kind": job.runtime_kind,
             "runtime_profile": job.runtime_profile,
-            "activity": activity_name(job),
+            "activity": activity,
         },
         "runtime_profile": runtime_profile,
         "project": {
@@ -62,6 +75,8 @@ pub(super) fn build_runtime_prompt_packet(
             "source_path": &workflow_document.source_path,
             "config": &workflow_document.config,
             "prompt_template": &workflow_document.prompt_template,
+            "activity_prompt": activity_prompt,
+            "activity_validation": activity_validation,
         },
         "command_input": job.input,
         "runtime_contract": {
@@ -214,6 +229,29 @@ pub(super) fn build_runtime_job_prompt(
         prompt.push_str("\nPrompt task request:\n");
         prompt.push_str(prompt_task_request);
         prompt.push('\n');
+    }
+    if let Some(activity_prompt) = prompt_packet
+        .get("workflow_file")
+        .and_then(|workflow_file| workflow_file.get("activity_prompt"))
+        .and_then(Value::as_str)
+        .filter(|activity_prompt| !activity_prompt.trim().is_empty())
+    {
+        prompt.push_str("\nRepository workflow activity prompt:\n");
+        prompt.push_str(activity_prompt);
+        prompt.push('\n');
+    }
+    if let Some(commands) = prompt_packet
+        .get("workflow_file")
+        .and_then(|workflow_file| workflow_file.get("activity_validation"))
+        .and_then(Value::as_array)
+        .filter(|commands| !commands.is_empty())
+    {
+        prompt.push_str("\nRepository workflow activity validation commands:\n");
+        for command in commands.iter().filter_map(Value::as_str) {
+            prompt.push_str("- ");
+            prompt.push_str(command);
+            prompt.push('\n');
+        }
     }
     if let Some(template) = prompt_packet
         .get("workflow_file")

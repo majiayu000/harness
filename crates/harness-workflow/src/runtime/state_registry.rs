@@ -321,6 +321,15 @@ pub fn workflow_declarative_definition(
         .declarative_definition(definition_id, definition_version)
 }
 
+pub fn current_declarative_workflow_definition(
+    definition_id: &str,
+) -> Option<Arc<DeclarativeWorkflowDefinition>> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .current_declarative_definition(definition_id)
+}
+
 pub fn workflow_definition_for_version(
     definition_id: &str,
     definition_version: u32,

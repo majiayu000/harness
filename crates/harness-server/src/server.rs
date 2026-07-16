@@ -5,6 +5,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[path = "server/declarative_startup.rs"]
+mod declarative_startup;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeLogState {
     Disabled,
@@ -105,6 +108,7 @@ impl HarnessServer {
 
     /// Start in stdio mode (JSON-RPC over stdin/stdout).
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
+        self.register_startup_declarative_workflows()?;
         harness_workflow::runtime::freeze_workflow_definition_registry();
         let state = crate::http::build_app_state(Arc::new(self)).await?;
         crate::stdio::serve(state).await
@@ -112,6 +116,7 @@ impl HarnessServer {
 
     /// Start in HTTP + WebSocket mode.
     pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
+        self.register_startup_declarative_workflows()?;
         harness_workflow::runtime::freeze_workflow_definition_registry();
         crate::http::serve(self, addr).await
     }

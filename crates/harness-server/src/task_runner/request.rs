@@ -13,6 +13,9 @@ pub const MAX_TASK_PRIORITY: u8 = 2;
 pub struct CreateTaskRequest {
     /// Free-text task description (prompt, issue URL, etc.).
     pub prompt: Option<String>,
+    /// Registered declarative workflow definition to use for this prompt task.
+    #[serde(default)]
+    pub definition_id: Option<String>,
     /// GitHub issue number to implement from.
     pub issue: Option<u64>,
     /// When true, issue-backed tasks bypass the triage/plan pipeline and go
@@ -137,6 +140,8 @@ pub struct PersistedRequestSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
@@ -184,6 +189,7 @@ impl PersistedRequestSettings {
         Self {
             issue: req.issue,
             pr: req.pr,
+            definition_id: req.definition_id.clone(),
             agent: req.agent.clone(),
             max_rounds: req.max_rounds,
             max_turns: req.max_turns,
@@ -223,6 +229,7 @@ impl PersistedRequestSettings {
         if req.pr.is_none() {
             req.pr = self.pr;
         }
+        req.definition_id = self.definition_id.clone();
         req.agent = self.agent.clone();
         req.max_rounds = self.max_rounds;
         req.max_turns = self.max_turns;
@@ -251,6 +258,7 @@ impl Default for CreateTaskRequest {
     fn default() -> Self {
         Self {
             prompt: None,
+            definition_id: None,
             issue: None,
             skip_triage: false,
             force_execute: false,
@@ -288,6 +296,9 @@ pub(super) fn summarize_request_description(req: &CreateTaskRequest) -> Option<S
     }
     if let Some(n) = req.pr {
         return Some(format!("PR #{n}"));
+    }
+    if let Some(definition_id) = req.definition_id.as_deref() {
+        return Some(format!("declarative workflow {definition_id}"));
     }
     if req.prompt.is_some() {
         return task_kind.prompt_task_label().map(str::to_string);

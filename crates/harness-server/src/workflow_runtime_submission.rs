@@ -26,6 +26,8 @@ const GITHUB_TRACKER_SOURCE: &str = "github";
 mod cancel;
 #[path = "workflow_runtime_submission/commit.rs"]
 mod commit;
+#[path = "workflow_runtime_submission/declarative.rs"]
+mod declarative;
 #[path = "workflow_runtime_submission/dependencies.rs"]
 mod dependencies;
 #[path = "workflow_runtime_submission/prompt_memory.rs"]
@@ -37,7 +39,11 @@ pub(crate) use cancel::{
     cancel_issue_submission_by_task_id, cancel_submission_by_workflow_id,
     RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
 };
-use commit::{apply_decision, apply_prompt_decision};
+use commit::{apply_decision, apply_declarative_decision, apply_prompt_decision};
+pub(crate) use declarative::{
+    declarative_workflow_id, record_declarative_submission, resolve_project_declarative_definition,
+    DeclarativeSubmissionRuntimeContext,
+};
 pub(crate) use dependencies::{
     release_ready_issue_dependencies, release_ready_prompt_dependencies,
     resolve_issue_dependency_status, RuntimeDependencyStatus,
@@ -668,6 +674,10 @@ mod replay_tests;
 #[cfg(test)]
 #[path = "workflow_runtime_submission/trust_tests.rs"]
 mod trust_tests;
+
+#[cfg(test)]
+#[path = "workflow_runtime_submission/declarative_tests.rs"]
+mod declarative_tests;
 
 #[cfg(test)]
 #[path = "workflow_runtime_submission_tests.rs"]

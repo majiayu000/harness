@@ -64,7 +64,10 @@ pub use candidate_selection::{
     CandidateOutcome, CandidatePromotionRecord, CandidateRankingRecord, CandidateSelectionInput,
     CandidateSelectionRecord, CANDIDATE_SELECTION_RECORD_TYPE, CANDIDATE_SELECTION_SCHEMA,
 };
-pub use declarative::{build_declarative_definition, DeclarativeWorkflowDefinition};
+pub use declarative::{
+    build_declarative_definition, build_declarative_submission_decision,
+    DeclarativeWorkflowDefinition,
+};
 pub use declarative_pinning::{
     declarative_definition_identity, hydrate_declarative_definition,
     persisted_declarative_definition,
@@ -148,9 +151,9 @@ pub use repo_memory::{
     REPO_MEMORY_DEGRADATION_ARTIFACT,
 };
 pub use state_registry::{
-    decision_validator_for_definition, decision_validator_for_instance,
-    freeze_workflow_definition_registry, known_workflow_definition_ids,
-    register_declarative_workflow_definitions,
+    current_declarative_workflow_definition, decision_validator_for_definition,
+    decision_validator_for_instance, freeze_workflow_definition_registry,
+    known_workflow_definition_ids, register_declarative_workflow_definitions,
     register_historical_declarative_workflow_definitions, register_workflow_definition,
     resolve_declarative_definition, workflow_declarative_definition, workflow_definition,
     workflow_definition_for_version, workflow_state_definition,

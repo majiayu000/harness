@@ -1,7 +1,8 @@
 use super::{
     depends_on_strings, insert_author_trust_class, merge_last_decision, optional_string_field,
-    string_field, IssueSubmissionRuntimeContext, PromptSubmissionRuntimeContext,
-    WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
+    string_field, DeclarativeSubmissionRuntimeContext, IssueSubmissionRuntimeContext,
+    PromptSubmissionRuntimeContext, WorkflowSubmissionRuntimeRecord,
+    EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
 use super::{
     prompt_memory::{cache_prompt_submission_prompt, remove_prompt_submission_prompt},
@@ -255,6 +256,114 @@ pub(super) async fn apply_prompt_decision(
     })
 }
 
+pub(super) async fn apply_declarative_decision(
+    store: &WorkflowRuntimeStore,
+    instance: WorkflowInstance,
+    new_instance: bool,
+    mut decision: WorkflowDecision,
+    ctx: &DeclarativeSubmissionRuntimeContext<'_>,
+    accepted_data: serde_json::Value,
+) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
+    let validator = harness_workflow::runtime::decision_validator_for_instance(&instance)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "declarative submission for workflow '{}' has an invalid definition pin: {error:?}",
+                instance.id
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "declarative submission for workflow '{}' has no registered validator",
+                instance.id
+            )
+        })?;
+    validator.validate(
+        &instance,
+        &decision,
+        &ValidationContext::new("workflow-runtime-submission", chrono::Utc::now()),
+    )?;
+
+    let event = declarative_submission_event_for_commit(store, &instance.id, ctx).await?;
+    let new_event_id = new_submission_event_id(&event);
+    if event.disambiguates_command_dedupe() {
+        let event_id = new_event_id
+            .as_deref()
+            .expect("new replay attempt should reserve an event id");
+        disambiguate_submission_command_dedupe(&mut decision, event_id);
+    }
+    let existing_record = match event.event_id.as_deref() {
+        Some(event_id) => decision_for_event(store, &instance.id, event_id).await?,
+        None => None,
+    };
+    if let Some(record) = existing_record.as_ref().filter(|record| !record.accepted) {
+        return Ok(WorkflowSubmissionRuntimeRecord {
+            workflow_id: instance.id,
+            accepted: false,
+            decision_id: record.id.clone(),
+            command_ids: Vec::new(),
+            rejection_reason: record.rejection_reason.clone(),
+        });
+    }
+
+    let prompt_ref = string_field(&accepted_data, "prompt_ref")?;
+    let committed_decision = existing_record
+        .as_ref()
+        .map(|record| &record.decision)
+        .unwrap_or(&decision);
+    let final_instance = accepted_submission_instance(
+        instance.clone(),
+        committed_decision,
+        accepted_data,
+        preserves_applied_instance(&instance, existing_record.as_ref()),
+    );
+    let previous_prompt_ref = optional_string_field(&instance.data, "prompt_ref");
+    let previous_prompt_ref_to_remove = previous_prompt_ref
+        .as_deref()
+        .filter(|previous| *previous != prompt_ref.as_str());
+    let command_status = if committed_decision
+        .commands
+        .iter()
+        .any(|command| command.requires_runtime_job())
+    {
+        WorkflowCommandStatus::Pending
+    } else {
+        WorkflowCommandStatus::HandledInline
+    };
+    let outcome = store
+        .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+            workflow_id: &instance.id,
+            expected_state: &instance.state,
+            expected_version: instance.version,
+            create_if_missing: new_instance.then_some(&instance),
+            event_id: event.event_id.as_deref(),
+            new_event_id: new_event_id.as_deref(),
+            event_type: "DeclarativeSubmitted",
+            source: "workflow_runtime_submission",
+            payload: declarative_submission_event_payload(ctx),
+            decision: &decision,
+            existing_record: existing_record.as_ref(),
+            rejection_reason: None,
+            final_instance: Some(&final_instance),
+            command_status,
+            prompt_payload: Some(WorkflowSubmissionPromptPayload {
+                prompt_ref: &prompt_ref,
+                prompt: ctx.prompt,
+                previous_prompt_ref: previous_prompt_ref_to_remove,
+            }),
+        })
+        .await?
+        .ok_or_else(|| submission_commit_conflict(&instance.id))?;
+    cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
+    remove_prompt_submission_prompt(previous_prompt_ref_to_remove);
+    Ok(WorkflowSubmissionRuntimeRecord {
+        workflow_id: instance.id,
+        accepted: true,
+        decision_id: outcome.record.id,
+        command_ids: outcome.command_ids,
+        rejection_reason: None,
+    })
+}
+
 async fn issue_submission_event_for_commit(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
@@ -275,6 +384,20 @@ async fn prompt_submission_event_for_commit(
 ) -> anyhow::Result<SubmissionEventSelection> {
     let lookup =
         submission_event_for_replay(store, workflow_id, "PromptSubmitted", ctx.task_id).await?;
+    Ok(SubmissionEventSelection {
+        event_id: lookup.event_id,
+        has_prior_attempt: lookup.has_prior_attempt,
+    })
+}
+
+async fn declarative_submission_event_for_commit(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    ctx: &DeclarativeSubmissionRuntimeContext<'_>,
+) -> anyhow::Result<SubmissionEventSelection> {
+    let lookup =
+        submission_event_for_replay(store, workflow_id, "DeclarativeSubmitted", ctx.task_id)
+            .await?;
     Ok(SubmissionEventSelection {
         event_id: lookup.event_id,
         has_prior_attempt: lookup.has_prior_attempt,
@@ -323,6 +446,17 @@ fn prompt_submission_event_payload(ctx: &PromptSubmissionRuntimeContext<'_>) -> 
         payload["continuation"] = json!(policy);
     }
     payload
+}
+
+fn declarative_submission_event_payload(
+    ctx: &DeclarativeSubmissionRuntimeContext<'_>,
+) -> serde_json::Value {
+    json!({
+        "task_id": ctx.task_id.as_str(),
+        "definition_id": ctx.definition_id,
+        "source": ctx.source,
+        "external_id": ctx.external_id,
+    })
 }
 
 fn accepted_submission_instance(
