@@ -17,8 +17,9 @@ fixtures and assertions occupy roughly two thirds of the source file.
 - Give the existing GitHub webhook tests a dedicated private child module while
   retaining their current parent module and test names.
 - Reduce both resulting Rust files to no more than 800 formatted lines.
-- Preserve the production implementation and every test body, assertion,
-  fixture, attribute, and coverage point exactly.
+- Preserve the production implementation exactly and preserve every test's
+  Rust tokens, assertion, fixture, attribute, and coverage point; only
+  deterministic whitespace reflow required by `rustfmt` is permitted.
 - Make webhook production changes reviewable without traversing the complete
   test suite in the same physical source file.
 - Provide deterministic evidence that the extraction is mechanical.
@@ -45,8 +46,10 @@ results as current `origin/main`.
       than 800 formatted lines.
 - [ ] B-002: The complete production function/type inventory and every
       production item body remain unchanged.
-- [ ] B-003: All 33 test names, bodies, assertions, fixtures, attributes,
-      ordering, and `webhook::tests::*` module paths remain unchanged.
+- [ ] B-003: All 33 test names, non-whitespace Rust tokens, assertions,
+      fixtures, attributes, ordering, and `webhook::tests::*` module paths
+      remain unchanged. Whitespace may differ only when the unindented baseline
+      test body is canonically formatted by the repository `rustfmt` version.
 - [ ] B-004: No production behavior, public API, visibility, dependency,
       manifest, lockfile, schema, persisted format, or test expectation changes.
 - [ ] B-005: Focused webhook tests, `harness-server` checks/tests, workspace
@@ -62,7 +65,7 @@ results as current `origin/main`.
   widening production visibility.
 - HMAC fixtures, JSON payload strings, case-insensitive review states, empty
   bodies, invalid payloads, label filters, and ignored actions must move without
-  textual rewriting.
+  token rewriting; indentation-driven `rustfmt` line wrapping is permitted.
 - Test filtering by the existing `webhook::tests::...` path must continue to
   select the same 33 tests.
 - The module declaration remains test-only and must not affect production
