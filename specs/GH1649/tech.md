@@ -52,6 +52,16 @@ split along the same responsibility boundaries rather than compressing or
 rewriting logic. Use the narrowest `pub(super)` visibility needed for sibling
 calls. Do not expose new `pub(crate)` APIs.
 
+Private helpers currently referenced by the nested test suite must remain
+available through the root test namespace. In particular, moved helpers such as
+`failed_child_suppression_cutoff`, `issue_instance`, `pr_scoped_instance`,
+`pr_workflow_id`, `commit_runtime_decision`,
+`upsert_github_issue_pr_definition`, and
+`has_active_pr_feedback_command` must use `pub(super)` in their owner module and
+an explicit `#[cfg(test)] use` in the root facade. This preserves the existing
+`use super::*` test contract without editing test files or widening the
+production API.
+
 The existing `pr_lifecycle_persist` module remains unchanged except for a
 minimal import path adjustment if Rust module ownership requires it.
 
@@ -80,6 +90,8 @@ No new persistence, external call, serialization step, or fallback is added.
   siblings, and qualified private paths only.
 - Preserve all `WorkflowDefinition`, `WorkflowDecision`, command/evidence,
   JSON, logging, error, retry, and timestamp expressions exactly.
+- Preserve root test-namespace access for every moved private helper through
+  `pub(super)` plus root `#[cfg(test)] use`; do not change test files.
 - Grep all external references to ensure stable caller paths remain unchanged.
 - Require root and touched production child files to be at most 800 formatted
   lines.

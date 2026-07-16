@@ -51,6 +51,8 @@ GH-1649
   - move active-command checks, status predicates, and failed-child suppression
     as complete bodies;
   - preserve every query, predicate, cutoff, JSON key, default, error, and log;
+  - retain helpers used by nested tests with `pub(super)` in the owner and
+    explicit root `#[cfg(test)] use` imports;
   - use only narrow sibling visibility and keep external caller paths stable.
 - Done when:
   - every moved symbol has one owner and the exact multiset still matches;
@@ -73,6 +75,8 @@ GH-1649
     logic as complete bodies;
   - preserve validator inputs, transition rejection, instance/command/evidence
     persistence, retry/failure handling, event order, errors, logs, and returns;
+  - preserve root test-namespace access to moved persistence helpers without
+    editing tests or widening production visibility;
   - retain existing facade entry points and context/outcome type paths.
 - Done when:
   - exact inventories and movement review show no missing, duplicate, or
