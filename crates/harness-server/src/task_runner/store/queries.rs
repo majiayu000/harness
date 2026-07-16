@@ -434,3 +434,12 @@ impl TaskStore {
         Ok(by_external_id)
     }
 }
+
+fn latest_timestamp_at_least(candidate: Option<&str>, existing: Option<&str>) -> bool {
+    match (candidate, existing) {
+        (Some(candidate), Some(existing)) => candidate >= existing,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
+}
