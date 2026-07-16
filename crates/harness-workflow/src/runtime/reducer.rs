@@ -550,6 +550,10 @@ fn prompt_task_has_validation_evidence(result: &ActivityResult) -> bool {
 }
 
 #[cfg(test)]
+#[path = "reducer/declarative_tests.rs"]
+mod declarative_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::model::{

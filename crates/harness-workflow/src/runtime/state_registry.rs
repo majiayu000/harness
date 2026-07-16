@@ -321,6 +321,32 @@ pub fn workflow_declarative_definition(
         .declarative_definition(definition_id, definition_version)
 }
 
+pub fn current_declarative_workflow_definition(
+    definition_id: &str,
+) -> Option<Arc<DeclarativeWorkflowDefinition>> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .current_declarative_definition(definition_id)
+}
+
+pub fn declarative_workflow_definition_for_instance(
+    instance: &WorkflowInstance,
+) -> Option<Arc<DeclarativeWorkflowDefinition>> {
+    match resolve_declarative_definition(instance) {
+        DeclarativeDefinitionResolution::Resolved(definition) => Some(definition),
+        DeclarativeDefinitionResolution::NotDeclarative
+        | DeclarativeDefinitionResolution::PinError(_) => None,
+    }
+}
+
+pub fn workflow_instance_is_declarative(instance: &WorkflowInstance) -> bool {
+    !matches!(
+        resolve_declarative_definition(instance),
+        DeclarativeDefinitionResolution::NotDeclarative
+    )
+}
+
 pub fn workflow_definition_for_version(
     definition_id: &str,
     definition_version: u32,

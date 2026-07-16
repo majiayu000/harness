@@ -1,6 +1,8 @@
 use crate::thread_manager::ThreadManager;
 use harness_agents::registry::AgentRegistry;
+use harness_core::config::workflow::load_workflow_document;
 use harness_core::config::{HarnessConfig, ProjectEntry};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -105,6 +107,7 @@ impl HarnessServer {
 
     /// Start in stdio mode (JSON-RPC over stdin/stdout).
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
+        self.register_declarative_workflow_definitions()?;
         harness_workflow::runtime::freeze_workflow_definition_registry();
         let state = crate::http::build_app_state(Arc::new(self)).await?;
         crate::stdio::serve(state).await
@@ -112,9 +115,60 @@ impl HarnessServer {
 
     /// Start in HTTP + WebSocket mode.
     pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
+        self.register_declarative_workflow_definitions()?;
         harness_workflow::runtime::freeze_workflow_definition_registry();
         crate::http::serve(self, addr).await
     }
+
+    fn register_declarative_workflow_definitions(&self) -> anyhow::Result<()> {
+        harness_workflow::runtime::register_declarative_workflow_definitions(
+            self.load_declarative_workflow_definitions()?,
+        )
+    }
+
+    fn load_declarative_workflow_definitions(
+        &self,
+    ) -> anyhow::Result<Vec<harness_workflow::runtime::DeclarativeWorkflowDefinition>> {
+        let mut project_roots = BTreeSet::new();
+        project_roots.insert(project_root_identity(&self.config.server.project_root));
+        for project in self
+            .startup_projects
+            .iter()
+            .chain(self.startup_default_project.iter())
+        {
+            project_roots.insert(project_root_identity(&project.root));
+        }
+
+        let mut definitions = Vec::new();
+        for project_root in project_roots {
+            let document = load_workflow_document(&project_root).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to load workflow definition for project '{}': {error}",
+                    project_root.display()
+                )
+            })?;
+            let Some(policy) = document.config.definition.as_ref() else {
+                continue;
+            };
+            let definition = harness_workflow::runtime::build_declarative_definition(
+                policy,
+                &document.config.activities,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid workflow definition '{}' for project '{}': {error}",
+                    policy.id,
+                    project_root.display()
+                )
+            })?;
+            definitions.push(definition);
+        }
+        Ok(definitions)
+    }
+}
+
+fn project_root_identity(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 #[cfg(test)]
@@ -134,5 +188,44 @@ mod tests {
             Some(active_path.to_string_lossy().as_ref())
         );
         assert_eq!(metadata.retention_max_files, 30);
+    }
+
+    #[test]
+    fn declarative_definitions_compile_as_an_atomic_startup_batch() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        std::fs::write(
+            project.path().join("WORKFLOW.md"),
+            r#"---
+definition:
+  id: startup_docs_review
+  initial: review
+  states:
+    review:
+      activity: review_docs
+      on_success: done
+      on_failure: failed
+      on_blocked: blocked
+      on_signal: { cancel: cancelled }
+    blocked: { progress: operator_gate }
+  terminal: { done: succeeded, failed: failed, cancelled: cancelled }
+activities:
+  review_docs: { prompt: review }
+---
+Review documentation.
+"#,
+        )?;
+        let mut config = HarnessConfig::default();
+        config.server.project_root = project.path().to_path_buf();
+        let server = HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+
+        let definitions = server.load_declarative_workflow_definitions()?;
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].policy().id, "startup_docs_review");
+
+        let mut registry = harness_workflow::runtime::WorkflowDefinitionRegistry::new();
+        registry.register_declarative_current_batch(definitions)?;
+        registry.freeze();
+        assert!(registry.is_frozen());
+        Ok(())
     }
 }

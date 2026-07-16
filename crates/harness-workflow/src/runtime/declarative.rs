@@ -410,6 +410,10 @@ fn validate_reachability(
         }
         // Any active state can enter the runtime's invalid-output blocked fallback.
         pending.push_back("blocked");
+        // Runtime completion supplies terminal fallbacks even when the declaration
+        // does not spell out failure or cancellation edges.
+        pending.push_back(terminal_state_for_class(policy, "failed"));
+        pending.push_back(terminal_state_for_class(policy, "cancelled"));
         if state_name == "blocked" {
             pending.extend(policy.recovery_targets.iter().map(String::as_str));
         }
@@ -478,31 +482,29 @@ fn compile_allowlist(
 
     let mut rules = edges
         .into_iter()
-        .map(|(source, target)| {
-            let mut rule = TransitionRule::new(
-                source,
-                target,
-                allowed_commands_for_target(policy, terminal_states, target),
-            );
-            rule.required_command =
-                Some(required_command_for_target(policy, terminal_states, target));
-            if target != "blocked" {
-                rule.required_evidence = policy
-                    .evidence_required
-                    .get(target)
-                    .into_iter()
-                    .flatten()
-                    .cloned()
-                    .collect();
-            }
-            rule.operator_recovery_only = source == "blocked"
-                && policy
-                    .recovery_targets
-                    .iter()
-                    .any(|recovery_target| recovery_target == target);
-            rule
-        })
+        .map(|(source, target)| transition_rule_for_target(policy, terminal_states, source, target))
         .collect::<Vec<_>>();
+    rules.push(transition_rule_for_target(
+        policy,
+        terminal_states,
+        "__submission__",
+        &policy.initial,
+    ));
+    for source in policy.states.keys() {
+        for class in ["failed", "cancelled"] {
+            let target = terminal_state_for_class(policy, class);
+            if !rules.iter().any(|rule| {
+                rule.from_state.as_deref() == Some(source.as_str()) && rule.to_state == target
+            }) {
+                rules.push(transition_rule_for_target(
+                    policy,
+                    terminal_states,
+                    source,
+                    target,
+                ));
+            }
+        }
+    }
     rules.push(TransitionRule::from_any(
         "blocked",
         [
@@ -512,6 +514,35 @@ fn compile_allowlist(
         ],
     ));
     TransitionAllowlist::new(rules)
+}
+
+fn transition_rule_for_target(
+    policy: &WorkflowDefinitionPolicy,
+    terminal_states: &BTreeMap<String, WorkflowTerminalState>,
+    source: &str,
+    target: &str,
+) -> TransitionRule {
+    let mut rule = TransitionRule::new(
+        source,
+        target,
+        allowed_commands_for_target(policy, terminal_states, target),
+    );
+    rule.required_command = Some(required_command_for_target(policy, terminal_states, target));
+    if target != "blocked" {
+        rule.required_evidence = policy
+            .evidence_required
+            .get(target)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+    }
+    rule.operator_recovery_only = source == "blocked"
+        && policy
+            .recovery_targets
+            .iter()
+            .any(|recovery_target| recovery_target == target);
+    rule
 }
 
 fn required_command_for_target(
@@ -538,6 +569,14 @@ fn required_command_for_target(
             None => unreachable!("validated active state must declare a progress driver"),
         }
     }
+}
+
+fn terminal_state_for_class<'a>(policy: &'a WorkflowDefinitionPolicy, class: &str) -> &'a str {
+    policy
+        .terminal
+        .iter()
+        .find_map(|(state, declared_class)| (declared_class == class).then_some(state.as_str()))
+        .expect("terminal class coverage was validated")
 }
 
 fn allowed_commands_for_target(

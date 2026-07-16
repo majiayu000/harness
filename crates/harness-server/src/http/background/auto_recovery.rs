@@ -218,6 +218,9 @@ async fn process_instance(
     instance: &WorkflowInstance,
     now: DateTime<Utc>,
 ) -> anyhow::Result<InstanceOutcome> {
+    if !supports_auto_recovery(instance) {
+        return Ok(InstanceOutcome::Skipped);
+    }
     let policy = &github.auto_recovery;
     let Some(repo) = data_string(&instance.data, "repo") else {
         return Ok(InstanceOutcome::Skipped);
@@ -274,6 +277,10 @@ async fn process_instance(
         stop_reason_code.as_deref(),
     )
     .await
+}
+
+fn supports_auto_recovery(instance: &WorkflowInstance) -> bool {
+    instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
 }
 
 /// A prior attempt crashed between its audit event and its outcome event.

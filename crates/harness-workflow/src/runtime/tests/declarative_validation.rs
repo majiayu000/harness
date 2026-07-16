@@ -247,6 +247,27 @@ mod declarative_validation {
     }
 
     #[test]
+    fn implicit_failure_and_cancellation_fallbacks_make_terminal_states_reachable() {
+        let mut policy = valid_policy();
+        let reviewing = policy.states.get_mut("reviewing").unwrap();
+        reviewing.on_failure = None;
+        reviewing.on_signal.clear();
+
+        let compiled = build_declarative_definition(&policy, &activity_policies())
+            .expect("runtime terminal fallbacks should satisfy reachability");
+        assert!(compiled
+            .registered()
+            .allowlist
+            .rule_for("reviewing", "failed")
+            .is_some());
+        assert!(compiled
+            .registered()
+            .allowlist
+            .rule_for("reviewing", "cancelled")
+            .is_some());
+    }
+
+    #[test]
     fn compiles_deterministic_signal_edges_and_target_driver_commands() {
         let mut policy = valid_policy();
         policy.states.insert(

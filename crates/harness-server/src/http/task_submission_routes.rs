@@ -238,7 +238,7 @@ fn is_runtime_submission_definition(definition_id: &str) -> bool {
         definition_id,
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID
             | harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID
-    )
+    ) || harness_workflow::runtime::current_declarative_workflow_definition(definition_id).is_some()
 }
 
 async fn runtime_workflow_by_handle(
@@ -254,7 +254,13 @@ async fn runtime_workflow_by_handle(
     else {
         return Ok(None);
     };
-    if is_runtime_submission_definition(&workflow.definition_id) {
+    if is_runtime_submission_definition(&workflow.definition_id)
+        || workflow
+            .data
+            .get("definition_hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| !hash.trim().is_empty())
+    {
         Ok(Some(workflow))
     } else {
         Ok(None)

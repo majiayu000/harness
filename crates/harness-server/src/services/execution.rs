@@ -152,6 +152,11 @@ struct PreparedRuntimePromptSubmission {
     project_id: String,
 }
 
+struct PreparedRuntimeDeclarativeSubmission {
+    req: CreateTaskRequest,
+    project_id: String,
+}
+
 struct PreparedRuntimePrFeedbackSubmission {
     req: CreateTaskRequest,
     project_id: String,
@@ -163,6 +168,7 @@ enum PreparedEnqueueResult {
     Existing(TaskId),
     RuntimeIssueSubmission(Box<PreparedRuntimeIssueSubmission>),
     RuntimePromptSubmission(Box<PreparedRuntimePromptSubmission>),
+    RuntimeDeclarativeSubmission(Box<PreparedRuntimeDeclarativeSubmission>),
     RuntimePrFeedbackSubmission(Box<PreparedRuntimePrFeedbackSubmission>),
     Ready(Box<PreparedEnqueue>),
 }
@@ -359,10 +365,36 @@ impl DefaultExecutionService {
 
     /// Validate the request has at least one task specifier and a valid priority.
     fn validate_request(req: &CreateTaskRequest) -> Result<(), EnqueueTaskError> {
-        if req.prompt.is_none() && req.issue.is_none() && req.pr.is_none() {
+        if req.definition_id.is_none()
+            && req.prompt.is_none()
+            && req.issue.is_none()
+            && req.pr.is_none()
+        {
             return Err(EnqueueTaskError::BadRequest(
-                "at least one of prompt, issue, or pr must be provided".to_string(),
+                "at least one of definition_id, prompt, issue, or pr must be provided".to_string(),
             ));
+        }
+        if let Some(definition_id) = req.definition_id.as_deref() {
+            if definition_id.trim().is_empty() {
+                return Err(EnqueueTaskError::BadRequest(
+                    "definition_id must not be empty".to_string(),
+                ));
+            }
+            if req.issue.is_some() || req.pr.is_some() {
+                return Err(EnqueueTaskError::BadRequest(
+                    "declarative workflow submissions cannot include issue or pr".to_string(),
+                ));
+            }
+            if !req.depends_on.is_empty() || !req.serialization_depends_on.is_empty() {
+                return Err(EnqueueTaskError::BadRequest(
+                    "declarative workflow submissions do not support dependencies".to_string(),
+                ));
+            }
+            if req.continuation.is_some() {
+                return Err(EnqueueTaskError::BadRequest(
+                    "declarative workflow submissions do not support continuation".to_string(),
+                ));
+            }
         }
         if req.priority > task_runner::MAX_TASK_PRIORITY {
             return Err(EnqueueTaskError::BadRequest(format!(
@@ -802,6 +834,61 @@ impl DefaultExecutionService {
         runtime_submission_response_handle(store, &record.workflow_id, &task_id).await
     }
 
+    async fn submit_declarative_to_workflow_runtime(
+        &self,
+        prepared: PreparedRuntimeDeclarativeSubmission,
+    ) -> Result<TaskId, EnqueueTaskError> {
+        let Some(store) = self.workflow_runtime_store.as_deref() else {
+            return Err(EnqueueTaskError::Internal(
+                "workflow runtime store is required for declarative workflow submissions"
+                    .to_string(),
+            ));
+        };
+        let Some(definition_id) = prepared.req.definition_id.as_deref() else {
+            return Err(EnqueueTaskError::BadRequest(
+                "declarative workflow submission requires definition_id".to_string(),
+            ));
+        };
+        let task_id = TaskId::new();
+        let project_root = prepared
+            .req
+            .project
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(&prepared.project_id));
+        let record = crate::workflow_runtime_submission::record_declarative_submission(
+            store,
+            crate::workflow_runtime_submission::DeclarativeSubmissionRuntimeContext {
+                project_root,
+                definition_id,
+                task_id: &task_id,
+                prompt: prepared.req.prompt.as_deref().unwrap_or_default(),
+                depends_on: &prepared.req.depends_on,
+                serialization_depends_on: &prepared.req.serialization_depends_on,
+                source: prepared.req.source.as_deref(),
+                external_id: prepared.req.external_id.as_deref(),
+            },
+        )
+        .await
+        .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
+        if !record.accepted {
+            return Err(EnqueueTaskError::BadRequest(format!(
+                "workflow runtime rejected declarative submission for workflow {}: {}",
+                record.workflow_id,
+                record
+                    .rejection_reason
+                    .as_deref()
+                    .unwrap_or("decision rejected")
+            )));
+        }
+        if record.command_ids.is_empty() {
+            return Err(EnqueueTaskError::Internal(format!(
+                "workflow runtime accepted declarative submission for workflow {} without commands",
+                record.workflow_id
+            )));
+        }
+        runtime_submission_response_handle(store, &record.workflow_id, &task_id).await
+    }
+
     async fn submit_pr_feedback_to_workflow_runtime(
         &self,
         prepared: PreparedRuntimePrFeedbackSubmission,
@@ -923,6 +1010,29 @@ impl DefaultExecutionService {
 
         task_runner::fill_missing_repo_from_project(&mut req).await;
         Self::populate_external_id(&mut req);
+
+        if let Some(definition_id) = req.definition_id.as_deref() {
+            crate::workflow_runtime_submission::resolve_declarative_definition_for_project(
+                &canonical,
+                definition_id,
+            )
+            .map_err(|error| EnqueueTaskError::BadRequest(error.to_string()))?;
+            if self.workflow_runtime_store.is_none() {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime store is required for declarative workflow submissions"
+                        .to_string(),
+                ));
+            }
+            if !self.runtime_prompt_submission_enabled(&canonical)? {
+                return Err(EnqueueTaskError::Internal(
+                    "workflow runtime dispatch and worker must be enabled for declarative workflow submissions"
+                        .to_string(),
+                ));
+            }
+            return Ok(PreparedEnqueueResult::RuntimeDeclarativeSubmission(
+                Box::new(PreparedRuntimeDeclarativeSubmission { req, project_id }),
+            ));
+        }
 
         if let Some(existing_id) = self.check_workflow_duplicate(&project_id, &req).await {
             return Ok(PreparedEnqueueResult::Existing(existing_id));
@@ -1094,6 +1204,9 @@ impl ExecutionService for DefaultExecutionService {
             PreparedEnqueueResult::RuntimePromptSubmission(prepared) => {
                 return self.submit_prompt_to_workflow_runtime(*prepared).await;
             }
+            PreparedEnqueueResult::RuntimeDeclarativeSubmission(prepared) => {
+                return self.submit_declarative_to_workflow_runtime(*prepared).await;
+            }
             PreparedEnqueueResult::RuntimePrFeedbackSubmission(prepared) => {
                 return self.submit_pr_feedback_to_workflow_runtime(*prepared).await;
             }
@@ -1157,6 +1270,9 @@ impl ExecutionService for DefaultExecutionService {
             }
             PreparedEnqueueResult::RuntimePromptSubmission(prepared) => {
                 return self.submit_prompt_to_workflow_runtime(*prepared).await;
+            }
+            PreparedEnqueueResult::RuntimeDeclarativeSubmission(prepared) => {
+                return self.submit_declarative_to_workflow_runtime(*prepared).await;
             }
             PreparedEnqueueResult::RuntimePrFeedbackSubmission(prepared) => {
                 return self.submit_pr_feedback_to_workflow_runtime(*prepared).await;

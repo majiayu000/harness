@@ -465,3 +465,117 @@ fn runtime_merge_response(
         ),
     }
 }
+
+#[cfg(test)]
+mod recovery_response_tests {
+    use super::*;
+    use harness_workflow::runtime::{WorkflowInstance, WorkflowSubject};
+
+    fn workflow(definition_id: &str, state: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            definition_id,
+            1,
+            state,
+            WorkflowSubject::new("issue", "issue:1609"),
+        )
+        .with_id("workflow-1609")
+    }
+
+    #[test]
+    fn recovery_request_accepts_optional_target_state() {
+        let legacy: WorkflowRuntimeRecoveryRouteRequest = serde_json::from_value(json!({
+            "workflow_id": "workflow-1",
+            "reason": "operator recovery",
+        }))
+        .expect("legacy recovery request should deserialize");
+        assert_eq!(legacy.target_state, None);
+
+        let declarative: WorkflowRuntimeRecoveryRouteRequest = serde_json::from_value(json!({
+            "workflow_id": "workflow-2",
+            "reason": "operator recovery",
+            "target_state": "running",
+        }))
+        .expect("declarative recovery request should deserialize");
+        assert_eq!(declarative.target_state.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn builtin_wrong_state_bodies_remain_exact() {
+        let (status, Json(body)) = runtime_recovery_response(
+            WorkflowRuntimeRecoveryAction::Unblock,
+            WorkflowRuntimeRecoveryOutcome::WrongState {
+                workflow: workflow("github_issue_pr", "implementing"),
+            },
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            json!({
+                "error": "workflow not in blocked state",
+                "workflow_id": "workflow-1609",
+                "state": "implementing",
+            })
+        );
+
+        let (status, Json(body)) = runtime_recovery_response(
+            WorkflowRuntimeRecoveryAction::Retry,
+            WorkflowRuntimeRecoveryOutcome::WrongState {
+                workflow: workflow("github_issue_pr", "blocked"),
+            },
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            json!({
+                "error": "workflow not in failed state",
+                "workflow_id": "workflow-1609",
+                "state": "blocked",
+            })
+        );
+    }
+
+    #[test]
+    fn declarative_recovery_rejections_have_stable_statuses() {
+        let declarative = || workflow("release_workflow", "blocked");
+        let (status, Json(body)) = runtime_recovery_response(
+            WorkflowRuntimeRecoveryAction::Unblock,
+            WorkflowRuntimeRecoveryOutcome::TargetRequired {
+                workflow: declarative(),
+            },
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            json!("target_state is required when multiple recovery targets are declared")
+        );
+
+        let outcome = WorkflowRuntimeRecoveryOutcome::TargetNotAllowed {
+            workflow: declarative(),
+            target_state: "done".to_string(),
+        };
+        assert_eq!(
+            runtime_recovery_response(WorkflowRuntimeRecoveryAction::Unblock, outcome).0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn unsupported_definition_body_remains_exact() {
+        let (status, Json(body)) = runtime_recovery_response(
+            WorkflowRuntimeRecoveryAction::Unblock,
+            WorkflowRuntimeRecoveryOutcome::UnsupportedDefinition {
+                workflow: workflow("quality_gate", "blocked"),
+            },
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            json!({
+                "error": "workflow runtime recovery supports only GitHub issue PR workflows",
+                "workflow_id": "workflow-1609",
+                "definition_id": "quality_gate",
+                "state": "blocked",
+            })
+        );
+    }
+}

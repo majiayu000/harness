@@ -134,13 +134,11 @@ fn builtins_preserve_literal_states_terminal_mappings_and_transition_rules() {
         },
     ];
 
-    assert_eq!(
-        known_workflow_definition_ids(),
-        expected
-            .iter()
-            .map(|definition| definition.id.to_string())
-            .collect::<Vec<_>>()
-    );
+    let expected_ids = expected
+        .iter()
+        .map(|definition| definition.id.to_string())
+        .collect::<Vec<_>>();
+    assert!(known_workflow_definition_ids().starts_with(&expected_ids));
 
     for expected_definition in expected {
         let actual = workflow_definition(expected_definition.id)
@@ -356,8 +354,15 @@ fn progress_mode_semantics_match_authoritative_ownership_matrix() {
         ),
     ];
 
+    let builtin_ids = [
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        PROMPT_TASK_DEFINITION_ID,
+        QUALITY_GATE_DEFINITION_ID,
+        PR_FEEDBACK_DEFINITION_ID,
+    ];
     let actual = known_workflow_definition_ids()
         .into_iter()
+        .filter(|definition_id| builtin_ids.contains(&definition_id.as_str()))
         .flat_map(|definition_id| {
             workflow_states_for_definition(&definition_id)
                 .into_iter()
@@ -420,15 +425,14 @@ fn registry_scopes_success_states_to_workflow_definitions() {
 
 #[test]
 fn registry_lists_only_known_definition_states() {
-    assert_eq!(
-        known_workflow_definition_ids(),
-        vec![
-            GITHUB_ISSUE_PR_DEFINITION_ID,
-            PROMPT_TASK_DEFINITION_ID,
-            QUALITY_GATE_DEFINITION_ID,
-            PR_FEEDBACK_DEFINITION_ID,
-        ]
-    );
+    let builtin_ids = [
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        PROMPT_TASK_DEFINITION_ID,
+        QUALITY_GATE_DEFINITION_ID,
+        PR_FEEDBACK_DEFINITION_ID,
+    ]
+    .map(str::to_string);
+    assert!(known_workflow_definition_ids().starts_with(&builtin_ids));
     assert!(workflow_states_for_definition("unknown_workflow").is_empty());
     assert!(workflow_state_exists(
         GITHUB_ISSUE_PR_DEFINITION_ID,
