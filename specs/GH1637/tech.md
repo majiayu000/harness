@@ -10,138 +10,132 @@ GH-1637
 
 ## Codebase Context
 
-Verified at `origin/main` commit `7b8dc534`.
+Updated from the original `7b8dc534` baseline after GH-1639 was specified.
 
 | Area | Anchor | Current behavior | Relevance |
 | --- | --- | --- | --- |
-| Shared child management | `crates/harness-agents/src/lib.rs:151-357` | `ManagedChild` owns process-group cleanup for both agent adapters. | Production semantics are shared and must remain unchanged without separate failure evidence. |
-| Codex lifecycle fixtures | `crates/harness-agents/src/codex_tests.rs:291-489` | Root-exit, receiver-drop, timeout-drop, and buffered execute fixtures create long-lived children or descendants. | These fixtures compete under the full parallel test binary. |
-| Claude lifecycle fixtures | `crates/harness-agents/src/claude_tests.rs:761-928` | Equivalent stream root-exit, receiver-drop, and timeout-drop fixtures exercise the same OS lifecycle boundary. | Coordination must cross adapter modules. |
-| Existing environment locks | `codex_tests.rs:8-52`, `claude_tests.rs:352-389` | Each module has a private blocking mutex only for process-global environment mutation. | They cannot coordinate cross-adapter async lifecycle tests and must not be reused across `await`. |
-| GH-1635 hook command | `.githooks/pre-push` in the GH-1635 implementation branch | Runs the ordinary parallel non-server/non-workflow workspace lib suite. | The repair must make this real gate pass without serializing the whole workspace. |
+| Child cleanup | `crates/harness-agents/src/lib.rs:151-357` | `ManagedChild` bounds post-exit group drainage at two seconds. Diagnostic runs drained in 0–14 ms once cleanup began. | Production cleanup is not the observed delay and remains unchanged. |
+| Codex lifecycle fixtures | `crates/harness-agents/src/codex_tests.rs:291-489` | Two root-exit tests wrap process startup and cleanup together in five seconds; adjacent cancellation/drop tests already observe startup separately. | Reuse the proven two-phase fixture pattern. |
+| Claude lifecycle fixtures | `crates/harness-agents/src/claude_tests/lifecycle.rs` after GH-1639 | The streamed root-exit test has the same combined deadline; cancellation/drop tests already separate startup observation. | Apply the same marker-anchored contract after the split. |
+| Startup helpers | `codex_tests.rs:88-163`, `claude_tests.rs:19-30` | Existing helpers observe stream/task progress or filesystem markers with independent bounds. | Reuse rather than adding synchronization infrastructure. |
+| GH-1635 hook | `.githooks/pre-push` in the GH-1635 implementation branch | Runs the ordinary parallel non-server/non-workflow workspace lib suite. | Must pass without whole-suite serialization. |
 
-## Reproduction Evidence
+## Root-Cause Evidence
 
-Two consecutive ordinary workspace test runs failed in one or both Codex
-root-exit descendant tests at their five-second outer timeout. Each exact test
-passed alone, all three root-exit descendant tests passed together, and the
-complete 193-test binary passed with `--test-threads=1` in 40.03 seconds. This
-isolates the failure to full-suite fixture concurrency rather than the GH-1635
-database environment or a deterministic single-cleanup failure.
+The original parallel suite failed twice. A shared async lock around seven
+lifecycle fixtures produced two passing package runs and then another exact
+timeout, falsifying fixture concurrency as the root cause. The exact Claude
+root-exit test then failed on run 8 of 10.
+
+Temporary test-only timing diagnostics ran the exact fixture 20 times. Once
+`ManagedChild` cleanup started, group drainage completed in approximately
+0–14 ms. Total fixture duration varied from about 2.05 to 5.94 seconds while an
+unrelated Cargo build kept host load high. The delay therefore occurs before
+the descendant marker and cleanup phase, but the existing timeout charges that
+startup/scheduling delay to cleanup.
 
 ## Proposed Design
 
-### 1. Add one crate-level async test coordination primitive
+### 1. Land the GH-1639 prerequisite
 
-Under `#[cfg(test)]` in `crates/harness-agents/src/lib.rs`, add a crate-private
-async helper backed by `OnceLock<tokio::sync::Mutex<()>>`. The helper returns a
-`tokio::sync::MutexGuard<'static, ()>`.
+First merge the behavior-preserving extraction of the three Claude lifecycle
+fixtures into `claude_tests/lifecycle.rs`. GH-1637 then edits compliant files
+without bypassing the 800-line hard ceiling.
 
-This location gives Codex and Claude tests one lock. Tokio's mutex is designed
-for guards held across `await`, avoids blocking a libtest worker, and does not
-poison after a panic. Tokio is already a workspace dependency.
+### 2. Run root-exit fixtures as observable tasks
 
-Do not add a public API, production branch, dependency, environment variable,
-or global test-runner setting.
+For the three tests that prove a root process exits while a descendant holds a
+pipe:
 
-### 2. Coordinate only destructive lifecycle fixtures
+- spawn the existing agent execution future as a Tokio task;
+- independently observe the existing descendant-start marker with a bounded
+  startup helper;
+- fail and abort cleanly when the marker is not observed;
+- only after the marker exists, wrap the task handle in the existing
+  five-second completion timeout.
 
-Acquire the shared guard as the first statement in these tests and retain it
-through the final cleanup/no-mutation assertion:
+The Codex streamed test can reuse
+`assert_path_observed_before_task_exit`. The buffered Codex and streamed Claude
+tests may use their existing marker polling pattern with explicit abort/join
+diagnostics appropriate to each task result type.
 
-- Codex root exit with descendant-held stderr;
-- Codex receiver-drop cancellation with a long-lived child;
-- Codex timeout/drop with a descendant;
-- Codex buffered execute with descendant-held stdout;
-- Claude root exit with descendant-held stderr;
-- Claude receiver-drop cancellation;
-- Claude timeout/drop with a descendant.
+### 3. Preserve the cleanup contract
 
-Do not coordinate parser, argument, registry, ordinary short-process, or other
-unit tests. Coordination wait time occurs before each fixture's existing
-operation-specific timeout begins.
+Do not change the five-second completion deadline, mock shell scripts, marker
+paths, response parsing, descendant-start assertions, 1.5-second
+no-late-mutation delay, cancellation/drop tests, or production code.
 
-### 3. Preserve the safety assertions verbatim
-
-The implementation adds guard acquisition only. It does not change fixture
-scripts, sleep durations, timeout values, output assertions, descendant-start
-markers, cancellation expectations, or final no-mutation markers.
-
-The lock prevents multiple destructive fixtures from competing for orphan
-reaping and scheduler time; it does not turn a failed cleanup into success.
+No shared lock is added. Startup observation is not a retry; it defines the
+precondition from which cleanup latency is measured.
 
 ## Data Flow
 
 ```text
-normal parallel libtest run
-  -> ordinary tests continue in parallel
-  -> lifecycle fixture awaits shared async guard
-       -> spawn child/descendant
-       -> execute existing timeout/cancellation contract
-       -> assert descendant started
-       -> assert no late workspace mutation
-       -> release guard
-  -> next lifecycle fixture proceeds
+parallel libtest worker
+  -> spawn existing mock agent task
+  -> bounded startup observation
+       -> marker absent/task exits: fail with diagnostics
+       -> descendant marker exists: start existing 5-second deadline
+  -> await root exit + process-group cleanup + pipe drainage
+  -> assert parsed result
+  -> retain delayed no-workspace-mutation assertion
 ```
 
 ## Product-to-Test Mapping
 
-| Behavior invariant | Implementation area | Verification |
+| Invariant | Implementation area | Verification |
 | --- | --- | --- |
-| B-001/B-002 repeated default-parallel stability | coordinated lifecycle fixture set | three `cargo test -p harness-agents --lib` runs plus the workspace pre-push command |
-| B-003 shared cross-adapter primitive | `harness-agents/src/lib.rs` test-only helper | code review and both adapter test modules using the same helper |
-| B-004 guard lifetime | seven named fixtures | diff review confirms first-statement acquisition and final-assertion scope |
-| B-005 assertion integrity | existing Codex/Claude test bodies | semantic diff review; no timeout/script/assertion changes |
-| B-006 async safety | Tokio mutex helper | Clippy with `-D warnings`; no `std::sync::MutexGuard` across `await` |
-| B-007 scoped concurrency | all other agent tests | diff boundary and ordinary parallel suite |
-| B-008 no production/dependency change | Cargo manifests and non-test code | exact diff review |
-| B-009 local readiness | package/workspace commands | fmt, package tests, hook contract test, full Clippy |
-| B-010 GH-1635 recovery | rebased GH-1635 branch | real DB-less pre-push run after merge |
+| B-001/B-002 repeated stability | three root-exit fixtures | three package runs plus ordinary workspace command |
+| B-003 marker-anchored deadline | Codex streamed/buffered and Claude streamed tests | targeted source review and exact filters |
+| B-004 startup failure | existing marker/task helpers and abort branches | missing-marker diagnostics review and targeted tests |
+| B-005 unchanged deadline | three `Duration::from_secs(5)` calls | exact diff review |
+| B-006 assertion integrity | existing scripts and assertions | semantic diff review |
+| B-007 no serialization | crate/test runner configuration | absence of lock, skip, retry, and thread override |
+| B-008 no production/dependency change | manifests and non-test code | exact file-list review |
+| B-009 local readiness | package/workspace/hook/Clippy commands | fresh command outputs |
+| B-010 GH-1635 recovery | rebased GH-1635 branch | real DB-less pre-push run |
 
 ## Risks
 
-- Coverage: over-broad coordination could hide unrelated races. Limit use to
-  the seven fixtures that intentionally retain long-lived processes.
-- Deadlock: a blocking mutex across async suspension could stall worker
-  threads. Use `tokio::sync::Mutex`, acquire once, and rely on guard drop.
-- False green: changing timeout or marker assertions would weaken the safety
-  contract. The implementation diff must contain guard additions only in the
-  seven test bodies.
-- Platform behavior: macOS exposed the contention, while Linux CI may not.
-  Keep ordinary default-parallel commands on both platforms.
-- Panic recovery: Tokio mutexes do not poison, so one failed test does not
-  cascade lock acquisition failures.
+- Task ownership: spawning changes error shape. Join errors and agent errors
+  must remain distinguishable in assertions.
+- False green: starting the five-second deadline before the marker would retain
+  the bug; starting it after cleanup would weaken the test. Anchor immediately
+  after marker observation.
+- Hung startup: use an independent bounded observation and abort the task on
+  failure.
+- Scope drift: do not edit production cleanup or the cancellation/drop tests.
+- Platform variance: keep default parallel test commands and do not stop
+  unrelated operator workloads to make verification pass.
 
 ## Alternatives Considered
 
-1. Raise five-second timeouts. Rejected: it hides contention and weakens the
-   bounded-return contract.
-2. Run the entire crate/workspace with `--test-threads=1`. Rejected: it slows
-   unrelated tests and masks broader concurrency regressions.
-3. Add `serial_test`. Rejected: a standard-library/Tokio solution already
-   exists and a new dependency is unnecessary.
-4. Reuse module environment locks. Rejected: they are blocking, adapter-local,
-   and unsafe to hold across async suspension.
-5. Change `ManagedChild` signaling or drain semantics. Rejected for this issue:
-   exact and serial runs pass, so current evidence does not justify changing a
-   workspace-safety production path.
+1. Shared async test lock. Rejected by new evidence: two runs passed and the
+   third failed; the exact test also failed without fixture concurrency.
+2. Increase the five-second timeout. Rejected: it would hide phase conflation
+   rather than measure cleanup from its real precondition.
+3. Global `--test-threads=1`. Rejected: slows unrelated tests and does not fix
+   the exact-test failure.
+4. Change `ManagedChild`. Rejected: instrumentation shows cleanup itself drains
+   promptly once reached.
+5. Stop unrelated builds. Rejected: external operator state is out of scope and
+   tests must tolerate ordinary host load.
 
 ## Test Plan
 
-- [ ] Preserve the original failing outputs as baseline evidence.
+- [ ] Merge GH-1639 and rebase GH-1637 onto current `origin/main`.
 - [ ] `cargo fmt --all -- --check`.
+- [ ] Run the three root-exit filters repeatedly.
 - [ ] Run `cargo test -p harness-agents --lib` three consecutive times with no
       test-thread override.
 - [ ] `cargo test --workspace --exclude harness-server --exclude harness-workflow --lib`.
 - [ ] `bash scripts/test-pre-push-hook.sh` on the rebased GH-1635 branch.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] `python3 checks/check_workflow.py --repo .`.
-- [ ] `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1637`.
-- [ ] Exact diff review proving no timeout, script, assertion, manifest, hook,
-      or production cleanup change.
+- [ ] Both SpecRail workflow checks.
+- [ ] Exact diff review proving the five-second deadline, scripts, final
+      assertions, manifests, hooks, and production cleanup are unchanged.
 
 ## Rollback Plan
 
-Revert the implementation PR. No production process, data, migration, or API
-rollback is needed. The original parallel-suite flake and GH-1635 gate blocker
-would return.
+Revert the implementation PR. No production or data rollback is required; the
+known loaded-host timing flake and GH-1635 gate blocker would return.

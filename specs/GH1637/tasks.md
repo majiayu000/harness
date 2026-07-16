@@ -11,88 +11,72 @@ GH-1637
 
 ## Implementation Tasks
 
-- [ ] `SP1637-T1` Owner: Codex | Done when: the failing parallel, passing exact, and passing serial baselines are recorded on a fresh `origin/main` branch | Verify: ordinary workspace test, exact filters, and the 193-test binary with `--test-threads=1`
-- [ ] `SP1637-T2` Owner: Codex | Done when: one crate-level async test-only coordination helper is used by the seven scoped lifecycle fixtures with all existing assertions unchanged | Verify: targeted diff review and `cargo test -p harness-agents --lib`
-- [ ] `SP1637-T3` Owner: Codex | Done when: three consecutive default-parallel package runs and the ordinary workspace command pass without skips or thread overrides | Verify: repeated package command plus `cargo test --workspace --exclude harness-server --exclude harness-workflow --lib`
-- [ ] `SP1637-T4` Owner: Codex | Done when: local readiness, exact-head CI/review evidence, SpecRail PR gate, and authorized merge readiness are complete | Verify: full Clippy, workflow checks, PR evidence, and PR gate
+- [ ] `SP1637-T1` Owner: Codex | Done when: parallel, coordinated, exact, diagnostic-timing, and host-load evidence identify pre-marker scheduling as the failure phase | Verify: preserved command outputs and clean pre-edit diff
+- [ ] `SP1637-T2` Owner: Codex | Done when: GH-1639's compliant Claude lifecycle module is merged and GH-1637 rebases onto current `origin/main` | Verify: line counts, merged PR evidence, and route gate
+- [ ] `SP1637-T3` Owner: Codex | Done when: three root-exit fixtures observe descendant startup before applying the unchanged five-second completion deadline | Verify: targeted tests, semantic diff review, and package tests
+- [ ] `SP1637-T4` Owner: Codex | Done when: three package runs, ordinary workspace tests, full Clippy, exact-head CI/review evidence, and SpecRail PR gate pass | Verify: commands in `tech.md` and PR evidence
 
-### SP1637-T1 — Preserve and classify the baseline
+### SP1637-T1 — Preserve the corrected root-cause evidence
 
 - Owner: Codex implementation agent.
-- Dependencies: merged GH-1637 spec PR; fresh branch from current
-  `origin/main`.
-- Covers: B-001, B-002, B-005, B-007, B-010.
+- Dependencies: original GH-1637 spec and failed implementation experiment.
+- Covers: B-001, B-002, B-003, B-005, B-007, B-008.
 - Work:
-  - retain both full-suite timeout outputs and exact passing outputs;
-  - confirm the full binary passes serially;
-  - inventory every long-lived lifecycle fixture before editing.
-- Done when:
-  - evidence distinguishes full-suite fixture contention from a deterministic
-    single-cleanup failure;
-  - no file changed during baseline capture.
-- Verify:
-  - baseline commands listed in `tech.md`;
-  - `git diff --exit-code` before implementation.
+  - retain the two original full-suite failures;
+  - retain the failed shared-lock and exact-test reproductions;
+  - retain temporary timing evidence showing 0–14 ms cleanup after variable
+    pre-marker startup delay;
+  - remove all diagnostic code before implementation.
+- Done when: one evidence-backed hypothesis remains and the source diff is
+  clean before the corrected implementation.
+- Verify: `git diff --exit-code` after diagnostic removal.
 
-### SP1637-T2 — Add scoped async fixture coordination
+### SP1637-T2 — Land the file-size prerequisite
 
 - Owner: Codex implementation agent.
-- Dependencies: SP1637-T1.
+- Dependencies: GH-1639 spec and implementation PRs.
+- Covers: B-006, B-008.
+- Work:
+  - merge the byte-equivalent Claude lifecycle extraction;
+  - rebase from fresh `origin/main`;
+  - confirm all touched files remain below 800 lines.
+- Done when: VibeGuard accepts scoped edits without bypass.
+- Verify: line counts and GH-1639 merge evidence.
+
+### SP1637-T3 — Anchor cleanup deadlines to descendant startup
+
+- Owner: Codex implementation agent.
+- Dependencies: SP1637-T1 and SP1637-T2.
 - Covers: B-003, B-004, B-005, B-006, B-007, B-008.
 - Work:
-  - add one `#[cfg(test)]` Tokio mutex helper in `harness-agents/src/lib.rs`;
-  - acquire it at the start of the seven named lifecycle fixtures;
-  - hold each guard through the final existing cleanup assertion;
-  - change no fixture script, timeout, assertion, manifest, hook, or production
-    cleanup behavior.
-- Done when:
-  - the package suite passes with default parallelism;
-  - the implementation diff contains only the helper and guard acquisitions.
-- Verify:
-  - `cargo fmt --all -- --check`;
-  - `cargo test -p harness-agents --lib`;
-  - exact semantic diff review.
+  - spawn the existing Codex streamed, Codex buffered, and Claude streamed
+    root-exit executions as observable tasks;
+  - bound and verify descendant marker startup;
+  - apply the existing five-second timeout only after marker observation;
+  - preserve scripts, response and marker assertions, final delayed safety
+    checks, cancellation/drop tests, and production code.
+- Done when: targeted filters pass repeatedly and the diff contains no lock,
+  timeout increase, skip, retry, manifest, hook, or production edit.
+- Verify: formatting, targeted tests, and semantic diff review.
 
-### SP1637-T3 — Prove repeated parallel stability
-
-- Owner: Codex implementation agent.
-- Dependencies: SP1637-T2.
-- Covers: B-001, B-002, B-005, B-007, B-009, B-010.
-- Work:
-  - run the package suite three consecutive times without thread overrides;
-  - run the ordinary pre-push workspace test command;
-  - verify GH-1635's deterministic hook test after rebasing that branch.
-- Done when:
-  - every repeated and workspace run passes;
-  - no skip, ignore, timeout increase, or global serialization appears.
-- Verify:
-  - commands in the `tech.md` test plan.
-
-### SP1637-T4 — Complete local and remote readiness gates
+### SP1637-T4 — Prove repeated readiness and merge gates
 
 - Owner: Codex implementation agent; human final review remains authoritative.
 - Dependencies: SP1637-T3.
 - Covers: B-001 through B-010.
 - Work:
-  - run full workspace Clippy and SpecRail checks;
-  - compare implementation to the issue and full spec packet;
-  - open the separate implementation PR;
-  - collect exact-head CI, review-thread, merge-state, and PR-gate evidence.
-- Done when:
-  - all local and remote gates pass with no unresolved actionable feedback;
-  - authorized merge does not bypass required review evidence.
-- Verify:
-  - `cargo clippy --workspace --all-targets -- -D warnings`;
-  - `python3 checks/check_workflow.py --repo .`;
-  - `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1637`;
-  - `python3 checks/github_pr_evidence.py --github-repo majiayu000/harness --pr <pr-number> --json > /tmp/pr-<pr-number>-evidence.json`;
-  - `python3 checks/pr_gate.py --repo . --evidence /tmp/pr-<pr-number>-evidence.json --json`.
+  - run three default-parallel package suites and the ordinary workspace suite;
+  - verify the deterministic GH-1635 hook contract and full Clippy;
+  - open the separate implementation PR and collect exact-head CI, review
+    threads, merge state, and PR-gate evidence.
+- Done when: all local and remote gates pass without stopping unrelated
+  operator workloads or bypassing selected tests.
+- Verify: all commands in the `tech.md` test plan and repository PR gate.
 
 ## Parallelization
 
-No parallel writable lanes. The shared helper and both adapter test modules are
-one concurrency contract and require a single integration owner. Independent
-review may be read-only.
+No parallel writable lanes. GH-1639 is an ordered prerequisite; the three
+fixture changes form one timing contract and have one integration owner.
 
 ## Verification
 
@@ -101,15 +85,14 @@ review may be read-only.
 - [ ] Task coverage union:
       `{B-001, B-002, B-003, B-004, B-005, B-006, B-007, B-008, B-009, B-010}`.
 - [ ] Product and task coverage sets are equal.
-- [ ] Seven lifecycle fixtures use the same async test-only guard.
-- [ ] Existing fixture scripts, timeouts, and assertions are unchanged.
-- [ ] Repeated parallel and workspace commands pass.
+- [ ] Three root-exit fixtures anchor the deadline after startup.
+- [ ] Five-second deadlines, scripts, and final assertions remain unchanged.
+- [ ] Repeated parallel and workspace commands pass under current host load.
 
 ## Handoff Notes
 
-- Commit policy: `per_step`; helper/guard implementation is one atomic tested
-  step because neither half is useful alone.
-- GH-1635 remains paused at real-hook readiness until this repair merges.
-- Maintainer standing authorization covers issue/spec/implementation and merge
-  only after required gates; it does not waive CI, review threads, assertion
-  integrity, or SpecRail gates.
+- Commit policy: `per_step`; corrected fixture timing is one atomic tested step.
+- The original shared-lock implementation is abandoned based on fresh evidence.
+- GH-1635 resumes after this repair merges.
+- Standing authorization remains conditional on CI, review threads, assertion
+  integrity, and SpecRail gates.
