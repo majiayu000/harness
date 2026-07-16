@@ -36,12 +36,6 @@ const MAX_FAILURE_GROUPS: usize = 20;
 const MAX_RECENT_FAILURES: i64 = 100;
 const STALLED_AFTER_MINS: u64 = 30;
 const OPERATOR_ACTION_STATES: &[&str] = &["ready_to_merge", "awaiting_feedback", "blocked"];
-const WORKFLOW_DEFINITION_IDS: &[&str] = &[
-    harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-    harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
-    harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
-    harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID,
-];
 
 #[derive(Debug, Clone, Serialize)]
 struct OperatorMonitorPayload {
@@ -359,9 +353,10 @@ async fn list_runtime_workflows_from_store(
     store: &WorkflowRuntimeStore,
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
     let sample_limit = WORKFLOW_SAMPLE_LIMIT as usize;
-    let mut workflows = list_operator_action_workflows(store).await?;
-    workflows.extend(list_recent_failed_workflows(store, sample_limit).await?);
-    for definition_id in WORKFLOW_DEFINITION_IDS {
+    let definition_ids = super::definition_ids::operator_definition_ids()?;
+    let mut workflows = list_operator_action_workflows(store, &definition_ids).await?;
+    workflows.extend(list_recent_failed_workflows(store, sample_limit, &definition_ids).await?);
+    for definition_id in &definition_ids {
         workflows.extend(
             store
                 .list_nonterminal_instances_by_definition(
@@ -787,5 +782,7 @@ fn project_label(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+#[cfg(test)]
+mod declarative_visibility_tests;
 #[cfg(test)]
 mod tests;

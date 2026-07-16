@@ -1054,7 +1054,9 @@ async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result
         .execute(workflow_runtime_store.pool())
         .await?;
 
-    let workflows = list_recent_failed_workflows(&workflow_runtime_store, 1).await?;
+    let definition_ids = crate::handlers::definition_ids::operator_definition_ids()?;
+    let workflows =
+        list_recent_failed_workflows(&workflow_runtime_store, 1, &definition_ids).await?;
 
     assert_eq!(workflows.len(), 1);
     assert_eq!(workflows[0].id, "recent-failed");

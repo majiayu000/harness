@@ -35,6 +35,38 @@ exemption list):
 - `crates/harness-server/src/runtime_projection.rs:295` (quality-gate
   `pending` special case) and other `definition_id == ...` behavioral
   branches in projection/worker code.
+- `crates/harness-server/src/http/misc_routes.rs`
+  (`github_intake_status` runtime lookup): queries
+  `GITHUB_ISSUE_PR_DEFINITION_ID` only because GitHub intake exclusively
+  produces that definition — a per-definition behavioral query, not an
+  enumeration of all definitions.
+- `crates/harness-server/src/handlers/operator_monitor/driverless_progress.rs`:
+  uses the definition-agnostic `list_driverless_progress_instances`
+  store query; the `GITHUB_ISSUE_PR_DEFINITION_ID` references are test
+  fixtures.
+- Test fixtures constructing instances with a built-in definition id
+  (`handlers/worktrees.rs`, `handlers/dashboard.rs`,
+  `runtime_projection.rs` test modules, and similar).
+
+## T002 Resolution: child-definition exclusion on active counts
+
+Implementation-time history check (`git log -S`): the two-id arrays in
+`dashboard_active_counts.rs` (introduced by #1372, 2026-06-20) and
+`overview.rs` (introduced by "Fix dashboard runtime metrics",
+2026-05-22) never contained `pr_feedback` or `quality_gate`. Both of
+those definitions are spawned exclusively as child workflows of a
+parent instance (`workflow_runtime_worker/child_workflow.rs`,
+`child_workflow_non_issue.rs`, since #1052), so counting them in
+dashboard/overview "active" totals would double-count their parent's
+activity. The exclusion is therefore treated as intentional and is
+preserved exactly via the documented
+`ACTIVE_COUNT_EXCLUDED_CHILD_DEFINITION_IDS` predicate in
+`crates/harness-server/src/handlers/definition_ids.rs`
+(`active_count_definition_ids()`); declarative definitions are always
+top-level submissions and are never excluded. The operator monitor and
+its sampling keep enumerating all registry definitions
+(`operator_definition_ids()`), matching the pre-change four-built-in
+const.
 
 Store query used by all four sites:
 `list_nonterminal_instances_by_definition(definition_id, ...)` — already

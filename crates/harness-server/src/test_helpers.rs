@@ -329,6 +329,74 @@ async fn make_state_inner(
     })
 }
 
+/// Register a declarative fixture workflow definition in the process-global
+/// registry and return it (GH-1652 operator-visibility tests).
+///
+/// Safe to call repeatedly and from concurrent tests: the first caller
+/// registers the fixture, later callers reuse the existing registration.
+pub fn register_declarative_fixture_definition(
+    definition_id: &str,
+) -> Arc<harness_workflow::runtime::DeclarativeWorkflowDefinition> {
+    use harness_core::config::workflow::{
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    };
+    use std::collections::BTreeMap;
+
+    if let Some(existing) =
+        harness_workflow::runtime::current_declarative_workflow_definition(definition_id)
+    {
+        return existing;
+    }
+    let policy = WorkflowDefinitionPolicy {
+        id: definition_id.to_string(),
+        initial: "working".to_string(),
+        states: BTreeMap::from([
+            (
+                "working".to_string(),
+                DeclaredState {
+                    activity: Some("perform_work".to_string()),
+                    on_success: Some("done".to_string()),
+                    on_failure: Some("failed".to_string()),
+                    on_blocked: Some("blocked".to_string()),
+                    on_signal: BTreeMap::from([("cancel".to_string(), "cancelled".to_string())]),
+                    ..DeclaredState::default()
+                },
+            ),
+            (
+                "blocked".to_string(),
+                DeclaredState {
+                    progress: Some(DeclaredProgressMode::OperatorGate),
+                    ..DeclaredState::default()
+                },
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+            ("cancelled".to_string(), "cancelled".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec!["working".to_string()],
+    };
+    let definition = harness_workflow::runtime::build_declarative_definition(
+        &policy,
+        &BTreeMap::from([(
+            "perform_work".to_string(),
+            WorkflowActivityPolicy::default(),
+        )]),
+    )
+    .expect("declarative fixture definition should be valid");
+    if let Err(error) =
+        harness_workflow::runtime::register_declarative_workflow_definitions([definition])
+    {
+        // Lost a registration race with a concurrent test; the lookup below
+        // asserts the definition exists either way.
+        tracing::debug!("declarative fixture registration raced: {error}");
+    }
+    harness_workflow::runtime::current_declarative_workflow_definition(definition_id)
+        .expect("declarative fixture definition should be registered")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,13 +1,14 @@
-use super::{OPERATOR_ACTION_STATES, WORKFLOW_DEFINITION_IDS, WORKFLOW_SAMPLE_LIMIT};
+use super::{OPERATOR_ACTION_STATES, WORKFLOW_SAMPLE_LIMIT};
 use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
 pub(super) async fn list_operator_action_workflows(
     store: &WorkflowRuntimeStore,
+    definition_ids: &[String],
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
     let mut workflows = Vec::new();
-    for definition_id in WORKFLOW_DEFINITION_IDS {
+    for definition_id in definition_ids {
         for state in OPERATOR_ACTION_STATES {
             workflows.extend(
                 store
@@ -27,13 +28,14 @@ pub(super) fn dedupe_workflows(workflows: &mut Vec<WorkflowInstance>) {
 pub(super) async fn list_recent_failed_workflows(
     store: &WorkflowRuntimeStore,
     capacity: usize,
+    definition_ids: &[String],
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
     if capacity == 0 {
         return Ok(Vec::new());
     }
     let per_definition_limit = capacity.min(WORKFLOW_SAMPLE_LIMIT as usize) as i64;
     let mut workflows = Vec::new();
-    for definition_id in WORKFLOW_DEFINITION_IDS {
+    for definition_id in definition_ids {
         workflows.extend(
             store
                 .list_recent_instances_by_state(definition_id, "failed", per_definition_limit)

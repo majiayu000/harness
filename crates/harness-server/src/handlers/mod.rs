@@ -3,6 +3,7 @@ pub mod context;
 pub mod cross_review;
 pub mod dashboard;
 mod dashboard_active_counts;
+mod definition_ids;
 pub mod error;
 pub mod evals;
 pub mod exec;
@@ -25,6 +26,9 @@ pub mod thread;
 pub mod token_usage;
 pub mod usage_monitor;
 pub mod worktrees;
+
+#[cfg(test)]
+mod declarative_counts_tests;
 
 #[cfg(test)]
 mod runtime_project_cache_api_tests;
