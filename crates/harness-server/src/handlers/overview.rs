@@ -481,32 +481,36 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
     }
 
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-        for definition_id in [
-            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
-        ] {
-            match store
-                .list_nonterminal_instances_by_definition(definition_id, None, None)
-                .await
-            {
-                Ok(workflows) => {
-                    for workflow in workflows {
-                        if runtime_workflow_matches_active_legacy_task(
-                            &workflow,
-                            &active_legacy_task_ids,
-                        ) {
-                            continue;
+        match crate::handlers::definition_ids::active_count_definition_ids() {
+            Ok(definition_ids) => {
+                for definition_id in &definition_ids {
+                    match store
+                        .list_nonterminal_instances_by_definition(definition_id, None, None)
+                        .await
+                    {
+                        Ok(workflows) => {
+                            for workflow in workflows {
+                                if runtime_workflow_matches_active_legacy_task(
+                                    &workflow,
+                                    &active_legacy_task_ids,
+                                ) {
+                                    continue;
+                                }
+                                counted_runtime_active_workflows |=
+                                    add_active_runtime_workflow(&mut counts, &workflow);
+                            }
                         }
-                        counted_runtime_active_workflows |=
-                            add_active_runtime_workflow(&mut counts, &workflow);
+                        Err(error) => {
+                            tracing::warn!(
+                                definition_id = definition_id.as_str(),
+                                "overview: failed to list runtime workflows for active counts: {error}"
+                            );
+                        }
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        definition_id,
-                        "overview: failed to list runtime workflows for active counts: {error}"
-                    );
-                }
+            }
+            Err(error) => {
+                tracing::error!("overview: {error}; runtime workflow active counts unavailable");
             }
         }
     }

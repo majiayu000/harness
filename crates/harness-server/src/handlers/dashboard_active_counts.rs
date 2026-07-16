@@ -103,39 +103,44 @@ pub(super) async fn dashboard_active_counts(
     }
 
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-        for definition_id in [
-            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
-        ] {
-            match store
-                .list_nonterminal_instances_by_definition(definition_id, None, None)
-                .await
-            {
-                Ok(workflows) => {
-                    for workflow in workflows {
-                        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
-                        if projection
-                            .legacy_dedupe_task_handle
-                            .as_ref()
-                            .is_some_and(|task_id| active_legacy_task_ids.contains(task_id))
-                        {
-                            continue;
+        match crate::handlers::definition_ids::active_count_definition_ids() {
+            Ok(definition_ids) => {
+                for definition_id in &definition_ids {
+                    match store
+                        .list_nonterminal_instances_by_definition(definition_id, None, None)
+                        .await
+                    {
+                        Ok(workflows) => {
+                            for workflow in workflows {
+                                let projection =
+                                    RuntimeWorkflowProjection::from_workflow(&workflow);
+                                if projection
+                                    .legacy_dedupe_task_handle
+                                    .as_ref()
+                                    .is_some_and(|task_id| active_legacy_task_ids.contains(task_id))
+                                {
+                                    continue;
+                                }
+                                counted_runtime_active_workflows |= add_active_runtime_workflow(
+                                    &mut counts,
+                                    &projection,
+                                    visible_project_ids,
+                                    scope_root,
+                                    allowed_project_roots,
+                                );
+                            }
                         }
-                        counted_runtime_active_workflows |= add_active_runtime_workflow(
-                            &mut counts,
-                            &projection,
-                            visible_project_ids,
-                            scope_root,
-                            allowed_project_roots,
-                        );
+                        Err(error) => {
+                            tracing::warn!(
+                                definition_id = definition_id.as_str(),
+                                "dashboard: failed to list runtime workflows for active counts: {error}"
+                            );
+                        }
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        definition_id,
-                        "dashboard: failed to list runtime workflows for active counts: {error}"
-                    );
-                }
+            }
+            Err(error) => {
+                tracing::error!("dashboard: {error}; runtime workflow active counts unavailable");
             }
         }
     }

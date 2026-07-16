@@ -1012,6 +1012,108 @@ async fn endpoint_includes_config_enabled_stuck_workflows() -> anyhow::Result<()
     Ok(())
 }
 
+const DECLARATIVE_VISIBILITY_DEFINITION_ID: &str = "operator_monitor_visibility_flow";
+static REGISTER_DECLARATIVE_VISIBILITY_DEFINITION: std::sync::Once = std::sync::Once::new();
+
+/// Register a uniquely-named declarative definition into the process-global
+/// registry (GH-1609 fixture pattern, `Once`-guarded so it is idempotent across
+/// tests in this binary). It carries no built-in instances, so counting tests in
+/// sibling suites are unaffected.
+fn register_declarative_visibility_definition() {
+    use harness_core::config::workflow::{
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    };
+    use std::collections::BTreeMap;
+
+    REGISTER_DECLARATIVE_VISIBILITY_DEFINITION.call_once(|| {
+        let policy = WorkflowDefinitionPolicy {
+            id: DECLARATIVE_VISIBILITY_DEFINITION_ID.to_string(),
+            initial: "working".to_string(),
+            states: BTreeMap::from([
+                (
+                    "working".to_string(),
+                    DeclaredState {
+                        activity: Some("perform_work".to_string()),
+                        on_success: Some("done".to_string()),
+                        on_failure: Some("failed".to_string()),
+                        on_blocked: Some("blocked".to_string()),
+                        ..DeclaredState::default()
+                    },
+                ),
+                (
+                    "blocked".to_string(),
+                    DeclaredState {
+                        progress: Some(DeclaredProgressMode::OperatorGate),
+                        ..DeclaredState::default()
+                    },
+                ),
+            ]),
+            terminal: BTreeMap::from([
+                ("done".to_string(), "succeeded".to_string()),
+                ("failed".to_string(), "failed".to_string()),
+            ]),
+            evidence_required: BTreeMap::new(),
+            recovery_targets: vec!["working".to_string()],
+        };
+        let definition = harness_workflow::runtime::build_declarative_definition(
+            &policy,
+            &BTreeMap::from([(
+                "perform_work".to_string(),
+                WorkflowActivityPolicy::default(),
+            )]),
+        )
+        .expect("visibility fixture definition should be valid");
+        harness_workflow::runtime::register_declarative_workflow_definitions([definition])
+            .expect("visibility fixture definition should register");
+    });
+}
+
+/// B-003 / B-005: a blocked instance of a declarative definition surfaces in the
+/// operator monitor's runtime-workflow sample (registry-driven enumeration), and
+/// a declarative definition with no instances contributes nothing.
+#[tokio::test]
+async fn declarative_definition_instances_are_visible_in_operator_monitor() -> anyhow::Result<()> {
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    register_declarative_visibility_definition();
+
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-declarative-")?;
+    let store = WorkflowRuntimeStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+        Some(&test_helpers::test_database_url()?),
+    )
+    .await?;
+
+    store
+        .upsert_instance(
+            &WorkflowInstance::new(
+                DECLARATIVE_VISIBILITY_DEFINITION_ID,
+                1,
+                "blocked",
+                WorkflowSubject::new("issue", "issue:9001"),
+            )
+            .with_id("declarative-blocked".to_string())
+            .with_data(json!({ "repo": "owner/repo", "blocked_reason": "operator gate" })),
+        )
+        .await?;
+
+    let workflows = list_runtime_workflows_from_store(&store).await?;
+
+    assert!(
+        workflows
+            .iter()
+            .any(|workflow| workflow.id == "declarative-blocked"
+                && workflow.definition_id == DECLARATIVE_VISIBILITY_DEFINITION_ID),
+        "declarative blocked instance must appear in the operator monitor sample"
+    );
+    // B-005: no instances were created for any other definition, so the built-ins
+    // contribute nothing here — the only sampled workflow is the declarative one.
+    assert_eq!(workflows.len(), 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
@@ -1054,7 +1156,9 @@ async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result
         .execute(workflow_runtime_store.pool())
         .await?;
 
-    let workflows = list_recent_failed_workflows(&workflow_runtime_store, 1).await?;
+    let definition_ids = crate::handlers::definition_ids::operator_definition_ids()?;
+    let workflows =
+        list_recent_failed_workflows(&workflow_runtime_store, &definition_ids, 1).await?;
 
     assert_eq!(workflows.len(), 1);
     assert_eq!(workflows[0].id, "recent-failed");
