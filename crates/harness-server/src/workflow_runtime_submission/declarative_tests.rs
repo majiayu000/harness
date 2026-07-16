@@ -59,6 +59,7 @@ fn register_test_definition() {
             ]),
             evidence_required: BTreeMap::new(),
             recovery_targets: vec!["working".to_string()],
+            intake: None,
         };
         let definition = harness_workflow::runtime::build_declarative_definition(
             &policy,

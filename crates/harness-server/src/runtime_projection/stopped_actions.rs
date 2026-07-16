@@ -358,6 +358,7 @@ mod tests {
                 vec!["operator_ticket".to_string()],
             )]),
             recovery_targets: vec!["running".to_string()],
+            intake: None,
         };
         let definition = build_declarative_definition(
             &policy,

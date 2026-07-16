@@ -47,6 +47,7 @@ fn declarative_recovery_definition(
             ("done".to_string(), vec!["release_report".to_string()]),
         ]),
         recovery_targets: vec!["running".to_string(), "waiting".to_string()],
+        intake: None,
     };
     super::build_declarative_definition(
         &policy,

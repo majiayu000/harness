@@ -134,6 +134,7 @@ mod tests {
             ]),
             evidence_required: BTreeMap::new(),
             recovery_targets: vec!["working".to_string()],
+            intake: None,
         };
         super::super::declarative::build_declarative_definition(
             &policy,

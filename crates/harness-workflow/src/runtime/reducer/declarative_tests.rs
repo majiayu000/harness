@@ -41,6 +41,7 @@ fn declarative_failure_without_route_uses_configured_generic_retry() -> anyhow::
         ]),
         evidence_required: BTreeMap::new(),
         recovery_targets: Vec::new(),
+        intake: None,
     };
     let definition = super::super::declarative::build_declarative_definition(
         &policy,

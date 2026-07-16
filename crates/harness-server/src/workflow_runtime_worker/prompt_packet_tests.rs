@@ -677,6 +677,7 @@ fn compiled_activity_policy_definition() -> harness_workflow::runtime::Declarati
         ]),
         evidence_required: BTreeMap::new(),
         recovery_targets: vec!["working".to_string()],
+        intake: None,
     };
     build_declarative_definition(
         &policy,

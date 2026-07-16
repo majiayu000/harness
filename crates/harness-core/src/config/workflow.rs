@@ -4,8 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 mod candidates;
+mod defaults;
+mod intake_binding;
 mod storage;
 pub use candidates::WorkflowCandidatesPolicy;
+use defaults::*;
+pub use intake_binding::{IntakeFilterPolicy, WorkflowDefinitionIntakePolicy};
 pub use storage::WorkflowStoragePolicy;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -112,9 +116,16 @@ pub struct WorkflowDefinitionPolicy {
     pub evidence_required: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub recovery_targets: Vec<String>,
+    /// Optional intake binding (GH-1656). Absent for definitions fed only via
+    /// the submission API; existing WORKFLOW.md files parse unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake: Option<WorkflowDefinitionIntakePolicy>,
 }
 impl WorkflowDefinitionPolicy {
     fn validate_identifiers(&self) -> anyhow::Result<()> {
+        if let Some(intake) = &self.intake {
+            intake.validate(&self.id)?;
+        }
         if self.id.trim().is_empty() {
             anyhow::bail!("definition id must not be empty");
         }
@@ -482,111 +493,6 @@ impl Default for WorkflowHooksPolicy {
     }
 }
 
-fn default_workflow_version() -> u32 {
-    1
-}
-
-fn default_base_remote() -> String {
-    "origin".to_string()
-}
-
-fn default_base_branch() -> String {
-    "main".to_string()
-}
-
-fn default_workspace_strategy() -> String {
-    "worktree".to_string()
-}
-
-fn default_workspace_branch_prefix() -> String {
-    "harness/".to_string()
-}
-
-fn default_workspace_cleanup() -> String {
-    "on_terminal".to_string()
-}
-
-fn default_hook_timeout_secs() -> u64 {
-    60
-}
-
-fn default_force_execute_label() -> String {
-    "force-execute".to_string()
-}
-
-fn default_pr_scope_guard_max_files_changed() -> u32 {
-    30
-}
-
-fn default_pr_scope_guard_max_lines_added() -> u32 {
-    1500
-}
-
-fn default_feedback_sweep_interval_secs() -> u64 {
-    60
-}
-
-fn default_feedback_claim_stale_after_secs() -> u64 {
-    300
-}
-
-fn default_pr_hygiene_interval_secs() -> u64 {
-    30 * 60
-}
-
-fn default_pr_hygiene_dirty_age_to_repair_secs() -> u64 {
-    48 * 60 * 60
-}
-
-fn default_pr_hygiene_dirty_age_to_comment_secs() -> u64 {
-    7 * 24 * 60 * 60
-}
-
-fn default_pr_hygiene_rebase_needed_label() -> String {
-    "rebase-needed".to_string()
-}
-
-fn default_pr_hygiene_batch_limit() -> u32 {
-    25
-}
-
-fn default_runtime_dispatch_interval_secs() -> u64 {
-    30
-}
-
-fn default_runtime_dispatch_batch_limit() -> u32 {
-    25
-}
-
-fn default_runtime_dispatch_defer_backoff_secs() -> u64 {
-    30
-}
-
-fn default_runtime_dispatch_defer_backoff_max_secs() -> u64 {
-    15 * 60
-}
-
-fn default_runtime_dispatch_activity_profiles() -> BTreeMap<String, RuntimeDispatchProfileOverride>
-{
-    BTreeMap::new()
-}
-
-fn default_runtime_worker_interval_secs() -> u64 {
-    5
-}
-
-fn default_runtime_worker_concurrency() -> u32 {
-    10
-}
-
-fn default_runtime_worker_lease_ttl_secs() -> u64 {
-    3900
-}
-
-fn default_true() -> bool {
-    true
-}
-
 /// Load workflow policy from `{project_root}/WORKFLOW.md`.
 ///
 /// Only the YAML front matter is parsed. Missing files or missing front matter
@@ -798,3 +704,7 @@ fn split_front_matter_and_body(contents: &str) -> (Option<&str>, &str) {
 #[cfg(test)]
 #[path = "workflow_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "workflow_intake_binding_tests.rs"]
+mod intake_binding_tests;

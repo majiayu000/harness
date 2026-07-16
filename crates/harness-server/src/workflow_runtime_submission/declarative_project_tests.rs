@@ -36,6 +36,7 @@ fn project_binding_policy() -> WorkflowDefinitionPolicy {
         ]),
         evidence_required: BTreeMap::new(),
         recovery_targets: vec!["working".to_string()],
+        intake: None,
     }
 }
 

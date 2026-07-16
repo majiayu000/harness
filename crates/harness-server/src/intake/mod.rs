@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::http::AppState;
 use crate::task_runner::{TaskFailureKind, TaskId, TaskStatus};
 
+pub mod binding;
 mod direct_dispatch;
 pub mod feishu;
 mod github_coverage_gate;
