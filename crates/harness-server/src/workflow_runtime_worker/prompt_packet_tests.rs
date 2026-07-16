@@ -404,7 +404,7 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
 }
 
 #[test]
-fn runtime_prompt_packet_includes_workflow_file_contract() {
+fn runtime_prompt_packet_does_not_bind_activity_policy_without_a_declarative_instance() {
     let job = RuntimeJob::pending(
         "command-1",
         RuntimeKind::CodexJsonrpc,
@@ -436,27 +436,20 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
         &runtime_profile,
         &workflow_document,
         &[],
-    );
+    )
+    .expect("non-declarative prompt packet should build");
     assert_eq!(packet["project"]["root"], "/workspaces/job-1");
     assert_eq!(packet["project"]["source_root"], "/repo");
     assert_eq!(
         packet["workflow_file"]["prompt_template"],
         "Follow the repository workflow prompt."
     );
-    assert_eq!(
-        packet["workflow_file"]["activity_prompt"],
-        "Apply the issue-specific review policy."
-    );
-    assert_eq!(
-        packet["workflow_file"]["activity_validation"],
-        json!(["cargo test -p harness-server"])
-    );
+    assert!(packet["workflow_file"].get("activity_prompt").is_none());
+    assert!(packet["workflow_file"].get("activity_validation").is_none());
 
     let prompt = build_runtime_job_prompt(&packet, None);
-    assert!(prompt.contains("Repository workflow activity prompt:"));
-    assert!(prompt.contains("Apply the issue-specific review policy."));
-    assert!(prompt.contains("Repository workflow activity validation commands:"));
-    assert!(prompt.contains("- cargo test -p harness-server"));
+    assert!(!prompt.contains("Repository workflow activity prompt:"));
+    assert!(!prompt.contains("Repository workflow activity validation commands:"));
     assert!(prompt.contains("Repository workflow prompt template:"));
     assert!(prompt.contains("Follow the repository workflow prompt."));
 }
@@ -499,7 +492,8 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
         &runtime_profile,
         &WorkflowDocument::default(),
         &[],
-    );
+    )
+    .expect("continuation prompt packet should build");
 
     assert_eq!(packet["continuation_context"]["attempt"], 2);
     assert_eq!(
@@ -545,7 +539,8 @@ fn runtime_prompt_packet_describes_deferred_candidate_submission_contract() {
         &runtime_profile,
         &workflow_document,
         &[],
-    );
+    )
+    .expect("candidate prompt packet should build");
 
     assert_eq!(packet["runtime_contract"]["submission_mode"], "deferred");
     assert!(packet["runtime_contract"]["deferred_submission_contract"]
@@ -596,7 +591,8 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
         &runtime_profile,
         &workflow_document,
         &repo_memory,
-    );
+    )
+    .expect("repo-memory prompt packet should build");
 
     assert_eq!(
         packet["repo_memory"]["schema"],
@@ -646,7 +642,8 @@ fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
         &runtime_profile,
         &workflow_document,
         &[],
-    );
+    )
+    .expect("prompt packet without repo memory should build");
 
     assert!(packet.get("repo_memory").is_none());
     let prompt = build_runtime_job_prompt(&packet, None);

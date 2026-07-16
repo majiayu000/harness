@@ -21,6 +21,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde_json::json;
 
+pub const DECLARATIVE_SUBMISSION_DECISION: &str = "submit_declarative_workflow";
+
 /// A structurally validated declaration and the registry definition compiled from it.
 ///
 /// The policy remains attached because the generic interpreter needs routing, evidence,
@@ -167,7 +169,7 @@ pub fn build_declarative_submission_decision(
     Ok(WorkflowDecision::new(
         &instance.id,
         &instance.state,
-        "submit_declarative_workflow",
+        DECLARATIVE_SUBMISSION_DECISION,
         &instance.state,
         format!(
             "submitted declarative workflow '{}' in initial state '{}'",
@@ -498,6 +500,10 @@ fn validate_reachability(
         }
         // Any active state can enter the runtime's invalid-output blocked fallback.
         pending.push_back("blocked");
+        // Runtime completion supplies terminal fallbacks even when the declaration
+        // omits explicit failure or cancellation routes.
+        pending.push_back(terminal_state_for_class(policy, "failed"));
+        pending.push_back(terminal_state_for_class(policy, "cancelled"));
         if state_name == "blocked" {
             pending.extend(policy.recovery_targets.iter().map(String::as_str));
         }
@@ -559,6 +565,11 @@ fn compile_allowlist(
         if source == &policy.initial || state.activity.is_some() {
             edges.insert((source.as_str(), source.as_str()));
         }
+        edges.insert((source.as_str(), terminal_state_for_class(policy, "failed")));
+        edges.insert((
+            source.as_str(),
+            terminal_state_for_class(policy, "cancelled"),
+        ));
     }
     edges.extend(
         policy
@@ -603,6 +614,14 @@ fn compile_allowlist(
         ],
     ));
     TransitionAllowlist::new(rules)
+}
+
+fn terminal_state_for_class<'a>(policy: &'a WorkflowDefinitionPolicy, class: &str) -> &'a str {
+    policy
+        .terminal
+        .iter()
+        .find_map(|(state, declared_class)| (declared_class == class).then_some(state.as_str()))
+        .expect("terminal class coverage was validated before compilation")
 }
 
 fn required_command_for_target(

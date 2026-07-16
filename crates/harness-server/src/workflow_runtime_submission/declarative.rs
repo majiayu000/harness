@@ -8,6 +8,7 @@ use harness_workflow::runtime::{
     build_declarative_definition, build_declarative_submission_decision,
     current_declarative_workflow_definition, persisted_declarative_definition,
     DeclarativeWorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    DECLARATIVE_SUBMISSION_DECISION,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -92,27 +93,76 @@ pub(crate) async fn record_declarative_submission(
             document.source_path.as_deref(),
         ))
         .await?;
-    let (instance, new_instance) = match store.get_instance(&workflow_id).await? {
-        Some(instance) => (instance, false),
-        None => (
-            declarative_instance(&definition, workflow_id, &project_id, &ctx),
-            true,
-        ),
-    };
+    if store.get_instance(&workflow_id).await?.is_some() {
+        return existing_declarative_submission(
+            store,
+            &workflow_id,
+            definition.policy().id.as_str(),
+            definition.definition_version(),
+            definition.definition_hash(),
+        )
+        .await;
+    }
+    let instance = declarative_instance(&definition, workflow_id, &project_id, &ctx);
     let prompt_ref =
         prompt_ref_for_submission(&project_id, ctx.external_id, ctx.task_id, ctx.prompt);
     let submitted_data =
         declarative_submission_data(&instance.data, &project_id, &prompt_ref, &definition, &ctx);
     let decision = build_declarative_submission_decision(&definition, &instance)?;
-    apply_declarative_decision(
-        store,
-        instance,
-        new_instance,
-        decision,
-        &ctx,
-        submitted_data,
-    )
-    .await
+    apply_declarative_decision(store, instance, true, decision, &ctx, submitted_data).await
+}
+
+pub(super) async fn existing_declarative_submission(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    definition_id: &str,
+    definition_version: u32,
+    definition_hash: &str,
+) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
+    let instance = store.get_instance(workflow_id).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "declarative workflow submission '{}' disappeared during conflict reconciliation",
+            workflow_id
+        )
+    })?;
+    if instance.definition_id != definition_id
+        || instance.definition_version != definition_version
+        || instance.data.get("definition_hash").and_then(Value::as_str) != Some(definition_hash)
+    {
+        anyhow::bail!(
+            "existing declarative workflow submission '{}' does not match definition '{}@{}'",
+            workflow_id,
+            definition_id,
+            definition_version
+        );
+    }
+    let record = store
+        .decisions_for(workflow_id)
+        .await?
+        .into_iter()
+        .find(|record| {
+            record.accepted && record.decision.decision == DECLARATIVE_SUBMISSION_DECISION
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "existing declarative workflow submission '{}' has no accepted submission decision",
+                workflow_id
+            )
+        })?;
+    let command_ids = store
+        .commands_for(workflow_id)
+        .await?
+        .into_iter()
+        .filter(|command| command.decision_id.as_deref() == Some(record.id.as_str()))
+        .map(|command| command.id)
+        .collect();
+    Ok(WorkflowSubmissionRuntimeRecord {
+        workflow_id: workflow_id.to_string(),
+        accepted: true,
+        decision_id: record.id,
+        command_ids,
+        rejection_reason: None,
+    })
 }
 
 pub(crate) fn declarative_workflow_id(

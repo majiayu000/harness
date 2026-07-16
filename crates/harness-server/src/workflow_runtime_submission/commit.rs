@@ -1,7 +1,7 @@
 use super::{
-    depends_on_strings, insert_author_trust_class, merge_last_decision, optional_string_field,
-    string_field, DeclarativeSubmissionRuntimeContext, IssueSubmissionRuntimeContext,
-    PromptSubmissionRuntimeContext, WorkflowSubmissionRuntimeRecord,
+    declarative::existing_declarative_submission, depends_on_strings, insert_author_trust_class,
+    merge_last_decision, optional_string_field, string_field, DeclarativeSubmissionRuntimeContext,
+    IssueSubmissionRuntimeContext, PromptSubmissionRuntimeContext, WorkflowSubmissionRuntimeRecord,
     EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
 use super::{
@@ -351,8 +351,27 @@ pub(super) async fn apply_declarative_decision(
                 previous_prompt_ref: previous_prompt_ref_to_remove,
             }),
         })
-        .await?
-        .ok_or_else(|| submission_commit_conflict(&instance.id))?;
+        .await?;
+    let Some(outcome) = outcome else {
+        let definition_hash = instance
+            .data
+            .get("definition_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "declarative submission '{}' lost its definition hash during conflict reconciliation",
+                    instance.id
+                )
+            })?;
+        return existing_declarative_submission(
+            store,
+            &instance.id,
+            &instance.definition_id,
+            instance.definition_version,
+            definition_hash,
+        )
+        .await;
+    };
     cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
     remove_prompt_submission_prompt(previous_prompt_ref_to_remove);
     Ok(WorkflowSubmissionRuntimeRecord {

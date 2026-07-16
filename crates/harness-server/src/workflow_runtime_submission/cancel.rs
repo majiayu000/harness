@@ -1,6 +1,7 @@
 use harness_workflow::runtime::{
-    WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision,
-    WorkflowInstance, WorkflowRuntimeStore, PROMPT_TASK_DEFINITION_ID,
+    resolve_declarative_definition, DeclarativeDefinitionResolution, WorkflowCommand,
+    WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowInstance,
+    WorkflowRuntimeStore, PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::fmt;
@@ -86,31 +87,70 @@ async fn cancel_submission_instance(
         return Ok(RuntimeSubmissionCancelOutcome::AlreadyTerminal(instance));
     }
     let is_prompt = instance.definition_id == PROMPT_TASK_DEFINITION_ID;
-    if !is_prompt && instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
-        return Err(RuntimeSubmissionCancelError::UnsupportedDefinition {
-            definition_id: instance.definition_id,
-        });
-    }
-    let event_type = if is_prompt {
-        "PromptSubmissionCancelled"
+    let is_issue = instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID;
+    let declarative = if is_prompt || is_issue {
+        None
     } else {
-        "IssueSubmissionCancelled"
+        match resolve_declarative_definition(&instance) {
+            DeclarativeDefinitionResolution::Resolved(definition) => Some(definition),
+            DeclarativeDefinitionResolution::PinError(error) => {
+                return Err(RuntimeSubmissionCancelError::Store(anyhow::anyhow!(
+                    "declarative workflow '{}' has an invalid definition pin during cancellation: {error:?}",
+                    instance.id
+                )));
+            }
+            DeclarativeDefinitionResolution::NotDeclarative => {
+                return Err(RuntimeSubmissionCancelError::UnsupportedDefinition {
+                    definition_id: instance.definition_id,
+                });
+            }
+        }
     };
-    let decision_name = if is_prompt {
-        "cancel_prompt_submission"
-    } else {
-        "cancel_issue_submission"
-    };
-    let reason = if is_prompt {
-        "operator cancelled the runtime prompt submission"
-    } else {
-        "operator cancelled the runtime issue submission"
-    };
-    let command_prefix = if is_prompt {
-        "prompt-submit"
-    } else {
-        "issue-submit"
-    };
+    let (event_type, decision_name, reason, command_prefix, target_state, remove_prompt) =
+        if is_prompt {
+            (
+                "PromptSubmissionCancelled",
+                "cancel_prompt_submission",
+                "operator cancelled the runtime prompt submission",
+                "prompt-submit",
+                "cancelled".to_string(),
+                true,
+            )
+        } else if is_issue {
+            (
+                "IssueSubmissionCancelled",
+                "cancel_issue_submission",
+                "operator cancelled the runtime issue submission",
+                "issue-submit",
+                "cancelled".to_string(),
+                false,
+            )
+        } else {
+            let definition = declarative.as_ref().ok_or_else(|| {
+                RuntimeSubmissionCancelError::Store(anyhow::anyhow!(
+                    "declarative cancellation resolution lost its definition"
+                ))
+            })?;
+            let target_state = definition
+                .policy()
+                .terminal
+                .iter()
+                .find_map(|(state, class)| (class == "cancelled").then_some(state.clone()))
+                .ok_or_else(|| {
+                    RuntimeSubmissionCancelError::Store(anyhow::anyhow!(
+                        "declarative workflow '{}' has no cancelled terminal state",
+                        instance.id
+                    ))
+                })?;
+            (
+                "DeclarativeSubmissionCancelled",
+                "cancel_declarative_submission",
+                "operator cancelled the runtime declarative submission",
+                "declarative-submit",
+                target_state,
+                true,
+            )
+        };
     let event = store
         .append_event(
             &instance.id,
@@ -126,7 +166,7 @@ async fn cancel_submission_instance(
         &instance.id,
         &instance.state,
         decision_name,
-        "cancelled",
+        target_state,
         reason,
     )
     .with_command(WorkflowCommand::new(
@@ -156,7 +196,7 @@ async fn cancel_submission_instance(
     }
     cancelled.data = set_data_bool(cancelled.data, "cancelled", true);
     store.upsert_instance(&cancelled).await?;
-    if is_prompt {
+    if remove_prompt {
         remove_prompt_submission_prompt_durable(
             store,
             optional_string_field(&cancelled.data, "prompt_ref").as_deref(),

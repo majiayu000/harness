@@ -283,7 +283,15 @@ fn decision_validator_for_instance(
     match instance.definition_id.as_str() {
         GITHUB_ISSUE_PR_DEFINITION_ID => Ok(DecisionValidator::github_issue_pr()),
         PROMPT_TASK_DEFINITION_ID => Ok(DecisionValidator::prompt_task()),
-        other => anyhow::bail!("workflow definition `{other}` cannot be committed by submission"),
+        other => harness_workflow::runtime::decision_validator_for_instance(instance)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "workflow definition '{other}' has an invalid declarative pin: {error:?}"
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!("workflow definition '{other}' cannot be committed by submission")
+            }),
     }
 }
 

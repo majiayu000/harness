@@ -98,7 +98,7 @@ mod declarative_interpreter {
         state: &str,
     ) -> WorkflowInstance {
         WorkflowInstance::new(
-            DEFINITION_ID,
+            definition.policy().id.clone(),
             definition.definition_version(),
             state,
             WorkflowSubject::new("document", "doc-1"),
@@ -228,12 +228,16 @@ mod declarative_interpreter {
     #[test]
     fn generic_blocked_failed_and_retry_fallbacks_remain_declared_shape_aware() {
         let mut fallback_policy = policy();
+        fallback_policy.id = "declarative_interpreter_fallback_v1".to_string();
         let reviewing = fallback_policy.states.get_mut("reviewing").unwrap();
         reviewing.on_blocked = None;
         reviewing.on_failure = None;
+        reviewing.on_signal.remove("cancel");
         fallback_policy.states.remove("needs_operator");
         let definition = definition_for(&fallback_policy);
         let instance = instance_for(&definition, "reviewing");
+        register_declarative_workflow_definitions([definition.clone()])
+            .expect("fallback definition should register");
 
         let blocked = blocked_result("review");
         let blocked_event = completion_event(&instance, "review", &blocked);
@@ -257,6 +261,34 @@ mod declarative_interpreter {
             failed_decision.commands[0].command_type,
             WorkflowCommandType::MarkFailed
         );
+        let validator = decision_validator_for_instance(&instance)
+            .expect("fallback definition pin should resolve")
+            .expect("fallback definition should provide a validator");
+        validator
+            .validate(
+                &instance,
+                &failed_decision,
+                &ValidationContext::new("fallback-test", chrono::Utc::now()),
+            )
+            .expect("implicit failed fallback must be allowlisted");
+
+        let cancelled = ActivityResult::cancelled("review", "cancelled");
+        let cancelled_event = completion_event(&instance, "review", &cancelled);
+        let cancelled_decision = reduce_declarative_completion(
+            &definition,
+            &instance,
+            &cancelled_event,
+            &cancelled,
+        );
+        decision_validator_for_instance(&instance)
+            .expect("cancel fallback definition pin should resolve")
+            .expect("cancel fallback definition should provide a validator")
+            .validate(
+                &instance,
+                &cancelled_decision,
+                &ValidationContext::new("fallback-test", chrono::Utc::now()),
+            )
+            .expect("implicit cancelled fallback must be allowlisted");
 
         let retrying = instance.clone().with_data(json!({
             "definition_hash": definition.definition_hash(),

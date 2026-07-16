@@ -151,8 +151,12 @@ async fn declarative_request_enters_runtime_once_for_stable_external_id() -> any
         ..Default::default()
     };
 
-    let first_handle = service.enqueue_background(request.clone()).await?;
-    let duplicate_handle = service.enqueue_background(request).await?;
+    let (first_result, duplicate_result) = tokio::join!(
+        service.enqueue_background(request.clone()),
+        service.enqueue_background(request)
+    );
+    let first_handle = first_result?;
+    let duplicate_handle = duplicate_result?;
 
     assert_eq!(duplicate_handle, first_handle);
     assert!(task_store

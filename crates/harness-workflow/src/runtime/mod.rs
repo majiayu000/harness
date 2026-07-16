@@ -66,7 +66,7 @@ pub use candidate_selection::{
 };
 pub use declarative::{
     build_declarative_definition, build_declarative_submission_decision,
-    DeclarativeWorkflowDefinition,
+    DeclarativeWorkflowDefinition, DECLARATIVE_SUBMISSION_DECISION,
 };
 pub use declarative_pinning::{
     declarative_definition_identity, hydrate_declarative_definition,
@@ -167,10 +167,10 @@ pub use state_registry::{
 pub use status::WorkflowCommandStatus;
 pub use store::{
     DriverlessProgressInstance, DriverlessProgressProvenanceStatus, RuntimeHistoryPruneSummary,
-    RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
-    WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeRecoveryAction,
-    WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore,
-    WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
+    RuntimeJobEnqueueOutcome, RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert,
+    RuntimeUsageUpsertOutcome, WorkflowDecisionTransition, WorkflowRejectedDecisionTransition,
+    WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
+    WorkflowRuntimeStore, WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload,
 };
 pub use submission::{
