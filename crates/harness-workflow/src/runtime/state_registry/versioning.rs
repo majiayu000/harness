@@ -187,6 +187,13 @@ impl WorkflowDefinitionRegistry {
         &self,
         instance: &WorkflowInstance,
     ) -> DeclarativeDefinitionResolution {
+        if self.definitions.contains_key(&instance.definition_id)
+            && !self
+                .current_declarative_versions
+                .contains_key(&instance.definition_id)
+        {
+            return DeclarativeDefinitionResolution::NotDeclarative;
+        }
         let definition =
             self.declarative_definition(&instance.definition_id, instance.definition_version);
         let is_declarative = definition.is_some()

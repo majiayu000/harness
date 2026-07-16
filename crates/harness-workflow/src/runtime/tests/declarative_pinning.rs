@@ -215,6 +215,18 @@ mod declarative_pinning {
             .state_definition_for_instance(&missing_unmarked_version, "completed")
             .is_none());
         assert!(workflow_definition_for_version(GITHUB_ISSUE_PR_DEFINITION_ID, u32::MAX).is_some());
+        let builtin_with_unrelated_hash = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            u32::MAX,
+            "done",
+            WorkflowSubject::new("issue", "1609"),
+        )
+        .with_data(json!({ "definition_hash": "unrelated-business-metadata" }));
+        assert_eq!(
+            workflow_state_definition_for_instance(&builtin_with_unrelated_hash, "done")
+                .and_then(|state| state.terminal_state),
+            Some(WorkflowTerminalState::Succeeded),
+        );
 
         let mut raw_registry = WorkflowDefinitionRegistry::new_for_tests();
         raw_registry
@@ -233,12 +245,16 @@ mod declarative_pinning {
         assert!(raw_registry
             .state_definition_for_instance(&raw_instance, "done")
             .is_some());
-        let missing_pinned_version = raw_instance
+        let raw_with_unrelated_hash = raw_instance
             .clone()
             .with_data(json!({ "definition_hash": v1.definition_hash() }));
+        assert!(matches!(
+            raw_registry.resolve_declarative_definition(&raw_with_unrelated_hash),
+            DeclarativeDefinitionResolution::NotDeclarative
+        ));
         assert!(raw_registry
-            .state_definition_for_instance(&missing_pinned_version, "done")
-            .is_none());
+            .state_definition_for_instance(&raw_with_unrelated_hash, "done")
+            .is_some());
     }
 
     #[test]
