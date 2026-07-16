@@ -174,4 +174,6 @@ config to unwind.
 | B-004 | sort in helper | helper unit test |
 | B-005 | no-op for empty definitions | fixture test with zero-instance definition |
 | B-006 | empty-registry error | helper unit test with fresh registry |
+
+B-006 note: on the infallible dashboard/overview count handlers, "explicit error path" means error-level log escalation while the response still returns without the runtime-workflow contribution (no wire schema change is a non-goal); the monitor path returns a real error. The empty-registry state is unreachable after healthy startup because built-ins are seeded at boot.
 | B-007 | enumeration audit | grep gate in CI-visible test or review checklist |
