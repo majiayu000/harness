@@ -45,3 +45,19 @@ issue.
 Feature ships disabled by default. If the Phase 1 gate fails, keep the
 trait and tests, remove the seams from default builds, and record the
 downgrade decision in this packet.
+
+T006 status (2026-07-16): `scripts/run_nap_replay.py` executes the A/B
+replay through an agent-runtime channel (default `codex exec` with
+`gpt-5.6-luna` on a subscription seat; `claude -p` and an OpenAI-compatible
+API are optional channels), mirroring `PromptCompressor` semantics
+(prompts, seeded sampling, 2-of-3 sketch agreement, breaker, byte/4
+estimates) and binding evidence to the manifest via per-session source
+HMAC re-verification. Runs are resumable through per-session state files.
+Success oracle is a documented proxy pending a human-approved task oracle:
+`baseline_success` is true (sessions completed historically) and
+`candidate_success` is false only when the session trips the NAP breaker.
+Pricing enters via explicit `--pricing-*` flags; subscription-seat runs may
+pass 0 for compressor cost, which trivially satisfies the cost-ratio gate
+and must be disclosed alongside the evidence. Remaining for T006: run the
+pilot then the full 40-session replay under the approved channel, and
+summarize with `evaluate_nap_replay.py summarize-evidence`.
