@@ -209,7 +209,7 @@ pub(super) fn submission_instance(
     WorkflowInstance::new(
         definition.policy().id.as_str(),
         definition.definition_version(),
-        "__submission__",
+        definition.policy().initial.as_str(),
         WorkflowSubject::new("declarative", subject_key(ctx.external_id, ctx.task_id)),
     )
     .with_id(workflow_id)

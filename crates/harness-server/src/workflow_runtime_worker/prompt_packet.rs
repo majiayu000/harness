@@ -31,7 +31,7 @@ pub(super) fn build_runtime_prompt_packet(
     runtime_profile: &RuntimeProfile,
     workflow_document: &WorkflowDocument,
     repo_memory: &[RetrievedRepoMemoryRecord],
-) -> Value {
+) -> anyhow::Result<Value> {
     let mut packet = json!({
         "schema": "harness.runtime.prompt_packet.v1",
         "runtime_job": {
@@ -85,12 +85,12 @@ pub(super) fn build_runtime_prompt_packet(
     if !repo_memory.is_empty() {
         packet["repo_memory"] = repo_memory_prompt_value(repo_memory);
     }
-    apply_activity_policy(&mut packet, job, workflow, workflow_document);
+    apply_activity_policy(&mut packet, job, workflow, workflow_document)?;
     apply_candidate_submission_contract(&mut packet, job);
     if let Some(context) = prompt_continuation_context(workflow) {
         packet["continuation_context"] = context;
     }
-    packet
+    Ok(packet)
 }
 
 fn prompt_continuation_context(workflow: Option<&WorkflowInstance>) -> Option<Value> {

@@ -71,9 +71,25 @@ pub(super) fn validate_target_progress_contract(
     instance: &WorkflowInstance,
     decision: &WorkflowDecision,
 ) -> Result<(), WorkflowDecisionRejection> {
-    if state_registry::workflow_state_definition_for_instance(instance, &decision.next_state)
-        .is_none()
+    validate_target_progress_contract_with_override(instance, decision, false)
+}
+
+pub(super) fn validate_target_progress_contract_with_override(
+    instance: &WorkflowInstance,
+    decision: &WorkflowDecision,
+    allow_missing_pinned_cancel: bool,
+) -> Result<(), WorkflowDecisionRejection> {
+    let state =
+        state_registry::workflow_state_definition_for_instance(instance, &decision.next_state);
+    if state.is_none()
+        && allow_missing_pinned_cancel
+        && decision.decision == "cancel_declarative_submission"
+        && decision.commands.len() == 1
+        && decision.commands[0].command_type == super::model::WorkflowCommandType::MarkCancelled
     {
+        return Ok(());
+    }
+    if state.is_none() {
         return Err(WorkflowDecisionRejection::new(
             WorkflowDecisionRejectionKind::TransitionNotAllowed,
             format!(
@@ -82,9 +98,7 @@ pub(super) fn validate_target_progress_contract(
             ),
         ));
     }
-    let progress_mode =
-        state_registry::workflow_state_definition_for_instance(instance, &decision.next_state)
-            .and_then(|state| state.progress_mode);
+    let progress_mode = state.and_then(|state| state.progress_mode);
     let has_driver = decision
         .commands
         .iter()

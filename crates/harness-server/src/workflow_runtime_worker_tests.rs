@@ -309,7 +309,8 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
         &runtime_profile,
         &workflow_document,
         &[],
-    );
+    )
+    .expect("workflow-file prompt packet should build");
     assert_eq!(packet["project"]["root"], "/workspaces/job-1");
     assert_eq!(packet["project"]["source_root"], "/repo");
     assert_eq!(
