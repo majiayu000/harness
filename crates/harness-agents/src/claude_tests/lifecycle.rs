@@ -27,9 +27,19 @@ printf 'root done\n'
     };
 
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    timeout(Duration::from_secs(5), agent.execute_stream(request, tx))
+    let mut handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
+    if !wait_for_path(&descendant_marker, Duration::from_secs(20)).await {
+        handle.abort();
+        let abort_outcome = timeout(Duration::from_secs(2), &mut handle).await;
+        panic!(
+            "timed out waiting for descendant startup marker at `{}`; abort outcome: {abort_outcome:?}",
+            descendant_marker.display()
+        );
+    }
+    timeout(Duration::from_secs(5), handle)
         .await
         .expect("execute_stream should not wait for descendant-held stderr")
+        .expect("execute_stream task should join")
         .expect("stream execution should succeed");
 
     assert!(

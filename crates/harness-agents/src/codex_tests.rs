@@ -92,11 +92,11 @@ enum StreamObservation {
     TaskFinished(Result<harness_core::error::Result<()>, tokio::task::JoinError>),
 }
 
-fn describe_stream_task_outcome(
-    outcome: Result<harness_core::error::Result<()>, tokio::task::JoinError>,
+fn describe_agent_task_outcome<T>(
+    outcome: Result<harness_core::error::Result<T>, tokio::task::JoinError>,
 ) -> String {
     match outcome {
-        Ok(Ok(())) => "task returned Ok(())".to_string(),
+        Ok(Ok(_)) => "task returned Ok(_)".to_string(),
         Ok(Err(err)) => format!("task returned Err({err})"),
         Err(join_err) => format!("task join failed: {join_err}"),
     }
@@ -120,7 +120,7 @@ async fn wait_for_stream_item_or_task_exit(
         Ok(StreamObservation::TaskFinished(outcome)) => {
             panic!(
                 "execute_stream finished before {description}: {}",
-                describe_stream_task_outcome(outcome)
+                describe_agent_task_outcome(outcome)
             );
         }
         Err(_) => {
@@ -133,9 +133,9 @@ async fn wait_for_stream_item_or_task_exit(
     }
 }
 
-async fn assert_path_observed_before_task_exit(
+async fn assert_path_observed_before_task_exit<T: std::fmt::Debug>(
     path: &std::path::Path,
-    handle: &mut tokio::task::JoinHandle<harness_core::error::Result<()>>,
+    handle: &mut tokio::task::JoinHandle<harness_core::error::Result<T>>,
     timeout_duration: Duration,
     description: &str,
 ) {
@@ -149,7 +149,7 @@ async fn assert_path_observed_before_task_exit(
             panic!(
                 "execute_stream finished before {description} at `{}`: {}",
                 path.display(),
-                describe_stream_task_outcome(outcome)
+                describe_agent_task_outcome(outcome)
             );
         }
         if tokio::time::Instant::now() >= deadline {
@@ -312,9 +312,18 @@ printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":1,"output_toke
     };
 
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    timeout(Duration::from_secs(5), agent.execute_stream(request, tx))
+    let mut handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
+    assert_path_observed_before_task_exit(
+        &descendant_marker,
+        &mut handle,
+        Duration::from_secs(20),
+        "descendant startup marker",
+    )
+    .await;
+    timeout(Duration::from_secs(5), handle)
         .await
         .expect("execute_stream should not wait for descendant-held stderr")
+        .expect("execute_stream task should join")
         .expect("stream execution should succeed");
 
     assert!(
@@ -470,9 +479,18 @@ while [ ! -f "{}" ]; do sleep 0.01; done
         project_root: dir.path().to_path_buf(),
         ..AgentRequest::default()
     };
-    let response = timeout(Duration::from_secs(5), agent.execute(request))
+    let mut handle = tokio::spawn(async move { agent.execute(request).await });
+    assert_path_observed_before_task_exit(
+        &descendant_marker,
+        &mut handle,
+        Duration::from_secs(20),
+        "descendant startup marker",
+    )
+    .await;
+    let response = timeout(Duration::from_secs(5), handle)
         .await
         .expect("execute should not hang on descendant-held stdout")
+        .expect("execute task should join")
         .expect("execute should parse root output");
 
     assert_eq!(response.output, "root done");
