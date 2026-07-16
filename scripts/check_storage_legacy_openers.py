@@ -36,7 +36,6 @@ LEGACY_STORE_TYPES = {
     "ThreadDb",
     "ProjectRegistry",
     "RuntimeStateStore",
-    "EvalStore",
     "PlanDb",
     "ReviewStore",
     "WorkflowRuntimeStore",
