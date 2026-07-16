@@ -375,6 +375,7 @@ class SessionReplayer:
         self.task_summary = task_summary
 
     def replay(self, source: SessionSource) -> dict[str, Any]:
+        self._session_key = source.session_key
         sampler = SeededRateSampler(self.nap_sample_rate, source.session_key)
         digest_key = hmac.new(
             self.salt, b"harness.nap-replay.source-content.v1", hashlib.sha256
@@ -429,6 +430,15 @@ class SessionReplayer:
             "candidate_success": not breaker_tripped,
         }
 
+    def _warn(self, stage: str, seq: int, exc: Exception) -> None:
+        # Errors fall back to raw text (production semantics), but the
+        # degradation must stay observable per run for gate review.
+        key = getattr(self, "_session_key", "unknown")
+        print(
+            f"warn: {stage} failed for {key} obs#{seq}: {str(exc)[:200]}",
+            file=sys.stderr,
+        )
+
     def _breaker_open(self, totals: dict[str, int]) -> bool:
         checked = totals["nap_checked"]
         if checked < BREAKER_MIN_CHECKS:
@@ -453,7 +463,8 @@ class SessionReplayer:
             compressed = self._complete(
                 _summarize_prompt(text, self.task_summary), totals
             )
-        except ChannelError:
+        except ChannelError as exc:
+            self._warn("summarize", seq, exc)
             totals["untouched_raw_tokens"] += raw_tokens
             return
         compressed_tokens = _estimate_tokens(compressed)
@@ -467,7 +478,8 @@ class SessionReplayer:
             compressed_sketch = _parse_sketch(
                 self._complete(_sketch_prompt(compressed, self.task_summary), totals)
             )
-        except (ChannelError, ReplayValidationError):
+        except (ChannelError, ReplayValidationError) as exc:
+            self._warn("sketch", seq, exc)
             totals["untouched_raw_tokens"] += raw_tokens
             return
         totals["nap_checked"] += 1
