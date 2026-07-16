@@ -1,0 +1,22 @@
+{
+  "issue": 1633,
+  "route": "triage_issue",
+  "state": "ready_to_spec",
+  "classification": "maintainability",
+  "security_private": false,
+  "duplicate": false,
+  "related_work": [
+    "GH-1238",
+    "GH-1468",
+    "PR-1083"
+  ],
+  "search_summary": "No active issue or pull request specifically covers modularizing crates/harness-workflow/src/runtime/store.rs.",
+  "proposed_labels": [
+    "enhancement",
+    "area_runtime",
+    "agent_generated",
+    "ready_to_spec"
+  ],
+  "decision": "allowed",
+  "human_gate_evidence": "Maintainer standing authorization recorded in the 2026-07-16 Codex goal thread."
+}
