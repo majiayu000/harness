@@ -1,4 +1,6 @@
 ---
+# Custom workflow shapes (`definition` block) and prompt-task continuation
+# policies are documented in docs/workflow-declarative-definitions.md.
 workflow:
   id: github_issue_pr
   version: 1

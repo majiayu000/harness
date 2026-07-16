@@ -31,4 +31,5 @@ tempfile = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
