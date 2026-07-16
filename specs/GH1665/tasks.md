@@ -48,9 +48,12 @@ GH-1665
   - replace the inline test wrapper with `#[cfg(test)] mod tests;`;
   - move the wrapper contents to `webhook/tests.rs` in the same order;
   - preserve `use super::*`, local imports, attributes, names, JSON/HMAC
-    fixtures, strings, assertions, and helper calls without semantic edits;
+    fixtures, strings, assertions, and helper calls without token or semantic
+    edits;
+  - generate the expected child file by unindenting the exact-base test body
+    and formatting it with the repository `rustfmt`; require an exact diff;
   - compare exact production/test inventories and perform a movement-aware
-    diff review;
+    diff review that permits only the reproduced whitespace reflow;
   - commit the verified relocation before PR-readiness work.
 - Done when:
   - both formatted files are at most 800 lines;
@@ -61,7 +64,8 @@ GH-1665
   - `cargo fmt --all -- --check`;
   - `cargo check -p harness-server --all-targets`;
   - `cargo test -p harness-server webhook::tests -- --test-threads=1`;
-  - exact inventory, module-path, size, scope, and movement checks.
+  - exact inventory, module-path, size, scope, production-prefix, and
+    canonical-rustfmt movement checks.
 
 ### SP1665-T3 — Prove PR readiness and clean up
 

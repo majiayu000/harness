@@ -48,9 +48,16 @@ production visibility or path change is required.
   the exact base and compare the complete production inventory.
 - Compare the ordered test-name and attribute inventory across the root plus
   `webhook/tests.rs` against the base; require every test exactly once.
-- Review the moved test content as a pure relocation. Permitted textual edits
-  are limited to replacing the inline wrapper with `mod tests;` and removing
-  one indentation level from the moved block.
+- Review the moved test content as a pure relocation. Permitted edits are
+  limited to replacing the inline wrapper with `mod tests;`, removing one
+  indentation level from the moved block, and accepting the deterministic line
+  wrapping produced when the repository `rustfmt` version formats that
+  unindented baseline body. No non-whitespace Rust token may change.
+- Generate the expected child file by extracting base lines 336-984, removing
+  one four-space indentation level, and piping the result through
+  `rustfmt --edition 2021 --emit stdout`; require an exact diff against
+  `webhook/tests.rs`. This makes the allowed whitespace delta reproducible
+  without weakening semantic or fixture integrity.
 - Preserve all JSON/HMAC fixtures, strings, assertions, local imports, request
   comparisons, ignored reasons, and helper calls.
 - Preserve the exact `webhook::tests::*` paths and require both Rust files to
@@ -81,9 +88,9 @@ format file is expected to change.
 
 - Compatibility: low; the logical test module path remains unchanged.
 - Production behavior: minimal; no production body or visibility changes.
-- Test integrity: low if the move is exact, but inventory and movement-aware
-  diff checks are mandatory to prevent a lost test, assertion, fixture, or
-  attribute.
+- Test integrity: low if the move matches the canonically formatted baseline,
+  but inventory and movement-aware diff checks are mandatory to prevent a lost
+  test, non-whitespace token, assertion, fixture, or attribute.
 - Security: low; production signature verification and event validation remain
   byte-for-byte unchanged.
 - Maintenance: reduced by separating production webhook handling from its test
@@ -99,7 +106,8 @@ format file is expected to change.
       repository database test environment.
 - [ ] `cargo fmt --all -- --check` and formatted line-count gates.
 - [ ] Exact production and ordered test inventory comparisons.
-- [ ] Diff-scope and movement review proving no test or production rewrite.
+- [ ] Exact production diff plus canonical-rustfmt movement comparison proving
+      no non-whitespace test token or production rewrite.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Workspace tests under the repository test environment.
 - [ ] SpecRail global/packet/route checks, VibeGuard compliance, exact-head CI,
