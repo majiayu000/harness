@@ -18,8 +18,8 @@ Use the user's language for conversation. Keep repository artifacts in English, 
 - Run `cargo fmt --all` before every commit — CI enforces `cargo fmt --all -- --check`
 - Dead code in `#[cfg(test)]` modules still triggers `-D warnings` in CI; delete unused test helpers instead of suppressing with `#[allow(dead_code)]`
 - Pre-commit hook (`.githooks/pre-commit`) runs fmt + staged-scope clippy as a fast commit gate. After cloning, activate with: `git config core.hooksPath .githooks`
-- Pre-push hook (`.githooks/pre-push`) runs full workspace clippy, non-server workspace lib tests, and `harness-server` lib tests when `HARNESS_DATABASE_URL` is configured.
-- Local Postgres-dependent `harness-server` tests require `HARNESS_DATABASE_URL`; without it, pre-push skips `harness-server` locally.
+- Pre-push hook (`.githooks/pre-push`) always runs full workspace clippy. In DB-less mode it runs database-independent workspace and `harness-workflow` lib tests under an isolated config root. With `HARNESS_DATABASE_URL`, it runs the full `harness-workflow` and `harness-server` lib suites.
+- PostgreSQL-dependent `harness-workflow` and `harness-server` tests require an isolated disposable database through `HARNESS_DATABASE_URL`; without it, pre-push defers those explicit PostgreSQL suites to CI or a configured local database.
 
 ## Local Cargo Concurrency
 

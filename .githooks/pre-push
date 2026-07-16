@@ -6,24 +6,49 @@ set -euo pipefail
 # workspace tests that spawn their own git repos in temp directories.
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE 2>/dev/null || true
 
+database_configured=false
+if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
+    database_configured=true
+fi
+
+db_less_config_home="$(mktemp -d "${TMPDIR:-/tmp}/harness-pre-push.XXXXXX")"
+cleanup() {
+    rm -rf -- "$db_less_config_home"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+run_db_less() {
+    env \
+        -u HARNESS_DATABASE_URL \
+        -u HARNESS_DATABASE_POOL_MAX_CONNECTIONS \
+        -u HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS \
+        XDG_CONFIG_HOME="$db_less_config_home" \
+        "$@"
+}
+
 echo "=== pre-push: clippy ==="
 cargo clippy --workspace --all-targets -- -D warnings
 
 echo "=== pre-push: test ==="
-# Keep HARNESS_DATABASE_URL scoped to harness-server. Some non-server tests
-# exercise process-global environment behavior and should not inherit DB config.
-echo "=== pre-push: non-server lib tests ==="
-env \
-    -u HARNESS_DATABASE_URL \
-    -u HARNESS_DATABASE_POOL_MAX_CONNECTIONS \
-    -u HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS \
-    cargo test --workspace --exclude harness-server --lib
+echo "=== pre-push: database-independent workspace lib tests ==="
+run_db_less cargo test --workspace --exclude harness-server --exclude harness-workflow --lib
 
-if [ -n "${HARNESS_DATABASE_URL:-}" ]; then
+if [ "$database_configured" = true ]; then
+    echo "=== pre-push: harness-workflow full lib tests ==="
+    cargo test -p harness-workflow --lib
+
     echo "=== pre-push: harness-server lib tests ==="
     cargo test -p harness-server --lib
 else
-    echo "HARNESS_DATABASE_URL not set — skipping harness-server DB-backed lib tests"
+    echo "=== pre-push: harness-workflow database-independent lib tests ==="
+    run_db_less \
+        cargo test -p harness-workflow --lib -- \
+        --skip runtime::tests::remote_host_lease
+
+    echo "HARNESS_DATABASE_URL is not set — deferred 6 runtime::tests::remote_host_lease PostgreSQL tests and harness-server DB-backed lib tests"
 fi
 
 echo "=== pre-push: all checks passed ==="

@@ -29,10 +29,12 @@ and clippy for the cargo packages touched by staged files. Docs-only staged
 changes skip clippy.
 
 The pre-push hook is the full local gate before upload: it runs
-`cargo clippy --workspace --all-targets -- -D warnings`, non-server workspace
-lib tests, and `harness-server` lib tests when `HARNESS_DATABASE_URL` is
-configured. Without `HARNESS_DATABASE_URL`, the hook skips `harness-server`
-locally and leaves full DB coverage to CI or a configured local database.
+`cargo clippy --workspace --all-targets -- -D warnings` in every mode. Without
+`HARNESS_DATABASE_URL`, it runs database-independent workspace and
+`harness-workflow` lib tests under an isolated config root, then defers the
+explicit PostgreSQL suites to CI or a configured local database. With an
+isolated disposable database configured through `HARNESS_DATABASE_URL`, it
+runs the full `harness-workflow` and `harness-server` lib suites.
 
 Use the smallest focused check that covers the files you changed before moving
 to broader gates:
