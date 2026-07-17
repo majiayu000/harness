@@ -310,6 +310,13 @@ mod declarative_pinning {
         store.persist_definition_version(&persisted_v1).await?;
         store.persist_definition_version(&persisted_v2).await?;
 
+        let startup_hydrated = store.list_persisted_declarative_definitions().await?;
+        assert_eq!(startup_hydrated.len(), 2);
+        assert!(startup_hydrated.iter().any(|definition| {
+            definition.definition_version() == v1.definition_version()
+                && definition.definition_hash() == v1.definition_hash()
+        }));
+
         let persisted = store.list_definitions().await?;
         assert_eq!(persisted.len(), 2);
         let loaded_v1 = persisted

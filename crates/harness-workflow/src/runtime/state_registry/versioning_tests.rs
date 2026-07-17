@@ -116,6 +116,17 @@ fn strict_resolution_and_validator_use_exact_pinned_definition() {
 }
 
 #[test]
+fn historical_only_declarative_definition_is_enumerated() {
+    let definition = definition();
+    let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+    registry
+        .register_declarative_historical(definition)
+        .expect("historical fixture should register");
+
+    assert_eq!(registry.known_definition_ids(), vec!["pin_test"]);
+}
+
+#[test]
 fn builtins_ignore_forged_declarative_pin_markers() {
     let registry = WorkflowDefinitionRegistry::new_for_tests();
     let builtin = WorkflowInstance::new(

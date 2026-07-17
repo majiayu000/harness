@@ -4,7 +4,8 @@ use crate::task_runner::{
     SchedulerAuthorityState, TaskFailureKind, TaskId, TaskPhase, TaskSchedulerState, TaskStatus,
 };
 use harness_workflow::runtime::{
-    WorkflowInstance, WorkflowTerminalState, QUALITY_GATE_DEFINITION_ID,
+    declarative_workflow_definition_for_instance, workflow_state_definition_for_instance,
+    WorkflowInstance, WorkflowProgressMode, WorkflowTerminalState, QUALITY_GATE_DEFINITION_ID,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -87,7 +88,7 @@ impl RuntimeWorkflowProjection {
     ) -> Self {
         let terminal_state = workflow.terminal_state();
         let task_status = workflow_state_to_task_status(workflow, terminal_state);
-        let scheduler = workflow_scheduler_state(&workflow.state, &task_status, terminal_state);
+        let scheduler = workflow_scheduler_state(workflow, &task_status, terminal_state);
         let active_bucket = workflow_active_bucket(
             &workflow.definition_id,
             &workflow.state,
@@ -237,7 +238,7 @@ fn workflow_state_to_task_phase(
 }
 
 fn workflow_scheduler_state(
-    state: &str,
+    workflow: &WorkflowInstance,
     status: &TaskStatus,
     terminal_state: Option<WorkflowTerminalState>,
 ) -> TaskSchedulerState {
@@ -246,9 +247,17 @@ fn workflow_scheduler_state(
         scheduler.mark_terminal(status);
         return scheduler;
     }
-    match state {
+    if declarative_workflow_definition_for_instance(workflow).is_some() {
+        if let Some(progress_mode) =
+            workflow_state_definition_for_instance(workflow, &workflow.state)
+                .and_then(|state| state.progress_mode)
+        {
+            return scheduler_state_for_progress_mode(progress_mode);
+        }
+    }
+    match workflow.state.as_str() {
         "awaiting_dependencies" => TaskSchedulerState::awaiting_dependencies(),
-        "scheduled" | "discovered" => TaskSchedulerState::queued(),
+        "scheduled" | "discovered" | "pending" => TaskSchedulerState::queued(),
         "checking"
         | "dispatching"
         | "implementing"
@@ -271,16 +280,36 @@ fn workflow_scheduler_state(
         | "quality_gate_pending"
         | "ready_to_merge"
         | "blocked" => TaskSchedulerState::queued(),
-        _ => match status {
-            TaskStatus::AwaitingDeps => TaskSchedulerState::awaiting_dependencies(),
-            TaskStatus::Pending => TaskSchedulerState::queued(),
-            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => {
-                let mut scheduler = TaskSchedulerState::queued();
-                scheduler.mark_terminal(status);
-                scheduler
-            }
-            _ => TaskSchedulerState::queued(),
+        _ => match workflow_state_definition_for_instance(workflow, &workflow.state)
+            .and_then(|state| state.progress_mode)
+        {
+            Some(progress_mode) => scheduler_state_for_progress_mode(progress_mode),
+            None => match status {
+                TaskStatus::AwaitingDeps => TaskSchedulerState::awaiting_dependencies(),
+                TaskStatus::Pending => TaskSchedulerState::queued(),
+                TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled => {
+                    let mut scheduler = TaskSchedulerState::queued();
+                    scheduler.mark_terminal(status);
+                    scheduler
+                }
+                _ => TaskSchedulerState::queued(),
+            },
         },
+    }
+}
+
+fn scheduler_state_for_progress_mode(progress_mode: WorkflowProgressMode) -> TaskSchedulerState {
+    match progress_mode {
+        WorkflowProgressMode::CommandDriven => TaskSchedulerState {
+            authority_state: SchedulerAuthorityState::Running,
+            owner: None,
+            run_generation: 0,
+            recovery_generation: 0,
+            lease_expires_at: None,
+        },
+        WorkflowProgressMode::ExternalWait
+        | WorkflowProgressMode::OperatorGate
+        | WorkflowProgressMode::ParentHandoff => TaskSchedulerState::queued(),
     }
 }
 

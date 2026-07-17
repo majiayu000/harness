@@ -18,7 +18,7 @@ use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary
 use activity::{runtime_workflow_counts, source_activity, RuntimeWorkflowCounts, SourceActivity};
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
-use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
+use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState};
 use sampling::{dedupe_workflows, list_operator_action_workflows, list_recent_failed_workflows};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -36,12 +36,6 @@ const MAX_FAILURE_GROUPS: usize = 20;
 const MAX_RECENT_FAILURES: i64 = 100;
 const STALLED_AFTER_MINS: u64 = 30;
 const OPERATOR_ACTION_STATES: &[&str] = &["ready_to_merge", "awaiting_feedback", "blocked"];
-const WORKFLOW_DEFINITION_IDS: &[&str] = &[
-    harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-    harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
-    harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
-    harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID,
-];
 
 #[derive(Debug, Clone, Serialize)]
 struct OperatorMonitorPayload {
@@ -359,9 +353,10 @@ async fn list_runtime_workflows_from_store(
     store: &WorkflowRuntimeStore,
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
     let sample_limit = WORKFLOW_SAMPLE_LIMIT as usize;
-    let mut workflows = list_operator_action_workflows(store).await?;
-    workflows.extend(list_recent_failed_workflows(store, sample_limit).await?);
-    for definition_id in WORKFLOW_DEFINITION_IDS {
+    let definition_ids = crate::handlers::definition_ids::operator_definition_ids()?;
+    let mut workflows = list_operator_action_workflows(store, &definition_ids).await?;
+    workflows.extend(list_recent_failed_workflows(store, &definition_ids, sample_limit).await?);
+    for definition_id in &definition_ids {
         workflows.extend(
             store
                 .list_nonterminal_instances_by_definition(
@@ -382,9 +377,9 @@ fn truncate_workflow_sample(workflows: &mut Vec<WorkflowInstance>, limit: usize)
     let mut failed = Vec::new();
     let mut other = Vec::new();
     for workflow in workflows.drain(..) {
-        if workflow.state == "failed" {
+        if workflow.terminal_state() == Some(WorkflowTerminalState::Failed) {
             failed.push(workflow);
-        } else if workflow_action_kind(workflow.state.as_str()).is_some() {
+        } else if workflow_action_kind(&workflow).is_some() {
             operator_actions.push(workflow);
         } else {
             other.push(workflow);
@@ -464,7 +459,7 @@ fn operator_actions(
 ) -> Vec<OperatorAction> {
     let mut actions = Vec::new();
     for workflow in workflows {
-        let Some(kind) = workflow_action_kind(workflow.state.as_str()) else {
+        let Some(kind) = workflow_action_kind(workflow) else {
             continue;
         };
         let projection = RuntimeWorkflowProjection::from_workflow_with_stopped_eligibility(
@@ -521,12 +516,25 @@ fn operator_actions(
     actions
 }
 
-fn workflow_action_kind(state: &str) -> Option<&'static str> {
-    match state {
+fn workflow_action_kind(workflow: &WorkflowInstance) -> Option<&'static str> {
+    if workflow.terminal_state() == Some(WorkflowTerminalState::Failed) {
+        return Some("failed");
+    }
+    if harness_workflow::runtime::declarative_workflow_definition_for_instance(workflow).is_some() {
+        return harness_workflow::runtime::workflow_state_definition_for_instance(
+            workflow,
+            &workflow.state,
+        )
+        .is_some_and(|state| {
+            state.progress_mode
+                == Some(harness_workflow::runtime::WorkflowProgressMode::OperatorGate)
+        })
+        .then_some("blocked");
+    }
+    match workflow.state.as_str() {
         "ready_to_merge" => Some("ready_to_merge"),
         "awaiting_feedback" => Some("awaiting_feedback"),
         "blocked" => Some("blocked"),
-        "failed" => Some("failed"),
         _ => None,
     }
 }
@@ -571,7 +579,7 @@ fn grouped_failures(
     }
     for workflow in workflows
         .iter()
-        .filter(|workflow| workflow.state == "failed")
+        .filter(|workflow| workflow.terminal_state() == Some(WorkflowTerminalState::Failed))
     {
         let workflow_task_ids = workflow_failure_task_ids(workflow);
         if workflow_task_ids

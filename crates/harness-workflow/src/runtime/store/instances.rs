@@ -7,7 +7,6 @@ use super::{
     WorkflowRuntimeStore,
 };
 use crate::runtime::model::{WorkflowDecisionRecord, WorkflowInstance};
-use crate::runtime::state_registry::workflow_terminal_state_names_for_definition;
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::WorkflowOtelTraceContext;
 use chrono::{DateTime, Utc};
@@ -768,33 +767,6 @@ impl WorkflowRuntimeStore {
         .await?;
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
-            .collect()
-    }
-
-    pub async fn list_nonterminal_instances_by_definition(
-        &self,
-        definition_id: &str,
-        project_id: Option<&str>,
-        limit: Option<i64>,
-    ) -> anyhow::Result<Vec<WorkflowInstance>> {
-        let limit = limit.map(|value| value.clamp(1, 500));
-        let terminal_states = workflow_terminal_state_names_for_definition(definition_id);
-        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT data::text, updated_at FROM workflow_instances
-             WHERE definition_id = $1
-               AND NOT (state = ANY($3::text[]))
-               AND ($2::text IS NULL OR data->'data'->>'project_id' = $2)
-             ORDER BY updated_at DESC
-             LIMIT COALESCE($4, 2147483647)",
-        )
-        .bind(definition_id)
-        .bind(project_id)
-        .bind(&terminal_states)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
             .collect()
     }
 }

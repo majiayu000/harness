@@ -1,13 +1,16 @@
-use super::{OPERATOR_ACTION_STATES, WORKFLOW_DEFINITION_IDS, WORKFLOW_SAMPLE_LIMIT};
-use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
+use super::{OPERATOR_ACTION_STATES, WORKFLOW_SAMPLE_LIMIT};
+use harness_workflow::runtime::{
+    WorkflowInstance, WorkflowProgressMode, WorkflowRuntimeStore, WorkflowTerminalState,
+};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
 pub(super) async fn list_operator_action_workflows(
     store: &WorkflowRuntimeStore,
+    definition_ids: &[String],
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
     let mut workflows = Vec::new();
-    for definition_id in WORKFLOW_DEFINITION_IDS {
+    for definition_id in definition_ids {
         for state in OPERATOR_ACTION_STATES {
             workflows.extend(
                 store
@@ -15,6 +18,15 @@ pub(super) async fn list_operator_action_workflows(
                     .await?,
             );
         }
+        workflows.extend(
+            store
+                .list_recent_instances_by_progress_mode(
+                    definition_id,
+                    WorkflowProgressMode::OperatorGate,
+                    WORKFLOW_SAMPLE_LIMIT,
+                )
+                .await?,
+        );
     }
     Ok(workflows)
 }
@@ -26,6 +38,7 @@ pub(super) fn dedupe_workflows(workflows: &mut Vec<WorkflowInstance>) {
 
 pub(super) async fn list_recent_failed_workflows(
     store: &WorkflowRuntimeStore,
+    definition_ids: &[String],
     capacity: usize,
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
     if capacity == 0 {
@@ -33,10 +46,14 @@ pub(super) async fn list_recent_failed_workflows(
     }
     let per_definition_limit = capacity.min(WORKFLOW_SAMPLE_LIMIT as usize) as i64;
     let mut workflows = Vec::new();
-    for definition_id in WORKFLOW_DEFINITION_IDS {
+    for definition_id in definition_ids {
         workflows.extend(
             store
-                .list_recent_instances_by_state(definition_id, "failed", per_definition_limit)
+                .list_recent_terminal_instances_by_definition(
+                    definition_id,
+                    WorkflowTerminalState::Failed,
+                    per_definition_limit,
+                )
                 .await?,
         );
     }

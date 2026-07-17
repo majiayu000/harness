@@ -137,6 +137,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     crate::handlers::dashboard::SERVER_START.get_or_init(std::time::Instant::now);
 
     let state = Arc::new(build_app_state(server.clone()).await?);
+    harness_workflow::runtime::freeze_workflow_definition_registry();
     let app = http_router::build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

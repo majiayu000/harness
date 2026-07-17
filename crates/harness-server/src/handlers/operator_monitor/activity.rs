@@ -1,6 +1,10 @@
 use super::{workflow_legacy_task_ids, workflow_source, TaskSummary, WorkflowInstance};
 use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
 use crate::task_runner::{SchedulerAuthorityState, TaskPhase, TaskStatus};
+use harness_workflow::runtime::{
+    declarative_workflow_definition_for_instance, workflow_state_definition_for_instance,
+    WorkflowProgressMode,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -66,6 +70,12 @@ fn workflow_bucket(workflow: &WorkflowInstance) -> WorkflowBucket {
         TaskStatus::Done => return WorkflowBucket::Done,
         TaskStatus::AwaitingDeps => return WorkflowBucket::AwaitingDependencies,
         _ => {}
+    }
+    if declarative_workflow_definition_for_instance(workflow).is_some()
+        && workflow_state_definition_for_instance(workflow, &workflow.state)
+            .is_some_and(|state| state.progress_mode == Some(WorkflowProgressMode::OperatorGate))
+    {
+        return WorkflowBucket::Blocked;
     }
     if workflow.state == "ready_to_merge" {
         return WorkflowBucket::ReadyToMerge;
