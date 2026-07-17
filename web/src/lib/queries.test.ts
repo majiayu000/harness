@@ -137,7 +137,7 @@ describe("useWorktrees", () => {
 
 function buildStreamUrl(taskId: string): string {
   const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-  const base = `/api/workflows/runtime/submissions/${taskId}/stream`;
+  const base = `/api/workflows/runtime/submissions/${encodeURIComponent(taskId)}/stream`;
   return tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
 }
 
@@ -157,6 +157,12 @@ describe("stream URL construction", () => {
 
   it("omits token param when no session token", () => {
     expect(buildStreamUrl("abc-123")).not.toContain("token=");
+  });
+
+  it("encodes submission handles that contain path separators", () => {
+    expect(buildStreamUrl("github-pr-feedback::/repo::pr:42")).toBe(
+      "/api/workflows/runtime/submissions/github-pr-feedback%3A%3A%2Frepo%3A%3Apr%3A42/stream",
+    );
   });
 });
 

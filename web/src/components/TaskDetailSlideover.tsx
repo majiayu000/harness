@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useTaskDetail, useTaskStream } from "@/lib/queries";
-import { apiJson } from "@/lib/api";
+import { apiJson, runtimeSubmissionPath } from "@/lib/api";
 import { isTerminal } from "@/types/task";
 import { ProofOfWorkCard } from "./ProofOfWorkCard";
 import type { FullTask, TaskArtifact, TaskPrompt } from "@/types";
@@ -45,14 +45,14 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
   const { data: artifacts, isError: isArtifactsError } = useQuery({
     queryKey: ["task-artifacts", taskId],
     queryFn: ({ signal }) =>
-      apiJson<TaskArtifact[]>(`/api/workflows/runtime/submissions/${taskId}/artifacts`, { signal }),
+      apiJson<TaskArtifact[]>(runtimeSubmissionPath(taskId!, "artifacts"), { signal }),
     enabled: !!taskId && (activeTab === "artifacts" || isTaskTerminal),
   });
 
   const { data: prompts, isError: isPromptsError } = useQuery({
     queryKey: ["task-prompts", taskId],
     queryFn: ({ signal }) =>
-      apiJson<TaskPrompt[]>(`/api/workflows/runtime/submissions/${taskId}/prompts`, { signal }),
+      apiJson<TaskPrompt[]>(runtimeSubmissionPath(taskId!, "prompts"), { signal }),
     enabled: !!taskId && (activeTab === "prompts" || isTaskTerminal),
   });
 

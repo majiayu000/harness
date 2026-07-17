@@ -4,6 +4,16 @@
  */
 export const TOKEN_KEY = "harness_token";
 
+type RuntimeSubmissionResource = "artifacts" | "prompts" | "proof" | "stream";
+
+export function runtimeSubmissionPath(
+  submissionId: string,
+  resource?: RuntimeSubmissionResource,
+): string {
+  const base = `/api/workflows/runtime/submissions/${encodeURIComponent(submissionId)}`;
+  return resource ? `${base}/${resource}` : base;
+}
+
 /**
  * EventTarget that dispatches a single "unauthorized" event type when the
  * server returns 401. The app mounts a listener in TokenPrompt.

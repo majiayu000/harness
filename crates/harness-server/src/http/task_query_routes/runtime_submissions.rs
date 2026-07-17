@@ -51,10 +51,19 @@ async fn append_runtime_definition_summaries(
     let mut cursor_created_at = cursor.map(|cursor| cursor.created_at);
     let mut cursor_id = cursor.map(|cursor| cursor.id.clone());
     let include_all_kinds = filter.kinds.is_empty();
-    let kinds = harness_workflow::runtime::WorkflowSubmissionKindFilter {
+    let store_filter = harness_workflow::runtime::WorkflowSubmissionFilter {
+        project_id: filter.project.clone(),
+        source: filter.source.clone(),
+        repo: filter.repo.clone(),
         include_issue: include_all_kinds || filter.kinds.contains(&TaskKind::Issue),
         include_pr: include_all_kinds || filter.kinds.contains(&TaskKind::Pr),
         include_prompt: include_all_kinds || filter.kinds.contains(&TaskKind::Prompt),
+        active_only: filter.active,
+        task_statuses: filter
+            .statuses
+            .iter()
+            .map(|status| status.as_str().to_string())
+            .collect(),
     };
     let mut listed_ids: HashSet<String> = summaries
         .iter()
@@ -64,10 +73,9 @@ async fn append_runtime_definition_summaries(
     loop {
         let workflows = store
             .list_submission_instances_page(
-                filter.project.as_deref(),
                 cursor_created_at,
                 cursor_id.as_deref(),
-                kinds,
+                &store_filter,
                 page_limit,
             )
             .await?;

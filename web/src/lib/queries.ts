@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiJson, apiFetch } from "./api";
+import { apiJson, apiFetch, runtimeSubmissionPath } from "./api";
 import type {
   DashboardPayload,
   FullTask,
@@ -140,7 +140,7 @@ export function useTaskDetail(id: string | null) {
   return useQuery<FullTask, Error>({
     queryKey: ["task", id],
     queryFn: ({ signal }) =>
-      apiJson<FullTask>(`/api/workflows/runtime/submissions/${id}`, { signal }),
+      apiJson<FullTask>(runtimeSubmissionPath(id!), { signal }),
     enabled: !!id,
   });
 }
@@ -163,7 +163,7 @@ export function useTaskStream(
 
     (async () => {
       try {
-        const resp = await apiFetch(`/api/workflows/runtime/submissions/${id}/stream`, {
+        const resp = await apiFetch(runtimeSubmissionPath(id, "stream"), {
           signal: controller.signal,
           headers: { Accept: "text/event-stream" },
         });

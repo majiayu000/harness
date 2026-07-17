@@ -11,9 +11,9 @@ vi.mock("@/lib/queries", () => ({
   useOverview: vi.fn(),
 }));
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
   apiFetch: vi.fn(),
-  TOKEN_KEY: "harness_token",
 }));
 
 import { useOverview, useWorktrees } from "@/lib/queries";
@@ -133,7 +133,7 @@ describe("<Worktrees>", () => {
       cards: [
         worktreeCard({
           runtimeWorkflowId: "runtime-workflow-1",
-          runtimeSubmissionId: "runtime-submission-1",
+          runtimeSubmissionId: "runtime-submission::/repo/one",
         }),
       ],
       isLoading: false,
@@ -147,7 +147,7 @@ describe("<Worktrees>", () => {
     fireEvent.click(screen.getByRole("button", { name: "Logs" }));
 
     expect(open).toHaveBeenCalledWith(
-      "/api/workflows/runtime/submissions/runtime-submission-1/stream",
+      "/api/workflows/runtime/submissions/runtime-submission%3A%3A%2Frepo%2Fone/stream",
       "_blank",
       "noreferrer",
     );

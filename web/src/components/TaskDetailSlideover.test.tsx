@@ -10,7 +10,8 @@ vi.mock("@/lib/queries", () => ({
   useTaskStream: vi.fn(),
 }));
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
   apiJson: vi.fn().mockResolvedValue([]),
 }));
 

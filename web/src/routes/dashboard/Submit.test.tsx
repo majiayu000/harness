@@ -15,9 +15,9 @@ vi.mock("@/lib/queries", () => ({
   useCancelWorkflowRuntime: vi.fn(),
 }));
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
   apiFetch: vi.fn(),
-  TOKEN_KEY: "harness_token",
   ApiError: class ApiError extends Error {
     constructor(
       public status: number,
