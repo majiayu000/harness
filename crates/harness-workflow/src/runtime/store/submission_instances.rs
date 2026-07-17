@@ -1,5 +1,6 @@
 use super::instance_helpers::terminal_task_status_rows;
 use super::{WorkflowInstance, WorkflowRuntimeStore};
+use crate::runtime::declarative_pinning::DECLARATIVE_DEFINITION_METADATA_KIND;
 use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,10 +31,33 @@ impl WorkflowRuntimeStore {
             "WITH terminal_states(definition_id, state, task_status) AS (
                  SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
              ),
+             persisted_terminal_states AS (
+                 SELECT definitions.id AS definition_id,
+                        definitions.version AS definition_version,
+                        definitions.data->>'definition_hash' AS definition_hash,
+                        terminal.state,
+                        CASE terminal.class
+                            WHEN 'succeeded' THEN 'done'
+                            WHEN 'failed' THEN 'failed'
+                            WHEN 'cancelled' THEN 'cancelled'
+                        END AS task_status
+                 FROM workflow_definitions AS definitions
+                 CROSS JOIN LATERAL jsonb_each_text(
+                     CASE
+                         WHEN jsonb_typeof(
+                             definitions.data->'metadata'->'policy'->'terminal'
+                         ) = 'object'
+                         THEN definitions.data->'metadata'->'policy'->'terminal'
+                         ELSE '{}'::jsonb
+                     END
+                 ) AS terminal(state, class)
+                 WHERE definitions.data->'metadata'->>'kind' = $15
+             ),
              submissions AS (
                  SELECT workflow_instances.*,
                         COALESCE(
                             terminal.task_status,
+                            persisted_terminal.task_status,
                             CASE workflow_instances.state
                                 WHEN 'awaiting_dependencies' THEN 'awaiting_deps'
                                 WHEN 'scheduled' THEN 'pending'
@@ -55,6 +79,13 @@ impl WorkflowRuntimeStore {
                  LEFT JOIN terminal_states AS terminal
                    ON terminal.definition_id = workflow_instances.definition_id
                   AND terminal.state = workflow_instances.state
+                 LEFT JOIN persisted_terminal_states AS persisted_terminal
+                   ON persisted_terminal.definition_id = workflow_instances.definition_id
+                  AND persisted_terminal.definition_version =
+                      (workflow_instances.data->>'definition_version')::bigint
+                  AND persisted_terminal.definition_hash =
+                      workflow_instances.data->'data'->>'definition_hash'
+                  AND persisted_terminal.state = workflow_instances.state
              )
              SELECT data::text FROM submissions
              WHERE ($4::text IS NULL OR data->'data'->>'project_id' = $4)
@@ -113,6 +144,7 @@ impl WorkflowRuntimeStore {
         .bind(filter.source.as_deref())
         .bind(filter.repo.as_deref())
         .bind(limit)
+        .bind(DECLARATIVE_DEFINITION_METADATA_KIND)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

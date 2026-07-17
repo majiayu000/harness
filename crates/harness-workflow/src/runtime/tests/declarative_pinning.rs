@@ -374,4 +374,70 @@ mod declarative_pinning {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn submission_filters_use_persisted_declarative_terminal_states() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("declarative-submissions.db")).await?;
+        let definition = compiled(&policy_v1());
+        let mut persisted = persisted_declarative_definition(&definition, None);
+        persisted.active = false;
+        store.persist_definition_version(&persisted).await?;
+
+        let submission = WorkflowInstance::new(
+            "docs_review",
+            definition.definition_version(),
+            "done",
+            WorkflowSubject::new("prompt", "persisted-declarative-terminal"),
+        )
+        .with_id("persisted-declarative-terminal")
+        .with_data(json!({
+            "submission_id": "persisted-declarative-terminal",
+            "definition_hash": definition.definition_hash(),
+        }));
+        store.upsert_instance(&submission).await?;
+
+        let active = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: true,
+                    include_pr: true,
+                    include_prompt: true,
+                    active_only: true,
+                    task_statuses: Vec::new(),
+                },
+                10,
+            )
+            .await?;
+        assert!(active.is_empty());
+
+        let done = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: true,
+                    include_pr: true,
+                    include_prompt: true,
+                    active_only: false,
+                    task_statuses: vec!["done".to_string()],
+                },
+                10,
+            )
+            .await?;
+        assert_eq!(done, vec![submission]);
+        Ok(())
+    }
 }
