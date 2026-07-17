@@ -7,14 +7,11 @@ use harness_core::{
     config::misc::{ReviewConfig, ReviewStrategy},
     types::{Decision, Event, EventFilters, SessionId},
 };
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 
 use super::tick_helpers::{
-    build_fix_prompt, ensure_review_queue_limit, format_violations_for_prompt,
+    ensure_review_queue_limit, format_violations_for_prompt, parse_review_output,
     pick_secondary_review_agent, poll_task_output,
 };
 
@@ -196,9 +193,8 @@ pub(super) async fn run_review_tick(
         }
     }
 
-    // Wait for review completion, optionally run synthesis, then persist findings.
+    // Wait for review completion, optionally run synthesis, then advance the watermark.
     let store = state.core.tasks.clone();
-    let review_store = state.observability.review_store.clone();
     let timeout_secs = config.timeout_secs;
     let primary_agent_for_synthesis = review_agent.clone();
     let secondary_agent_name = secondary_agent.clone();
@@ -411,7 +407,7 @@ pub(super) async fn run_review_tick(
             return;
         };
 
-        match crate::review_store::parse_review_output(&output) {
+        match parse_review_output(&output) {
             Ok(review) => {
                 // Advance the watermark only after parse succeeds.
                 // Doing this here (rather than before the match) prevents a
@@ -452,318 +448,6 @@ pub(super) async fn run_review_tick(
                     health_score = review.summary.health_score,
                     "scheduler: periodic review parsed"
                 );
-                if let Some(ref rs) = review_store {
-                    match rs
-                        .persist_findings(
-                            &project_root_for_poll.to_string_lossy(),
-                            &final_task_id.0,
-                            &review.findings,
-                        )
-                        .await
-                    {
-                        Ok(n) => {
-                            tracing::info!(
-                                new_findings = n,
-                                "scheduler: review findings persisted"
-                            );
-                            // Recover findings stuck in task_id='pending':
-                            // - Rows with real_task_id set (both confirms failed but
-                            //   enqueue succeeded): recovered only when the underlying
-                            //   task has reached a terminal state, so no fixed time
-                            //   bound is needed regardless of rounds or queue wait.
-                            // - Rows without real_task_id: covers two sub-cases:
-                            //   (a) genuine mid-claim window (try_claim → enqueue,
-                            //       normally a few seconds), and
-                            //   (b) rows where confirm_task_spawned AND record_real_task_id
-                            //       both failed — the task is running but its ID was not
-                            //       persisted, so we must wait long enough to avoid
-                            //       concurrent duplicate tasks.  Use 3900 s (≥ one full
-                            //       turn timeout) as the fallback threshold; this also
-                            //       protects migration-backfilled pre-upgrade rows from
-                            //       premature recovery while any task spawned before the
-                            //       upgrade may still be running.
-                            let tasks_snapshot = state_for_synthesis.core.tasks.clone();
-                            // Pre-resolve task statuses for all stale real_task_ids.
-                            // The in-memory cache only contains active tasks; terminal
-                            // tasks (Failed, Cancelled) are evicted at startup and are
-                            // DB-only after a server restart.  Using get_with_db_fallback
-                            // ensures we correctly classify those tasks instead of
-                            // misidentifying them as successful (None in-memory).
-                            let stale_ids = match rs
-                                .list_stale_real_task_ids(&project_root_for_poll.to_string_lossy())
-                                .await
-                            {
-                                Ok(ids) => ids,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "scheduler: failed to list stale real task IDs, \
-                                         recovery may be incomplete: {e}"
-                                    );
-                                    vec![]
-                                }
-                            };
-                            let mut task_outcome_map = HashMap::new();
-                            for tid in stale_ids {
-                                let task_id = harness_core::types::TaskId(tid.clone());
-                                let outcome = match tasks_snapshot
-                                    .get_with_db_fallback(&task_id)
-                                    .await
-                                {
-                                    Ok(Some(t)) => match t.status {
-                                        crate::task_runner::TaskStatus::Done => Some(false),
-                                        crate::task_runner::TaskStatus::Failed
-                                        | crate::task_runner::TaskStatus::Cancelled => Some(true),
-                                        // Still in-flight — leave pending claim intact.
-                                        _ => None,
-                                    },
-                                    // Task unknown in both cache and DB, or DB error:
-                                    // leave the pending claim intact so Strategy 2
-                                    // (time-based fallback) can recover it later.
-                                    Ok(None) | Err(_) => None,
-                                };
-                                task_outcome_map.insert(tid, outcome);
-                            }
-                            match rs
-                                .recover_stale_pending_claims(&project_root_for_poll.to_string_lossy(), 3900, |tid| {
-                                    // Flatten Option<&Option<bool>> → Option<bool>.
-                                    task_outcome_map.get(tid).copied().flatten()
-                                })
-                                .await
-                            {
-                                Ok(0) => {}
-                                Ok(n) => tracing::warn!(
-                                    recovered = n,
-                                    "scheduler: reset stale pending claims to allow retry"
-                                ),
-                                Err(e) => tracing::warn!(
-                                    "scheduler: recover_stale_pending_claims failed (continuing): {e}"
-                                ),
-                            }
-                            // Auto-spawn fix tasks for P1/P2 open findings that have
-                            // no existing task yet (task_id IS NULL = dedup guard).
-                            // P0 excluded: critical issues require human judgment.
-                            // P3 excluded: informational only, too low priority.
-                            match rs
-                                .list_spawnable_findings(&final_task_id.0, &["P1", "P2"])
-                                .await
-                            {
-                                Ok(spawnable) => {
-                                    // Safety: all finding fields come from reviewer
-                                    // LLM output. build_fix_prompt applies injection
-                                    // hardening, structural labelling, and field
-                                    // truncation before embedding into the fix prompt.
-                                    for finding in spawnable {
-                                        let prompt = build_fix_prompt(
-                                            &finding.rule_id,
-                                            &finding.file,
-                                            finding.line,
-                                            &finding.title,
-                                            &finding.description,
-                                            &finding.action,
-                                        );
-                                        // Claim before enqueue: atomically mark this
-                                        // finding as "pending" so concurrent pollers
-                                        // see task_id IS NOT NULL and skip it.  Only
-                                        // if the claim succeeds do we enqueue a task,
-                                        // preventing orphaned tasks on race loss.
-                                        match rs
-                                            .try_claim_finding(
-                                                &project_root_for_poll.to_string_lossy(),
-                                                &finding.rule_id,
-                                                &finding.file,
-                                            )
-                                            .await
-                                        {
-                                            Ok(false) => {
-                                                tracing::debug!(
-                                                    finding_id = %finding.id,
-                                                    "scheduler: finding already claimed by concurrent poller, skipping"
-                                                );
-                                                continue;
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    finding_id = %finding.id,
-                                                    "scheduler: failed to claim finding: {e}"
-                                                );
-                                                continue;
-                                            }
-                                            Ok(true) => {} // won the claim
-                                        }
-                                        let req = CreateTaskRequest {
-                                            prompt: Some(prompt),
-                                            source: Some("auto-fix".into()),
-                                            project: Some(project_root_for_poll.clone()),
-                                            ..CreateTaskRequest::default()
-                                        };
-                                        match task_routes::enqueue_task(&state_for_synthesis, req)
-                                            .await
-                                        {
-                                            Ok(fix_task_id) => {
-                                                match rs
-                                                    .confirm_task_spawned(
-                                                        &project_root_for_poll.to_string_lossy(),
-                                                        &finding.rule_id,
-                                                        &finding.file,
-                                                        &fix_task_id.0,
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(()) => {
-                                                        tracing::info!(
-                                                            finding_id = %finding.id,
-                                                            task_id = %fix_task_id,
-                                                            "scheduler: auto-fix task spawned"
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            finding_id = %finding.id,
-                                                            task_id = %fix_task_id,
-                                                            "scheduler: confirm_task_spawned failed, retrying once: {e}"
-                                                        );
-                                                        // Brief pause before retry — improves success
-                                                        // rate against transient SQLite "database is
-                                                        // locked" errors.
-                                                        sleep(Duration::from_millis(100)).await;
-                                                        // Retry once — the UPDATE is idempotent so a
-                                                        // second attempt is safe.
-                                                        if let Err(e2) = rs
-                                                            .confirm_task_spawned(
-                                                                &project_root_for_poll
-                                                                    .to_string_lossy(),
-                                                                &finding.rule_id,
-                                                                &finding.file,
-                                                                &fix_task_id.0,
-                                                            )
-                                                            .await
-                                                        {
-                                                            // Both confirm attempts failed.  enqueue_task
-                                                            // already succeeded — a real task is running.
-                                                            // Do NOT release the claim (reset task_id to
-                                                            // NULL) here: doing so would let every future
-                                                            // scheduler cycle re-select this finding via
-                                                            // "task_id IS NULL" and spawn another task,
-                                                            // leading to unbounded duplicate tasks and
-                                                            // queue/quota saturation under load.
-                                                            //
-                                                            // Record real_task_id so that stale recovery
-                                                            // can gate on actual task completion rather
-                                                            // than a fixed time threshold that does not
-                                                            // bound multi-round or queued task lifetime.
-                                                            // Retry record_real_task_id: confirm_task_spawned
-                                                            // just failed, likely due to a transient DB lock.
-                                                            // A brief pause lets the lock clear so that
-                                                            // record_real_task_id can persist the task ID.
-                                                            // Without real_task_id the fallback stale
-                                                            // threshold (3900 s) would apply, which is safe
-                                                            // but slower; persisting real_task_id enables
-                                                            // the faster task-completion-based recovery.
-                                                            let delays_ms: &[u64] =
-                                                                &[200, 500, 1000];
-                                                            let mut record_ok = false;
-                                                            for &delay in delays_ms {
-                                                                sleep(Duration::from_millis(delay))
-                                                                    .await;
-                                                                match rs
-                                                                    .record_real_task_id(
-                                                                        &project_root_for_poll
-                                                                            .to_string_lossy(),
-                                                                        &finding.rule_id,
-                                                                        &finding.file,
-                                                                        &fix_task_id.0,
-                                                                    )
-                                                                    .await
-                                                                {
-                                                                    Ok(()) => {
-                                                                        record_ok = true;
-                                                                        break;
-                                                                    }
-                                                                    Err(re) => {
-                                                                        tracing::warn!(
-                                                                            finding_id = %finding.id,
-                                                                            real_task_id = %fix_task_id,
-                                                                            "scheduler: record_real_task_id attempt failed (retrying): {re}"
-                                                                        );
-                                                                    }
-                                                                }
-                                                            }
-                                                            if !record_ok {
-                                                                tracing::error!(
-                                                                    finding_id = %finding.id,
-                                                                    real_task_id = %fix_task_id,
-                                                                    "scheduler: record_real_task_id failed after all retries; \
-                                                                     row will be recovered by 3900 s time threshold — \
-                                                                     manual review recommended if duplicate tasks appear"
-                                                                );
-                                                            }
-                                                            tracing::error!(
-                                                                finding_id = %finding.id,
-                                                                real_task_id = %fix_task_id,
-                                                                "scheduler: confirm_task_spawned retry failed; \
-                                                                 leaving finding with task_id='pending' to prevent \
-                                                                 unbounded duplicate-task spawning — \
-                                                                 real task already enqueued as {fix_task_id}, \
-                                                                 manual recovery may be needed: {e2}"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                // Release the claim so the next cycle can retry.
-                                                if let Err(re) = rs
-                                                    .release_claim(
-                                                        &project_root_for_poll.to_string_lossy(),
-                                                        &finding.rule_id,
-                                                        &finding.file,
-                                                    )
-                                                    .await
-                                                {
-                                                    tracing::warn!(
-                                                        finding_id = %finding.id,
-                                                        "scheduler: failed to release claim after enqueue failure: {re}"
-                                                    );
-                                                }
-                                                tracing::warn!(
-                                                    finding_id = %finding.id,
-                                                    "scheduler: failed to spawn fix task: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "scheduler: failed to list spawnable findings: {e}"
-                                    );
-                                }
-                            }
-                            // Reset cooldown counters for findings that were not
-                            // seen in this scan cycle (violation resolved).
-                            // This runs after the spawn loop so that resolution
-                            // and re-spawn cannot race within the same tick.
-                            match rs
-                                .reset_cooldowns_for_resolved(
-                                    &project_root_for_poll.to_string_lossy(),
-                                    &final_task_id.0,
-                                )
-                                .await
-                            {
-                                Ok(0) => {}
-                                Ok(n) => tracing::debug!(
-                                    cleared = n,
-                                    "scheduler: reset cooldowns for resolved findings"
-                                ),
-                                Err(e) => tracing::warn!(
-                                    "scheduler: reset_cooldowns_for_resolved failed \
-                                     (continuing): {e}"
-                                ),
-                            }
-                        }
-                        Err(e) => tracing::warn!("scheduler: failed to persist findings: {e}"),
-                    }
-                }
             }
             Err(e) => {
                 tracing::error!("scheduler: failed to parse review output as JSON: {e}");

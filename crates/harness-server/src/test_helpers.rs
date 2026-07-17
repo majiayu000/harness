@@ -284,7 +284,6 @@ async fn make_state_inner(
             password_reset_rate_limiter: Arc::new(
                 crate::http::rate_limit::PasswordResetRateLimiter::new(password_reset_rate_limit),
             ),
-            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue,

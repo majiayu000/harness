@@ -92,7 +92,6 @@ pub struct ObservabilityServices {
     pub alerts: crate::alerting::AlertHandle,
     pub signal_rate_limiter: Arc<rate_limit::SignalRateLimiter>,
     pub password_reset_rate_limiter: Arc<rate_limit::PasswordResetRateLimiter>,
-    pub review_store: Option<Arc<crate::review_store::ReviewStore>>,
 }
 
 /// Concurrency services: task queue and workspace isolation.

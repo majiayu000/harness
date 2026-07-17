@@ -113,10 +113,6 @@ mod tests {
                 ))?,
             ),
             (
-                "review_store",
-                crate::review_store::ReviewStore::shared_schema_context(Some(TEST_DATABASE_URL))?,
-            ),
-            (
                 "event_store",
                 harness_observe::event_store::EventStore::shared_schema_context(Some(
                     TEST_DATABASE_URL,
