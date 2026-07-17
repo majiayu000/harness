@@ -149,18 +149,7 @@ fn runtime_workflow_task_summary(
         .get("issue_number")
         .and_then(|value| value.as_u64());
     let external_id = runtime_external_id(task_kind, &workflow.data, issue);
-    let description = match task_kind {
-        TaskKind::Issue => Some(
-            issue
-                .map(|issue_number| format!("issue #{issue_number}"))
-                .unwrap_or_else(|| workflow.subject.subject_key.clone()),
-        ),
-        TaskKind::Prompt => Some(
-            runtime_string_field(&workflow.data, "prompt_summary")
-                .unwrap_or_else(|| "prompt task".to_string()),
-        ),
-        _ => Some(workflow.subject.subject_key.clone()),
-    };
+    let description = Some(runtime_submission_description(&workflow, task_kind, issue));
     TaskSummary {
         id: task_id,
         task_kind,
@@ -184,6 +173,21 @@ fn runtime_workflow_task_summary(
         run_generation: 0,
         workflow: Some(TaskWorkflowSummary::from_runtime_workflow(&workflow)),
         scheduler: projection.scheduler,
+    }
+}
+
+pub(crate) fn runtime_submission_description(
+    workflow: &harness_workflow::runtime::WorkflowInstance,
+    task_kind: TaskKind,
+    issue: Option<u64>,
+) -> String {
+    match task_kind {
+        TaskKind::Issue => issue
+            .map(|issue_number| format!("issue #{issue_number}"))
+            .unwrap_or_else(|| workflow.subject.subject_key.clone()),
+        TaskKind::Prompt => runtime_string_field(&workflow.data, "prompt_summary")
+            .unwrap_or_else(|| "prompt task".to_string()),
+        _ => workflow.subject.subject_key.clone(),
     }
 }
 

@@ -25,6 +25,10 @@ struct RuntimeTaskResponse {
     phase: crate::task_runner::TaskPhase,
     scheduler: crate::task_runner::TaskSchedulerState,
     turn: u32,
+    pr_url: Option<String>,
+    description: Option<String>,
+    created_at: String,
+    updated_at: String,
     execution_path: &'static str,
     workflow_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,6 +183,9 @@ async fn runtime_task_response_by_handle(
         .unwrap_or_else(|| task_id.0.clone());
     let error = runtime_string_field(&workflow.data, "failure_reason");
     let terminal = TaskTerminalInfo::from_status_error(&task_status, error.as_deref());
+    let description = Some(super::runtime_submissions::runtime_submission_description(
+        &workflow, task_kind, issue,
+    ));
     Ok(Some(RuntimeTaskResponse {
         id: submission_id.clone(),
         task_id: submission_id.clone(),
@@ -190,6 +197,10 @@ async fn runtime_task_response_by_handle(
         phase,
         scheduler,
         turn: 0,
+        pr_url: runtime_string_field(&workflow.data, "pr_url"),
+        description,
+        created_at: workflow.created_at.to_rfc3339(),
+        updated_at: workflow.updated_at.to_rfc3339(),
         execution_path: "workflow_runtime",
         workflow_id: workflow.id.clone(),
         source: runtime_string_field(&workflow.data, "source"),

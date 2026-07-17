@@ -269,6 +269,7 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
             "project_id": project_root.to_string_lossy(),
             "repo": "owner/repo",
             "issue_number": 70,
+            "pr_url": "https://github.com/owner/repo/pull/170",
             "submission_id": task_id,
             "task_id": format!("{task_id}-legacy"),
         }));
@@ -298,6 +299,10 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
         assert_eq!(body["workflow"]["state"], workflow_state);
         assert_eq!(body["status"], status);
         assert_eq!(body["phase"], phase);
+        assert_eq!(body["pr_url"], "https://github.com/owner/repo/pull/170");
+        assert_eq!(body["description"], "issue #70");
+        assert!(body["created_at"].as_str().is_some());
+        assert!(body["updated_at"].as_str().is_some());
         assert_eq!(body["scheduler"]["authority_state"], scheduler_state);
         match failure_kind {
             Some(kind) => assert_eq!(body["failure_kind"], *kind),
@@ -1277,6 +1282,13 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
     let declarative_detail = response_json(declarative_detail_response).await?;
     assert_eq!(declarative_detail["task_kind"], "prompt");
     assert_eq!(declarative_detail["execution_path"], "workflow_runtime");
+    assert_eq!(
+        declarative_detail["description"],
+        "custom declarative submission"
+    );
+    assert!(declarative_detail["pr_url"].is_null());
+    assert!(declarative_detail["created_at"].as_str().is_some());
+    assert!(declarative_detail["updated_at"].as_str().is_some());
 
     let detail_response = app
         .clone()
@@ -1292,6 +1304,10 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
     let detail = response_json(detail_response).await?;
     assert_eq!(detail["submission_id"], submission_id);
     assert_eq!(detail["execution_path"], "workflow_runtime");
+    assert_eq!(detail["description"], "prompt task");
+    assert!(detail["pr_url"].is_null());
+    assert!(detail["created_at"].as_str().is_some());
+    assert!(detail["updated_at"].as_str().is_some());
 
     let legacy_detail_response = app
         .clone()
