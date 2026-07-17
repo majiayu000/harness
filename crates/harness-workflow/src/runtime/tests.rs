@@ -39,6 +39,7 @@ include!("tests/completion_reducer_core.rs");
 include!("tests/completion_reducer_scope.rs");
 include!("tests/prompt_continuation_reducer.rs");
 include!("tests/completion_reducer_quality.rs");
+include!("tests/completion_reducer_quality_gate.rs");
 include!("tests/runtime_failure_classification.rs");
 include!("tests/decision_validator.rs");
 include!("tests/command_bus.rs");
