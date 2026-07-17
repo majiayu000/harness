@@ -16,7 +16,7 @@ GH-1574
 - [x] `SP1574-T003` Owner: `nap-verify` | Done when: sampled NAP verification compares `{intent, target_files, command_class}` sketches, falls back to raw on mismatch, and auto-disables past 15% failure with an error-level event | Verify: `cargo test -p harness-context nap`
 - [x] `SP1574-T004` Owner: `composer-seam` | Done when: `Degraded::Summarized { nap }` exists and `ComposeManifest` items carry optional token/nap fields without breaking existing manifest consumers | Verify: `cargo test -p harness-context`
 - [x] `SP1574-T005` Owner: `agent-seam` | Done when: subagent final output passes through the compressor when enabled, with raw artifact path recorded before replacement | Verify: `cargo test -p harness-agents`
-- [ ] `SP1574-T006` Owner: `replay-eval` | Done when: an A/B replay script reports token saving, NAP mismatch rate, and cost ratio over the 40-session measurement set | Verify: script output attached to the PR; gate numbers from product.md
+- [x] `SP1574-T006` Owner: `replay-eval` | Done when: an A/B replay script reports token saving, NAP mismatch rate, and cost ratio over the 40-session measurement set | Verify: `phase1-replay-report.json`; gate numbers from product.md
 
 ## Parallelization
 
@@ -46,7 +46,7 @@ Feature ships disabled by default. If the Phase 1 gate fails, keep the
 trait and tests, remove the seams from default builds, and record the
 downgrade decision in this packet.
 
-T006 status (2026-07-16): `scripts/run_nap_replay.py` executes the A/B
+T006 result (2026-07-17): `scripts/run_nap_replay.py` executed the A/B
 replay through an agent-runtime channel (default `codex exec` with
 `gpt-5.6-luna` on a subscription seat; `claude -p` and an OpenAI-compatible
 API are optional channels), mirroring `PromptCompressor` semantics
@@ -57,7 +57,13 @@ Success oracle is a documented proxy pending a human-approved task oracle:
 `baseline_success` is true (sessions completed historically) and
 `candidate_success` is false only when the session trips the NAP breaker.
 Pricing enters via explicit `--pricing-*` flags; subscription-seat runs may
-pass 0 for compressor cost, which trivially satisfies the cost-ratio gate
-and must be disclosed alongside the evidence. Remaining for T006: run the
-pilot then the full 40-session replay under the approved channel, and
-summarize with `evaluate_nap_replay.py summarize-evidence`.
+pass 0 for compressor cost, which trivially satisfies the cost-ratio gate.
+
+The complete 40-session report is `phase1-replay-report.json`, bound to
+manifest `56ea095bfcc140faea8ead3ef862af08864c3db8b83292393a2e3031bd69d40c`.
+The Phase 1 gate failed: effective token saving was 4.23% (minimum 20%), NAP
+mismatch was 87.77% (maximum below 5%), and the proxy recorded 36 paired
+success regressions (maximum 0). The subscription-seat compressor cost was
+0 USD, so the 0% cost ratio passed trivially and is not evidence of product
+viability. Per the approved downgrade rule, compression remains disabled by
+default; the trait and tests remain, and Phase 1 does not advance.
