@@ -35,7 +35,7 @@ GH-1697
 - Create the support file from exact-base lines 620-832.
 - Replace only that range with the single direct include.
 - Prove 688/213 lines, 11 tests, nine helpers, 43 occurrences, identical
-  compiled paths, exact source ranges, and exact two-file scope.
+  compiled paths, exact source ranges, and exact two-file working-tree scope.
 - Run final formatting, diff, package, focused, and sanitized full workflow
   checks before commit; require configured exact-head CI for the six deferred
   PostgreSQL lease tests.
@@ -46,6 +46,8 @@ GH-1697
 - Covers: B-001 through B-008.
 - Open a separate implementation PR with reason, plan, exact movement,
   inventory, scope, test, and rollback evidence.
+- After committing, require a clean worktree and the exact two-file committed
+  scope gate from `tech.md`.
 - Wait for exact-head CI and advisory review, address valid findings, audit
   review threads, obtain independent read-only review, run the required PR
   gate, and merge only under standing authorization.

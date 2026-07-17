@@ -150,7 +150,10 @@ diff -u \
   <(printf '%s\n' \
     crates/harness-workflow/src/runtime/tests/runtime_store.rs \
     crates/harness-workflow/src/runtime/tests/runtime_store_support.rs) \
-  <(git diff --name-only "$BASE"...HEAD | sort)
+  <({
+    git diff --name-only "$BASE"
+    git ls-files --others --exclude-standard
+  } | sort)
 cargo check -p harness-workflow --all-targets
 env -u HARNESS_DATABASE_URL \
   -u HARNESS_DATABASE_POOL_MAX_CONNECTIONS \
@@ -179,7 +182,22 @@ The sanitized local full suite must pass all database-independent workflow
 library tests while explicitly skipping the six
 `runtime::tests::remote_host_lease` PostgreSQL tests. Exact-head CI's
 configured full database profile is authoritative for those six tests and
-other DB-backed coverage.
+the 11 runtime-store tests' DB-backed SQL/assertion coverage.
+
+After committing, rerun the exact two-file scope gate against committed state
+and require a clean worktree:
+
+```bash
+set -euo pipefail
+
+BASE="$(git merge-base HEAD origin/main)"
+test -z "$(git status --porcelain)"
+diff -u \
+  <(printf '%s\n' \
+    crates/harness-workflow/src/runtime/tests/runtime_store.rs \
+    crates/harness-workflow/src/runtime/tests/runtime_store_support.rs) \
+  <(git diff --name-only "$BASE"...HEAD | sort)
+```
 
 ## Rollback Plan
 
