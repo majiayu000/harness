@@ -141,6 +141,8 @@ both include files into the same existing test namespace.
   RETAINED=$SOURCE
   MOVED=crates/harness-workflow/src/runtime/tests/worker_completion_transitions.rs
   INCLUDES=crates/harness-workflow/src/runtime/tests.rs
+  BASE_LIST=/tmp/GH1694-base-tests.txt
+  FINAL_LIST=/tmp/GH1694-final-tests.txt
 
   diff -u \
     <(git show "$BASE:$SOURCE" | sed -n '1,457p') \
@@ -164,9 +166,33 @@ both include files into the same existing test namespace.
     <(sed -nE \
       's/^async fn ([A-Za-z0-9_]+)\(.*/runtime::tests::\1/p' \
       "$RETAINED" "$MOVED")
+  test "$(wc -l < "$RETAINED" | tr -d ' ')" = 457
+  test "$(wc -l < "$MOVED" | tr -d ' ')" = 496
+  test "$(
+    rg -o 'assert(_eq|_ne)?!|expect\(' "$RETAINED" "$MOVED" |
+      wc -l | tr -d ' '
+  )" = 145
+  test "$(
+    sed -nE \
+      's/^async fn ([A-Za-z0-9_]+)\(.*/runtime::tests::\1/p' \
+      "$RETAINED" "$MOVED" |
+      wc -l | tr -d ' '
+  )" = 15
+  cargo test -p harness-workflow --lib -- --list > "$FINAL_LIST"
+  diff -u "$BASE_LIST" "$FINAL_LIST"
+  diff -u \
+    <(printf '%s\n' \
+      crates/harness-workflow/src/runtime/tests.rs \
+      crates/harness-workflow/src/runtime/tests/worker_completion_transitions.rs \
+      crates/harness-workflow/src/runtime/tests/worker_lifecycle.rs) \
+    <(git diff --name-only "$BASE"...HEAD | sort)
   ```
 
 - [ ] Baseline and final `cargo check -p harness-workflow --all-targets`.
+- [ ] Before editing, capture the compiled logical-path baseline with
+      `cargo test -p harness-workflow --lib -- --list >
+      /tmp/GH1694-base-tests.txt`; after editing, require the complete final
+      list to match it exactly.
 - [ ] Baseline and final
       `cargo test -p harness-workflow --lib runtime::tests::runtime_worker`,
       with the same 18 selected tests passing and unchanged paths.
@@ -175,10 +201,10 @@ both include files into the same existing test namespace.
       with the same 12 selected tests passing and unchanged paths.
 - [ ] Final database-independent `cargo test -p harness-workflow --lib` using
       a temporary empty `XDG_CONFIG_HOME` and unset Harness database variables.
-- [ ] `cargo fmt --all -- --check`, `git diff --check`, line-count, exact
-      retained file, exact moved file, exact concatenation, ordered inventory,
-      namespace, include adjacency, 145-site inventory, and three-file scope
-      checks.
+- [ ] `cargo fmt --all -- --check`, `git diff --check`, the executable
+      line-count, exact retained file, exact moved file, exact concatenation,
+      ordered inventory, compiled-path, include adjacency, 145-occurrence, and
+      exact three-file scope checks above.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` and workspace
       tests under the repository test environment.
 - [ ] SpecRail global/packet/route checks, manual VibeGuard L1-L7 review,
