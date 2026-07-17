@@ -21,6 +21,9 @@ GH-1697
 
 - Dependencies: merged GH-1697 spec PR; fresh worktree from `origin/main`.
 - Covers: B-001 through B-007.
+- Require the complete source file to match pinned issue/spec base
+  `08157897b686c6ae9245d626c7d2997b93acdf27` byte-for-byte; stop for a new
+  spec if it drifted.
 - Preserve the complete `--list` output before editing.
 - Stop if the base, inventories, target absence, focused tests, or package
   check differ from the packet.

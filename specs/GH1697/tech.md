@@ -84,6 +84,7 @@ Before editing:
 ```bash
 set -euo pipefail
 
+PINNED_BASE=08157897b686c6ae9245d626c7d2997b93acdf27
 BASE="$(git rev-parse HEAD)"
 SOURCE=crates/harness-workflow/src/runtime/tests/runtime_store.rs
 SUPPORT=crates/harness-workflow/src/runtime/tests/runtime_store_support.rs
@@ -92,6 +93,7 @@ BASE_CONFIG_HOME="$(mktemp -d /tmp/harness-GH1697-base.XXXXXX)"
 trap 'rm -rf -- "$BASE_CONFIG_HOME"' EXIT
 
 test ! -e "$SUPPORT"
+cmp <(git show "$PINNED_BASE:$SOURCE") "$SOURCE"
 test "$(wc -l < "$SOURCE" | tr -d ' ')" = 900
 test "$(rg -c '^#\[tokio::test\]' "$SOURCE")" = 11
 test "$(rg -o 'assert(_eq|_ne)?!|expect\(' "$SOURCE" | wc -l | tr -d ' ')" = 43
