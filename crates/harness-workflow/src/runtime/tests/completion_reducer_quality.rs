@@ -495,4 +495,3 @@ fn runtime_completion_reducer_ignores_success_for_already_terminal_workflow() {
         "stale terminal workflow completion should not produce a new decision"
     );
 }
-

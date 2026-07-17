@@ -1,3 +1,4 @@
+
 #[test]
 fn quality_gate_run_decision_starts_runtime_activity() {
     let instance = quality_gate_instance("pending");
