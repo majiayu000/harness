@@ -29,6 +29,11 @@ observes results. The following capabilities are **only available over HTTP**:
 | `GET  /projects/queue-stats` | stats | Per-project queue statistics |
 | `GET  /api/dashboard` | dashboard | Dashboard data |
 | `GET  /api/intake` | intake | Intake source status |
+| `POST /api/workflows/runtime/submissions` | submit | Create a durable workflow-runtime submission |
+| `GET  /api/workflows/runtime/submissions/{id}` | get | Read runtime submission status |
+| `GET  /api/workflows/runtime/submissions/{id}/artifacts` | artifacts | Read runtime output artifacts |
+| `GET  /api/workflows/runtime/submissions/{id}/stream` | stream | Stream runtime submission events |
+| `POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}` | approval | Respond to a live runtime approval request |
 | `POST /webhook` | webhook | GitHub webhook (HMAC-verified) |
 | `POST /webhook/feishu` | webhook | Feishu bot webhook |
 | `POST /signals` | ingest | Signal ingestion (rate-limited) |
@@ -72,13 +77,15 @@ non-exempt routes require `Authorization: Bearer <token>`; if both a token and
 ignored. Exempt routes that bypass auth entirely: `/health`, `/webhook`,
 `/webhook/feishu`, `/signals`, and `/favicon.ico` (these carry their own
 HMAC-based protection or are intentionally public). For browser clients that
-cannot set `Authorization` headers on SSE requests, `/tasks/{id}/stream`
-additionally accepts a `?token=<value>` query parameter as a fallback; all other
-routes only accept `Authorization: Bearer <token>`.
+cannot set `Authorization` headers on SSE requests, `/tasks/{id}/stream` and
+`/api/workflows/runtime/submissions/{id}/stream` additionally accept a
+`?token=<value>` query parameter as a fallback; all other routes only accept
+`Authorization: Bearer <token>`.
 
 ### JSON-RPC 2.0 — agent-facing (data plane)
 
-JSON-RPC is the protocol used by agents running inside Harness threads. The
+JSON-RPC is the protocol used by agent-facing support integrations. Workflow
+submission and live turn lifecycle control are HTTP control-plane concerns. The
 transport is selected at server startup with `--transport <mode>`:
 
 * **stdio** (`--transport stdio`) — for agents launched as child processes
@@ -94,17 +101,6 @@ All three transports share the same method set. The following capabilities are
 | Method | Purpose |
 |--------|---------|
 | `initialize` / `initialized` | Protocol handshake |
-| `thread/start` | Create a new thread |
-| `thread/list` | List threads |
-| `thread/delete` | Delete a thread |
-| `thread/resume` | Reopen a thread |
-| `thread/fork` | Branch a thread from a turn |
-| `thread/compact` | Compact thread history |
-| `turn/start` | Begin a generation turn |
-| `turn/cancel` | Cancel an in-flight turn |
-| `turn/status` | Query turn status |
-| `turn/steer` | Append an instruction to a running turn |
-| `turn/respond_approval` | Submit a decision for a pending turn approval request |
 | `skill/create` | Register a skill |
 | `skill/list` | Query skills |
 | `skill/get` | Get skill details |
@@ -154,9 +150,9 @@ The design is intentional:
    projects regardless of auth configuration.
 
 2. **Semantic clarity** — HTTP semantics (status codes, REST verbs, SSE) are a
-   natural fit for long-running job management. JSON-RPC semantics (request/
-   response over a single channel, server-push notifications) are a natural fit for
-   interactive agent sessions.
+   natural fit for long-running job management and live runtime control.
+   JSON-RPC request/response semantics remain a fit for bounded agent support
+   integrations such as rules, skills, plans, and observability.
 
 3. **Client simplicity** — CI scripts, GitHub Actions, and dashboard frontends use
    HTTP. Agent frameworks use JSON-RPC. Neither audience is burdened with the
@@ -169,8 +165,9 @@ The design is intentional:
 | Submit a task from a CI script | `POST /tasks` (HTTP) |
 | Stream live output from a running task | `GET /tasks/{id}/stream` (HTTP SSE) |
 | Register a new project | `POST /projects` (HTTP) |
-| Run an agent thread interactively | `turn/start` (JSON-RPC) |
-| Inspect or cancel a running turn | `turn/status` / `turn/cancel` (JSON-RPC) |
+| Run a prompt through the workflow runtime | `POST /api/workflows/runtime/submissions` (HTTP) |
+| Inspect a running runtime submission | `GET /api/workflows/runtime/submissions/{id}` (HTTP) |
+| Respond to a live approval request | `POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}` (HTTP) |
 | Load rules for an agent to respect | `rule/load` (JSON-RPC) |
 | Record an event from within an agent | `event/log` (JSON-RPC) |
 

@@ -85,4 +85,8 @@ GH-1434
   Harness-owned lifecycle requests and thread persistence are removed. The
   in-memory `ThreadManager`, workflow-runtime turn engine and notifications,
   and Codex app-server adapter protocol remain live. Protocol rejection tests
-  retain the removed method strings as negative compatibility fixtures.
+  retain the removed method strings as negative compatibility fixtures. The
+  published Python and TypeScript SDKs submit and poll workflow-runtime HTTP
+  submissions, live approval responses use the authenticated runtime HTTP
+  endpoint, and the unwritten context-manifest getter is removed with its sole
+  legacy writer.

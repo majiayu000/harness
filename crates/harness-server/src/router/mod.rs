@@ -179,9 +179,6 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             request,
             supplied_items,
         } => Some(handlers::context::context_preview(state, id, request, supplied_items).await),
-        Method::ContextManifestGet { thread_id } => {
-            Some(handlers::context::context_manifest_get(state, id, thread_id).await)
-        }
     }
 }
 

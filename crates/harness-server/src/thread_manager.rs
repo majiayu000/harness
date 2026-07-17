@@ -459,8 +459,8 @@ impl ThreadManager {
     /// Forward an approval response to the live adapter for the given turn
     /// and update the corresponding `ApprovalRequest` item in thread state.
     ///
-    /// Returns `Err` when no adapter is registered or when the adapter rejects
-    /// the call (e.g. `Unsupported` for Claude-backed turns).
+    /// Returns `Err` when the turn does not exist, no adapter is registered, or
+    /// the adapter rejects the call (e.g. `Unsupported` for Claude-backed turns).
     pub async fn respond_approval_on_turn(
         &self,
         turn_id: &TurnId,
@@ -468,6 +468,9 @@ impl ThreadManager {
         decision: ApprovalDecision,
     ) -> harness_core::error::Result<()> {
         record_usage(UsageProbeSurface::ThreadManager);
+        let thread_id = self
+            .find_thread_for_turn(turn_id)
+            .ok_or_else(|| harness_core::error::HarnessError::TurnNotFound(turn_id.to_string()))?;
         let adapter = self
             .running_adapters
             .get(turn_id.as_str())
@@ -477,17 +480,13 @@ impl ThreadManager {
                 adapter
                     .respond_approval(request_id.clone(), decision.clone())
                     .await?;
-                // Update thread state to reflect the decision.
-                if let Some(thread_id) = self.find_thread_for_turn(turn_id) {
-                    let approved = matches!(decision, ApprovalDecision::Accept);
-                    if let Err(e) =
-                        self.set_approval_status(&thread_id, turn_id, &request_id, approved)
-                    {
-                        tracing::warn!(
-                            turn_id = %turn_id,
-                            "failed to update approval status in thread state: {e}"
-                        );
-                    }
+                let approved = matches!(decision, ApprovalDecision::Accept);
+                if let Err(e) = self.set_approval_status(&thread_id, turn_id, &request_id, approved)
+                {
+                    tracing::warn!(
+                        turn_id = %turn_id,
+                        "failed to update approval status in thread state: {e}"
+                    );
                 }
                 Ok(())
             }

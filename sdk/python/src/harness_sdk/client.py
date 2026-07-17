@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,11 +24,20 @@ class Event(TypedDict):
     timestamp: str
 
 
-RpcHandler = Callable[[str, dict[str, Any]], Any]
+HttpHandler = Callable[[str, str, dict[str, Any] | None], Any]
 EventHandler = Callable[[Event], None]
 
 
+class HarnessHttpError(RuntimeError):
+    def __init__(self, status: int, message: str, data: Any = None):
+        super().__init__(message)
+        self.status = status
+        self.data = data
+
+
 class HarnessRpcError(RuntimeError):
+    """Deprecated compatibility type for callers importing the old error class."""
+
     def __init__(self, code: int, message: str, data: Any = None):
         super().__init__(message)
         self.code = code
@@ -53,114 +63,178 @@ class Harness:
         api_token: str | None = None,
         headers: dict[str, str] | None = None,
         request_timeout_seconds: float = 15.0,
-        rpc_handler: RpcHandler | None = None,
+        http_handler: HttpHandler | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.cwd = cwd
         self.api_token = api_token.strip() if isinstance(api_token, str) else None
         self.headers = dict(headers) if headers else {}
         self.request_timeout_seconds = request_timeout_seconds
-        self._rpc_handler = rpc_handler
-        self._next_id = 1
+        self._http_handler = http_handler
 
     def start_thread(self, cwd: str | None = None) -> "HarnessThread":
-        resolved_cwd = cwd if cwd is not None else self.cwd
-        if not isinstance(resolved_cwd, str) or not resolved_cwd:
+        project = cwd if cwd is not None else self.cwd
+        if not isinstance(project, str) or not project:
             raise ValueError(
-                "`cwd` is required for thread/start; pass Harness(cwd=...) "
-                "or start_thread(cwd=...)."
+                "`cwd` is required; pass Harness(cwd=...) or start_thread(cwd=...)."
             )
-        params: dict[str, Any] = {"cwd": resolved_cwd}
+        return HarnessThread(self, project)
 
-        result = self._rpc("thread/start", params)
-        return HarnessThread(self, str(result["thread_id"]))
+    def resume_thread(self, project: str) -> "HarnessThread":
+        return self.thread(project)
 
-    def resume_thread(self, thread_id: str) -> "HarnessThread":
-        self._rpc("thread/resume", {"thread_id": thread_id})
-        return HarnessThread(self, thread_id)
+    def thread(self, project: str) -> "HarnessThread":
+        if not isinstance(project, str) or not project:
+            raise ValueError("project handle must not be empty")
+        return HarnessThread(self, project)
 
-    def thread(self, thread_id: str) -> "HarnessThread":
-        return HarnessThread(self, thread_id)
-
-    def start_turn(self, thread_id: str, prompt: str) -> dict[str, Any]:
-        return self._rpc("turn/start", {"thread_id": thread_id, "input": prompt})
+    def start_turn(self, project: str, prompt: str) -> dict[str, Any]:
+        created = self._request(
+            "POST",
+            "/api/workflows/runtime/submissions",
+            {"project": project, "prompt": prompt},
+        )
+        if not isinstance(created, dict) or created.get("execution_path") != "workflow_runtime":
+            raise RuntimeError("server did not create a workflow-runtime submission")
+        turn_id = created.get("submission_id") or created.get("task_id")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise RuntimeError("runtime submission response is missing submission_id")
+        return {"turn_id": turn_id}
 
     def turn_status(
-        self, turn_id: str, timeout_seconds: float | None = None
+        self,
+        turn_id: str,
+        timeout_seconds: float | None = None,
+        *,
+        project: str | None = None,
     ) -> dict[str, Any]:
-        return self._rpc(
-            "turn/status",
-            {"turn_id": turn_id},
-            timeout_seconds=timeout_seconds,
+        encoded_id = urllib.parse.quote(turn_id, safe="")
+        detail = self._request(
+            "GET",
+            f"/api/workflows/runtime/submissions/{encoded_id}",
+            None,
+            timeout_seconds,
         )
+        if not isinstance(detail, dict):
+            raise RuntimeError("runtime submission detail must be an object")
+        status = _runtime_status_to_turn_status(detail.get("status"))
+        items = self._runtime_items(
+            turn_id, status, detail.get("error"), timeout_seconds
+        )
+        turn: dict[str, Any] = {
+            "id": detail.get("submission_id") or turn_id,
+            "thread_id": detail.get("project") or project or "",
+            "status": status,
+            "items": items,
+        }
+        if isinstance(detail.get("created_at"), str):
+            turn["started_at"] = detail["created_at"]
+        if status != "running" and isinstance(detail.get("updated_at"), str):
+            turn["completed_at"] = detail["updated_at"]
+        return turn
 
-    def _rpc(
+    def _runtime_items(
+        self,
+        turn_id: str,
+        status: str,
+        task_error: Any,
+        timeout_seconds: float | None,
+    ) -> list[dict[str, Any]]:
+        if status == "running":
+            return []
+        encoded_id = urllib.parse.quote(turn_id, safe="")
+        artifacts = self._request(
+            "GET",
+            f"/api/workflows/runtime/submissions/{encoded_id}/artifacts",
+            None,
+            timeout_seconds,
+        )
+        if not isinstance(artifacts, list):
+            raise RuntimeError("runtime artifacts response must be an array")
+        final_result: dict[str, Any] = {}
+        for artifact in reversed(artifacts):
+            if not isinstance(artifact, dict):
+                continue
+            if artifact.get("artifact_type") != "activity_result_envelope":
+                continue
+            content = artifact.get("content")
+            if not isinstance(content, str):
+                break
+            try:
+                envelope = json.loads(content)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    f"Invalid activity_result_envelope artifact: {error}"
+                ) from error
+            candidate = envelope.get("final_result") if isinstance(envelope, dict) else None
+            if isinstance(candidate, dict):
+                final_result = candidate
+            break
+
+        items: list[dict[str, Any]] = []
+        summary = final_result.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            items.append({"type": "agent_reasoning", "content": summary})
+        error = final_result.get("error")
+        if not isinstance(error, str) or not error.strip():
+            error = task_error
+        if isinstance(error, str) and error.strip():
+            items.append({"type": "error", "code": 1, "message": error})
+        return items
+
+    def _request(
         self,
         method: str,
-        params: dict[str, Any] | None = None,
+        path: str,
+        body: dict[str, Any] | None,
         timeout_seconds: float | None = None,
     ) -> Any:
-        if self._rpc_handler:
-            return self._rpc_handler(method, params or {})
+        if self._http_handler is not None:
+            return self._http_handler(method, path, body)
 
-        request_id = self._next_id
-        self._next_id += 1
-
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params or {},
-        }
-        body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json", **self.headers}
         if self.api_token:
             headers["Authorization"] = f"Bearer {self.api_token}"
         request = urllib.request.Request(
-            f"{self.base_url}/rpc",
-            data=body,
-            method="POST",
+            f"{self.base_url}{path}",
+            data=json.dumps(body).encode("utf-8") if body is not None else None,
             headers=headers,
+            method=method,
         )
-
         try:
-            timeout = (
-                self.request_timeout_seconds
-                if timeout_seconds is None
-                else max(0.01, float(timeout_seconds))
-            )
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                response_body = response.read().decode("utf-8")
+            with urllib.request.urlopen(
+                request,
+                timeout=(
+                    timeout_seconds
+                    if timeout_seconds is not None
+                    else self.request_timeout_seconds
+                ),
+            ) as response:
+                raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as error:
-            response_body = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {error.code}: {response_body}") from error
-        except urllib.error.URLError as error:
-            raise RuntimeError(f"Failed to reach Harness server: {error}") from error
-
-        try:
-            parsed = json.loads(response_body)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(
-                f"Failed to parse RPC response for '{method}': {error}"
-            ) from error
-
-        if parsed.get("error"):
-            rpc_error = parsed["error"]
-            raise HarnessRpcError(
-                code=int(rpc_error.get("code", -32000)),
-                message=str(rpc_error.get("message", "unknown error")),
-                data=rpc_error.get("data"),
+            raw_error = error.read().decode("utf-8", errors="replace")
+            try:
+                data: Any = json.loads(raw_error)
+            except json.JSONDecodeError:
+                data = raw_error
+            message = (
+                str(data.get("error"))
+                if isinstance(data, dict) and "error" in data
+                else f"HTTP {error.code}"
             )
-
-        if "result" not in parsed:
-            raise RuntimeError(f"Missing RPC result for '{method}'")
-        return parsed["result"]
+            raise HarnessHttpError(error.code, message, data) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"HTTP request failed: {error.reason}") from error
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Invalid HTTP response: {error}") from error
 
 
 class HarnessThread:
-    def __init__(self, client: Harness, thread_id: str) -> None:
+    def __init__(self, client: Harness, project: str) -> None:
         self._client = client
-        self.id = thread_id
+        self.id = project
 
     def run(
         self,
@@ -170,28 +244,28 @@ class HarnessThread:
         on_event: EventHandler | None = None,
     ) -> RunResult:
         events: list[Event] = []
-        turn_id = ""
         latest_turn: dict[str, Any] | None = None
-
+        turn_id = ""
         for event in self.run_stream(
             prompt,
-            timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
+            timeout_seconds=timeout_seconds,
             on_event=on_event,
         ):
             events.append(event)
             if event["method"] == "sdk:turn/started":
-                turn_id = str(event["params"]["turn_id"])
-            if event["method"] == "sdk:turn/status":
-                latest_turn = event["params"]["turn"]
-
-        if not latest_turn and turn_id:
-            latest_turn = self._client.turn_status(turn_id)
-
+                turn_id = str(event["params"].get("turn_id", ""))
+            elif event["method"] == "sdk:turn/status":
+                candidate = event["params"].get("turn")
+                if isinstance(candidate, dict):
+                    latest_turn = candidate
+        if latest_turn is None and turn_id:
+            latest_turn = self._client.turn_status(turn_id, project=self.id)
+        status = str(latest_turn.get("status", "running")) if latest_turn else "running"
         return RunResult(
             thread_id=self.id,
             turn_id=turn_id,
-            status=str((latest_turn or {}).get("status", "running")),
+            status=status,
             output=_extract_output(latest_turn),
             turn=latest_turn,
             events=events,
@@ -205,70 +279,48 @@ class HarnessThread:
         poll_interval_seconds: float = 0.5,
         on_event: EventHandler | None = None,
     ) -> Generator[Event, None, None]:
-        poll_interval = max(0.01, float(poll_interval_seconds))
-        timeout = max(0.01, float(timeout_seconds))
-        deadline = time.monotonic() + timeout
-
-        started = self._client.start_turn(self.id, prompt)
-        turn_id = str(started["turn_id"])
+        poll_interval = max(0.01, poll_interval_seconds)
+        timeout = max(0.001, timeout_seconds)
+        started_at = time.monotonic()
         previous_signature = ""
-
-        start_event = _new_event(
+        turn_id = str(self._client.start_turn(self.id, prompt)["turn_id"])
+        yield _emit(
             "sdk:turn/started",
             {
                 "thread_id": self.id,
                 "turn_id": turn_id,
                 "source": "sdk-poll",
-                "server_method": "turn/start",
+                "server_method": "POST /api/workflows/runtime/submissions",
             },
+            on_event,
         )
-        _notify(on_event, start_event)
-        yield start_event
-
         while True:
-            remaining_before_poll = deadline - time.monotonic()
-            if remaining_before_poll <= 0:
-                timeout_event = _new_event(
-                    "sdk:turn/timeout",
-                    {
-                        "thread_id": self.id,
-                        "turn_id": turn_id,
-                        "timeout_ms": int(timeout * 1000),
-                        "timeout_seconds": timeout,
-                        "source": "sdk-poll",
-                        "server_method": "turn/status",
-                    },
-                )
-                _notify(on_event, timeout_event)
-                yield timeout_event
-                return
-
+            remaining = max(0.001, timeout - (time.monotonic() - started_at))
             turn = self._client.turn_status(
                 turn_id,
-                timeout_seconds=min(
-                    self._client.request_timeout_seconds, remaining_before_poll
-                ),
+                min(self._client.request_timeout_seconds, remaining),
+                project=self.id,
             )
-            signature = _turn_signature(turn)
-
+            signature = json.dumps(
+                [turn.get("status"), turn.get("items"), turn.get("completed_at")],
+                sort_keys=True,
+            )
             if signature != previous_signature:
                 previous_signature = signature
-                status_event = _new_event(
+                yield _emit(
                     "sdk:turn/status",
                     {
                         "thread_id": self.id,
                         "turn_id": turn_id,
                         "turn": turn,
                         "source": "sdk-poll",
-                        "server_method": "turn/status",
+                        "server_method": "GET /api/workflows/runtime/submissions/{id}",
                     },
+                    on_event,
                 )
-                _notify(on_event, status_event)
-                yield status_event
-
-            status = str(turn.get("status", "running"))
-            if _is_terminal_status(status):
-                completed_event = _new_event(
+            status = turn.get("status")
+            if status in {"completed", "cancelled", "failed"}:
+                yield _emit(
                     "sdk:turn/completed",
                     {
                         "thread_id": self.id,
@@ -276,84 +328,58 @@ class HarnessThread:
                         "status": status,
                         "token_usage": turn.get("token_usage"),
                         "source": "sdk-poll",
-                        "server_method": "turn/status",
+                        "server_method": "GET /api/workflows/runtime/submissions/{id}",
                     },
+                    on_event,
                 )
-                _notify(on_event, completed_event)
-                yield completed_event
                 return
-
-            if time.monotonic() >= deadline:
-                timeout_event = _new_event(
+            if time.monotonic() - started_at >= timeout:
+                yield _emit(
                     "sdk:turn/timeout",
                     {
                         "thread_id": self.id,
                         "turn_id": turn_id,
-                        "timeout_ms": int(timeout * 1000),
-                        "timeout_seconds": timeout,
+                        "timeout_seconds": timeout_seconds,
                         "source": "sdk-poll",
-                        "server_method": "turn/status",
+                        "server_method": "GET /api/workflows/runtime/submissions/{id}",
                     },
+                    on_event,
                 )
-                _notify(on_event, timeout_event)
-                yield timeout_event
                 return
-
-            sleep_for = min(poll_interval, max(0.0, deadline - time.monotonic()))
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+            time.sleep(poll_interval)
 
 
-def _notify(on_event: EventHandler | None, event: Event) -> None:
-    if on_event:
-        on_event(event)
-
-
-def _new_event(method: EventMethod, params: dict[str, Any]) -> Event:
-    timestamp = (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
-    return {
-        "method": method,
-        "params": params,
-        "timestamp": timestamp,
-    }
-
-
-def _turn_signature(turn: dict[str, Any]) -> str:
-    status = str(turn.get("status", "running"))
-    items = turn.get("items")
-    item_count = len(items) if isinstance(items, list) else 0
-    completed_at = str(turn.get("completed_at") or "")
-    return f"{status}|{item_count}|{completed_at}"
-
-
-def _is_terminal_status(status: str) -> bool:
-    return status in {"completed", "cancelled", "failed"}
+def _runtime_status_to_turn_status(status: Any) -> str:
+    if status == "done":
+        return "completed"
+    if status == "failed":
+        return "failed"
+    if status == "cancelled":
+        return "cancelled"
+    return "running"
 
 
 def _extract_output(turn: dict[str, Any] | None) -> str:
-    if not turn:
+    if not turn or not isinstance(turn.get("items"), list):
         return ""
-
-    items = turn.get("items")
-    if not isinstance(items, list):
-        return ""
-
     messages: list[str] = []
-    for item in items:
-        if not isinstance(item, dict):
+    for item in turn["items"]:
+        if not isinstance(item, dict) or item.get("type") == "user_message":
             continue
-
-        if item.get("type") == "user_message":
-            continue
-
-        for key in ("content", "stdout", "message"):
-            value = item.get(key)
+        for field in ("content", "stdout", "message"):
+            value = item.get(field)
             if isinstance(value, str) and value.strip():
                 messages.append(value.strip())
                 break
-
     return "\n\n".join(messages)
+
+
+def _emit(method: EventMethod, params: dict[str, Any], handler: EventHandler | None) -> Event:
+    event: Event = {
+        "method": method,
+        "params": params,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if handler is not None:
+        handler(event)
+    return event

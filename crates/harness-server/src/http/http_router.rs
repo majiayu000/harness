@@ -102,6 +102,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(sse_routes::stream_runtime_submission_sse),
         )
         .route(
+            "/api/workflows/runtime/turns/{turn_id}/approvals/{request_id}",
+            post(runtime_submission_routes::respond_to_approval),
+        )
+        .route(
             "/api/runtime/circuit-breakers/{profile}/reset",
             post(reset_runtime_circuit_breaker),
         )

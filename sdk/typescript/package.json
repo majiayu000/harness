@@ -1,7 +1,7 @@
 {
   "name": "harness-sdk",
   "version": "0.1.0",
-  "description": "TypeScript SDK for Harness JSON-RPC app server",
+  "description": "TypeScript SDK for Harness workflow runtime submissions",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.cjs",

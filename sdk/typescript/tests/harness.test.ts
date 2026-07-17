@@ -2,452 +2,261 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   Harness,
-  HarnessRpcError,
+  HarnessHttpError,
   SDK_TURN_COMPLETED,
   SDK_TURN_TIMEOUT,
-  ThreadEvent,
+  type ThreadEvent,
 } from "../src/index";
 
 interface RecordedCall {
   url: string;
   method: string;
-  params: Record<string, unknown>;
+  body: Record<string, unknown> | undefined;
   headers: Record<string, string>;
 }
 
-function createMockFetch(
-  handler: (method: string, params: Record<string, unknown>) => unknown,
-): {
-  calls: RecordedCall[];
-  fetch: (
-    url: string,
-    init: {
-      method: string;
-      headers: Record<string, string>;
-      body: string;
-    },
-  ) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
-} {
-  const calls: RecordedCall[] = [];
+interface MockResponse {
+  status?: number;
+  body: unknown;
+}
 
+function createMockFetch(handler: (call: RecordedCall) => MockResponse) {
+  const calls: RecordedCall[] = [];
   return {
     calls,
-    fetch: async (url, init) => {
-      const payload = JSON.parse(init.body) as {
+    fetch: async (
+      url: string,
+      init: {
         method: string;
-        params: Record<string, unknown>;
-        id: number;
-      };
-
-      calls.push({
+        headers: Record<string, string>;
+        body?: string;
+      },
+    ) => {
+      const call: RecordedCall = {
         url,
-        method: payload.method,
-        params: payload.params,
+        method: init.method,
+        body: init.body ? (JSON.parse(init.body) as Record<string, unknown>) : undefined,
         headers: init.headers,
-      });
-      const result = handler(payload.method, payload.params);
-      const envelope = {
-        jsonrpc: "2.0",
-        id: payload.id,
-        ...result,
       };
-
+      calls.push(call);
+      const response = handler(call);
+      const status = response.status ?? 200;
       return {
-        ok: true,
-        status: 200,
+        ok: status >= 200 && status < 300,
+        status,
         async text() {
-          return JSON.stringify(envelope);
+          return JSON.stringify(response.body);
         },
       };
     },
   };
 }
 
-test("startThread sends configured cwd", async () => {
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-1" } };
-    }
-    return { result: {} };
-  });
-
+test("startThread creates a local project handle without a server request", async () => {
+  const mock = createMockFetch(() => ({ body: {} }));
   const harness = new Harness({ fetch: mock.fetch, cwd: "/repo" });
+
   const thread = await harness.startThread();
 
-  assert.equal(thread.id, "thread-1");
-  assert.equal(mock.calls.length, 1);
-  assert.equal(mock.calls[0]?.method, "thread/start");
-  assert.equal(mock.calls[0]?.params.cwd, "/repo");
-});
-
-test("startThread requires cwd when not configured", async () => {
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-2" } };
-    }
-    return { result: {} };
-  });
-
-  const harness = new Harness({ fetch: mock.fetch });
-  await assert.rejects(
-    () => harness.startThread(),
-    /`cwd` is required for thread\/start; pass Harness\(\{ cwd \}\) or startThread\(\{ cwd \}\)\./,
-  );
+  assert.equal(thread.id, "/repo");
   assert.equal(mock.calls.length, 0);
 });
 
-test("run returns completed status and extracted output", async () => {
-  let statusPollCount = 0;
-
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-3" } };
-    }
-    if (method === "turn/start") {
-      return { result: { turn_id: "turn-3" } };
-    }
-    if (method === "turn/status") {
-      statusPollCount += 1;
-      if (statusPollCount === 1) {
-        return {
-          result: {
-            id: "turn-3",
-            thread_id: "thread-3",
-            status: "running",
-            items: [{ type: "user_message", content: "hello" }],
-          },
-        };
-      }
-      return {
-        result: {
-          id: "turn-3",
-          thread_id: "thread-3",
-          status: "completed",
-          items: [
-            { type: "user_message", content: "hello" },
-            { type: "agent_reasoning", content: "done" },
-            { type: "shell_command", command: "ls", stdout: "ls output", stderr: "" },
-            { type: "error", code: 1, message: "tool failed" },
-          ],
-          token_usage: {
-            input_tokens: 1,
-            output_tokens: 1,
-            total_tokens: 2,
-            cost_usd: 0,
-          },
-        },
-      };
-    }
-    return { result: {} };
-  });
-
-  const harness = new Harness({
-    fetch: mock.fetch,
-    defaultPollIntervalMs: 1,
-    defaultRunTimeoutMs: 500,
-  });
-  const thread = await harness.startThread({ cwd: "/repo" });
-  const emitted: ThreadEvent[] = [];
-  const result = await thread.run("Summarize", {
-    onEvent: async (event) => {
-      emitted.push(event);
-    },
-  });
-
-  assert.equal(result.threadId, "thread-3");
-  assert.equal(result.turnId, "turn-3");
-  assert.equal(result.status, "completed");
-  assert.equal(result.output, "done\n\nls output\n\ntool failed");
-  assert.equal(result.timedOut, false);
-  assert.ok(result.events.some((event) => event.method === SDK_TURN_COMPLETED));
-  assert.ok(emitted.length >= 3);
-});
-
-test("run validates status-event turn payload before storing snapshot", async () => {
-  let statusPollCount = 0;
-
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-5" } };
-    }
-    if (method === "turn/start") {
-      return { result: { turn_id: "turn-5" } };
-    }
-    if (method === "turn/status") {
-      statusPollCount += 1;
-      if (statusPollCount === 1) {
-        return {
-          result: {
-            id: "turn-5",
-            thread_id: "thread-5",
-            status: "completed",
-            items: "invalid-items",
-          },
-        };
-      }
-      return {
-        result: {
-          id: "turn-5",
-          thread_id: "thread-5",
-          status: "completed",
-          items: [{ type: "agent_reasoning", content: "final answer" }],
-        },
-      };
-    }
-    return { result: {} };
-  });
-
-  const harness = new Harness({
-    fetch: mock.fetch,
-    cwd: "/repo",
-    defaultPollIntervalMs: 1,
-    defaultRunTimeoutMs: 500,
-  });
-
-  const thread = await harness.startThread();
-  const result = await thread.run("Summarize");
-
-  assert.equal(result.turnId, "turn-5");
-  assert.equal(result.status, "completed");
-  assert.equal(result.output, "final answer");
-  assert.equal(statusPollCount, 2);
-});
-
-test("run preserves approval_request id in final snapshot", async () => {
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-6" } };
-    }
-    if (method === "turn/start") {
-      return { result: { turn_id: "turn-6" } };
-    }
-    if (method === "turn/status") {
-      return {
-        result: {
-          id: "turn-6",
-          thread_id: "thread-6",
-          status: "completed",
-          items: [
-            { type: "user_message", content: "hello" },
-            {
-              type: "approval_request",
-              id: "approval-1",
-              action: "execute_command",
-              approved: null,
-            },
-          ],
-        },
-      };
-    }
-    return { result: {} };
-  });
-
-  const harness = new Harness({
-    fetch: mock.fetch,
-    defaultPollIntervalMs: 1,
-    defaultRunTimeoutMs: 500,
-  });
-  const thread = await harness.startThread({ cwd: "/repo" });
-  const result = await thread.run("Summarize");
-
-  assert.equal(result.status, "completed");
-  assert.equal(result.turn?.items.length, 2);
-  assert.deepEqual(result.turn?.items[1], {
-    type: "approval_request",
-    id: "approval-1",
-    action: "execute_command",
-    approved: null,
-  });
-});
-
-test("run preserves legacy approval_request items without id", async () => {
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-legacy" } };
-    }
-    if (method === "turn/start") {
-      return { result: { turn_id: "turn-legacy" } };
-    }
-    if (method === "turn/status") {
-      return {
-        result: {
-          id: "turn-legacy",
-          thread_id: "thread-legacy",
-          status: "completed",
-          items: [
-            { type: "user_message", content: "hello" },
-            {
-              type: "approval_request",
-              action: "execute_command",
-              approved: null,
-            },
-          ],
-        },
-      };
-    }
-    return { result: {} };
-  });
-
-  const harness = new Harness({
-    fetch: mock.fetch,
-    defaultPollIntervalMs: 1,
-    defaultRunTimeoutMs: 500,
-  });
-  const thread = await harness.startThread({ cwd: "/repo" });
-  const result = await thread.run("Summarize");
-
-  assert.equal(result.status, "completed");
-  assert.equal(result.turn?.items.length, 2);
-  assert.deepEqual(result.turn?.items[1], {
-    type: "approval_request",
-    action: "execute_command",
-    approved: null,
-  });
-});
-
-
-test("run emits timeout event with timeout_ms", async () => {
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-4" } };
-    }
-    if (method === "turn/start") {
-      return { result: { turn_id: "turn-4" } };
-    }
-    if (method === "turn/status") {
-      return {
-        result: {
-          id: "turn-4",
-          thread_id: "thread-4",
-          status: "running",
-          items: [{ type: "user_message", content: "hello" }],
-        },
-      };
-    }
-    return { result: {} };
-  });
-
-  const harness = new Harness({
-    fetch: mock.fetch,
-    defaultPollIntervalMs: 1,
-    defaultRunTimeoutMs: 5,
-  });
-
-  const thread = await harness.startThread({ cwd: "/repo" });
-  const result = await thread.run("Keep going");
-  const timeoutEvent = result.events.find((event) => event.method === SDK_TURN_TIMEOUT);
-
-  assert.equal(result.threadId, "thread-4");
-  assert.equal(result.turnId, "turn-4");
-  assert.equal(result.status, "running");
-  assert.equal(result.timedOut, true);
-  assert.ok(timeoutEvent);
-  assert.equal(timeoutEvent?.params.timeout_ms, 5);
-  assert.equal("timeout_seconds" in timeoutEvent!.params, false);
-});
-
-test("run preserves unknown turn item types in final snapshot", async () => {
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-7" } };
-    }
-    if (method === "turn/start") {
-      return { result: { turn_id: "turn-7" } };
-    }
-    if (method === "turn/status") {
-      return {
-        result: {
-          id: "turn-7",
-          thread_id: "thread-7",
-          status: "completed",
-          items: [
-            { type: "user_message", content: "hello" },
-            { type: "future_item", payload: { a: 1 } },
-          ],
-        },
-      };
-    }
-    return { result: {} };
-  });
-
-  const harness = new Harness({
-    fetch: mock.fetch,
-    defaultPollIntervalMs: 1,
-    defaultRunTimeoutMs: 500,
-  });
-  const thread = await harness.startThread({ cwd: "/repo" });
-  const result = await thread.run("Summarize");
-
-  assert.equal(result.status, "completed");
-  assert.equal(result.turn?.items.length, 2);
-  assert.equal(result.turn?.items[1]?.type, "future_item");
-});
-
-test("run handles timeout when turn never reaches terminal status", async () => {
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-4" } };
-    }
-    if (method === "turn/start") {
-      return { result: { turn_id: "turn-4" } };
-    }
-    if (method === "turn/status") {
-      return {
-        result: {
-          id: "turn-4",
-          thread_id: "thread-4",
-          status: "running",
-          items: [{ type: "user_message", content: "hello" }],
-        },
-      };
-    }
-    return { result: {} };
-  });
-
-  const harness = new Harness({
-    fetch: mock.fetch,
-    defaultPollIntervalMs: 1,
-    defaultRunTimeoutMs: 5,
-  });
-
-  const thread = await harness.startThread({ cwd: "/repo" });
-  const result = await thread.run("Keep going");
-
-  assert.equal(result.threadId, "thread-4");
-  assert.equal(result.turnId, "turn-4");
-  assert.equal(result.status, "running");
-  assert.equal(result.timedOut, true);
-  assert.ok(result.events.some((event) => event.method === SDK_TURN_TIMEOUT));
-});
-
-test("raises HarnessRpcError when server returns JSON-RPC error", async () => {
-  const mock = createMockFetch(() => ({
-    error: { code: -32001, message: "thread not found" },
-  }));
-
+test("startThread requires a project root", async () => {
+  const mock = createMockFetch(() => ({ body: {} }));
   const harness = new Harness({ fetch: mock.fetch });
-  await assert.rejects(() => harness.resumeThread("missing-thread"), (error) => {
-    assert.ok(error instanceof HarnessRpcError);
-    assert.equal(error.code, -32001);
-    return true;
-  });
+
+  await assert.rejects(
+    () => harness.startThread(),
+    /`cwd` is required; pass Harness\(\{ cwd \}\) or startThread\(\{ cwd \}\)\./,
+  );
 });
 
-test("adds bearer token header when apiToken is configured", async () => {
-  const mock = createMockFetch((method) => {
-    if (method === "thread/start") {
-      return { result: { thread_id: "thread-auth" } };
+test("run submits and polls a workflow-runtime prompt", async () => {
+  let detailPolls = 0;
+  const mock = createMockFetch((call) => {
+    if (call.method === "POST" && call.url.endsWith("/api/workflows/runtime/submissions")) {
+      return {
+        status: 202,
+        body: {
+          task_id: "submission-1",
+          submission_id: "submission-1",
+          execution_path: "workflow_runtime",
+        },
+      };
     }
-    return { result: {} };
+    if (call.url.endsWith("/api/workflows/runtime/submissions/submission-1")) {
+      detailPolls += 1;
+      return {
+        body: {
+          submission_id: "submission-1",
+          status: detailPolls === 1 ? "implementing" : "done",
+          project: "/repo",
+          created_at: "2026-07-18T00:00:00Z",
+          updated_at: "2026-07-18T00:00:01Z",
+        },
+      };
+    }
+    if (call.url.endsWith("/api/workflows/runtime/submissions/submission-1/artifacts")) {
+      return {
+        body: [
+          {
+            artifact_type: "activity_result_envelope",
+            content: JSON.stringify({
+              final_result: { summary: "Repository analyzed.", error: null },
+            }),
+          },
+        ],
+      };
+    }
+    throw new Error(`unexpected request: ${call.method} ${call.url}`);
   });
-
   const harness = new Harness({
     fetch: mock.fetch,
     cwd: "/repo",
     apiToken: "token-123",
+    defaultPollIntervalMs: 1,
+    defaultRunTimeoutMs: 500,
   });
-  await harness.startThread();
+  const thread = await harness.startThread();
+  const emitted: ThreadEvent[] = [];
 
-  assert.equal(mock.calls.length, 1);
+  const result = await thread.run("Analyze the repository", {
+    onEvent: (event) => emitted.push(event),
+  });
+
+  assert.equal(result.turnId, "submission-1");
+  assert.equal(result.status, "completed");
+  assert.equal(result.output, "Repository analyzed.");
+  assert.equal(result.timedOut, false);
+  assert.ok(result.events.some((event) => event.method === SDK_TURN_COMPLETED));
+  assert.equal(emitted.length, result.events.length);
+  assert.deepEqual(mock.calls[0]?.body, {
+    project: "/repo",
+    prompt: "Analyze the repository",
+  });
   assert.equal(mock.calls[0]?.headers.authorization, "Bearer token-123");
+});
+
+test("run exposes a terminal runtime error", async () => {
+  const mock = createMockFetch((call) => {
+    if (call.method === "POST") {
+      return {
+        status: 202,
+        body: {
+          task_id: "submission-failed",
+          execution_path: "workflow_runtime",
+        },
+      };
+    }
+    if (call.url.endsWith("/artifacts")) {
+      return {
+        body: [
+          {
+            artifact_type: "activity_result_envelope",
+            content: JSON.stringify({
+              final_result: { summary: "Agent failed.", error: "spawn failed" },
+            }),
+          },
+        ],
+      };
+    }
+    return {
+      body: {
+        submission_id: "submission-failed",
+        status: "failed",
+        project: "/repo",
+      },
+    };
+  });
+  const harness = new Harness({ fetch: mock.fetch, cwd: "/repo" });
+
+  const result = await (await harness.startThread()).run("Fail");
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.output, "Agent failed.\n\nspawn failed");
+});
+
+test("run emits timeout while a runtime submission remains active", async () => {
+  const mock = createMockFetch((call) => {
+    if (call.method === "POST") {
+      return {
+        status: 202,
+        body: { task_id: "submission-running", execution_path: "workflow_runtime" },
+      };
+    }
+    return {
+      body: {
+        submission_id: "submission-running",
+        status: "implementing",
+        project: "/repo",
+      },
+    };
+  });
+  const harness = new Harness({
+    fetch: mock.fetch,
+    cwd: "/repo",
+    defaultPollIntervalMs: 1,
+    defaultRunTimeoutMs: 5,
+  });
+
+  const result = await (await harness.startThread()).run("Keep going");
+
+  assert.equal(result.status, "running");
+  assert.equal(result.timedOut, true);
+  assert.ok(result.events.some((event) => event.method === SDK_TURN_TIMEOUT));
+  assert.ok(mock.calls.every((call) => !call.url.endsWith("/artifacts")));
+});
+
+test("resumeThread reuses a project handle locally", async () => {
+  const mock = createMockFetch(() => ({ body: {} }));
+  const harness = new Harness({ fetch: mock.fetch });
+
+  const thread = await harness.resumeThread("/repo");
+
+  assert.equal(thread.id, "/repo");
+  assert.equal(mock.calls.length, 0);
+});
+
+test("HTTP failures expose status and response data", async () => {
+  const mock = createMockFetch(() => ({
+    status: 503,
+    body: { error: "workflow runtime store unavailable" },
+  }));
+  const harness = new Harness({ fetch: mock.fetch, cwd: "/repo" });
+
+  await assert.rejects(
+    () => harness.startTurn("/repo", "Run"),
+    (error) => {
+      assert.ok(error instanceof HarnessHttpError);
+      assert.equal(error.status, 503);
+      assert.deepEqual(error.data, { error: "workflow runtime store unavailable" });
+      return true;
+    },
+  );
+});
+
+test("malformed runtime result artifacts fail loudly", async () => {
+  const mock = createMockFetch((call) => {
+    if (call.method === "POST") {
+      return {
+        status: 202,
+        body: { task_id: "submission-bad", execution_path: "workflow_runtime" },
+      };
+    }
+    if (call.url.endsWith("/artifacts")) {
+      return {
+        body: [{ artifact_type: "activity_result_envelope", content: "not-json" }],
+      };
+    }
+    return {
+      body: { submission_id: "submission-bad", status: "done", project: "/repo" },
+    };
+  });
+  const harness = new Harness({ fetch: mock.fetch, cwd: "/repo" });
+
+  await assert.rejects(
+    () => harness.startThread().then((thread) => thread.run("Run")),
+    /Invalid activity_result_envelope artifact/,
+  );
 });

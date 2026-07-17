@@ -1,5 +1,5 @@
 use harness_core::types::{
-    DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId, ThreadId,
+    DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId,
 };
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
@@ -154,9 +154,6 @@ pub enum Method {
         request: harness_context::ComposeRequest,
         #[serde(default)]
         supplied_items: Vec<harness_context::ContextItem>,
-    },
-    ContextManifestGet {
-        thread_id: ThreadId,
     },
 }
 
@@ -313,7 +310,6 @@ impl Method {
             Self::Preflight { .. } => "preflight",
             Self::CrossReview { .. } => "cross_review",
             Self::ContextPreview { .. } => "context/preview",
-            Self::ContextManifestGet { .. } => "context/manifest/get",
             Self::SkillGovernanceView { .. } => "skill/governance/view",
             Self::SkillGovernanceHistory { .. } => "skill/governance/history",
             Self::SkillStale => "skill/stale",
@@ -375,26 +371,6 @@ mod context_tests {
             } => {
                 assert_eq!(request.thread_id.as_str(), "thread-1");
                 assert_eq!(supplied_items.len(), 1);
-            }
-            other => panic!("unexpected method: {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn context_rpc_manifest_get_slash_method_deserializes() -> anyhow::Result<()> {
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "context/manifest/get",
-            "params": {"thread_id": "thread-1"}
-        });
-
-        let parsed: RpcRequest = serde_json::from_value(request)?;
-        assert_eq!(parsed.method.method_name(), "context/manifest/get");
-        match parsed.method {
-            Method::ContextManifestGet { thread_id } => {
-                assert_eq!(thread_id.as_str(), "thread-1");
             }
             other => panic!("unexpected method: {other:?}"),
         }

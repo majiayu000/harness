@@ -4,14 +4,10 @@ use harness_context::{
         ContractProvider, ErrorProvider, ExecPlanProvider, GcDraftsProvider, RulesProvider,
         SkillsProvider, TaskBriefProvider,
     },
-    ComposeConfig, ComposeManifest, ComposeMode, ComposeRequest, Composition, ContextComposer,
-    ContextItem,
+    ComposeConfig, ComposeMode, ComposeRequest, Composition, ContextComposer, ContextItem,
 };
 use harness_core::run_id::RunIdentity;
-use harness_core::types::{EventFilters, ThreadId};
-use harness_protocol::methods::{RpcResponse, INTERNAL_ERROR, NOT_FOUND};
-
-const CONTEXT_MANIFEST_HOOK: &str = "context_manifest";
+use harness_protocol::methods::{RpcResponse, INTERNAL_ERROR};
 
 pub async fn context_preview(
     state: &AppState,
@@ -23,43 +19,6 @@ pub async fn context_preview(
     let composer = build_composer(state, ComposeMode::Preview).await;
     match composer.compose_supplied(&request, supplied_items) {
         Ok(composition) => RpcResponse::success(id, composition_response(composition)),
-        Err(error) => RpcResponse::error(id, INTERNAL_ERROR, error.to_string()),
-    }
-}
-
-pub async fn context_manifest_get(
-    state: &AppState,
-    id: Option<serde_json::Value>,
-    thread_id: ThreadId,
-) -> RpcResponse {
-    let filters = EventFilters {
-        hook: Some(CONTEXT_MANIFEST_HOOK.to_string()),
-        tool: Some(thread_id.to_string()),
-        ..Default::default()
-    };
-    match state.observability.events.query(&filters).await {
-        Ok(events) => {
-            let Some(event) = events.into_iter().last() else {
-                return RpcResponse::error(id, NOT_FOUND, "context manifest not found");
-            };
-            let Some(detail) = event.detail else {
-                return RpcResponse::error(
-                    id,
-                    INTERNAL_ERROR,
-                    "context manifest event missing detail",
-                );
-            };
-            match serde_json::from_str::<ComposeManifest>(&detail) {
-                Ok(manifest) => {
-                    RpcResponse::success(id, serde_json::json!({ "manifest": manifest }))
-                }
-                Err(error) => RpcResponse::error(
-                    id,
-                    INTERNAL_ERROR,
-                    format!("failed to decode context manifest: {error}"),
-                ),
-            }
-        }
         Err(error) => RpcResponse::error(id, INTERNAL_ERROR, error.to_string()),
     }
 }

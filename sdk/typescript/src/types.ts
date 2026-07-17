@@ -31,7 +31,7 @@ export type FetchLike = (
   init: {
     method: string;
     headers: Record<string, string>;
-    body: string;
+    body?: string;
   },
 ) => Promise<FetchResponseLike>;
 
@@ -153,7 +153,7 @@ interface ThreadStartedEventParams {
   thread_id: string;
   turn_id: string;
   source: "sdk-poll";
-  server_method: "turn/start";
+  server_method: "POST /api/workflows/runtime/submissions";
 }
 
 interface ThreadStatusEventParams {
@@ -161,7 +161,7 @@ interface ThreadStatusEventParams {
   turn_id: string;
   turn: TurnSnapshot;
   source: "sdk-poll";
-  server_method: "turn/status";
+  server_method: "GET /api/workflows/runtime/submissions/{id}";
 }
 
 interface ThreadCompletedEventParams {
@@ -170,7 +170,7 @@ interface ThreadCompletedEventParams {
   status: TurnStatus;
   token_usage: TokenUsage | null;
   source: "sdk-poll";
-  server_method: "turn/status";
+  server_method: "GET /api/workflows/runtime/submissions/{id}";
 }
 
 interface ThreadTimeoutEventParams {
@@ -178,7 +178,7 @@ interface ThreadTimeoutEventParams {
   turn_id: string;
   timeout_ms: number;
   source: "sdk-poll";
-  server_method: "turn/status";
+  server_method: "GET /api/workflows/runtime/submissions/{id}";
 }
 
 export type ThreadStartedEvent = ThreadEventBase<"sdk:turn/started", ThreadStartedEventParams>;

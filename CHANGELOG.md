@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **breaking:** removed Harness-owned JSON-RPC thread/turn lifecycle methods and
+  the unwritten `context/manifest/get` endpoint. Use workflow-runtime HTTP
+  submissions for durable work; live approval responses now use
+  `POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}`. The
+  TypeScript and Python SDKs have migrated to these HTTP surfaces.
 - **security:** HTTP API authentication now fails closed when neither
   `api_token` nor `HARNESS_API_TOKEN` is configured. Operators must set a token
   or explicitly opt in to tokenless local development with

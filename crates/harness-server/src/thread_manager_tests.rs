@@ -589,6 +589,22 @@ async fn respond_approval_on_turn_propagates_unsupported_error() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn respond_approval_on_turn_rejects_unknown_turn() {
+    let tm = ThreadManager::new();
+    let turn_id = TurnId::from_str("missing-turn");
+
+    let error = tm
+        .respond_approval_on_turn(&turn_id, "req-1".to_string(), ApprovalDecision::Accept)
+        .await
+        .expect_err("unknown turn must fail");
+
+    assert!(matches!(
+        error,
+        harness_core::error::HarnessError::TurnNotFound(ref id) if id == "missing-turn"
+    ));
+}
+
+#[tokio::test]
 async fn steer_active_turn_after_deregister_is_noop() -> anyhow::Result<()> {
     let tm = ThreadManager::new();
     let thread_id = tm.start_thread(PathBuf::from("/tmp"));
