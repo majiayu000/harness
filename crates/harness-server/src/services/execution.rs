@@ -879,6 +879,9 @@ impl DefaultExecutionService {
                 serialization_depends_on: &prepared.req.serialization_depends_on,
                 source: prepared.req.source.as_deref(),
                 external_id: prepared.req.external_id.as_deref(),
+                subject_key: None,
+                repo: prepared.req.repo.as_deref(),
+                author_trust_class: None,
             },
         )
         .await

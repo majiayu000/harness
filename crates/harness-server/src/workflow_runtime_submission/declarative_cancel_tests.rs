@@ -50,6 +50,7 @@ fn definition(with_stop_signal: bool) -> harness_workflow::runtime::DeclarativeW
             ]),
             evidence_required: BTreeMap::new(),
             recovery_targets: vec!["working".to_string()],
+            intake: None,
         },
         &BTreeMap::from([(
             "perform_work".to_string(),

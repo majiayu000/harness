@@ -57,6 +57,7 @@ fn definition() -> crate::runtime::declarative::DeclarativeWorkflowDefinition {
             "waiting".to_string(),
             "approval".to_string(),
         ],
+        intake: None,
     };
     build_declarative_definition(
         &policy,

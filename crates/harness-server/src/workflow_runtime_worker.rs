@@ -301,6 +301,7 @@ fn runtime_submission_completion_task(
     let task_kind = match instance.definition_id.as_str() {
         GITHUB_ISSUE_PR_DEFINITION_ID => TaskKind::Issue,
         PROMPT_TASK_DEFINITION_ID => TaskKind::Prompt,
+        _ if instance.subject.subject_type == "declarative" => TaskKind::Prompt,
         _ => return None,
     };
     let source = optional_data_string(instance, "source")?;
@@ -421,6 +422,23 @@ mod tests {
         }))
     }
 
+    fn declarative_intake_instance(state: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID,
+            1,
+            state,
+            WorkflowSubject::new("declarative", "github:owner/repo:issue:42"),
+        )
+        .with_data(json!({
+            "task_id": "runtime-declarative-42",
+            "project_id": "/tmp/project",
+            "prompt_summary": "declarative workflow task",
+            "source": "github",
+            "external_id": "42",
+            "repo": "owner/repo",
+        }))
+    }
+
     #[test]
     fn runtime_submission_completion_task_maps_done_via_projection() {
         let instance = issue_instance("done");
@@ -478,6 +496,23 @@ mod tests {
         assert_eq!(task.external_id.as_deref(), Some("manual:prompt:42"));
         assert_eq!(task.issue, None);
         assert_eq!(task.description.as_deref(), Some("prompt task"));
+    }
+
+    #[test]
+    fn runtime_submission_completion_task_preserves_declarative_intake_identity() {
+        let instance = declarative_intake_instance("passed");
+        let result = ActivityResult::succeeded("quality_gate", "Declared workflow completed.");
+
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+            panic!("terminal declarative intake should map to an intake task");
+        };
+
+        assert_eq!(task.id.as_str(), "runtime-declarative-42");
+        assert_eq!(task.task_kind, TaskKind::Prompt);
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.source.as_deref(), Some("github"));
+        assert_eq!(task.external_id.as_deref(), Some("42"));
+        assert_eq!(task.repo.as_deref(), Some("owner/repo"));
     }
 
     #[test]

@@ -272,6 +272,15 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let intake =
         builders::intake::build_intake(&server, &storage, &engines, &registry, &project_root, &dir)
             .await?;
+    // Validate bindings against the sources that were actually registered for
+    // poll_tick. Configured webhook-only sources and disabled pollers cannot
+    // silently pass startup validation (GH-1656, B-002).
+    let routed_sources = intake
+        .github_pollers
+        .iter()
+        .map(|(_, source)| source.name().to_string())
+        .collect();
+    let intake_bindings = server.build_intake_binding_registry(&routed_sources)?;
 
     // Phase 5: services — interceptor stack, service layer, runtime host/project-cache
     // managers, snapshot restore, recovery validator spawn.
@@ -431,6 +440,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                 github_poller_repos,
                 completion_callback: intake.completion_callback,
                 token_dispatch_counters: IntakeServices::new_token_dispatch_counters(),
+                intake_bindings,
             }
         },
         project_svc: services.project_svc,
