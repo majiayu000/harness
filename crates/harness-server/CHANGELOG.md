@@ -391,7 +391,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restricted_tools returns Result to hard-fail on misconfigured profiles ([#494](https://github.com/majiayu000/harness/pull/494))
 - remove --allowedTools flag that crashes Claude CLI 2.1.70 ([#483](https://github.com/majiayu000/harness/pull/483)) ([#493](https://github.com/majiayu000/harness/pull/493))
 - *(periodic_reviewer)* prevent stale deduplication on EventStore write failure ([#484](https://github.com/majiayu000/harness/pull/484)) ([#492](https://github.com/majiayu000/harness/pull/492))
-- eliminate TOCTOU race in review_store check-then-insert ([#485](https://github.com/majiayu000/harness/pull/485)) ([#491](https://github.com/majiayu000/harness/pull/491))
+- eliminate TOCTOU race in review store check-then-insert ([#485](https://github.com/majiayu000/harness/pull/485)) ([#491](https://github.com/majiayu000/harness/pull/491))
 - *(sec)* deny access when allowed_project_root canonicalization fails ([#490](https://github.com/majiayu000/harness/pull/490))
 - add prompt diagnostics log before agent execution to debug empty-prompt failures
 - periodic review JSON parsing — use REVIEW_JSON_START/END markers and reorder prompt to create issues before outputting JSON

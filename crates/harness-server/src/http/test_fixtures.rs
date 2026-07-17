@@ -220,7 +220,6 @@ async fn make_read_only_route_test_state_with_project_root(
             password_reset_rate_limiter: Arc::new(
                 crate::http::rate_limit::PasswordResetRateLimiter::new(password_reset_rate_limit),
             ),
-            review_store: None,
         },
         concurrency: ConcurrencyServices {
             task_queue,

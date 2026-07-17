@@ -12,11 +12,10 @@ pub enum UsageProbeSurface {
     TaskExecutor,
     TaskRunner,
     HarnessEval,
-    ReviewStore,
 }
 
 impl UsageProbeSurface {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::ThreadRpc,
         Self::TurnRpc,
         Self::ThreadManager,
@@ -24,7 +23,6 @@ impl UsageProbeSurface {
         Self::TaskExecutor,
         Self::TaskRunner,
         Self::HarnessEval,
-        Self::ReviewStore,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -36,7 +34,6 @@ impl UsageProbeSurface {
             Self::TaskExecutor => "task_executor",
             Self::TaskRunner => "task_runner",
             Self::HarnessEval => "harness_eval",
-            Self::ReviewStore => "review_store",
         }
     }
 
@@ -49,7 +46,6 @@ impl UsageProbeSurface {
             Self::TaskExecutor => &TASK_EXECUTOR_COUNT,
             Self::TaskRunner => &TASK_RUNNER_COUNT,
             Self::HarnessEval => &HARNESS_EVAL_COUNT,
-            Self::ReviewStore => &REVIEW_STORE_COUNT,
         }
     }
 }
@@ -67,7 +63,6 @@ static TASK_DB_COUNT: AtomicU64 = AtomicU64::new(0);
 static TASK_EXECUTOR_COUNT: AtomicU64 = AtomicU64::new(0);
 static TASK_RUNNER_COUNT: AtomicU64 = AtomicU64::new(0);
 static HARNESS_EVAL_COUNT: AtomicU64 = AtomicU64::new(0);
-static REVIEW_STORE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_usage(surface: UsageProbeSurface) {
     surface.counter().fetch_add(1, Ordering::Relaxed);
@@ -116,14 +111,11 @@ mod tests {
     #[test]
     fn snapshot_includes_recorded_surface_counts() {
         let thread_before = count_for("thread_rpc");
-        let review_before = count_for("review_store");
 
         record_usage(UsageProbeSurface::ThreadRpc);
         record_usage(UsageProbeSurface::ThreadRpc);
-        record_usage(UsageProbeSurface::ReviewStore);
 
         assert!(count_for("thread_rpc") >= thread_before + 2);
-        assert!(count_for("review_store") > review_before);
     }
 
     #[test]

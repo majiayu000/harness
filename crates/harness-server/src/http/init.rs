@@ -66,93 +66,6 @@ fn startup_failure_error(startup_statuses: &[StoreStartupResult]) -> Option<anyh
     })
 }
 
-async fn build_review_store(
-    data_dir: &std::path::Path,
-    configured_database_url: Option<&str>,
-) -> anyhow::Result<(
-    Option<Arc<crate::review_store::ReviewStore>>,
-    StoreStartupResult,
-)> {
-    let review_db_path = harness_core::config::dirs::default_db_path(data_dir, "reviews");
-    let forced = builders::forced_startup_error("review_store");
-    if let Some(error) = forced {
-        return Ok((
-            None,
-            StoreStartupResult::optional("review_store").failed(error),
-        ));
-    }
-
-    let database_url = match harness_core::db::resolve_database_url(configured_database_url) {
-        Ok(database_url) => database_url,
-        Err(error) => {
-            return Ok((
-                None,
-                StoreStartupResult::optional("review_store").failed(error.to_string()),
-            ));
-        }
-    };
-    let setup_pool = match harness_core::db::pg_open_pool(&database_url).await {
-        Ok(pool) => pool,
-        Err(error) => {
-            return Ok((
-                None,
-                StoreStartupResult::optional("review_store").failed(error.to_string()),
-            ));
-        }
-    };
-
-    let context = match crate::review_store::ReviewStore::shared_schema_context(Some(&database_url))
-    {
-        Ok(context) => {
-            if let Err(error) =
-                builders::ensure_startup_context_not_path_derived("review_store", &context)
-            {
-                setup_pool.close().await;
-                return Ok((
-                    None,
-                    StoreStartupResult::optional("review_store").failed(error.to_string()),
-                ));
-            }
-            context
-        }
-        Err(error) => {
-            setup_pool.close().await;
-            return Ok((
-                None,
-                StoreStartupResult::optional("review_store").failed(error.to_string()),
-            ));
-        }
-    };
-    let review_store =
-        crate::review_store::ReviewStore::open_with_context(&context, &setup_pool).await;
-    setup_pool.close().await;
-
-    match review_store {
-        Ok(store) => {
-            match crate::review_store::migrate_legacy_review_store_if_needed(
-                &review_db_path,
-                Some(&database_url),
-                &store,
-            )
-            .await
-            {
-                Ok(_) => Ok((
-                    Some(Arc::new(store)),
-                    StoreStartupResult::optional("review_store"),
-                )),
-                Err(error) => Ok((
-                    None,
-                    StoreStartupResult::optional("review_store").failed(error.to_string()),
-                )),
-            }
-        }
-        Err(error) => Ok((
-            None,
-            StoreStartupResult::optional("review_store").failed(error.to_string()),
-        )),
-    }
-}
-
 /// Build an AppState with all stores. Used by both HTTP and stdio transports.
 ///
 /// Initialization is split into five ordered phases — each phase's outputs
@@ -224,7 +137,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         }
     }
 
-    // Phase 1: storage — dir validation (symlink check, chmod), task DB, eval store.
+    // Phase 1: storage — dir validation (symlink check, chmod), task DB.
     let storage = builders::storage::build_storage_with_database_url(
         &dir,
         server.config.server.database_url.as_deref(),
@@ -329,11 +242,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
         .unavailable_required_tiers(&server.config.isolation)
         .is_empty();
 
-    let (review_store, review_status) =
-        build_review_store(&dir, server.config.server.database_url.as_deref()).await?;
     #[cfg(test)]
     drop(db_setup_guard);
-    startup_statuses.push(review_status);
 
     // NOTE: add a matching entry here whenever a new optional store is added.
     let mut degraded_subsystems: Vec<&'static str> = startup_statuses
@@ -400,7 +310,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             password_reset_rate_limiter: Arc::new(rate_limit::PasswordResetRateLimiter::new(
                 password_reset_rate_limit,
             )),
-            review_store,
         },
         concurrency: ConcurrencyServices {
             task_queue: intake.task_queue,

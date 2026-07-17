@@ -45,7 +45,6 @@ pub(crate) mod postgres_catalog;
 pub mod project_registry;
 pub mod quality_trigger;
 pub mod redact;
-pub mod review_store;
 pub mod router;
 pub(crate) mod runtime_circuit_breaker;
 pub mod runtime_hosts;

@@ -296,18 +296,15 @@ async fn health_startup_errors_are_redacted() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut state = make_read_only_route_test_state(dir.path()).await?;
     let state_mut = Arc::get_mut(&mut state).unwrap();
-    state_mut.degraded_subsystems = vec!["review_store"];
-    state_mut.startup_statuses =
-        vec![
-            crate::http::state::StoreStartupResult::optional("review_store")
-                .failed("failed to connect to postgres://user:secret@db.internal/harness"),
-        ];
+    state_mut.degraded_subsystems = vec!["plan_db"];
+    state_mut.startup_statuses = vec![crate::http::state::StoreStartupResult::optional("plan_db")
+        .failed("failed to connect to postgres://user:secret@db.internal/harness")];
 
     let health = call_health(state).await?;
     assert_eq!(health.status, "degraded");
     assert_eq!(health.persistence.startup.stores.len(), 1);
     let store = &health.persistence.startup.stores[0];
-    assert_eq!(store.name, "review_store");
+    assert_eq!(store.name, "plan_db");
     assert!(!store.critical);
     assert!(!store.ready);
     assert_eq!(store.error.as_deref(), Some("database_unavailable"));
