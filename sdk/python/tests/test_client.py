@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+import urllib.error
 from typing import Any
 from unittest import mock
 
@@ -157,6 +158,34 @@ class HarnessSdkTests(unittest.TestCase):
             any(event["method"] == "sdk:turn/timeout" for event in result.events)
         )
         self.assertFalse(any(path.endswith("/artifacts") for path in calls))
+
+    def test_run_converts_poll_socket_timeout_to_timeout_event(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-socket-timeout",
+                    "execution_path": "workflow_runtime",
+                }
+            raise TimeoutError("socket timed out")
+
+        result = Harness(cwd="/repo", http_handler=handler).start_thread().run(
+            "Keep going", timeout_seconds=0.005
+        )
+
+        self.assertEqual(result.status, "running")
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.events[-1]["method"], "sdk:turn/timeout")
+
+    def test_wrapped_socket_timeout_preserves_timeout_type(self) -> None:
+        harness = Harness(base_url="http://127.0.0.1:9800")
+
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError(TimeoutError("socket timed out")),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "HTTP request timed out"):
+                harness.turn_status("submission-timeout")
 
     def test_resume_thread_reuses_project_handle_locally(self) -> None:
         runtime = FakeRuntime()

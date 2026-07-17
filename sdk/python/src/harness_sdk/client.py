@@ -224,6 +224,8 @@ class Harness:
             )
             raise HarnessHttpError(error.code, message, data) from error
         except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise TimeoutError("HTTP request timed out") from error
             raise RuntimeError(f"HTTP request failed: {error.reason}") from error
         try:
             return json.loads(raw)
@@ -259,7 +261,8 @@ class HarnessThread:
                 candidate = event["params"].get("turn")
                 if isinstance(candidate, dict):
                     latest_turn = candidate
-        if latest_turn is None and turn_id:
+        timed_out = any(event["method"] == "sdk:turn/timeout" for event in events)
+        if latest_turn is None and turn_id and not timed_out:
             latest_turn = self._client.turn_status(turn_id, project=self.id)
         status = str(latest_turn.get("status", "running")) if latest_turn else "running"
         return RunResult(
@@ -269,7 +272,7 @@ class HarnessThread:
             output=_extract_output(latest_turn),
             turn=latest_turn,
             events=events,
-            timed_out=any(event["method"] == "sdk:turn/timeout" for event in events),
+            timed_out=timed_out,
         )
 
     def run_stream(
@@ -282,8 +285,23 @@ class HarnessThread:
         poll_interval = max(0.01, poll_interval_seconds)
         timeout = max(0.001, timeout_seconds)
         started_at = time.monotonic()
+        deadline = started_at + timeout
         previous_signature = ""
         turn_id = str(self._client.start_turn(self.id, prompt)["turn_id"])
+
+        def timeout_event() -> Event:
+            return _emit(
+                "sdk:turn/timeout",
+                {
+                    "thread_id": self.id,
+                    "turn_id": turn_id,
+                    "timeout_seconds": timeout_seconds,
+                    "source": "sdk-poll",
+                    "server_method": "GET /api/workflows/runtime/submissions/{id}",
+                },
+                on_event,
+            )
+
         yield _emit(
             "sdk:turn/started",
             {
@@ -295,12 +313,19 @@ class HarnessThread:
             on_event,
         )
         while True:
-            remaining = max(0.001, timeout - (time.monotonic() - started_at))
-            turn = self._client.turn_status(
-                turn_id,
-                min(self._client.request_timeout_seconds, remaining),
-                project=self.id,
-            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                yield timeout_event()
+                return
+            try:
+                turn = self._client.turn_status(
+                    turn_id,
+                    min(self._client.request_timeout_seconds, remaining),
+                    project=self.id,
+                )
+            except TimeoutError:
+                yield timeout_event()
+                return
             signature = json.dumps(
                 [turn.get("status"), turn.get("items"), turn.get("completed_at")],
                 sort_keys=True,
@@ -333,18 +358,8 @@ class HarnessThread:
                     on_event,
                 )
                 return
-            if time.monotonic() - started_at >= timeout:
-                yield _emit(
-                    "sdk:turn/timeout",
-                    {
-                        "thread_id": self.id,
-                        "turn_id": turn_id,
-                        "timeout_seconds": timeout_seconds,
-                        "source": "sdk-poll",
-                        "server_method": "GET /api/workflows/runtime/submissions/{id}",
-                    },
-                    on_event,
-                )
+            if time.monotonic() >= deadline:
+                yield timeout_event()
                 return
             time.sleep(poll_interval)
 
