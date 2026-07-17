@@ -122,12 +122,49 @@ pub(super) async fn poll_task_output(
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ReviewOutput {
-    pub(super) findings: Vec<serde_json::Value>,
+    pub(super) findings: Vec<ReviewFinding>,
     pub(super) summary: ReviewSummary,
+}
+
+/// Validation-only representation of the finding schema required by the
+/// periodic-review prompt. The fields stay private because the persistence and
+/// auto-fix consumers were removed with the review store.
+#[derive(Debug, Deserialize)]
+pub(super) struct ReviewFinding {
+    #[serde(rename = "id")]
+    _id: String,
+    #[serde(rename = "rule_id")]
+    _rule_id: String,
+    #[serde(rename = "priority")]
+    _priority: String,
+    #[serde(rename = "impact")]
+    _impact: i32,
+    #[serde(rename = "confidence")]
+    _confidence: i32,
+    #[serde(rename = "effort")]
+    _effort: i32,
+    #[serde(rename = "file")]
+    _file: String,
+    #[serde(rename = "line")]
+    _line: i64,
+    #[serde(rename = "title")]
+    _title: String,
+    #[serde(rename = "description")]
+    _description: String,
+    #[serde(rename = "action")]
+    _action: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ReviewSummary {
+    #[serde(rename = "p0_count")]
+    _p0_count: i32,
+    #[serde(rename = "p1_count")]
+    _p1_count: i32,
+    #[serde(rename = "p2_count")]
+    _p2_count: i32,
+    #[serde(rename = "p3_count")]
+    _p3_count: i32,
     pub(super) health_score: i32,
 }
 
@@ -164,7 +201,7 @@ pub(super) fn parse_review_output(raw: &str) -> anyhow::Result<ReviewOutput> {
 mod review_output_tests {
     use super::parse_review_output;
 
-    const EMPTY_REVIEW: &str = r#"{"findings":[],"summary":{"health_score":100}}"#;
+    const EMPTY_REVIEW: &str = r#"{"findings":[],"summary":{"p0_count":0,"p1_count":0,"p2_count":0,"p3_count":0,"health_score":100}}"#;
 
     #[test]
     fn parses_clean_json() -> anyhow::Result<()> {
@@ -193,5 +230,11 @@ mod review_output_tests {
     #[test]
     fn rejects_output_without_json() {
         assert!(parse_review_output("not json at all").is_err());
+    }
+
+    #[test]
+    fn rejects_findings_that_do_not_match_the_prompt_schema() {
+        let malformed = r#"{"findings":[{}],"summary":{"p0_count":0,"p1_count":0,"p2_count":0,"p3_count":0,"health_score":100}}"#;
+        assert!(parse_review_output(malformed).is_err());
     }
 }
