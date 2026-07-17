@@ -45,9 +45,9 @@ current `origin/main`.
 - [ ] B-001: `completion_reducer_quality.rs` and
       `completion_reducer_quality_gate.rs` each contain no more than 800
       formatted lines.
-- [ ] B-002: Exact-base lines 1-498 remain byte-for-byte unchanged in
+- [ ] B-002: Exact-base lines 1-497 remain byte-for-byte unchanged in
       `completion_reducer_quality.rs`.
-- [ ] B-003: Exact-base lines 499-896 appear byte-for-byte unchanged and in
+- [ ] B-003: Exact-base lines 498-896 appear byte-for-byte unchanged and in
       order in `completion_reducer_quality_gate.rs`.
 - [ ] B-004: `runtime/tests.rs` adds exactly one sibling
       `include!("tests/completion_reducer_quality_gate.rs");` immediately after
@@ -73,6 +73,9 @@ current `origin/main`.
 - Quality-gate rejection tests for missing, conflicting, invalid, and
   incomplete evidence must remain exact; test integrity must not be weakened.
 - No test may be duplicated or omitted across the split boundary.
+- Exact-base line 498 is a blank separator. It must move to the start of the
+  sibling file so the retained file does not end with a blank line rejected by
+  the mandatory committed-whitespace check.
 - The sibling include must remain adjacent so source organization mirrors the
   conceptual reducer grouping.
 
