@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { useTaskStream, useCancelTask, useCancelWorkflowRuntime } from "@/lib/queries";
-import { TOKEN_KEY } from "@/lib/api";
+import { useTaskStream, useCancelWorkflowRuntime } from "@/lib/queries";
+import { runtimeSubmissionPath, TOKEN_KEY } from "@/lib/api";
 
 interface Props {
   taskId: string;
@@ -12,22 +12,20 @@ interface Props {
 export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Props) {
   const [output, setOutput] = useState<string>("");
   const [streamError, setStreamError] = useState<string | null>(null);
-  const cancelTask = useCancelTask();
   const cancelWorkflowRuntime = useCancelWorkflowRuntime();
+  const canUseRuntimeSubmission = executionPath === "workflow_runtime";
   const canCancelWorkflowRuntime = executionPath === "workflow_runtime" && !!workflowId;
-  const cancelPending = canCancelWorkflowRuntime
-    ? cancelWorkflowRuntime.isPending
-    : cancelTask.isPending;
+  const cancelPending = cancelWorkflowRuntime.isPending;
 
   useTaskStream(
-    taskId,
+    canUseRuntimeSubmission ? taskId : null,
     (text) => setOutput((prev) => prev + text),
     (err) => setStreamError(err),
   );
 
   function openStream() {
     const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-    const base = `/tasks/${taskId}/stream`;
+    const base = runtimeSubmissionPath(taskId, "stream");
     const url = tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
     window.open(url, "_blank", "noreferrer");
   }
@@ -36,7 +34,7 @@ export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Pr
     if (canCancelWorkflowRuntime && workflowId) {
       cancelWorkflowRuntime.mutate(workflowId, { onSuccess: onReset });
     } else {
-      cancelTask.mutate(taskId, { onSuccess: onReset });
+      setStreamError("Workflow runtime id unavailable; cancellation was not sent");
     }
   }
 
@@ -54,14 +52,17 @@ export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Pr
       <div className="flex gap-2">
         <button
           type="button"
+          disabled={!canUseRuntimeSubmission}
+          title={canUseRuntimeSubmission ? undefined : "Runtime submission unavailable"}
           onClick={openStream}
-          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
+          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink disabled:opacity-50 disabled:cursor-not-allowed"
         >
           Watch live
         </button>
         <button
           type="button"
-          disabled={cancelPending}
+          disabled={cancelPending || !canCancelWorkflowRuntime}
+          title={canCancelWorkflowRuntime ? undefined : "Workflow runtime id unavailable"}
           onClick={handleCancel}
           className="font-mono text-[11.5px] px-3 py-1 border border-danger/40 text-danger rounded-[3px] hover:bg-danger/5 disabled:opacity-50 disabled:cursor-not-allowed"
         >

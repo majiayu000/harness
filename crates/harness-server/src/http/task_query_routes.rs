@@ -8,11 +8,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use super::state::AppState;
-use crate::runtime_projection::{runtime_string_field, RuntimeWorkflowProjection};
 use crate::task_runner::{
     SchedulerAuthorityState, TaskId, TaskKind, TaskState, TaskStatus, TaskSummary,
     TaskSummaryFilter, TaskSummaryPageCursor, TaskTerminalInfo, TaskWorkflowSummary,
@@ -20,7 +19,16 @@ use crate::task_runner::{
 use harness_core::proof_of_work::{CiStatus, ProofOfWork, QualitySignal, ReviewOutcome};
 
 mod detail;
-pub(crate) use detail::{get_task, get_task_artifacts, get_task_prompts, get_task_proof};
+mod runtime_submissions;
+pub(crate) use detail::{
+    get_runtime_submission, get_runtime_submission_proof, get_task, get_task_artifacts,
+    get_task_prompts, get_task_proof,
+};
+use runtime_submissions::append_runtime_submission_summaries;
+pub(super) use runtime_submissions::{
+    runtime_external_id, runtime_submission_task_kind, runtime_task_id_array,
+    workflow_runtime_store_required,
+};
 
 #[cfg(test)]
 pub(crate) use detail::{proof_from_runtime_workflow, proof_from_state};
@@ -268,6 +276,70 @@ pub(crate) async fn list_tasks(
                 .into_response()
         }
     }
+}
+
+/// List workflow-runtime submissions without consulting the legacy task store.
+pub(crate) async fn list_runtime_submissions(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<RawTaskListParams>, QueryRejection>,
+) -> Response {
+    let raw_query = match query {
+        Ok(Query(query)) => query,
+        Err(error) => {
+            return task_list_bad_request(
+                "invalid_query",
+                format!("Invalid runtime submission query parameters: {error}"),
+                None,
+            )
+            .into_response();
+        }
+    };
+    let query = match TaskListQuery::from_raw(raw_query) {
+        Ok(query) => query,
+        Err(error) => return error.into_response(),
+    };
+    if state.core.workflow_runtime_store.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "workflow runtime store unavailable"})),
+        )
+            .into_response();
+    }
+
+    let cursor = query
+        .cursor
+        .as_ref()
+        .map(TaskListCursor::as_task_summary_cursor);
+    let mut summaries = Vec::new();
+    if let Err(error) = append_runtime_submission_summaries(
+        &state,
+        &mut summaries,
+        &query.filter,
+        cursor.as_ref(),
+        query.limit + 1,
+    )
+    .await
+    {
+        tracing::error!(
+            "list_runtime_submissions: failed to load runtime submission summaries: {error}"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "internal server error"})),
+        )
+            .into_response();
+    }
+
+    sort_task_summaries(&mut summaries);
+    let (data, page) = paginate_task_summaries(&summaries, &query);
+    let counts = task_list_counts(&data);
+    Json(TaskListResponse {
+        data: data.into_iter().map(TaskSummaryResponse::from).collect(),
+        page,
+        counts,
+        degraded: None,
+    })
+    .into_response()
 }
 
 impl TaskListQuery {
@@ -554,178 +626,6 @@ fn task_is_after_cursor(summary: &TaskSummary, cursor: &TaskListCursor) -> bool 
 fn task_list_cursor_for_summary(summary: &TaskSummary) -> Option<String> {
     let created_at = summary.created_at.as_deref()?;
     Some(format!("{}|{}", created_at, summary.id.as_str()))
-}
-
-async fn append_runtime_submission_summaries(
-    state: &AppState,
-    summaries: &mut Vec<TaskSummary>,
-    filter: &TaskSummaryFilter,
-    cursor: Option<&TaskSummaryPageCursor>,
-    limit: usize,
-) -> anyhow::Result<()> {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        if workflow_runtime_summaries_required(state, filter) {
-            anyhow::bail!("workflow runtime store is unavailable");
-        }
-        return Ok(());
-    };
-    append_runtime_definition_summaries(
-        store,
-        summaries,
-        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-        TaskKind::Issue,
-        filter,
-        cursor,
-        limit,
-    )
-    .await?;
-    append_runtime_definition_summaries(
-        store,
-        summaries,
-        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
-        TaskKind::Prompt,
-        filter,
-        cursor,
-        limit,
-    )
-    .await
-}
-
-fn workflow_runtime_summaries_required(state: &AppState, filter: &TaskSummaryFilter) -> bool {
-    workflow_runtime_store_required(state) && filter_includes_runtime_submission_kinds(filter)
-}
-
-pub(super) fn workflow_runtime_store_required(state: &AppState) -> bool {
-    state
-        .startup_statuses
-        .iter()
-        .any(|status| status.name == "workflow_runtime_store")
-        || state
-            .degraded_subsystems
-            .contains(&"workflow_runtime_store")
-}
-
-fn filter_includes_runtime_submission_kinds(filter: &TaskSummaryFilter) -> bool {
-    filter.kinds.is_empty()
-        || filter.kinds.contains(&TaskKind::Issue)
-        || filter.kinds.contains(&TaskKind::Prompt)
-}
-
-async fn append_runtime_definition_summaries(
-    store: &harness_workflow::runtime::WorkflowRuntimeStore,
-    summaries: &mut Vec<TaskSummary>,
-    definition_id: &str,
-    task_kind: TaskKind,
-    filter: &TaskSummaryFilter,
-    cursor: Option<&TaskSummaryPageCursor>,
-    limit: usize,
-) -> anyhow::Result<()> {
-    if !filter.kinds.is_empty() && !filter.kinds.contains(&task_kind) {
-        return Ok(());
-    }
-    let workflows = store
-        .list_instances_by_definition_page(
-            definition_id,
-            filter.project.as_deref(),
-            cursor.map(|cursor| cursor.created_at),
-            cursor.map(|cursor| cursor.id.as_str()),
-            i64::try_from(limit.max(1)).unwrap_or(i64::MAX),
-        )
-        .await?;
-    let mut listed_ids: HashSet<String> = summaries
-        .iter()
-        .map(|summary| summary.id.as_str().to_string())
-        .collect();
-    for workflow in workflows {
-        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
-        let Some(task_id) = projection.submission_handle.clone() else {
-            continue;
-        };
-        if !listed_ids.insert(task_id.as_str().to_string()) {
-            continue;
-        }
-        let summary = runtime_workflow_task_summary(workflow, task_id, task_kind);
-        if filter.matches_summary(&summary) {
-            summaries.push(summary);
-        }
-    }
-    Ok(())
-}
-
-fn runtime_workflow_task_summary(
-    workflow: harness_workflow::runtime::WorkflowInstance,
-    task_id: harness_core::types::TaskId,
-    task_kind: TaskKind,
-) -> TaskSummary {
-    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
-    let status = projection.task_status.clone();
-    let issue = workflow
-        .data
-        .get("issue_number")
-        .and_then(|value| value.as_u64());
-    let external_id = runtime_external_id(task_kind, &workflow.data, issue);
-    let description = match task_kind {
-        TaskKind::Issue => Some(
-            issue
-                .map(|issue_number| format!("issue #{issue_number}"))
-                .unwrap_or_else(|| workflow.subject.subject_key.clone()),
-        ),
-        TaskKind::Prompt => Some(
-            runtime_string_field(&workflow.data, "prompt_summary")
-                .unwrap_or_else(|| "prompt task".to_string()),
-        ),
-        _ => Some(workflow.subject.subject_key.clone()),
-    };
-    TaskSummary {
-        id: task_id,
-        task_kind,
-        status: status.clone(),
-        failure_kind: projection.failure_kind,
-        turn: 0,
-        pr_url: runtime_string_field(&workflow.data, "pr_url"),
-        error: runtime_string_field(&workflow.data, "failure_reason"),
-        source: runtime_string_field(&workflow.data, "source"),
-        parent_id: None,
-        external_id,
-        repo: runtime_string_field(&workflow.data, "repo"),
-        description,
-        created_at: Some(workflow.created_at.to_rfc3339()),
-        phase: projection.phase,
-        depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
-        subtask_ids: Vec::new(),
-        project: projection.project_id,
-        workspace_path: None,
-        workspace_owner: None,
-        run_generation: 0,
-        workflow: Some(TaskWorkflowSummary::from_runtime_workflow(&workflow)),
-        scheduler: projection.scheduler,
-    }
-}
-
-/// Render the `external_id` shown for a runtime-backed task in dashboard
-/// responses. Pulled out of two identical match blocks in
-/// [`runtime_workflow_task_summary`] and [`runtime_task_response_by_handle`]
-/// so that adding a new `TaskKind` variant only edits one place.
-pub(super) fn runtime_external_id(
-    task_kind: TaskKind,
-    workflow_data: &serde_json::Value,
-    issue: Option<u64>,
-) -> Option<String> {
-    match task_kind {
-        TaskKind::Issue => issue.map(|issue_number| format!("issue:{issue_number}")),
-        TaskKind::Prompt => runtime_string_field(workflow_data, "external_id"),
-        TaskKind::Pr | TaskKind::Review | TaskKind::Planner => None,
-    }
-}
-
-fn runtime_task_id_array(data: &serde_json::Value, field: &str) -> Vec<TaskId> {
-    data.get(field)
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str())
-        .map(TaskId::from_str)
-        .collect()
 }
 
 #[cfg(test)]

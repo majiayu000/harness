@@ -20,6 +20,7 @@ pub struct WorktreeResponse {
     pub source_repo: String,
     pub repo: Option<String>,
     pub runtime_workflow_id: Option<String>,
+    pub runtime_submission_id: Option<String>,
     pub status: String,
     pub phase: String,
     pub description: Option<String>,
@@ -265,6 +266,9 @@ fn response_from_task(
         source_repo: entry.source_repo.to_string_lossy().into_owned(),
         repo: task.repo.clone(),
         runtime_workflow_id,
+        runtime_submission_id: runtime_projection
+            .and_then(|projection| projection.submission_handle.as_ref())
+            .map(|task_id| task_id.as_str().to_string()),
         status: status.as_ref().to_string(),
         phase: phase_name(phase).to_string(),
         description: task.description.clone(),
@@ -309,6 +313,9 @@ fn response_from_workspace_entry(
         source_repo: source_repo.clone(),
         repo: entry.repo,
         runtime_workflow_id,
+        runtime_submission_id: runtime_projection
+            .and_then(|projection| projection.submission_handle.as_ref())
+            .map(|task_id| task_id.as_str().to_string()),
         status: status.as_ref().to_string(),
         phase: phase_name(&phase).to_string(),
         description: None,
@@ -602,6 +609,7 @@ mod tests {
                     "project_id": project_id,
                     "repo": "owner/repo",
                     "issue_number": 882,
+                    "submission_id": "route-submission-1",
                     "task_id": "route-task-1",
                     "task_ids": ["route-task-1"]
                 })),
@@ -630,6 +638,7 @@ mod tests {
         assert_eq!(payload[0]["description"], "Render active worktrees");
         assert_eq!(payload[0]["repo"], "owner/repo");
         assert_eq!(payload[0]["runtime_workflow_id"], workflow_id);
+        assert_eq!(payload[0]["runtime_submission_id"], "route-submission-1");
         assert_eq!(payload[0]["status"], "waiting");
         assert_eq!(payload[0]["phase"], "review");
         assert_eq!(payload[0]["turn"], 2);
@@ -682,7 +691,7 @@ mod tests {
                 workspace_path: workspace_path.clone(),
                 source_repo: source_repo.clone(),
                 repo: Some("owner/repo".to_string()),
-                runtime_workflow_id: None,
+                runtime_workflow_id: Some("workflow-1".to_string()),
                 workspace_key: "owner_repo__runtime_workspace_1".to_string(),
                 project_key: "test-project".to_string(),
                 slot_index: 0,
@@ -703,6 +712,7 @@ mod tests {
                 )
                 .with_id("workflow-1".to_string())
                 .with_data(json!({
+                    "submission_id": "runtime-submission-1",
                     "task_id": "runtime-workspace-1",
                     "task_ids": ["runtime-workspace-1"]
                 })),
@@ -730,6 +740,7 @@ mod tests {
         assert_eq!(payload[0]["phase"], "review");
         assert_eq!(payload[0]["repo"], "owner/repo");
         assert_eq!(payload[0]["runtime_workflow_id"], "workflow-1");
+        assert_eq!(payload[0]["runtime_submission_id"], "runtime-submission-1");
         assert_eq!(payload[0]["turn"], 0);
         assert_eq!(payload[0]["max_turns"], 20);
         assert_eq!(

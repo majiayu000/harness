@@ -28,6 +28,7 @@ mod orphan_reaper;
 pub(crate) mod pr_hygiene_background;
 pub(crate) mod rate_limit;
 mod runtime_retention;
+pub(crate) mod runtime_submission_routes;
 pub(crate) mod sse_routes;
 pub(crate) mod state;
 pub(crate) mod task_mutation_routes;

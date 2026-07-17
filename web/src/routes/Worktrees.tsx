@@ -6,7 +6,7 @@ import { TopBar } from "@/components/TopBar";
 import { PaletteFab } from "@/components/PaletteFab";
 import { DOCS_URL } from "@/lib/links";
 import { useWorktrees, useOverview } from "@/lib/queries";
-import { apiFetch, TOKEN_KEY } from "@/lib/api";
+import { apiFetch, runtimeSubmissionPath, TOKEN_KEY } from "@/lib/api";
 import type { WorktreeCard } from "@/lib/queries";
 
 function formatDuration(seconds: number): string {
@@ -47,9 +47,9 @@ function statusColor(status: string): string {
   }
 }
 
-function openStream(taskId: string): void {
+function openStream(submissionId: string): void {
   const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-  const base = `/tasks/${taskId}/stream`;
+  const base = runtimeSubmissionPath(submissionId, "stream");
   const url = tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
   window.open(url, "_blank", "noreferrer");
 }
@@ -133,14 +133,19 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
         </span>
         <button
           type="button"
-          onClick={() => openStream(card.taskId)}
-          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
+          disabled={!card.runtimeSubmissionId}
+          title={card.runtimeSubmissionId ? undefined : "Runtime submission id unavailable"}
+          onClick={() => {
+            if (card.runtimeSubmissionId) openStream(card.runtimeSubmissionId);
+          }}
+          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink disabled:opacity-50 disabled:cursor-not-allowed"
         >
           Logs
         </button>
         <button
           type="button"
-          disabled={cancelling}
+          disabled={cancelling || !card.runtimeWorkflowId}
+          title={card.runtimeWorkflowId ? undefined : "Workflow runtime id unavailable"}
           onClick={() => onCancel(card)}
           className="font-mono text-[11.5px] px-3 py-1 border border-danger/40 text-danger rounded-[3px] hover:bg-danger/5 disabled:opacity-50 disabled:cursor-not-allowed"
         >
@@ -175,7 +180,7 @@ export function Worktrees() {
           body: JSON.stringify({ workflow_id: card.runtimeWorkflowId }),
         });
       } else {
-        await apiFetch(`/tasks/${card.taskId}/cancel`, { method: "POST" });
+        throw new Error("Workflow runtime id unavailable; cancellation was not sent");
       }
     } catch (err) {
       setCancelError(err instanceof Error ? err.message : "Cancel failed");

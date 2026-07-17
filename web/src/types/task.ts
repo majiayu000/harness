@@ -1,5 +1,6 @@
 /**
- * Shape of a single row returned by `GET /tasks`. Kept minimal — only the
+ * Shape of a single row returned by `GET /api/workflows/runtime/submissions`.
+ * Kept minimal — only the
  * fields the dashboard kanban actually renders. Extend as consumers grow.
  */
 export interface Task {

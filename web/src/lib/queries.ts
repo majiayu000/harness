@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { apiJson, apiFetch } from "./api";
+import { apiJson, apiFetch, runtimeSubmissionPath } from "./api";
 import type {
   DashboardPayload,
   FullTask,
@@ -70,14 +70,13 @@ function taskListPath(params: TaskListParams): string {
     query.set(key, String(value));
   }
   const suffix = query.toString();
-  return suffix ? `/tasks?${suffix}` : "/tasks";
+  const base = "/api/workflows/runtime/submissions";
+  return suffix ? `${base}?${suffix}` : base;
 }
 
 export function useTasks(params: TaskListParams = { active: true, limit: 200 }) {
   return useQuery<TaskListResponse, Error>({
     queryKey: ["tasks", params],
-    // Task list/detail/stream routes are exposed at `/tasks`; only aggregate
-    // dashboard endpoints are mounted under `/api/*`.
     queryFn: ({ signal }) => apiJson<TaskListResponse>(taskListPath(params), { signal }),
   });
 }
@@ -140,7 +139,8 @@ export function useWorkflowRuntimeTree(projectId?: string | null) {
 export function useTaskDetail(id: string | null) {
   return useQuery<FullTask, Error>({
     queryKey: ["task", id],
-    queryFn: ({ signal }) => apiJson<FullTask>(`/tasks/${id}`, { signal }),
+    queryFn: ({ signal }) =>
+      apiJson<FullTask>(runtimeSubmissionPath(id!), { signal }),
     enabled: !!id,
   });
 }
@@ -163,7 +163,7 @@ export function useTaskStream(
 
     (async () => {
       try {
-        const resp = await apiFetch(`/tasks/${id}/stream`, {
+        const resp = await apiFetch(runtimeSubmissionPath(id, "stream"), {
           signal: controller.signal,
           headers: { Accept: "text/event-stream" },
         });
@@ -211,14 +211,6 @@ export function useTaskStream(
   }, [id]);
 }
 
-export function useCancelTask() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (id: string) => apiFetch(`/tasks/${id}/cancel`, { method: "POST" }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["tasks"] }),
-  });
-}
-
 export function useCancelWorkflowRuntime() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -242,6 +234,7 @@ export interface WorktreeCard {
   sourceRepo: string;
   repo: string | null;
   runtimeWorkflowId: string | null;
+  runtimeSubmissionId: string | null;
   branch: string;
   status: string;
   phase: string;
@@ -262,6 +255,7 @@ interface WorktreeApiEntry {
   source_repo: string;
   repo: string | null;
   runtime_workflow_id: string | null;
+  runtime_submission_id: string | null;
   status: string;
   phase: string;
   description: string | null;
@@ -325,6 +319,7 @@ export function useWorktrees(): { cards: WorktreeCard[]; isLoading: boolean; err
       sourceRepo: entry.source_repo,
       repo: entry.repo,
       runtimeWorkflowId: entry.runtime_workflow_id,
+      runtimeSubmissionId: entry.runtime_submission_id,
       branch: entry.branch,
       status: entry.status,
       phase: entry.phase,

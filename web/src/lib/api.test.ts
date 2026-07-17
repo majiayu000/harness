@@ -1,5 +1,13 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { apiFetch, TOKEN_KEY, unauthorizedEvents } from "./api";
+import { apiFetch, runtimeSubmissionPath, TOKEN_KEY, unauthorizedEvents } from "./api";
+
+describe("runtimeSubmissionPath", () => {
+  it("encodes opaque submission handles as one path segment", () => {
+    expect(runtimeSubmissionPath("github-pr-feedback::/repo::pr:42", "stream")).toBe(
+      "/api/workflows/runtime/submissions/github-pr-feedback%3A%3A%2Frepo%3A%3Apr%3A42/stream",
+    );
+  });
+});
 
 describe("apiFetch", () => {
   const originalFetch = global.fetch;

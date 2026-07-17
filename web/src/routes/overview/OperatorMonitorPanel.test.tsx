@@ -81,7 +81,7 @@ function makeMonitor(): OperatorMonitorPayload {
         state: "ready_to_merge",
         age_secs: 900,
         url: "https://github.com/owner/repo/pull/43",
-        evidence_url: "/tasks/task-42",
+        evidence_url: "/api/workflows/runtime/submissions/task-42",
         next_action: "Review and merge",
         source: "github",
       },
