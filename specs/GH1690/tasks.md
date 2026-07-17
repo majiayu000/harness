@@ -33,10 +33,15 @@ GH-1690
   - all 47 focused reducer tests pass;
   - the planned three-file scope is unambiguous.
 - Verify:
-  - `git rev-parse HEAD`;
-  - `wc -l crates/harness-workflow/src/runtime/tests/completion_reducer_quality.rs`;
-  - the executable retained, moved, include-only, and ordered logical-path
-    comparisons from `tech.md`;
+  - record `BASE="$(git rev-parse HEAD)"`;
+  - set `SOURCE=crates/harness-workflow/src/runtime/tests/completion_reducer_quality.rs`
+    and
+    `MOVED=crates/harness-workflow/src/runtime/tests/completion_reducer_quality_gate.rs`;
+  - `test ! -e "$MOVED"`;
+  - `test "$(wc -l < "$SOURCE" | tr -d ' ')" = 896`;
+  - `test "$(sed -nE 's/^(async )?fn ([A-Za-z0-9_]+)\(.*/runtime::tests::\2/p' "$SOURCE" | wc -l | tr -d ' ')" = 23`;
+  - `test "$(sed -n '499p' "$SOURCE")" = '#[test]'`;
+  - `test "$(sed -n '500p' "$SOURCE")" = 'fn quality_gate_run_decision_starts_runtime_activity() {'`;
   - `cargo check -p harness-workflow --all-targets`;
   - `cargo test -p harness-workflow completion_reducer`;
   - `cargo test -p harness-workflow quality_gate_run_decision_starts_runtime_activity`.
