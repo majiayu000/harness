@@ -174,10 +174,8 @@ impl HarnessServer {
     /// sources. Invalid bindings abort startup with an actionable error.
     pub fn build_intake_binding_registry(
         &self,
+        routed_sources: &std::collections::HashSet<String>,
     ) -> anyhow::Result<crate::intake::binding::IntakeBindingRegistry> {
-        let enabled_sources =
-            crate::intake::binding::enabled_intake_source_names(&self.config.intake);
-
         let mut project_roots = BTreeSet::new();
         project_roots.insert(project_root_identity(&self.config.server.project_root));
         for project in self
@@ -205,7 +203,7 @@ impl HarnessServer {
             let binding = crate::intake::binding::IntakeBinding::from_policy(
                 &policy.id,
                 intake,
-                &enabled_sources,
+                routed_sources,
             )
             .map_err(|error| {
                 anyhow::anyhow!(

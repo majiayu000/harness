@@ -8,7 +8,6 @@
 //! `IntakeSource` trait and needs no change to this module (B-003, B-010).
 
 use super::IncomingIssue;
-use harness_core::config::intake::IntakeConfig;
 use harness_core::config::workflow::WorkflowDefinitionIntakePolicy;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -22,20 +21,6 @@ pub fn binding_project_key(root: &Path) -> String {
         .unwrap_or_else(|_| root.to_path_buf())
         .to_string_lossy()
         .into_owned()
-}
-
-/// Names of intake sources that are configured and enabled for a deployment.
-/// A binding may only target one of these (B-002 fail-closed). Only sources that
-/// actually flow through the poll/dispatch path are eligible.
-pub fn enabled_intake_source_names(config: &IntakeConfig) -> HashSet<String> {
-    let mut names = HashSet::new();
-    if config.github.as_ref().is_some_and(|github| github.enabled) {
-        names.insert("github".to_string());
-    }
-    if config.feishu.as_ref().is_some_and(|feishu| feishu.enabled) {
-        names.insert("feishu".to_string());
-    }
-    names
 }
 
 /// A validated, startup-frozen intake binding.
@@ -319,13 +304,5 @@ mod tests {
                 .is_err(),
             "no enabled sources means every binding is rejected"
         );
-    }
-
-    #[test]
-    fn enabled_intake_source_names_is_empty_by_default() {
-        // A default IntakeConfig has no enabled sources, so any binding fails
-        // closed until a source is configured and enabled.
-        let names = enabled_intake_source_names(&IntakeConfig::default());
-        assert!(names.is_empty());
     }
 }

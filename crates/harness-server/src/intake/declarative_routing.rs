@@ -40,6 +40,22 @@ pub(super) async fn route_declarative_intake(
     let definition_id = matched.binding.definition_id.clone();
     let cap = matched.binding.max_active_instances;
     let tie = matched.tie_definition_ids.clone();
+    let subject_key = match declarative_intake_subject_key(issue) {
+        Ok(subject_key) => subject_key,
+        Err(error) => {
+            audit(
+                state,
+                issue,
+                source.name(),
+                &definition_id,
+                "failed",
+                &tie,
+                Some(&format!("invalid intake identity: {error}")),
+            )
+            .await;
+            return true;
+        }
+    };
 
     let Some(store) = state.core.workflow_runtime_store.as_deref() else {
         audit(
@@ -83,7 +99,7 @@ pub(super) async fn route_declarative_intake(
     // instance reaches a terminal state the issue becomes eligible again.
     if nonterminal
         .iter()
-        .any(|instance| instance.subject.subject_key == issue.external_id)
+        .any(|instance| instance.subject.subject_key == subject_key)
     {
         audit(
             state,
@@ -115,7 +131,16 @@ pub(super) async fn route_declarative_intake(
     }
 
     // Dispatch (B-005, B-011): reuse the operator declarative submission path.
-    match dispatch(store, project_root, &definition_id, source, issue).await {
+    match dispatch(
+        store,
+        project_root,
+        &definition_id,
+        &subject_key,
+        source,
+        issue,
+    )
+    .await
+    {
         Ok(task_id) => {
             if let Err(error) = source.mark_dispatched(&issue.external_id, &task_id).await {
                 tracing::warn!(
@@ -159,6 +184,7 @@ async fn dispatch(
     store: &WorkflowRuntimeStore,
     project_root: &Path,
     definition_id: &str,
+    subject_key: &str,
     source: &Arc<dyn IntakeSource>,
     issue: &IncomingIssue,
 ) -> anyhow::Result<TaskId> {
@@ -175,6 +201,9 @@ async fn dispatch(
             serialization_depends_on: &[],
             source: Some(source.name()),
             external_id: Some(&issue.external_id),
+            subject_key: Some(subject_key),
+            repo: issue.repo.as_deref(),
+            author_trust_class: Some(issue.author_trust_class),
         },
     )
     .await?;
@@ -186,6 +215,23 @@ async fn dispatch(
         );
     }
     Ok(task_id)
+}
+
+fn declarative_intake_subject_key(issue: &IncomingIssue) -> anyhow::Result<String> {
+    let external_id = issue.external_id.trim();
+    if external_id.is_empty() {
+        anyhow::bail!("external_id is empty");
+    }
+    if issue.source == "github" {
+        let repo = issue
+            .repo
+            .as_deref()
+            .map(str::trim)
+            .filter(|repo| !repo.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("GitHub issue is missing repository identity"))?;
+        return Ok(format!("github:{repo}:issue:{external_id}"));
+    }
+    Ok(format!("{}:{external_id}", issue.source))
 }
 
 /// Record an intake routing outcome to the observe event store (B-009). Every
@@ -234,6 +280,58 @@ async fn audit(
             definition_id,
             outcome,
             "intake: failed to record intake_routing audit event: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_core::config::isolation::IsolationTrustClass;
+
+    fn issue(source: &str, external_id: &str, repo: Option<&str>) -> IncomingIssue {
+        IncomingIssue {
+            source: source.to_string(),
+            external_id: external_id.to_string(),
+            identifier: format!("#{external_id}"),
+            title: "fixture".to_string(),
+            description: None,
+            repo: repo.map(ToOwned::to_owned),
+            url: None,
+            priority: None,
+            labels: Vec::new(),
+            created_at: None,
+            author_trust_class: IsolationTrustClass::Trusted,
+            project_root: None,
+        }
+    }
+
+    #[test]
+    fn github_subject_keys_are_namespaced_by_repository() {
+        let first = declarative_intake_subject_key(&issue("github", "42", Some("org/one")))
+            .expect("first repository identity should be valid");
+        let second = declarative_intake_subject_key(&issue("github", "42", Some("org/two")))
+            .expect("second repository identity should be valid");
+
+        assert_eq!(first, "github:org/one:issue:42");
+        assert_eq!(second, "github:org/two:issue:42");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn github_subject_key_requires_repository_identity() {
+        let error = declarative_intake_subject_key(&issue("github", "42", None))
+            .expect_err("a bare GitHub issue number is not globally unique");
+
+        assert!(error.to_string().contains("missing repository identity"));
+    }
+
+    #[test]
+    fn non_github_subject_keys_remain_source_agnostic() {
+        assert_eq!(
+            declarative_intake_subject_key(&issue("linear", "ENG-42", None))
+                .expect("normalized non-GitHub identity should be valid"),
+            "linear:ENG-42"
         );
     }
 }

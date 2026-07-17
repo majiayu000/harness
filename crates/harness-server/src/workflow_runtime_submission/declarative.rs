@@ -1,7 +1,8 @@
 use super::{
-    merge_last_decision, prompt_memory::prompt_ref_for_submission, TaskId,
-    WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
+    insert_author_trust_class, merge_last_decision, prompt_memory::prompt_ref_for_submission,
+    TaskId, WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
+use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
     build_declarative_submission_decision, current_declarative_workflow_definition,
     decision_validator_for_instance, persisted_declarative_definition,
@@ -22,6 +23,9 @@ pub(crate) struct DeclarativeSubmissionRuntimeContext<'a> {
     pub serialization_depends_on: &'a [TaskId],
     pub source: Option<&'a str>,
     pub external_id: Option<&'a str>,
+    pub subject_key: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    pub author_trust_class: Option<IsolationTrustClass>,
 }
 
 pub(crate) async fn record_declarative_submission(
@@ -38,8 +42,12 @@ pub(crate) async fn record_declarative_submission(
         resolve_declarative_definition_for_project(ctx.project_root, ctx.definition_id)?;
 
     let project_id = ctx.project_root.to_string_lossy().into_owned();
-    let workflow_id =
-        declarative_workflow_id(&project_id, ctx.definition_id, ctx.external_id, ctx.task_id);
+    let workflow_id = declarative_workflow_id(
+        &project_id,
+        ctx.definition_id,
+        submission_subject_key(&ctx),
+        ctx.task_id,
+    );
     persist_definition_metadata(store, ctx.project_root, &definition).await?;
     if let Some(instance) = store.get_instance(&workflow_id).await? {
         return existing_submission(store, instance, &definition).await;
@@ -109,8 +117,12 @@ async fn persist_new_submission(
     workflow_id: String,
     definition: &DeclarativeWorkflowDefinition,
 ) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
-    let prompt_ref =
-        prompt_ref_for_submission(project_id, ctx.external_id, ctx.task_id, ctx.prompt);
+    let prompt_ref = prompt_ref_for_submission(
+        project_id,
+        submission_subject_key(ctx),
+        ctx.task_id,
+        ctx.prompt,
+    );
     let instance = submission_instance(ctx, project_id, &workflow_id, &prompt_ref, definition);
     let decision = build_declarative_submission_decision(definition, &instance)?;
     let validator = decision_validator_for_instance(&instance)
@@ -190,27 +202,30 @@ pub(super) fn submission_instance(
     prompt_ref: &str,
     definition: &DeclarativeWorkflowDefinition,
 ) -> WorkflowInstance {
-    let data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
-        ctx.project_root,
-        json!({
-            "project_id": project_id,
-            "definition_hash": definition.definition_hash(),
-            "submission_id": ctx.task_id.as_str(),
-            "task_id": ctx.task_id.as_str(),
-            "task_ids": [ctx.task_id.as_str()],
-            "prompt_summary": "declarative workflow task",
-            "prompt_chars": ctx.prompt.chars().count(),
-            "prompt_ref": prompt_ref,
-            "source": ctx.source,
-            "external_id": ctx.external_id,
-            "depends_on": [],
-        }),
-    );
+    let mut data = json!({
+        "project_id": project_id,
+        "definition_hash": definition.definition_hash(),
+        "submission_id": ctx.task_id.as_str(),
+        "task_id": ctx.task_id.as_str(),
+        "task_ids": [ctx.task_id.as_str()],
+        "prompt_summary": "declarative workflow task",
+        "prompt_chars": ctx.prompt.chars().count(),
+        "prompt_ref": prompt_ref,
+        "source": ctx.source,
+        "external_id": ctx.external_id,
+        "repo": ctx.repo,
+        "depends_on": [],
+    });
+    insert_author_trust_class(&mut data, ctx.author_trust_class);
+    let data = crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data);
     WorkflowInstance::new(
         definition.policy().id.as_str(),
         definition.definition_version(),
         definition.policy().initial.as_str(),
-        WorkflowSubject::new("declarative", subject_key(ctx.external_id, ctx.task_id)),
+        WorkflowSubject::new(
+            "declarative",
+            subject_key(submission_subject_key(ctx), ctx.task_id),
+        ),
     )
     .with_id(workflow_id)
     .with_data(data)
@@ -281,6 +296,10 @@ fn subject_key(external_id: Option<&str>, task_id: &TaskId) -> String {
         .to_string()
 }
 
+fn submission_subject_key<'a>(ctx: &'a DeclarativeSubmissionRuntimeContext<'a>) -> Option<&'a str> {
+    ctx.subject_key.or(ctx.external_id)
+}
+
 fn submission_event_payload(ctx: &DeclarativeSubmissionRuntimeContext<'_>) -> serde_json::Value {
     json!({
         "task_id": ctx.task_id.as_str(),
@@ -288,6 +307,9 @@ fn submission_event_payload(ctx: &DeclarativeSubmissionRuntimeContext<'_>) -> se
         "prompt_chars": ctx.prompt.chars().count(),
         "source": ctx.source,
         "external_id": ctx.external_id,
+        "subject_key": ctx.subject_key,
+        "repo": ctx.repo,
+        "author_trust_class": ctx.author_trust_class,
         "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
     })
 }

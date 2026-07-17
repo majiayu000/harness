@@ -183,9 +183,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     if let Some(github) = server.config.intake.github.as_ref() {
         github.auto_recovery.validate()?;
     }
-    // Built here, before `server` is moved into CoreServices, so a bad intake
-    // binding aborts startup fail-closed (GH-1656, T002).
-    let intake_bindings = server.build_intake_binding_registry()?;
     let api_auth_mode = super::auth::resolve_api_auth_mode(&server.config.server)?;
     super::auth::log_api_auth_mode(&api_auth_mode, &server.config.server);
     #[cfg(test)]
@@ -275,6 +272,15 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     let intake =
         builders::intake::build_intake(&server, &storage, &engines, &registry, &project_root, &dir)
             .await?;
+    // Validate bindings against the sources that were actually registered for
+    // poll_tick. Configured webhook-only sources and disabled pollers cannot
+    // silently pass startup validation (GH-1656, B-002).
+    let routed_sources = intake
+        .github_pollers
+        .iter()
+        .map(|(_, source)| source.name().to_string())
+        .collect();
+    let intake_bindings = server.build_intake_binding_registry(&routed_sources)?;
 
     // Phase 5: services — interceptor stack, service layer, runtime host/project-cache
     // managers, snapshot restore, recovery validator spawn.

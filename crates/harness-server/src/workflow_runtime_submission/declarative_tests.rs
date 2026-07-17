@@ -1,6 +1,7 @@
 use super::*;
 use chrono::{Duration, Utc};
 use harness_core::{
+    config::isolation::IsolationTrustClass,
     config::workflow::{
         DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
     },
@@ -133,6 +134,43 @@ fn declarative_submission_decision_validates_against_the_registered_submission_r
         .expect("registered declarative submission transition should validate");
 }
 
+#[test]
+fn declarative_submission_preserves_intake_identity_and_trust() {
+    register_test_definition();
+    let Some(definition) =
+        harness_workflow::runtime::current_declarative_workflow_definition(TEST_DEFINITION_ID)
+    else {
+        panic!("definition should be registered");
+    };
+    let task_id = TaskId::from_str("declarative-intake-identity");
+    let ctx = DeclarativeSubmissionRuntimeContext {
+        project_root: Path::new("/repo"),
+        definition_id: TEST_DEFINITION_ID,
+        task_id: &task_id,
+        prompt: "handle the incoming issue",
+        depends_on: &[],
+        serialization_depends_on: &[],
+        source: Some("github"),
+        external_id: Some("42"),
+        subject_key: Some("github:owner/repo:issue:42"),
+        repo: Some("owner/repo"),
+        author_trust_class: Some(IsolationTrustClass::NonCollaborator),
+    };
+
+    let instance = super::declarative::submission_instance(
+        &ctx,
+        "/repo",
+        "declarative-intake-workflow",
+        "prompt-ref",
+        &definition,
+    );
+
+    assert_eq!(instance.subject.subject_key, "github:owner/repo:issue:42");
+    assert_eq!(instance.data["external_id"], "42");
+    assert_eq!(instance.data["repo"], "owner/repo");
+    assert_eq!(instance.data["author_trust_class"], "non_collaborator");
+}
+
 #[tokio::test]
 async fn declarative_submission_pins_immutable_definition_metadata() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
@@ -155,6 +193,9 @@ async fn declarative_submission_pins_immutable_definition_metadata() -> anyhow::
             serialization_depends_on: &[],
             source: Some("test"),
             external_id: Some("pin-1"),
+            subject_key: None,
+            repo: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -210,6 +251,9 @@ async fn declarative_submission_enqueues_initial_activity_atomically() -> anyhow
             serialization_depends_on: &[],
             source: None,
             external_id: None,
+            subject_key: None,
+            repo: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -248,6 +292,9 @@ async fn declarative_submission_mapped_signal_reaches_terminal_state() -> anyhow
             serialization_depends_on: &[],
             source: Some("stub-runtime-test"),
             external_id: Some("e2e-1"),
+            subject_key: None,
+            repo: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -334,6 +381,9 @@ async fn declarative_submission_can_be_cancelled_by_an_operator() -> anyhow::Res
             serialization_depends_on: &[],
             source: Some("operator-test"),
             external_id: Some("cancel-1"),
+            subject_key: None,
+            repo: None,
+            author_trust_class: None,
         },
     )
     .await?;
@@ -373,6 +423,9 @@ async fn declarative_submission_rejects_dependencies() -> anyhow::Result<()> {
             serialization_depends_on: &[],
             source: None,
             external_id: None,
+            subject_key: None,
+            repo: None,
+            author_trust_class: None,
         },
     )
     .await
@@ -403,6 +456,9 @@ async fn declarative_submission_rejects_unknown_and_builtin_ids() -> anyhow::Res
                 serialization_depends_on: &[],
                 source: None,
                 external_id: None,
+                subject_key: None,
+                repo: None,
+                author_trust_class: None,
             },
         )
         .await
@@ -447,6 +503,9 @@ async fn declarative_dedupe_and_cap_query_key_off_subject_external_id() -> anyho
                     serialization_depends_on: &[],
                     source: Some("github"),
                     external_id: Some(external),
+                    subject_key: None,
+                    repo: None,
+                    author_trust_class: None,
                 },
             )
             .await

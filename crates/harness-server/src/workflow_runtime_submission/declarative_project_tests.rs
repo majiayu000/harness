@@ -105,6 +105,9 @@ fn declarative_submission_instance_persists_runtime_retry_policy() -> anyhow::Re
         serialization_depends_on: &[],
         source: Some("test"),
         external_id: None,
+        subject_key: None,
+        repo: None,
+        author_trust_class: None,
     };
 
     let instance = super::declarative::submission_instance(
