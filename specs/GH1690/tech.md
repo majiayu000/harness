@@ -19,12 +19,13 @@ the `runtime::tests` module by:
 include!("tests/completion_reducer_quality.rs");
 ```
 
-Lines 1-498 contain 13 tests covering PR-feedback decisions, invalid or
+Lines 1-497 contain 13 tests covering PR-feedback decisions, invalid or
 unknown structured decisions, stale completion handling, child start
-acknowledgements, and already-terminal workflows. Lines 499-896 contain 10
-contiguous tests covering quality-gate dispatch, successful completion,
-issue-PR readiness, missing or conflicting evidence, invalid structured
-decisions, and transient retries.
+acknowledgements, and already-terminal workflows. Line 498 is the blank
+separator before the quality-gate group. Lines 499-896 contain 10 contiguous
+tests covering quality-gate dispatch, successful completion, issue-PR
+readiness, missing or conflicting evidence, invalid structured decisions, and
+transient retries.
 
 Because `include!` expands both sibling files into the same Rust module, the
 quality-gate tests can move without adding a module segment to their logical
@@ -32,12 +33,14 @@ paths.
 
 ## Proposed Design
 
-Keep exact-base lines 1-498 in
+Keep exact-base lines 1-497 in
 `runtime/tests/completion_reducer_quality.rs`.
 
 Create
 `runtime/tests/completion_reducer_quality_gate.rs` from exact-base lines
-499-896 in their current order.
+498-896 in their current order. Moving the blank separator with the
+quality-gate group prevents the retained file from ending with a blank line,
+which the mandatory committed-whitespace CI check rejects.
 
 In `runtime/tests.rs`, add:
 
@@ -84,8 +87,8 @@ expand into the existing `runtime::tests` namespace.
 
 - Record the exact base SHA, line count, ordered 23-test inventory, attributes,
   and split boundary before editing.
-- Require the final retained file to equal exact-base lines 1-498.
-- Require the new sibling file to equal exact-base lines 499-896.
+- Require the final retained file to equal exact-base lines 1-497.
+- Require the new sibling file to equal exact-base lines 498-896.
 - Preserve all 23 attributes, names, bodies, assertions, helper calls,
   artifacts, signals, JSON values, strings, and non-whitespace Rust tokens
   exactly once.
@@ -146,10 +149,10 @@ files into the same existing test namespace.
   INCLUDES=crates/harness-workflow/src/runtime/tests.rs
 
   diff -u \
-    <(git show "$BASE:$SOURCE" | sed -n '1,498p') \
+    <(git show "$BASE:$SOURCE" | sed -n '1,497p') \
     "$RETAINED"
   diff -u \
-    <(git show "$BASE:$SOURCE" | sed -n '499,896p') \
+    <(git show "$BASE:$SOURCE" | sed -n '498,896p') \
     "$MOVED"
   diff -u \
     <(git show "$BASE:$INCLUDES" | awk '

@@ -40,6 +40,7 @@ GH-1690
   - `test ! -e "$MOVED"`;
   - `test "$(wc -l < "$SOURCE" | tr -d ' ')" = 896`;
   - `test "$(sed -nE 's/^(async )?fn ([A-Za-z0-9_]+)\(.*/runtime::tests::\2/p' "$SOURCE" | wc -l | tr -d ' ')" = 23`;
+  - `test -z "$(sed -n '498p' "$SOURCE")"`;
   - `test "$(sed -n '499p' "$SOURCE")" = '#[test]'`;
   - `test "$(sed -n '500p' "$SOURCE")" = 'fn quality_gate_run_decision_starts_runtime_activity() {'`;
   - `cargo check -p harness-workflow --all-targets`;
@@ -52,8 +53,8 @@ GH-1690
 - Dependencies: SP1690-T1.
 - Covers: B-001 through B-006.
 - Work:
-  - retain exact-base lines 1-498;
-  - create the sibling include file from exact-base lines 499-896;
+  - retain exact-base lines 1-497;
+  - create the sibling include file from exact-base lines 498-896;
   - add exactly one adjacent include to `runtime/tests.rs`;
   - preserve every attribute, name, body, assertion, helper call, artifact,
     signal, JSON value, string, non-whitespace Rust token, and logical test
@@ -62,7 +63,8 @@ GH-1690
     line ceilings, include adjacency, and approved three-file scope;
   - run focused and full workflow tests before committing.
 - Done when:
-  - the retained and sibling files are each at most 800 formatted lines;
+  - the retained and sibling files contain 497 and 399 formatted lines,
+    respectively;
   - all 23 tests appear exactly once and every logical path is unchanged;
   - exact movement and verification pass;
   - no file outside the approved three changes.
@@ -116,7 +118,7 @@ sequentially.
 ## Handoff Notes
 
 - Exact issue/spec base: `888c64a48995b4fc89532b06434b562960c7f4b9`.
-- Baseline: 896 lines, 23 tests, retained lines 1-498, moved lines 499-896,
+- Baseline: 896 lines, 23 tests, retained lines 1-497, moved lines 498-896,
   and 47 focused reducer tests passing.
 - Preserve test bodies and logical paths exactly; use sibling `include!`, not a
   nested module.
