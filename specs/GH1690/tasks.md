@@ -35,9 +35,11 @@ GH-1690
 - Verify:
   - `git rev-parse HEAD`;
   - `wc -l crates/harness-workflow/src/runtime/tests/completion_reducer_quality.rs`;
-  - inventory, include, and boundary searches from `tech.md`;
+  - the executable retained, moved, include-only, and ordered logical-path
+    comparisons from `tech.md`;
   - `cargo check -p harness-workflow --all-targets`;
-  - `cargo test -p harness-workflow completion_reducer`.
+  - `cargo test -p harness-workflow completion_reducer`;
+  - `cargo test -p harness-workflow quality_gate_run_decision_starts_runtime_activity`.
 
 ### SP1690-T2 — Extract the final quality-gate test group
 
@@ -62,9 +64,10 @@ GH-1690
 - Verify:
   - `cargo fmt --all -- --check`;
   - `cargo check -p harness-workflow --all-targets`;
-  - focused and full workflow tests from `tech.md`;
-  - exact retained, exact moved, inventory, path, include, size, and scope
-    checks.
+  - both focused test commands and the full workflow test from `tech.md`;
+  - the executable retained, moved, include-only, and ordered logical-path
+    comparisons from `tech.md`;
+  - line-count and approved-scope checks.
 
 ### SP1690-T3 — Prove PR readiness and clean up
 

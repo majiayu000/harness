@@ -135,10 +135,44 @@ files into the same existing test namespace.
 
 ## Test Plan
 
+- [ ] Run the exact mechanical source checks below from the implementation
+      worktree:
+
+  ```bash
+  BASE="$(git merge-base HEAD origin/main)"
+  SOURCE=crates/harness-workflow/src/runtime/tests/completion_reducer_quality.rs
+  RETAINED=$SOURCE
+  MOVED=crates/harness-workflow/src/runtime/tests/completion_reducer_quality_gate.rs
+  INCLUDES=crates/harness-workflow/src/runtime/tests.rs
+
+  diff -u \
+    <(git show "$BASE:$SOURCE" | sed -n '1,498p') \
+    "$RETAINED"
+  diff -u \
+    <(git show "$BASE:$SOURCE" | sed -n '499,896p') \
+    "$MOVED"
+  diff -u \
+    <(git show "$BASE:$INCLUDES" | awk '
+      { print }
+      $0 == "include!(\"tests/completion_reducer_quality.rs\");" {
+        print "include!(\"tests/completion_reducer_quality_gate.rs\");"
+      }') \
+    "$INCLUDES"
+  diff -u \
+    <(git show "$BASE:$SOURCE" |
+      sed -nE 's/^(async )?fn ([A-Za-z0-9_]+)\(.*/runtime::tests::\2/p') \
+    <(sed -nE \
+      's/^(async )?fn ([A-Za-z0-9_]+)\(.*/runtime::tests::\2/p' \
+      "$RETAINED" "$MOVED")
+  ```
+
 - [ ] Baseline and final `cargo check -p harness-workflow --all-targets`.
 - [ ] Baseline and final
       `cargo test -p harness-workflow completion_reducer`, with the same 47
       selected tests passing and unchanged paths.
+- [ ] Final
+      `cargo test -p harness-workflow quality_gate_run_decision_starts_runtime_activity`
+      passes the moved test omitted by the `completion_reducer` filter.
 - [ ] Final `cargo test -p harness-workflow --lib`.
 - [ ] `cargo fmt --all -- --check`, line-count, exact retained file, exact
       moved file, ordered inventory, namespace, include adjacency, and
