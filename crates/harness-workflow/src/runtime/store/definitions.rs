@@ -1,6 +1,8 @@
 use super::{to_jsonb_string, WorkflowRuntimeStore};
+use crate::runtime::declarative_pinning::hydrate_persisted_declarative_definition;
 use crate::runtime::declarative_pinning::DECLARATIVE_DEFINITION_METADATA_KIND;
 use crate::runtime::model::WorkflowDefinition;
+use crate::runtime::DeclarativeWorkflowDefinition;
 
 impl WorkflowRuntimeStore {
     pub async fn upsert_definition(&self, definition: &WorkflowDefinition) -> anyhow::Result<()> {
@@ -109,6 +111,17 @@ impl WorkflowRuntimeStore {
         .await?;
         rows.into_iter()
             .map(|(data,)| serde_json::from_str(&data).map_err(Into::into))
+            .collect()
+    }
+
+    pub async fn list_persisted_declarative_definitions(
+        &self,
+    ) -> anyhow::Result<Vec<DeclarativeWorkflowDefinition>> {
+        self.list_definitions()
+            .await?
+            .into_iter()
+            .filter(is_declarative_definition)
+            .map(|definition| hydrate_persisted_declarative_definition(&definition))
             .collect()
     }
 }

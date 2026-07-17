@@ -71,7 +71,7 @@ pub use declarative_interpreter::{
 };
 pub use declarative_pinning::{
     declarative_definition_identity, hydrate_declarative_definition,
-    persisted_declarative_definition,
+    hydrate_persisted_declarative_definition, persisted_declarative_definition,
 };
 pub use dispatch_barrier::{
     DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrier, DispatchBarrierInput,

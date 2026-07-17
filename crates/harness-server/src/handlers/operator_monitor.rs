@@ -379,7 +379,7 @@ fn truncate_workflow_sample(workflows: &mut Vec<WorkflowInstance>, limit: usize)
     for workflow in workflows.drain(..) {
         if workflow.terminal_state() == Some(WorkflowTerminalState::Failed) {
             failed.push(workflow);
-        } else if workflow_action_kind(workflow.state.as_str()).is_some() {
+        } else if workflow_action_kind(&workflow).is_some() {
             operator_actions.push(workflow);
         } else {
             other.push(workflow);
@@ -459,7 +459,7 @@ fn operator_actions(
 ) -> Vec<OperatorAction> {
     let mut actions = Vec::new();
     for workflow in workflows {
-        let Some(kind) = workflow_action_kind(workflow.state.as_str()) else {
+        let Some(kind) = workflow_action_kind(workflow) else {
             continue;
         };
         let projection = RuntimeWorkflowProjection::from_workflow_with_stopped_eligibility(
@@ -516,12 +516,25 @@ fn operator_actions(
     actions
 }
 
-fn workflow_action_kind(state: &str) -> Option<&'static str> {
-    match state {
+fn workflow_action_kind(workflow: &WorkflowInstance) -> Option<&'static str> {
+    if workflow.terminal_state() == Some(WorkflowTerminalState::Failed) {
+        return Some("failed");
+    }
+    if harness_workflow::runtime::declarative_workflow_definition_for_instance(workflow).is_some() {
+        return harness_workflow::runtime::workflow_state_definition_for_instance(
+            workflow,
+            &workflow.state,
+        )
+        .is_some_and(|state| {
+            state.progress_mode
+                == Some(harness_workflow::runtime::WorkflowProgressMode::OperatorGate)
+        })
+        .then_some("blocked");
+    }
+    match workflow.state.as_str() {
         "ready_to_merge" => Some("ready_to_merge"),
         "awaiting_feedback" => Some("awaiting_feedback"),
         "blocked" => Some("blocked"),
-        "failed" => Some("failed"),
         _ => None,
     }
 }
@@ -566,7 +579,7 @@ fn grouped_failures(
     }
     for workflow in workflows
         .iter()
-        .filter(|workflow| workflow.state == "failed")
+        .filter(|workflow| workflow.terminal_state() == Some(WorkflowTerminalState::Failed))
     {
         let workflow_task_ids = workflow_failure_task_ids(workflow);
         if workflow_task_ids

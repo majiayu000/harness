@@ -1,8 +1,10 @@
 use super::{workflow_instance_from_row, WorkflowInstance, WorkflowRuntimeStore};
 use crate::runtime::state_registry::{
-    workflow_terminal_state_selectors_for_definition, WorkflowTerminalStateSelector,
+    workflow_progress_state_selectors_for_definition,
+    workflow_terminal_state_selectors_for_definition, WorkflowProgressStateSelector,
+    WorkflowTerminalStateSelector,
 };
-use crate::runtime::WorkflowTerminalState;
+use crate::runtime::{WorkflowProgressMode, WorkflowTerminalState};
 use chrono::{DateTime, Utc};
 
 struct TerminalSelectorQueryParts {
@@ -13,6 +15,48 @@ struct TerminalSelectorQueryParts {
 }
 
 impl WorkflowRuntimeStore {
+    pub async fn list_recent_instances_by_progress_mode(
+        &self,
+        definition_id: &str,
+        progress_mode: WorkflowProgressMode,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let selectors =
+            workflow_progress_state_selectors_for_definition(definition_id, progress_mode);
+        let query = progress_selector_query_parts(&selectors)?;
+        if query.unversioned_states.is_empty() && query.versioned_states.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT data::text, updated_at FROM workflow_instances
+             WHERE definition_id = $1
+               AND (
+                   state = ANY($2::text[])
+                   OR EXISTS (
+                       SELECT 1
+                       FROM unnest($3::bigint[], $4::text[], $5::text[])
+                           AS progress(definition_version, definition_hash, state)
+                       WHERE progress.definition_version = (data->>'definition_version')::bigint
+                         AND progress.definition_hash = data->'data'->>'definition_hash'
+                         AND progress.state = workflow_instances.state
+                   )
+               )
+             ORDER BY updated_at DESC
+             LIMIT $6",
+        )
+        .bind(definition_id)
+        .bind(&query.unversioned_states)
+        .bind(&query.definition_versions)
+        .bind(&query.definition_hashes)
+        .bind(&query.versioned_states)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
+            .collect()
+    }
+
     pub async fn list_recent_terminal_instances_by_definition(
         &self,
         definition_id: &str,
@@ -98,6 +142,34 @@ impl WorkflowRuntimeStore {
             .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
             .collect()
     }
+}
+
+fn progress_selector_query_parts(
+    selectors: &[WorkflowProgressStateSelector],
+) -> anyhow::Result<TerminalSelectorQueryParts> {
+    let mut query = TerminalSelectorQueryParts {
+        unversioned_states: Vec::new(),
+        definition_versions: Vec::new(),
+        definition_hashes: Vec::new(),
+        versioned_states: Vec::new(),
+    };
+    for selector in selectors {
+        match (selector.definition_version, &selector.definition_hash) {
+            (Some(definition_version), Some(definition_hash)) => {
+                query
+                    .definition_versions
+                    .push(i64::from(definition_version));
+                query.definition_hashes.push(definition_hash.clone());
+                query.versioned_states.push(selector.state.clone());
+            }
+            (None, None) => query.unversioned_states.push(selector.state.clone()),
+            _ => anyhow::bail!(
+                "progress state selector '{}' must include both definition version and hash",
+                selector.state
+            ),
+        }
+    }
+    Ok(query)
 }
 
 fn terminal_selector_query_parts(

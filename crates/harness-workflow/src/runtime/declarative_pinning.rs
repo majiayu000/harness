@@ -51,6 +51,26 @@ pub fn hydrate_declarative_definition(
     definition: &DurableWorkflowDefinition,
     activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
+    let policy = persisted_declarative_policy(definition)?;
+    hydrate_declarative_definition_with_policy(definition, &policy, activity_policies)
+}
+
+pub fn hydrate_persisted_declarative_definition(
+    definition: &DurableWorkflowDefinition,
+) -> anyhow::Result<DeclarativeWorkflowDefinition> {
+    let policy = persisted_declarative_policy(definition)?;
+    let activity_policies = policy
+        .states
+        .values()
+        .filter_map(|state| state.activity.as_ref())
+        .map(|activity| (activity.clone(), WorkflowActivityPolicy::default()))
+        .collect();
+    hydrate_declarative_definition_with_policy(definition, &policy, &activity_policies)
+}
+
+fn persisted_declarative_policy(
+    definition: &DurableWorkflowDefinition,
+) -> anyhow::Result<WorkflowDefinitionPolicy> {
     let metadata = definition.metadata.as_object().ok_or_else(|| {
         anyhow::anyhow!(
             "persisted workflow definition '{}@{}' metadata must be an object",
@@ -85,8 +105,15 @@ pub fn hydrate_declarative_definition(
             definition.version
         )
     })?;
-    let policy: WorkflowDefinitionPolicy = serde_json::from_value(policy_value.clone())?;
-    let hydrated = build_declarative_definition(&policy, activity_policies)?;
+    serde_json::from_value(policy_value.clone()).map_err(Into::into)
+}
+
+fn hydrate_declarative_definition_with_policy(
+    definition: &DurableWorkflowDefinition,
+    policy: &WorkflowDefinitionPolicy,
+    activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
+) -> anyhow::Result<DeclarativeWorkflowDefinition> {
+    let hydrated = build_declarative_definition(policy, activity_policies)?;
     if hydrated.policy().id != definition.id {
         anyhow::bail!(
             "persisted declarative workflow definition id '{}' does not match policy id '{}'",

@@ -316,6 +316,10 @@ pub(crate) async fn build_registry(
                     &setup_pool,
                 )
                 .await?;
+                let historical_definitions = store.list_persisted_declarative_definitions().await?;
+                harness_workflow::runtime::register_historical_declarative_workflow_definitions(
+                    historical_definitions,
+                )?;
                 Ok::<_, anyhow::Error>(store)
             }
             .await

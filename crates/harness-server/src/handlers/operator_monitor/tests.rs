@@ -1052,7 +1052,17 @@ fn declarative_visibility_definition(
                     on_success: Some(success_state.to_string()),
                     on_failure: Some(failure_state.to_string()),
                     on_blocked: Some("blocked".to_string()),
-                    on_signal: BTreeMap::from([("cancel".to_string(), "cancelled".to_string())]),
+                    on_signal: BTreeMap::from([
+                        ("cancel".to_string(), "cancelled".to_string()),
+                        ("review".to_string(), "manual_review".to_string()),
+                    ]),
+                    ..DeclaredState::default()
+                },
+            ),
+            (
+                "manual_review".to_string(),
+                DeclaredState {
+                    progress: Some(DeclaredProgressMode::OperatorGate),
                     ..DeclaredState::default()
                 },
             ),
@@ -1150,6 +1160,93 @@ fn workflow_sample_truncation_preserves_declarative_failed_terminal() {
 
     assert_eq!(workflows.len(), 1);
     assert_eq!(workflows[0].id, "declarative-failed");
+}
+
+#[test]
+fn declarative_failed_terminal_populates_failure_and_action_surfaces() {
+    register_declarative_visibility_definition();
+    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
+        DECLARATIVE_VISIBILITY_DEFINITION_ID,
+    )
+    .expect("visibility fixture definition should be registered");
+    let failed = WorkflowInstance::new(
+        DECLARATIVE_VISIBILITY_DEFINITION_ID,
+        definition.definition_version(),
+        "rejected",
+        WorkflowSubject::new("issue", "issue:declarative-rejected"),
+    )
+    .with_id("declarative-rejected")
+    .with_data(json!({
+        "definition_hash": definition.definition_hash(),
+        "failure_reason": "declarative review rejected"
+    }));
+
+    let failures = grouped_failures(&[], std::slice::from_ref(&failed));
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].message, "declarative review rejected");
+
+    let actions = operator_actions(&[failed], Utc::now(), &std::collections::HashMap::new());
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].kind, "failed");
+}
+
+#[test]
+fn declarative_operator_gate_uses_registry_progress_for_action_kind() {
+    register_declarative_visibility_definition();
+    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
+        DECLARATIVE_VISIBILITY_DEFINITION_ID,
+    )
+    .expect("visibility fixture definition should be registered");
+    let gate = WorkflowInstance::new(
+        DECLARATIVE_VISIBILITY_DEFINITION_ID,
+        definition.definition_version(),
+        "manual_review",
+        WorkflowSubject::new("issue", "issue:manual-review"),
+    )
+    .with_id("declarative-manual-review")
+    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+
+    let actions = operator_actions(&[gate], Utc::now(), &std::collections::HashMap::new());
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].kind, "blocked");
+}
+
+#[tokio::test]
+async fn declarative_operator_gate_sampling_uses_registry_progress() -> anyhow::Result<()> {
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    register_declarative_visibility_definition();
+    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
+        DECLARATIVE_VISIBILITY_DEFINITION_ID,
+    )
+    .expect("visibility fixture definition should be registered");
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-gate-progress-")?;
+    let store = WorkflowRuntimeStore::open_with_database_url(
+        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+        Some(&test_helpers::test_database_url()?),
+    )
+    .await?;
+    store
+        .upsert_instance(
+            &WorkflowInstance::new(
+                DECLARATIVE_VISIBILITY_DEFINITION_ID,
+                definition.definition_version(),
+                "manual_review",
+                WorkflowSubject::new("issue", "issue:manual-review-sample"),
+            )
+            .with_id("declarative-manual-review-sample")
+            .with_data(json!({ "definition_hash": definition.definition_hash() })),
+        )
+        .await?;
+
+    let workflows =
+        list_operator_action_workflows(&store, &[DECLARATIVE_VISIBILITY_DEFINITION_ID.to_string()])
+            .await?;
+    assert_eq!(workflows.len(), 1);
+    assert_eq!(workflows[0].id, "declarative-manual-review-sample");
+    Ok(())
 }
 
 /// B-003 / B-005: a blocked instance of a declarative definition surfaces in the

@@ -272,6 +272,77 @@ fn runtime_workflow_scheduler_state_only_marks_executing_states_running() {
 }
 
 #[test]
+fn declarative_progress_takes_precedence_over_builtin_state_names() {
+    use harness_core::config::workflow::{
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    };
+    use std::collections::BTreeMap;
+
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    const DEFINITION_ID: &str = "runtime_projection_state_collision";
+    REGISTER.call_once(|| {
+        let policy = WorkflowDefinitionPolicy {
+            id: DEFINITION_ID.to_string(),
+            initial: "pending".to_string(),
+            states: BTreeMap::from([
+                (
+                    "pending".to_string(),
+                    DeclaredState {
+                        activity: Some("execute".to_string()),
+                        on_success: Some("done".to_string()),
+                        on_failure: Some("failed".to_string()),
+                        on_blocked: Some("blocked".to_string()),
+                        on_signal: BTreeMap::from([(
+                            "cancel".to_string(),
+                            "cancelled".to_string(),
+                        )]),
+                        ..DeclaredState::default()
+                    },
+                ),
+                (
+                    "blocked".to_string(),
+                    DeclaredState {
+                        progress: Some(DeclaredProgressMode::OperatorGate),
+                        ..DeclaredState::default()
+                    },
+                ),
+            ]),
+            terminal: BTreeMap::from([
+                ("done".to_string(), "succeeded".to_string()),
+                ("failed".to_string(), "failed".to_string()),
+                ("cancelled".to_string(), "cancelled".to_string()),
+            ]),
+            evidence_required: BTreeMap::new(),
+            recovery_targets: vec!["pending".to_string()],
+            intake: None,
+        };
+        let definition = harness_workflow::runtime::build_declarative_definition(
+            &policy,
+            &BTreeMap::from([("execute".to_string(), WorkflowActivityPolicy::default())]),
+        )
+        .expect("collision fixture should compile");
+        harness_workflow::runtime::register_declarative_workflow_definitions([definition])
+            .expect("collision fixture should register");
+    });
+    let definition =
+        harness_workflow::runtime::current_declarative_workflow_definition(DEFINITION_ID)
+            .expect("collision fixture should be registered");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        DEFINITION_ID,
+        definition.definition_version(),
+        "pending",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:collision"),
+    )
+    .with_data(serde_json::json!({ "definition_hash": definition.definition_hash() }));
+
+    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+    assert_eq!(
+        projection.scheduler.authority_state,
+        SchedulerAuthorityState::Running
+    );
+}
+
+#[test]
 fn paginate_task_summaries_returns_next_cursor_and_resumes_after_it() {
     let mut summaries = vec![
         summary_with_created_at("task-a", "2026-05-20T01:00:00Z"),

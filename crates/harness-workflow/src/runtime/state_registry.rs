@@ -66,6 +66,13 @@ pub(super) struct WorkflowTerminalStateSelector {
     pub terminal_state: WorkflowTerminalState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WorkflowProgressStateSelector {
+    pub definition_version: Option<u32>,
+    pub definition_hash: Option<String>,
+    pub state: String,
+}
+
 impl WorkflowStateDefinition {
     pub fn active(
         definition_id: impl Into<Arc<str>>,
@@ -300,6 +307,51 @@ impl WorkflowDefinitionRegistry {
         });
         selectors
     }
+
+    fn progress_state_selectors(
+        &self,
+        definition_id: &str,
+        progress_mode: WorkflowProgressMode,
+    ) -> Vec<WorkflowProgressStateSelector> {
+        let mut selectors = self
+            .declarative_versions
+            .iter()
+            .filter(|((registered_id, _), _)| registered_id == definition_id)
+            .flat_map(|((_, definition_version), definition)| {
+                definition
+                    .registered()
+                    .states
+                    .iter()
+                    .filter(|state| state.progress_mode == Some(progress_mode))
+                    .map(|state| WorkflowProgressStateSelector {
+                        definition_version: Some(*definition_version),
+                        definition_hash: Some(definition.definition_hash().to_string()),
+                        state: state.key.state.to_string(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        if selectors.is_empty() {
+            if let Some(definition) = self.definition(definition_id) {
+                selectors.extend(
+                    definition
+                        .states
+                        .iter()
+                        .filter(|state| state.progress_mode == Some(progress_mode))
+                        .map(|state| WorkflowProgressStateSelector {
+                            definition_version: None,
+                            definition_hash: None,
+                            state: state.key.state.to_string(),
+                        }),
+                );
+            }
+        }
+        selectors.sort_by(|left, right| {
+            left.definition_version
+                .cmp(&right.definition_version)
+                .then_with(|| left.state.cmp(&right.state))
+        });
+        selectors
+    }
 }
 
 impl Default for WorkflowDefinitionRegistry {
@@ -459,6 +511,16 @@ pub(super) fn workflow_terminal_state_selectors_for_definition(
         .read()
         .expect("workflow definition registry lock poisoned")
         .terminal_state_selectors(definition_id)
+}
+
+pub(super) fn workflow_progress_state_selectors_for_definition(
+    definition_id: &str,
+    progress_mode: WorkflowProgressMode,
+) -> Vec<WorkflowProgressStateSelector> {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .progress_state_selectors(definition_id, progress_mode)
 }
 
 pub fn workflow_state_definition(

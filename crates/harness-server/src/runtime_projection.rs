@@ -4,8 +4,8 @@ use crate::task_runner::{
     SchedulerAuthorityState, TaskFailureKind, TaskId, TaskPhase, TaskSchedulerState, TaskStatus,
 };
 use harness_workflow::runtime::{
-    workflow_state_definition_for_instance, WorkflowInstance, WorkflowProgressMode,
-    WorkflowTerminalState, QUALITY_GATE_DEFINITION_ID,
+    declarative_workflow_definition_for_instance, workflow_state_definition_for_instance,
+    WorkflowInstance, WorkflowProgressMode, WorkflowTerminalState, QUALITY_GATE_DEFINITION_ID,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -247,6 +247,14 @@ fn workflow_scheduler_state(
         scheduler.mark_terminal(status);
         return scheduler;
     }
+    if declarative_workflow_definition_for_instance(workflow).is_some() {
+        if let Some(progress_mode) =
+            workflow_state_definition_for_instance(workflow, &workflow.state)
+                .and_then(|state| state.progress_mode)
+        {
+            return scheduler_state_for_progress_mode(progress_mode);
+        }
+    }
     match workflow.state.as_str() {
         "awaiting_dependencies" => TaskSchedulerState::awaiting_dependencies(),
         "scheduled" | "discovered" | "pending" => TaskSchedulerState::queued(),
@@ -275,18 +283,7 @@ fn workflow_scheduler_state(
         _ => match workflow_state_definition_for_instance(workflow, &workflow.state)
             .and_then(|state| state.progress_mode)
         {
-            Some(WorkflowProgressMode::CommandDriven) => TaskSchedulerState {
-                authority_state: SchedulerAuthorityState::Running,
-                owner: None,
-                run_generation: 0,
-                recovery_generation: 0,
-                lease_expires_at: None,
-            },
-            Some(
-                WorkflowProgressMode::ExternalWait
-                | WorkflowProgressMode::OperatorGate
-                | WorkflowProgressMode::ParentHandoff,
-            ) => TaskSchedulerState::queued(),
+            Some(progress_mode) => scheduler_state_for_progress_mode(progress_mode),
             None => match status {
                 TaskStatus::AwaitingDeps => TaskSchedulerState::awaiting_dependencies(),
                 TaskStatus::Pending => TaskSchedulerState::queued(),
@@ -298,6 +295,21 @@ fn workflow_scheduler_state(
                 _ => TaskSchedulerState::queued(),
             },
         },
+    }
+}
+
+fn scheduler_state_for_progress_mode(progress_mode: WorkflowProgressMode) -> TaskSchedulerState {
+    match progress_mode {
+        WorkflowProgressMode::CommandDriven => TaskSchedulerState {
+            authority_state: SchedulerAuthorityState::Running,
+            owner: None,
+            run_generation: 0,
+            recovery_generation: 0,
+            lease_expires_at: None,
+        },
+        WorkflowProgressMode::ExternalWait
+        | WorkflowProgressMode::OperatorGate
+        | WorkflowProgressMode::ParentHandoff => TaskSchedulerState::queued(),
     }
 }
 

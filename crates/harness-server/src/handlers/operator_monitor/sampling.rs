@@ -1,5 +1,7 @@
 use super::{OPERATOR_ACTION_STATES, WORKFLOW_SAMPLE_LIMIT};
-use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState};
+use harness_workflow::runtime::{
+    WorkflowInstance, WorkflowProgressMode, WorkflowRuntimeStore, WorkflowTerminalState,
+};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
@@ -16,6 +18,15 @@ pub(super) async fn list_operator_action_workflows(
                     .await?,
             );
         }
+        workflows.extend(
+            store
+                .list_recent_instances_by_progress_mode(
+                    definition_id,
+                    WorkflowProgressMode::OperatorGate,
+                    WORKFLOW_SAMPLE_LIMIT,
+                )
+                .await?,
+        );
     }
     Ok(workflows)
 }
