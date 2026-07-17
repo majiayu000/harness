@@ -1037,6 +1037,10 @@ fn register_declarative_visibility_definition() {
                         on_success: Some("done".to_string()),
                         on_failure: Some("failed".to_string()),
                         on_blocked: Some("blocked".to_string()),
+                        on_signal: BTreeMap::from([(
+                            "cancel".to_string(),
+                            "cancelled".to_string(),
+                        )]),
                         ..DeclaredState::default()
                     },
                 ),
@@ -1051,6 +1055,7 @@ fn register_declarative_visibility_definition() {
             terminal: BTreeMap::from([
                 ("done".to_string(), "succeeded".to_string()),
                 ("failed".to_string(), "failed".to_string()),
+                ("cancelled".to_string(), "cancelled".to_string()),
             ]),
             evidence_required: BTreeMap::new(),
             recovery_targets: vec!["working".to_string()],
@@ -1066,6 +1071,22 @@ fn register_declarative_visibility_definition() {
         harness_workflow::runtime::register_declarative_workflow_definitions([definition])
             .expect("visibility fixture definition should register");
     });
+}
+
+/// Non-DB guard that the visibility fixture builds and registers. The DB-gated
+/// visibility test skips before touching the fixture when no database is
+/// configured, so without this the fixture's declarative validity is never
+/// exercised locally.
+#[test]
+fn declarative_visibility_fixture_definition_is_valid() {
+    register_declarative_visibility_definition();
+    assert!(
+        harness_workflow::runtime::current_declarative_workflow_definition(
+            DECLARATIVE_VISIBILITY_DEFINITION_ID
+        )
+        .is_some(),
+        "visibility fixture definition should register"
+    );
 }
 
 /// B-003 / B-005: a blocked instance of a declarative definition surfaces in the
