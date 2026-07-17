@@ -44,6 +44,7 @@ include!("tests/runtime_failure_classification.rs");
 include!("tests/decision_validator.rs");
 include!("tests/command_bus.rs");
 include!("tests/worker_lifecycle.rs");
+include!("tests/worker_completion_transitions.rs");
 include!("tests/quality_gate_worker.rs");
 include!("tests/worker_limits.rs");
 include!("tests/durable_store.rs");
