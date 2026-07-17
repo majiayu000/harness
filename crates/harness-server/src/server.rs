@@ -165,6 +165,61 @@ impl HarnessServer {
         }
         Ok(definitions)
     }
+
+    /// Build the project-scoped intake binding registry (GH-1656, T002).
+    ///
+    /// Enumerates the same startup projects as declarative definition
+    /// registration, extracts each definition's optional `intake` block, and
+    /// validates the source fail-closed against the deployment's enabled intake
+    /// sources. Invalid bindings abort startup with an actionable error.
+    pub fn build_intake_binding_registry(
+        &self,
+    ) -> anyhow::Result<crate::intake::binding::IntakeBindingRegistry> {
+        let enabled_sources =
+            crate::intake::binding::enabled_intake_source_names(&self.config.intake);
+
+        let mut project_roots = BTreeSet::new();
+        project_roots.insert(project_root_identity(&self.config.server.project_root));
+        for project in self
+            .startup_projects
+            .iter()
+            .chain(self.startup_default_project.iter())
+        {
+            project_roots.insert(project_root_identity(&project.root));
+        }
+
+        let mut bindings = Vec::new();
+        for project_root in project_roots {
+            let document = load_workflow_document(&project_root).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to load workflow definition for project '{}': {error}",
+                    project_root.display()
+                )
+            })?;
+            let Some(policy) = document.config.definition.as_ref() else {
+                continue;
+            };
+            let Some(intake) = policy.intake.as_ref() else {
+                continue;
+            };
+            let binding = crate::intake::binding::IntakeBinding::from_policy(
+                &policy.id,
+                intake,
+                &enabled_sources,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid intake binding for project '{}': {error}",
+                    project_root.display()
+                )
+            })?;
+            bindings.push((
+                crate::intake::binding::binding_project_key(&project_root),
+                binding,
+            ));
+        }
+        Ok(crate::intake::binding::IntakeBindingRegistry::from_bindings(bindings))
+    }
 }
 
 fn project_root_identity(root: &Path) -> PathBuf {

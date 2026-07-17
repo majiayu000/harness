@@ -416,3 +416,81 @@ async fn declarative_submission_rejects_unknown_and_builtin_ids() -> anyhow::Res
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn declarative_dedupe_and_cap_query_key_off_subject_external_id() -> anyhow::Result<()> {
+    // GH-1656 T005: the intake router's dedupe (live-suppress) and cap checks
+    // rely on `list_nonterminal_instances_by_definition` returning instances
+    // whose subject key is the issue's external id. This asserts that
+    // store-backed mechanism directly, independent of AppState wiring.
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    register_test_definition();
+    let dir = tempfile::tempdir()?;
+    let store = open_declarative_runtime_store(dir.path()).await?;
+    let project_root = create_test_project(dir.path())?;
+
+    let submit = |task: &'static str, external: &'static str| {
+        let store = &store;
+        let project_root = project_root.clone();
+        async move {
+            let task_id = TaskId::from_str(task);
+            record_declarative_submission(
+                store,
+                DeclarativeSubmissionRuntimeContext {
+                    project_root: &project_root,
+                    definition_id: TEST_DEFINITION_ID,
+                    task_id: &task_id,
+                    prompt: "handle the incoming issue",
+                    depends_on: &[],
+                    serialization_depends_on: &[],
+                    source: Some("github"),
+                    external_id: Some(external),
+                },
+            )
+            .await
+        }
+    };
+
+    // First submission for issue:42 -> one nonterminal instance keyed by the
+    // external id (the router's dedupe/cap query surface).
+    submit("intake-a", "issue:42").await?;
+    let active = store
+        .list_nonterminal_instances_by_definition(TEST_DEFINITION_ID, None, None)
+        .await?;
+    assert_eq!(
+        active.len(),
+        1,
+        "one nonterminal instance after first submission"
+    );
+    assert_eq!(
+        active[0].subject.subject_key, "issue:42",
+        "dedupe key is the issue external id"
+    );
+
+    // Re-submitting the same external id is idempotent (deterministic workflow
+    // id): still one nonterminal instance, so the router's live-dedupe check
+    // suppresses rather than creating a second.
+    submit("intake-b", "issue:42").await?;
+    let active = store
+        .list_nonterminal_instances_by_definition(TEST_DEFINITION_ID, None, None)
+        .await?;
+    assert_eq!(
+        active.len(),
+        1,
+        "same external id must not create a second live instance"
+    );
+
+    // A distinct external id creates a separate instance, so the cap count grows.
+    submit("intake-c", "issue:43").await?;
+    let active = store
+        .list_nonterminal_instances_by_definition(TEST_DEFINITION_ID, None, None)
+        .await?;
+    assert_eq!(
+        active.len(),
+        2,
+        "distinct external ids each count toward the per-binding cap"
+    );
+    Ok(())
+}

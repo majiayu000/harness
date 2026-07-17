@@ -183,6 +183,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     if let Some(github) = server.config.intake.github.as_ref() {
         github.auto_recovery.validate()?;
     }
+    // Built here, before `server` is moved into CoreServices, so a bad intake
+    // binding aborts startup fail-closed (GH-1656, T002).
+    let intake_bindings = server.build_intake_binding_registry()?;
     let api_auth_mode = super::auth::resolve_api_auth_mode(&server.config.server)?;
     super::auth::log_api_auth_mode(&api_auth_mode, &server.config.server);
     #[cfg(test)]
@@ -433,6 +436,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
                 github_poller_repos,
                 completion_callback: intake.completion_callback,
                 token_dispatch_counters: IntakeServices::new_token_dispatch_counters(),
+                intake_bindings,
             }
         },
         project_svc: services.project_svc,

@@ -8,7 +8,35 @@
 //! `IntakeSource` trait and needs no change to this module (B-003, B-010).
 
 use super::IncomingIssue;
-use std::collections::HashMap;
+use harness_core::config::intake::IntakeConfig;
+use harness_core::config::workflow::WorkflowDefinitionIntakePolicy;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+/// Canonical project key used to store and look up bindings. Both the startup
+/// registry build and the `poll_tick` lookup route through this single helper so
+/// the keys match by construction (avoids a silent routing miss from divergent
+/// canonicalization).
+pub fn binding_project_key(root: &Path) -> String {
+    root.canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Names of intake sources that are configured and enabled for a deployment.
+/// A binding may only target one of these (B-002 fail-closed). Only sources that
+/// actually flow through the poll/dispatch path are eligible.
+pub fn enabled_intake_source_names(config: &IntakeConfig) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if config.github.as_ref().is_some_and(|github| github.enabled) {
+        names.insert("github".to_string());
+    }
+    if config.feishu.as_ref().is_some_and(|feishu| feishu.enabled) {
+        names.insert("feishu".to_string());
+    }
+    names
+}
 
 /// A validated, startup-frozen intake binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +54,31 @@ pub struct IntakeBinding {
 }
 
 impl IntakeBinding {
+    /// Build a validated binding from a definition's intake policy, cross-checking
+    /// the source against the deployment's enabled intake sources (B-002
+    /// fail-closed). The policy's own field validation ran at parse time (T001).
+    pub fn from_policy(
+        definition_id: &str,
+        policy: &WorkflowDefinitionIntakePolicy,
+        enabled_sources: &HashSet<String>,
+    ) -> anyhow::Result<Self> {
+        if !enabled_sources.contains(&policy.source) {
+            let mut enabled: Vec<&str> = enabled_sources.iter().map(String::as_str).collect();
+            enabled.sort_unstable();
+            anyhow::bail!(
+                "definition `{definition_id}` intake source `{}` is not an enabled intake source (enabled: {enabled:?})",
+                policy.source
+            );
+        }
+        Ok(Self {
+            definition_id: definition_id.to_string(),
+            source: policy.source.clone(),
+            labels: policy.filter.labels.clone(),
+            exclude_labels: policy.filter.exclude_labels.clone(),
+            max_active_instances: policy.max_active_instances,
+        })
+    }
+
     /// Source + all-labels + no-exclude-labels over a normalized issue. Label
     /// matching is exact and case-sensitive (B-003).
     pub fn matches(&self, issue: &IncomingIssue) -> bool {
@@ -226,5 +279,53 @@ mod tests {
             .resolve("proj", &issue("github", &["docs"]))
             .expect("a binding should match");
         assert_eq!(m.tie_definition_ids, vec!["docs_flow"]);
+    }
+
+    fn intake_policy(source: &str) -> WorkflowDefinitionIntakePolicy {
+        use harness_core::config::workflow::IntakeFilterPolicy;
+        WorkflowDefinitionIntakePolicy {
+            source: source.to_string(),
+            filter: IntakeFilterPolicy {
+                labels: vec!["docs".to_string()],
+                exclude_labels: vec!["wip".to_string()],
+            },
+            max_active_instances: 4,
+        }
+    }
+
+    #[test]
+    fn from_policy_builds_binding_when_source_is_enabled() {
+        let enabled: HashSet<String> = ["github".to_string()].into_iter().collect();
+        let b = IntakeBinding::from_policy("docs_flow", &intake_policy("github"), &enabled)
+            .expect("enabled source should build");
+        assert_eq!(b.definition_id, "docs_flow");
+        assert_eq!(b.source, "github");
+        assert_eq!(b.labels, ["docs"]);
+        assert_eq!(b.exclude_labels, ["wip"]);
+        assert_eq!(b.max_active_instances, 4);
+    }
+
+    #[test]
+    fn from_policy_rejects_disabled_or_unknown_source() {
+        // B-002: a binding targeting a source the deployment has not enabled
+        // aborts startup fail-closed.
+        let enabled: HashSet<String> = ["github".to_string()].into_iter().collect();
+        assert!(
+            IntakeBinding::from_policy("triage_flow", &intake_policy("feishu"), &enabled).is_err(),
+            "a source not in the enabled set must be rejected"
+        );
+        assert!(
+            IntakeBinding::from_policy("triage_flow", &intake_policy("linear"), &HashSet::new())
+                .is_err(),
+            "no enabled sources means every binding is rejected"
+        );
+    }
+
+    #[test]
+    fn enabled_intake_source_names_is_empty_by_default() {
+        // A default IntakeConfig has no enabled sources, so any binding fails
+        // closed until a source is configured and enabled.
+        let names = enabled_intake_source_names(&IntakeConfig::default());
+        assert!(names.is_empty());
     }
 }

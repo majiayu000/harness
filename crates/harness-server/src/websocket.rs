@@ -410,6 +410,7 @@ mod tests {
                 github_poller_repos: vec![],
                 completion_callback: None,
                 token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
+                intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
             },
             project_svc,
             task_svc,

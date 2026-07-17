@@ -143,6 +143,10 @@ pub struct IntakeServices {
     /// monitoring to distinguish cheap server polling from token-consuming
     /// agent work.
     pub token_dispatch_counters: Arc<DashMap<String, Arc<GitHubTokenDispatchCounters>>>,
+    /// Project-scoped declarative intake bindings (GH-1656), built once at
+    /// startup and immutable afterwards. Empty when no definition declares an
+    /// `intake` block.
+    pub intake_bindings: crate::intake::binding::IntakeBindingRegistry,
 }
 
 impl IntakeServices {

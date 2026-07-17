@@ -9,6 +9,7 @@ use crate::http::AppState;
 use crate::task_runner::{TaskFailureKind, TaskId, TaskStatus};
 
 pub mod binding;
+mod declarative_routing;
 mod direct_dispatch;
 pub mod feishu;
 mod github_coverage_gate;
@@ -206,6 +207,18 @@ impl IntakeOrchestrator {
             }
             let mut uncovered_issues = Vec::new();
             for (source, issue) in issues {
+                // GH-1656: declarative intake routing runs first and is
+                // exclusive — a matched issue never reaches the github path.
+                if declarative_routing::route_declarative_intake(
+                    state,
+                    &project_root,
+                    &source,
+                    &issue,
+                )
+                .await
+                {
+                    continue;
+                }
                 let Some(issue_number) = github_direct_issue_number(source.name(), &issue) else {
                     enqueue_fallback_intake_issue(
                         state,
