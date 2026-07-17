@@ -86,18 +86,32 @@ BASE="$(git rev-parse HEAD)"
 SOURCE=crates/harness-workflow/src/runtime/tests/runtime_store.rs
 SUPPORT=crates/harness-workflow/src/runtime/tests/runtime_store_support.rs
 BASE_LIST=/tmp/GH1697-base-tests.txt
+BASE_CONFIG_HOME="$(mktemp -d /tmp/harness-GH1697-base.XXXXXX)"
+trap 'rm -rf -- "$BASE_CONFIG_HOME"' EXIT
 
 test ! -e "$SUPPORT"
 test "$(wc -l < "$SOURCE" | tr -d ' ')" = 900
 test "$(rg -c '^#\[tokio::test\]' "$SOURCE")" = 11
 test "$(rg -o 'assert(_eq|_ne)?!|expect\(' "$SOURCE" | wc -l | tr -d ' ')" = 43
-cargo test -p harness-workflow --lib -- --list > "$BASE_LIST"
+env -u HARNESS_DATABASE_URL \
+  -u HARNESS_DATABASE_POOL_MAX_CONNECTIONS \
+  -u HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS \
+  XDG_CONFIG_HOME="$BASE_CONFIG_HOME" \
+  cargo test -p harness-workflow --lib -- --list > "$BASE_LIST"
+cargo check -p harness-workflow --all-targets
+env -u HARNESS_DATABASE_URL \
+  -u HARNESS_DATABASE_POOL_MAX_CONNECTIONS \
+  -u HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS \
+  XDG_CONFIG_HOME="$BASE_CONFIG_HOME" \
+  cargo test -p harness-workflow --lib runtime::tests::runtime_store::
 ```
 
 After editing:
 
 ```bash
 FINAL_LIST=/tmp/GH1697-final-tests.txt
+FINAL_CONFIG_HOME="$(mktemp -d /tmp/harness-GH1697-final.XXXXXX)"
+trap 'rm -rf -- "$FINAL_CONFIG_HOME"' EXIT
 
 diff -u \
   <(git show "$BASE:$SOURCE" | sed -n '620,832p') \
@@ -116,25 +130,44 @@ test "$(rg -o 'assert(_eq|_ne)?!|expect\(' "$SOURCE" "$SUPPORT" |
   wc -l | tr -d ' ')" = 43
 test "$(sed -nE 's/^(async )?fn ([A-Za-z0-9_]+)\(.*/\2/p' "$SUPPORT" |
   wc -l | tr -d ' ')" = 9
-cargo test -p harness-workflow --lib -- --list > "$FINAL_LIST"
+env -u HARNESS_DATABASE_URL \
+  -u HARNESS_DATABASE_POOL_MAX_CONNECTIONS \
+  -u HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS \
+  XDG_CONFIG_HOME="$FINAL_CONFIG_HOME" \
+  cargo test -p harness-workflow --lib -- --list > "$FINAL_LIST"
 diff -u "$BASE_LIST" "$FINAL_LIST"
 diff -u \
   <(printf '%s\n' \
     crates/harness-workflow/src/runtime/tests/runtime_store.rs \
     crates/harness-workflow/src/runtime/tests/runtime_store_support.rs) \
   <(git diff --name-only "$BASE"...HEAD | sort)
+cargo check -p harness-workflow --all-targets
+env -u HARNESS_DATABASE_URL \
+  -u HARNESS_DATABASE_POOL_MAX_CONNECTIONS \
+  -u HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS \
+  XDG_CONFIG_HOME="$FINAL_CONFIG_HOME" \
+  cargo test -p harness-workflow --lib runtime::tests::runtime_store::
+env -u HARNESS_DATABASE_URL \
+  -u HARNESS_DATABASE_POOL_MAX_CONNECTIONS \
+  -u HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS \
+  XDG_CONFIG_HOME="$FINAL_CONFIG_HOME" \
+  cargo test -p harness-workflow --lib -- \
+    --skip runtime::tests::remote_host_lease
 ```
 
 Also run:
 
 - `cargo fmt --all -- --check`
 - `git diff --check`
-- `cargo check -p harness-workflow --all-targets`
-- `cargo test -p harness-workflow --lib runtime::tests::runtime_store::`
-- database-independent full `cargo test -p harness-workflow --lib`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - repository pre-push tests, SpecRail checks, manual VibeGuard L1-L7 review,
   exact-head CI, review-thread audit, independent review, and required PR gate.
+
+The sanitized local full suite must pass all database-independent workflow
+library tests while explicitly skipping the six
+`runtime::tests::remote_host_lease` PostgreSQL tests. Exact-head CI's
+configured full database profile is authoritative for those six tests and
+other DB-backed coverage.
 
 ## Rollback Plan
 

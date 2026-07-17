@@ -24,6 +24,9 @@ GH-1697
 - Preserve the complete `--list` output before editing.
 - Stop if the base, inventories, target absence, focused tests, or package
   check differ from the packet.
+- Run the package check and 11 focused module tests in the before-edit block,
+  using the sanitized database-independent environment specified in
+  `tech.md`.
 
 ### SP1697-T2 — Extract support block
 
@@ -33,8 +36,9 @@ GH-1697
 - Replace only that range with the single direct include.
 - Prove 688/213 lines, 11 tests, nine helpers, 43 occurrences, identical
   compiled paths, exact source ranges, and exact two-file scope.
-- Run formatting, diff, focused, full workflow, and package checks before
-  commit.
+- Run final formatting, diff, package, focused, and sanitized full workflow
+  checks before commit; require configured exact-head CI for the six deferred
+  PostgreSQL lease tests.
 
 ### SP1697-T3 — Prove readiness
 
