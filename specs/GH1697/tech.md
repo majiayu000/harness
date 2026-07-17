@@ -104,11 +104,17 @@ env -u HARNESS_DATABASE_URL \
   -u HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS \
   XDG_CONFIG_HOME="$BASE_CONFIG_HOME" \
   cargo test -p harness-workflow --lib runtime::tests::runtime_store::
+rm -rf -- "$BASE_CONFIG_HOME"
+trap - EXIT
 ```
 
 After editing:
 
 ```bash
+BASE="$(git merge-base HEAD origin/main)"
+SOURCE=crates/harness-workflow/src/runtime/tests/runtime_store.rs
+SUPPORT=crates/harness-workflow/src/runtime/tests/runtime_store_support.rs
+BASE_LIST=/tmp/GH1697-base-tests.txt
 FINAL_LIST=/tmp/GH1697-final-tests.txt
 FINAL_CONFIG_HOME="$(mktemp -d /tmp/harness-GH1697-final.XXXXXX)"
 trap 'rm -rf -- "$FINAL_CONFIG_HOME"' EXIT
@@ -153,6 +159,8 @@ env -u HARNESS_DATABASE_URL \
   XDG_CONFIG_HOME="$FINAL_CONFIG_HOME" \
   cargo test -p harness-workflow --lib -- \
     --skip runtime::tests::remote_host_lease
+rm -rf -- "$FINAL_CONFIG_HOME"
+trap - EXIT
 ```
 
 Also run:
