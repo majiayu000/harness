@@ -48,16 +48,20 @@ GH-1686
 - Work:
   - add `.bun-version` with exact value `1.3.14`;
   - replace all three active `bun-version: latest` inputs with the shared file;
+  - add `.bun-version` to the main CI `ci` filter and Web CI paths so a
+    version-only change validates the selected toolchain;
   - preserve every unrelated workflow line and all manifests/lockfiles;
   - install or download Bun 1.3.14 and run the complete web validation surface;
   - prove exact version/reference counts and approved four-file scope.
 - Done when:
   - Bun 1.3.14 is the single active workflow version source;
+  - a `.bun-version`-only change selects main CI and Web CI;
   - all web and SDK checks pass with frozen dependencies;
   - workflow YAML parses and unrelated configuration is unchanged.
 - Verify:
   - exact `.bun-version` byte check;
-  - active-workflow input inventory and zero-`latest` assertion;
+  - active-workflow input inventory, zero-`latest` assertion, and exact path
+    filter/trigger inventory;
   - `bun --version` under the pinned binary;
   - web frozen install, typecheck, test, and build commands;
   - YAML parse, diff, manifest/lockfile, and four-file scope checks.
@@ -110,5 +114,5 @@ verified, and committed sequentially.
 - Upstream `setup-bun` uses direct release URL construction only for strict
   versions; ranges and `latest` enumerate tags.
 - Preserve historical documentation examples and all workflow behavior outside
-  the three input substitutions.
+  the three input substitutions and two `.bun-version` path additions.
 - Route any web, SDK, or Rust product finding to a separate issue/spec cycle.

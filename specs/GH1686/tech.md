@@ -44,6 +44,13 @@ Replace each active workflow's `bun-version: latest` input with:
 bun-version-file: .bun-version
 ```
 
+Add `.bun-version` to the `ci` filter in `.github/workflows/ci.yml` so a
+version-only pull request runs the web bundle, Clippy, tests, and CI result.
+Add the same path to `.github/workflows/web-ci.yml` so version-only pull
+requests and pushes run web typecheck, tests, build, and artifact upload.
+`ci-disabled-modules.yml` already runs for every pull request and needs no
+trigger expansion.
+
 The action reads the trimmed file value, recognizes it as a strict semantic
 version, sets `tag = bun-v1.3.14`, and constructs the release asset URL without
 executing its tag-enumeration request. A root file is used because
@@ -57,7 +64,8 @@ later run steps use `working-directory: web`.
 - Every active `oven-sh/setup-bun@v2` step uses the same root version file.
 - No active workflow uses `latest`, a range, a literal duplicated version, a
   custom download URL, or a fallback installer.
-- Workflow triggers, permissions, runners, dependencies, environment,
+- The main CI `ci` change filter and Web CI paths include `.bun-version`;
+  all other triggers, filters, permissions, runners, dependencies, environment,
   working directories, commands, artifact paths, and retention remain exact.
 - Web and SDK manifests and lockfiles remain byte-for-byte unchanged.
 - No Rust source or test file changes.
@@ -94,6 +102,9 @@ and Rust validation steps. No Harness runtime data flow changes.
 - Put the version in `web/package.json`: rejected because `engines.bun`
   currently describes compatibility (`>=1.0.0`), not a repository toolchain
   pin, and changing it would mix package contract and CI selection semantics.
+- Preserve the existing path filters without `.bun-version`: rejected because
+  a later version-only change would select a new executable while skipping the
+  main and web validation intended to qualify it.
 
 ## Risks
 
@@ -121,8 +132,10 @@ and Rust validation steps. No Harness runtime data flow changes.
       `cargo check --workspace --all-features` after the web bundle exists.
 - [ ] Parse all changed YAML workflows and inspect the exact diff.
 - [ ] Assert one version file, three `bun-version-file` references, zero active
-      `bun-version: latest` references, unchanged manifests/lockfiles, and the
-      approved four-file scope.
+      `bun-version: latest` references, the two required `.bun-version` filter
+      entries, unchanged manifests/lockfiles, and the approved four-file scope.
+- [ ] Confirm a `.bun-version`-only path classification selects main CI and
+      Web CI while unrelated trigger/filter behavior remains unchanged.
 - [ ] Run repository-required workspace Clippy/tests, SpecRail checks, manual
       VibeGuard L1-L7 review, exact-head CI, review-thread audit, and required
       PR gate.

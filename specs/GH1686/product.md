@@ -19,6 +19,7 @@ tests never started even though the exact web build passed locally.
 - Make the Bun toolchain deterministic across all active workflows.
 - Avoid the full Bun tag-discovery request during CI setup.
 - Keep one repository-owned Bun version as the source of truth.
+- Ensure a Bun version-only change triggers the workflows that validate it.
 - Preserve all existing dependency-install, typecheck, test, build, artifact,
   and Rust validation commands.
 - Restore reliable validation for unrelated Rust pull requests.
@@ -44,7 +45,9 @@ run. Existing web and Rust validation commands and artifacts remain unchanged.
 - [ ] B-002: `.github/workflows/ci.yml`,
       `.github/workflows/web-ci.yml`, and
       `.github/workflows/ci-disabled-modules.yml` configure
-      `oven-sh/setup-bun@v2` through `bun-version-file: .bun-version`.
+      `oven-sh/setup-bun@v2` through `bun-version-file: .bun-version`;
+      `.bun-version` is also included in the main CI change filter and Web CI
+      path triggers.
 - [ ] B-003: No active workflow retains `bun-version: latest` or duplicates a
       literal Bun version.
 - [ ] B-004: The strict version path constructs the release download without
@@ -52,8 +55,9 @@ run. Existing web and Rust validation commands and artifacts remain unchanged.
 - [ ] B-005: Bun 1.3.14 completes frozen dependency installation, web
       typecheck, tests, SDK prebuild, and production build without manifest or
       lockfile changes.
-- [ ] B-006: Existing workflow triggers, job dependencies, commands, artifact
-      handling, and Rust validation behavior remain unchanged.
+- [ ] B-006: Apart from the narrow `.bun-version` path additions, existing
+      workflow triggers, job dependencies, commands, artifact handling, and
+      Rust validation behavior remain unchanged.
 - [ ] B-007: Format, web validation, workflow syntax/scope checks, manual
       VibeGuard review, exact-head CI, review-thread audit, and SpecRail gates
       pass.
@@ -66,6 +70,8 @@ run. Existing web and Rust validation commands and artifacts remain unchanged.
   range, `latest`, or malformed value would re-enter tag discovery.
 - All three active Bun-using workflows must move together so pull-request,
   web-only, and all-features validation cannot drift.
+- A pull request or push that changes only `.bun-version` must run main CI and
+  Web CI instead of silently skipping validation for the selected toolchain.
 - A cached runner and an uncached runner must resolve the same release.
 - Existing frozen lockfiles must remain accepted by Bun 1.3.14.
 - Historical examples under `docs/` are records, not active workflow
