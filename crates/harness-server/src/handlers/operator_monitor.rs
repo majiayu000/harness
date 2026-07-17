@@ -18,7 +18,7 @@ use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary
 use activity::{runtime_workflow_counts, source_activity, RuntimeWorkflowCounts, SourceActivity};
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
-use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
+use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState};
 use sampling::{dedupe_workflows, list_operator_action_workflows, list_recent_failed_workflows};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -377,7 +377,7 @@ fn truncate_workflow_sample(workflows: &mut Vec<WorkflowInstance>, limit: usize)
     let mut failed = Vec::new();
     let mut other = Vec::new();
     for workflow in workflows.drain(..) {
-        if workflow.state == "failed" {
+        if workflow.terminal_state() == Some(WorkflowTerminalState::Failed) {
             failed.push(workflow);
         } else if workflow_action_kind(workflow.state.as_str()).is_some() {
             operator_actions.push(workflow);

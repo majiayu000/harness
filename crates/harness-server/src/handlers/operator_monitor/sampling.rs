@@ -1,5 +1,5 @@
 use super::{OPERATOR_ACTION_STATES, WORKFLOW_SAMPLE_LIMIT};
-use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
+use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
@@ -38,7 +38,11 @@ pub(super) async fn list_recent_failed_workflows(
     for definition_id in definition_ids {
         workflows.extend(
             store
-                .list_recent_instances_by_state(definition_id, "failed", per_definition_limit)
+                .list_recent_terminal_instances_by_definition(
+                    definition_id,
+                    WorkflowTerminalState::Failed,
+                    per_definition_limit,
+                )
                 .await?,
         );
     }
