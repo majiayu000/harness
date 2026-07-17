@@ -323,15 +323,16 @@ describe("<Submit>", () => {
 // ── <SubmitSuccess> tests ──────────────────────────────────────────────────────
 
 describe("<SubmitSuccess>", () => {
-  it("reports a missing workflow id instead of calling a legacy cancel endpoint", () => {
+  it("disables runtime-only actions without runtime ownership", () => {
     const runtimeMutate = vi.fn();
     mockUseCancelWorkflowRuntime.mockReturnValue({ mutate: runtimeMutate, isPending: false });
 
     wrap(<SubmitSuccess taskId="task-abc" onReset={vi.fn()} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("button", { name: "Watch live" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
     expect(runtimeMutate).not.toHaveBeenCalled();
-    expect(screen.getByTestId("stream-error")).toHaveTextContent("Workflow runtime id unavailable");
+    expect(mockUseTaskStream).toHaveBeenCalledWith(null, expect.any(Function), expect.any(Function));
   });
 
   it("runtime cancel uses the workflow runtime endpoint handle", () => {

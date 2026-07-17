@@ -47,9 +47,9 @@ function statusColor(status: string): string {
   }
 }
 
-function openStream(taskId: string): void {
+function openStream(submissionId: string): void {
   const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-  const base = `/api/workflows/runtime/submissions/${taskId}/stream`;
+  const base = `/api/workflows/runtime/submissions/${submissionId}/stream`;
   const url = tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
   window.open(url, "_blank", "noreferrer");
 }
@@ -133,10 +133,10 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
         </span>
         <button
           type="button"
-          disabled={!card.runtimeWorkflowId}
-          title={card.runtimeWorkflowId ? undefined : "Workflow runtime id unavailable"}
+          disabled={!card.runtimeSubmissionId}
+          title={card.runtimeSubmissionId ? undefined : "Runtime submission id unavailable"}
           onClick={() => {
-            if (card.runtimeWorkflowId) openStream(card.taskId);
+            if (card.runtimeSubmissionId) openStream(card.runtimeSubmissionId);
           }}
           className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink disabled:opacity-50 disabled:cursor-not-allowed"
         >
@@ -144,7 +144,8 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
         </button>
         <button
           type="button"
-          disabled={cancelling}
+          disabled={cancelling || !card.runtimeWorkflowId}
+          title={card.runtimeWorkflowId ? undefined : "Workflow runtime id unavailable"}
           onClick={() => onCancel(card)}
           className="font-mono text-[11.5px] px-3 py-1 border border-danger/40 text-danger rounded-[3px] hover:bg-danger/5 disabled:opacity-50 disabled:cursor-not-allowed"
         >

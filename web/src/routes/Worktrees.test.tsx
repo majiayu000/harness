@@ -31,6 +31,7 @@ function worktreeCard(overrides: Partial<import("@/lib/queries").WorktreeCard> =
     sourceRepo: "/Users/example/src/repo",
     repo: "owner/repo",
     runtimeWorkflowId: null,
+    runtimeSubmissionId: null,
     branch: "harness/runtime-task-1",
     status: "implementing",
     phase: "implement",
@@ -81,7 +82,7 @@ describe("<Worktrees>", () => {
     expect(screen.getByRole("link", { name: "Docs" })).toHaveAttribute("href", DOCS_URL);
   });
 
-  it("reports missing runtime ownership instead of calling a legacy cancel endpoint", async () => {
+  it("disables cancellation when the worktree has no runtime ownership", () => {
     mockUseWorktrees.mockReturnValue({
       cards: [worktreeCard({ taskId: "runtime-task-1" })],
       isLoading: false,
@@ -99,10 +100,10 @@ describe("<Worktrees>", () => {
     mockApiFetch.mockResolvedValue(new Response("{}", { status: 200 }));
 
     wrap(<Worktrees />);
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-
-    await waitFor(() =>
-      expect(screen.getByText(/Workflow runtime id unavailable/)).toBeInTheDocument(),
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveAttribute(
+      "title",
+      "Workflow runtime id unavailable",
     );
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
@@ -122,14 +123,19 @@ describe("<Worktrees>", () => {
     expect(screen.getByRole("button", { name: "Logs" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Logs" })).toHaveAttribute(
       "title",
-      "Workflow runtime id unavailable",
+      "Runtime submission id unavailable",
     );
   });
 
   it("opens runtime-owned worktree logs through the submission stream", () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
     mockUseWorktrees.mockReturnValue({
-      cards: [worktreeCard({ runtimeWorkflowId: "runtime-workflow-1" })],
+      cards: [
+        worktreeCard({
+          runtimeWorkflowId: "runtime-workflow-1",
+          runtimeSubmissionId: "runtime-submission-1",
+        }),
+      ],
       isLoading: false,
       error: null,
     });
@@ -141,7 +147,7 @@ describe("<Worktrees>", () => {
     fireEvent.click(screen.getByRole("button", { name: "Logs" }));
 
     expect(open).toHaveBeenCalledWith(
-      "/api/workflows/runtime/submissions/runtime-task-1/stream",
+      "/api/workflows/runtime/submissions/runtime-submission-1/stream",
       "_blank",
       "noreferrer",
     );

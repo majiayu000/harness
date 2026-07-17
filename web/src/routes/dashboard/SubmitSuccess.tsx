@@ -13,11 +13,12 @@ export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Pr
   const [output, setOutput] = useState<string>("");
   const [streamError, setStreamError] = useState<string | null>(null);
   const cancelWorkflowRuntime = useCancelWorkflowRuntime();
+  const canUseRuntimeSubmission = executionPath === "workflow_runtime";
   const canCancelWorkflowRuntime = executionPath === "workflow_runtime" && !!workflowId;
   const cancelPending = cancelWorkflowRuntime.isPending;
 
   useTaskStream(
-    taskId,
+    canUseRuntimeSubmission ? taskId : null,
     (text) => setOutput((prev) => prev + text),
     (err) => setStreamError(err),
   );
@@ -51,14 +52,17 @@ export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Pr
       <div className="flex gap-2">
         <button
           type="button"
+          disabled={!canUseRuntimeSubmission}
+          title={canUseRuntimeSubmission ? undefined : "Runtime submission unavailable"}
           onClick={openStream}
-          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
+          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink disabled:opacity-50 disabled:cursor-not-allowed"
         >
           Watch live
         </button>
         <button
           type="button"
-          disabled={cancelPending}
+          disabled={cancelPending || !canCancelWorkflowRuntime}
+          title={canCancelWorkflowRuntime ? undefined : "Workflow runtime id unavailable"}
           onClick={handleCancel}
           className="font-mono text-[11.5px] px-3 py-1 border border-danger/40 text-danger rounded-[3px] hover:bg-danger/5 disabled:opacity-50 disabled:cursor-not-allowed"
         >
