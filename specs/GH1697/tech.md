@@ -82,6 +82,8 @@ visibility, helper calls, and logical test paths do not change.
 Before editing:
 
 ```bash
+set -euo pipefail
+
 BASE="$(git rev-parse HEAD)"
 SOURCE=crates/harness-workflow/src/runtime/tests/runtime_store.rs
 SUPPORT=crates/harness-workflow/src/runtime/tests/runtime_store_support.rs
@@ -111,6 +113,8 @@ trap - EXIT
 After editing:
 
 ```bash
+set -euo pipefail
+
 BASE="$(git merge-base HEAD origin/main)"
 SOURCE=crates/harness-workflow/src/runtime/tests/runtime_store.rs
 SUPPORT=crates/harness-workflow/src/runtime/tests/runtime_store_support.rs
