@@ -133,8 +133,12 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
         </span>
         <button
           type="button"
-          onClick={() => openStream(card.taskId)}
-          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink"
+          disabled={!card.runtimeWorkflowId}
+          title={card.runtimeWorkflowId ? undefined : "Workflow runtime id unavailable"}
+          onClick={() => {
+            if (card.runtimeWorkflowId) openStream(card.taskId);
+          }}
+          className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink disabled:opacity-50 disabled:cursor-not-allowed"
         >
           Logs
         </button>

@@ -107,6 +107,46 @@ describe("<Worktrees>", () => {
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
+  it("disables logs when the worktree has no runtime ownership", () => {
+    mockUseWorktrees.mockReturnValue({
+      cards: [worktreeCard({ runtimeWorkflowId: null })],
+      isLoading: false,
+      error: null,
+    });
+    mockUseOverview.mockReturnValue({
+      data: { projects: [], runtimes: [], kpi: { active_tasks: 1 } },
+    });
+
+    wrap(<Worktrees />);
+
+    expect(screen.getByRole("button", { name: "Logs" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Logs" })).toHaveAttribute(
+      "title",
+      "Workflow runtime id unavailable",
+    );
+  });
+
+  it("opens runtime-owned worktree logs through the submission stream", () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    mockUseWorktrees.mockReturnValue({
+      cards: [worktreeCard({ runtimeWorkflowId: "runtime-workflow-1" })],
+      isLoading: false,
+      error: null,
+    });
+    mockUseOverview.mockReturnValue({
+      data: { projects: [], runtimes: [], kpi: { active_tasks: 1 } },
+    });
+
+    wrap(<Worktrees />);
+    fireEvent.click(screen.getByRole("button", { name: "Logs" }));
+
+    expect(open).toHaveBeenCalledWith(
+      "/api/workflows/runtime/submissions/runtime-task-1/stream",
+      "_blank",
+      "noreferrer",
+    );
+  });
+
   it("cancels runtime worktrees through the workflow endpoint", async () => {
     mockUseWorktrees.mockReturnValue({
       cards: [

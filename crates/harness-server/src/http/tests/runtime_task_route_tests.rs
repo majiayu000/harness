@@ -1140,6 +1140,50 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         .upsert_instance(&declarative)
         .await?;
 
+    // Keep two newer issue rows ahead of the prompt rows. A kind filter applied
+    // after LIMIT would discard both and incorrectly return an empty page.
+    for offset in 1..=2 {
+        let mut issue = WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("github_issue", format!("issue-{offset}")),
+        )
+        .with_id(format!("newer-issue-instance-{offset}"))
+        .with_data(serde_json::json!({
+            "project_id": project_root.canonicalize()?.to_string_lossy(),
+            "submission_id": format!("newer-issue-submission-{offset}"),
+            "issue_number": offset,
+            "repo": "owner/repo"
+        }));
+        issue.created_at = declarative.created_at + chrono::Duration::seconds(offset);
+        issue.updated_at = issue.created_at;
+        state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .expect("workflow runtime store should be configured")
+            .upsert_instance(&issue)
+            .await?;
+    }
+
+    let prompt_page_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/submissions?kind=prompt&limit=1")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(prompt_page_response.status(), StatusCode::OK);
+    let prompt_page = response_json(prompt_page_response).await?;
+    let prompt_rows = prompt_page["data"]
+        .as_array()
+        .expect("filtered runtime submission page should be an array");
+    assert_eq!(prompt_rows.len(), 1);
+    assert_eq!(prompt_rows[0]["task_kind"], "prompt");
+    assert_eq!(prompt_page["page"]["has_more"], true);
+
     let list_response = app
         .clone()
         .oneshot(

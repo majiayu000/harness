@@ -46,11 +46,18 @@ async fn append_runtime_definition_summaries(
     cursor: Option<&TaskSummaryPageCursor>,
     limit: usize,
 ) -> anyhow::Result<()> {
+    let include_all_kinds = filter.kinds.is_empty();
+    let kinds = harness_workflow::runtime::WorkflowSubmissionKindFilter {
+        include_issue: include_all_kinds || filter.kinds.contains(&TaskKind::Issue),
+        include_pr: include_all_kinds || filter.kinds.contains(&TaskKind::Pr),
+        include_prompt: include_all_kinds || filter.kinds.contains(&TaskKind::Prompt),
+    };
     let workflows = store
         .list_submission_instances_page(
             filter.project.as_deref(),
             cursor.map(|cursor| cursor.created_at),
             cursor.map(|cursor| cursor.id.as_str()),
+            kinds,
             i64::try_from(limit.max(1)).unwrap_or(i64::MAX),
         )
         .await?;
