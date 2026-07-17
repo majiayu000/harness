@@ -1211,6 +1211,35 @@ fn declarative_operator_gate_uses_registry_progress_for_action_kind() {
     assert_eq!(actions[0].kind, "blocked");
 }
 
+#[test]
+fn declarative_operator_gate_counts_as_blocked_activity() {
+    register_declarative_visibility_definition();
+    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
+        DECLARATIVE_VISIBILITY_DEFINITION_ID,
+    )
+    .expect("visibility fixture definition should be registered");
+    let gate = WorkflowInstance::new(
+        DECLARATIVE_VISIBILITY_DEFINITION_ID,
+        definition.definition_version(),
+        "manual_review",
+        WorkflowSubject::new("issue", "issue:manual-review-counts"),
+    )
+    .with_data(json!({
+        "definition_hash": definition.definition_hash(),
+        "source": "github"
+    }));
+
+    let counts = runtime_workflow_counts(std::slice::from_ref(&gate));
+    assert_eq!(counts.blocked, 1);
+    assert_eq!(counts.pending, 0);
+
+    let by_source = source_activity(&[gate], &[]);
+    assert_eq!(by_source.len(), 1);
+    assert_eq!(by_source[0].source, "github");
+    assert_eq!(by_source[0].blocked, 1);
+    assert_eq!(by_source[0].pending, 0);
+}
+
 #[tokio::test]
 async fn declarative_operator_gate_sampling_uses_registry_progress() -> anyhow::Result<()> {
     if !test_helpers::db_tests_enabled().await {

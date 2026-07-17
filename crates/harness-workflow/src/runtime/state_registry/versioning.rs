@@ -26,7 +26,9 @@ impl WorkflowDefinitionRegistry {
         );
         let versioned = self.checked_version_entry(version_key.clone(), definition)?;
         self.validate_declarative_definition(&versioned)?;
-        self.definition_ids.push(version_key.0.clone());
+        if !self.definition_ids.contains(&version_key.0) {
+            self.definition_ids.push(version_key.0.clone());
+        }
         self.definitions.insert(
             version_key.0.clone(),
             Arc::new(versioned.registered().clone()),
@@ -70,6 +72,9 @@ impl WorkflowDefinitionRegistry {
         );
         let versioned = self.checked_version_entry(version_key.clone(), definition)?;
         self.validate_declarative_definition(&versioned)?;
+        if !self.definition_ids.contains(&version_key.0) {
+            self.definition_ids.push(version_key.0.clone());
+        }
         self.declarative_versions.insert(version_key, versioned);
         Ok(())
     }
