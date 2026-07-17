@@ -177,6 +177,37 @@ test("run exposes a terminal runtime error", async () => {
   assert.equal(result.output, "Agent failed.\n\nspawn failed");
 });
 
+test("run falls back to the task error when artifacts are not found", async () => {
+  const mock = createMockFetch((call) => {
+    if (call.method === "POST") {
+      return {
+        status: 202,
+        body: {
+          task_id: "submission-failed-early",
+          execution_path: "workflow_runtime",
+        },
+      };
+    }
+    if (call.url.endsWith("/artifacts")) {
+      return { status: 404, body: { error: "runtime submission not found" } };
+    }
+    return {
+      body: {
+        submission_id: "submission-failed-early",
+        status: "failed",
+        project: "/repo",
+        error: "startup failed",
+      },
+    };
+  });
+  const harness = new Harness({ fetch: mock.fetch, cwd: "/repo" });
+
+  const result = await (await harness.startThread()).run("Fail");
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.output, "startup failed");
+});
+
 test("run emits timeout while a runtime submission remains active", async () => {
   const mock = createMockFetch((call) => {
     if (call.method === "POST") {
@@ -258,5 +289,30 @@ test("malformed runtime result artifacts fail loudly", async () => {
   await assert.rejects(
     () => harness.startThread().then((thread) => thread.run("Run")),
     /Invalid activity_result_envelope artifact/,
+  );
+});
+
+test("non-object runtime result artifacts fail loudly", async () => {
+  const mock = createMockFetch((call) => {
+    if (call.method === "POST") {
+      return {
+        status: 202,
+        body: { task_id: "submission-null", execution_path: "workflow_runtime" },
+      };
+    }
+    if (call.url.endsWith("/artifacts")) {
+      return {
+        body: [{ artifact_type: "activity_result_envelope", content: "null" }],
+      };
+    }
+    return {
+      body: { submission_id: "submission-null", status: "done", project: "/repo" },
+    };
+  });
+  const harness = new Harness({ fetch: mock.fetch, cwd: "/repo" });
+
+  await assert.rejects(
+    () => harness.startThread().then((thread) => thread.run("Run")),
+    /Invalid activity_result_envelope artifact: expected an object/,
   );
 });

@@ -1,5 +1,6 @@
 import { HarnessThread } from "./thread";
 import { HttpTransport } from "./transport";
+import { HarnessHttpError } from "./errors";
 import type {
   ErrorItem,
   HarnessOptions,
@@ -104,10 +105,18 @@ export class Harness {
     if (status === "running") {
       return [];
     }
-    const artifacts = await this.transport.request<RuntimeArtifact[]>(
-      "GET",
-      `/api/workflows/runtime/submissions/${encodeURIComponent(turnId)}/artifacts`,
-    );
+    let artifacts: RuntimeArtifact[];
+    try {
+      artifacts = await this.transport.request<RuntimeArtifact[]>(
+        "GET",
+        `/api/workflows/runtime/submissions/${encodeURIComponent(turnId)}/artifacts`,
+      );
+    } catch (error) {
+      if (!(error instanceof HarnessHttpError) || error.status !== 404) {
+        throw error;
+      }
+      artifacts = [];
+    }
     const envelope = [...artifacts]
       .reverse()
       .find((artifact) => artifact.artifact_type === "activity_result_envelope");
@@ -146,15 +155,23 @@ function parseFinalResult(content: string | undefined): {
 } {
   if (!content) return {};
   try {
-    const envelope = JSON.parse(content) as {
-      final_result?: { summary?: unknown; error?: unknown };
-    };
+    const envelope = JSON.parse(content) as unknown;
+    if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) {
+      throw new Error("expected an object");
+    }
+    const finalResult =
+      "final_result" in envelope &&
+      typeof envelope.final_result === "object" &&
+      envelope.final_result !== null &&
+      !Array.isArray(envelope.final_result)
+        ? (envelope.final_result as { summary?: unknown; error?: unknown })
+        : {};
     return {
-      ...(typeof envelope.final_result?.summary === "string"
-        ? { summary: envelope.final_result.summary }
+      ...(typeof finalResult.summary === "string"
+        ? { summary: finalResult.summary }
         : {}),
-      ...(typeof envelope.final_result?.error === "string"
-        ? { error: envelope.final_result.error }
+      ...(typeof finalResult.error === "string"
+        ? { error: finalResult.error }
         : {}),
     };
   } catch (error) {

@@ -131,6 +131,28 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.output, "Agent failed.\n\nspawn failed")
 
+    def test_run_falls_back_to_task_error_when_artifacts_are_not_found(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-failed-early",
+                    "execution_path": "workflow_runtime",
+                }
+            if path.endswith("/artifacts"):
+                raise HarnessHttpError(404, "runtime submission not found")
+            return {
+                "submission_id": "submission-failed-early",
+                "status": "failed",
+                "project": "/repo",
+                "error": "startup failed",
+            }
+
+        result = Harness(cwd="/repo", http_handler=handler).start_thread().run("Fail")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.output, "startup failed")
+
     def test_run_times_out_while_submission_is_active(self) -> None:
         calls: list[str] = []
 
@@ -157,6 +179,10 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertTrue(
             any(event["method"] == "sdk:turn/timeout" for event in result.events)
         )
+        timeout_event = next(
+            event for event in result.events if event["method"] == "sdk:turn/timeout"
+        )
+        self.assertEqual(timeout_event["params"]["timeout_ms"], 5)
         self.assertFalse(any(path.endswith("/artifacts") for path in calls))
 
     def test_run_converts_poll_socket_timeout_to_timeout_event(self) -> None:
@@ -264,6 +290,34 @@ class HarnessSdkTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             RuntimeError, "Invalid activity_result_envelope artifact"
+        ):
+            harness.start_thread().run("Run")
+
+    def test_non_object_runtime_result_artifact_fails_loudly(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-null",
+                    "execution_path": "workflow_runtime",
+                }
+            if path.endswith("/artifacts"):
+                return [
+                    {
+                        "artifact_type": "activity_result_envelope",
+                        "content": "null",
+                    }
+                ]
+            return {
+                "submission_id": "submission-null",
+                "status": "done",
+                "project": "/repo",
+            }
+
+        harness = Harness(cwd="/repo", http_handler=handler)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Invalid activity_result_envelope artifact: expected an object"
         ):
             harness.start_thread().run("Run")
 

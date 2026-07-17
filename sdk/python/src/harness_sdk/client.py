@@ -143,12 +143,17 @@ class Harness:
         if status == "running":
             return []
         encoded_id = urllib.parse.quote(turn_id, safe="")
-        artifacts = self._request(
-            "GET",
-            f"/api/workflows/runtime/submissions/{encoded_id}/artifacts",
-            None,
-            timeout_seconds,
-        )
+        try:
+            artifacts = self._request(
+                "GET",
+                f"/api/workflows/runtime/submissions/{encoded_id}/artifacts",
+                None,
+                timeout_seconds,
+            )
+        except HarnessHttpError as error:
+            if error.status != 404:
+                raise
+            artifacts = []
         if not isinstance(artifacts, list):
             raise RuntimeError("runtime artifacts response must be an array")
         final_result: dict[str, Any] = {}
@@ -166,7 +171,11 @@ class Harness:
                 raise RuntimeError(
                     f"Invalid activity_result_envelope artifact: {error}"
                 ) from error
-            candidate = envelope.get("final_result") if isinstance(envelope, dict) else None
+            if not isinstance(envelope, dict):
+                raise RuntimeError(
+                    "Invalid activity_result_envelope artifact: expected an object"
+                )
+            candidate = envelope.get("final_result")
             if isinstance(candidate, dict):
                 final_result = candidate
             break
@@ -295,7 +304,8 @@ class HarnessThread:
                 {
                     "thread_id": self.id,
                     "turn_id": turn_id,
-                    "timeout_seconds": timeout_seconds,
+                    "timeout_ms": int(timeout * 1000),
+                    "timeout_seconds": timeout,
                     "source": "sdk-poll",
                     "server_method": "GET /api/workflows/runtime/submissions/{id}",
                 },
@@ -361,7 +371,9 @@ class HarnessThread:
             if time.monotonic() >= deadline:
                 yield timeout_event()
                 return
-            time.sleep(poll_interval)
+            sleep_for = min(poll_interval, max(0.0, deadline - time.monotonic()))
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
 
 def _runtime_status_to_turn_status(status: Any) -> str:
