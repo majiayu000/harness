@@ -204,11 +204,8 @@ describe("<Active>", () => {
     expect(screen.getByText("fallback: silence")).toBeInTheDocument();
     expect(columnCount("Ready")).toBe("1");
 
-    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
-
-    await waitFor(() => {
-      expect(mockApiFetch).toHaveBeenCalledWith("/tasks/ready-task/merge", { method: "POST" });
-    });
+    expect(screen.queryByRole("button", { name: "Merge" })).not.toBeInTheDocument();
+    expect(mockApiFetch).not.toHaveBeenCalled();
     expect(screen.queryByTestId("task-slideover")).not.toBeInTheDocument();
   });
 
@@ -235,6 +232,29 @@ describe("<Active>", () => {
         body: JSON.stringify({ workflow_id: "runtime-workflow-124" }),
       });
     });
+  });
+
+  it("handles runtime merge failures without an unhandled rejection", async () => {
+    const ready = {
+      ...makeTask("runtime-task", "harness", "waiting"),
+      workflow: {
+        id: "runtime-workflow-124",
+        definition_id: "github_issue_pr",
+        state: "ready_to_merge",
+        pr_number: 124,
+      },
+    };
+    const mergeError = new Error("workflow already terminal");
+    mockApiFetch.mockRejectedValueOnce(mergeError);
+    mockUseTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
+
+    wrap(<Active projectFilter="harness" />);
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("workflow already terminal");
+    });
+    expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
   });
 
   it("opens runtime rows by submission_id when present", () => {

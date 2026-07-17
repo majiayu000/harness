@@ -113,6 +113,43 @@ The `definition` block does **not** deep-merge. A repo-level `definition`
 replaces the central base's declaration wholesale; state machines are
 never merged field-by-field.
 
+### Intake bindings (optional)
+
+By default a declarative definition only gets instances when the
+submission API is called. An optional `intake` block routes matching
+incoming issues to the definition automatically, closing the "give a
+WORKFLOW.md and work arrives by itself" loop:
+
+```yaml
+definition:
+  id: docs_review_flow
+  # ... states / terminal as above ...
+  intake:
+    source: github          # any registered, enabled intake source name
+    filter:
+      labels: [docs-review]  # required, non-empty — the issue must carry ALL
+      exclude_labels: [wip]  # the issue must carry NONE
+    max_active_instances: 8  # anti-runaway cap on concurrent instances
+```
+
+- **Source-agnostic.** The binding consumes only normalized issue fields
+  (source name, labels), never a source-specific structure. `source`
+  names any registered, enabled intake source (`github`, `feishu`);
+  adding a new source (e.g. Linear) later needs no schema change here.
+- **Startup validation (fail-closed).** `filter.labels` must be
+  non-empty with no empty or duplicate labels, `max_active_instances`
+  must be `>= 1`, and `source` must name an enabled intake source.
+  Otherwise startup fails with an actionable error.
+- **Exclusive routing.** A matched issue is routed to the declarative
+  definition and never also dispatched to `github_issue_pr`. Unmatched
+  issues are unaffected. When more than one binding matches, the
+  lexicographically smallest definition id wins and the tie is audited.
+- **Dedupe and cap (never silent).** A live (nonterminal) instance with
+  the same external id suppresses re-dispatch; at `max_active_instances`
+  the issue is skipped and retried on a later tick. Every routed,
+  suppressed, and skipped outcome is recorded as an `intake_routing`
+  audit event — nothing is dropped silently.
+
 ## Prompt-task continuation policies
 
 A prompt task submission may carry an optional `continuation` object.

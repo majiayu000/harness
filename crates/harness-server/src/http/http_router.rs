@@ -10,8 +10,9 @@ use super::{
     auth, get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
     get_task, get_task_artifacts, get_task_prompts, get_task_proof, get_workflow_runtime_tree,
     github_webhook, handle_rpc, health_check, ingest_signal, intake_status, list_tasks,
-    password_reset, project_queue_stats, reset_runtime_circuit_breaker, state::AppState,
-    stream_task_sse, task_mutation_routes, task_routes,
+    password_reset, project_queue_stats, reset_runtime_circuit_breaker, runtime_submission_routes,
+    sse_routes, state::AppState, stream_task_sse, task_mutation_routes, task_query_routes,
+    task_routes,
 };
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
@@ -74,6 +75,31 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/workflows/runtime/tree",
             get(get_workflow_runtime_tree),
+        )
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions)
+                .post(task_routes::create_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/artifacts",
+            get(runtime_submission_routes::get_artifacts),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/prompts",
+            get(runtime_submission_routes::get_prompts),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/proof",
+            get(task_query_routes::get_runtime_submission_proof),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/stream",
+            get(sse_routes::stream_runtime_submission_sse),
         )
         .route(
             "/api/runtime/circuit-breakers/{profile}/reset",
@@ -152,32 +178,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/usage-monitor",
             get(crate::handlers::usage_monitor::usage_monitor),
-        )
-        .route(
-            "/api/evals/runs",
-            post(crate::handlers::evals::create_eval_run)
-                .get(crate::handlers::evals::list_eval_runs),
-        )
-        .route(
-            "/api/evals/runs/{run_id}",
-            get(crate::handlers::evals::get_eval_run),
-        )
-        .route(
-            "/api/evals/runs/{run_id}/artifacts",
-            post(crate::handlers::evals::add_eval_artifact)
-                .get(crate::handlers::evals::list_eval_artifacts),
-        )
-        .route(
-            "/api/evals/runs/{run_id}/score",
-            post(crate::handlers::evals::score_eval_run),
-        )
-        .route(
-            "/api/evals/quality-snapshots/{snapshot_id}",
-            get(crate::handlers::evals::get_eval_quality_snapshot),
-        )
-        .route(
-            "/api/evals/pr/{owner}/{repo}/{pr_number}",
-            get(crate::handlers::evals::list_eval_quality_snapshots_for_pr),
         )
         .route(
             "/webhook",

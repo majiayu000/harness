@@ -363,7 +363,6 @@ pub(super) async fn make_test_state_with_project_root(
             password_reset_rate_limiter: Arc::new(
                 crate::http::rate_limit::PasswordResetRateLimiter::new(5),
             ),
-            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue,
@@ -401,6 +400,7 @@ pub(super) async fn make_test_state_with_project_root(
             github_poller_repos: vec![],
             completion_callback: None,
             token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
+            intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
         },
         project_svc,
         task_svc,
@@ -453,7 +453,6 @@ pub(super) async fn make_test_state_with_issue_workflows(
             events: state.observability.events.clone(),
             signal_rate_limiter: state.observability.signal_rate_limiter.clone(),
             password_reset_rate_limiter: state.observability.password_reset_rate_limiter.clone(),
-            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: state.concurrency.task_queue.clone(),
@@ -487,6 +486,7 @@ pub(super) async fn make_test_state_with_issue_workflows(
             github_poller_repos: vec![],
             completion_callback: None,
             token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
+            intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
         },
         project_svc: state.project_svc.clone(),
         task_svc: state.task_svc.clone(),
@@ -576,7 +576,6 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
             events: state.observability.events.clone(),
             signal_rate_limiter: state.observability.signal_rate_limiter.clone(),
             password_reset_rate_limiter: state.observability.password_reset_rate_limiter.clone(),
-            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: state.concurrency.task_queue.clone(),
@@ -610,6 +609,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
             github_poller_repos: vec![],
             completion_callback: None,
             token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
+            intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
         },
         project_svc: state.project_svc.clone(),
         task_svc: state.task_svc.clone(),

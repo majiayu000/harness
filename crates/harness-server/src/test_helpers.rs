@@ -284,7 +284,6 @@ async fn make_state_inner(
             password_reset_rate_limiter: Arc::new(
                 crate::http::rate_limit::PasswordResetRateLimiter::new(password_reset_rate_limit),
             ),
-            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue,
@@ -322,6 +321,7 @@ async fn make_state_inner(
             github_poller_repos: vec![],
             completion_callback: None,
             token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
+            intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
         },
         project_svc,
         task_svc,

@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
 import { Submit } from "./Submit";
 import { SubmitSuccess } from "./SubmitSuccess";
-import { useOverview, useTaskStream, useCancelTask, useCancelWorkflowRuntime } from "@/lib/queries";
+import { useOverview, useTaskStream, useCancelWorkflowRuntime } from "@/lib/queries";
 import { apiFetch } from "@/lib/api";
 
 // ── Mocks ──────────────────────────────────────────────────────────────────────
@@ -12,13 +12,12 @@ import { apiFetch } from "@/lib/api";
 vi.mock("@/lib/queries", () => ({
   useOverview: vi.fn(),
   useTaskStream: vi.fn(),
-  useCancelTask: vi.fn(),
   useCancelWorkflowRuntime: vi.fn(),
 }));
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
   apiFetch: vi.fn(),
-  TOKEN_KEY: "harness_token",
   ApiError: class ApiError extends Error {
     constructor(
       public status: number,
@@ -31,7 +30,6 @@ vi.mock("@/lib/api", () => ({
 
 const mockUseOverview = useOverview as ReturnType<typeof vi.fn>;
 const mockUseTaskStream = useTaskStream as ReturnType<typeof vi.fn>;
-const mockUseCancelTask = useCancelTask as ReturnType<typeof vi.fn>;
 const mockUseCancelWorkflowRuntime = useCancelWorkflowRuntime as ReturnType<typeof vi.fn>;
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
 
@@ -53,7 +51,6 @@ const PROJECTS = [
 beforeEach(() => {
   mockUseOverview.mockReturnValue({ data: { projects: PROJECTS } });
   mockUseTaskStream.mockImplementation(() => {});
-  mockUseCancelTask.mockReturnValue({ mutate: vi.fn(), isPending: false });
   mockUseCancelWorkflowRuntime.mockReturnValue({ mutate: vi.fn(), isPending: false });
   mockApiFetch.mockResolvedValue(
     new Response(JSON.stringify({ task_id: "task-xyz", status: "running" }), { status: 200 }),
@@ -185,7 +182,7 @@ describe("<Submit>", () => {
     expect(screen.queryByRole("option", { name: "claude" })).not.toBeInTheDocument();
   });
 
-  it("submitting an issue task calls POST /tasks with correct payload", async () => {
+  it("submits an issue through the workflow runtime endpoint", async () => {
     wrap(<Submit />);
 
     goToConfig("Issue");
@@ -198,7 +195,12 @@ describe("<Submit>", () => {
     // options step
     fireEvent.click(screen.getByRole("button", { name: /Submit Task/ }));
 
-    await waitFor(() => expect(mockApiFetch).toHaveBeenCalledWith("/tasks", expect.objectContaining({ method: "POST" })));
+    await waitFor(() =>
+      expect(mockApiFetch).toHaveBeenCalledWith(
+        "/api/workflows/runtime/submissions",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
 
     const call = mockApiFetch.mock.calls[0];
     const body = JSON.parse(call[1].body as string);
@@ -321,27 +323,23 @@ describe("<Submit>", () => {
 // ── <SubmitSuccess> tests ──────────────────────────────────────────────────────
 
 describe("<SubmitSuccess>", () => {
-  it("cancel button calls useCancelTask.mutate with taskId and triggers onReset", () => {
-    const onReset = vi.fn();
-    const mockMutate = vi.fn().mockImplementation((_id: string, opts?: { onSuccess?: () => void }) => {
-      opts?.onSuccess?.();
-    });
-    mockUseCancelTask.mockReturnValue({ mutate: mockMutate, isPending: false });
+  it("disables runtime-only actions without runtime ownership", () => {
+    const runtimeMutate = vi.fn();
+    mockUseCancelWorkflowRuntime.mockReturnValue({ mutate: runtimeMutate, isPending: false });
 
-    wrap(<SubmitSuccess taskId="task-abc" onReset={onReset} />);
+    wrap(<SubmitSuccess taskId="task-abc" onReset={vi.fn()} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(mockMutate).toHaveBeenCalledWith("task-abc", expect.objectContaining({ onSuccess: expect.any(Function) }));
-    expect(onReset).toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Watch live" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    expect(runtimeMutate).not.toHaveBeenCalled();
+    expect(mockUseTaskStream).toHaveBeenCalledWith(null, expect.any(Function), expect.any(Function));
   });
 
   it("runtime cancel uses the workflow runtime endpoint handle", () => {
     const onReset = vi.fn();
-    const mockTaskMutate = vi.fn();
     const mockRuntimeMutate = vi.fn().mockImplementation((_id: string, opts?: { onSuccess?: () => void }) => {
       opts?.onSuccess?.();
     });
-    mockUseCancelTask.mockReturnValue({ mutate: mockTaskMutate, isPending: false });
     mockUseCancelWorkflowRuntime.mockReturnValue({ mutate: mockRuntimeMutate, isPending: false });
 
     wrap(
@@ -358,7 +356,6 @@ describe("<SubmitSuccess>", () => {
       "workflow-runtime-123",
       expect.objectContaining({ onSuccess: expect.any(Function) }),
     );
-    expect(mockTaskMutate).not.toHaveBeenCalled();
     expect(onReset).toHaveBeenCalled();
   });
 

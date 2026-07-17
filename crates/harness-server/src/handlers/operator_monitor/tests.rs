@@ -1071,6 +1071,7 @@ fn declarative_visibility_definition(
         ]),
         evidence_required: BTreeMap::new(),
         recovery_targets: vec!["working".to_string()],
+        intake: None,
     };
     harness_workflow::runtime::build_declarative_definition(
         &policy,

@@ -62,6 +62,44 @@ pub(crate) async fn get_task_prompts(
     super::task_query_routes::get_task_prompts(State(state), Path(task_id.0)).await
 }
 
+pub(super) async fn get_runtime_artifacts(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let task_id = harness_core::types::TaskId(id);
+    match runtime_artifacts_by_handle(&state, &task_id).await {
+        Ok(Some(artifacts)) => Json(artifacts).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "runtime submission not found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!("get_runtime_artifacts: runtime workflow lookup failed: {error}");
+            internal_server_error()
+        }
+    }
+}
+
+pub(super) async fn get_runtime_prompts(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let task_id = harness_core::types::TaskId(id);
+    match runtime_prompts_by_handle(&state, &task_id).await {
+        Ok(Some(prompts)) => Json(prompts).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "runtime submission not found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!("get_runtime_prompts: runtime workflow lookup failed: {error}");
+            internal_server_error()
+        }
+    }
+}
+
 async fn decorate_json_response(
     response: Response,
     decorate: fn(&mut Value),

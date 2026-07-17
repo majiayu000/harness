@@ -77,10 +77,6 @@ mod tests {
                 crate::task_db::TaskDb::shared_schema_context(Some(TEST_DATABASE_URL))?,
             ),
             (
-                "eval_store",
-                crate::eval_store::EvalStore::shared_schema_context(Some(TEST_DATABASE_URL))?,
-            ),
-            (
                 "thread_db",
                 crate::thread_db::ThreadDb::shared_schema_context(Some(TEST_DATABASE_URL))?,
             ),
@@ -115,10 +111,6 @@ mod tests {
                 crate::runtime_state_store::RuntimeStateStore::shared_schema_context(Some(
                     TEST_DATABASE_URL,
                 ))?,
-            ),
-            (
-                "review_store",
-                crate::review_store::ReviewStore::shared_schema_context(Some(TEST_DATABASE_URL))?,
             ),
             (
                 "event_store",

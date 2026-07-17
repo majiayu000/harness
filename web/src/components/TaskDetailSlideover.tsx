@@ -1,15 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useTaskDetail, useTaskStream } from "@/lib/queries";
-import { apiJson } from "@/lib/api";
+import { apiJson, runtimeSubmissionPath } from "@/lib/api";
 import { isTerminal } from "@/types/task";
 import { ProofOfWorkCard } from "./ProofOfWorkCard";
-import type {
-  EvalQualitySnapshotsResponse,
-  FullTask,
-  TaskArtifact,
-  TaskPrompt,
-} from "@/types";
+import type { FullTask, TaskArtifact, TaskPrompt } from "@/types";
 
 type Tab = "summary" | "output" | "prompts" | "artifacts";
 
@@ -49,26 +44,16 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
 
   const { data: artifacts, isError: isArtifactsError } = useQuery({
     queryKey: ["task-artifacts", taskId],
-    queryFn: ({ signal }) => apiJson<TaskArtifact[]>(`/tasks/${taskId}/artifacts`, { signal }),
+    queryFn: ({ signal }) =>
+      apiJson<TaskArtifact[]>(runtimeSubmissionPath(taskId!, "artifacts"), { signal }),
     enabled: !!taskId && (activeTab === "artifacts" || isTaskTerminal),
   });
 
   const { data: prompts, isError: isPromptsError } = useQuery({
     queryKey: ["task-prompts", taskId],
-    queryFn: ({ signal }) => apiJson<TaskPrompt[]>(`/tasks/${taskId}/prompts`, { signal }),
-    enabled: !!taskId && (activeTab === "prompts" || isTaskTerminal),
-  });
-
-  const prQualityPath = qualitySnapshotPath(task?.pr_url ?? null);
-  const {
-    data: qualitySnapshots,
-    isFetching: isQualitySnapshotLoading,
-    isError: isQualitySnapshotError,
-  } = useQuery({
-    queryKey: ["pr-quality-snapshots", prQualityPath],
     queryFn: ({ signal }) =>
-      apiJson<EvalQualitySnapshotsResponse>(prQualityPath!, { signal }),
-    enabled: isTaskTerminal && !!prQualityPath,
+      apiJson<TaskPrompt[]>(runtimeSubmissionPath(taskId!, "prompts"), { signal }),
+    enabled: !!taskId && (activeTab === "prompts" || isTaskTerminal),
   });
 
   useEffect(() => {
@@ -146,14 +131,7 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
             <>
               <SummaryContent task={task} />
               {isTaskTerminal && (
-                <ProofOfWorkCard
-                  task={task}
-                  prompts={prompts}
-                  artifacts={artifacts}
-                  qualitySnapshot={qualitySnapshots?.quality_snapshots[0]}
-                  qualitySnapshotLoading={isQualitySnapshotLoading}
-                  qualitySnapshotError={isQualitySnapshotError}
-                />
+                <ProofOfWorkCard task={task} prompts={prompts} artifacts={artifacts} />
               )}
             </>
           )}
@@ -179,30 +157,6 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
       </div>
     </>
   );
-}
-
-function qualitySnapshotPath(prUrl: string | null): string | null {
-  const ref = parseGitHubPrUrl(prUrl);
-  if (!ref) return null;
-  return `/api/evals/pr/${encodeURIComponent(ref.owner)}/${encodeURIComponent(ref.repo)}/${ref.prNumber}?limit=1`;
-}
-
-function parseGitHubPrUrl(
-  prUrl: string | null,
-): { owner: string; repo: string; prNumber: number } | null {
-  if (!prUrl) return null;
-  let url: URL;
-  try {
-    url = new URL(prUrl);
-  } catch {
-    return null;
-  }
-  if (url.hostname !== "github.com") return null;
-  const [owner, repo, pull, number] = url.pathname.split("/").filter(Boolean);
-  if (!owner || !repo || pull !== "pull") return null;
-  const prNumber = Number.parseInt(number ?? "", 10);
-  if (!Number.isSafeInteger(prNumber) || prNumber <= 0) return null;
-  return { owner, repo, prNumber };
 }
 
 function formatFallbackLabel(value: string | null | undefined): string {

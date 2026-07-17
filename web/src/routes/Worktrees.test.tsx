@@ -11,9 +11,9 @@ vi.mock("@/lib/queries", () => ({
   useOverview: vi.fn(),
 }));
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api")>()),
   apiFetch: vi.fn(),
-  TOKEN_KEY: "harness_token",
 }));
 
 import { useOverview, useWorktrees } from "@/lib/queries";
@@ -31,6 +31,7 @@ function worktreeCard(overrides: Partial<import("@/lib/queries").WorktreeCard> =
     sourceRepo: "/Users/example/src/repo",
     repo: "owner/repo",
     runtimeWorkflowId: null,
+    runtimeSubmissionId: null,
     branch: "harness/runtime-task-1",
     status: "implementing",
     phase: "implement",
@@ -81,7 +82,7 @@ describe("<Worktrees>", () => {
     expect(screen.getByRole("link", { name: "Docs" })).toHaveAttribute("href", DOCS_URL);
   });
 
-  it("cancels worktrees through the task endpoint", async () => {
+  it("disables cancellation when the worktree has no runtime ownership", () => {
     mockUseWorktrees.mockReturnValue({
       cards: [worktreeCard({ taskId: "runtime-task-1" })],
       isLoading: false,
@@ -99,13 +100,57 @@ describe("<Worktrees>", () => {
     mockApiFetch.mockResolvedValue(new Response("{}", { status: 200 }));
 
     wrap(<Worktrees />);
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveAttribute(
+      "title",
+      "Workflow runtime id unavailable",
+    );
+    expect(mockApiFetch).not.toHaveBeenCalled();
+  });
 
-    await waitFor(() => {
-      expect(mockApiFetch).toHaveBeenCalledWith("/tasks/runtime-task-1/cancel", {
-        method: "POST",
-      });
+  it("disables logs when the worktree has no runtime ownership", () => {
+    mockUseWorktrees.mockReturnValue({
+      cards: [worktreeCard({ runtimeWorkflowId: null })],
+      isLoading: false,
+      error: null,
     });
+    mockUseOverview.mockReturnValue({
+      data: { projects: [], runtimes: [], kpi: { active_tasks: 1 } },
+    });
+
+    wrap(<Worktrees />);
+
+    expect(screen.getByRole("button", { name: "Logs" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Logs" })).toHaveAttribute(
+      "title",
+      "Runtime submission id unavailable",
+    );
+  });
+
+  it("opens runtime-owned worktree logs through the submission stream", () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    mockUseWorktrees.mockReturnValue({
+      cards: [
+        worktreeCard({
+          runtimeWorkflowId: "runtime-workflow-1",
+          runtimeSubmissionId: "runtime-submission::/repo/one",
+        }),
+      ],
+      isLoading: false,
+      error: null,
+    });
+    mockUseOverview.mockReturnValue({
+      data: { projects: [], runtimes: [], kpi: { active_tasks: 1 } },
+    });
+
+    wrap(<Worktrees />);
+    fireEvent.click(screen.getByRole("button", { name: "Logs" }));
+
+    expect(open).toHaveBeenCalledWith(
+      "/api/workflows/runtime/submissions/runtime-submission%3A%3A%2Frepo%2Fone/stream",
+      "_blank",
+      "noreferrer",
+    );
   });
 
   it("cancels runtime worktrees through the workflow endpoint", async () => {
@@ -191,7 +236,12 @@ describe("<Worktrees>", () => {
     const qc = makeQueryClient();
     const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
     mockUseWorktrees.mockReturnValue({
-      cards: [worktreeCard({ taskId: "runtime-task-2" })],
+      cards: [
+        worktreeCard({
+          taskId: "runtime-task-2",
+          runtimeWorkflowId: "runtime-workflow-2",
+        }),
+      ],
       isLoading: false,
       error: null,
     });

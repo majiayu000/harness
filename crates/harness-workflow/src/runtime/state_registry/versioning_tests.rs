@@ -37,6 +37,7 @@ fn definition() -> DeclarativeWorkflowDefinition {
         ]),
         evidence_required: BTreeMap::new(),
         recovery_targets: vec!["running".to_string()],
+        intake: None,
     };
     build_declarative_definition(
         &policy,

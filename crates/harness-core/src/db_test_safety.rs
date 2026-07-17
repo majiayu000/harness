@@ -13,13 +13,9 @@ pub const KNOWN_TEST_SCHEMA_PREFIXES: &[&str] = &[
     "event_store_backfill_test",
     "event_store_jsonl_test",
     "event_store_scope_test",
-    "eval_store_migration_test",
-    "eval_store_missing_legacy_test",
-    "eval_store_scope_test",
     "plan_db_backfill_test",
     "project_registry_migration_test",
     "project_registry_scope_test",
-    "review_store_test",
     "runtime_state_store_test",
     "task_db_backfill_test",
     "task_db_retention_batch_test",
@@ -85,10 +81,9 @@ pub fn redact_database_url(database_url: &str) -> String {
 }
 
 pub fn is_known_test_schema_name(schema: &str) -> bool {
-    KNOWN_TEST_SCHEMA_PREFIXES.iter().any(|prefix| {
-        generated_test_schema_matches_prefix(schema, prefix)
-            || legacy_single_suffix_test_schema_matches_prefix(schema, prefix)
-    })
+    KNOWN_TEST_SCHEMA_PREFIXES
+        .iter()
+        .any(|prefix| generated_test_schema_matches_prefix(schema, prefix))
 }
 
 pub fn unique_test_schema_name(prefix: &str) -> anyhow::Result<String> {
@@ -285,19 +280,6 @@ fn generated_test_schema_matches_prefix(schema: &str, prefix: &str) -> bool {
         && counter.chars().all(|ch| ch.is_ascii_digit())
 }
 
-fn legacy_single_suffix_test_schema_matches_prefix(schema: &str, prefix: &str) -> bool {
-    if prefix != "review_store_test" {
-        return false;
-    }
-    let Some(rest) = schema
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix('_'))
-    else {
-        return false;
-    };
-    !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,13 +339,5 @@ mod tests {
         assert!(!is_known_test_schema_name(
             "unrelated_test_1783054126968028000_0"
         ));
-    }
-
-    #[test]
-    fn known_test_schema_matches_legacy_single_numeric_suffix() {
-        assert!(is_known_test_schema_name(
-            "review_store_test_1783054126968028000"
-        ));
-        assert!(!is_known_test_schema_name("review_store_test_alpha"));
     }
 }

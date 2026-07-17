@@ -296,10 +296,10 @@ async fn health_startup_errors_are_redacted() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut state = make_read_only_route_test_state(dir.path()).await?;
     let state_mut = Arc::get_mut(&mut state).unwrap();
-    state_mut.degraded_subsystems = vec!["review_store"];
+    state_mut.degraded_subsystems = vec!["runtime_state_store"];
     state_mut.startup_statuses =
         vec![
-            crate::http::state::StoreStartupResult::optional("review_store")
+            crate::http::state::StoreStartupResult::optional("runtime_state_store")
                 .failed("failed to connect to postgres://user:secret@db.internal/harness"),
         ];
 
@@ -307,7 +307,7 @@ async fn health_startup_errors_are_redacted() -> anyhow::Result<()> {
     assert_eq!(health.status, "degraded");
     assert_eq!(health.persistence.startup.stores.len(), 1);
     let store = &health.persistence.startup.stores[0];
-    assert_eq!(store.name, "review_store");
+    assert_eq!(store.name, "runtime_state_store");
     assert!(!store.critical);
     assert!(!store.ready);
     assert_eq!(store.error.as_deref(), Some("database_unavailable"));
@@ -324,18 +324,17 @@ async fn health_degraded_multiple_subsystems() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut state = make_read_only_route_test_state(dir.path()).await?;
     Arc::get_mut(&mut state).unwrap().startup_statuses = vec![
-        crate::http::state::StoreStartupResult::optional("eval_store")
+        crate::http::state::StoreStartupResult::optional("plan_db")
             .failed("pool timed out while waiting for an open connection"),
         crate::http::state::StoreStartupResult::optional("runtime_state_store")
             .failed("runtime state snapshot restore failed"),
     ];
-    Arc::get_mut(&mut state).unwrap().degraded_subsystems =
-        vec!["eval_store", "runtime_state_store"];
+    Arc::get_mut(&mut state).unwrap().degraded_subsystems = vec!["plan_db", "runtime_state_store"];
     let health = call_health(state).await?;
     assert_eq!(health.status, "degraded");
     assert_eq!(
         health.persistence.degraded_subsystems,
-        ["eval_store", "runtime_state_store"]
+        ["plan_db", "runtime_state_store"]
     );
     assert_eq!(health.persistence.startup.stores.len(), 2);
     Ok(())

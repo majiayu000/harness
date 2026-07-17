@@ -36,6 +36,7 @@ fn project_binding_policy() -> WorkflowDefinitionPolicy {
         ]),
         evidence_required: BTreeMap::new(),
         recovery_targets: vec!["working".to_string()],
+        intake: None,
     }
 }
 
@@ -104,6 +105,9 @@ fn declarative_submission_instance_persists_runtime_retry_policy() -> anyhow::Re
         serialization_depends_on: &[],
         source: Some("test"),
         external_id: None,
+        subject_key: None,
+        repo: None,
+        author_trust_class: None,
     };
 
     let instance = super::declarative::submission_instance(

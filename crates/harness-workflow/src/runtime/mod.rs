@@ -173,7 +173,7 @@ pub use store::{
     WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeRecoveryAction,
     WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore,
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
-    WorkflowSubmissionPromptPayload,
+    WorkflowSubmissionFilter, WorkflowSubmissionPromptPayload,
 };
 pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,

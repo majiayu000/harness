@@ -589,7 +589,8 @@ async fn query_param_token_rejected_on_protected_endpoint() -> anyhow::Result<()
 }
 
 #[tokio::test]
-async fn query_param_token_still_authorizes_sse_stream_endpoint() -> anyhow::Result<()> {
+async fn query_param_token_authorizes_legacy_and_runtime_sse_stream_endpoints() -> anyhow::Result<()>
+{
     let dir = tempfile::tempdir()?;
     let mut config = harness_core::config::HarnessConfig::default();
     config.server.api_token = Some("secret123".to_string());
@@ -601,21 +602,26 @@ async fn query_param_token_still_authorizes_sse_stream_endpoint() -> anyhow::Res
     .await?;
     let app = Router::new()
         .route("/tasks/{id}/stream", get(|| async { StatusCode::OK }))
+        .route(
+            "/api/workflows/runtime/submissions/{id}/stream",
+            get(|| async { StatusCode::OK }),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::api_auth_middleware,
         ))
         .with_state(state);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/tasks/task-1/stream?token=secret123")
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
+    for path in [
+        "/tasks/task-1/stream?token=secret123",
+        "/api/workflows/runtime/submissions/task-1/stream?token=secret123",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "path: {path}");
+    }
     Ok(())
 }
 

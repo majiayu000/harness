@@ -26,7 +26,6 @@ use state_support::*;
 mod route_helpers;
 use route_helpers::*;
 
-mod evals_api_tests;
 mod health_route_tests;
 mod intake_auth_list_tests;
 mod prompt_continuation_runtime_tests;

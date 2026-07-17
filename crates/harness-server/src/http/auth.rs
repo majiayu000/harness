@@ -265,7 +265,10 @@ pub(crate) async fn api_auth_middleware(
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::to_string)
         .or_else(|| {
-            if path.starts_with("/tasks/") && path.ends_with("/stream") {
+            let is_sse_stream = path.ends_with("/stream")
+                && (path.starts_with("/tasks/")
+                    || path.starts_with("/api/workflows/runtime/submissions/"));
+            if is_sse_stream {
                 req.uri().query().and_then(|q| {
                     q.split('&')
                         .find(|p| p.starts_with("token="))

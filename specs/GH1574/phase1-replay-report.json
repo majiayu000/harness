@@ -1,0 +1,56 @@
+{
+  "corpus_window": {
+    "since_date": "2026-06-01",
+    "through_date": "2026-07-12"
+  },
+  "decisions": {
+    "cost_ratio": true,
+    "nap_mismatch": false,
+    "success_parity": false,
+    "token_saving": false
+  },
+  "denominators": {
+    "baseline_tokens": 290322326,
+    "nap_checked": 188,
+    "saved_token_value_usd": 12.282183,
+    "success_sessions": 40
+  },
+  "expected_sessions": 40,
+  "gate": "gh1574_phase1",
+  "manifest_id": "56ea095bfcc140faea8ead3ef862af08864c3db8b83292393a2e3031bd69d40c",
+  "metrics": {
+    "baseline_success_rate": 1.0,
+    "baseline_successes": 40,
+    "candidate_success_rate": 0.1,
+    "candidate_successes": 4,
+    "compressed_tokens": 951365,
+    "compression_cost_saved_value_ratio": 0.0,
+    "compression_cost_usd": 0.0,
+    "compressor_input_tokens": 17063369,
+    "compressor_output_tokens": 1064710,
+    "effective_candidate_tokens": 278040143,
+    "effective_token_saving": 0.042305334106478604,
+    "fallback_raw_tokens": 1599026,
+    "nap_failed": 165,
+    "nap_mismatch_rate": 0.8776595744680851,
+    "paired_success_improvements": 0,
+    "paired_success_regressions": 36,
+    "saved_tokens": 12282183,
+    "success_rate_delta": -0.9,
+    "untouched_raw_tokens": 275489752
+  },
+  "observed_sessions": 40,
+  "overall_pass": false,
+  "pricing": {
+    "compressor_input_usd_per_million": 0.0,
+    "compressor_output_usd_per_million": 0.0,
+    "saved_input_usd_per_million": 1.0
+  },
+  "schema_version": 1,
+  "thresholds": {
+    "compression_cost_saved_value_ratio_max_exclusive": 0.2,
+    "effective_token_saving_min_inclusive": 0.2,
+    "nap_mismatch_max_exclusive": 0.05,
+    "paired_success_regressions_max_inclusive": 0
+  }
+}

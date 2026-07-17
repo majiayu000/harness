@@ -103,7 +103,6 @@ async fn make_test_state_with_config_and_registry(
             password_reset_rate_limiter: std::sync::Arc::new(
                 crate::http::rate_limit::PasswordResetRateLimiter::new(5),
             ),
-            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
@@ -144,6 +143,7 @@ async fn make_test_state_with_config_and_registry(
             github_poller_repos: vec![],
             completion_callback: None,
             token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
+            intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
         },
         project_svc,
         task_svc,
@@ -1869,7 +1869,6 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             password_reset_rate_limiter: std::sync::Arc::new(
                 crate::http::rate_limit::PasswordResetRateLimiter::new(5),
             ),
-            review_store: None,
         },
         concurrency: crate::http::ConcurrencyServices {
             task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
@@ -1910,6 +1909,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             github_poller_repos: vec![],
             completion_callback: None,
             token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
+            intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
         },
         project_svc,
         task_svc,

@@ -446,7 +446,7 @@ function TaskCard({
           {task.pr_url.replace(/^https:\/\/github\.com\//, "")}
         </a>
       )}
-      {workflow?.state === "ready_to_merge" && onMerge && (
+      {workflow?.state === "ready_to_merge" && runtimeMergeWorkflowId(workflow) && onMerge && (
         <button
           type="button"
           disabled={merging}
@@ -470,11 +470,13 @@ interface Props {
 export function Active({ projectFilter }: Props) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [merging, setMerging] = useState<Set<string>>(new Set());
+  const [mergeError, setMergeError] = useState<string | null>(null);
   const [cancellingWorkflows, setCancellingWorkflows] = useState<Set<string>>(new Set());
   const { data: dashboard } = useDashboard();
   const queryClient = useQueryClient();
 
   const handleMerge = async (taskId: string, workflow?: WorkflowSummary | null) => {
+    setMergeError(null);
     setMerging((prev) => new Set(prev).add(taskId));
     try {
       const runtimeWorkflowId = runtimeMergeWorkflowId(workflow);
@@ -485,10 +487,12 @@ export function Active({ projectFilter }: Props) {
           body: JSON.stringify({ workflow_id: runtimeWorkflowId }),
         });
       } else {
-        await apiFetch(`/tasks/${taskId}/merge`, { method: "POST" });
+        throw new Error("Workflow runtime id unavailable; merge was not sent");
       }
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["workflow-runtime-tree"] });
+    } catch (error) {
+      setMergeError(error instanceof Error ? error.message : "Merge failed");
     } finally {
       setMerging((prev) => {
         const next = new Set(prev);
@@ -560,6 +564,11 @@ export function Active({ projectFilter }: Props) {
         onCancel={handleCancelWorkflow}
         cancellingWorkflowIds={cancellingWorkflows}
       />
+      {mergeError ? (
+        <div role="alert" className="border border-rust/40 bg-rust/10 px-3 py-2 text-xs text-rust">
+          {mergeError}
+        </div>
+      ) : null}
       <div
         className="grid gap-3"
         style={{ gridTemplateColumns: `repeat(${COLUMNS.length + (showOther ? 1 : 0)}, 1fr)` }}

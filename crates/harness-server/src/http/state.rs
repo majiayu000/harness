@@ -60,9 +60,6 @@ pub struct CoreServices {
     /// project roots against `$HOME` in concurrent requests.
     pub home_dir: std::path::PathBuf,
     pub tasks: Arc<task_runner::TaskStore>,
-    /// Eval persistence store for runs, artifacts, and quality snapshots.
-    #[cfg(not(test))]
-    pub eval_store: Option<Arc<crate::eval_store::EvalStore>>,
     pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
     /// In-memory plan cache hydrated from `plan_db` on startup.
@@ -95,7 +92,6 @@ pub struct ObservabilityServices {
     pub alerts: crate::alerting::AlertHandle,
     pub signal_rate_limiter: Arc<rate_limit::SignalRateLimiter>,
     pub password_reset_rate_limiter: Arc<rate_limit::PasswordResetRateLimiter>,
-    pub review_store: Option<Arc<crate::review_store::ReviewStore>>,
 }
 
 /// Concurrency services: task queue and workspace isolation.
@@ -143,6 +139,10 @@ pub struct IntakeServices {
     /// monitoring to distinguish cheap server polling from token-consuming
     /// agent work.
     pub token_dispatch_counters: Arc<DashMap<String, Arc<GitHubTokenDispatchCounters>>>,
+    /// Project-scoped declarative intake bindings (GH-1656), built once at
+    /// startup and immutable afterwards. Empty when no definition declares an
+    /// `intake` block.
+    pub intake_bindings: crate::intake::binding::IntakeBindingRegistry,
 }
 
 impl IntakeServices {

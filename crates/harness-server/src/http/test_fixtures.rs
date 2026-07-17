@@ -220,7 +220,6 @@ async fn make_read_only_route_test_state_with_project_root(
             password_reset_rate_limiter: Arc::new(
                 crate::http::rate_limit::PasswordResetRateLimiter::new(password_reset_rate_limit),
             ),
-            review_store: None,
         },
         concurrency: ConcurrencyServices {
             task_queue,
@@ -255,6 +254,7 @@ async fn make_read_only_route_test_state_with_project_root(
             github_poller_repos: vec![],
             completion_callback: None,
             token_dispatch_counters: IntakeServices::new_token_dispatch_counters(),
+            intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
         },
         interceptors: vec![],
         startup_statuses: vec![],

@@ -5,7 +5,6 @@ pub mod dashboard;
 mod dashboard_active_counts;
 pub(crate) mod definition_ids;
 pub mod error;
-pub mod evals;
 pub mod exec;
 pub mod gc;
 pub mod health;

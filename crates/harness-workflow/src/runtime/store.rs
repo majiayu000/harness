@@ -54,6 +54,8 @@ mod runtime_jobs;
 mod runtime_usage;
 #[path = "store/submission_commit.rs"]
 mod submission_commit;
+#[path = "store/submission_instances.rs"]
+mod submission_instances;
 #[path = "store/terminal_instance_queries.rs"]
 mod terminal_instance_queries;
 #[path = "store/transaction_helpers.rs"]
@@ -69,6 +71,7 @@ pub use submission_commit::{
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload,
 };
+pub use submission_instances::WorkflowSubmissionFilter;
 use transaction_helpers::{
     apply_inline_command_side_effect, insert_decision_record_tx, insert_event_tx_with_id,
     insert_instance_if_absent_tx, load_or_insert_initial_instance_tx, runtime_job_for_command_tx,

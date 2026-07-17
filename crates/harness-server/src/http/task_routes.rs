@@ -393,14 +393,36 @@ pub(super) async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<task_runner::CreateTaskRequest>,
 ) -> Response {
+    create_task_response(state, req, false).await
+}
+
+pub(super) async fn create_runtime_submission(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<task_runner::CreateTaskRequest>,
+) -> Response {
+    create_task_response(state, req, true).await
+}
+
+async fn create_task_response(
+    state: Arc<AppState>,
+    req: task_runner::CreateTaskRequest,
+    require_runtime_submission: bool,
+) -> Response {
     let is_issue_submission = req.issue.is_some();
     match enqueue_task_background(state.clone(), req, None).await {
         Ok(task_id) => match task_response_details(&state, &task_id, is_issue_submission).await {
-            Ok(details) => (
-                StatusCode::ACCEPTED,
-                Json(task_submission_response(&task_id, details)),
+            Ok(details) if require_runtime_submission && details.execution_path != "workflow_runtime" => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "legacy_submission_active",
+                    "message": "an active pre-migration task already owns this submission; no workflow-runtime submission was created"
+                })),
             )
                 .into_response(),
+            Ok(details) => {
+                (StatusCode::ACCEPTED, Json(task_submission_response(&task_id, details)))
+                    .into_response()
+            }
             Err(EnqueueTaskError::BadRequest(error)) => {
                 (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
             }

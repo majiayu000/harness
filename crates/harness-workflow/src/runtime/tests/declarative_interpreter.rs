@@ -77,6 +77,7 @@ mod declarative_interpreter {
                 vec!["review_report".to_string()],
             )]),
             recovery_targets: vec!["reviewing".to_string()],
+            intake: None,
         }
     }
 
