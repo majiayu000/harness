@@ -1,5 +1,5 @@
 use harness_core::types::{
-    DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId, ThreadId, TurnId,
+    DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId, ThreadId,
 };
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
@@ -31,46 +31,6 @@ pub enum Method {
     /// Sent by the client after receiving an `initialize` response to confirm
     /// the handshake is complete.  No params required.
     Initialized,
-
-    // === Thread management ===
-    ThreadStart {
-        cwd: PathBuf,
-    },
-    ThreadResume {
-        thread_id: ThreadId,
-    },
-    ThreadFork {
-        thread_id: ThreadId,
-        from_turn: Option<TurnId>,
-    },
-    ThreadList,
-    ThreadDelete {
-        thread_id: ThreadId,
-    },
-    ThreadCompact {
-        thread_id: ThreadId,
-    },
-
-    // === Turn control ===
-    TurnStart {
-        thread_id: ThreadId,
-        input: String,
-    },
-    TurnSteer {
-        turn_id: TurnId,
-        instruction: String,
-    },
-    TurnCancel {
-        turn_id: TurnId,
-    },
-    TurnStatus {
-        turn_id: TurnId,
-    },
-    TurnRespondApproval {
-        turn_id: TurnId,
-        request_id: String,
-        decision: harness_core::agent::ApprovalDecision,
-    },
 
     // === GC Agent ===
     GcRun {
@@ -233,7 +193,7 @@ impl<'de> Deserialize<'de> for RpcRequest {
         } = RawRpcRequest::deserialize(deserializer)?;
 
         // Normalize slash-style method names to snake_case for serde:
-        // "thread/start" -> "thread_start", "exec_plan/init" -> "exec_plan_init"
+        // "gc/run" -> "gc_run", "exec_plan/init" -> "exec_plan_init"
         let method = method.replace('/', "_");
 
         let method = if method == "initialized" {
@@ -321,22 +281,11 @@ impl RpcResponse {
 }
 
 impl Method {
-    /// Returns the canonical slash-style method name (e.g. `"thread/start"`).
+    /// Returns the canonical slash-style method name (e.g. `"exec_plan/init"`).
     pub fn method_name(&self) -> &'static str {
         match self {
             Self::Initialize => "initialize",
             Self::Initialized => "initialized",
-            Self::ThreadStart { .. } => "thread/start",
-            Self::ThreadResume { .. } => "thread/resume",
-            Self::ThreadFork { .. } => "thread/fork",
-            Self::ThreadList => "thread/list",
-            Self::ThreadDelete { .. } => "thread/delete",
-            Self::ThreadCompact { .. } => "thread/compact",
-            Self::TurnStart { .. } => "turn/start",
-            Self::TurnSteer { .. } => "turn/steer",
-            Self::TurnCancel { .. } => "turn/cancel",
-            Self::TurnStatus { .. } => "turn/status",
-            Self::TurnRespondApproval { .. } => "turn/respond_approval",
             Self::GcRun { .. } => "gc/run",
             Self::GcStatus => "gc/status",
             Self::GcDrafts { .. } => "gc/drafts",

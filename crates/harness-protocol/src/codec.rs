@@ -71,9 +71,7 @@ mod tests {
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(serde_json::json!(1)),
-            method: Method::ThreadStart {
-                cwd: PathBuf::from("/tmp"),
-            },
+            method: Method::GcRun { project_id: None },
         };
         let json = serde_json::to_string(&req)?;
         let back: RpcRequest = decode_request(&json)?;
@@ -121,19 +119,26 @@ mod tests {
     }
 
     #[test]
-    fn slash_style_thread_start() -> anyhow::Result<()> {
-        let json = r#"{"jsonrpc":"2.0","id":1,"method":"thread/start","params":{"cwd":"/tmp"}}"#;
-        let req: RpcRequest = decode_request(json)?;
-        assert!(matches!(req.method, Method::ThreadStart { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn slash_style_turn_start() -> anyhow::Result<()> {
-        let json = r#"{"jsonrpc":"2.0","id":2,"method":"turn/start","params":{"thread_id":"t1","input":"hello"}}"#;
-        let req: RpcRequest = decode_request(json)?;
-        assert!(matches!(req.method, Method::TurnStart { .. }));
-        Ok(())
+    fn removed_lifecycle_methods_are_rejected() {
+        for method in [
+            "thread/start",
+            "thread/resume",
+            "thread/fork",
+            "thread/list",
+            "thread/delete",
+            "thread/compact",
+            "turn/start",
+            "turn/steer",
+            "turn/cancel",
+            "turn/status",
+            "turn/respond_approval",
+        ] {
+            let json = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#);
+            assert!(
+                decode_request(&json).is_err(),
+                "removed lifecycle method should not decode: {method}"
+            );
+        }
     }
 
     #[test]
@@ -165,20 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn snake_case_still_works() -> anyhow::Result<()> {
-        let json = r#"{"jsonrpc":"2.0","id":5,"method":"thread_start","params":{"cwd":"/tmp"}}"#;
-        let req: RpcRequest = decode_request(json)?;
-        assert!(matches!(req.method, Method::ThreadStart { .. }));
-        Ok(())
-    }
-
-    #[test]
     fn method_name_returns_slash_style() {
-        let m = Method::ThreadStart {
-            cwd: PathBuf::from("/tmp"),
-        };
-        assert_eq!(m.method_name(), "thread/start");
-
         let m = Method::Initialize;
         assert_eq!(m.method_name(), "initialize");
 

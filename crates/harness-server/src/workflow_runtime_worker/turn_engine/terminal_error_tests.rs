@@ -137,7 +137,6 @@ async fn adapter_terminal_error_fails_turn_and_notification() -> anyhow::Result<
     run_turn_lifecycle_with_options(
         server.clone(),
         None,
-        None,
         notification_tx,
         thread_id.clone(),
         turn_id.clone(),

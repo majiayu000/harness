@@ -1,6 +1,5 @@
 use super::helpers::{
-    emit_runtime_notification, mark_turn_failed, persist_runtime_thread, process_stream_item,
-    RuntimeUsageContext,
+    emit_runtime_notification, mark_turn_failed, process_stream_item, RuntimeUsageContext,
 };
 use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
 use harness_core::config::agents::SandboxMode;
@@ -59,30 +58,6 @@ fn bridge_agent_event(
     }
 }
 
-pub(crate) async fn run_turn_lifecycle(
-    server: Arc<crate::server::HarnessServer>,
-    thread_db: Option<crate::thread_db::ThreadDb>,
-    notify_tx: Option<crate::notify::NotifySender>,
-    notification_tx: tokio::sync::broadcast::Sender<RpcNotification>,
-    thread_id: harness_core::types::ThreadId,
-    turn_id: TurnId,
-    prompt: String,
-    agent_name: String,
-) {
-    run_turn_lifecycle_with_options(
-        server,
-        thread_db,
-        notify_tx,
-        notification_tx,
-        thread_id,
-        turn_id,
-        prompt,
-        agent_name,
-        TurnLifecycleOptions::default(),
-    )
-    .await;
-}
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TurnLifecycleOptions {
     pub model: Option<String>,
@@ -99,7 +74,6 @@ pub(crate) struct TurnLifecycleOptions {
 
 pub(crate) async fn run_turn_lifecycle_with_options(
     server: Arc<crate::server::HarnessServer>,
-    thread_db: Option<crate::thread_db::ThreadDb>,
     notify_tx: Option<crate::notify::NotifySender>,
     notification_tx: tokio::sync::broadcast::Sender<RpcNotification>,
     thread_id: harness_core::types::ThreadId,
@@ -134,7 +108,6 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         }
         mark_turn_failed(
             &server,
-            &thread_db,
             &notify_tx,
             &notification_tx,
             &thread_id,
@@ -301,7 +274,6 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         }
                         process_stream_item(
                             &server,
-                            &thread_db,
                             &notify_tx,
                             &notification_tx,
                             options.runtime_usage.as_ref(),
@@ -357,7 +329,6 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             if let Some(error_msg) = stream_error {
                 mark_turn_failed(
                     &server,
-                    &thread_db,
                     &notify_tx,
                     &notification_tx,
                     &thread_id,
@@ -369,7 +340,6 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             }
             match server.thread_manager.complete_turn(&thread_id, &turn_id) {
                 Ok(Some(usage)) => {
-                    persist_runtime_thread(&thread_db, &server, &thread_id).await;
                     emit_runtime_notification(
                         &notify_tx,
                         &notification_tx,
@@ -397,12 +367,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         },
                     ) {
                         tracing::warn!("failed to add error item to turn: {e}");
-                    } else {
-                        persist_runtime_thread(&thread_db, &server, &thread_id).await;
                     }
                     mark_turn_failed(
                         &server,
-                        &thread_db,
                         &notify_tx,
                         &notification_tx,
                         &thread_id,
@@ -424,12 +391,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 },
             ) {
                 tracing::warn!("failed to add error item to turn: {e}");
-            } else {
-                persist_runtime_thread(&thread_db, &server, &thread_id).await;
             }
             mark_turn_failed(
                 &server,
-                &thread_db,
                 &notify_tx,
                 &notification_tx,
                 &thread_id,
@@ -584,7 +548,6 @@ mod tests {
         let (notification_tx, _) = tokio::sync::broadcast::channel(16);
         run_turn_lifecycle_with_options(
             server,
-            None,
             None,
             notification_tx,
             thread_id,

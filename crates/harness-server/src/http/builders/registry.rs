@@ -13,7 +13,6 @@ use crate::server::HarnessServer;
 
 /// Outputs of the registry initialization phase.
 pub(crate) struct RegistryBundle {
-    pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<PlanDb>,
     pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
     pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
@@ -26,8 +25,8 @@ pub(crate) struct RegistryBundle {
     pub startup_results: Vec<StoreStartupResult>,
 }
 
-/// Initialize thread DB, plan DB, plan cache, project registry, workspace
-/// manager, and runtime state store.
+/// Initialize plan DB, plan cache, project registry, workspace manager, and
+/// runtime state store.
 ///
 /// Must follow `build_storage` (uses `storage.tasks` for orphan cleanup) —
 /// callers must pass `tasks` explicitly for that cleanup step.
@@ -58,60 +57,6 @@ pub(crate) async fn build_registry(
             return Ok(failed_registry_bundle(plan_cache, &error));
         }
     };
-
-    let thread_db_path = harness_core::config::dirs::default_db_path(data_dir, "threads");
-    let thread_context = crate::thread_db::ThreadDb::shared_schema_context(Some(&database_url))?;
-    super::ensure_startup_context_not_path_derived("thread_db", &thread_context)?;
-    let thread_db = match super::forced_startup_error("thread_db") {
-        Some(error) => {
-            startup_results.push(StoreStartupResult::critical("thread_db").failed(error));
-            None
-        }
-        None => match async {
-            let thread_db = crate::thread_db::ThreadDb::open_shared_with_data_dir(
-                &thread_context,
-                &setup_pool,
-                data_dir,
-            )
-            .await?;
-            crate::thread_db::migrate_legacy_thread_db_if_needed(
-                &thread_db_path,
-                Some(&database_url),
-                &thread_db,
-            )
-            .await?;
-            Ok::<_, anyhow::Error>(thread_db)
-        }
-        .await
-        {
-            Ok(thread_db) => Some(thread_db),
-            Err(error) => {
-                startup_results
-                    .push(StoreStartupResult::critical("thread_db").failed(error.to_string()));
-                None
-            }
-        },
-    };
-
-    // Load persisted threads into the in-memory ThreadManager cache.
-    if let Some(thread_db) = thread_db.as_ref() {
-        match thread_db.list().await {
-            Ok(threads) => {
-                for thread in threads {
-                    server
-                        .thread_manager
-                        .threads_cache()
-                        .insert(thread.id.as_str().to_string(), thread);
-                }
-                startup_results.push(StoreStartupResult::critical("thread_db"));
-            }
-            Err(error) => {
-                startup_results
-                    .push(StoreStartupResult::critical("thread_db").failed(error.to_string()));
-                tracing::warn!("thread cache: failed to load threads on startup: {error}");
-            }
-        }
-    }
 
     let plans_db_path = harness_core::config::dirs::default_db_path(data_dir, "plans");
     let plan_db = match super::forced_startup_error("plan_db") {
@@ -597,7 +542,6 @@ pub(crate) async fn build_registry(
     setup_pool.close().await;
 
     Ok(RegistryBundle {
-        thread_db,
         plan_db,
         plan_cache,
         issue_workflow_store,

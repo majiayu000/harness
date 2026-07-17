@@ -291,11 +291,6 @@ pub(super) async fn make_test_state_with_project_root(
         draft_store,
         project_root.to_path_buf(),
     ));
-    let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir, "threads"),
-        Some(&database_url),
-    )
-    .await?;
     let _project_svc_tmp = crate::project_registry::ProjectRegistry::open_with_database_url(
         &harness_core::config::dirs::default_db_path(dir, "projects"),
         Some(&database_url),
@@ -337,7 +332,6 @@ pub(super) async fn make_test_state_with_project_root(
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| project_root.to_path_buf()),
             tasks,
-            thread_db: Some(thread_db),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
@@ -433,7 +427,6 @@ pub(super) async fn make_test_state_with_issue_workflows(
             project_root: state.core.project_root.clone(),
             home_dir: state.core.home_dir.clone(),
             tasks: state.core.tasks.clone(),
-            thread_db: None,
             plan_db: None,
             plan_cache: state.core.plan_cache.clone(),
             issue_workflow_store: Some(Arc::new(workflow_store)),
@@ -556,7 +549,6 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
             project_root: state.core.project_root.clone(),
             home_dir: state.core.home_dir.clone(),
             tasks: state.core.tasks.clone(),
-            thread_db: state.core.thread_db.clone(),
             plan_db: None,
             plan_cache: state.core.plan_cache.clone(),
             issue_workflow_store: None,

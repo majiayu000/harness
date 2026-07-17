@@ -74,22 +74,6 @@ async fn plan_cache_hydrated_from_db() {
 }
 
 #[tokio::test]
-async fn build_registry_opens_thread_db_from_shared_schema() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
-        return;
-    };
-    let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
-        .await
-        .expect("build_registry should succeed");
-    let thread_db = bundle
-        .thread_db
-        .as_ref()
-        .expect("thread db should be ready");
-    assert_eq!(thread_db.schema(), crate::thread_db::THREAD_DB_SCHEMA);
-}
-
-#[tokio::test]
 async fn build_registry_opens_project_registry_from_shared_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
     let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {

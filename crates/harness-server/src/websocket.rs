@@ -299,10 +299,6 @@ mod tests {
             draft_store,
             dir.to_path_buf(),
         ));
-        let thread_db = crate::thread_db::ThreadDb::open(
-            &harness_core::config::dirs::default_db_path(dir, "threads"),
-        )
-        .await?;
         let (notification_tx, _) = broadcast::channel(notification_broadcast_capacity);
         let (ws_shutdown_tx, _) = broadcast::channel(1);
 
@@ -341,7 +337,6 @@ mod tests {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|_| dir.to_path_buf()),
                 tasks,
-                thread_db: Some(thread_db),
                 plan_db: None,
                 plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
                 issue_workflow_store: None,

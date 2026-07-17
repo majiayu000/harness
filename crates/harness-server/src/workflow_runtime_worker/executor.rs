@@ -2,7 +2,7 @@ use crate::http::AppState;
 use async_trait::async_trait;
 use harness_core::agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
 use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
-use harness_core::types::{AgentId, ThreadId};
+use harness_core::types::AgentId;
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, RuntimeKind, RuntimeProfile,
     WorkflowInstance,
@@ -156,11 +156,8 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 prompt.clone(),
                 AgentId::from_str(agent_name),
             )?;
-            persist_created_thread(self.state, &thread_id).await;
-
             run_turn_lifecycle_with_options(
                 self.state.core.server.clone(),
-                self.state.core.thread_db.clone(),
                 self.state.notifications.notify_tx.clone(),
                 self.state.notifications.notification_tx.clone(),
                 thread_id.clone(),
@@ -403,18 +400,6 @@ fn isolation_spawn_env_vars(job: &RuntimeJob) -> HashMap<String, String> {
         env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
     }
     env_vars
-}
-
-async fn persist_created_thread(state: &AppState, thread_id: &ThreadId) {
-    let Some(db) = state.core.thread_db.as_ref() else {
-        return;
-    };
-    let Some(thread) = state.core.server.thread_manager.get_thread(thread_id) else {
-        return;
-    };
-    if let Err(error) = db.insert(&thread).await {
-        tracing::warn!(thread_id = %thread_id, "failed to persist runtime worker thread: {error}");
-    }
 }
 
 fn runtime_profile_with_timeout_fallback(

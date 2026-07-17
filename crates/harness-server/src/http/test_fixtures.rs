@@ -198,7 +198,6 @@ async fn make_read_only_route_test_state_with_project_root(
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| project_root.to_path_buf()),
             tasks,
-            thread_db: None,
             plan_db: None,
             plan_cache: Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,

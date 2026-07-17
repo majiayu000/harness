@@ -60,7 +60,6 @@ pub struct CoreServices {
     /// project roots against `$HOME` in concurrent requests.
     pub home_dir: std::path::PathBuf,
     pub tasks: Arc<task_runner::TaskStore>,
-    pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
     /// In-memory plan cache hydrated from `plan_db` on startup.
     /// Write-through: every mutation must also persist via `plan_db`.

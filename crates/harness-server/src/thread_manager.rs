@@ -18,37 +18,10 @@ use tracing;
 
 /// In-memory thread registry and turn lifecycle manager.
 ///
-/// `ThreadManager` is a pure in-memory cache with no persistence layer.
-/// It owns only two DashMaps: one for thread state and one for running-turn
-/// task handles.  It intentionally has no `db` field and no async persistence
-/// methods (`open`, `persist`, `persist_insert`, `persist_delete`); those were
-/// removed in issue #97 because they duplicated the write-through logic that
-/// handlers and the task executor perform via `AppState.core.thread_db`.
-///
-/// Thread persistence is handled exclusively by `CoreServices.thread_db`
-/// (`AppState.core.thread_db`).
-///
-/// Lifecycle ownership:
-/// - **Startup hydration**: performed in `http.rs` during app initialisation,
-///   which loads persisted threads from `thread_db` into this cache via
-///   `threads_cache()`.
-/// - **Mutation persistence**: when `thread_db` is configured, mutations to
-///   this cache are followed by a write-through. All persistence helpers
-///   short-circuit when `thread_db` is `None`, so durability is optional.
-///   There are three call sites responsible:
-///   1. `handlers/thread.rs` — `persist_thread` / `persist_thread_insert`
-///      are called after each direct handler mutation: thread create/fork
-///      (`thread_start`, `thread_fork`), turn start (`turn_start`), turn
-///      cancel (`turn_cancel`), turn steer (`turn_steer`), thread resume
-///      (`thread_resume`), and thread compact (`thread_compact`).
-///   2. `handlers/thread.rs` — `thread_delete` removes the entry from this
-///      cache and, when `thread_db` is present, calls `db.delete(...)` to
-///      remove it from the backing store as well.
-///   3. `task_executor` — `persist_runtime_thread` is called (a) after each
-///      stream item is applied to the cache (`task_executor/helpers.rs`
-///      `process_stream_item`), and (b) at turn completion or failure
-///      (`task_executor.rs` and `task_executor/helpers.rs`
-///      `mark_turn_failed`).
+/// `ThreadManager` owns the live in-memory thread and turn state used while a
+/// workflow-runtime job executes. Historical thread persistence was removed
+/// in GH-1434; workflow state and runtime evidence remain durable in the
+/// workflow-runtime store.
 pub struct ThreadManager {
     threads: DashMap<String, Thread>,
     running_turn_tasks: DashMap<String, JoinHandle<()>>,
@@ -64,7 +37,7 @@ impl ThreadManager {
         }
     }
 
-    /// Access the underlying threads cache (for loading persisted threads).
+    /// Access the live threads cache for in-process lifecycle coordination.
     pub fn threads_cache(&self) -> &DashMap<String, Thread> {
         &self.threads
     }

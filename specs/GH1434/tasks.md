@@ -16,8 +16,8 @@ GH-1434
 - [x] `SP1434-T003` Owner: `gate` | Dependencies: `SP1434-T001` | Done when: probes have run for at least 7 days with zero counts for the deletion surface, or a maintainer records an explicit GH-1434 waiver with scope and reason | Verify: attach `probe_report` query output or waiver URL to each removal PR
 - [x] `SP1434-T004` Owner: `workspace` | Dependencies: `SP1434-T003` | Done when: `harness-eval` is removed from workspace members and related references are cleaned while eval-store data remains untouched | Verify: `cargo test --workspace && ! grep -r harness-eval crates/*/Cargo.toml Cargo.toml`
 - [x] `SP1434-T005` Owner: `server` | Dependencies: `SP1434-T003` | Done when: `review_store` modules and router/handler references are removed | Verify: `cargo test --workspace && test "$(rg -l review_store crates | wc -l)" -eq 0`
-- [ ] `SP1434-T006` Owner: `consumers` | Dependencies: runtime replacement APIs for any live compatibility behavior being moved | Done when: CLI, dashboard, and websocket references to thread/turn/task endpoints are removed or repointed to workflow-runtime equivalents before the old endpoints are deleted | Verify: `cargo test --workspace` plus dashboard first-viewport smoke
-- [ ] `SP1434-T007` Owner: `server` | Dependencies: `SP1434-T003`, `SP1434-T006` | Done when: thread/turn RPC methods are removed from protocol definitions, router registration, and handlers; thread persistence is removed; the live in-memory role is retained or safely inlined | Verify: `cargo test --workspace && test "$(rg -l 'thread/start|turn/start|thread_db' crates | wc -l)" -eq 0`
+- [x] `SP1434-T006` Owner: `consumers` | Dependencies: runtime replacement APIs for any live compatibility behavior being moved | Done when: CLI, dashboard, and websocket references to thread/turn/task endpoints are removed or repointed to workflow-runtime equivalents before the old endpoints are deleted | Verify: `cargo test --workspace` plus dashboard first-viewport smoke
+- [x] `SP1434-T007` Owner: `server` | Dependencies: `SP1434-T003`, `SP1434-T006` | Done when: thread/turn RPC methods are removed from protocol definitions, router registration, and handlers; thread persistence is removed; the live in-memory role is retained or safely inlined | Verify: `cargo test --workspace && ! rg 'Thread(Start|Resume|Fork|List|Delete|Compact)|Turn(Start|Steer|Cancel|Status|RespondApproval)' crates/harness-protocol/src/methods.rs && ! rg 'Method::(Thread(Start|Resume|Fork|List|Delete|Compact)|Turn(Start|Steer|Cancel|Status|RespondApproval))' crates/harness-server/src/router crates/harness-server/src/handlers && ! rg 'thread_db|ThreadDb' crates --glob '!CHANGELOG.md'`
 - [ ] `SP1434-T008` Owner: `server` | Dependencies: `SP1434-T003`, `SP1434-T006`, extraction evidence for live workflow-runtime turn-engine dependencies | Done when: dependency scanning identifies live `task_*` references; live pieces are moved without semantic changes into workflow-runtime-adjacent modules; removable task-layer code is deleted | Verify: `cargo test --workspace` plus a PR migration table showing moved code and unchanged behavior
 - [ ] `SP1434-T009` Owner: `docs` | Dependencies: all removal PRs | Done when: CHANGELOG documents removed RPC methods, task endpoint compatibility changes, and archive/restore instructions; final summary reports net deleted LOC | Verify: reviewer checks method list and `git diff --shortstat`
 - [ ] `SP1434-T010` Owner: `tests` | Dependencies: all removal PRs | Done when: full workspace tests, clippy, and smoke checks pass | Verify: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`
@@ -76,3 +76,13 @@ GH-1434
   wiring, and its dependent persistence/auto-fix path. Periodic review task
   execution, synthesis, structured output parsing, and watermark behavior stay
   in place. The archived `review_store` Postgres schema and data are untouched.
+- `SP1434-T006` landed in PR #1702. Dashboard submission list/detail, stream,
+  proof, artifact, merge, and cancel consumers now use workflow-runtime-backed
+  APIs, and the first-viewport smoke passed before the legacy lifecycle RPC
+  removal began.
+- `SP1434-T007` uses the scoped maintainer waiver recorded on GH-1434
+  (<https://github.com/majiayu000/harness/issues/1434#issuecomment-5006185197>).
+  Harness-owned lifecycle requests and thread persistence are removed. The
+  in-memory `ThreadManager`, workflow-runtime turn engine and notifications,
+  and Codex app-server adapter protocol remain live. Protocol rejection tests
+  retain the removed method strings as negative compatibility fixtures.
