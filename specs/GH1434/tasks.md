@@ -14,7 +14,7 @@ GH-1434
 - [x] `SP1434-T001` Owner: `observe` | Dependencies: none | Done when: usage probes cover thread/turn route dispatch and public entry points for `thread_manager`, `task_db`, legacy `task_executor`, `task_runner`, `harness-eval`, and `review_store`; `probe_report` can be emitted and queried | Verify: `cargo test --package harness-server probe`
 - [ ] `SP1434-T002` Owner: `ops` | Dependencies: none | Done when: `scripts/archive-phase1-data.sh` has produced thread/task dump artifacts and restore instructions for the deletion target | Verify: `bash scripts/archive-phase1-data.sh && test -s archives/phase1-*/RESTORE.md`
 - [ ] `SP1434-T003` Owner: `gate` | Dependencies: `SP1434-T001` | Done when: probes have run for at least 7 days with zero counts for the deletion surface, or a maintainer records an explicit GH-1434 waiver with scope and reason | Verify: attach `probe_report` query output or waiver URL to each removal PR
-- [ ] `SP1434-T004` Owner: `workspace` | Dependencies: `SP1434-T003` | Done when: `harness-eval` is removed from workspace members and related references are cleaned while eval-store data remains untouched | Verify: `cargo test --workspace && ! grep -r harness-eval crates/*/Cargo.toml Cargo.toml`
+- [x] `SP1434-T004` Owner: `workspace` | Dependencies: `SP1434-T003` | Done when: `harness-eval` is removed from workspace members and related references are cleaned while eval-store data remains untouched | Verify: `cargo test --workspace && ! grep -r harness-eval crates/*/Cargo.toml Cargo.toml`
 - [ ] `SP1434-T005` Owner: `server` | Dependencies: `SP1434-T003` | Done when: `review_store` modules and router/handler references are removed | Verify: `cargo test --workspace && test "$(rg -l review_store crates | wc -l)" -eq 0`
 - [ ] `SP1434-T006` Owner: `consumers` | Dependencies: runtime replacement APIs for any live compatibility behavior being moved | Done when: CLI, dashboard, and websocket references to thread/turn/task endpoints are removed or repointed to workflow-runtime equivalents before the old endpoints are deleted | Verify: `cargo test --workspace` plus dashboard first-viewport smoke
 - [ ] `SP1434-T007` Owner: `server` | Dependencies: `SP1434-T003`, `SP1434-T006` | Done when: thread/turn RPC methods are removed from protocol definitions, router registration, and handlers; thread persistence is removed; the live in-memory role is retained or safely inlined | Verify: `cargo test --workspace && test "$(rg -l 'thread/start|turn/start|thread_db' crates | wc -l)" -eq 0`
@@ -63,3 +63,14 @@ GH-1434
 - `/tasks` is currently a workflow-runtime compatibility API for dashboard
   submission handles and observation. Removing it requires replacement runtime
   APIs first.
+- `SP1434-T004` landed under the explicit maintainer waiver recorded on GH-1434
+  (<https://github.com/majiayu000/harness/issues/1434#issuecomment-4993856096>),
+  which waives the 7-day probe window for T004/T005 based on zero-count
+  `harness_eval` probe evidence
+  (<https://github.com/majiayu000/harness/issues/1434#issuecomment-4990260785>)
+  and the archive artifact `archives/phase1-20260716T092438Z`. The removal
+  deleted the `harness-eval` crate, the server eval-store module and
+  `/api/evals` routes, the dashboard Evals views, and the
+  `evaluate_pr_repair` script family. The `eval_store` Postgres schema and its
+  data are untouched, and the `UsageProbeSurface::HarnessEval` probe variant is
+  retained for continued zero-count reporting.

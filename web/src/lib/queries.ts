@@ -3,9 +3,6 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiJson, apiFetch } from "./api";
 import type {
   DashboardPayload,
-  EvalDashboardResponse,
-  EvalQualitySnapshotResponse,
-  EvalRunsResponse,
   FullTask,
   OperatorMonitorPayload,
   OperatorSnapshotPayload,
@@ -51,45 +48,6 @@ export function useUsageMonitor() {
     queryKey: ["usage-monitor"],
     queryFn: ({ signal }) => apiJson<UsageMonitorPayload>("/api/usage-monitor", { signal }),
     refetchInterval: 5_000,
-  });
-}
-
-export function useEvalDashboard(limit = 50) {
-  return useQuery<EvalDashboardResponse, Error>({
-    queryKey: ["eval-dashboard", limit],
-    queryFn: async ({ signal }) => {
-      const runs = await apiJson<EvalRunsResponse>(`/api/evals/runs?limit=${limit}`, { signal });
-      const rows = await Promise.all(
-        runs.runs.map(async (run) => {
-          if (!run.quality_snapshot_id) {
-            return {
-              run,
-              quality_snapshot: null,
-              quality_snapshot_error: null,
-            };
-          }
-          try {
-            const snapshot = await apiJson<EvalQualitySnapshotResponse>(
-              `/api/evals/quality-snapshots/${encodeURIComponent(run.quality_snapshot_id)}`,
-              { signal },
-            );
-            return {
-              run,
-              quality_snapshot: snapshot.quality_snapshot,
-              quality_snapshot_error: null,
-            };
-          } catch (error) {
-            return {
-              run,
-              quality_snapshot: null,
-              quality_snapshot_error: error instanceof Error ? error.message : "snapshot unavailable",
-            };
-          }
-        }),
-      );
-      return { rows };
-    },
-    refetchInterval: 30_000,
   });
 }
 
