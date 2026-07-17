@@ -46,41 +46,66 @@ async fn append_runtime_definition_summaries(
     cursor: Option<&TaskSummaryPageCursor>,
     limit: usize,
 ) -> anyhow::Result<()> {
+    let target_len = summaries.len().saturating_add(limit);
+    let page_limit = i64::try_from(limit.max(50)).unwrap_or(i64::MAX);
+    let mut cursor_created_at = cursor.map(|cursor| cursor.created_at);
+    let mut cursor_id = cursor.map(|cursor| cursor.id.clone());
     let include_all_kinds = filter.kinds.is_empty();
     let kinds = harness_workflow::runtime::WorkflowSubmissionKindFilter {
         include_issue: include_all_kinds || filter.kinds.contains(&TaskKind::Issue),
         include_pr: include_all_kinds || filter.kinds.contains(&TaskKind::Pr),
         include_prompt: include_all_kinds || filter.kinds.contains(&TaskKind::Prompt),
     };
-    let workflows = store
-        .list_submission_instances_page(
-            filter.project.as_deref(),
-            cursor.map(|cursor| cursor.created_at),
-            cursor.map(|cursor| cursor.id.as_str()),
-            kinds,
-            i64::try_from(limit.max(1)).unwrap_or(i64::MAX),
-        )
-        .await?;
     let mut listed_ids: HashSet<String> = summaries
         .iter()
         .map(|summary| summary.id.as_str().to_string())
         .collect();
-    for workflow in workflows {
-        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
-        let Some(task_id) = projection.submission_handle.clone() else {
-            continue;
+
+    loop {
+        let workflows = store
+            .list_submission_instances_page(
+                filter.project.as_deref(),
+                cursor_created_at,
+                cursor_id.as_deref(),
+                kinds,
+                page_limit,
+            )
+            .await?;
+        let fetched = workflows.len();
+        let next_cursor = workflows.last().and_then(|workflow| {
+            RuntimeWorkflowProjection::from_workflow(workflow)
+                .submission_handle
+                .map(|task_id| (workflow.created_at, task_id.as_str().to_string()))
+        });
+
+        for workflow in workflows {
+            let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+            let Some(task_id) = projection.submission_handle.clone() else {
+                continue;
+            };
+            let task_kind = runtime_submission_task_kind(&workflow);
+            if !filter.kinds.is_empty() && !filter.kinds.contains(&task_kind) {
+                continue;
+            }
+            if !listed_ids.insert(task_id.as_str().to_string()) {
+                continue;
+            }
+            let summary = runtime_workflow_task_summary(workflow, task_id, task_kind);
+            if filter.matches_summary(&summary) {
+                summaries.push(summary);
+            }
+        }
+
+        if summaries.len() >= target_len
+            || fetched < usize::try_from(page_limit).unwrap_or(usize::MAX)
+        {
+            break;
+        }
+        let Some((next_created_at, next_id)) = next_cursor else {
+            anyhow::bail!("runtime submission page did not expose a continuation cursor");
         };
-        let task_kind = runtime_submission_task_kind(&workflow);
-        if !filter.kinds.is_empty() && !filter.kinds.contains(&task_kind) {
-            continue;
-        }
-        if !listed_ids.insert(task_id.as_str().to_string()) {
-            continue;
-        }
-        let summary = runtime_workflow_task_summary(workflow, task_id, task_kind);
-        if filter.matches_summary(&summary) {
-            summaries.push(summary);
-        }
+        cursor_created_at = Some(next_created_at);
+        cursor_id = Some(next_id);
     }
     Ok(())
 }

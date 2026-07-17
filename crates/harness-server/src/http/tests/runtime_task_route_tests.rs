@@ -1075,7 +1075,8 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
     let app = Router::new()
         .route(
             "/api/workflows/runtime/submissions",
-            get(task_query_routes::list_runtime_submissions).post(task_routes::create_task),
+            get(task_query_routes::list_runtime_submissions)
+                .post(task_routes::create_runtime_submission),
         )
         .route(
             "/api/workflows/runtime/submissions/{id}",
@@ -1094,6 +1095,37 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
             get(task_query_routes::get_runtime_submission_proof),
         )
         .with_state(state.clone());
+
+    let legacy_duplicate_request = task_runner::CreateTaskRequest {
+        issue: Some(42),
+        repo: Some("owner/repo".to_string()),
+        project: Some(project_root.canonicalize()?),
+        external_id: Some("issue:42".to_string()),
+        ..Default::default()
+    };
+    task_runner::register_pending_task(state.core.tasks.clone(), &legacy_duplicate_request).await;
+    let legacy_duplicate_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/submissions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "project": project_root.display().to_string(),
+                        "repo": "owner/repo",
+                        "issue": 42
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(legacy_duplicate_response.status(), StatusCode::CONFLICT);
+    let legacy_duplicate = response_json(legacy_duplicate_response).await?;
+    assert_eq!(legacy_duplicate["error"], "legacy_submission_active");
+    assert!(legacy_duplicate.get("task_id").is_none());
+    assert!(legacy_duplicate.get("submission_id").is_none());
 
     let request_body = serde_json::json!({
         "project": project_root.display().to_string(),
@@ -1146,7 +1178,7 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         let mut issue = WorkflowInstance::new(
             harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
             1,
-            "implementing",
+            "done",
             WorkflowSubject::new("github_issue", format!("issue-{offset}")),
         )
         .with_id(format!("newer-issue-instance-{offset}"))
@@ -1183,6 +1215,33 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
     assert_eq!(prompt_rows.len(), 1);
     assert_eq!(prompt_rows[0]["task_kind"], "prompt");
     assert_eq!(prompt_page["page"]["has_more"], true);
+
+    for (filter, expected_has_more) in [("active=true", true), ("status=implementing", false)] {
+        let active_page_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/workflows/runtime/submissions?{filter}&limit=1"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(active_page_response.status(), StatusCode::OK);
+        let active_page = response_json(active_page_response).await?;
+        let active_rows = active_page["data"]
+            .as_array()
+            .expect("active runtime submission page should be an array");
+        assert_eq!(active_rows.len(), 1, "filter: {filter}");
+        assert_eq!(active_rows[0]["task_kind"], "prompt", "filter: {filter}");
+        if filter == "status=implementing" {
+            assert_eq!(active_rows[0]["status"], "implementing");
+        }
+        assert_eq!(
+            active_page["page"]["has_more"], expected_has_more,
+            "filter: {filter}"
+        );
+    }
 
     let list_response = app
         .clone()

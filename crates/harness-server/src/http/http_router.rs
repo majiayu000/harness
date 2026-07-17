@@ -78,7 +78,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/workflows/runtime/submissions",
-            get(task_query_routes::list_runtime_submissions).post(task_routes::create_task),
+            get(task_query_routes::list_runtime_submissions)
+                .post(task_routes::create_runtime_submission),
         )
         .route(
             "/api/workflows/runtime/submissions/{id}",
