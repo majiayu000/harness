@@ -15,7 +15,6 @@ export default defineConfig({
       // Do NOT proxy /, /overview, /favicon.ico, or /assets/* — those
       // are served by Vite during dev.
       "/api": "http://localhost:9800",
-      "/tasks": "http://localhost:9800",
       "/projects": "http://localhost:9800",
       "/rpc": "http://localhost:9800",
       "/health": "http://localhost:9800",

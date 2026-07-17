@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useTaskStream, useCancelTask, useCancelWorkflowRuntime } from "@/lib/queries";
+import { useTaskStream, useCancelWorkflowRuntime } from "@/lib/queries";
 import { TOKEN_KEY } from "@/lib/api";
 
 interface Props {
@@ -12,12 +12,9 @@ interface Props {
 export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Props) {
   const [output, setOutput] = useState<string>("");
   const [streamError, setStreamError] = useState<string | null>(null);
-  const cancelTask = useCancelTask();
   const cancelWorkflowRuntime = useCancelWorkflowRuntime();
   const canCancelWorkflowRuntime = executionPath === "workflow_runtime" && !!workflowId;
-  const cancelPending = canCancelWorkflowRuntime
-    ? cancelWorkflowRuntime.isPending
-    : cancelTask.isPending;
+  const cancelPending = cancelWorkflowRuntime.isPending;
 
   useTaskStream(
     taskId,
@@ -27,7 +24,7 @@ export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Pr
 
   function openStream() {
     const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-    const base = `/tasks/${taskId}/stream`;
+    const base = `/api/workflows/runtime/submissions/${taskId}/stream`;
     const url = tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
     window.open(url, "_blank", "noreferrer");
   }
@@ -36,7 +33,7 @@ export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Pr
     if (canCancelWorkflowRuntime && workflowId) {
       cancelWorkflowRuntime.mutate(workflowId, { onSuccess: onReset });
     } else {
-      cancelTask.mutate(taskId, { onSuccess: onReset });
+      setStreamError("Workflow runtime id unavailable; cancellation was not sent");
     }
   }
 

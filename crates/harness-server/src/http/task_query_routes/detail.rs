@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime_projection::{runtime_string_field, RuntimeWorkflowProjection};
 
 /// Response type for `GET /tasks/{id}` — `TaskState` fields plus the optional workflow summary
 /// that requires a separate workflow-store lookup (not persisted on `TaskState` itself).
@@ -106,6 +107,33 @@ pub(crate) async fn get_task(
     }
 }
 
+/// Get a workflow-runtime submission without consulting the legacy task store.
+pub(crate) async fn get_runtime_submission(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if state.core.workflow_runtime_store.is_none() {
+        return workflow_runtime_store_unavailable_response();
+    }
+    let task_id = harness_core::types::TaskId(id);
+    match runtime_task_response_by_handle(&state, &task_id).await {
+        Ok(Some(runtime_task)) => Json(runtime_task).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "runtime submission not found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!("get_runtime_submission: runtime workflow lookup failed: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn runtime_task_response_by_handle(
     state: &AppState,
     task_id: &harness_core::types::TaskId,
@@ -123,13 +151,19 @@ async fn runtime_task_response_by_handle(
         .data
         .get("issue_number")
         .and_then(|value| value.as_u64());
-    let Some(task_kind) = (match workflow.definition_id.as_str() {
-        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID => Some(TaskKind::Issue),
-        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID => Some(TaskKind::Prompt),
-        _ => None,
-    }) else {
+    let is_runtime_submission = matches!(
+        workflow.definition_id.as_str(),
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID
+            | harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID
+    ) || workflow
+        .data
+        .get("definition_hash")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|hash| !hash.trim().is_empty());
+    if !is_runtime_submission {
         return Ok(None);
-    };
+    }
+    let task_kind = runtime_submission_task_kind(&workflow);
     let RuntimeWorkflowProjection {
         task_status,
         failure_kind,
@@ -537,6 +571,43 @@ pub(crate) async fn get_task_proof(
         }
         Err(e) => {
             tracing::error!("get_task_proof: database error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Get proof for a workflow-runtime submission without consulting the legacy task store.
+pub(crate) async fn get_runtime_submission_proof(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if state.core.workflow_runtime_store.is_none() {
+        return workflow_runtime_store_unavailable_response();
+    }
+    let task_id = harness_core::types::TaskId(id);
+    match runtime_proof_by_handle(&state, &task_id).await {
+        Ok(RuntimeProofLookup::Terminal(proof)) => Json(proof).into_response(),
+        Ok(RuntimeProofLookup::InFlight(status)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "runtime submission is not in a terminal state",
+                "status": status,
+            })),
+        )
+            .into_response(),
+        Ok(RuntimeProofLookup::Missing) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "runtime submission not found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(
+                "get_runtime_submission_proof: runtime workflow lookup failed: {error}"
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "internal server error"})),

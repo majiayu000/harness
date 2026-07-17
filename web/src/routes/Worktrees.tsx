@@ -49,7 +49,7 @@ function statusColor(status: string): string {
 
 function openStream(taskId: string): void {
   const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-  const base = `/tasks/${taskId}/stream`;
+  const base = `/api/workflows/runtime/submissions/${taskId}/stream`;
   const url = tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
   window.open(url, "_blank", "noreferrer");
 }
@@ -175,7 +175,7 @@ export function Worktrees() {
           body: JSON.stringify({ workflow_id: card.runtimeWorkflowId }),
         });
       } else {
-        await apiFetch(`/tasks/${card.taskId}/cancel`, { method: "POST" });
+        throw new Error("Workflow runtime id unavailable; cancellation was not sent");
       }
     } catch (err) {
       setCancelError(err instanceof Error ? err.message : "Cancel failed");

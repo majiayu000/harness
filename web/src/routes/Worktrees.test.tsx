@@ -81,7 +81,7 @@ describe("<Worktrees>", () => {
     expect(screen.getByRole("link", { name: "Docs" })).toHaveAttribute("href", DOCS_URL);
   });
 
-  it("cancels worktrees through the task endpoint", async () => {
+  it("reports missing runtime ownership instead of calling a legacy cancel endpoint", async () => {
     mockUseWorktrees.mockReturnValue({
       cards: [worktreeCard({ taskId: "runtime-task-1" })],
       isLoading: false,
@@ -101,11 +101,10 @@ describe("<Worktrees>", () => {
     wrap(<Worktrees />);
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
-    await waitFor(() => {
-      expect(mockApiFetch).toHaveBeenCalledWith("/tasks/runtime-task-1/cancel", {
-        method: "POST",
-      });
-    });
+    await waitFor(() =>
+      expect(screen.getByText(/Workflow runtime id unavailable/)).toBeInTheDocument(),
+    );
+    expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
   it("cancels runtime worktrees through the workflow endpoint", async () => {
@@ -191,7 +190,12 @@ describe("<Worktrees>", () => {
     const qc = makeQueryClient();
     const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
     mockUseWorktrees.mockReturnValue({
-      cards: [worktreeCard({ taskId: "runtime-task-2" })],
+      cards: [
+        worktreeCard({
+          taskId: "runtime-task-2",
+          runtimeWorkflowId: "runtime-workflow-2",
+        }),
+      ],
       isLoading: false,
       error: null,
     });

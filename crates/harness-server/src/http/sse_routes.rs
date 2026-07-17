@@ -137,6 +137,41 @@ pub(crate) async fn stream_task_sse(
         .into_response()
 }
 
+/// Stream a workflow-runtime submission without consulting the legacy task store.
+pub(crate) async fn stream_runtime_submission_sse(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if state.core.workflow_runtime_store.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "workflow runtime store unavailable"})),
+        )
+            .into_response();
+    }
+    let task_id = harness_core::types::TaskId(id);
+    match runtime_task_sse_stream(state, task_id).await {
+        Ok(Some(stream)) => Sse::new(stream)
+            .keep_alive(sse_keep_alive())
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "runtime submission not found"})),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(
+                "stream_runtime_submission_sse: runtime workflow lookup failed: {error}"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn sse_keep_alive() -> KeepAlive {
     KeepAlive::new()
         .interval(Duration::from_secs(30))

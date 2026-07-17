@@ -204,11 +204,8 @@ describe("<Active>", () => {
     expect(screen.getByText("fallback: silence")).toBeInTheDocument();
     expect(columnCount("Ready")).toBe("1");
 
-    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
-
-    await waitFor(() => {
-      expect(mockApiFetch).toHaveBeenCalledWith("/tasks/ready-task/merge", { method: "POST" });
-    });
+    expect(screen.queryByRole("button", { name: "Merge" })).not.toBeInTheDocument();
+    expect(mockApiFetch).not.toHaveBeenCalled();
     expect(screen.queryByTestId("task-slideover")).not.toBeInTheDocument();
   });
 

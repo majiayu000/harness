@@ -133,18 +133,22 @@ describe("useWorktrees", () => {
 
 function buildStreamUrl(taskId: string): string {
   const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-  const base = `/tasks/${taskId}/stream`;
+  const base = `/api/workflows/runtime/submissions/${taskId}/stream`;
   return tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
 }
 
 describe("stream URL construction", () => {
-  it("uses /tasks/{id}/stream path (no /api prefix)", () => {
-    expect(buildStreamUrl("abc-123")).toBe("/tasks/abc-123/stream");
+  it("uses the workflow runtime submission stream path", () => {
+    expect(buildStreamUrl("abc-123")).toBe(
+      "/api/workflows/runtime/submissions/abc-123/stream",
+    );
   });
 
   it("appends token query param when session token is set", () => {
     sessionStorage.setItem(TOKEN_KEY, "mytoken");
-    expect(buildStreamUrl("abc-123")).toBe("/tasks/abc-123/stream?token=mytoken");
+    expect(buildStreamUrl("abc-123")).toBe(
+      "/api/workflows/runtime/submissions/abc-123/stream?token=mytoken",
+    );
   });
 
   it("omits token param when no session token", () => {
@@ -155,7 +159,7 @@ describe("stream URL construction", () => {
 // ── useTasks ─────────────────────────────────────────────────────────────────
 
 describe("useTasks", () => {
-  it("fetches the active task list envelope from /tasks without an /api prefix", async () => {
+  it("fetches the active workflow runtime submission list", async () => {
     const task = { id: "t1", status: "implementing", turn: 1, project: null };
     const taskList = {
       data: [task],
@@ -177,7 +181,7 @@ describe("useTasks", () => {
     await waitFor(() => expect(result.current.isLoading).toBe(false));
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/tasks?active=true&limit=200",
+      "/api/workflows/runtime/submissions?active=true&limit=200",
       expect.objectContaining({
         headers: expect.objectContaining({ Accept: "application/json" }),
       }),
@@ -205,10 +209,10 @@ describe("useAllTasks", () => {
       counts: firstPage.counts,
     };
     const fetchMock = vi.fn().mockImplementation((url: string) => {
-      if (url === "/tasks?status=done&limit=1") {
+      if (url === "/api/workflows/runtime/submissions?status=done&limit=1") {
         return Promise.resolve(new Response(JSON.stringify(firstPage), { status: 200 }));
       }
-      if (url === "/tasks?status=done&limit=1&cursor=cursor-2") {
+      if (url === "/api/workflows/runtime/submissions?status=done&limit=1&cursor=cursor-2") {
         return Promise.resolve(new Response(JSON.stringify(secondPage), { status: 200 }));
       }
       return Promise.resolve(new Response("not found", { status: 404 }));
@@ -229,7 +233,7 @@ describe("useAllTasks", () => {
 // ── useTaskDetail ─────────────────────────────────────────────────────────────
 
 describe("useTaskDetail", () => {
-  it("fetches /tasks/{id} and returns FullTask shape", async () => {
+  it("fetches a workflow runtime submission detail", async () => {
     const task = { id: "t1", status: "implementing", task_kind: "issue", rounds: [] };
     global.fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify(task), { status: 200 }),

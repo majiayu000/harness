@@ -54,6 +54,8 @@ mod runtime_jobs;
 mod runtime_usage;
 #[path = "store/submission_commit.rs"]
 mod submission_commit;
+#[path = "store/submission_instances.rs"]
+mod submission_instances;
 #[path = "store/transaction_helpers.rs"]
 mod transaction_helpers;
 pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};

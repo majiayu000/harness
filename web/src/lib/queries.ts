@@ -70,14 +70,13 @@ function taskListPath(params: TaskListParams): string {
     query.set(key, String(value));
   }
   const suffix = query.toString();
-  return suffix ? `/tasks?${suffix}` : "/tasks";
+  const base = "/api/workflows/runtime/submissions";
+  return suffix ? `${base}?${suffix}` : base;
 }
 
 export function useTasks(params: TaskListParams = { active: true, limit: 200 }) {
   return useQuery<TaskListResponse, Error>({
     queryKey: ["tasks", params],
-    // Task list/detail/stream routes are exposed at `/tasks`; only aggregate
-    // dashboard endpoints are mounted under `/api/*`.
     queryFn: ({ signal }) => apiJson<TaskListResponse>(taskListPath(params), { signal }),
   });
 }
@@ -140,7 +139,8 @@ export function useWorkflowRuntimeTree(projectId?: string | null) {
 export function useTaskDetail(id: string | null) {
   return useQuery<FullTask, Error>({
     queryKey: ["task", id],
-    queryFn: ({ signal }) => apiJson<FullTask>(`/tasks/${id}`, { signal }),
+    queryFn: ({ signal }) =>
+      apiJson<FullTask>(`/api/workflows/runtime/submissions/${id}`, { signal }),
     enabled: !!id,
   });
 }
@@ -163,7 +163,7 @@ export function useTaskStream(
 
     (async () => {
       try {
-        const resp = await apiFetch(`/tasks/${id}/stream`, {
+        const resp = await apiFetch(`/api/workflows/runtime/submissions/${id}/stream`, {
           signal: controller.signal,
           headers: { Accept: "text/event-stream" },
         });
@@ -209,14 +209,6 @@ export function useTaskStream(
 
     return () => controller.abort();
   }, [id]);
-}
-
-export function useCancelTask() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (id: string) => apiFetch(`/tasks/${id}/cancel`, { method: "POST" }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["tasks"] }),
-  });
 }
 
 export function useCancelWorkflowRuntime() {

@@ -1050,6 +1050,206 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let legacy_task_id = task_runner::TaskId::from_str("legacy-only-task");
+    state
+        .core
+        .tasks
+        .insert(&task_runner::TaskState::new(legacy_task_id.clone()))
+        .await;
+
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions).post(task_routes::create_task),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/artifacts",
+            get(runtime_submission_routes::get_artifacts),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/prompts",
+            get(runtime_submission_routes::get_prompts),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/proof",
+            get(task_query_routes::get_runtime_submission_proof),
+        )
+        .with_state(state.clone());
+
+    let request_body = serde_json::json!({
+        "project": project_root.display().to_string(),
+        "prompt": "exercise runtime-only submission routes",
+        "source": "dashboard",
+        "external_id": "manual:runtime-route-test"
+    });
+    let create_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/submissions")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body.to_string()))?,
+        )
+        .await?;
+    assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+    let created = response_json(create_response).await?;
+    assert_eq!(created["execution_path"], "workflow_runtime");
+    let submission_id = created["submission_id"]
+        .as_str()
+        .expect("runtime submission should expose a stable handle")
+        .to_string();
+    let declarative_submission_id = "declarative-submission-handle";
+    let declarative = WorkflowInstance::new(
+        "custom_dashboard_flow",
+        1,
+        "running",
+        WorkflowSubject::new("prompt", "custom-dashboard-flow"),
+    )
+    .with_id("custom-dashboard-flow-instance")
+    .with_data(serde_json::json!({
+        "project_id": project_root.canonicalize()?.to_string_lossy(),
+        "submission_id": declarative_submission_id,
+        "definition_hash": "sha256:declarative-test-definition@1",
+        "prompt_summary": "custom declarative submission"
+    }));
+    state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured")
+        .upsert_instance(&declarative)
+        .await?;
+
+    let list_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/submissions")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let listed = response_json(list_response).await?;
+    let listed_ids = listed["data"]
+        .as_array()
+        .expect("runtime submission list should be an array")
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(listed_ids.contains(&submission_id.as_str()));
+    assert!(listed_ids.contains(&declarative_submission_id));
+    assert!(!listed_ids.contains(&legacy_task_id.as_str()));
+
+    let declarative_detail_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{declarative_submission_id}"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(declarative_detail_response.status(), StatusCode::OK);
+    let declarative_detail = response_json(declarative_detail_response).await?;
+    assert_eq!(declarative_detail["task_kind"], "prompt");
+    assert_eq!(declarative_detail["execution_path"], "workflow_runtime");
+
+    let detail_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{submission_id}"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail = response_json(detail_response).await?;
+    assert_eq!(detail["submission_id"], submission_id);
+    assert_eq!(detail["execution_path"], "workflow_runtime");
+
+    let legacy_detail_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{}",
+                    legacy_task_id.as_str()
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(legacy_detail_response.status(), StatusCode::NOT_FOUND);
+
+    let prompts_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{submission_id}/prompts"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(prompts_response.status(), StatusCode::OK);
+    let prompts = response_json(prompts_response).await?;
+    assert_eq!(
+        prompts[0]["prompt"],
+        "exercise runtime-only submission routes"
+    );
+
+    let artifacts_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{submission_id}/artifacts"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(artifacts_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(artifacts_response).await?,
+        serde_json::json!([])
+    );
+
+    let proof_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{submission_id}/proof"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(proof_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_tasks_paginates_past_runtime_only_second_page() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

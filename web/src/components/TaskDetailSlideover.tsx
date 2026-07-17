@@ -44,13 +44,15 @@ export function TaskDetailSlideover({ taskId, onClose }: Props) {
 
   const { data: artifacts, isError: isArtifactsError } = useQuery({
     queryKey: ["task-artifacts", taskId],
-    queryFn: ({ signal }) => apiJson<TaskArtifact[]>(`/tasks/${taskId}/artifacts`, { signal }),
+    queryFn: ({ signal }) =>
+      apiJson<TaskArtifact[]>(`/api/workflows/runtime/submissions/${taskId}/artifacts`, { signal }),
     enabled: !!taskId && (activeTab === "artifacts" || isTaskTerminal),
   });
 
   const { data: prompts, isError: isPromptsError } = useQuery({
     queryKey: ["task-prompts", taskId],
-    queryFn: ({ signal }) => apiJson<TaskPrompt[]>(`/tasks/${taskId}/prompts`, { signal }),
+    queryFn: ({ signal }) =>
+      apiJson<TaskPrompt[]>(`/api/workflows/runtime/submissions/${taskId}/prompts`, { signal }),
     enabled: !!taskId && (activeTab === "prompts" || isTaskTerminal),
   });
 

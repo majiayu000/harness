@@ -446,7 +446,7 @@ function TaskCard({
           {task.pr_url.replace(/^https:\/\/github\.com\//, "")}
         </a>
       )}
-      {workflow?.state === "ready_to_merge" && onMerge && (
+      {workflow?.state === "ready_to_merge" && runtimeMergeWorkflowId(workflow) && onMerge && (
         <button
           type="button"
           disabled={merging}
@@ -485,7 +485,7 @@ export function Active({ projectFilter }: Props) {
           body: JSON.stringify({ workflow_id: runtimeWorkflowId }),
         });
       } else {
-        await apiFetch(`/tasks/${taskId}/merge`, { method: "POST" });
+        throw new Error("Workflow runtime id unavailable; merge was not sent");
       }
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["workflow-runtime-tree"] });
