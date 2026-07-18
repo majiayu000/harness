@@ -55,11 +55,10 @@ async fn local_review_gate_runtime_reconciliation_marks_merged_pr_done() -> anyh
     }));
     stores.runtime_store.upsert_instance(&instance).await?;
 
-    let report = run_once_with_runtime_token(
-        &stores.task_store,
+    let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),
         Some(&stores.issue_store),
-        20,
+        &runtime_config(),
         false,
         None,
     )

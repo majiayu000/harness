@@ -1,8 +1,6 @@
 use super::*;
-use crate::task_runner::TaskState;
-use harness_core::types::TaskId;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 #[path = "reconciliation_blocked_done_tests.rs"]
@@ -11,20 +9,6 @@ mod blocked_done_tests;
 mod local_review_gate_tests;
 #[path = "reconciliation_ready_to_merge_tests.rs"]
 mod ready_to_merge_tests;
-
-fn make_task(
-    id: &str,
-    status: TaskStatus,
-    pr_url: Option<&str>,
-    external_id: Option<&str>,
-) -> TaskState {
-    let tid = TaskId(id.to_string());
-    let mut task = TaskState::new(tid);
-    task.status = status;
-    task.pr_url = pr_url.map(|s| s.to_string());
-    task.external_id = external_id.map(|s| s.to_string());
-    task
-}
 
 fn async_env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -103,19 +87,8 @@ async fn github_state_server(routes: Vec<(&'static str, &'static str)>) -> Strin
     format!("http://{addr}")
 }
 
-fn write_git_remote_config(path: &std::path::Path, origin: &str) {
-    let dotgit = path.join(".git");
-    std::fs::create_dir_all(&dotgit).expect("create .git");
-    std::fs::write(
-        dotgit.join("config"),
-        format!("[remote \"origin\"]\n\turl = {origin}\n"),
-    )
-    .expect("write git config");
-}
-
 struct RuntimeStores {
     dir: tempfile::TempDir,
-    task_store: Arc<TaskStore>,
     runtime_store: WorkflowRuntimeStore,
     issue_store: IssueWorkflowStore,
 }
@@ -123,11 +96,6 @@ struct RuntimeStores {
 async fn open_runtime_stores() -> anyhow::Result<Option<RuntimeStores>> {
     let database_url = crate::test_helpers::test_database_url()?;
     let dir = tempfile::tempdir()?;
-    let task_store = match TaskStore::open(&dir.path().join("tasks.db")).await {
-        Ok(store) => store,
-        Err(err) if crate::test_helpers::is_pool_timeout(&err) => return Ok(None),
-        Err(err) => return Err(err),
-    };
     let runtime_store = match WorkflowRuntimeStore::open_with_database_url(
         &dir.path().join("runtime"),
         Some(&database_url),
@@ -150,7 +118,6 @@ async fn open_runtime_stores() -> anyhow::Result<Option<RuntimeStores>> {
     };
     Ok(Some(RuntimeStores {
         dir,
-        task_store,
         runtime_store,
         issue_store,
     }))
@@ -163,6 +130,13 @@ fn ready_to_merge_config(min_age_secs: u64, alert_ttl_secs: u64) -> Reconciliati
         max_gh_calls_per_minute: 20,
         ready_to_merge_min_age_secs: min_age_secs,
         ready_to_merge_alert_ttl_secs: alert_ttl_secs,
+    }
+}
+
+fn runtime_config() -> ReconciliationConfig {
+    ReconciliationConfig {
+        max_gh_calls_per_minute: 20,
+        ..ReconciliationConfig::default()
     }
 }
 
@@ -284,125 +258,6 @@ fn parse_external_id_handles_issue_pr_and_none() {
 }
 
 #[test]
-fn candidate_from_task_skips_terminal() {
-    let mut t = make_task(
-        "x",
-        TaskStatus::Done,
-        Some("https://github.com/a/b/pull/1"),
-        None,
-    );
-    assert!(candidate_from_task(&t).is_none());
-    t.status = TaskStatus::Cancelled;
-    assert!(candidate_from_task(&t).is_none());
-}
-
-#[test]
-fn candidate_from_task_handles_references() {
-    let t = make_task("x", TaskStatus::Implementing, None, None);
-    assert!(candidate_from_task(&t).is_none());
-
-    let t = make_task(
-        "x",
-        TaskStatus::Implementing,
-        Some("https://github.com/a/b/pull/2"),
-        None,
-    );
-    let c = candidate_from_task(&t).unwrap();
-    assert!(c.pr_url.is_some());
-    assert_eq!(c.issue_num, None);
-
-    let mut t = make_task("x", TaskStatus::Pending, None, Some("issue:9"));
-    t.project_root = Some(PathBuf::from("/tmp/projects/alpha"));
-    let c = candidate_from_task(&t).unwrap();
-    assert_eq!(c.project_root, Some(PathBuf::from("/tmp/projects/alpha")));
-
-    let t = make_task("x", TaskStatus::Pending, None, Some("issue:9"));
-    let c = candidate_from_task(&t).unwrap();
-    assert_eq!(c.issue_num, Some(9));
-    assert!(c.pr_url.is_none());
-}
-
-#[tokio::test]
-async fn resolve_repo_slug_uses_candidate_project_root_when_repo_missing() {
-    let repo_a = tempfile::tempdir().expect("repo a tempdir");
-    let repo_b = tempfile::tempdir().expect("repo b tempdir");
-    write_git_remote_config(repo_a.path(), "https://github.com/example/repo-a.git");
-    write_git_remote_config(repo_b.path(), "https://github.com/example/repo-b.git");
-    assert_eq!(
-        crate::workflow_runtime_pr_feedback::pr_detection::detect_repo_slug(repo_a.path()).await,
-        Some("example/repo-a".to_string())
-    );
-
-    let candidate = Candidate {
-        id: TaskId("task-1".to_string()),
-        pr_url: None,
-        repo: None,
-        project_root: Some(repo_b.path().to_path_buf()),
-        issue_num: Some(9),
-        pr_num_from_ext: None,
-    };
-
-    let mut cache = HashMap::new();
-    let repo_slug = reconciliation_legacy::resolve_repo_slug(&candidate, &mut cache).await;
-    assert_eq!(repo_slug, Some("example/repo-b".to_string()));
-}
-
-#[tokio::test]
-async fn run_once_uses_each_task_project_root_when_repo_is_missing() {
-    let _env_guard = async_env_lock().lock().await;
-    if !crate::test_helpers::db_tests_enabled().await {
-        return;
-    }
-    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
-    let repo_a = tempfile::tempdir().expect("repo a tempdir");
-    let repo_b = tempfile::tempdir().expect("repo b tempdir");
-    write_git_remote_config(repo_a.path(), "https://github.com/example/repo-a.git");
-    write_git_remote_config(repo_b.path(), "https://github.com/example/repo-b.git");
-
-    let api_base = github_state_server(vec![
-        ("/repos/example/repo-a/issues/9", r#"{"state":"open"}"#),
-        ("/repos/example/repo-a/issues/41", r#"{"state":"open"}"#),
-        ("/repos/example/repo-b/issues/9", r#"{"state":"closed"}"#),
-    ])
-    .await;
-    let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
-
-    let dir = tempfile::tempdir().expect("task store tempdir");
-    let store = match TaskStore::open(&dir.path().join("tasks.db")).await {
-        Ok(store) => store,
-        Err(err) if crate::test_helpers::is_pool_timeout(&err) => return,
-        Err(err) => panic!("open task store: {err}"),
-    };
-
-    let mut repo_task = make_task("repo-task", TaskStatus::Pending, None, Some("issue:41"));
-    repo_task.repo = Some("example/repo-a".to_string());
-    repo_task.project_root = Some(repo_a.path().to_path_buf());
-    store.insert(&repo_task).await;
-
-    let mut repo_less_task =
-        make_task("repo-less-task", TaskStatus::Pending, None, Some("issue:9"));
-    repo_less_task.project_root = Some(repo_b.path().to_path_buf());
-    store.insert(&repo_less_task).await;
-
-    let report = run_once(&store, 20, false).await;
-
-    assert_eq!(report.transitions.len(), 1);
-    assert_eq!(report.transitions[0].task_id, repo_less_task.id.0);
-    assert_eq!(
-        report.transitions[0].reason,
-        "reconciled: issue closed before PR"
-    );
-
-    let repo_task_after = store.get(&repo_task.id).expect("repo task remains");
-    assert_eq!(repo_task_after.status, TaskStatus::Pending);
-
-    let repo_less_after = store
-        .get(&repo_less_task.id)
-        .expect("repo-less task remains");
-    assert_eq!(repo_less_after.status, TaskStatus::Cancelled);
-}
-
-#[test]
 fn classify_pr_state_handles_merged_and_closed() {
     assert_eq!(
         classify_pr_state(&GitHubPullState {
@@ -434,19 +289,6 @@ fn classify_issue_state_handles_open_and_closed() {
         }),
         GitHubState::IssueClosed
     );
-}
-
-#[test]
-fn transition_mapping_matches_external_states() {
-    assert_eq!(
-        transition_for_github_state(GitHubState::PrMerged),
-        Some((TaskStatus::Done, "reconciled: PR merged externally"))
-    );
-    assert_eq!(
-        transition_for_github_state(GitHubState::PrClosed),
-        Some((TaskStatus::Cancelled, "reconciled: PR closed externally"))
-    );
-    assert_eq!(transition_for_github_state(GitHubState::Open), None);
 }
 
 #[test]
@@ -563,11 +405,10 @@ async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> 
     }));
     stores.runtime_store.upsert_instance(&instance).await?;
 
-    let report = run_once_with_runtime_token(
-        &stores.task_store,
+    let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),
         Some(&stores.issue_store),
-        20,
+        &runtime_config(),
         false,
         None,
     )
@@ -649,11 +490,10 @@ async fn run_once_reconciles_runtime_closed_pr_workflow() -> anyhow::Result<()> 
     }));
     stores.runtime_store.upsert_instance(&instance).await?;
 
-    let report = run_once_with_runtime_token(
-        &stores.task_store,
+    let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),
         Some(&stores.issue_store),
-        20,
+        &runtime_config(),
         false,
         None,
     )
@@ -701,7 +541,6 @@ async fn ready_to_merge_reconciliation_waits_for_configured_age() -> anyhow::Res
         persist_ready_to_merge_runtime(&stores, "project-young", 44, "task-3", 99, 120, false)
             .await?;
     let report = run_once_with_runtime_config(
-        &stores.task_store,
         Some(&stores.runtime_store),
         Some(&stores.issue_store),
         &ready_to_merge_config(3600, 7200),
@@ -740,7 +579,6 @@ async fn ready_to_merge_reconciliation_marks_merged_pr_done() -> anyhow::Result<
         persist_ready_to_merge_runtime(&stores, "project-merged", 45, "task-4", 100, 120, true)
             .await?;
     let report = run_once_with_runtime_config(
-        &stores.task_store,
         Some(&stores.runtime_store),
         Some(&stores.issue_store),
         &ready_to_merge_config(0, 3600),
@@ -781,7 +619,6 @@ async fn ready_to_merge_reconciliation_alerts_for_open_pr_after_ttl() -> anyhow:
     };
     persist_ready_to_merge_runtime(&stores, "project-open", 46, "task-5", 101, 120, false).await?;
     let report = run_once_with_runtime_config(
-        &stores.task_store,
         Some(&stores.runtime_store),
         Some(&stores.issue_store),
         &ready_to_merge_config(0, 0),

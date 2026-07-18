@@ -20,7 +20,6 @@ async fn ready_to_merge_reconciliation_marks_closed_unmerged_pr_cancelled() -> a
         persist_ready_to_merge_runtime(&stores, "project-closed", 47, "task-6", 102, 120, true)
             .await?;
     let report = run_once_with_runtime_config(
-        &stores.task_store,
         Some(&stores.runtime_store),
         Some(&stores.issue_store),
         &ready_to_merge_config(0, 3600),

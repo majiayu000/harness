@@ -182,7 +182,6 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // recovery decisions are made on fresh GitHub truth.
     if state.core.server.config.reconciliation.enabled {
         crate::reconciliation::run_once_with_runtime_config(
-            &state.core.tasks,
             state.core.workflow_runtime_store.as_deref(),
             state.core.issue_workflow_store.as_deref(),
             &state.core.server.config.reconciliation,
