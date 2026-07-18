@@ -24,7 +24,10 @@ use crate::runtime_circuit_breaker::{
     classify_agent_failure, CircuitBreakerEvent, CircuitBreakerEventKind, FailureClass,
 };
 use crate::runtime_projection::RuntimeWorkflowProjection;
-use crate::task_runner::{TaskFailureKind, TaskKind, TaskState, TaskStatus};
+use crate::workflow_runtime_submission::{
+    runtime_models::{TaskFailureKind, TaskKind, TaskStatus},
+    runtime_state::TaskState,
+};
 use chrono::Duration;
 use data_helpers::{optional_data_string, optional_data_u64};
 use executor::ServerRuntimeJobExecutor;

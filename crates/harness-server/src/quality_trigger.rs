@@ -1,9 +1,9 @@
 use crate::handlers::cross_review::run_cross_review_with_context;
 use crate::observation_compression::{completion_observation_session, RawObservationSink};
-use crate::task_runner::TaskId;
 use chrono::{Duration as ChronoDuration, Utc};
 use harness_core::agent::CodeAgent;
 use harness_core::config::misc::AutoAdoptPolicy;
+use harness_core::types::TaskId;
 use harness_core::types::{Capability, EventFilters, Grade, Project};
 use harness_gc::gc_agent::GcAgent;
 use harness_observe::event_store::EventStore;

@@ -1,5 +1,5 @@
-use crate::task_runner::TaskId;
 use anyhow::Context;
+use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     RuntimeJob, WorkflowInstance, WorkflowRuntimeStore, PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };

@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::AppState;
-use crate::task_runner::{TaskFailureKind, TaskId, TaskStatus};
+use crate::workflow_runtime_submission::{
+    runtime_models::{TaskFailureKind, TaskId, TaskStatus},
+    CreateTaskRequest, MAX_TASK_PRIORITY,
+};
 
 pub mod binding;
 mod declarative_routing;
@@ -373,13 +376,13 @@ fn fallback_intake_task_request(
     issue: &IncomingIssue,
     source_name: &str,
     default_project_root: std::path::PathBuf,
-) -> crate::task_runner::CreateTaskRequest {
+) -> CreateTaskRequest {
     let priority = issue
         .priority
         .and_then(|priority| u8::try_from(priority).ok())
-        .filter(|priority| *priority <= crate::task_runner::MAX_TASK_PRIORITY)
+        .filter(|priority| *priority <= MAX_TASK_PRIORITY)
         .unwrap_or_default();
-    crate::task_runner::CreateTaskRequest {
+    CreateTaskRequest {
         prompt: Some(build_prompt_from_issue(issue)),
         project: Some(issue.project_root.clone().unwrap_or(default_project_root)),
         source: Some(source_name.to_string()),

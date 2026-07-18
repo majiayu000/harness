@@ -1,6 +1,6 @@
 use crate::http::AppState;
-use crate::task_runner::TaskId;
 use harness_core::config::workflow::WorkflowDocument;
+use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     RuntimeJob, WorkflowCommandRecord, WorkflowCommandStatus, WorkflowInstance,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_GATE_ACTIVITY,

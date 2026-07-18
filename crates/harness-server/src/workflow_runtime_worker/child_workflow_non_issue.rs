@@ -1,5 +1,5 @@
 use crate::http::AppState;
-use crate::task_runner::TaskId;
+use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     build_pr_feedback_inspect_decision, build_quality_gate_run_decision, ActivityArtifact,
     ActivityErrorKind, ActivityResult, DecisionValidator, PrFeedbackInspectDecisionInput,

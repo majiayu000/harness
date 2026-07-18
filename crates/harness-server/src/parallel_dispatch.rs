@@ -1,8 +1,10 @@
-use crate::task_runner::TaskId;
 use crate::workspace::WorkspaceManager;
 use harness_core::{
-    agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, capability::CapabilityToken,
-    types::ContextItem,
+    agent::AgentRequest,
+    agent::AgentResponse,
+    agent::CodeAgent,
+    capability::CapabilityToken,
+    types::{ContextItem, TaskId},
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

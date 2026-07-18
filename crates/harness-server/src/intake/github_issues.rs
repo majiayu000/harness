@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
-use crate::task_runner::TaskId;
+use crate::workflow_runtime_submission::runtime_models::{TaskFailureKind, TaskId};
 
 const GITHUB_ISSUES_MAX_PAGES: usize = 20;
 const DEFAULT_RATE_LIMIT_RETRY_SECS: i64 = 60;
@@ -670,7 +670,7 @@ impl IntakeSource for GitHubIssuesPoller {
             .unwrap_or(false);
         let is_workspace_lifecycle = matches!(
             result.failure_kind,
-            Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle)
+            Some(TaskFailureKind::WorkspaceLifecycle)
         );
         // Remove transient failed or cancelled issues from dispatched so the poller can
         // retry them later if they remain open. Done tasks and permanent failures stay
