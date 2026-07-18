@@ -131,6 +131,9 @@ class Harness:
             turn["started_at"] = detail["created_at"]
         if status != "running" and isinstance(detail.get("updated_at"), str):
             turn["completed_at"] = detail["updated_at"]
+        token_usage = _parse_token_usage(detail.get("token_usage"))
+        if token_usage is not None:
+            turn["token_usage"] = token_usage
         return turn
 
     def _runtime_items(
@@ -384,6 +387,15 @@ def _runtime_status_to_turn_status(status: Any) -> str:
     if status == "cancelled":
         return "cancelled"
     return "running"
+
+
+def _parse_token_usage(value: Any) -> dict[str, int | float] | None:
+    if not isinstance(value, dict):
+        return None
+    fields = ("input_tokens", "output_tokens", "total_tokens", "cost_usd")
+    if any(not isinstance(value.get(field), (int, float)) for field in fields):
+        return None
+    return {field: value[field] for field in fields}
 
 
 def _extract_output(turn: dict[str, Any] | None) -> str:

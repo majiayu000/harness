@@ -26,6 +26,7 @@ pub struct ThreadManager {
     threads: DashMap<String, Thread>,
     running_turn_tasks: DashMap<String, JoinHandle<()>>,
     running_adapters: DashMap<String, Arc<dyn AgentAdapter>>,
+    runtime_turn_aliases: DashMap<String, Vec<TurnId>>,
 }
 
 impl ThreadManager {
@@ -34,6 +35,7 @@ impl ThreadManager {
             threads: DashMap::new(),
             running_turn_tasks: DashMap::new(),
             running_adapters: DashMap::new(),
+            runtime_turn_aliases: DashMap::new(),
         }
     }
 
@@ -386,6 +388,30 @@ impl ThreadManager {
         self.running_adapters.remove(turn_id.as_str());
     }
 
+    pub fn register_runtime_turn_alias(&self, alias: &str, turn_id: &TurnId) {
+        record_usage(UsageProbeSurface::ThreadManager);
+        let mut turn_ids = self
+            .runtime_turn_aliases
+            .entry(alias.to_string())
+            .or_default();
+        if !turn_ids.contains(turn_id) {
+            turn_ids.push(turn_id.clone());
+        }
+    }
+
+    pub fn deregister_runtime_turn_alias(&self, alias: &str, turn_id: &TurnId) {
+        record_usage(UsageProbeSurface::ThreadManager);
+        let remove_alias = if let Some(mut turn_ids) = self.runtime_turn_aliases.get_mut(alias) {
+            turn_ids.retain(|candidate| candidate != turn_id);
+            turn_ids.is_empty()
+        } else {
+            false
+        };
+        if remove_alias {
+            self.runtime_turn_aliases.remove(alias);
+        }
+    }
+
     /// Append a steering instruction to the turn's item list, then forward the
     /// instruction to the live adapter if one is registered for this turn.
     ///
@@ -494,6 +520,56 @@ impl ThreadManager {
                 "no active adapter registered for turn {turn_id}"
             ))),
         }
+    }
+
+    pub async fn respond_approval_on_runtime_handle(
+        &self,
+        handle: &str,
+        request_id: String,
+        decision: ApprovalDecision,
+    ) -> harness_core::error::Result<()> {
+        let direct_turn_id = TurnId::from_str(handle);
+        if self.find_thread_for_turn(&direct_turn_id).is_some() {
+            return self
+                .respond_approval_on_turn(&direct_turn_id, request_id, decision)
+                .await;
+        }
+
+        let candidates = self
+            .runtime_turn_aliases
+            .get(handle)
+            .map(|turn_ids| turn_ids.clone())
+            .unwrap_or_default();
+        let matching = candidates
+            .iter()
+            .filter(|turn_id| {
+                self.find_thread_and_turn(turn_id).is_some_and(|(_, turn)| {
+                    turn.items.iter().any(|item| {
+                        matches!(
+                            item,
+                            Item::ApprovalRequest { id: Some(id), .. } if id == &request_id
+                        )
+                    })
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let turn_id = match matching.as_slice() {
+            [turn_id] => turn_id.clone(),
+            [] if candidates.len() == 1 => candidates[0].clone(),
+            [] if candidates.is_empty() => {
+                return Err(harness_core::error::HarnessError::TurnNotFound(
+                    handle.to_string(),
+                ));
+            }
+            _ => {
+                return Err(harness_core::error::HarnessError::Unsupported(format!(
+                    "approval request {request_id} is ambiguous for runtime submission {handle}"
+                )));
+            }
+        };
+        self.respond_approval_on_turn(&turn_id, request_id, decision)
+            .await
     }
 }
 

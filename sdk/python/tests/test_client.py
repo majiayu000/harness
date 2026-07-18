@@ -32,6 +32,12 @@ class FakeRuntime:
                 "project": "/repo",
                 "created_at": "2026-07-18T00:00:00Z",
                 "updated_at": "2026-07-18T00:00:01Z",
+                "token_usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 30,
+                    "total_tokens": 150,
+                    "cost_usd": 0.02,
+                },
             }
         if path == "/api/workflows/runtime/submissions/submission-1/artifacts":
             return [
@@ -87,6 +93,20 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertFalse(result.timed_out)
         self.assertTrue(
             any(event["method"] == "sdk:turn/completed" for event in result.events)
+        )
+        completed = next(
+            event
+            for event in result.events
+            if event["method"] == "sdk:turn/completed"
+        )
+        self.assertEqual(
+            completed["params"]["token_usage"],
+            {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "total_tokens": 150,
+                "cost_usd": 0.02,
+            },
         )
         self.assertEqual(emitted, result.events)
         self.assertEqual(

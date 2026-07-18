@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use harness_core::{agent::ApprovalDecision, types::TurnId};
+use harness_core::agent::ApprovalDecision;
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -44,7 +44,7 @@ pub(super) async fn respond_to_approval_with_manager(
     }
 
     match thread_manager
-        .respond_approval_on_turn(&TurnId::from_str(&turn_id), request_id, decision)
+        .respond_approval_on_runtime_handle(&turn_id, request_id, decision)
         .await
     {
         Ok(()) => Json(ApprovalResponse { accepted: true }).into_response(),

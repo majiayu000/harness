@@ -295,7 +295,7 @@ function parseTurnItem(value: unknown): TurnItem | undefined {
   }
 }
 
-function parseTokenUsage(value: unknown): TokenUsage | undefined {
+export function parseTokenUsage(value: unknown): TokenUsage | undefined {
   if (!isRecord(value)) {
     return undefined;
   }

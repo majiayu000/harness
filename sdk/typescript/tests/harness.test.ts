@@ -94,6 +94,12 @@ test("run submits and polls a workflow-runtime prompt", async () => {
           project: "/repo",
           created_at: "2026-07-18T00:00:00Z",
           updated_at: "2026-07-18T00:00:01Z",
+          token_usage: {
+            input_tokens: 120,
+            output_tokens: 30,
+            total_tokens: 150,
+            cost_usd: 0.02,
+          },
         },
       };
     }
@@ -130,6 +136,13 @@ test("run submits and polls a workflow-runtime prompt", async () => {
   assert.equal(result.output, "Repository analyzed.");
   assert.equal(result.timedOut, false);
   assert.ok(result.events.some((event) => event.method === SDK_TURN_COMPLETED));
+  const completed = result.events.find((event) => event.method === SDK_TURN_COMPLETED);
+  assert.deepEqual(completed?.params.token_usage, {
+    input_tokens: 120,
+    output_tokens: 30,
+    total_tokens: 150,
+    cost_usd: 0.02,
+  });
   assert.equal(emitted.length, result.events.length);
   assert.deepEqual(mock.calls[0]?.body, {
     project: "/repo",

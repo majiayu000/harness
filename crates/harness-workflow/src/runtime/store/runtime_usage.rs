@@ -196,6 +196,40 @@ impl WorkflowRuntimeStore {
             .map(runtime_usage_record_from_row)
             .collect()
     }
+
+    pub async fn runtime_usage_for_workflow(
+        &self,
+        workflow_id: &str,
+    ) -> anyhow::Result<Option<RuntimeUsageMetrics>> {
+        let row: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                COUNT(*)::BIGINT,
+                COALESCE(SUM(input_tokens), 0)::BIGINT,
+                COALESCE(SUM(output_tokens), 0)::BIGINT,
+                COALESCE(SUM(cache_read_input_tokens), 0)::BIGINT,
+                COALESCE(SUM(cache_creation_input_tokens), 0)::BIGINT,
+                COALESCE(SUM(GREATEST(
+                    COALESCE(reported_total_tokens, 0),
+                    input_tokens + output_tokens
+                        + cache_read_input_tokens + cache_creation_input_tokens
+                )), 0)::BIGINT
+             FROM runtime_usage_events
+             WHERE workflow_id = $1",
+        )
+        .bind(workflow_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if row.0 == 0 {
+            return Ok(None);
+        }
+        Ok(Some(RuntimeUsageMetrics {
+            input_tokens: i64_to_u64(row.1, "input_tokens")?,
+            output_tokens: i64_to_u64(row.2, "output_tokens")?,
+            cache_read_input_tokens: i64_to_u64(row.3, "cache_read_input_tokens")?,
+            cache_creation_input_tokens: i64_to_u64(row.4, "cache_creation_input_tokens")?,
+            reported_total_tokens: Some(i64_to_u64(row.5, "reported_total_tokens")?),
+        }))
+    }
 }
 
 fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<RuntimeUsageRecord> {

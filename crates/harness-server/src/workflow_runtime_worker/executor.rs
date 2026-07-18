@@ -4,7 +4,7 @@ use harness_core::agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV}
 use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
 use harness_core::types::AgentId;
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, RuntimeKind, RuntimeProfile,
+    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, RuntimeProfile,
     WorkflowInstance,
 };
 use serde_json::{json, Value};
@@ -33,6 +33,7 @@ use super::runtime_profile::{
     agent_name_for_runtime_kind, runtime_profile_approval_policy, runtime_profile_for_job,
     runtime_profile_sandbox_mode,
 };
+use super::runtime_turn_control::{force_code_agent_for_runtime_turn, RuntimeTurnAliasGuard};
 use super::runtime_usage::runtime_usage_context;
 use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
 use super::turn_engine::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
@@ -156,6 +157,20 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 prompt.clone(),
                 AgentId::from_str(agent_name),
             )?;
+            let _runtime_turn_alias_guard = workflow
+                .as_ref()
+                .and_then(|workflow| {
+                    crate::workflow_runtime_submission::runtime_issue_task_handle(workflow)
+                })
+                .map(|submission_id| {
+                    RuntimeTurnAliasGuard::register(
+                        self.state.core.server.clone(),
+                        submission_id.0,
+                        turn_id.clone(),
+                    )
+                });
+            let force_code_agent =
+                force_code_agent_for_runtime_turn(job.runtime_kind, approval_policy.as_deref());
             run_turn_lifecycle_with_options(
                 self.state.core.server.clone(),
                 self.state.notifications.notify_tx.clone(),
@@ -173,18 +188,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     timeout_secs: runtime_profile.timeout_secs,
                     stall_timeout_secs: None,
                     env_vars: isolation_spawn_env_vars(&job),
-                    // Always drive Codex turns through the `codex exec` CLI rather
-                    // than the persistent `codex app-server` JSON-RPC adapter. The
-                    // app-server holds one long-lived connection per turn, which is
-                    // dropped mid-stream on long (xhigh, 100+ item) turns and surfaces
-                    // as "Reconnecting... N/5" failures; `codex exec` opens a fresh
-                    // short-lived connection per turn and does not hit this. Both
-                    // Codex runtime kinds (exec and the legacy jsonrpc label) now
-                    // resolve to the CLI exec path.
-                    force_code_agent: matches!(
-                        job.runtime_kind,
-                        RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
-                    ),
+                    // Prefer the stable `codex exec` path for non-interactive turns.
+                    // Approval-gated turns use the app-server adapter because it owns
+                    // the live approval response channel.
+                    force_code_agent,
                     runtime_usage: runtime_usage_context(
                         self.state,
                         &job,

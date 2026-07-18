@@ -1,4 +1,4 @@
-import { HarnessThread } from "./thread";
+import { HarnessThread, parseTokenUsage } from "./thread";
 import { HttpTransport } from "./transport";
 import { HarnessHttpError } from "./errors";
 import type {
@@ -23,6 +23,7 @@ interface RuntimeSubmissionDetail {
   error?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  token_usage?: unknown;
 }
 
 interface RuntimeArtifact {
@@ -88,11 +89,13 @@ export class Harness {
     }
     const status = runtimeStatusToTurnStatus(detail.status);
     const items = await this.runtimeItems(turnId, status, detail.error);
+    const tokenUsage = parseTokenUsage(detail.token_usage);
     return {
       id: detail.submission_id || turnId,
       thread_id: detail.project || project || "",
       status,
       items,
+      ...(tokenUsage ? { token_usage: tokenUsage } : {}),
       ...(detail.created_at ? { started_at: detail.created_at } : {}),
       ...(status !== "running" && detail.updated_at
         ? { completed_at: detail.updated_at }

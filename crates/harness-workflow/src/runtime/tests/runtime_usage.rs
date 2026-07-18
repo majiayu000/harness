@@ -59,6 +59,51 @@ async fn runtime_usage_upsert_replaces_cumulative_turn_usage() -> anyhow::Result
     Ok(())
 }
 
+#[tokio::test]
+async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let first = runtime_usage_upsert(RuntimeUsageMetrics {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 2,
+        cache_creation_input_tokens: 0,
+        reported_total_tokens: Some(17),
+    });
+    let mut second = first.clone();
+    second.runtime_job_id = "runtime-job-2".to_string();
+    second.turn_id = Some("turn-2".to_string());
+    second.metrics = RuntimeUsageMetrics {
+        input_tokens: 20,
+        output_tokens: 7,
+        cache_read_input_tokens: 3,
+        cache_creation_input_tokens: 1,
+        reported_total_tokens: Some(31),
+    };
+
+    store.upsert_runtime_usage(&first).await?;
+    store.upsert_runtime_usage(&second).await?;
+    let usage = store
+        .runtime_usage_for_workflow("workflow-1")
+        .await?
+        .expect("workflow usage should exist");
+
+    assert_eq!(usage.input_tokens, 30);
+    assert_eq!(usage.output_tokens, 12);
+    assert_eq!(usage.cache_read_input_tokens, 5);
+    assert_eq!(usage.cache_creation_input_tokens, 1);
+    assert_eq!(usage.total_tokens(), 48);
+    assert!(store
+        .runtime_usage_for_workflow("missing-workflow")
+        .await?
+        .is_none());
+    Ok(())
+}
+
 fn runtime_usage_upsert(metrics: RuntimeUsageMetrics) -> RuntimeUsageUpsert {
     RuntimeUsageUpsert {
         runtime_job_id: "runtime-job-1".to_string(),
