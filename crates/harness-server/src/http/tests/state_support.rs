@@ -244,7 +244,8 @@ pub(super) async fn make_test_state_with(
     config: harness_core::config::HarnessConfig,
     agent_registry: harness_agents::registry::AgentRegistry,
 ) -> anyhow::Result<Arc<AppState>> {
-    make_test_state_with_project_root(dir, dir, config, agent_registry).await
+    make_test_state_with_workflow_runtime_config_and_registry(dir, dir, config, agent_registry)
+        .await
 }
 
 pub(super) async fn make_test_state_with_project_root(
@@ -403,80 +404,6 @@ pub(super) async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<Arc
     .await
 }
 
-pub(super) async fn make_test_state_with_issue_workflows(
-    dir: &std::path::Path,
-) -> anyhow::Result<Arc<AppState>> {
-    let state = make_test_state(dir).await?;
-    let workflow_store = harness_workflow::issue_lifecycle::IssueWorkflowStore::open(
-        &harness_core::config::dirs::default_db_path(dir, "issue_workflows"),
-    )
-    .await?;
-    Ok(Arc::new(AppState {
-        core: crate::http::CoreServices {
-            server: state.core.server.clone(),
-            project_root: state.core.project_root.clone(),
-            home_dir: state.core.home_dir.clone(),
-            tasks: state.core.tasks.clone(),
-            plan_db: None,
-            plan_cache: state.core.plan_cache.clone(),
-            issue_workflow_store: Some(Arc::new(workflow_store)),
-            project_workflow_store: None,
-            workflow_runtime_store: None,
-            project_registry: None,
-            runtime_state_store: None,
-            maintenance_active: state.core.maintenance_active.clone(),
-        },
-        engines: crate::http::EngineServices {
-            skills: state.engines.skills.clone(),
-            rules: state.engines.rules.clone(),
-            gc_agent: state.engines.gc_agent.clone(),
-        },
-        observability: crate::http::ObservabilityServices {
-            alerts: crate::alerting::AlertHandle::disabled(),
-            events: state.observability.events.clone(),
-            signal_rate_limiter: state.observability.signal_rate_limiter.clone(),
-            password_reset_rate_limiter: state.observability.password_reset_rate_limiter.clone(),
-        },
-        concurrency: crate::http::ConcurrencyServices {
-            task_queue: state.concurrency.task_queue.clone(),
-            review_task_queue: state.concurrency.review_task_queue.clone(),
-            workspace_mgr: None,
-        },
-        #[cfg(test)]
-        _db_state_guard: None,
-        runtime_hosts: state.runtime_hosts.clone(),
-        runtime_project_cache: state.runtime_project_cache.clone(),
-        postgres_catalog: state.postgres_catalog.clone(),
-        isolation_availability: state.isolation_availability.clone(),
-        runtime_state_persist_lock: tokio::sync::Mutex::new(()),
-        runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
-        runtime_circuit_breakers: state.runtime_circuit_breakers.clone(),
-        notifications: crate::http::NotificationServices {
-            notification_tx: tokio::sync::broadcast::channel(32).0,
-            notification_lagged_total: Arc::new(AtomicU64::new(0)),
-            notification_lag_log_every: 1,
-            notify_tx: None,
-            initializing: Arc::new(AtomicBool::new(true)),
-            initialized: Arc::new(AtomicBool::new(true)),
-            ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
-        },
-        interceptors: vec![],
-        startup_statuses: vec![],
-        degraded_subsystems: vec![],
-        intake: crate::http::IntakeServices {
-            feishu_intake: None,
-            github_pollers: vec![],
-            github_poller_repos: vec![],
-            completion_callback: None,
-            token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
-            intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
-        },
-        project_svc: state.project_svc.clone(),
-        task_svc: state.task_svc.clone(),
-        execution_svc: state.execution_svc.clone(),
-    }))
-}
-
 pub(super) async fn make_test_state_with_workflow_runtime(
     dir: &std::path::Path,
 ) -> anyhow::Result<Arc<AppState>> {
@@ -576,12 +503,12 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
-            feishu_intake: None,
-            github_pollers: vec![],
-            github_poller_repos: vec![],
-            completion_callback: None,
-            token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
-            intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
+            feishu_intake: state.intake.feishu_intake.clone(),
+            github_pollers: state.intake.github_pollers.clone(),
+            github_poller_repos: state.intake.github_poller_repos.clone(),
+            completion_callback: state.intake.completion_callback.clone(),
+            token_dispatch_counters: state.intake.token_dispatch_counters.clone(),
+            intake_bindings: state.intake.intake_bindings.clone(),
         },
         project_svc: state.project_svc.clone(),
         task_svc: state.task_svc.clone(),

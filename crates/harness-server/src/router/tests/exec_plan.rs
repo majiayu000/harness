@@ -1,4 +1,7 @@
 use super::*;
+use crate::{server::HarnessServer, thread_manager::ThreadManager};
+use harness_core::config::HarnessConfig;
+use tokio::sync::RwLock;
 
 async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<AppState> {
     let server = Arc::new(HarnessServer::new(

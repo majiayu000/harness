@@ -274,28 +274,33 @@ pub async fn gc_adopt(
                     state,
                     "gc_adopt",
                     Decision::Complete,
-                    Some(format!("draft={} task_id=none", draft_id)),
+                    Some(format!("draft={} submission_id=none", draft_id)),
                     Some("adopted_without_pr".to_string()),
                 )
                 .await;
                 return RpcResponse::success(
                     id,
-                    serde_json::json!({ "adopted": true, "task_id": null }),
+                    serde_json::json!({
+                        "adopted": true,
+                        "submission_id": null,
+                        "workflow_id": null,
+                    }),
                 );
             }
             let dispatch_result = if let Some(req) = task_dispatch_plan {
-                state
-                    .execution_svc
-                    .enqueue(req)
-                    .await
-                    .map(|task_id| Some(task_id.0))
-                    .map_err(|error| error.to_string())
+                match state.execution_svc.enqueue(req).await {
+                    Ok(task_id) => crate::http::task_routes::task_response_details(state, &task_id)
+                        .await
+                        .map(|details| Some((details.submission_id, details.workflow_id)))
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
             } else {
                 Ok(None)
             };
 
-            let (task_id, dispatch_error) = match dispatch_result {
-                Ok(task_id) => (task_id, None),
+            let (submission, dispatch_error) = match dispatch_result {
+                Ok(submission) => (submission, None),
                 Err(err) => (None, Some(err)),
             };
             let decision = if dispatch_error.is_some() {
@@ -308,9 +313,12 @@ pub async fn gc_adopt(
                 "gc_adopt",
                 decision,
                 Some(format!(
-                    "draft={} task_id={}{}",
+                    "draft={} submission_id={}{}",
                     draft_id,
-                    task_id.as_deref().unwrap_or("none"),
+                    submission
+                        .as_ref()
+                        .map(|(submission_id, _)| submission_id.as_str())
+                        .unwrap_or("none"),
                     dispatch_error
                         .as_ref()
                         .map(|e| format!(" dispatch_error={e}"))
@@ -323,8 +331,9 @@ pub async fn gc_adopt(
                 id,
                 serde_json::json!({
                     "adopted": true,
-                    "task_id": task_id,
-                    "task_dispatch_error": dispatch_error
+                    "submission_id": submission.as_ref().map(|(submission_id, _)| submission_id),
+                    "workflow_id": submission.as_ref().map(|(_, workflow_id)| workflow_id),
+                    "submission_dispatch_error": dispatch_error
                 }),
             )
         }

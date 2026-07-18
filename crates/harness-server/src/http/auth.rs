@@ -266,8 +266,7 @@ pub(crate) async fn api_auth_middleware(
         .map(str::to_string)
         .or_else(|| {
             let is_sse_stream = path.ends_with("/stream")
-                && (path.starts_with("/tasks/")
-                    || path.starts_with("/api/workflows/runtime/submissions/"));
+                && path.starts_with("/api/workflows/runtime/submissions/");
             if is_sse_stream {
                 req.uri().query().and_then(|q| {
                     q.split('&')

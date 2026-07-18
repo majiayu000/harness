@@ -58,26 +58,6 @@ pub(super) async fn merge_workflow_runtime(
     }
 }
 
-#[cfg(test)]
-pub(super) async fn merge_task(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "workflow runtime store unavailable"})),
-        );
-    };
-    match crate::workflow_runtime_pr_feedback::approve_runtime_merge_by_task_id(store, &id).await {
-        Ok(outcome) => runtime_merge_response(outcome),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        ),
-    }
-}
-
 pub(super) async fn cancel_workflow_runtime(
     State(state): State<Arc<AppState>>,
     Json(request): Json<WorkflowRuntimeCancelRequest>,

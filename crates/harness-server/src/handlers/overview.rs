@@ -480,7 +480,7 @@ impl ActiveTaskOverviewCounts {
 
 pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCounts {
     let mut counts = ActiveTaskOverviewCounts::default();
-    let mut counted_runtime_active_workflows = false;
+    let runtime_counts_available = state.core.workflow_runtime_store.is_some();
 
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
         match crate::handlers::definition_ids::active_count_definition_ids() {
@@ -492,8 +492,7 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
                     {
                         Ok(workflows) => {
                             for workflow in workflows {
-                                counted_runtime_active_workflows |=
-                                    add_active_runtime_workflow(&mut counts, &workflow);
+                                add_active_runtime_workflow(&mut counts, &workflow);
                             }
                         }
                         Err(error) => {
@@ -511,7 +510,7 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
         }
     }
 
-    if !counted_runtime_active_workflows {
+    if !runtime_counts_available {
         for _ in 0..state.concurrency.task_queue.running_count() {
             counts.add(None, ActiveTaskBucket::Running);
         }

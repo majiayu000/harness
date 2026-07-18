@@ -41,19 +41,6 @@ impl DashboardActiveCounts {
             }
         }
     }
-
-    fn add_queued_waiters(&mut self, project_id: Option<&str>, queued: usize) {
-        if queued == 0 {
-            return;
-        }
-        self.queued += queued;
-        if let Some(project_id) = project_id {
-            self.by_project
-                .entry(project_id.to_owned())
-                .or_default()
-                .queued += queued;
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +54,7 @@ pub(super) async fn dashboard_active_counts(
     visible_project_ids: Option<&HashSet<String>>,
 ) -> DashboardActiveCounts {
     let mut counts = DashboardActiveCounts::default();
-    let mut counted_runtime_active_workflows = false;
+    let runtime_counts_available = state.core.workflow_runtime_store.is_some();
     let scope_root = &state.core.project_root;
     let allowed_project_roots = &state.core.server.config.server.allowed_project_roots;
 
@@ -83,7 +70,7 @@ pub(super) async fn dashboard_active_counts(
                             for workflow in workflows {
                                 let projection =
                                     RuntimeWorkflowProjection::from_workflow(&workflow);
-                                counted_runtime_active_workflows |= add_active_runtime_workflow(
+                                add_active_runtime_workflow(
                                     &mut counts,
                                     &projection,
                                     visible_project_ids,
@@ -107,43 +94,13 @@ pub(super) async fn dashboard_active_counts(
         }
     }
 
-    if !counted_runtime_active_workflows {
+    if !runtime_counts_available {
         counts.running = state.concurrency.task_queue.running_count();
         counts.queued = state.concurrency.task_queue.queued_count();
         counts.used_task_queue_fallback = true;
-    } else {
-        add_task_queue_waiters(
-            &mut counts,
-            state,
-            visible_project_ids,
-            scope_root,
-            allowed_project_roots,
-        );
     }
 
     counts
-}
-
-fn add_task_queue_waiters(
-    counts: &mut DashboardActiveCounts,
-    state: &AppState,
-    visible_project_ids: Option<&HashSet<String>>,
-    scope_root: &Path,
-    allowed_project_roots: &[std::path::PathBuf],
-) {
-    for (project_id, stats) in state.concurrency.task_queue.all_project_stats() {
-        if !project_is_in_dashboard_scope(
-            Some(&project_id),
-            visible_project_ids,
-            scope_root,
-            allowed_project_roots,
-        ) {
-            continue;
-        }
-        let visible_project_id =
-            project_is_visible(Some(&project_id), visible_project_ids).then_some(project_id);
-        counts.add_queued_waiters(visible_project_id.as_deref(), stats.queued);
-    }
 }
 
 fn add_active_runtime_workflow(

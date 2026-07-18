@@ -491,7 +491,9 @@ fn operator_actions(
             repo,
             issue,
             pr,
-            evidence_url: task_id.as_ref().map(|id| format!("/tasks/{id}")),
+            evidence_url: task_id
+                .as_ref()
+                .map(|id| format!("/api/workflows/runtime/submissions/{id}")),
             task_id,
             workflow_id: workflow.id.clone(),
             state: workflow.state.clone(),

@@ -48,20 +48,6 @@ fn run_git(root: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn task_app(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(health_check))
-        .route(
-            "/api/workflows/runtime/submissions/{id}",
-            get(task_query_routes::get_runtime_submission),
-        )
-        .route(
-            "/api/workflows/runtime/submissions/{id}/proof",
-            get(task_query_routes::get_runtime_submission_proof),
-        )
-        .with_state(state)
-}
-
 pub(super) async fn call_health(state: Arc<AppState>) -> anyhow::Result<HealthResponse> {
     use http_body_util::BodyExt;
     let app = Router::new()
@@ -138,7 +124,7 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
         "runtime-backed task should not have a legacy task row"
     );
 
-    let response = task_app(state)
+    let response = runtime_submission_app(state)
         .oneshot(
             Request::builder()
                 .uri(format!(
@@ -193,7 +179,7 @@ async fn get_task_proof_rejects_nonterminal_runtime_task() -> anyhow::Result<()>
     }));
     store.upsert_instance(&workflow).await?;
 
-    let response = task_app(state)
+    let response = runtime_submission_app(state)
         .oneshot(
             Request::builder()
                 .uri(format!(
@@ -205,7 +191,10 @@ async fn get_task_proof_rejects_nonterminal_runtime_task() -> anyhow::Result<()>
 
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = response_json(response).await?;
-    assert_eq!(body["error"], "task is not in a terminal state");
+    assert_eq!(
+        body["error"],
+        "runtime submission is not in a terminal state"
+    );
     assert_eq!(body["status"], "implementing");
     Ok(())
 }
@@ -385,7 +374,7 @@ pub(super) async fn assert_runtime_issue_submission(
     assert_eq!(commands[0].status, "pending");
     assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
 
-    let get_response = task_app(state.clone())
+    let get_response = runtime_submission_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("GET")

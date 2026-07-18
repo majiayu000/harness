@@ -291,11 +291,11 @@ async fn get_task_exposes_workspace_lifecycle_metadata() -> anyhow::Result<()> {
     let task_id = task.id.clone();
     state.core.tasks.insert(&task).await;
 
-    let app = task_app(state);
+    let app = runtime_submission_app(state);
     let response = app
         .oneshot(
             Request::builder()
-                .uri(format!("/tasks/{}", task_id.0))
+                .uri(format!("/api/workflows/runtime/submissions/{}", task_id.0))
                 .body(Body::empty())?,
         )
         .await?;

@@ -195,7 +195,18 @@ async fn overview_returns_expected_shape() -> anyhow::Result<()> {
         return Ok(());
     }
     let dir = test_helpers::tempdir_in_home("harness-test-overview-")?;
-    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    state.core.workflow_runtime_store = Some(Arc::new(
+        harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(
+                dir.path(),
+                "workflow_runtime_overview_test",
+            ),
+            Some(&test_helpers::test_database_url()?),
+        )
+        .await?,
+    ));
+    let state = Arc::new(state);
 
     let app = Router::new()
         .route("/api/overview", get(overview))
@@ -248,7 +259,18 @@ async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::
     let dir = test_helpers::tempdir_in_home("harness-test-overview-stalled-")?;
     let canonical_root = dir.path().canonicalize()?;
     let project_root = canonical_root.to_string_lossy().into_owned();
-    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    state.core.workflow_runtime_store = Some(Arc::new(
+        harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(
+                dir.path(),
+                "workflow_runtime_overview_stalled_test",
+            ),
+            Some(&test_helpers::test_database_url()?),
+        )
+        .await?,
+    ));
+    let state = Arc::new(state);
     state
         .project_svc
         .register(crate::project_registry::Project {

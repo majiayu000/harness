@@ -262,12 +262,29 @@ mod tests {
 
     async fn make_test_state_with_config(mut config: HarnessConfig) -> anyhow::Result<AppState> {
         config.server.allow_unauthenticated = true;
+        let database_url = config
+            .server
+            .database_url
+            .clone()
+            .or_else(|| crate::test_helpers::test_database_url().ok());
+        let runtime_path = harness_core::config::dirs::default_db_path(
+            &config.server.data_dir,
+            "workflow_runtime_dashboard_test",
+        );
         let server = Arc::new(HarnessServer::new(
             config,
             ThreadManager::new(),
             AgentRegistry::new("test"),
         ));
-        build_app_state(server).await
+        let mut state = build_app_state(server).await?;
+        state.core.workflow_runtime_store = Some(Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &runtime_path,
+                database_url.as_deref(),
+            )
+            .await?,
+        ));
+        Ok(state)
     }
 
     async fn dashboard_body(state: Arc<AppState>) -> anyhow::Result<serde_json::Value> {
@@ -417,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_dedupes_runtime_workflow_with_active_legacy_task() -> anyhow::Result<()> {
+    async fn dashboard_uses_runtime_workflow_when_legacy_task_exists() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -446,16 +463,16 @@ mod tests {
 
         let body = dashboard_body(state).await?;
 
-        assert_eq!(body["global"]["running"], 0);
-        assert_eq!(body["global"]["queued"], 1);
+        assert_eq!(body["global"]["running"], 1);
+        assert_eq!(body["global"]["queued"], 0);
         let project = project_entry(&body, &project_root)?;
-        assert_eq!(project["tasks"]["running"], 0);
-        assert_eq!(project["tasks"]["queued"], 1);
+        assert_eq!(project["tasks"]["running"], 1);
+        assert_eq!(project["tasks"]["queued"], 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn dashboard_counts_recovering_legacy_task_as_running() -> anyhow::Result<()> {
+    async fn dashboard_ignores_recovering_legacy_task() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -472,16 +489,16 @@ mod tests {
 
         let body = dashboard_body(state).await?;
 
-        assert_eq!(body["global"]["running"], 1);
+        assert_eq!(body["global"]["running"], 0);
         assert_eq!(body["global"]["queued"], 0);
         let project = project_entry(&body, &project_root)?;
-        assert_eq!(project["tasks"]["running"], 1);
+        assert_eq!(project["tasks"]["running"], 0);
         assert_eq!(project["tasks"]["queued"], 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn dashboard_counts_unregistered_project_work_in_global_totals() -> anyhow::Result<()> {
+    async fn dashboard_ignores_unregistered_legacy_project_work() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -504,7 +521,7 @@ mod tests {
 
         let body = dashboard_body(state).await?;
 
-        assert_eq!(body["global"]["running"], 1);
+        assert_eq!(body["global"]["running"], 0);
         assert_eq!(body["global"]["queued"], 0);
         let registered_project = project_entry(&body, &registered_root)?;
         assert_eq!(registered_project["tasks"]["running"], 0);
@@ -517,8 +534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_counts_unregistered_allowed_root_work_in_global_totals() -> anyhow::Result<()>
-    {
+    async fn dashboard_ignores_unregistered_allowed_root_legacy_work() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -552,7 +568,7 @@ mod tests {
 
         let body = dashboard_body(state).await?;
 
-        assert_eq!(body["global"]["running"], 1);
+        assert_eq!(body["global"]["running"], 0);
         assert_eq!(body["global"]["queued"], 0);
         let registered_project = project_entry(&body, &registered_root)?;
         assert_eq!(registered_project["tasks"]["running"], 0);
@@ -565,7 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_preserves_foreground_task_queue_waiters() -> anyhow::Result<()> {
+    async fn dashboard_ignores_task_queue_waiters_with_runtime_store() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -599,15 +615,16 @@ mod tests {
         assert!(join_error.is_cancelled());
 
         assert_eq!(body["global"]["running"], 0);
-        assert_eq!(body["global"]["queued"], 1);
+        assert_eq!(body["global"]["queued"], 0);
         let project = project_entry(&body, &project_root)?;
         assert_eq!(project["tasks"]["running"], 0);
-        assert_eq!(project["tasks"]["queued"], 1);
+        assert_eq!(project["tasks"]["queued"], 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn dashboard_does_not_double_count_background_queue_waiters() -> anyhow::Result<()> {
+    async fn dashboard_ignores_background_task_queue_waiters_with_runtime_store(
+    ) -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -646,10 +663,10 @@ mod tests {
         assert!(join_error.is_cancelled());
 
         assert_eq!(body["global"]["running"], 0);
-        assert_eq!(body["global"]["queued"], 1);
+        assert_eq!(body["global"]["queued"], 0);
         let project = project_entry(&body, &project_root)?;
         assert_eq!(project["tasks"]["running"], 0);
-        assert_eq!(project["tasks"]["queued"], 1);
+        assert_eq!(project["tasks"]["queued"], 0);
         Ok(())
     }
 

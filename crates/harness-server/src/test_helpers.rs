@@ -221,9 +221,16 @@ async fn make_state_inner(
         project_root.to_path_buf(),
     );
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let workflow_runtime_store = Arc::new(
+        harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir, "workflow_runtime"),
+            Some(&database_url),
+        )
+        .await?,
+    );
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
         Arc::new(server.config.clone()),
-        None,
+        Some(workflow_runtime_store.clone()),
         None,
         vec![],
     );
@@ -239,7 +246,7 @@ async fn make_state_inner(
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
             project_workflow_store: None,
-            workflow_runtime_store: None,
+            workflow_runtime_store: Some(workflow_runtime_store),
             project_registry: None,
             runtime_state_store: None,
             maintenance_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -254,7 +254,8 @@ impl TaskStore {
     ///
     /// Fetches summary columns from the DB (skipping the heavy `rounds` field),
     /// then overrides with live cache entries so in-flight state is accurate.
-    /// Use this in the `/tasks` list endpoint instead of `list_all_with_terminal`.
+    /// Use this for lightweight internal task-store projections instead of
+    /// `list_all_with_terminal`.
     pub async fn list_all_summaries_with_terminal(&self) -> anyhow::Result<Vec<TaskSummary>> {
         record_task_runner_usage();
         let mut by_id: std::collections::HashMap<TaskId, TaskSummary> = self

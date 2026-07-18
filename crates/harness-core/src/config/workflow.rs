@@ -160,8 +160,9 @@ pub struct IssueWorkflowPolicy {
     #[serde(default = "default_true")]
     pub auto_replan_on_plan_issue: bool,
     /// When true, the review loop pauses at `ready_to_merge` and requires a
-    /// human to call `POST /tasks/:id/merge` before the workflow advances to
-    /// `done`.  Defaults to `false` to preserve the legacy auto-merge flow.
+    /// human to call `POST /api/workflows/runtime/merge` with the workflow ID
+    /// before the workflow advances to `done`. Defaults to `false` to
+    /// preserve the automatic merge flow.
     #[serde(default)]
     pub require_human_gate_before_merge: bool,
 }

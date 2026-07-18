@@ -55,13 +55,6 @@ pub use state::{
     NotificationServices, ObservabilityServices,
 };
 
-#[cfg(test)]
-pub(crate) use sse_routes::stream_runtime_submission_sse as stream_task_sse;
-#[cfg(test)]
-pub(crate) use task_query_routes::{
-    get_runtime_submission as get_task, list_runtime_submissions as list_tasks,
-};
-
 // Handler re-exports — moved to focused submodules, kept accessible via `crate::http::`.
 pub(crate) use misc_routes::{
     get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
