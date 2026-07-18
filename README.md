@@ -242,8 +242,8 @@ cargo run -p harness-cli -- exec "Fix the failing test in src/lib.rs"
 ### Common Workflows
 
 ```bash
-# Task management
-curl -X POST http://127.0.0.1:9800/tasks \
+# Workflow-runtime submission
+curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Add input validation to the API handler"}'
 
@@ -375,19 +375,19 @@ max_turns = 20
 
 ## HTTP REST API
 
-### Task Management
+### Workflow Runtime Submissions
 
 ```bash
-# Submit a task by prompt
-curl -X POST http://127.0.0.1:9800/tasks \
+# Submit work by prompt
+curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Add input validation to the API handler",
     "project": "/path/to/project"
   }'
 
-# Submit a task by GitHub issue number
-curl -X POST http://127.0.0.1:9800/tasks \
+# Submit work by GitHub issue number
+curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -395,8 +395,8 @@ curl -X POST http://127.0.0.1:9800/tasks \
     "prompt": "fix: handle edge case in parser"
   }'
 
-# Submit an issue task but bypass triage/plan and go straight to implementation
-curl -X POST http://127.0.0.1:9800/tasks \
+# Submit an issue but bypass triage/plan and go straight to implementation
+curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -404,30 +404,29 @@ curl -X POST http://127.0.0.1:9800/tasks \
     "skip_triage": true
   }'
 
-# Submit a task by PR number (for review/fix)
-curl -X POST http://127.0.0.1:9800/tasks \
+# Submit a PR for review/fix
+curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
     "pr": 100
   }'
 
-# Batch submit multiple tasks
-curl -X POST http://127.0.0.1:9800/tasks/batch \
-  -H "Content-Type: application/json" \
-  -d '{
-    "project": "/path/to/project",
-    "issues": [10, 11, 12]
-  }'
+# Submit multiple issues (one durable submission per request)
+for issue in 10 11 12; do
+  curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+    -H "Content-Type: application/json" \
+    -d "{\"project\":\"/path/to/project\",\"issue\":$issue}"
+done
 
-# Get task status
-curl http://127.0.0.1:9800/tasks/{task_id}
+# Get submission status
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}
 
-# List all tasks
-curl http://127.0.0.1:9800/tasks
+# List submissions
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions
 
-# Stream task output (SSE)
-curl http://127.0.0.1:9800/tasks/{task_id}/stream
+# Stream submission output (SSE)
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}/stream
 ```
 
 ### Project Management
@@ -508,17 +507,17 @@ Before using direct `./target/release/harness ... serve` commands, run
 The direct binary commands do not start local Postgres or build the release
 binary for you.
 
-## Task Execution Flow
+## Workflow Runtime Execution Flow
 
 ```
-POST /tasks → TaskQueue → acquire semaphore (project + global)
+POST /api/workflows/runtime/submissions → persist workflow + implementation command
+    → runtime dispatcher creates a job → worker acquires the project queue permit
     → create git worktree → agent executes in isolation
-    → post-validator runs (cargo fmt, cargo check)
-    → agent creates PR → Codex review (up to 3 rounds)
-    → quality score → cleanup worktree → done
+    → validate and review → persist terminal workflow evidence
 ```
 
-Each task runs in an isolated git worktree, so multiple agents can work on the same repo in parallel without conflicts.
+Each implementation runs in an isolated git worktree. The workflow runtime is
+the scheduling and lifecycle authority.
 
 ## Workspace Crates
 
@@ -526,7 +525,7 @@ Each task runs in an isolated git worktree, so multiple agents can work on the s
 |---|---|
 | `harness-core` | Shared domain types, config, prompts, agent/interceptor traits |
 | `harness-protocol` | JSON-RPC method definitions, envelopes, notifications, codecs |
-| `harness-server` | App Server runtime (HTTP + stdio + WebSocket), routing, handlers, task/thread stores |
+| `harness-server` | App Server runtime (HTTP + stdio + WebSocket), routing, handlers, and workflow-runtime integration |
 | `harness-agents` | Agent adapters (Claude CLI, Codex CLI, Anthropic API) and registry |
 | `harness-gc` | Signal detection and draft remediation generation/adoption |
 | `harness-rules` | Rule loading/parsing, Starlark execution policy engine |
@@ -537,18 +536,17 @@ Each task runs in an isolated git worktree, so multiple agents can work on the s
 
 ## JSON-RPC API
 
-Harness exposes 42 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
+Harness exposes 32 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
 
 | Category | Methods |
 |---|---|
 | Lifecycle | `initialize`, `initialized` |
-| Threads | `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/delete`, `thread/compact` |
-| Turns | `turn/start`, `turn/steer`, `turn/cancel`, `turn/status`, `turn/respond_approval` |
 | GC | `gc/run`, `gc/status`, `gc/drafts`, `gc/adopt`, `gc/reject` |
 | Skills | `skill/create`, `skill/list`, `skill/get`, `skill/delete`, `skill/governance/view`, `skill/governance/history`, `skill/stale` |
 | Rules | `rule/load`, `rule/check` |
 | ExecPlan | `exec_plan/init`, `exec_plan/update`, `exec_plan/status` |
 | Observability | `event/log`, `event/query`, `metrics/collect`, `metrics/query` |
+| Context | `context/preview` |
 | Classification | `task/classify`, `learn/rules`, `learn/skills` |
 | Health | `health/check`, `stats/query`, `agent/list` |
 | VibeGuard | `preflight`, `cross_review` |

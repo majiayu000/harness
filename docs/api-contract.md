@@ -17,11 +17,6 @@ observes results. The following capabilities are **only available over HTTP**:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `POST /tasks` | create | Enqueue a single task |
-| `GET  /tasks` | list | List all tasks |
-| `POST /tasks/batch` | batch create | Enqueue multiple tasks at once |
-| `GET  /tasks/{id}` | get | Fetch task details |
-| `GET  /tasks/{id}/stream` | stream | Server-Sent Events live output |
 | `POST /projects` | register | Register a project root |
 | `GET  /projects` | list | List registered projects |
 | `GET  /projects/{id}` | get | Get project details |
@@ -30,9 +25,14 @@ observes results. The following capabilities are **only available over HTTP**:
 | `GET  /api/dashboard` | dashboard | Dashboard data |
 | `GET  /api/intake` | intake | Intake source status |
 | `POST /api/workflows/runtime/submissions` | submit | Create a durable workflow-runtime submission |
+| `GET  /api/workflows/runtime/submissions` | list | List runtime submissions |
 | `GET  /api/workflows/runtime/submissions/{id}` | get | Read runtime submission status |
 | `GET  /api/workflows/runtime/submissions/{id}/artifacts` | artifacts | Read runtime output artifacts |
+| `GET  /api/workflows/runtime/submissions/{id}/prompts` | prompts | Read recorded runtime prompts |
+| `GET  /api/workflows/runtime/submissions/{id}/proof` | proof | Read terminal proof of work |
 | `GET  /api/workflows/runtime/submissions/{id}/stream` | stream | Stream runtime submission events |
+| `POST /api/workflows/runtime/cancel` | cancel | Cancel a workflow by `workflow_id` |
+| `POST /api/workflows/runtime/merge` | merge | Approve or merge a workflow by `workflow_id` |
 | `POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}` | approval | Respond to a live runtime approval request |
 | `POST /webhook` | webhook | GitHub webhook (HMAC-verified) |
 | `POST /webhook/feishu` | webhook | Feishu bot webhook |
@@ -47,22 +47,10 @@ initialization failed or runtime state is dirty; the `persistence.startup.stores
 array reports each store by name with `critical`, `ready`, and a redacted
 `error` code.
 
-`GET /tasks` keeps returning the task rows it can safely load, but includes a
-`degraded` object when runtime-only submissions could not be loaded:
-
-```json
-{
-  "degraded": {
-    "partial": true,
-    "missing": ["workflow_runtime_submissions"],
-    "reason": "runtime_submission_summaries_unavailable"
-  }
-}
-```
-
-`GET /tasks/{id}` and `GET /tasks/{id}/proof` return `503 Service Unavailable`
-with `error: "workflow runtime store unavailable"` when the requested handle
-could be runtime-backed but the required workflow runtime store is unavailable.
+Runtime submission list, detail, proof, artifact, prompt, and stream routes fail
+closed when their required workflow-runtime store is unavailable. The JSON
+error is `workflow runtime store unavailable`; the list and detail surfaces use
+`503 Service Unavailable` rather than returning partial legacy rows.
 
 Runtime-host mutations, including watched-project sync, fail with
 `503 Service Unavailable` when runtime state persistence was required at startup
@@ -77,8 +65,8 @@ non-exempt routes require `Authorization: Bearer <token>`; if both a token and
 ignored. Exempt routes that bypass auth entirely: `/health`, `/webhook`,
 `/webhook/feishu`, `/signals`, and `/favicon.ico` (these carry their own
 HMAC-based protection or are intentionally public). For browser clients that
-cannot set `Authorization` headers on SSE requests, `/tasks/{id}/stream` and
-`/api/workflows/runtime/submissions/{id}/stream` additionally accept a
+cannot set `Authorization` headers on SSE requests,
+`/api/workflows/runtime/submissions/{id}/stream` additionally accepts a
 `?token=<value>` query parameter as a fallback; all other routes only accept
 `Authorization: Bearer <token>`.
 
@@ -117,6 +105,7 @@ All three transports share the same method set. The following capabilities are
 | `event/query` | Query events |
 | `metrics/collect` | Gather project metrics |
 | `metrics/query` | Query metrics |
+| `context/preview` | Preview a composed context manifest |
 | `task/classify` | Classify prompt/issue/PR complexity |
 | `learn/rules` | Learn from rule violations |
 | `learn/skills` | Learn from skill usage |
@@ -143,7 +132,7 @@ error.
 
 The design is intentional:
 
-1. **Security boundary** — Task submission and project registration are privileged
+1. **Security boundary** — Runtime submission and project registration are privileged
    operations. Keeping them HTTP-only means they go through the same
    token-based authentication middleware (when `api_token` is configured).
    Agent processes communicating over stdio cannot submit new tasks or register
@@ -162,8 +151,8 @@ The design is intentional:
 
 | You want to… | Use |
 |---|---|
-| Submit a task from a CI script | `POST /tasks` (HTTP) |
-| Stream live output from a running task | `GET /tasks/{id}/stream` (HTTP SSE) |
+| Submit work from a CI script | `POST /api/workflows/runtime/submissions` (HTTP) |
+| Stream live output from a running submission | `GET /api/workflows/runtime/submissions/{id}/stream` (HTTP SSE) |
 | Register a new project | `POST /projects` (HTTP) |
 | Run a prompt through the workflow runtime | `POST /api/workflows/runtime/submissions` (HTTP) |
 | Inspect a running runtime submission | `GET /api/workflows/runtime/submissions/{id}` (HTTP) |
@@ -171,9 +160,10 @@ The design is intentional:
 | Load rules for an agent to respect | `rule/load` (JSON-RPC) |
 | Record an event from within an agent | `event/log` (JSON-RPC) |
 
-## HTTP task list
+## HTTP runtime submission list
 
-`GET /tasks` returns a paginated envelope, not a raw array:
+`GET /api/workflows/runtime/submissions` returns a paginated envelope, not a raw
+array:
 
 ```json
 {
@@ -193,7 +183,8 @@ Supported query parameters are `status`, `scheduler_state`, `active`, `kind`,
 `source`, `repo`, `project_id`, `limit`, and `cursor`. `status` is the task
 lifecycle status; `scheduler_state` is the ownership/execution state. For
 example, currently executing work is queried with
-`/tasks?scheduler_state=running`, not `status=running`.
+`/api/workflows/runtime/submissions?scheduler_state=running`, not
+`status=running`.
 
 ## Error codes
 
@@ -213,4 +204,5 @@ All JSON-RPC errors follow [JSON-RPC 2.0](https://www.jsonrpc.org/specification)
 | `-32005` | `AGENT_ERROR` | Agent execution error |
 | `-32006` | `VALIDATION_ERROR` | Input validation failure |
 
-HTTP errors follow standard HTTP status codes (200, 201, 400, 401, 404, 409, 500).
+HTTP errors follow standard HTTP status codes (200, 201, 202, 400, 401, 404,
+409, 500, 503).
