@@ -164,7 +164,7 @@ class Harness:
                 continue
             content = artifact.get("content")
             if not isinstance(content, str):
-                break
+                continue
             try:
                 envelope = json.loads(content)
             except json.JSONDecodeError as error:

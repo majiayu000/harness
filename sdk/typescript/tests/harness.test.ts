@@ -208,6 +208,54 @@ test("run falls back to the task error when artifacts are not found", async () =
   assert.equal(result.output, "startup failed");
 });
 
+test("run rejects a non-object runtime submission detail", async () => {
+  const mock = createMockFetch((call) => {
+    if (call.method === "POST") {
+      return {
+        status: 202,
+        body: { task_id: "submission-invalid-detail", execution_path: "workflow_runtime" },
+      };
+    }
+    return { body: null };
+  });
+  const harness = new Harness({ fetch: mock.fetch, cwd: "/repo" });
+
+  await assert.rejects(
+    () => harness.startThread().then((thread) => thread.run("Run")),
+    /runtime submission detail must be an object/,
+  );
+});
+
+test("run rejects a non-array runtime artifacts response", async () => {
+  const mock = createMockFetch((call) => {
+    if (call.method === "POST") {
+      return {
+        status: 202,
+        body: {
+          task_id: "submission-invalid-artifacts",
+          execution_path: "workflow_runtime",
+        },
+      };
+    }
+    if (call.url.endsWith("/artifacts")) {
+      return { body: { artifact_type: "activity_result_envelope" } };
+    }
+    return {
+      body: {
+        submission_id: "submission-invalid-artifacts",
+        status: "done",
+        project: "/repo",
+      },
+    };
+  });
+  const harness = new Harness({ fetch: mock.fetch, cwd: "/repo" });
+
+  await assert.rejects(
+    () => harness.startThread().then((thread) => thread.run("Run")),
+    /runtime artifacts response must be an array/,
+  );
+});
+
 test("run emits timeout while a runtime submission remains active", async () => {
   const mock = createMockFetch((call) => {
     if (call.method === "POST") {

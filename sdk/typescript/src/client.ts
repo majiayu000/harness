@@ -83,6 +83,9 @@ export class Harness {
       "GET",
       `/api/workflows/runtime/submissions/${encodeURIComponent(turnId)}`,
     );
+    if (typeof detail !== "object" || detail === null || Array.isArray(detail)) {
+      throw new Error("runtime submission detail must be an object");
+    }
     const status = runtimeStatusToTurnStatus(detail.status);
     const items = await this.runtimeItems(turnId, status, detail.error);
     return {
@@ -105,9 +108,9 @@ export class Harness {
     if (status === "running") {
       return [];
     }
-    let artifacts: RuntimeArtifact[];
+    let artifacts: unknown;
     try {
-      artifacts = await this.transport.request<RuntimeArtifact[]>(
+      artifacts = await this.transport.request<unknown>(
         "GET",
         `/api/workflows/runtime/submissions/${encodeURIComponent(turnId)}/artifacts`,
       );
@@ -117,9 +120,21 @@ export class Harness {
       }
       artifacts = [];
     }
+    if (!Array.isArray(artifacts)) {
+      throw new Error("runtime artifacts response must be an array");
+    }
     const envelope = [...artifacts]
       .reverse()
-      .find((artifact) => artifact.artifact_type === "activity_result_envelope");
+      .find(
+        (artifact): artifact is RuntimeArtifact =>
+          typeof artifact === "object" &&
+          artifact !== null &&
+          !Array.isArray(artifact) &&
+          "artifact_type" in artifact &&
+          artifact.artifact_type === "activity_result_envelope" &&
+          "content" in artifact &&
+          typeof artifact.content === "string",
+      );
     const finalResult = parseFinalResult(envelope?.content);
     const items: TurnItem[] = [];
     if (finalResult.summary) {

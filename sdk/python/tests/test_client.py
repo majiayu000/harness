@@ -321,6 +321,37 @@ class HarnessSdkTests(unittest.TestCase):
         ):
             harness.start_thread().run("Run")
 
+    def test_non_string_runtime_result_artifact_skips_to_older_envelope(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-mixed-artifacts",
+                    "execution_path": "workflow_runtime",
+                }
+            if path.endswith("/artifacts"):
+                return [
+                    {
+                        "artifact_type": "activity_result_envelope",
+                        "content": json.dumps(
+                            {"final_result": {"summary": "Earlier valid result."}}
+                        ),
+                    },
+                    {
+                        "artifact_type": "activity_result_envelope",
+                        "content": None,
+                    },
+                ]
+            return {
+                "submission_id": "submission-mixed-artifacts",
+                "status": "done",
+                "project": "/repo",
+            }
+
+        result = Harness(cwd="/repo", http_handler=handler).start_thread().run("Run")
+
+        self.assertEqual(result.output, "Earlier valid result.")
+
 
 if __name__ == "__main__":
     unittest.main()
