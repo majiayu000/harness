@@ -25,13 +25,16 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
     .await;
     let graphql_url = spawn_json_server(
         "200 OK",
-        vec![graphql_response(pr_snapshot(
-            pr_number,
-            issue_number,
-            "OPEN",
-            "SUCCESS",
-            true,
-        ))],
+        vec![
+            issue_links_response("OPEN", &[pr_number]),
+            graphql_response(pr_snapshot(
+                pr_number,
+                issue_number,
+                "OPEN",
+                "SUCCESS",
+                true,
+            )),
+        ],
     )
     .await;
 
@@ -104,7 +107,7 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
 }
 
 #[tokio::test]
-async fn recovery_maps_open_feedback_and_merged_pr_facts() -> anyhow::Result<()> {
+async fn recovery_maps_open_pr_facts() -> anyhow::Result<()> {
     let Some((dir, store)) = open_runtime_store().await? else {
         return Ok(());
     };
@@ -112,7 +115,6 @@ async fn recovery_maps_open_feedback_and_merged_pr_facts() -> anyhow::Result<()>
     for (index, (pr_state, checks, approved, expected_state)) in [
         ("OPEN", "PENDING", false, "pr_open"),
         ("OPEN", "FAILURE", false, "awaiting_feedback"),
-        ("MERGED", "SUCCESS", true, "done"),
     ]
     .into_iter()
     .enumerate()
@@ -129,13 +131,16 @@ async fn recovery_maps_open_feedback_and_merged_pr_facts() -> anyhow::Result<()>
         .await;
         let graphql_url = spawn_json_server(
             "200 OK",
-            vec![graphql_response(pr_snapshot(
-                pr_number,
-                issue_number,
-                pr_state,
-                checks,
-                approved,
-            ))],
+            vec![
+                issue_links_response("OPEN", &[pr_number]),
+                graphql_response(pr_snapshot(
+                    pr_number,
+                    issue_number,
+                    pr_state,
+                    checks,
+                    approved,
+                )),
+            ],
         )
         .await;
 
@@ -162,22 +167,56 @@ async fn recovery_maps_open_feedback_and_merged_pr_facts() -> anyhow::Result<()>
             .await?
             .expect("server-owned PR fact");
         assert_eq!(fact.facts["pr_number"], pr_number);
-        if expected_state == "done" {
-            let workflow = store
-                .get_instance(&workflow_id(&project_id, Some(REPO), issue_number))
-                .await?
-                .expect("merged workflow");
-            assert_eq!(
-                workflow.data["terminal_evidence"]["reason"],
-                "closing_pr_merged"
-            );
-            assert_eq!(
-                workflow.data["terminal_evidence"]["merge_commit_sha"],
-                "merge-sha"
-            );
-        }
         assert_no_agent_work(&store, &project_id, issue_number).await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn merged_pr_does_not_cover_an_issue_github_still_reports_open() -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("merged-open-issue");
+    std::fs::create_dir(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let issue_number = 1729;
+    let pr_number = 1739;
+    let rest_url = spawn_json_server(
+        "200 OK",
+        vec![rest_candidates(&[(pr_number, issue_number)])],
+    )
+    .await;
+    let graphql_url = spawn_json_server(
+        "200 OK",
+        vec![
+            issue_links_response("OPEN", &[]),
+            graphql_response(pr_snapshot(
+                pr_number,
+                issue_number,
+                "MERGED",
+                "SUCCESS",
+                true,
+            )),
+        ],
+    )
+    .await;
+
+    let coverage = recover_with_urls(
+        &store,
+        &project_root,
+        &project_id,
+        issue_number,
+        &rest_url,
+        &graphql_url,
+    )
+    .await?;
+
+    assert_eq!(coverage, GitHubIssueCoverage::Uncovered);
+    assert!(store
+        .get_instance(&workflow_id(&project_id, Some(REPO), issue_number))
+        .await?
+        .is_none());
     Ok(())
 }
 
@@ -194,13 +233,10 @@ async fn closed_pr_is_uncovered_but_a_later_valid_pr_recovers_coverage() -> anyh
         spawn_json_server("200 OK", vec![rest_candidates(&[(1741, issue_number)])]).await;
     let graphql_url = spawn_json_server(
         "200 OK",
-        vec![graphql_response(pr_snapshot(
-            1741,
-            issue_number,
-            "CLOSED",
-            "SUCCESS",
-            true,
-        ))],
+        vec![
+            issue_links_response("OPEN", &[]),
+            graphql_response(pr_snapshot(1741, issue_number, "CLOSED", "SUCCESS", true)),
+        ],
     )
     .await;
 
@@ -237,7 +273,7 @@ async fn closed_pr_is_uncovered_but_a_later_valid_pr_recovers_coverage() -> anyh
     let graphql_url = spawn_json_server(
         "200 OK",
         vec![
-            graphql_response(pr_snapshot(1741, issue_number, "CLOSED", "SUCCESS", true)),
+            issue_links_response("OPEN", &[1742]),
             graphql_response(pr_snapshot(1742, issue_number, "OPEN", "PENDING", false)),
         ],
     )
@@ -267,7 +303,7 @@ async fn github_lookup_failure_is_visible_and_leaves_no_dispatchable_work() -> a
     let project_id = project_root.to_string_lossy().into_owned();
     let rest_url =
         spawn_json_server("503 Service Unavailable", vec![json!({"error": "down"})]).await;
-    let graphql_url = spawn_json_server("200 OK", vec![json!({})]).await;
+    let graphql_url = spawn_json_server("200 OK", vec![issue_links_response("OPEN", &[])]).await;
 
     let error = recover_with_urls(
         &store,
@@ -313,7 +349,14 @@ async fn incomplete_closing_issue_snapshot_preserves_exact_rest_candidate() -> a
             }))
             .collect::<Vec<_>>(),
     });
-    let graphql_url = spawn_json_server("200 OK", vec![graphql_response(snapshot)]).await;
+    let graphql_url = spawn_json_server(
+        "200 OK",
+        vec![
+            issue_links_response("OPEN", &[]),
+            graphql_response(snapshot),
+        ],
+    )
+    .await;
 
     let coverage = recover_with_urls(
         &store,
@@ -333,6 +376,181 @@ async fn incomplete_closing_issue_snapshot_preserves_exact_rest_candidate() -> a
         }
     );
     assert_recovered_binding(&store, &project_id, issue_number, pr_number, "pr_open").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_linked_pr_without_closing_keyword_recovers_coverage() -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("issue-linked-pr");
+    std::fs::create_dir(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let issue_number = 1_780;
+    let pr_number = 1_781;
+    let rest_url = spawn_json_server("200 OK", vec![rest_candidates(&[])]).await;
+    let mut snapshot = pr_snapshot(pr_number, issue_number, "OPEN", "PENDING", false);
+    snapshot["closingIssuesReferences"]["nodes"] = json!([]);
+    let graphql_url = spawn_json_server(
+        "200 OK",
+        vec![
+            issue_links_response("OPEN", &[pr_number]),
+            graphql_response(snapshot),
+        ],
+    )
+    .await;
+
+    let coverage = recover_with_urls(
+        &store,
+        &project_root,
+        &project_id,
+        issue_number,
+        &rest_url,
+        &graphql_url,
+    )
+    .await?;
+
+    assert_eq!(
+        coverage,
+        GitHubIssueCoverage::Covered {
+            source: "github_closing_pr",
+            state: "pr_open".to_string(),
+        }
+    );
+    assert_recovered_binding(&store, &project_id, issue_number, pr_number, "pr_open").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ready_pr_recovery_transitions_existing_uncovered_workflow_before_reporting_coverage(
+) -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("existing-planning");
+    std::fs::create_dir(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let issue_number = 1_782;
+    let pr_number = 1_783;
+    store
+        .upsert_definition(&WorkflowDefinition::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "GitHub issue PR workflow",
+        ))
+        .await?;
+    let existing = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "planning",
+        WorkflowSubject::new("issue", format!("issue:{issue_number}")),
+    )
+    .with_id(workflow_id(&project_id, Some(REPO), issue_number));
+    store.upsert_instance(&existing).await?;
+    let rest_url = spawn_json_server("200 OK", vec![rest_candidates(&[])]).await;
+    let graphql_url = spawn_json_server(
+        "200 OK",
+        vec![
+            issue_links_response("OPEN", &[pr_number]),
+            graphql_response(pr_snapshot(
+                pr_number,
+                issue_number,
+                "OPEN",
+                "SUCCESS",
+                true,
+            )),
+        ],
+    )
+    .await;
+
+    let coverage = recover_with_urls(
+        &store,
+        &project_root,
+        &project_id,
+        issue_number,
+        &rest_url,
+        &graphql_url,
+    )
+    .await?;
+
+    assert_eq!(
+        coverage,
+        GitHubIssueCoverage::Covered {
+            source: "github_closing_pr",
+            state: "quality_gate_pending".to_string(),
+        }
+    );
+    assert_recovered_binding(
+        &store,
+        &project_id,
+        issue_number,
+        pr_number,
+        "quality_gate_pending",
+    )
+    .await?;
+    assert_quality_gate_queued(&store, &project_id, issue_number, pr_number).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_preserves_project_base_branch_for_later_merge_gates() -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("release-base");
+    std::fs::create_dir(&project_root)?;
+    std::fs::create_dir(project_root.join(".harness"))?;
+    std::fs::write(
+        project_root.join(".harness/config.toml"),
+        "[git]\nbase_branch = \"release\"\n",
+    )?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let issue_number = 1_784;
+    let pr_number = 1_785;
+    let rest_url = spawn_json_server("200 OK", vec![rest_candidates(&[])]).await;
+    let graphql_url = spawn_json_server(
+        "200 OK",
+        vec![
+            issue_links_response("OPEN", &[pr_number]),
+            graphql_response(pr_snapshot(
+                pr_number,
+                issue_number,
+                "OPEN",
+                "SUCCESS",
+                true,
+            )),
+        ],
+    )
+    .await;
+
+    let coverage = recover_with_urls(
+        &store,
+        &project_root,
+        &project_id,
+        issue_number,
+        &rest_url,
+        &graphql_url,
+    )
+    .await?;
+
+    assert_eq!(
+        coverage,
+        GitHubIssueCoverage::Covered {
+            source: "github_closing_pr",
+            state: "awaiting_feedback".to_string(),
+        }
+    );
+    let workflow = store
+        .get_instance(&workflow_id(&project_id, Some(REPO), issue_number))
+        .await?
+        .expect("recovered workflow");
+    assert_eq!(workflow.data["expected_base_ref"], "release");
+    assert_eq!(
+        workflow.data["recovered_pr_snapshot"]["expected_base_ref"],
+        "release"
+    );
+    assert_no_agent_work(&store, &project_id, issue_number).await?;
     Ok(())
 }
 
@@ -479,6 +697,29 @@ fn pr_snapshot(
 
 fn graphql_response(pr: Value) -> Value {
     json!({"data": {"repository": {"pullRequest": pr}}})
+}
+
+fn issue_links_response(issue_state: &str, prs: &[u64]) -> Value {
+    json!({
+        "data": {
+            "repository": {
+                "issue": {
+                    "state": issue_state,
+                    "closedByPullRequestsReferences": {
+                        "pageInfo": {"hasNextPage": false, "endCursor": null},
+                        "nodes": prs
+                            .iter()
+                            .map(|pr| json!({
+                                "number": pr,
+                                "url": format!("https://github.com/{REPO}/pull/{pr}"),
+                                "headRefName": format!("linked-{pr}"),
+                            }))
+                            .collect::<Vec<_>>(),
+                    },
+                },
+            },
+        },
+    })
 }
 
 async fn spawn_json_server(status: &'static str, bodies: Vec<Value>) -> String {
