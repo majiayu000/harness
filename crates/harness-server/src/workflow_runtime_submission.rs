@@ -1,4 +1,3 @@
-use crate::task_runner::TaskId;
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
     build_issue_submission_decision, build_prompt_submission_decision,
@@ -34,6 +33,14 @@ mod dependencies;
 mod prompt_memory;
 #[path = "workflow_runtime_submission/replay.rs"]
 mod replay;
+#[path = "workflow_runtime_submission/runtime_models.rs"]
+pub(crate) mod runtime_models;
+#[path = "workflow_runtime_submission/runtime_request.rs"]
+pub(crate) mod runtime_request;
+#[path = "workflow_runtime_submission/runtime_state.rs"]
+pub(crate) mod runtime_state;
+
+pub use runtime_models::TaskId;
 
 pub(crate) use cancel::{
     cancel_issue_submission_by_task_id, cancel_submission_by_workflow_id,

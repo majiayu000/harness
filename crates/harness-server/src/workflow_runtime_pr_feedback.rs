@@ -1,4 +1,4 @@
-use crate::task_runner::TaskId;
+use crate::workflow_runtime_submission::TaskId;
 use harness_workflow::runtime::{
     build_local_review_completed_decision, build_local_review_request_decision,
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
@@ -18,6 +18,7 @@ const DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS: u64 = 24 * 60 * 60;
 
 mod command_state;
 mod persistence;
+pub(crate) mod pr_detection;
 mod pr_lifecycle_persist;
 mod targets;
 
