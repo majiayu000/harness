@@ -7,6 +7,7 @@ use std::time::Duration;
 pub(crate) enum GitHubState {
     PrMerged,
     PrClosed,
+    IssueCompleted,
     IssueClosed,
     Open,
     Unknown,
@@ -21,6 +22,8 @@ pub(super) struct GitHubPullState {
 #[derive(Debug, Deserialize)]
 pub(super) struct GitHubIssueState {
     pub(super) state: String,
+    #[serde(default)]
+    pub(super) state_reason: Option<String>,
 }
 
 pub(crate) fn github_api_base_url() -> String {
@@ -72,9 +75,10 @@ pub(super) fn classify_pr_state(state: &GitHubPullState) -> GitHubState {
 }
 
 pub(super) fn classify_issue_state(state: &GitHubIssueState) -> GitHubState {
-    match state.state.as_str() {
-        "closed" | "CLOSED" => GitHubState::IssueClosed,
-        "open" | "OPEN" => GitHubState::Open,
+    match (state.state.as_str(), state.state_reason.as_deref()) {
+        ("closed" | "CLOSED", Some("completed" | "COMPLETED")) => GitHubState::IssueCompleted,
+        ("closed" | "CLOSED", _) => GitHubState::IssueClosed,
+        ("open" | "OPEN", _) => GitHubState::Open,
         _ => GitHubState::Unknown,
     }
 }

@@ -32,6 +32,20 @@ pub(super) fn build_runtime_prompt_packet(
     workflow_document: &WorkflowDocument,
     repo_memory: &[RetrievedRepoMemoryRecord],
 ) -> anyhow::Result<Value> {
+    let workflow_value = workflow.map(|workflow| {
+        let mut data = workflow.data.clone();
+        remove_duplicated_command_field(&mut data, &job.input, "additional_prompt");
+        json!({
+            "id": workflow.id,
+            "definition_id": workflow.definition_id,
+            "definition_version": workflow.definition_version,
+            "state": workflow.state,
+            "version": workflow.version,
+            "subject": workflow.subject,
+            "parent_workflow_id": workflow.parent_workflow_id,
+            "data": data,
+        })
+    });
     let mut packet = json!({
         "schema": "harness.runtime.prompt_packet.v1",
         "runtime_job": {
@@ -50,18 +64,7 @@ pub(super) fn build_runtime_prompt_packet(
                 .and_then(Value::as_str)
                 .or_else(|| job.input.get("repo").and_then(Value::as_str)),
         },
-        "workflow": workflow.map(|workflow| {
-            json!({
-                "id": workflow.id,
-                "definition_id": workflow.definition_id,
-                "definition_version": workflow.definition_version,
-                "state": workflow.state,
-                "version": workflow.version,
-                "subject": workflow.subject,
-                "parent_workflow_id": workflow.parent_workflow_id,
-                "data": workflow.data,
-            })
-        }),
+        "workflow": workflow_value,
         "workflow_file": {
             "source_path": &workflow_document.source_path,
             "config": &workflow_document.config,
@@ -91,6 +94,18 @@ pub(super) fn build_runtime_prompt_packet(
         packet["continuation_context"] = context;
     }
     Ok(packet)
+}
+
+fn remove_duplicated_command_field(data: &mut Value, job_input: &Value, field: &str) {
+    let Some(command_value) = job_input.pointer(&format!("/command/{field}")) else {
+        return;
+    };
+    let Some(object) = data.as_object_mut() else {
+        return;
+    };
+    if object.get(field) == Some(command_value) {
+        object.remove(field);
+    }
 }
 
 fn prompt_continuation_context(workflow: Option<&WorkflowInstance>) -> Option<Value> {
@@ -161,7 +176,19 @@ pub(super) fn build_runtime_job_prompt(
     prompt_packet: &Value,
     prompt_task_request: Option<&str>,
 ) -> String {
-    let prompt_packet_json = pretty_json(prompt_packet);
+    let workflow_prompt_template = prompt_packet
+        .pointer("/workflow_file/prompt_template")
+        .and_then(Value::as_str)
+        .filter(|template| !template.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let mut model_packet = prompt_packet.clone();
+    if let Some(workflow_file) = model_packet
+        .get_mut("workflow_file")
+        .and_then(Value::as_object_mut)
+    {
+        workflow_file.remove("prompt_template");
+    }
+    let prompt_packet_json = pretty_json(&model_packet);
     let activity = prompt_packet
         .get("runtime_job")
         .and_then(|runtime_job| runtime_job.get("activity"))
@@ -221,14 +248,9 @@ pub(super) fn build_runtime_job_prompt(
         prompt.push_str(prompt_task_request);
         prompt.push('\n');
     }
-    if let Some(template) = prompt_packet
-        .get("workflow_file")
-        .and_then(|workflow_file| workflow_file.get("prompt_template"))
-        .and_then(Value::as_str)
-        .filter(|template| !template.trim().is_empty())
-    {
+    if let Some(template) = workflow_prompt_template {
         prompt.push_str("\nRepository workflow prompt template:\n");
-        prompt.push_str(template);
+        prompt.push_str(&template);
         prompt.push('\n');
     }
     prompt
@@ -766,3 +788,7 @@ mod tests;
 #[cfg(test)]
 #[path = "prompt_packet_pinning_tests.rs"]
 mod pinning_tests;
+
+#[cfg(test)]
+#[path = "prompt_packet_activity_policy_tests.rs"]
+mod activity_policy_tests;

@@ -20,7 +20,7 @@ fn reconciliation_payload_has_no_workspace_paths() {
             applied: true,
             repo: Some("owner/repo".to_string()),
             issue_number: Some(42),
-            pr_number: 77,
+            pr_number: Some(77),
             pr_url: Some("https://github.com/owner/repo/pull/77".to_string()),
         }],
         workflow_alerts: vec![],

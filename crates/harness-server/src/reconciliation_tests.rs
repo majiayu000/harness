@@ -280,12 +280,14 @@ fn classify_issue_state_handles_open_and_closed() {
     assert_eq!(
         classify_issue_state(&GitHubIssueState {
             state: "open".to_string(),
+            state_reason: None,
         }),
         GitHubState::Open
     );
     assert_eq!(
         classify_issue_state(&GitHubIssueState {
             state: "closed".to_string(),
+            state_reason: None,
         }),
         GitHubState::IssueClosed
     );
@@ -311,7 +313,7 @@ fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
     let candidate = runtime_candidate_from_instance(&active, row_updated_at).expect("candidate");
     assert_eq!(candidate.workflow_id, "workflow-1");
     assert_eq!(candidate.row_updated_at, row_updated_at);
-    assert_eq!(candidate.pr_number, 77);
+    assert_eq!(candidate.pr_number, Some(77));
     assert_eq!(candidate.repo.as_deref(), Some("owner/repo"));
 
     let terminal = WorkflowInstance::new(
@@ -342,7 +344,7 @@ fn ready_to_merge_open_alert_uses_row_age() {
         repo: Some("owner/repo".to_string()),
         project_root: None,
         issue_number: Some(42),
-        pr_number: 77,
+        pr_number: Some(77),
         pr_url: Some("https://github.com/owner/repo/pull/77".to_string()),
     };
     let settings = RuntimeWorkflowReconciliationSettings {
@@ -628,7 +630,7 @@ async fn ready_to_merge_reconciliation_alerts_for_open_pr_after_ttl() -> anyhow:
     .await;
     assert!(report.workflow_transitions.is_empty());
     assert_eq!(report.workflow_alerts.len(), 1);
-    assert_eq!(report.workflow_alerts[0].pr_number, 101);
+    assert_eq!(report.workflow_alerts[0].pr_number, Some(101));
     assert_eq!(report.workflow_alerts[0].state, "ready_to_merge");
     Ok(())
 }

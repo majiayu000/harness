@@ -38,17 +38,21 @@ pub(super) fn runtime_candidate_from_instance(
     let pr_number = instance
         .data
         .get("pr_number")
-        .and_then(serde_json::Value::as_u64)?;
+        .and_then(serde_json::Value::as_u64);
+    let issue_number = instance
+        .data
+        .get("issue_number")
+        .and_then(serde_json::Value::as_u64);
+    if pr_number.is_none() && issue_number.is_none() {
+        return None;
+    }
     Some(RuntimeWorkflowCandidate {
         workflow_id: instance.id.clone(),
         state: instance.state.clone(),
         row_updated_at,
         repo: optional_json_string(&instance.data, "repo"),
         project_root: optional_json_string(&instance.data, "project_id").map(PathBuf::from),
-        issue_number: instance
-            .data
-            .get("issue_number")
-            .and_then(serde_json::Value::as_u64),
+        issue_number,
         pr_number,
         pr_url: optional_json_string(&instance.data, "pr_url"),
     })
@@ -63,14 +67,19 @@ pub(super) async fn resolve_runtime_github_state(
         rate.acquire().await;
         return fetch_pr_state_by_url(pr_url, github_token).await;
     }
-    if let Some(repo) = candidate.repo.as_deref() {
+    if let (Some(repo), Some(pr_number)) = (candidate.repo.as_deref(), candidate.pr_number) {
         rate.acquire().await;
-        return fetch_pr_state_by_slug_with_token(repo, candidate.pr_number, github_token).await;
+        return fetch_pr_state_by_slug_with_token(repo, pr_number, github_token).await;
+    }
+    if let (Some(repo), Some(issue_number)) = (candidate.repo.as_deref(), candidate.issue_number) {
+        rate.acquire().await;
+        return fetch_issue_state_with_token(repo, issue_number, github_token).await;
     }
     tracing::debug!(
         workflow_id = %candidate.workflow_id,
         pr = candidate.pr_number,
-        "workflow runtime GitHub state check skipped because repository slug is unavailable"
+        issue = candidate.issue_number,
+        "workflow runtime GitHub state check skipped because remote target is unavailable"
     );
     GitHubState::Unknown
 }

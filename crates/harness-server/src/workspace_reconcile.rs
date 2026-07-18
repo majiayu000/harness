@@ -351,7 +351,8 @@ impl WorkspaceManager {
 
             let should_remove = matches!(
                 gh_state,
-                crate::reconciliation::GitHubState::IssueClosed
+                crate::reconciliation::GitHubState::IssueCompleted
+                    | crate::reconciliation::GitHubState::IssueClosed
                     | crate::reconciliation::GitHubState::PrMerged
                     | crate::reconciliation::GitHubState::PrClosed
             );

@@ -15,6 +15,8 @@ use std::{
 };
 use tokio::time::sleep;
 
+#[path = "reconciliation_apply.rs"]
+mod reconciliation_apply;
 #[path = "reconciliation_github.rs"]
 mod reconciliation_github;
 #[path = "reconciliation_periodic.rs"]
@@ -22,6 +24,7 @@ mod reconciliation_periodic;
 #[path = "reconciliation_runtime.rs"]
 mod reconciliation_runtime;
 
+use self::reconciliation_apply::apply_runtime_workflow_transition;
 use self::reconciliation_github::fetch_pr_state_by_url;
 #[cfg(test)]
 use self::reconciliation_github::{
@@ -36,6 +39,7 @@ use self::reconciliation_runtime::runtime_candidate_from_instance;
 use self::reconciliation_runtime::{collect_runtime_candidates, resolve_runtime_github_state};
 pub use reconciliation_periodic::start;
 
+/// A workflow-runtime issue PR workflow with a bound GitHub PR or issue.
 struct RuntimeWorkflowCandidate {
     workflow_id: String,
     state: String,
@@ -43,7 +47,7 @@ struct RuntimeWorkflowCandidate {
     repo: Option<String>,
     project_root: Option<PathBuf>,
     issue_number: Option<u64>,
-    pr_number: u64,
+    pr_number: Option<u64>,
     pr_url: Option<String>,
 }
 
@@ -80,7 +84,7 @@ pub struct WorkflowReconciliationTransition {
     pub applied: bool,
     pub repo: Option<String>,
     pub issue_number: Option<u64>,
-    pub pr_number: u64,
+    pub pr_number: Option<u64>,
     pub pr_url: Option<String>,
 }
 
@@ -93,7 +97,7 @@ pub struct WorkflowReconciliationAlert {
     pub ttl_secs: u64,
     pub repo: Option<String>,
     pub issue_number: Option<u64>,
-    pub pr_number: u64,
+    pub pr_number: Option<u64>,
     pub pr_url: Option<String>,
 }
 
@@ -215,7 +219,9 @@ fn runtime_transition_for_github_state(
     match github_state {
         GitHubState::PrMerged => Some(("done", "reconciled: PR merged externally")),
         GitHubState::PrClosed => Some(("cancelled", "reconciled: PR closed externally")),
-        GitHubState::IssueClosed | GitHubState::Open | GitHubState::Unknown => None,
+        GitHubState::IssueCompleted => Some(("done", "reconciled: issue completed externally")),
+        GitHubState::IssueClosed => Some(("cancelled", "reconciled: issue closed externally")),
+        GitHubState::Open | GitHubState::Unknown => None,
     }
 }
 
@@ -322,200 +328,12 @@ fn ready_to_merge_open_alert(
     })
 }
 
-async fn apply_runtime_workflow_transition(
-    runtime_store: &WorkflowRuntimeStore,
-    issue_workflows: Option<&IssueWorkflowStore>,
-    candidate: &RuntimeWorkflowCandidate,
-    target_state: &str,
-    reason: &str,
-) -> anyhow::Result<bool> {
-    let Some(mut instance) = runtime_store.get_instance(&candidate.workflow_id).await? else {
-        return Ok(false);
-    };
-    if instance.is_terminal() || instance.state != candidate.state {
-        return Ok(false);
-    }
-    let event_type = if target_state == "done" {
-        "PrMerged"
-    } else {
-        "PrClosed"
-    };
-    let command_type = if target_state == "done" {
-        WorkflowCommandType::MarkDone
-    } else {
-        WorkflowCommandType::MarkCancelled
-    };
-    let decision_name = if target_state == "done" {
-        "reconcile_pr_merged"
-    } else {
-        "reconcile_pr_closed"
-    };
-    let decision = WorkflowDecision::new(
-        &instance.id,
-        &instance.state,
-        decision_name,
-        target_state,
-        reason,
-    )
-    .with_command(WorkflowCommand::new(
-        command_type,
-        format!(
-            "runtime-reconcile:{}:{}:{}",
-            instance.id, target_state, candidate.pr_number
-        ),
-        json!({
-            "workflow_id": instance.id,
-            "repo": candidate.repo.as_deref(),
-            "issue_number": candidate.issue_number,
-            "pr_number": candidate.pr_number,
-            "pr_url": candidate.pr_url.as_deref(),
-            "reason": reason,
-        }),
-    ))
-    .with_evidence(WorkflowEvidence::new(
-        "github_pr",
-        runtime_pr_evidence_summary(candidate),
-    ))
-    .high_confidence();
-    DecisionValidator::github_issue_pr().validate(
-        &instance,
-        &decision,
-        &ValidationContext::new("reconciliation", chrono::Utc::now()),
-    )?;
-
-    instance.state = decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_runtime_reconciliation_data(
-        instance.data,
-        decision_name,
-        target_state,
-        reason,
-        candidate,
-    );
-    let event_payload = json!({
-        "repo": candidate.repo.as_deref(),
-        "issue_number": candidate.issue_number,
-        "pr_number": candidate.pr_number,
-        "pr_url": candidate.pr_url.as_deref(),
-        "target_state": target_state,
-        "reason": reason,
-    });
-    let Some(_) = runtime_store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: candidate.state.as_str(),
-            create_if_missing: None,
-            event_type,
-            source: "reconciliation",
-            payload: event_payload,
-            decision: &decision,
-            final_instance: &instance,
-            command_status: WorkflowCommandStatus::Completed,
-        })
-        .await?
-    else {
-        return Ok(false);
-    };
-    record_runtime_issue_side_effects(issue_workflows, candidate, target_state, reason).await;
-    Ok(true)
-}
-
-fn runtime_pr_evidence_summary(candidate: &RuntimeWorkflowCandidate) -> String {
-    format!(
-        "repo={} issue={} pr={} url={}",
-        candidate.repo.as_deref().unwrap_or("<unknown>"),
-        candidate
-            .issue_number
-            .map(|issue| issue.to_string())
-            .unwrap_or_else(|| "<unknown>".to_string()),
-        candidate.pr_number,
-        candidate.pr_url.as_deref().unwrap_or("<unknown>")
-    )
-}
-
-fn merge_runtime_reconciliation_data(
-    mut data: serde_json::Value,
-    decision: &str,
-    target_state: &str,
-    reason: &str,
-    candidate: &RuntimeWorkflowCandidate,
-) -> serde_json::Value {
-    if let Some(object) = data.as_object_mut() {
-        object.insert("last_decision".to_string(), json!(decision));
-        object.insert("reconciled_at".to_string(), json!(chrono::Utc::now()));
-        object.insert("reconciliation_reason".to_string(), json!(reason));
-        object.insert("external_pr_state".to_string(), json!(target_state));
-        object.insert("pr_number".to_string(), json!(candidate.pr_number));
-        if let Some(pr_url) = candidate.pr_url.as_deref() {
-            object.insert("pr_url".to_string(), json!(pr_url));
-        }
-        if let Some(repo) = candidate.repo.as_deref() {
-            object.insert("repo".to_string(), json!(repo));
-        }
-        if let Some(issue_number) = candidate.issue_number {
-            object.insert("issue_number".to_string(), json!(issue_number));
-        }
-    }
-    data
-}
-
-async fn record_runtime_issue_side_effects(
-    issue_workflows: Option<&IssueWorkflowStore>,
-    candidate: &RuntimeWorkflowCandidate,
-    target_state: &str,
-    reason: &str,
-) {
-    let (Some(issue_workflows), Some(project_root)) =
-        (issue_workflows, candidate.project_root.as_deref())
-    else {
-        return;
-    };
-    let project_id = project_root.to_string_lossy();
-    let result = if target_state == "done" {
-        if let Some(issue_number) = candidate.issue_number {
-            issue_workflows
-                .record_pr_merged_for_issue(
-                    &project_id,
-                    candidate.repo.as_deref(),
-                    issue_number,
-                    candidate.pr_number,
-                    candidate.pr_url.as_deref(),
-                    Some(reason),
-                )
-                .await
-        } else {
-            issue_workflows
-                .record_pr_merged(
-                    &project_id,
-                    candidate.repo.as_deref(),
-                    candidate.pr_number,
-                    Some(reason),
-                )
-                .await
-        }
-    } else {
-        issue_workflows
-            .record_terminal_for_pr(
-                &project_id,
-                candidate.repo.as_deref(),
-                candidate.pr_number,
-                false,
-                true,
-                Some(reason),
-            )
-            .await
-    };
-    if let Err(error) = result {
-        tracing::warn!(
-            repo = candidate.repo.as_deref(),
-            pr_number = candidate.pr_number,
-            "reconciliation: issue workflow side effect failed: {error}"
-        );
-    }
-}
-
 #[cfg(test)]
 #[path = "reconciliation_payload_tests.rs"]
 mod payload_tests;
+#[cfg(test)]
+#[path = "reconciliation_state_tests.rs"]
+mod state_tests;
 #[cfg(test)]
 #[path = "reconciliation_tests.rs"]
 mod tests;
