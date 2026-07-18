@@ -26,6 +26,7 @@ fn ready_pr() -> Value {
             ]
         },
         "closingIssuesReferences": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
             "nodes": [
                 {"number": 12, "url": "https://github.com/owner/repo/issues/12"}
             ]
@@ -52,7 +53,20 @@ fn maps_graphql_pr_to_runtime_snapshot_artifact() {
     assert_eq!(snapshot["active_unresolved_review_threads_count"], 0);
     assert_eq!(snapshot["changed_files"][0]["path"], "src/lib.rs");
     assert_eq!(snapshot["closing_issues"][0]["number"], 12);
+    assert_eq!(snapshot["closing_issues_complete"], true);
     assert_eq!(snapshot["review_threads_complete"], true);
+}
+
+#[test]
+fn marks_paginated_closing_issue_snapshot_incomplete() -> anyhow::Result<()> {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let mut pr = ready_pr();
+    pr["closingIssuesReferences"]["pageInfo"]["hasNextPage"] = json!(true);
+
+    let snapshot = normalize_github_pr_snapshot(&target, &pr)?;
+
+    assert_eq!(snapshot["closing_issues_complete"], false);
+    Ok(())
 }
 
 #[test]

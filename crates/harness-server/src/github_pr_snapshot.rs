@@ -218,6 +218,10 @@ async fn fetch_github_pr_snapshot_value(
                 }
               }
               closingIssuesReferences(first: 20) {
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
                 nodes {
                   number
                   url
@@ -313,6 +317,7 @@ fn normalize_github_pr_snapshot(
     let observed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let review_threads_complete = !connection_has_next_page(pr, "reviewThreads");
     let changed_files_complete = !connection_has_next_page(pr, "files");
+    let closing_issues_complete = !connection_has_next_page(pr, "closingIssuesReferences");
 
     Ok(json!({
         "schema": SERVER_PR_SNAPSHOT_SCHEMA,
@@ -349,6 +354,7 @@ fn normalize_github_pr_snapshot(
         "changed_files": changed_files,
         "changed_files_complete": changed_files_complete,
         "closing_issues": closing_issues,
+        "closing_issues_complete": closing_issues_complete,
     }))
 }
 

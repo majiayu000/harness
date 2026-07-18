@@ -1,8 +1,10 @@
 use chrono::Utc;
 use harness_workflow::issue_lifecycle::{workflow_id, IssueLifecycleState, IssueWorkflowStore};
 use harness_workflow::runtime::{
-    RemoteFactSnapshot, WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
-    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    RemoteFactSnapshot, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
+    WorkflowDecision, WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore,
+    WorkflowSubject, WorkflowSubmissionDecisionTransition, GITHUB_ISSUE_PR_DEFINITION_ID,
+    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
@@ -55,6 +57,7 @@ pub(crate) fn runtime_issue_state_is_covered(state: &str) -> bool {
             | "awaiting_feedback"
             | "feedback_claimed"
             | "addressing_feedback"
+            | "quality_gate_pending"
             | "ready_to_merge"
             | "merging"
             | "done"
@@ -217,6 +220,7 @@ async fn recover_github_pr_coverage_with_client(
         github_token,
         api_base_url,
         "all",
+        None,
     )
     .await?;
 
@@ -225,7 +229,7 @@ async fn recover_github_pr_coverage_with_client(
         let artifacts =
             fetch_github_pr_snapshot_with_client(client, &target, github_token, graphql_url)
                 .await?;
-        if !snapshot_closes_issue(&artifacts.normalized_snapshot, issue_number) {
+        if !snapshot_confirms_closing_candidate(&artifacts.normalized_snapshot, issue_number) {
             continue;
         }
 
@@ -267,22 +271,27 @@ async fn recover_github_pr_coverage_with_client(
     Ok(GitHubIssueCoverage::Uncovered)
 }
 
-fn snapshot_closes_issue(snapshot: &serde_json::Value, issue_number: u64) -> bool {
-    snapshot
+fn snapshot_confirms_closing_candidate(snapshot: &serde_json::Value, issue_number: u64) -> bool {
+    let contains_issue = snapshot
         .get("closing_issues")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|issues| {
             issues.iter().any(|issue| {
                 issue.get("number").and_then(serde_json::Value::as_u64) == Some(issue_number)
             })
-        })
+        });
+    contains_issue
+        || snapshot
+            .get("closing_issues_complete")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
 }
 
 fn recovered_runtime_state(readiness: PrReadiness) -> &'static str {
     match readiness {
         PrReadiness::NeedsFeedbackRepair | PrReadiness::NeedsCiRepair => "awaiting_feedback",
         PrReadiness::WaitingForChecks | PrReadiness::WaitingForMergeability => "pr_open",
-        PrReadiness::ReadyToMerge => "ready_to_merge",
+        PrReadiness::ReadyToMerge => "quality_gate_pending",
         PrReadiness::Merged => "done",
         PrReadiness::ClosedUnmerged => "cancelled",
     }
@@ -326,6 +335,18 @@ async fn persist_recovered_workflow(
     }
     data = crate::workflow_runtime_policy::merge_runtime_retry_policy(project_root, data);
 
+    if state == "quality_gate_pending" {
+        return persist_recovered_quality_gate(
+            runtime_store,
+            project_id,
+            repo,
+            issue_number,
+            candidate,
+            data,
+        )
+        .await;
+    }
+
     if let Some(mut existing) = runtime_store.get_instance(&id).await? {
         if recovered_closed_pr_requires_lookup(&existing) {
             existing.state = state.to_string();
@@ -346,6 +367,98 @@ async fn persist_recovered_workflow(
     .with_data(data);
     runtime_store.insert_instance_if_absent(&recovered).await?;
     Ok(())
+}
+
+async fn persist_recovered_quality_gate(
+    runtime_store: &WorkflowRuntimeStore,
+    project_id: &str,
+    repo: &str,
+    issue_number: u64,
+    candidate: &ClosingPullRequestCandidate,
+    data: serde_json::Value,
+) -> anyhow::Result<()> {
+    let id = workflow_id(project_id, Some(repo), issue_number);
+    let existing = runtime_store.get_instance(&id).await?;
+    if existing
+        .as_ref()
+        .is_some_and(|workflow| !recovered_closed_pr_requires_lookup(workflow))
+    {
+        return Ok(());
+    }
+
+    let create_if_missing = existing.is_none();
+    let initial = existing.unwrap_or_else(|| {
+        WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "awaiting_feedback",
+            WorkflowSubject::new("issue", format!("issue:{issue_number}")),
+        )
+        .with_id(id.clone())
+        .with_data(data.clone())
+    });
+    let task_id = format!("github-issue:{repo}:issue:{issue_number}");
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::StartChildWorkflow,
+        format!("quality-gate:{task_id}:{}:run", candidate.number),
+        json!({
+            "definition_id": QUALITY_GATE_DEFINITION_ID,
+            "subject_key": format!("pr:{}", candidate.number),
+            "child_activity": QUALITY_GATE_ACTIVITY,
+            "pr_number": candidate.number,
+            "pr_url": candidate.url,
+            "validation_commands": [],
+        }),
+    );
+    let decision = WorkflowDecision::new(
+        &id,
+        &initial.state,
+        "recover_pr_quality_gate",
+        "quality_gate_pending",
+        "Recovered a ready closing PR; run the quality gate before merge eligibility.",
+    )
+    .with_command(command)
+    .with_evidence(WorkflowEvidence::new(
+        "server_pr_snapshot",
+        "GitHub reported a green, approved, mergeable closing PR.",
+    ))
+    .high_confidence();
+    let mut final_instance = initial.clone();
+    final_instance.state = decision.next_state.clone();
+    final_instance.data = data;
+    final_instance.version = final_instance.version.saturating_add(1);
+    let committed = runtime_store
+        .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+            workflow_id: &id,
+            expected_state: &initial.state,
+            expected_version: initial.version,
+            create_if_missing: create_if_missing.then_some(&initial),
+            event_id: None,
+            new_event_id: None,
+            event_type: "ClosingPrCoverageRecovered",
+            source: "github_intake_coverage",
+            payload: json!({
+                "issue_number": issue_number,
+                "pr_number": candidate.number,
+                "target_state": "quality_gate_pending",
+            }),
+            decision: &decision,
+            existing_record: None,
+            rejection_reason: None,
+            final_instance: Some(&final_instance),
+            command_status: WorkflowCommandStatus::Pending,
+            prompt_payload: None,
+        })
+        .await?;
+    if committed.is_some()
+        || runtime_store
+            .get_instance(&id)
+            .await?
+            .is_some_and(|workflow| workflow.state == "quality_gate_pending")
+    {
+        return Ok(());
+    }
+    anyhow::bail!("closing PR coverage recovery lost a concurrent workflow state transition")
 }
 
 #[cfg(test)]
@@ -382,6 +495,7 @@ mod tests {
     #[test]
     fn runtime_coverage_includes_stopped_and_recovered_states() {
         assert!(runtime_issue_state_is_covered("ready_to_merge"));
+        assert!(runtime_issue_state_is_covered("quality_gate_pending"));
         assert!(runtime_issue_state_is_covered("blocked"));
         assert!(runtime_issue_state_is_covered("failed"));
         assert!(runtime_issue_state_is_covered("replanning"));

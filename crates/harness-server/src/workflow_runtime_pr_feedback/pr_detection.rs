@@ -245,6 +245,7 @@ async fn find_existing_pr_for_issue_in_repo(
         github_token,
         api_base_url,
         "open",
+        Some(1),
     )
     .await?
     .into_iter()
@@ -259,6 +260,7 @@ pub(crate) async fn find_closing_prs_for_issue_in_repo(
     github_token: Option<&str>,
     api_base_url: &str,
     state: &str,
+    candidate_limit: Option<usize>,
 ) -> anyhow::Result<Vec<ClosingPullRequestCandidate>> {
     let mut next_url = Some(github_pulls_url(api_base_url, repo_slug, state));
     let mut seen_urls = HashSet::new();
@@ -299,6 +301,13 @@ pub(crate) async fn find_closing_prs_for_issue_in_repo(
                     url: item.url,
                 }),
         );
+
+        if let Some(limit) = candidate_limit {
+            if candidates.len() >= limit {
+                candidates.truncate(limit);
+                break;
+            }
+        }
 
         next_url = page.next_url;
     }

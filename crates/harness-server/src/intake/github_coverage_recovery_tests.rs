@@ -48,7 +48,7 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
         coverage,
         GitHubIssueCoverage::Covered {
             source: "github_closing_pr",
-            state: "ready_to_merge".to_string(),
+            state: "quality_gate_pending".to_string(),
         }
     );
     assert_recovered_binding(
@@ -56,10 +56,10 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
         &project_id,
         issue_number,
         pr_number,
-        "ready_to_merge",
+        "quality_gate_pending",
     )
     .await?;
-    assert_no_agent_work(&store, &project_id, issue_number).await?;
+    assert_quality_gate_queued(&store, &project_id, issue_number, pr_number).await?;
 
     let repeated = check_github_issue_coverage(
         None,
@@ -72,7 +72,7 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
     )
     .await?;
     assert!(matches!(repeated, GitHubIssueCoverage::Covered { .. }));
-    assert_no_agent_work(&store, &project_id, issue_number).await?;
+    assert_quality_gate_queued(&store, &project_id, issue_number, pr_number).await?;
 
     drop(store);
     let reopened = WorkflowRuntimeStore::open_with_database_url(
@@ -96,10 +96,10 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
         &project_id,
         issue_number,
         pr_number,
-        "ready_to_merge",
+        "quality_gate_pending",
     )
     .await?;
-    assert_no_agent_work(&reopened, &project_id, issue_number).await?;
+    assert_quality_gate_queued(&reopened, &project_id, issue_number, pr_number).await?;
     Ok(())
 }
 
@@ -288,6 +288,54 @@ async fn github_lookup_failure_is_visible_and_leaves_no_dispatchable_work() -> a
     Ok(())
 }
 
+#[tokio::test]
+async fn incomplete_closing_issue_snapshot_preserves_exact_rest_candidate() -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("paginated-closing-issues");
+    std::fs::create_dir(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let issue_number = 1_777;
+    let pr_number = 1_778;
+    let rest_url = spawn_json_server(
+        "200 OK",
+        vec![rest_candidates(&[(pr_number, issue_number)])],
+    )
+    .await;
+    let mut snapshot = pr_snapshot(pr_number, issue_number, "OPEN", "PENDING", false);
+    snapshot["closingIssuesReferences"] = json!({
+        "pageInfo": {"hasNextPage": true, "endCursor": "cursor-20"},
+        "nodes": (1_u64..=20)
+            .map(|number| json!({
+                "number": number,
+                "url": format!("https://github.com/{REPO}/issues/{number}"),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let graphql_url = spawn_json_server("200 OK", vec![graphql_response(snapshot)]).await;
+
+    let coverage = recover_with_urls(
+        &store,
+        &project_root,
+        &project_id,
+        issue_number,
+        &rest_url,
+        &graphql_url,
+    )
+    .await?;
+
+    assert_eq!(
+        coverage,
+        GitHubIssueCoverage::Covered {
+            source: "github_closing_pr",
+            state: "pr_open".to_string(),
+        }
+    );
+    assert_recovered_binding(&store, &project_id, issue_number, pr_number, "pr_open").await?;
+    Ok(())
+}
+
 async fn open_runtime_store() -> anyhow::Result<Option<(tempfile::TempDir, WorkflowRuntimeStore)>> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(None);
@@ -353,6 +401,27 @@ async fn assert_no_agent_work(
     Ok(())
 }
 
+async fn assert_quality_gate_queued(
+    store: &WorkflowRuntimeStore,
+    project_id: &str,
+    issue_number: u64,
+    pr_number: u64,
+) -> anyhow::Result<()> {
+    let id = workflow_id(project_id, Some(REPO), issue_number);
+    let commands = store.commands_for(&id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].command.command_type,
+        WorkflowCommandType::StartChildWorkflow
+    );
+    assert_eq!(
+        commands[0].command.command["definition_id"],
+        QUALITY_GATE_DEFINITION_ID
+    );
+    assert_eq!(commands[0].command.command["pr_number"], pr_number);
+    Ok(())
+}
+
 fn rest_candidates(prs: &[(u64, u64)]) -> Value {
     Value::Array(
         prs.iter()
@@ -399,6 +468,7 @@ fn pr_snapshot(
             "nodes": [],
         },
         "closingIssuesReferences": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
             "nodes": [{
                 "number": issue_number,
                 "url": format!("https://github.com/{REPO}/issues/{issue_number}"),
