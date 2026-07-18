@@ -189,6 +189,14 @@ class HarnessSdkTests(unittest.TestCase):
                 "submission_id": "submission-running",
                 "status": "implementing",
                 "project": "/repo",
+                "pending_approvals": [
+                    {
+                        "type": "approval_request",
+                        "id": "request-1",
+                        "action": "run pytest",
+                        "approved": None,
+                    }
+                ],
             }
 
         result = Harness(cwd="/repo", http_handler=handler).start_thread().run(
@@ -197,6 +205,17 @@ class HarnessSdkTests(unittest.TestCase):
 
         self.assertEqual(result.status, "running")
         self.assertTrue(result.timed_out)
+        self.assertEqual(
+            result.turn["items"] if result.turn else None,
+            [
+                {
+                    "type": "approval_request",
+                    "id": "request-1",
+                    "action": "run pytest",
+                    "approved": None,
+                }
+            ],
+        )
         self.assertTrue(
             any(event["method"] == "sdk:turn/timeout" for event in result.events)
         )
@@ -223,6 +242,26 @@ class HarnessSdkTests(unittest.TestCase):
         self.assertEqual(result.status, "running")
         self.assertTrue(result.timed_out)
         self.assertEqual(result.events[-1]["method"], "sdk:turn/timeout")
+
+    def test_run_rejects_malformed_pending_approvals(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del path, body
+            if method == "POST":
+                return {
+                    "task_id": "submission-running",
+                    "execution_path": "workflow_runtime",
+                }
+            return {
+                "submission_id": "submission-running",
+                "status": "implementing",
+                "project": "/repo",
+                "pending_approvals": {"id": "request-1"},
+            }
+
+        with self.assertRaisesRegex(
+            RuntimeError, "runtime pending_approvals must be an array"
+        ):
+            Harness(cwd="/repo", http_handler=handler).start_thread().run("Run")
 
     def test_wrapped_socket_timeout_preserves_timeout_type(self) -> None:
         harness = Harness(base_url="http://127.0.0.1:9800")

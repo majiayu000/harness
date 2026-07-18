@@ -16,9 +16,15 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     let agent = RuntimeStreamAgent::new();
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", agent.clone());
-    let state =
-        make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
-            .await?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.agents.sandbox_mode = SandboxMode::WorkspaceWrite;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &project_root,
+        config,
+        registry,
+    )
+    .await?;
     let store = state
         .core
         .workflow_runtime_store
@@ -46,7 +52,6 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     );
     runtime_profile.model = Some("gpt-runtime".to_string());
     runtime_profile.reasoning_effort = Some("medium".to_string());
-    runtime_profile.sandbox = Some("read-only".to_string());
     runtime_profile.approval_policy = Some("on-request".to_string());
     runtime_profile.timeout_secs = Some(300);
     let runtime_job = store
@@ -182,7 +187,10 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(reasoning_efforts.as_slice(), &[Some("medium".to_string())]);
     drop(reasoning_efforts);
     let sandbox_modes = agent.sandbox_modes.lock().await;
-    assert_eq!(sandbox_modes.as_slice(), &[Some(SandboxMode::ReadOnly)]);
+    assert_eq!(
+        sandbox_modes.as_slice(),
+        &[Some(SandboxMode::WorkspaceWrite)]
+    );
     drop(sandbox_modes);
     let approval_policies = agent.approval_policies.lock().await;
     assert_eq!(

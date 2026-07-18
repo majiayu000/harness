@@ -6,7 +6,9 @@ import {
   SDK_TURN_COMPLETED,
   SDK_TURN_TIMEOUT,
   type ThreadEvent,
+  type TurnSnapshot,
 } from "../src/index";
+import { turnSignature } from "../src/utils";
 
 interface RecordedCall {
   url: string;
@@ -60,6 +62,24 @@ test("startThread creates a local project handle without a server request", asyn
 
   assert.equal(thread.id, "/repo");
   assert.equal(mock.calls.length, 0);
+});
+
+test("turn signatures change when a pending approval request changes", () => {
+  const turn = (id: string): TurnSnapshot => ({
+    id: "submission-1",
+    thread_id: "/repo",
+    status: "running",
+    items: [
+      {
+        type: "approval_request",
+        id,
+        action: "run tests",
+        approved: null,
+      },
+    ],
+  });
+
+  assert.notEqual(turnSignature(turn("request-1")), turnSignature(turn("request-2")));
 });
 
 test("startThread requires a project root", async () => {
@@ -282,6 +302,14 @@ test("run emits timeout while a runtime submission remains active", async () => 
         submission_id: "submission-running",
         status: "implementing",
         project: "/repo",
+        pending_approvals: [
+          {
+            type: "approval_request",
+            id: "request-1",
+            action: "run cargo test",
+            approved: null,
+          },
+        ],
       },
     };
   });
@@ -296,8 +324,41 @@ test("run emits timeout while a runtime submission remains active", async () => 
 
   assert.equal(result.status, "running");
   assert.equal(result.timedOut, true);
+  assert.deepEqual(result.turn?.items, [
+    {
+      type: "approval_request",
+      id: "request-1",
+      action: "run cargo test",
+      approved: null,
+    },
+  ]);
   assert.ok(result.events.some((event) => event.method === SDK_TURN_TIMEOUT));
   assert.ok(mock.calls.every((call) => !call.url.endsWith("/artifacts")));
+});
+
+test("run rejects malformed pending approvals", async () => {
+  const mock = createMockFetch((call) => {
+    if (call.method === "POST") {
+      return {
+        status: 202,
+        body: { task_id: "submission-running", execution_path: "workflow_runtime" },
+      };
+    }
+    return {
+      body: {
+        submission_id: "submission-running",
+        status: "implementing",
+        project: "/repo",
+        pending_approvals: { id: "request-1" },
+      },
+    };
+  });
+  const harness = new Harness({ fetch: mock.fetch, cwd: "/repo" });
+
+  await assert.rejects(
+    () => harness.startThread().then((thread) => thread.run("Keep going")),
+    /runtime pending_approvals must be an array/,
+  );
 });
 
 test("resumeThread reuses a project handle locally", async () => {

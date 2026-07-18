@@ -1,4 +1,4 @@
-import { HarnessThread, parseTokenUsage } from "./thread";
+import { HarnessThread, parseTokenUsage, parseTurnItems } from "./thread";
 import { HttpTransport } from "./transport";
 import { HarnessHttpError } from "./errors";
 import type {
@@ -24,6 +24,7 @@ interface RuntimeSubmissionDetail {
   created_at?: string | null;
   updated_at?: string | null;
   token_usage?: unknown;
+  pending_approvals?: unknown;
 }
 
 interface RuntimeArtifact {
@@ -88,7 +89,12 @@ export class Harness {
       throw new Error("runtime submission detail must be an object");
     }
     const status = runtimeStatusToTurnStatus(detail.status);
-    const items = await this.runtimeItems(turnId, status, detail.error);
+    const items = await this.runtimeItems(
+      turnId,
+      status,
+      detail.error,
+      detail.pending_approvals,
+    );
     const tokenUsage = parseTokenUsage(detail.token_usage);
     return {
       id: detail.submission_id || turnId,
@@ -107,9 +113,10 @@ export class Harness {
     turnId: string,
     status: TurnStatus,
     taskError: string | null | undefined,
+    pendingApprovals: unknown,
   ): Promise<TurnItem[]> {
     if (status === "running") {
-      return [];
+      return parsePendingApprovals(pendingApprovals);
     }
     let artifacts: unknown;
     try {
@@ -158,6 +165,29 @@ export class Harness {
   resolveRunTimeoutMs(value: number | undefined): number {
     return Math.max(1, value ?? this.defaultRunTimeoutMs);
   }
+}
+
+function parsePendingApprovals(value: unknown): TurnItem[] {
+  if (typeof value === "undefined") {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("runtime pending_approvals must be an array");
+  }
+  const items = parseTurnItems(value);
+  if (
+    !items ||
+    items.some(
+      (item) =>
+        item.type !== "approval_request" ||
+        typeof item.id !== "string" ||
+        item.id.length === 0 ||
+        (typeof item.approved !== "undefined" && item.approved !== null),
+    )
+  ) {
+    throw new Error("runtime pending_approvals contains an invalid approval request");
+  }
+  return items;
 }
 
 function runtimeStatusToTurnStatus(status: string): TurnStatus {

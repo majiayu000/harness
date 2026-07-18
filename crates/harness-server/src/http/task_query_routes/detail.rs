@@ -49,6 +49,8 @@ struct RuntimeTaskResponse {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     token_usage: Option<harness_core::types::TokenUsage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_approvals: Vec<harness_core::types::Item>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<TaskTerminalInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -194,6 +196,11 @@ async fn runtime_task_response_by_handle(
             total_tokens: usage.metrics.total_tokens(),
             cost_usd: harness_workflow::runtime::cost_usd_from_micros(usage.cost_usd_micros),
         });
+    let pending_approvals = state
+        .core
+        .server
+        .thread_manager
+        .pending_approval_items_for_runtime_handle(&submission_id);
     let description = Some(super::runtime_submissions::runtime_submission_description(
         &workflow, task_kind, issue,
     ));
@@ -227,6 +234,7 @@ async fn runtime_task_response_by_handle(
         issue,
         error,
         token_usage,
+        pending_approvals,
         terminal,
         depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
         subtask_ids: Vec::new(),

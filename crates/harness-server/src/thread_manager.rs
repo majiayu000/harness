@@ -412,6 +412,36 @@ impl ThreadManager {
         }
     }
 
+    pub fn pending_approval_items_for_runtime_handle(&self, handle: &str) -> Vec<Item> {
+        record_usage(UsageProbeSurface::ThreadManager);
+        let direct_turn_id = TurnId::from_str(handle);
+        let turn_ids = if self.find_thread_and_turn(&direct_turn_id).is_some() {
+            vec![direct_turn_id]
+        } else {
+            self.runtime_turn_aliases
+                .get(handle)
+                .map(|turn_ids| turn_ids.clone())
+                .unwrap_or_default()
+        };
+
+        turn_ids
+            .iter()
+            .filter_map(|turn_id| self.find_thread_and_turn(turn_id))
+            .filter(|(_, turn)| matches!(turn.status, TurnStatus::Running))
+            .flat_map(|(_, turn)| turn.items)
+            .filter(|item| {
+                matches!(
+                    item,
+                    Item::ApprovalRequest {
+                        id: Some(_),
+                        approved: None,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
     /// Append a steering instruction to the turn's item list, then forward the
     /// instruction to the live adapter if one is registered for this turn.
     ///

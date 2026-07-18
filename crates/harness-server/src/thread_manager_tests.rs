@@ -630,6 +630,47 @@ async fn respond_approval_on_runtime_handle_rejects_missing_request_for_multiple
     Ok(())
 }
 
+#[test]
+fn pending_approval_items_for_runtime_handle_returns_only_actionable_running_items(
+) -> anyhow::Result<()> {
+    let tm = ThreadManager::new();
+    let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+    let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+    tm.add_item(
+        &thread_id,
+        &turn_id,
+        Item::ApprovalRequest {
+            id: Some("request-1".to_string()),
+            action: "run tests".to_string(),
+            approved: None,
+        },
+    )?;
+    tm.add_item(
+        &thread_id,
+        &turn_id,
+        Item::ApprovalRequest {
+            id: Some("request-2".to_string()),
+            action: "run formatter".to_string(),
+            approved: Some(true),
+        },
+    )?;
+    tm.register_runtime_turn_alias("submission-1", &turn_id);
+
+    assert_eq!(
+        tm.pending_approval_items_for_runtime_handle("submission-1"),
+        vec![Item::ApprovalRequest {
+            id: Some("request-1".to_string()),
+            action: "run tests".to_string(),
+            approved: None,
+        }]
+    );
+    tm.complete_turn(&thread_id, &turn_id)?;
+    assert!(tm
+        .pending_approval_items_for_runtime_handle("submission-1")
+        .is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 async fn steer_active_turn_after_deregister_is_noop() -> anyhow::Result<()> {
     let tm = ThreadManager::new();

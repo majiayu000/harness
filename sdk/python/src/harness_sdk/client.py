@@ -120,7 +120,11 @@ class Harness:
             raise RuntimeError("runtime submission detail must be an object")
         status = _runtime_status_to_turn_status(detail.get("status"))
         items = self._runtime_items(
-            turn_id, status, detail.get("error"), timeout_seconds
+            turn_id,
+            status,
+            detail.get("error"),
+            detail.get("pending_approvals"),
+            timeout_seconds,
         )
         turn: dict[str, Any] = {
             "id": detail.get("submission_id") or turn_id,
@@ -142,10 +146,11 @@ class Harness:
         turn_id: str,
         status: str,
         task_error: Any,
+        pending_approvals: Any,
         timeout_seconds: float | None,
     ) -> list[dict[str, Any]]:
         if status == "running":
-            return []
+            return _parse_pending_approvals(pending_approvals)
         encoded_id = urllib.parse.quote(turn_id, safe="")
         try:
             artifacts = self._request(
@@ -388,6 +393,28 @@ def _runtime_status_to_turn_status(status: Any) -> str:
     if status == "cancelled":
         return "cancelled"
     return "running"
+
+
+def _parse_pending_approvals(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RuntimeError("runtime pending_approvals must be an array")
+    approvals: list[dict[str, Any]] = []
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "approval_request"
+            or not isinstance(item.get("id"), str)
+            or not item["id"]
+            or not isinstance(item.get("action"), str)
+            or item.get("approved") is not None
+        ):
+            raise RuntimeError(
+                "runtime pending_approvals contains an invalid approval request"
+            )
+        approvals.append(dict(item))
+    return approvals
 
 
 def _parse_token_usage(value: Any) -> dict[str, int | float] | None:

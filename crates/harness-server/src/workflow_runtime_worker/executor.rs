@@ -93,7 +93,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             workflow.as_ref(),
             &job,
         );
-        let sandbox_mode = runtime_profile_sandbox_mode(&runtime_profile)?;
+        let sandbox_mode = Some(
+            runtime_profile_sandbox_mode(&runtime_profile)?
+                .unwrap_or(self.state.core.server.config.agents.sandbox_mode),
+        );
         let approval_policy = runtime_profile_approval_policy(&runtime_profile, job.runtime_kind)?;
         let prompt_task_request =
             prompt_task_request_for_job(&job, self.state.core.workflow_runtime_store.as_deref())

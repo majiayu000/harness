@@ -203,7 +203,7 @@ function parseTurnSnapshot(value: unknown): TurnSnapshot | undefined {
   return snapshot;
 }
 
-function parseTurnItems(items: unknown[]): TurnItem[] | undefined {
+export function parseTurnItems(items: unknown[]): TurnItem[] | undefined {
   const parsedItems: TurnItem[] = [];
   for (const item of items) {
     const parsedItem = parseTurnItem(item);

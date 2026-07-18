@@ -1155,6 +1155,30 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         .as_str()
         .expect("runtime submission should expose a stable handle")
         .to_string();
+    let live_thread_id = state
+        .core
+        .server
+        .thread_manager
+        .start_thread(project_root.clone());
+    let live_turn_id = state.core.server.thread_manager.start_turn(
+        &live_thread_id,
+        "approval-gated runtime turn".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+    state.core.server.thread_manager.add_item(
+        &live_thread_id,
+        &live_turn_id,
+        Item::ApprovalRequest {
+            id: Some("request-1".to_string()),
+            action: "run cargo test".to_string(),
+            approved: None,
+        },
+    )?;
+    state
+        .core
+        .server
+        .thread_manager
+        .register_runtime_turn_alias(&submission_id, &live_turn_id);
     let declarative_submission_id = "declarative-submission-handle";
     let declarative = WorkflowInstance::new(
         "custom_dashboard_flow",
@@ -1305,6 +1329,15 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
     assert_eq!(detail["submission_id"], submission_id);
     assert_eq!(detail["execution_path"], "workflow_runtime");
     assert_eq!(detail["description"], "prompt task");
+    assert_eq!(
+        detail["pending_approvals"],
+        serde_json::json!([{
+            "type": "approval_request",
+            "id": "request-1",
+            "action": "run cargo test",
+            "approved": null
+        }])
+    );
     assert!(detail["pr_url"].is_null());
     assert!(detail["created_at"].as_str().is_some());
     assert!(detail["updated_at"].as_str().is_some());
