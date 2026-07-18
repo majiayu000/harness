@@ -653,9 +653,7 @@ impl DecisionValidator {
         context: &ValidationContext,
     ) -> Result<bool, WorkflowDecisionRejection> {
         if self.kind != DecisionValidatorKind::GithubIssuePr
-            || !github_issue_pr_validation::is_reconciliation_only_pr_merge_done_transition(
-                decision,
-            )
+            || !github_issue_pr_validation::is_reconciliation_only_done_transition(decision)
         {
             return Ok(false);
         }
@@ -667,7 +665,7 @@ impl DecisionValidator {
         );
         self.validate_commands(&rule, decision, context)?;
         validator_progress::validate_target_progress_contract(instance, decision)?;
-        github_issue_pr_validation::validate_reconciliation_only_pr_merge_done(decision, context)?;
+        github_issue_pr_validation::validate_reconciliation_only_done(decision, context)?;
         Ok(true)
     }
 

@@ -112,11 +112,19 @@ fn render_report(report: &ReconciliationReport, dry_run: bool) -> String {
             "dry-run"
         };
         let repo = transition.repo.as_deref().unwrap_or("<unknown>");
+        let target = transition
+            .pr_number
+            .map(|number| format!("{repo}#{number}"))
+            .or_else(|| {
+                transition
+                    .issue_number
+                    .map(|number| format!("{repo} issue #{number}"))
+            })
+            .unwrap_or_else(|| repo.to_string());
         output.push_str(&format!(
-            "  workflow {} {}#{}: {} → {} ({}) [{}]\n",
+            "  workflow {} {}: {} → {} ({}) [{}]\n",
             transition.workflow_id,
-            repo,
-            transition.pr_number,
+            target,
             transition.from,
             transition.to,
             transition.reason,
@@ -130,13 +138,17 @@ fn render_report(report: &ReconciliationReport, dry_run: bool) -> String {
             .issue_number
             .map(|number| number.to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
+        let pr_number = alert
+            .pr_number
+            .map(|number| number.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
         let pr_url = alert.pr_url.as_deref().unwrap_or("<unknown>");
         output.push_str(&format!(
             "  workflow alert {} repo={} issue=#{} pr=#{} state={} age_secs={} ttl_secs={} reason={} url={}\n",
             alert.workflow_id,
             repo,
             issue_number,
-            alert.pr_number,
+            pr_number,
             alert.state,
             alert.age_secs,
             alert.ttl_secs,
@@ -255,7 +267,7 @@ mod tests {
                 applied: false,
                 repo: Some("owner/repo".to_string()),
                 issue_number: Some(41),
-                pr_number: 42,
+                pr_number: Some(42),
                 pr_url: Some("https://example.test/pr/42".to_string()),
             }],
             workflow_alerts: vec![WorkflowReconciliationAlert {
@@ -266,7 +278,7 @@ mod tests {
                 ttl_secs: 60,
                 repo: Some("owner/repo".to_string()),
                 issue_number: None,
-                pr_number: 43,
+                pr_number: Some(43),
                 pr_url: None,
             }],
         }
