@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Generator, Literal, TypedDict
+from typing import Any, Callable, Generator, Literal, Optional, TypedDict
 
 
 EventMethod = Literal[
@@ -24,7 +25,7 @@ class Event(TypedDict):
     timestamp: str
 
 
-HttpHandler = Callable[[str, str, dict[str, Any] | None], Any]
+HttpHandler = Callable[[str, str, Optional[dict[str, Any]]], Any]
 EventHandler = Callable[[Event], None]
 
 
@@ -236,7 +237,7 @@ class Harness:
             )
             raise HarnessHttpError(error.code, message, data) from error
         except urllib.error.URLError as error:
-            if isinstance(error.reason, TimeoutError):
+            if isinstance(error.reason, (TimeoutError, socket.timeout)):
                 raise TimeoutError("HTTP request timed out") from error
             raise RuntimeError(f"HTTP request failed: {error.reason}") from error
         try:

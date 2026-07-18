@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import unittest
 import urllib.error
 from typing import Any
@@ -226,12 +227,14 @@ class HarnessSdkTests(unittest.TestCase):
     def test_wrapped_socket_timeout_preserves_timeout_type(self) -> None:
         harness = Harness(base_url="http://127.0.0.1:9800")
 
-        with mock.patch(
-            "urllib.request.urlopen",
-            side_effect=urllib.error.URLError(TimeoutError("socket timed out")),
-        ):
-            with self.assertRaisesRegex(TimeoutError, "HTTP request timed out"):
-                harness.turn_status("submission-timeout")
+        for timeout_type in (TimeoutError, socket.timeout):
+            with self.subTest(timeout_type=timeout_type):
+                with mock.patch(
+                    "urllib.request.urlopen",
+                    side_effect=urllib.error.URLError(timeout_type("socket timed out")),
+                ):
+                    with self.assertRaisesRegex(TimeoutError, "HTTP request timed out"):
+                        harness.turn_status("submission-timeout")
 
     def test_resume_thread_reuses_project_handle_locally(self) -> None:
         runtime = FakeRuntime()
