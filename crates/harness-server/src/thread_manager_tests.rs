@@ -575,6 +575,15 @@ async fn respond_approval_on_turn_propagates_unsupported_error() -> anyhow::Resu
     let tm = ThreadManager::new();
     let thread_id = tm.start_thread(PathBuf::from("/tmp"));
     let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+    tm.add_item(
+        &thread_id,
+        &turn_id,
+        Item::ApprovalRequest {
+            id: Some("req-1".to_string()),
+            action: "run tests".to_string(),
+            approved: None,
+        },
+    )?;
     tm.register_active_adapter(&turn_id, Arc::new(AlwaysUnsupportedAdapter));
 
     let err = tm

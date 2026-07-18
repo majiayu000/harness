@@ -704,7 +704,7 @@ fn parse_app_server_agent_event(
             .unwrap_or(ParsedCodexMessage::Ignore),
         "thread/tokenUsage/updated" => params
             .get("tokenUsage")
-            .and_then(|usage| usage.get("last"))
+            .and_then(|usage| usage.get("total"))
             .and_then(parse_codex_token_usage)
             .map(|usage| ParsedCodexMessage::Event(AgentEvent::TokenUsage { usage }))
             .unwrap_or(ParsedCodexMessage::Ignore),

@@ -120,15 +120,15 @@ fn parse_error_notification() {
 
 #[test]
 fn otel_turn_spans_parse_token_usage_notification() {
-    let line = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":15},"total":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":15}}}}"#;
+    let line = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":15},"total":{"inputTokens":25,"cachedInputTokens":9,"outputTokens":8,"reasoningOutputTokens":5,"totalTokens":38}}}}"#;
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
         ParsedCodexMessage::Event(AgentEvent::TokenUsage {
             usage: harness_core::types::TokenUsage {
-                input_tokens: 10,
-                output_tokens: 3,
-                total_tokens: 15,
+                input_tokens: 25,
+                output_tokens: 8,
+                total_tokens: 38,
                 cost_usd: 0.0,
             }
         })

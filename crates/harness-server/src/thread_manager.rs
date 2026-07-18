@@ -442,6 +442,22 @@ impl ThreadManager {
             .collect()
     }
 
+    fn has_pending_approval_request(&self, turn_id: &TurnId, request_id: &str) -> bool {
+        self.find_thread_and_turn(turn_id).is_some_and(|(_, turn)| {
+            matches!(turn.status, TurnStatus::Running)
+                && turn.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        Item::ApprovalRequest {
+                            id: Some(id),
+                            approved: None,
+                            ..
+                        } if id == request_id
+                    )
+                })
+        })
+    }
+
     /// Append a steering instruction to the turn's item list, then forward the
     /// instruction to the live adapter if one is registered for this turn.
     ///
@@ -493,21 +509,25 @@ impl ThreadManager {
         let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
             harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
         })?;
-        if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
-            for item in &mut turn.items {
-                if let Item::ApprovalRequest {
-                    id: Some(id),
-                    approved: status,
-                    ..
-                } = item
-                {
-                    if id == request_id {
-                        *status = Some(approved);
-                        break;
-                    }
-                }
-            }
-        }
+        let turn = thread
+            .turns
+            .iter_mut()
+            .find(|turn| turn.id == *turn_id)
+            .ok_or_else(|| harness_core::error::HarnessError::TurnNotFound(turn_id.to_string()))?;
+        let status = turn.items.iter_mut().find_map(|item| match item {
+            Item::ApprovalRequest {
+                id: Some(id),
+                approved,
+                ..
+            } if id == request_id && approved.is_none() => Some(approved),
+            _ => None,
+        });
+        let status = status.ok_or_else(|| {
+            harness_core::error::HarnessError::TurnNotFound(format!(
+                "{turn_id}/approvals/{request_id}"
+            ))
+        })?;
+        *status = Some(approved);
         thread.updated_at = chrono::Utc::now();
         Ok(())
     }
@@ -527,6 +547,11 @@ impl ThreadManager {
         let thread_id = self
             .find_thread_for_turn(turn_id)
             .ok_or_else(|| harness_core::error::HarnessError::TurnNotFound(turn_id.to_string()))?;
+        if !self.has_pending_approval_request(turn_id, &request_id) {
+            return Err(harness_core::error::HarnessError::TurnNotFound(format!(
+                "{turn_id}/approvals/{request_id}"
+            )));
+        }
         let adapter = self
             .running_adapters
             .get(turn_id.as_str())
@@ -537,13 +562,7 @@ impl ThreadManager {
                     .respond_approval(request_id.clone(), decision.clone())
                     .await?;
                 let approved = matches!(decision, ApprovalDecision::Accept);
-                if let Err(e) = self.set_approval_status(&thread_id, turn_id, &request_id, approved)
-                {
-                    tracing::warn!(
-                        turn_id = %turn_id,
-                        "failed to update approval status in thread state: {e}"
-                    );
-                }
+                self.set_approval_status(&thread_id, turn_id, &request_id, approved)?;
                 Ok(())
             }
             None => Err(harness_core::error::HarnessError::Unsupported(format!(
@@ -572,21 +591,11 @@ impl ThreadManager {
             .unwrap_or_default();
         let matching = candidates
             .iter()
-            .filter(|turn_id| {
-                self.find_thread_and_turn(turn_id).is_some_and(|(_, turn)| {
-                    turn.items.iter().any(|item| {
-                        matches!(
-                            item,
-                            Item::ApprovalRequest { id: Some(id), .. } if id == &request_id
-                        )
-                    })
-                })
-            })
+            .filter(|turn_id| self.has_pending_approval_request(turn_id, &request_id))
             .cloned()
             .collect::<Vec<_>>();
         let turn_id = match matching.as_slice() {
             [turn_id] => turn_id.clone(),
-            [] if candidates.len() == 1 => candidates[0].clone(),
             [] => {
                 return Err(harness_core::error::HarnessError::TurnNotFound(
                     handle.to_string(),
