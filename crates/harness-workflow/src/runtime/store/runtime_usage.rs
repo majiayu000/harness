@@ -262,6 +262,26 @@ impl WorkflowRuntimeStore {
             cost_usd_micros: i64_to_u64(row.6, "cost_usd_micros")?,
         }))
     }
+
+    /// Return one durable runtime turn count per workflow for dashboard
+    /// distribution metrics. Each persisted usage key represents one turn (or
+    /// the runtime job fallback when an adapter does not expose a turn id).
+    pub async fn runtime_turn_counts(&self) -> anyhow::Result<Vec<u32>> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*)
+             FROM runtime_usage_events
+             GROUP BY workflow_id
+             ORDER BY COUNT(*) ASC, workflow_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(count,)| {
+                u32::try_from(count)
+                    .map_err(|_| anyhow::anyhow!("runtime turn count is outside u32 range"))
+            })
+            .collect()
+    }
 }
 
 fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<RuntimeUsageRecord> {

@@ -149,6 +149,35 @@ async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn runtime_turn_counts_group_usage_by_workflow() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let first = runtime_usage_upsert(RuntimeUsageMetrics {
+        input_tokens: 1,
+        output_tokens: 1,
+        ..Default::default()
+    });
+    let mut second = first.clone();
+    second.runtime_job_id = "runtime-job-2".to_string();
+    second.turn_id = Some("turn-2".to_string());
+    let mut other_workflow = first.clone();
+    other_workflow.runtime_job_id = "runtime-job-3".to_string();
+    other_workflow.workflow_id = "workflow-2".to_string();
+    other_workflow.turn_id = Some("turn-3".to_string());
+
+    for usage in [&first, &second, &other_workflow] {
+        store.upsert_runtime_usage(usage).await?;
+    }
+
+    assert_eq!(store.runtime_turn_counts().await?, vec![1, 2]);
+    Ok(())
+}
+
 fn runtime_usage_upsert(metrics: RuntimeUsageMetrics) -> RuntimeUsageUpsert {
     RuntimeUsageUpsert {
         runtime_job_id: "runtime-job-1".to_string(),
