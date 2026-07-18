@@ -45,7 +45,7 @@ export class HarnessThread {
     }
 
     if (!latestTurn && turnId) {
-      latestTurn = await this.client.turnStatus(turnId);
+      latestTurn = await this.client.turnStatus(turnId, this.id);
     }
 
     return {
@@ -78,7 +78,7 @@ export class HarnessThread {
           thread_id: this.id,
           turn_id: turnId,
           source: "sdk-poll",
-          server_method: "turn/start",
+          server_method: "POST /api/workflows/runtime/submissions",
         },
         timestamp: new Date().toISOString(),
       },
@@ -86,7 +86,7 @@ export class HarnessThread {
     );
 
     while (true) {
-      const turn = await this.client.turnStatus(turnId);
+      const turn = await this.client.turnStatus(turnId, this.id);
       const signature = turnSignature(turn);
 
       if (signature !== previousSignature) {
@@ -99,7 +99,7 @@ export class HarnessThread {
               turn_id: turnId,
               turn,
               source: "sdk-poll",
-              server_method: "turn/status",
+              server_method: "GET /api/workflows/runtime/submissions/{id}",
             },
             timestamp: new Date().toISOString(),
           },
@@ -117,7 +117,7 @@ export class HarnessThread {
               status: turn.status,
               token_usage: turn.token_usage ?? null,
               source: "sdk-poll",
-              server_method: "turn/status",
+              server_method: "GET /api/workflows/runtime/submissions/{id}",
             },
             timestamp: new Date().toISOString(),
           },
@@ -135,7 +135,7 @@ export class HarnessThread {
               turn_id: turnId,
               timeout_ms: timeoutMs,
               source: "sdk-poll",
-              server_method: "turn/status",
+              server_method: "GET /api/workflows/runtime/submissions/{id}",
             },
             timestamp: new Date().toISOString(),
           },
@@ -203,7 +203,7 @@ function parseTurnSnapshot(value: unknown): TurnSnapshot | undefined {
   return snapshot;
 }
 
-function parseTurnItems(items: unknown[]): TurnItem[] | undefined {
+export function parseTurnItems(items: unknown[]): TurnItem[] | undefined {
   const parsedItems: TurnItem[] = [];
   for (const item of items) {
     const parsedItem = parseTurnItem(item);
@@ -295,7 +295,7 @@ function parseTurnItem(value: unknown): TurnItem | undefined {
   }
 }
 
-function parseTokenUsage(value: unknown): TokenUsage | undefined {
+export function parseTokenUsage(value: unknown): TokenUsage | undefined {
   if (!isRecord(value)) {
     return undefined;
   }

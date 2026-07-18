@@ -68,7 +68,6 @@ pub(crate) mod workflow_runtime_submission;
 pub(crate) mod workflow_runtime_worker;
 pub use harness_workflow::task_queue;
 pub mod task_runner;
-pub mod thread_db;
 pub mod thread_manager;
 pub mod trusted_proxy;
 pub mod webhook;

@@ -1,10 +1,5 @@
-import { HarnessRpcError } from "./errors";
-import type {
-  FetchLike,
-  HarnessOptions,
-  RpcEnvelope,
-  RpcRequestEnvelope,
-} from "./types";
+import { HarnessHttpError } from "./errors";
+import type { FetchLike, HarnessOptions } from "./types";
 import { normalizeBaseUrl, withTimeout } from "./utils";
 
 function resolveFetch(customFetch: FetchLike | undefined): FetchLike {
@@ -20,15 +15,14 @@ function resolveFetch(customFetch: FetchLike | undefined): FetchLike {
   return (url, init) => (globalFetch as FetchLike)(url, init);
 }
 
-export class RpcTransport {
-  private readonly endpoint: string;
+export class HttpTransport {
+  private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
   private readonly requestTimeoutMs: number;
   private readonly headers: Record<string, string>;
-  private nextRequestId: number;
 
   constructor(options: HarnessOptions) {
-    this.endpoint = `${normalizeBaseUrl(options.baseUrl)}/rpc`;
+    this.baseUrl = normalizeBaseUrl(options.baseUrl);
     this.fetchImpl = resolveFetch(options.fetch);
     this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
     const headers: Record<string, string> = {
@@ -40,50 +34,45 @@ export class RpcTransport {
       headers.authorization = `Bearer ${token}`;
     }
     this.headers = headers;
-    this.nextRequestId = 1;
   }
 
-  async request<T>(method: string, params: Record<string, unknown>): Promise<T> {
-    const payload: RpcRequestEnvelope = {
-      jsonrpc: "2.0",
-      id: this.nextRequestId++,
-      method,
-      params,
-    };
-
+  async request<T>(
+    method: "GET" | "POST",
+    path: string,
+    body?: Record<string, unknown>,
+  ): Promise<T> {
     const responseText = await withTimeout(
-      this.fetchImpl(this.endpoint, {
-        method: "POST",
+      this.fetchImpl(`${this.baseUrl}${path}`, {
+        method,
         headers: this.headers,
-        body: JSON.stringify(payload),
+        ...(body ? { body: JSON.stringify(body) } : {}),
       }).then(async (response) => {
-        const body = await response.text();
+        const responseBody = await response.text();
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${body}`);
+          let data: unknown = responseBody;
+          try {
+            data = JSON.parse(responseBody) as unknown;
+          } catch {
+            // Preserve non-JSON error bodies verbatim.
+          }
+          const message =
+            typeof data === "object" && data !== null && "error" in data
+              ? String((data as { error: unknown }).error)
+              : `HTTP ${response.status}`;
+          throw new HarnessHttpError(response.status, message, data);
         }
-        return body;
+        return responseBody;
       }),
       this.requestTimeoutMs,
-      `RPC request timeout after ${this.requestTimeoutMs}ms for method '${method}'`,
+      `HTTP request timeout after ${this.requestTimeoutMs}ms for ${method} ${path}`,
     );
 
-    let parsed: RpcEnvelope<T>;
     try {
-      parsed = JSON.parse(responseText) as RpcEnvelope<T>;
+      return JSON.parse(responseText) as T;
     } catch (error) {
       throw new Error(
-        `Failed to parse RPC response for '${method}': ${(error as Error).message}`,
+        `Failed to parse HTTP response for ${method} ${path}: ${(error as Error).message}`,
       );
     }
-
-    if (parsed.error) {
-      throw new HarnessRpcError(parsed.error);
-    }
-
-    if (typeof parsed.result === "undefined") {
-      throw new Error(`Missing RPC result for '${method}'`);
-    }
-
-    return parsed.result;
   }
 }

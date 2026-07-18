@@ -1,3 +1,9 @@
-from .client import Harness, HarnessRpcError, HarnessThread, RunResult
+from .client import Harness, HarnessHttpError, HarnessRpcError, HarnessThread, RunResult
 
-__all__ = ["Harness", "HarnessThread", "RunResult", "HarnessRpcError"]
+__all__ = [
+    "Harness",
+    "HarnessThread",
+    "RunResult",
+    "HarnessHttpError",
+    "HarnessRpcError",
+]

@@ -323,6 +323,8 @@ impl ActivityResultEnvelope {
                 "final_result": {
                     "activity": self.final_result.activity,
                     "status": self.final_result.status,
+                    "summary": self.final_result.summary,
+                    "error": self.final_result.error,
                     "error_kind": self.final_result.error_kind,
                 }
             }),

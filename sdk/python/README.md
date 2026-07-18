@@ -1,6 +1,6 @@
 # Harness Python SDK
 
-Python client for the Harness JSON-RPC app server.
+Python client for Harness workflow-runtime submissions.
 
 ## Install
 
@@ -23,6 +23,12 @@ result = thread.run(
 
 print(result.status, result.output)
 ```
+
+`start_thread()` creates a local project-scoped handle. Each `run()` call submits
+a new prompt through `POST /api/workflows/runtime/submissions` and polls the
+durable runtime submission until it is terminal. `resume_thread(project)`
+reconstructs the same local handle; it does not restore removed server-side
+thread history.
 
 ### Authenticated server
 

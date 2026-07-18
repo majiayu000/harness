@@ -18,41 +18,15 @@ use tracing;
 
 /// In-memory thread registry and turn lifecycle manager.
 ///
-/// `ThreadManager` is a pure in-memory cache with no persistence layer.
-/// It owns only two DashMaps: one for thread state and one for running-turn
-/// task handles.  It intentionally has no `db` field and no async persistence
-/// methods (`open`, `persist`, `persist_insert`, `persist_delete`); those were
-/// removed in issue #97 because they duplicated the write-through logic that
-/// handlers and the task executor perform via `AppState.core.thread_db`.
-///
-/// Thread persistence is handled exclusively by `CoreServices.thread_db`
-/// (`AppState.core.thread_db`).
-///
-/// Lifecycle ownership:
-/// - **Startup hydration**: performed in `http.rs` during app initialisation,
-///   which loads persisted threads from `thread_db` into this cache via
-///   `threads_cache()`.
-/// - **Mutation persistence**: when `thread_db` is configured, mutations to
-///   this cache are followed by a write-through. All persistence helpers
-///   short-circuit when `thread_db` is `None`, so durability is optional.
-///   There are three call sites responsible:
-///   1. `handlers/thread.rs` — `persist_thread` / `persist_thread_insert`
-///      are called after each direct handler mutation: thread create/fork
-///      (`thread_start`, `thread_fork`), turn start (`turn_start`), turn
-///      cancel (`turn_cancel`), turn steer (`turn_steer`), thread resume
-///      (`thread_resume`), and thread compact (`thread_compact`).
-///   2. `handlers/thread.rs` — `thread_delete` removes the entry from this
-///      cache and, when `thread_db` is present, calls `db.delete(...)` to
-///      remove it from the backing store as well.
-///   3. `task_executor` — `persist_runtime_thread` is called (a) after each
-///      stream item is applied to the cache (`task_executor/helpers.rs`
-///      `process_stream_item`), and (b) at turn completion or failure
-///      (`task_executor.rs` and `task_executor/helpers.rs`
-///      `mark_turn_failed`).
+/// `ThreadManager` owns the live in-memory thread and turn state used while a
+/// workflow-runtime job executes. Historical thread persistence was removed
+/// in GH-1434; workflow state and runtime evidence remain durable in the
+/// workflow-runtime store.
 pub struct ThreadManager {
     threads: DashMap<String, Thread>,
     running_turn_tasks: DashMap<String, JoinHandle<()>>,
     running_adapters: DashMap<String, Arc<dyn AgentAdapter>>,
+    runtime_turn_aliases: DashMap<String, Vec<TurnId>>,
 }
 
 impl ThreadManager {
@@ -61,10 +35,11 @@ impl ThreadManager {
             threads: DashMap::new(),
             running_turn_tasks: DashMap::new(),
             running_adapters: DashMap::new(),
+            runtime_turn_aliases: DashMap::new(),
         }
     }
 
-    /// Access the underlying threads cache (for loading persisted threads).
+    /// Access the live threads cache for in-process lifecycle coordination.
     pub fn threads_cache(&self) -> &DashMap<String, Thread> {
         &self.threads
     }
@@ -413,6 +388,76 @@ impl ThreadManager {
         self.running_adapters.remove(turn_id.as_str());
     }
 
+    pub fn register_runtime_turn_alias(&self, alias: &str, turn_id: &TurnId) {
+        record_usage(UsageProbeSurface::ThreadManager);
+        let mut turn_ids = self
+            .runtime_turn_aliases
+            .entry(alias.to_string())
+            .or_default();
+        if !turn_ids.contains(turn_id) {
+            turn_ids.push(turn_id.clone());
+        }
+    }
+
+    pub fn deregister_runtime_turn_alias(&self, alias: &str, turn_id: &TurnId) {
+        record_usage(UsageProbeSurface::ThreadManager);
+        let remove_alias = if let Some(mut turn_ids) = self.runtime_turn_aliases.get_mut(alias) {
+            turn_ids.retain(|candidate| candidate != turn_id);
+            turn_ids.is_empty()
+        } else {
+            false
+        };
+        if remove_alias {
+            self.runtime_turn_aliases.remove(alias);
+        }
+    }
+
+    pub fn pending_approval_items_for_runtime_handle(&self, handle: &str) -> Vec<Item> {
+        record_usage(UsageProbeSurface::ThreadManager);
+        let direct_turn_id = TurnId::from_str(handle);
+        let turn_ids = if self.find_thread_and_turn(&direct_turn_id).is_some() {
+            vec![direct_turn_id]
+        } else {
+            self.runtime_turn_aliases
+                .get(handle)
+                .map(|turn_ids| turn_ids.clone())
+                .unwrap_or_default()
+        };
+
+        turn_ids
+            .iter()
+            .filter_map(|turn_id| self.find_thread_and_turn(turn_id))
+            .filter(|(_, turn)| matches!(turn.status, TurnStatus::Running))
+            .flat_map(|(_, turn)| turn.items)
+            .filter(|item| {
+                matches!(
+                    item,
+                    Item::ApprovalRequest {
+                        id: Some(_),
+                        approved: None,
+                        ..
+                    }
+                )
+            })
+            .collect()
+    }
+
+    fn has_pending_approval_request(&self, turn_id: &TurnId, request_id: &str) -> bool {
+        self.find_thread_and_turn(turn_id).is_some_and(|(_, turn)| {
+            matches!(turn.status, TurnStatus::Running)
+                && turn.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        Item::ApprovalRequest {
+                            id: Some(id),
+                            approved: None,
+                            ..
+                        } if id == request_id
+                    )
+                })
+        })
+    }
+
     /// Append a steering instruction to the turn's item list, then forward the
     /// instruction to the live adapter if one is registered for this turn.
     ///
@@ -464,21 +509,25 @@ impl ThreadManager {
         let mut thread = self.threads.get_mut(thread_id.as_str()).ok_or_else(|| {
             harness_core::error::HarnessError::ThreadNotFound(thread_id.to_string())
         })?;
-        if let Some(turn) = thread.turns.iter_mut().find(|t| t.id == *turn_id) {
-            for item in &mut turn.items {
-                if let Item::ApprovalRequest {
-                    id: Some(id),
-                    approved: status,
-                    ..
-                } = item
-                {
-                    if id == request_id {
-                        *status = Some(approved);
-                        break;
-                    }
-                }
-            }
-        }
+        let turn = thread
+            .turns
+            .iter_mut()
+            .find(|turn| turn.id == *turn_id)
+            .ok_or_else(|| harness_core::error::HarnessError::TurnNotFound(turn_id.to_string()))?;
+        let status = turn.items.iter_mut().find_map(|item| match item {
+            Item::ApprovalRequest {
+                id: Some(id),
+                approved,
+                ..
+            } if id == request_id && approved.is_none() => Some(approved),
+            _ => None,
+        });
+        let status = status.ok_or_else(|| {
+            harness_core::error::HarnessError::TurnNotFound(format!(
+                "{turn_id}/approvals/{request_id}"
+            ))
+        })?;
+        *status = Some(approved);
         thread.updated_at = chrono::Utc::now();
         Ok(())
     }
@@ -486,8 +535,8 @@ impl ThreadManager {
     /// Forward an approval response to the live adapter for the given turn
     /// and update the corresponding `ApprovalRequest` item in thread state.
     ///
-    /// Returns `Err` when no adapter is registered or when the adapter rejects
-    /// the call (e.g. `Unsupported` for Claude-backed turns).
+    /// Returns `Err` when the turn does not exist, no adapter is registered, or
+    /// the adapter rejects the call (e.g. `Unsupported` for Claude-backed turns).
     pub async fn respond_approval_on_turn(
         &self,
         turn_id: &TurnId,
@@ -495,6 +544,14 @@ impl ThreadManager {
         decision: ApprovalDecision,
     ) -> harness_core::error::Result<()> {
         record_usage(UsageProbeSurface::ThreadManager);
+        let thread_id = self
+            .find_thread_for_turn(turn_id)
+            .ok_or_else(|| harness_core::error::HarnessError::TurnNotFound(turn_id.to_string()))?;
+        if !self.has_pending_approval_request(turn_id, &request_id) {
+            return Err(harness_core::error::HarnessError::TurnNotFound(format!(
+                "{turn_id}/approvals/{request_id}"
+            )));
+        }
         let adapter = self
             .running_adapters
             .get(turn_id.as_str())
@@ -504,24 +561,54 @@ impl ThreadManager {
                 adapter
                     .respond_approval(request_id.clone(), decision.clone())
                     .await?;
-                // Update thread state to reflect the decision.
-                if let Some(thread_id) = self.find_thread_for_turn(turn_id) {
-                    let approved = matches!(decision, ApprovalDecision::Accept);
-                    if let Err(e) =
-                        self.set_approval_status(&thread_id, turn_id, &request_id, approved)
-                    {
-                        tracing::warn!(
-                            turn_id = %turn_id,
-                            "failed to update approval status in thread state: {e}"
-                        );
-                    }
-                }
+                let approved = matches!(decision, ApprovalDecision::Accept);
+                self.set_approval_status(&thread_id, turn_id, &request_id, approved)?;
                 Ok(())
             }
             None => Err(harness_core::error::HarnessError::Unsupported(format!(
                 "no active adapter registered for turn {turn_id}"
             ))),
         }
+    }
+
+    pub async fn respond_approval_on_runtime_handle(
+        &self,
+        handle: &str,
+        request_id: String,
+        decision: ApprovalDecision,
+    ) -> harness_core::error::Result<()> {
+        let direct_turn_id = TurnId::from_str(handle);
+        if self.find_thread_for_turn(&direct_turn_id).is_some() {
+            return self
+                .respond_approval_on_turn(&direct_turn_id, request_id, decision)
+                .await;
+        }
+
+        let candidates = self
+            .runtime_turn_aliases
+            .get(handle)
+            .map(|turn_ids| turn_ids.clone())
+            .unwrap_or_default();
+        let matching = candidates
+            .iter()
+            .filter(|turn_id| self.has_pending_approval_request(turn_id, &request_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let turn_id = match matching.as_slice() {
+            [turn_id] => turn_id.clone(),
+            [] => {
+                return Err(harness_core::error::HarnessError::TurnNotFound(
+                    handle.to_string(),
+                ));
+            }
+            _ => {
+                return Err(harness_core::error::HarnessError::Unsupported(format!(
+                    "approval request {request_id} is ambiguous for runtime submission {handle}"
+                )));
+            }
+        };
+        self.respond_approval_on_turn(&turn_id, request_id, decision)
+            .await
     }
 }
 

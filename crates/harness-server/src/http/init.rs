@@ -274,11 +274,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_root,
             home_dir,
             tasks,
-            thread_db: Some(
-                registry
-                    .thread_db
-                    .expect("critical thread DB should be present after startup validation"),
-            ),
             plan_db: Some(
                 registry
                     .plan_db

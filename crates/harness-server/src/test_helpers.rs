@@ -219,11 +219,6 @@ async fn make_state_inner(
         draft_store,
         project_root.to_path_buf(),
     ));
-    let thread_db = crate::thread_db::ThreadDb::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir, "threads"),
-        Some(&database_url),
-    )
-    .await?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(64);
     let task_queue = Arc::new(crate::task_queue::TaskQueue::new(&Default::default()));
 
@@ -262,7 +257,6 @@ async fn make_state_inner(
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| project_root.to_path_buf()),
             tasks,
-            thread_db: Some(thread_db),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,

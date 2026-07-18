@@ -519,7 +519,10 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
     agent_registry
         .register_adapter(
             "codex",
-            Arc::new(CodexAdapter::new(config.agents.codex.cli_path.clone())),
+            Arc::new(CodexAdapter::from_config(
+                config.agents.codex.clone(),
+                config.agents.sandbox_mode,
+            )),
         )
         .context("failed to attach codex adapter")?;
 

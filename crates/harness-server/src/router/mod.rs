@@ -10,7 +10,6 @@
 
 use crate::handlers;
 use crate::http::AppState;
-use harness_core::usage_probe::{record_usage, UsageProbeSurface};
 use harness_protocol::{methods::Method, methods::RpcRequest, methods::RpcResponse};
 
 /// Route a JSON-RPC request to the appropriate handler.
@@ -32,21 +31,6 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         _ => {}
     }
 
-    match &req.method {
-        Method::ThreadStart { .. }
-        | Method::ThreadList
-        | Method::ThreadDelete { .. }
-        | Method::ThreadResume { .. }
-        | Method::ThreadFork { .. }
-        | Method::ThreadCompact { .. } => record_usage(UsageProbeSurface::ThreadRpc),
-        Method::TurnStart { .. }
-        | Method::TurnCancel { .. }
-        | Method::TurnStatus { .. }
-        | Method::TurnSteer { .. }
-        | Method::TurnRespondApproval { .. } => record_usage(UsageProbeSurface::TurnRpc),
-        _ => {}
-    }
-
     match req.method {
         // === Initialization ===
         Method::Initialize => {
@@ -61,7 +45,7 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
                 .notifications
                 .initializing
                 .store(true, Ordering::Relaxed);
-            Some(handlers::thread::initialize(id).await)
+            Some(handlers::initialize::initialize(id).await)
         }
         Method::Initialized => {
             if !state.notifications.initializing.load(Ordering::Relaxed) {
@@ -75,52 +59,13 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
                 .notifications
                 .initialized
                 .store(true, Ordering::Relaxed);
-            handlers::thread::initialized().await;
+            handlers::initialize::initialized().await;
             if id.is_none() {
                 None
             } else {
                 Some(RpcResponse::success(id, serde_json::json!({})))
             }
         }
-
-        // === Thread management ===
-        Method::ThreadStart { cwd } => Some(handlers::thread::thread_start(state, id, cwd).await),
-        Method::ThreadList => Some(handlers::thread::thread_list(state, id).await),
-        Method::ThreadDelete { thread_id } => {
-            Some(handlers::thread::thread_delete(state, id, thread_id).await)
-        }
-        Method::ThreadResume { thread_id } => {
-            Some(handlers::thread::thread_resume(state, id, thread_id).await)
-        }
-        Method::ThreadFork {
-            thread_id,
-            from_turn,
-        } => Some(handlers::thread::thread_fork(state, id, thread_id, from_turn).await),
-        Method::ThreadCompact { thread_id } => {
-            Some(handlers::thread::thread_compact(state, id, thread_id).await)
-        }
-
-        // === Turn control ===
-        Method::TurnStart { thread_id, input } => {
-            Some(handlers::thread::turn_start(state, id, thread_id, input).await)
-        }
-        Method::TurnCancel { turn_id } => {
-            Some(handlers::thread::turn_cancel(state, id, turn_id).await)
-        }
-        Method::TurnStatus { turn_id } => {
-            Some(handlers::thread::turn_status(state, id, turn_id).await)
-        }
-        Method::TurnSteer {
-            turn_id,
-            instruction,
-        } => Some(handlers::thread::turn_steer(state, id, turn_id, instruction).await),
-        Method::TurnRespondApproval {
-            turn_id,
-            request_id,
-            decision,
-        } => Some(
-            handlers::thread::turn_respond_approval(state, id, turn_id, request_id, decision).await,
-        ),
 
         // === Skills ===
         Method::SkillCreate { name, content } => {
@@ -234,9 +179,6 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             request,
             supplied_items,
         } => Some(handlers::context::context_preview(state, id, request, supplied_items).await),
-        Method::ContextManifestGet { thread_id } => {
-            Some(handlers::context::context_manifest_get(state, id, thread_id).await)
-        }
     }
 }
 

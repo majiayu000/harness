@@ -2,8 +2,8 @@ use harness_core::agent::StreamItem;
 use harness_core::types::{ThreadId, TokenUsage, TurnId, TurnStatus};
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use harness_workflow::runtime::{
-    RuntimeKind, RuntimeUsageMetrics, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
-    WorkflowRuntimeStore,
+    cost_usd_to_micros, RuntimeKind, RuntimeUsageMetrics, RuntimeUsageUpsert,
+    RuntimeUsageUpsertOutcome, WorkflowRuntimeStore,
 };
 use std::sync::Arc;
 
@@ -70,6 +70,7 @@ impl RuntimeUsageContext {
                 candidate_index: self.candidate_index,
                 candidate_count: self.candidate_count,
                 metrics: RuntimeUsageMetrics::from_token_usage(usage),
+                cost_usd_micros: cost_usd_to_micros(usage.cost_usd)?,
                 reported_at: chrono::Utc::now(),
             })
             .await?
@@ -90,23 +91,8 @@ pub(crate) fn emit_runtime_notification(
     let _ = notification_tx.send(RpcNotification::new(notification));
 }
 
-pub(crate) async fn persist_runtime_thread(
-    thread_db: &Option<crate::thread_db::ThreadDb>,
-    server: &crate::server::HarnessServer,
-    thread_id: &ThreadId,
-) {
-    if let Some(db) = thread_db {
-        if let Some(thread) = server.thread_manager.get_thread(thread_id) {
-            if let Err(err) = db.update(&thread).await {
-                tracing::warn!("thread_db persist failed during turn execution: {err}");
-            }
-        }
-    }
-}
-
 pub(crate) async fn process_stream_item(
     server: &crate::server::HarnessServer,
-    thread_db: &Option<crate::thread_db::ThreadDb>,
     notify_tx: &Option<crate::notify::NotifySender>,
     notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
     runtime_usage: Option<&RuntimeUsageContext>,
@@ -121,8 +107,6 @@ pub(crate) async fn process_stream_item(
                 .add_item(thread_id, turn_id, item.clone())
             {
                 tracing::warn!("failed to append stream item_started to turn: {err}");
-            } else {
-                persist_runtime_thread(thread_db, server, thread_id).await;
             }
             emit_runtime_notification(
                 notify_tx,
@@ -139,8 +123,6 @@ pub(crate) async fn process_stream_item(
                 .add_item(thread_id, turn_id, item.clone())
             {
                 tracing::warn!("failed to append stream item_completed to turn: {err}");
-            } else {
-                persist_runtime_thread(thread_db, server, thread_id).await;
             }
             emit_runtime_notification(
                 notify_tx,
@@ -158,8 +140,6 @@ pub(crate) async fn process_stream_item(
                     .set_turn_token_usage(thread_id, turn_id, usage.clone())
             {
                 tracing::warn!("failed to update turn token usage: {err}");
-            } else {
-                persist_runtime_thread(thread_db, server, thread_id).await;
             }
             emit_runtime_notification(
                 notify_tx,
@@ -187,8 +167,6 @@ pub(crate) async fn process_stream_item(
                 harness_core::types::Item::Error { code: -1, message },
             ) {
                 tracing::warn!("failed to append stream error item to turn: {err}");
-            } else {
-                persist_runtime_thread(thread_db, server, thread_id).await;
             }
         }
         StreamItem::MessageDelta { text } => {
@@ -223,8 +201,6 @@ pub(crate) async fn process_stream_item(
                 },
             ) {
                 tracing::warn!("failed to append approval request item to turn: {err}");
-            } else {
-                persist_runtime_thread(thread_db, server, thread_id).await;
             }
             emit_runtime_notification(
                 notify_tx,
@@ -252,7 +228,6 @@ pub(crate) async fn process_stream_item(
 
 pub(crate) async fn mark_turn_failed(
     server: &crate::server::HarnessServer,
-    thread_db: &Option<crate::thread_db::ThreadDb>,
     notify_tx: &Option<crate::notify::NotifySender>,
     notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
     thread_id: &ThreadId,
@@ -261,8 +236,6 @@ pub(crate) async fn mark_turn_failed(
 ) {
     if let Err(err) = server.thread_manager.fail_turn(thread_id, turn_id) {
         tracing::warn!("failed to mark turn as failed: {err}");
-    } else {
-        persist_runtime_thread(thread_db, server, thread_id).await;
     }
     emit_runtime_notification(
         notify_tx,
@@ -326,7 +299,6 @@ mod tests {
         process_stream_item(
             &server,
             &None,
-            &None,
             &notification_tx,
             Some(&context),
             &thread_id,
@@ -336,7 +308,7 @@ mod tests {
                     input_tokens: 11,
                     output_tokens: 7,
                     total_tokens: 20,
-                    cost_usd: 0.0,
+                    cost_usd: 0.125,
                 },
             },
         )
@@ -358,6 +330,7 @@ mod tests {
         assert_eq!(records[0].metrics.input_tokens, 11);
         assert_eq!(records[0].metrics.output_tokens, 7);
         assert_eq!(records[0].metrics.total_tokens(), 20);
+        assert_eq!(records[0].cost_usd_micros, 125_000);
         assert_eq!(records[0].candidate_id.as_deref(), Some("candidate-1"));
         assert_eq!(turn.token_usage.total_tokens, 20);
         Ok(())

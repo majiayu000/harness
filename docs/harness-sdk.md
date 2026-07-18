@@ -1,12 +1,18 @@
 # Harness SDKs (TypeScript + Python)
 
-Harness now includes first-party SDK scaffolds for programmatic JSON-RPC usage.
+Harness includes first-party SDKs for programmatic workflow-runtime submissions.
 
 ## Scope
 
-- TypeScript SDK with `startThread()`, `resumeThread()`, `thread.run(prompt)`, and `thread.runStream(prompt)`.
-- Python SDK with `start_thread()`, `resume_thread()`, `thread.run(prompt)`, and `thread.run_stream(prompt)`.
+- TypeScript SDK with local project handles via `startThread()` / `resumeThread()` and runtime-backed `thread.run(prompt)` / `thread.runStream(prompt)`.
+- Python SDK with local project handles via `start_thread()` / `resume_thread()` and runtime-backed `thread.run(prompt)` / `thread.run_stream(prompt)`.
 - Event streaming via SDK lifecycle events (`sdk:turn/started`, `sdk:turn/status`, `sdk:turn/completed`, `sdk:turn/timeout`).
+
+Each run creates a durable submission with `POST /api/workflows/runtime/submissions`,
+polls `GET /api/workflows/runtime/submissions/{id}`, and reads terminal output
+from the submission's artifacts. The thread-shaped SDK object is a local
+project-scoped convenience handle; Harness no longer exposes server-side thread
+or turn lifecycle RPCs.
 
 ## Package Locations
 

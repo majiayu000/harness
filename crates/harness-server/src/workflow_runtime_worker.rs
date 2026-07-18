@@ -13,6 +13,7 @@ mod prompt_input_telemetry;
 mod prompt_packet;
 mod repo_memory_prompt;
 mod runtime_profile;
+mod runtime_turn_control;
 mod runtime_usage;
 mod server_merge;
 pub(crate) mod turn_engine;

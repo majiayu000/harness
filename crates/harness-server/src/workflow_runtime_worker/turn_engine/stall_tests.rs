@@ -64,7 +64,6 @@ async fn lifecycle_fails_silent_stream_with_stall_reason() -> anyhow::Result<()>
     run_turn_lifecycle_with_options(
         server.clone(),
         None,
-        None,
         notification_tx,
         thread_id.clone(),
         turn_id.clone(),
@@ -113,7 +112,6 @@ async fn lifecycle_wall_clock_timeout_wins_when_stall_cannot_be_shorter() -> any
 
     run_turn_lifecycle_with_options(
         server.clone(),
-        None,
         None,
         notification_tx,
         thread_id.clone(),

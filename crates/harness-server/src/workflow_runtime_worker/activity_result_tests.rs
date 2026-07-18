@@ -185,6 +185,11 @@ Final result:
     assert_eq!(envelope["outcome"], "accepted");
     assert_eq!(envelope["extracted_activity"], "implement_issue");
     assert_eq!(envelope["final_result"]["status"], "succeeded");
+    assert_eq!(
+        envelope["final_result"]["summary"],
+        "Implementation completed."
+    );
+    assert!(envelope["final_result"]["error"].is_null());
     assert!(result
         .signals
         .iter()
