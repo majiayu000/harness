@@ -10,7 +10,8 @@ use serde_json::json;
 use std::path::Path;
 
 use super::github_issue_links::{
-    fetch_github_issue_closing_prs_with_client, recovery_expected_base_ref,
+    closing_pr_belongs_to_repo, fetch_github_issue_closing_prs_with_client,
+    recovery_expected_base_ref,
 };
 use super::IncomingIssue;
 use crate::github_pr_snapshot::{
@@ -253,7 +254,10 @@ async fn recover_github_pr_coverage_with_client(
             .await?;
 
     for candidate in candidates {
-        let target = GitHubPrSnapshotTarget::new(repo, candidate.number)?
+        if !closing_pr_belongs_to_repo(&candidate, repo) {
+            continue;
+        }
+        let target = GitHubPrSnapshotTarget::new(&candidate.repo_slug, candidate.number)?
             .with_expected_base_ref(&expected_base_ref);
         let artifacts =
             fetch_github_pr_snapshot_with_client(client, &target, github_token, graphql_url)
@@ -396,19 +400,21 @@ async fn persist_recovered_workflow(
     }
 
     if let Some(mut existing) = runtime_store.get_instance(&id).await? {
-        if recovered_closed_pr_requires_lookup(&existing) {
-            existing.state = state.to_string();
-            existing.data = data;
-            existing.version = existing.version.saturating_add(1);
-            runtime_store.upsert_instance(&existing).await?;
-            return Ok(RecoveredWorkflowPersistence::Persisted);
+        if existing.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
+            return Ok(RecoveredWorkflowPersistence::Rejected);
         }
-        if runtime_issue_state_is_covered(&existing.state) {
+        if runtime_issue_state_is_covered(&existing.state)
+            && !recovered_closed_pr_requires_lookup(&existing)
+        {
             return Ok(RecoveredWorkflowPersistence::ExistingCoverage(
                 existing.state,
             ));
         }
-        return Ok(RecoveredWorkflowPersistence::Rejected);
+        existing.state = state.to_string();
+        existing.data = data;
+        existing.version = existing.version.saturating_add(1);
+        runtime_store.upsert_instance(&existing).await?;
+        return Ok(RecoveredWorkflowPersistence::Persisted);
     }
 
     let recovered = WorkflowInstance::new(

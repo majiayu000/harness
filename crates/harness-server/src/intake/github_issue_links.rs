@@ -11,6 +11,23 @@ use harness_workflow::runtime::WorkflowRuntimeStore;
 
 const GITHUB_ISSUE_LINK_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const GITHUB_ISSUE_LINK_MAX_PAGES: usize = 20;
+const GITHUB_ISSUE_LINK_QUERY: &str = r#"
+    query HarnessIssueClosingPrs(
+      $owner: String!, $repo: String!, $issue: Int!, $cursor: String
+    ) {
+      repository(owner: $owner, name: $repo) {
+        issue(number: $issue) {
+          state
+          closedByPullRequestsReferences(
+            first: 100, after: $cursor, includeClosedPrs: true
+          ) {
+            pageInfo { hasNextPage endCursor }
+            nodes { number url headRefName repository { nameWithOwner } }
+          }
+        }
+      }
+    }
+"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct GitHubIssueClosingPrs {
@@ -74,10 +91,14 @@ pub(super) async fn fetch_github_issue_closing_prs_with_client(
                 .get("number")
                 .and_then(Value::as_u64)
                 .context("GitHub issue closing-PR link omitted PR number")?;
-            if !seen_prs.insert(number) {
+            let repo_slug =
+                crate::github_pr_snapshot::value_string(node.pointer("/repository/nameWithOwner"))
+                    .context("GitHub issue closing-PR query omitted repository nameWithOwner")?;
+            if !seen_prs.insert((repo_slug.clone(), number)) {
                 continue;
             }
             candidates.push(ClosingPullRequestCandidate {
+                repo_slug,
                 number,
                 head_ref_name: crate::github_pr_snapshot::value_string(node.get("headRefName"))
                     .context("GitHub issue closing-PR query omitted headRefName")?,
@@ -101,6 +122,13 @@ pub(super) async fn fetch_github_issue_closing_prs_with_client(
     }
 
     anyhow::bail!("GitHub issue closing-PR query exceeded {GITHUB_ISSUE_LINK_MAX_PAGES} pages")
+}
+
+pub(super) fn closing_pr_belongs_to_repo(
+    candidate: &ClosingPullRequestCandidate,
+    repo_slug: &str,
+) -> bool {
+    candidate.repo_slug.eq_ignore_ascii_case(repo_slug)
 }
 
 pub(super) async fn recovery_expected_base_ref(
@@ -137,27 +165,12 @@ async fn fetch_github_issue_closing_pr_page(
     github_token: Option<&str>,
     graphql_url: &str,
 ) -> anyhow::Result<Value> {
-    let query = r#"
-        query HarnessIssueClosingPrs(
-          $owner: String!, $repo: String!, $issue: Int!, $cursor: String
-        ) {
-          repository(owner: $owner, name: $repo) {
-            issue(number: $issue) {
-              state
-              closedByPullRequestsReferences(first: 100, after: $cursor) {
-                pageInfo { hasNextPage endCursor }
-                nodes { number url headRefName }
-              }
-            }
-          }
-        }
-    "#;
     let mut request = client
         .post(graphql_url)
         .header(ACCEPT, "application/vnd.github+json")
         .header(USER_AGENT, "harness-server")
         .json(&json!({
-            "query": query,
+            "query": GITHUB_ISSUE_LINK_QUERY,
             "variables": {
                 "owner": owner,
                 "repo": repo,
@@ -187,4 +200,28 @@ async fn fetch_github_issue_closing_pr_page(
         );
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_pr_query_requests_closed_prs_and_repository_identity() {
+        assert!(GITHUB_ISSUE_LINK_QUERY.contains("includeClosedPrs: true"));
+        assert!(GITHUB_ISSUE_LINK_QUERY.contains("repository { nameWithOwner }"));
+    }
+
+    #[test]
+    fn closing_pr_repository_match_is_case_insensitive_and_repo_scoped() {
+        let candidate = ClosingPullRequestCandidate {
+            repo_slug: "Owner/Repo".to_string(),
+            number: 42,
+            head_ref_name: "fix/42".to_string(),
+            url: "https://github.com/Owner/Repo/pull/42".to_string(),
+        };
+
+        assert!(closing_pr_belongs_to_repo(&candidate, "owner/repo"));
+        assert!(!closing_pr_belongs_to_repo(&candidate, "owner/other"));
+    }
 }

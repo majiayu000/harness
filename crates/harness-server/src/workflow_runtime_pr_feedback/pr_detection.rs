@@ -28,6 +28,7 @@ struct GhPrListItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClosingPullRequestCandidate {
+    pub(crate) repo_slug: String,
     pub(crate) number: u64,
     pub(crate) head_ref_name: String,
     pub(crate) url: String,
@@ -296,6 +297,7 @@ pub(crate) async fn find_closing_prs_for_issue_in_repo(
                 .into_iter()
                 .filter(|item| pr_claims_to_close_issue(item, issue, Some(repo_slug)))
                 .map(|item| ClosingPullRequestCandidate {
+                    repo_slug: repo_slug.to_string(),
                     number: item.number,
                     head_ref_name: item.head_ref_name,
                     url: item.url,

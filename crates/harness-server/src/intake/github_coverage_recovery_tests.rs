@@ -124,6 +124,14 @@ async fn recovery_maps_open_pr_facts() -> anyhow::Result<()> {
         let project_root = dir.path().join(format!("project-{index}"));
         std::fs::create_dir(&project_root)?;
         let project_id = project_root.to_string_lossy().into_owned();
+        let existing = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "planning",
+            WorkflowSubject::new("issue", format!("issue:{issue_number}")),
+        )
+        .with_id(workflow_id(&project_id, Some(REPO), issue_number));
+        store.upsert_instance(&existing).await?;
         let rest_url = spawn_json_server(
             "200 OK",
             vec![rest_candidates(&[(pr_number, issue_number)])],
@@ -713,6 +721,7 @@ fn issue_links_response(issue_state: &str, prs: &[u64]) -> Value {
                                 "number": pr,
                                 "url": format!("https://github.com/{REPO}/pull/{pr}"),
                                 "headRefName": format!("linked-{pr}"),
+                                "repository": {"nameWithOwner": REPO},
                             }))
                             .collect::<Vec<_>>(),
                     },
