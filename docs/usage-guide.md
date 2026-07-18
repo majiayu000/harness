@@ -164,7 +164,7 @@ Response:
 
 ```json
 {
-  "status": "pending",
+  "status": "implementing",
   "execution_path": "workflow_runtime",
   "submission_id": "prompt-task:...",
   "task_id": "prompt-task:...",
@@ -172,9 +172,9 @@ Response:
 }
 ```
 
-The submission is accepted immediately and persisted as pending runtime work.
-Use `GET /api/workflows/runtime/submissions/{submission_id}` to observe when
-execution starts.
+The submission is accepted immediately and persisted as active runtime work in
+the `implementing` state. Use
+`GET /api/workflows/runtime/submissions/{submission_id}` to observe progress.
 
 ### By GitHub Issue
 

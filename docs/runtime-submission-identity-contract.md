@@ -27,8 +27,10 @@ with list-derived links for detail, stream, proof, artifacts, and prompts.
 
 Historical runtime rows created before explicit submission ids may derive the
 handle from the first string in `data.task_ids`, or from `data.task_id` when the
-array is absent. That lookup rule preserves old runtime links; it does not imply
-that a legacy task row exists.
+array is absent. For those legacy rows, every existing string in
+`data.task_ids` remains a resolvable lookup alias, as does `data.task_id`. These
+lookup rules preserve old runtime links; they do not imply that a legacy task
+row exists.
 
 ### `task_id`
 

@@ -33,6 +33,8 @@ observes results. The following capabilities are **only available over HTTP**:
 | `GET  /api/workflows/runtime/submissions/{id}/stream` | stream | Stream runtime submission events |
 | `POST /api/workflows/runtime/cancel` | cancel | Cancel a workflow by `workflow_id` |
 | `POST /api/workflows/runtime/merge` | merge | Approve or merge a workflow by `workflow_id` |
+| `POST /api/workflows/runtime/unblock` | unblock | Resume a blocked workflow by `workflow_id` |
+| `POST /api/workflows/runtime/retry` | retry | Retry an eligible failed workflow by `workflow_id` |
 | `POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}` | approval | Respond to a live runtime approval request |
 | `POST /webhook` | webhook | GitHub webhook (HMAC-verified) |
 | `POST /webhook/feishu` | webhook | Feishu bot webhook |
@@ -205,4 +207,5 @@ All JSON-RPC errors follow [JSON-RPC 2.0](https://www.jsonrpc.org/specification)
 | `-32006` | `VALIDATION_ERROR` | Input validation failure |
 
 HTTP errors follow standard HTTP status codes (200, 201, 202, 400, 401, 404,
-409, 500, 503).
+409, 422, 500, 503). The runtime proof route returns `422 Unprocessable
+Entity` while an existing submission is not yet terminal.
