@@ -9,6 +9,89 @@ use harness_workflow::runtime::{
 };
 use serde_json::json;
 
+#[tokio::test]
+async fn transcript_reconstruction_route_accepts_provider_exports_above_axum_default_limit(
+) -> anyhow::Result<()> {
+    if harness_core::db::resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.allow_unauthenticated = true;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store")
+        .clone();
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        WorkflowSubject::new("issue", "large-export"),
+    )
+    .with_id("workflow-large-export");
+    store.upsert_instance(&workflow).await?;
+    let command_id = store
+        .enqueue_command(
+            &workflow.id,
+            None,
+            &WorkflowCommand::enqueue_activity("implement_issue", "large-export-command"),
+        )
+        .await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexExec,
+            "codex-default",
+            json!({ "workflow_id": workflow.id, "activity": "implement_issue" }),
+        )
+        .await?;
+    let content = "x".repeat(2 * 1024 * 1024 + 1);
+    let body = json!({
+        "workflow_id": workflow.id,
+        "runtime_job_id": job.id,
+        "content": content,
+    });
+    let app = super::http_router::build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/transcripts/reconstruct")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    let status = response.status();
+    let response_body = http_body_util::BodyExt::collect(response.into_body())
+        .await?
+        .to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected response: {}",
+        String::from_utf8_lossy(&response_body)
+    );
+    let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&job.id);
+    let RuntimeTranscriptRead::Verified(record) =
+        store.read_runtime_transcript(&artifact_ref).await?
+    else {
+        anyhow::bail!("large provider export was not stored as a verified transcript");
+    };
+    assert_eq!(record.content.len(), content.len());
+    Ok(())
+}
+
 fn exact_replay_job(artifact_ref: &str) -> RuntimeJob {
     RuntimeJob::pending(
         "consumer-command",

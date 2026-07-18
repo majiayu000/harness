@@ -6,8 +6,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{
-    prepare_runtime_transcript, ActivityResult, RuntimeJobClaimDecision, RuntimeJobClaimGuard,
-    RuntimeJobNotFoundError, RuntimeKind, WorkflowRuntimeStore,
+    prepare_runtime_transcript, ActivityResult, RuntimeJob, RuntimeJobClaimDecision,
+    RuntimeJobClaimGuard, RuntimeJobNotFoundError, RuntimeKind, WorkflowRuntimeStore,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -270,7 +270,7 @@ pub async fn claim_runtime_job_for_runtime_host(
         Err(response) => return response,
     };
 
-    let job = match store
+    let mut job = match store
         .claim_next_runtime_job_for_runtime_kind(
             RuntimeKind::RemoteHost,
             &host_id,
@@ -349,6 +349,20 @@ pub async fn claim_runtime_job_for_runtime_host(
         }
     }
 
+    if let Err(result) =
+        crate::workflow_runtime_worker::hydrate_exact_replay_transcript(&state, &mut job).await
+    {
+        return complete_runtime_host_preflight_failure(
+            &state,
+            store.as_ref(),
+            &host_id,
+            lease_expires_at,
+            &job,
+            result,
+        )
+        .await;
+    }
+
     let runtime_job_id = job.id.clone();
     let lease_generation = job.lease_generation;
     (
@@ -359,6 +373,99 @@ pub async fn claim_runtime_job_for_runtime_host(
             "runtime_job_id": runtime_job_id,
             "lease_expires_at": lease_expires_at,
             "lease_generation": lease_generation,
+        })),
+    )
+}
+
+async fn complete_runtime_host_preflight_failure(
+    state: &Arc<AppState>,
+    store: &WorkflowRuntimeStore,
+    host_id: &str,
+    lease_expires_at: DateTime<Utc>,
+    job: &RuntimeJob,
+    result: ActivityResult,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let result_payload = match serde_json::to_value(&result) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(
+                runtime_job_id = %job.id,
+                %error,
+                "failed to serialize remote runtime job preflight result"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to serialize runtime job preflight result" })),
+            );
+        }
+    };
+    let completion = match store
+        .commit_runtime_activity_completion_if_owned_with_generation(
+            &job.id,
+            host_id,
+            lease_expires_at,
+            Some(job.lease_generation),
+            &result,
+        )
+        .await
+    {
+        Ok(Some(completion)) => completion,
+        Ok(None) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "claimed": false,
+                    "error": "runtime job lease is not owned by this host"
+                })),
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                runtime_job_id = %job.id,
+                %error,
+                "failed to persist remote runtime job preflight failure"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({ "error": format!("failed to complete runtime job preflight: {error}") }),
+                ),
+            );
+        }
+    };
+    if let Err(error) = store
+        .record_runtime_event(&job.id, "ActivityResultReady", result_payload)
+        .await
+    {
+        tracing::warn!(
+            runtime_job_id = %job.id,
+            %error,
+            "runtime job preflight completion succeeded but event recording failed"
+        );
+    }
+    let mut runtime_job = completion.runtime_job;
+    if let Err(error) = crate::workflow_runtime_worker::record_runtime_circuit_breaker_completion(
+        state.as_ref(),
+        store,
+        &mut runtime_job,
+    )
+    .await
+    {
+        tracing::warn!(
+            runtime_job_id = %job.id,
+            %error,
+            "runtime job preflight completion succeeded but circuit breaker update failed"
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "claimed": false,
+            "preflight_failed": true,
+            "runtime_job_id": job.id,
+            "runtime_job": runtime_job,
+            "workflow_event": completion.workflow_event,
+            "decision": completion.decision,
         })),
     )
 }

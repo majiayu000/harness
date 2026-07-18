@@ -14,6 +14,8 @@ use super::{
     task_query_routes, task_routes,
 };
 
+const MAX_RUNTIME_TRANSCRIPT_RECONSTRUCTION_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(crate::dashboard::index))
@@ -116,7 +118,9 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/workflows/runtime/transcripts/reconstruct",
-            post(task_mutation_routes::reconstruct_runtime_transcript),
+            post(task_mutation_routes::reconstruct_runtime_transcript).layer(
+                DefaultBodyLimit::max(MAX_RUNTIME_TRANSCRIPT_RECONSTRUCTION_BODY_BYTES),
+            ),
         )
         .route(
             "/api/projects/{id}/memory",

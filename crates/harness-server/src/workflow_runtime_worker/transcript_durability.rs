@@ -42,7 +42,7 @@ pub(super) async fn exact_replay_preflight_result(
     }
 }
 
-pub(super) async fn hydrate_exact_replay_transcript(
+pub(crate) async fn hydrate_exact_replay_transcript(
     state: &Arc<AppState>,
     job: &mut RuntimeJob,
 ) -> Result<(), ActivityResult> {

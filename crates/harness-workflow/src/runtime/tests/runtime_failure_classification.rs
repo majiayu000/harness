@@ -198,6 +198,41 @@ fn runtime_transcript_store_failure_uses_bounded_default_backoff() {
 }
 
 #[test]
+fn runtime_transcript_store_failure_honors_explicit_zero_retry_limits() {
+    for retry_policy in [
+        json!({ "max_failed_activity_retries": 0 }),
+        json!({
+            "max_failed_activity_retries": 3,
+            "activity_retries": {
+                "exact_replay": { "max_failed_activity_retries": 0 }
+            }
+        }),
+    ] {
+        let mut instance = issue_instance("implementing");
+        instance.data["runtime_retry_policy"] = retry_policy;
+        let result = ActivityResult::failed(
+            "exact_replay",
+            "transcript preflight failed",
+            "transcript store unavailable",
+        )
+        .with_error_kind(ActivityErrorKind::Retryable)
+        .with_signal(ActivitySignal::new(
+            "RuntimeTranscriptUnavailable",
+            json!({
+                "stop_reason_code": "runtime_transcript_store_unavailable",
+            }),
+        ));
+        let event = runtime_completion_event(&instance, "exact_replay", result);
+
+        let decision = reduce_runtime_job_completed(&instance, &event)
+            .expect("event should parse")
+            .expect("zero-retry transcript failure should terminate");
+        assert_eq!(decision.next_state, "failed");
+        assert_eq!(decision.decision, "fail_after_runtime_activity");
+    }
+}
+
+#[test]
 fn confirmed_runtime_transcript_loss_is_terminal() {
     let instance = issue_instance("implementing");
     let result = ActivityResult::failed(

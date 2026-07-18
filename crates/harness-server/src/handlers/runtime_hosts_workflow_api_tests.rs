@@ -192,6 +192,122 @@ async fn runtime_job_claim_endpoint_claims_remote_host_jobs_only() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn runtime_job_claim_endpoint_hydrates_verified_exact_replay_transcript() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host(&app, "host-a").await?;
+
+    let producer = enqueue_runtime_host_test_job(
+        &store,
+        "replay-producer",
+        RuntimeKind::CodexExec,
+        "codex-default",
+        json!({ "activity": "implement_issue" }),
+    )
+    .await?;
+    let content = "verified provider transcript";
+    let reconstructed = store
+        .reconstruct_runtime_transcript(
+            "runtime-host-test-replay-producer",
+            &producer.id,
+            content,
+            None,
+            "test",
+        )
+        .await?;
+    let consumer = enqueue_runtime_host_test_job(
+        &store,
+        "replay-consumer",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "exact_replay",
+            "command": {
+                "activity": "exact_replay",
+                "exact_replay": {
+                    "transcript_artifact_ref": reconstructed.reference.artifact_ref,
+                },
+            },
+        }),
+    )
+    .await?;
+
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    assert_eq!(claimed["claimed"], true);
+    assert_eq!(claimed["runtime_job_id"], consumer.id);
+    assert_eq!(
+        claimed["runtime_job"]["input"]["command"]["exact_replay"]["transcript"],
+        content
+    );
+    assert_eq!(
+        claimed["runtime_job"]["input"]["command"]["exact_replay"]["verified_transcript"]
+            ["checksum"],
+        reconstructed.reference.checksum
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_claim_endpoint_completes_missing_exact_replay_before_dispatch(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host(&app, "host-a").await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "missing-replay",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "exact_replay",
+            "command": {
+                "activity": "exact_replay",
+                "exact_replay": {
+                    "transcript_artifact_ref": "runtime-transcript:missing",
+                },
+            },
+        }),
+    )
+    .await?;
+
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    assert_eq!(claimed["claimed"], false);
+    assert_eq!(claimed["preflight_failed"], true);
+    assert_eq!(claimed["runtime_job_id"], job.id);
+    assert_eq!(claimed["runtime_job"]["status"], "failed");
+    assert_eq!(
+        claimed["runtime_job"]["output"]["signals"][0]["signal"]["stop_reason_code"],
+        "runtime_transcript_lost"
+    );
+    let persisted = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("preflight-failed job should remain auditable");
+    assert_eq!(persisted.status, RuntimeJobStatus::Failed);
+    assert!(persisted.lease.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_claim_endpoint_blocks_duplicate_claims() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {

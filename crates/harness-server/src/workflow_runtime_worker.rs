@@ -22,6 +22,8 @@ mod transcript_durability;
 pub(crate) mod turn_engine;
 mod workspace;
 
+pub(crate) use transcript_durability::hydrate_exact_replay_transcript;
+
 use crate::http::AppState;
 use crate::runtime_circuit_breaker::{
     classify_agent_failure, CircuitBreakerEvent, CircuitBreakerEventKind, FailureClass,

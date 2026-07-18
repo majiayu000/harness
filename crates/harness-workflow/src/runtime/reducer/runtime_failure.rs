@@ -173,10 +173,7 @@ fn runtime_failure_reason(result: &ActivityResult, fallback: &str) -> String {
 }
 
 fn failed_activity_retry_limit(instance: &WorkflowInstance, activity: &str) -> Option<u64> {
-    if let Some(limit) = retry_policy_u64(instance, activity, "max_failed_activity_retries") {
-        return (limit > 0).then_some(limit);
-    }
-    None
+    retry_policy_u64(instance, activity, "max_failed_activity_retries")
 }
 
 #[derive(Debug, Clone, Copy)]
