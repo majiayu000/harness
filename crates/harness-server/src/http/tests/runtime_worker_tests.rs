@@ -18,6 +18,8 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     registry.register("codex", agent.clone());
     let mut config = harness_core::config::HarnessConfig::default();
     config.agents.sandbox_mode = SandboxMode::WorkspaceWrite;
+    config.agents.codex.default_model = "configured-codex-model".to_string();
+    config.agents.codex.reasoning_effort = "configured-codex-effort".to_string();
     let state = make_test_state_with_workflow_runtime_config_and_registry(
         dir.path(),
         &project_root,
@@ -50,8 +52,6 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         "codex-default",
         harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
     );
-    runtime_profile.model = Some("gpt-runtime".to_string());
-    runtime_profile.reasoning_effort = Some("medium".to_string());
     runtime_profile.approval_policy = Some("on-request".to_string());
     runtime_profile.timeout_secs = Some(300);
     let runtime_job = store
@@ -178,13 +178,18 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert!(prompts[0].contains("Prompt packet:"));
     assert!(prompts[0].contains("activity_result_schema"));
     assert!(prompts[0].contains("required_structured_output"));
-    assert!(prompts[0].contains("gpt-runtime"));
     drop(prompts);
     let models = agent.models.lock().await;
-    assert_eq!(models.as_slice(), &[Some("gpt-runtime".to_string())]);
+    assert_eq!(
+        models.as_slice(),
+        &[Some("configured-codex-model".to_string())]
+    );
     drop(models);
     let reasoning_efforts = agent.reasoning_efforts.lock().await;
-    assert_eq!(reasoning_efforts.as_slice(), &[Some("medium".to_string())]);
+    assert_eq!(
+        reasoning_efforts.as_slice(),
+        &[Some("configured-codex-effort".to_string())]
+    );
     drop(reasoning_efforts);
     let sandbox_modes = agent.sandbox_modes.lock().await;
     assert_eq!(

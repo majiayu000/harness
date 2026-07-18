@@ -31,7 +31,7 @@ use super::prompt_packet::{
 use super::repo_memory_prompt::{repo_memory_config_artifact, repo_memory_for_prompt_packet};
 use super::runtime_profile::{
     agent_name_for_runtime_kind, runtime_profile_approval_policy, runtime_profile_for_job,
-    runtime_profile_sandbox_mode,
+    runtime_profile_model_and_reasoning, runtime_profile_sandbox_mode,
 };
 use super::runtime_turn_control::{force_code_agent_for_runtime_turn, RuntimeTurnAliasGuard};
 use super::runtime_usage::runtime_usage_context;
@@ -96,6 +96,11 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         let sandbox_mode = Some(
             runtime_profile_sandbox_mode(&runtime_profile)?
                 .unwrap_or(self.state.core.server.config.agents.sandbox_mode),
+        );
+        let (model, reasoning_effort) = runtime_profile_model_and_reasoning(
+            &runtime_profile,
+            job.runtime_kind,
+            &self.state.core.server.config.agents.codex,
         );
         let approval_policy = runtime_profile_approval_policy(&runtime_profile, job.runtime_kind)?;
         let prompt_task_request =
@@ -183,8 +188,8 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 prompt,
                 agent_name.to_string(),
                 TurnLifecycleOptions {
-                    model: runtime_profile.model.clone(),
-                    reasoning_effort: runtime_profile.reasoning_effort.clone(),
+                    model,
+                    reasoning_effort,
                     execution_phase,
                     sandbox_mode,
                     approval_policy,

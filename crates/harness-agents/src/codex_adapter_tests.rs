@@ -289,6 +289,99 @@ fn start_params_include_runtime_profile_overrides() {
 }
 
 #[test]
+fn configured_adapter_applies_defaults_identity_and_secret_filtering() {
+    let adapter = CodexAdapter::from_config(
+        harness_core::config::agents::CodexAgentConfig {
+            cli_path: PathBuf::from("codex"),
+            default_model: "configured-model".to_string(),
+            reasoning_effort: "configured-effort".to_string(),
+            cloud: harness_core::config::agents::CodexCloudConfig {
+                enabled: true,
+                cache_ttl_hours: 0,
+                setup_commands: Vec::new(),
+                setup_secret_env: vec!["SETUP_SECRET".to_string()],
+            },
+        },
+        SandboxMode::ReadOnly,
+    );
+    let mut env_vars = HashMap::new();
+    env_vars.insert("SETUP_SECRET".to_string(), "secret-value".to_string());
+    let request = TurnRequest {
+        prompt: "ping".to_string(),
+        prompt_layers: None,
+        project_root: PathBuf::from("/tmp/project"),
+        model: None,
+        reasoning_effort: None,
+        execution_phase: None,
+        sandbox_mode: None,
+        approval_policy: Some("on-request".to_string()),
+        allowed_tools: vec![],
+        context: vec![],
+        timeout_secs: None,
+        env_vars,
+        capability_token: None,
+    };
+
+    let request = adapter.effective_turn_request(request);
+
+    assert_eq!(request.model.as_deref(), Some("configured-model"));
+    assert_eq!(
+        request.reasoning_effort.as_deref(),
+        Some("configured-effort")
+    );
+    assert_eq!(request.sandbox_mode, Some(SandboxMode::ReadOnly));
+    assert!(!request.env_vars.contains_key("SETUP_SECRET"));
+    assert!(request
+        .env_vars
+        .get(harness_core::run_id::AGENT_RUN_ID_ENV)
+        .is_some_and(|run_id| run_id.starts_with("ar-")));
+}
+
+#[tokio::test]
+async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let marker = dir.path().join("adapter-setup-ran");
+    let adapter = CodexAdapter::from_config(
+        harness_core::config::agents::CodexAgentConfig {
+            cli_path: dir.path().join("missing-codex"),
+            default_model: "configured-model".to_string(),
+            reasoning_effort: "configured-effort".to_string(),
+            cloud: harness_core::config::agents::CodexCloudConfig {
+                enabled: true,
+                cache_ttl_hours: 0,
+                setup_commands: vec!["touch adapter-setup-ran".to_string()],
+                setup_secret_env: Vec::new(),
+            },
+        },
+        SandboxMode::WorkspaceWrite,
+    );
+    let request = TurnRequest {
+        prompt: "ping".to_string(),
+        prompt_layers: None,
+        project_root: dir.path().to_path_buf(),
+        model: None,
+        reasoning_effort: None,
+        execution_phase: None,
+        sandbox_mode: None,
+        approval_policy: Some("on-request".to_string()),
+        allowed_tools: vec![],
+        context: vec![],
+        timeout_secs: None,
+        env_vars: HashMap::new(),
+        capability_token: None,
+    };
+    let (tx, _rx) = mpsc::channel(4);
+
+    adapter
+        .start_turn(request, tx)
+        .await
+        .expect_err("missing codex executable should fail after setup");
+
+    assert!(marker.exists());
+    Ok(())
+}
+
+#[test]
 fn app_server_spawn_honors_container_isolation() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let mut env_vars = HashMap::new();
