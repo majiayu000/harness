@@ -98,6 +98,12 @@ pub(crate) async fn build_intake(
     {
         let github_throttle =
             Arc::new(crate::intake::github_issues::GitHubRateLimitThrottle::default());
+        let runtime_task_checker: Arc<dyn crate::intake::github_issues::DispatchedTaskChecker> =
+            registry
+                .workflow_runtime_store
+                .as_ref()
+                .expect("direct REST polling requires a workflow runtime store")
+                .clone();
         cfg.effective_repos()
             .into_iter()
             .map(|repo_cfg| {
@@ -113,7 +119,8 @@ pub(crate) async fn build_intake(
                         None,
                         server.config.server.github_token.clone(),
                         Arc::clone(&github_throttle),
-                    );
+                    )
+                    .with_task_checker(runtime_task_checker.clone());
                 (
                     key,
                     Arc::new(poller) as Arc<dyn crate::intake::IntakeSource>,

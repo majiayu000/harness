@@ -21,9 +21,12 @@ pub(crate) trait DispatchedTaskChecker: Send + Sync {
 }
 
 #[async_trait]
-impl DispatchedTaskChecker for crate::task_runner::TaskStore {
+impl DispatchedTaskChecker for harness_workflow::runtime::WorkflowRuntimeStore {
     async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool> {
-        self.exists_with_db_fallback(task_id).await
+        Ok(self
+            .get_instance_by_submission_id(task_id.as_str())
+            .await?
+            .is_some())
     }
 }
 
@@ -56,10 +59,7 @@ impl DispatchedTaskChecker for RuntimeAwareDispatchedTaskChecker {
         let Some(store) = self.workflow_runtime_store.as_ref() else {
             return Ok(false);
         };
-        Ok(store
-            .get_instance_by_task_id(task_id.as_str())
-            .await?
-            .is_some())
+        store.exists(task_id).await
     }
 }
 
@@ -150,7 +150,6 @@ impl GitHubIssuesPoller {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn with_task_checker(
         mut self,
         task_checker: Arc<dyn DispatchedTaskChecker>,
