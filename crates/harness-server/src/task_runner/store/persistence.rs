@@ -186,6 +186,7 @@ impl TaskStore {
     /// Used to roll back a cancelled status after a failed retry enqueue so that
     /// `list_stalled_tasks` still considers the task stale on the next tick instead
     /// of deferring by a full `stale_threshold_mins` window.
+    #[cfg(test)]
     pub(crate) async fn restore_status_preserve_staleness(
         &self,
         id: &TaskId,

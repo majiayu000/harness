@@ -224,6 +224,7 @@ impl PersistedRequestSettings {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_to_req(&self, req: &mut CreateTaskRequest) {
         if req.definition_id.is_none() {
             req.definition_id = self.definition_id.clone();
