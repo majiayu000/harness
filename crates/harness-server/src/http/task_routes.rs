@@ -10,10 +10,6 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-#[cfg(test)]
-pub(crate) use crate::services::execution::{
-    resolve_project_from_registry, workflow_reuse_strategy, WorkflowReuseStrategy,
-};
 pub(crate) use crate::services::execution::{select_agent, QueueDomain};
 
 pub(crate) async fn enqueue_task(
@@ -34,18 +30,12 @@ pub(crate) async fn enqueue_task_background(
 pub(crate) async fn enqueue_task_background_in_domain(
     state: Arc<AppState>,
     req: task_runner::CreateTaskRequest,
-    group_sem: Option<Arc<tokio::sync::Semaphore>>,
-    queue_domain: QueueDomain,
+    _group_sem: Option<Arc<tokio::sync::Semaphore>>,
+    _queue_domain: QueueDomain,
 ) -> Result<task_runner::TaskId, EnqueueTaskError> {
     state
         .execution_svc
-        .enqueue_background_with_options(
-            req,
-            EnqueueBackgroundOptions {
-                queue_domain,
-                group_sem,
-            },
-        )
+        .enqueue_background_with_options(req, EnqueueBackgroundOptions)
         .await
 }
 
@@ -576,7 +566,3 @@ pub(super) async fn cancel_task(
 
     (StatusCode::OK, Json(json!({ "status": "cancelled" })))
 }
-
-#[cfg(test)]
-#[path = "task_routes_tests.rs"]
-mod tests;

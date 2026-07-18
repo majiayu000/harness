@@ -234,17 +234,7 @@ async fn make_state_inner(
     );
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
-        tasks.clone(),
-        server.agent_registry.clone(),
         Arc::new(server.config.clone()),
-        Default::default(),
-        events.clone(),
-        vec![],
-        None,
-        task_queue.clone(),
-        task_queue.clone(),
-        None,
-        None,
         None,
         None,
         vec![],

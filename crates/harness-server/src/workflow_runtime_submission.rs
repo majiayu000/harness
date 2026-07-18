@@ -36,6 +36,9 @@ pub(crate) mod runtime_request;
 pub(crate) mod runtime_state;
 
 pub use runtime_models::TaskId;
+pub(crate) use runtime_request::{
+    fill_missing_repo_from_project, CreateTaskRequest, MAX_TASK_PRIORITY,
+};
 
 pub(crate) use cancel::{
     cancel_issue_submission_by_task_id, cancel_submission_by_workflow_id,

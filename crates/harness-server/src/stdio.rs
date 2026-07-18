@@ -208,17 +208,7 @@ mod tests {
         );
         let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
         let execution_svc = crate::services::execution::DefaultExecutionService::new(
-            tasks.clone(),
-            server.agent_registry.clone(),
             Arc::new(server.config.clone()),
-            Default::default(),
-            events.clone(),
-            vec![],
-            None,
-            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-            None,
-            None,
             None,
             None,
             vec![],

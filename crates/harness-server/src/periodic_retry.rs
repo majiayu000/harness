@@ -707,17 +707,7 @@ mod tests {
         );
         state.core.workflow_runtime_store = Some(runtime_store.clone());
         state.execution_svc = crate::services::execution::DefaultExecutionService::new(
-            state.core.tasks.clone(),
-            state.core.server.agent_registry.clone(),
             Arc::new(state.core.server.config.clone()),
-            state.engines.skills.clone(),
-            state.observability.events.clone(),
-            state.interceptors.clone(),
-            None,
-            state.concurrency.task_queue.clone(),
-            state.concurrency.review_task_queue.clone(),
-            None,
-            None,
             Some(runtime_store.clone()),
             None,
             vec![],

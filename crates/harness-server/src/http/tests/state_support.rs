@@ -308,17 +308,7 @@ pub(super) async fn make_test_state_with_project_root(
     review_queue_config.max_concurrent_tasks = server.config.review.max_concurrent_tasks.max(1);
     let review_task_queue = Arc::new(crate::task_queue::TaskQueue::new(&review_queue_config));
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
-        tasks.clone(),
-        server.agent_registry.clone(),
         Arc::new(server.config.clone()),
-        Default::default(),
-        events.clone(),
-        vec![],
-        None,
-        task_queue.clone(),
-        review_task_queue.clone(),
-        None,
-        None,
         None,
         None,
         vec![],
@@ -528,17 +518,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         .await?,
     );
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
-        state.core.tasks.clone(),
-        state.core.server.agent_registry.clone(),
         Arc::new(state.core.server.config.clone()),
-        state.engines.skills.clone(),
-        state.observability.events.clone(),
-        state.interceptors.clone(),
-        None,
-        state.concurrency.task_queue.clone(),
-        state.concurrency.review_task_queue.clone(),
-        None,
-        None,
         Some(workflow_runtime_store.clone()),
         None,
         vec![],

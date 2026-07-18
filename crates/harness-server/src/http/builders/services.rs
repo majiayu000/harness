@@ -75,17 +75,7 @@ pub(crate) async fn build_services(
     );
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
-        tasks.clone(),
-        server.agent_registry.clone(),
         Arc::new(server.config.clone()),
-        engines.skills.clone(),
-        events.clone(),
-        interceptors.clone(),
-        registry.workspace_mgr.clone(),
-        intake.task_queue.clone(),
-        intake.review_task_queue.clone(),
-        intake.completion_callback.clone(),
-        registry.issue_workflow_store.clone(),
         registry.workflow_runtime_store.clone(),
         Some(project_registry.clone()),
         server.config.server.allowed_project_roots.clone(),
