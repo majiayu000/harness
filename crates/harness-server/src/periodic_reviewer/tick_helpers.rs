@@ -1,4 +1,6 @@
 use crate::http::AppState;
+use harness_core::types::{Item, ThreadId, Turn, TurnId};
+use harness_workflow::runtime::{ActivityResult, ActivityStatus};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,12 +71,71 @@ where
         .cloned()
 }
 
-/// Poll a task until it reaches a terminal state, then extract its output.
+pub(super) enum TerminalResultDisposition {
+    ReadRuntimeTurn,
+    Return(String),
+    Ignore,
+    Failed(String),
+}
+
+pub(super) fn terminal_result_disposition(result: &ActivityResult) -> TerminalResultDisposition {
+    match result.status {
+        ActivityStatus::Succeeded => TerminalResultDisposition::ReadRuntimeTurn,
+        ActivityStatus::Cancelled => TerminalResultDisposition::Ignore,
+        ActivityStatus::Failed | ActivityStatus::Blocked
+            if result.summary.trim() == "REVIEW_SKIPPED" =>
+        {
+            TerminalResultDisposition::Return("REVIEW_SKIPPED".to_string())
+        }
+        ActivityStatus::Failed | ActivityStatus::Blocked => TerminalResultDisposition::Failed(
+            result
+                .error
+                .clone()
+                .unwrap_or_else(|| result.summary.clone()),
+        ),
+    }
+}
+
+pub(super) fn runtime_turn_ref(result: &ActivityResult) -> Option<(ThreadId, TurnId)> {
+    let artifact = result
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "runtime_turn")?;
+    let thread_id = artifact.artifact.get("thread_id")?.as_str()?.trim();
+    let turn_id = artifact.artifact.get("turn_id")?.as_str()?.trim();
+    if thread_id.is_empty() || turn_id.is_empty() {
+        return None;
+    }
+    Some((ThreadId::from_str(thread_id), TurnId::from_str(turn_id)))
+}
+
+pub(super) fn review_output_from_turn(turn: &Turn) -> Option<String> {
+    let output = turn
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::AgentReasoning { content } if !content.trim().is_empty() => {
+                Some(content.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!output.is_empty()).then_some(output)
+}
+
+/// Poll a workflow-runtime submission until its activity completes, then read
+/// the full agent output from the live runtime turn referenced by the durable
+/// completion event.
 pub(super) async fn poll_task_output(
-    store: &crate::task_runner::TaskStore,
+    state: &AppState,
     task_id: &harness_core::types::TaskId,
     timeout_secs: u64,
 ) -> Option<String> {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        tracing::error!(task_id = %task_id, "poll_task_output: workflow runtime store unavailable");
+        return None;
+    };
     let poll_interval = Duration::from_secs(15);
     let max_wait = if timeout_secs == 0 {
         Duration::from_secs(999_999)
@@ -88,34 +149,81 @@ pub(super) async fn poll_task_output(
             tracing::warn!(task_id = %task_id, "poll_task_output: timed out");
             return None;
         }
-        let Some(task) = store.get(task_id) else {
-            continue;
+        let workflow = match store.get_instance_by_submission_id(task_id.as_str()).await {
+            Ok(Some(workflow)) => workflow,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::error!(task_id = %task_id, "poll_task_output: workflow lookup failed: {error}");
+                return None;
+            }
         };
-        if !task.status.is_terminal() {
-            continue;
+        let event = match store
+            .latest_event_for_type(&workflow.id, "RuntimeJobCompleted")
+            .await
+        {
+            Ok(Some(event)) => event,
+            Ok(None) if workflow.is_terminal() => {
+                tracing::error!(
+                    task_id = %task_id,
+                    workflow_id = %workflow.id,
+                    "poll_task_output: terminal workflow has no runtime completion event"
+                );
+                return None;
+            }
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::error!(
+                    task_id = %task_id,
+                    workflow_id = %workflow.id,
+                    "poll_task_output: completion event lookup failed: {error}"
+                );
+                return None;
+            }
+        };
+        let result: ActivityResult = match event.event.get("activity_result").cloned() {
+            Some(value) => match serde_json::from_value(value) {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!(task_id = %task_id, "poll_task_output: invalid activity result: {error}");
+                    return None;
+                }
+            },
+            None => {
+                tracing::error!(task_id = %task_id, "poll_task_output: completion event has no activity result");
+                return None;
+            }
+        };
+        match terminal_result_disposition(&result) {
+            TerminalResultDisposition::Return(output) => return Some(output),
+            TerminalResultDisposition::Ignore => return None,
+            TerminalResultDisposition::Failed(error) => {
+                tracing::error!(task_id = %task_id, "poll_task_output: runtime activity failed: {error}");
+                return None;
+            }
+            TerminalResultDisposition::ReadRuntimeTurn => {}
         }
-        if task.status.is_cancelled() {
+        let Some((thread_id, turn_id)) = runtime_turn_ref(&result) else {
+            tracing::error!(task_id = %task_id, "poll_task_output: activity result has no runtime turn reference");
             return None;
-        }
-        if task.status.is_failure() {
+        };
+        let Some(turn) = state
+            .core
+            .server
+            .thread_manager
+            .get_turn(&thread_id, &turn_id)
+        else {
             tracing::error!(
                 task_id = %task_id,
-                error = ?task.error,
-                status = task.status.as_ref(),
-                "poll_task_output: task failed"
+                thread_id = %thread_id,
+                turn_id = %turn_id,
+                "poll_task_output: referenced runtime turn is unavailable"
             );
             return None;
-        }
-        let output: String = task
-            .rounds
-            .iter()
-            .filter_map(|r| r.detail.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if output.is_empty() {
-            tracing::warn!(task_id = %task_id, "poll_task_output: completed but no output");
+        };
+        let Some(output) = review_output_from_turn(&turn) else {
+            tracing::warn!(task_id = %task_id, "poll_task_output: completed but no agent output");
             return None;
-        }
+        };
         return Some(output);
     }
 }

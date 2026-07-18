@@ -194,7 +194,6 @@ pub(super) async fn run_review_tick(
     }
 
     // Wait for review completion, optionally run synthesis, then advance the watermark.
-    let store = state.core.tasks.clone();
     let timeout_secs = config.timeout_secs;
     let primary_agent_for_synthesis = review_agent.clone();
     let secondary_agent_name = secondary_agent.clone();
@@ -210,7 +209,8 @@ pub(super) async fn run_review_tick(
     // are executing are NOT silently skipped on the next tick.
     let scan_ts = Utc::now();
     let handle = tokio::spawn(async move {
-        let primary_output = poll_task_output(&store, &primary_review_id, timeout_secs).await;
+        let primary_output =
+            poll_task_output(&state_for_synthesis, &primary_review_id, timeout_secs).await;
         tracing::info!(
             task_id = %primary_review_id,
             output_len = primary_output.as_ref().map(|s| s.len()).unwrap_or(0),
@@ -317,7 +317,8 @@ pub(super) async fn run_review_tick(
         if let (Some(secondary_id), Some(secondary_name)) =
             (secondary_review_id.as_ref(), secondary_agent_name.as_ref())
         {
-            let secondary_output = poll_task_output(&store, secondary_id, timeout_secs).await;
+            let secondary_output =
+                poll_task_output(&state_for_synthesis, secondary_id, timeout_secs).await;
             tracing::info!(
                 task_id = %secondary_id,
                 agent = %secondary_name,
@@ -365,7 +366,8 @@ pub(super) async fn run_review_tick(
                         // commits arriving during synthesis latency are caught next
                         // tick (issue-2 fix).
                         let pre_synthesis_ts = Utc::now();
-                        let synth_out = poll_task_output(&store, &synth_id, timeout_secs).await;
+                        let synth_out =
+                            poll_task_output(&state_for_synthesis, &synth_id, timeout_secs).await;
                         if synth_out.is_none() {
                             // Synthesis timed out / OOM / rate-limited.  Fall back to
                             // primary output.  Do NOT advance the watermark to
