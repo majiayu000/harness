@@ -170,9 +170,9 @@ pub use status::WorkflowCommandStatus;
 pub use store::{
     DriverlessProgressInstance, DriverlessProgressProvenanceStatus, RuntimeHistoryPruneSummary,
     RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
-    WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeRecoveryAction,
-    WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore,
-    WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
+    RuntimeWorkflowUsage, WorkflowDecisionTransition, WorkflowRejectedDecisionTransition,
+    WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
+    WorkflowRuntimeStore, WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionFilter, WorkflowSubmissionPromptPayload,
 };
 pub use submission::{

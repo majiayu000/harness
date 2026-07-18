@@ -1,5 +1,6 @@
 use super::*;
 use harness_core::types::Item;
+use std::collections::HashMap;
 
 #[test]
 fn parse_no_jsonrpc_thread_started_notification() {
@@ -251,6 +252,7 @@ fn start_params_include_runtime_profile_overrides() {
         allowed_tools: vec![],
         context: vec![],
         timeout_secs: Some(60),
+        env_vars: HashMap::new(),
         capability_token: None,
     };
 
@@ -284,6 +286,50 @@ fn start_params_include_runtime_profile_overrides() {
             ],
         })
     );
+}
+
+#[test]
+fn app_server_spawn_honors_container_isolation() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut env_vars = HashMap::new();
+    env_vars.insert(
+        harness_core::agent::AGENT_ISOLATION_TIER_ENV.to_string(),
+        "container".to_string(),
+    );
+    env_vars.insert(
+        harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
+        "github.com".to_string(),
+    );
+    let request = TurnRequest {
+        prompt: "ping".to_string(),
+        prompt_layers: None,
+        project_root: root.path().to_path_buf(),
+        model: None,
+        reasoning_effort: None,
+        execution_phase: None,
+        sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+        approval_policy: Some("on-request".to_string()),
+        allowed_tools: vec![],
+        context: vec![],
+        timeout_secs: None,
+        env_vars,
+        capability_token: None,
+    };
+
+    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request)?;
+    let args = spawn
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(spawn.program, PathBuf::from("docker"));
+    assert!(spawn.clear_inherited_env);
+    assert!(args.contains(&"--network".to_string()));
+    assert!(args.contains(&"none".to_string()));
+    assert!(args.contains(&"app-server".to_string()));
+    assert!(args.contains(&"stdio://".to_string()));
+    Ok(())
 }
 
 #[test]
@@ -357,6 +403,7 @@ async fn start_turn_missing_workspace_reports_workspace_missing() -> anyhow::Res
         allowed_tools: vec![],
         context: vec![],
         timeout_secs: None,
+        env_vars: HashMap::new(),
         capability_token: None,
     };
     let (tx, _rx) = mpsc::channel(4);
@@ -422,6 +469,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         allowed_tools: vec![],
         context: vec![],
         timeout_secs: None,
+        env_vars: HashMap::new(),
         capability_token: None,
     };
     let (tx, mut rx) = mpsc::channel(4);

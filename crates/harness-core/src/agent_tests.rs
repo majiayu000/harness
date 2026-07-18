@@ -1,5 +1,6 @@
 use crate::agent::{AgentPromptLayers, AgentRequest, TurnRequest};
 use crate::prompts;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[test]
@@ -86,6 +87,7 @@ fn turn_request_uses_same_claude_layer_split() {
         allowed_tools: vec![],
         context: vec![],
         timeout_secs: None,
+        env_vars: HashMap::new(),
         capability_token: None,
     };
 

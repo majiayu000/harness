@@ -242,6 +242,7 @@ fn runtime_usage_record_becomes_usage_record_with_candidate() -> anyhow::Result<
             cache_creation_input_tokens: 0,
             reported_total_tokens: Some(30),
         },
+        cost_usd: 0.125,
         reported_at: Utc::now(),
         updated_at: Utc::now(),
     };

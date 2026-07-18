@@ -70,6 +70,7 @@ impl RuntimeUsageContext {
                 candidate_index: self.candidate_index,
                 candidate_count: self.candidate_count,
                 metrics: RuntimeUsageMetrics::from_token_usage(usage),
+                cost_usd: usage.cost_usd,
                 reported_at: chrono::Utc::now(),
             })
             .await?
@@ -307,7 +308,7 @@ mod tests {
                     input_tokens: 11,
                     output_tokens: 7,
                     total_tokens: 20,
-                    cost_usd: 0.0,
+                    cost_usd: 0.125,
                 },
             },
         )
@@ -329,6 +330,7 @@ mod tests {
         assert_eq!(records[0].metrics.input_tokens, 11);
         assert_eq!(records[0].metrics.output_tokens, 7);
         assert_eq!(records[0].metrics.total_tokens(), 20);
+        assert_eq!(records[0].cost_usd, 0.125);
         assert_eq!(records[0].candidate_id.as_deref(), Some("candidate-1"));
         assert_eq!(turn.token_usage.total_tokens, 20);
         Ok(())

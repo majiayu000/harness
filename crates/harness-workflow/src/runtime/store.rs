@@ -66,6 +66,7 @@ pub use recovery::{
 };
 pub use runtime_usage::{
     RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
+    RuntimeWorkflowUsage,
 };
 pub use submission_commit::{
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,

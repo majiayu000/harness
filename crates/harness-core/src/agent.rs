@@ -318,6 +318,7 @@ pub struct TurnRequest {
     pub allowed_tools: Vec<String>,
     pub context: Vec<ContextItem>,
     pub timeout_secs: Option<u64>,
+    pub env_vars: HashMap<String, String>,
     /// Scoped write capability; checked for expiry before spawning.
     pub capability_token: Option<CapabilityToken>,
 }

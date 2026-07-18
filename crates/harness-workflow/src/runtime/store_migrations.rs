@@ -533,4 +533,22 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_runtime_job_lease_receipts_expiry
           ON runtime_job_lease_renewal_receipts (runtime_job_id, renewed_expires_at)",
     },
+    Migration {
+        version: 21,
+        description: "persist workflow runtime usage costs",
+        sql: "ALTER TABLE runtime_usage_events
+              ADD COLUMN IF NOT EXISTS cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+              DO $$
+              BEGIN
+                IF NOT EXISTS (
+                  SELECT 1 FROM pg_constraint
+                  WHERE conname = 'runtime_usage_events_cost_nonnegative'
+                    AND conrelid = 'runtime_usage_events'::regclass
+                ) THEN
+                  ALTER TABLE runtime_usage_events
+                    ADD CONSTRAINT runtime_usage_events_cost_nonnegative
+                    CHECK (cost_usd >= 0);
+                END IF;
+              END $$",
+    },
 ];

@@ -3,8 +3,9 @@ use crate::streaming::capture_agent_stderr_diagnostics;
 use async_trait::async_trait;
 use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
 use harness_core::config::agents::SandboxMode;
+use harness_sandbox::SandboxSpec;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -13,6 +14,31 @@ use tokio::sync::{mpsc, Mutex};
 
 type StdoutLines = Lines<BufReader<ChildStdout>>;
 const MAX_PROTOCOL_LINE_PREVIEW: usize = 240;
+
+fn prepare_app_server_spawn(
+    cli_path: &std::path::Path,
+    req: &TurnRequest,
+) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
+    let args = [
+        OsString::from("app-server"),
+        OsString::from("--listen"),
+        OsString::from("stdio://"),
+    ];
+    let sandbox_mode = req.sandbox_mode.unwrap_or(SandboxMode::DangerFullAccess);
+    let sandbox_spec = if let Some(token) = req.capability_token.as_ref() {
+        SandboxSpec::new(sandbox_mode, &req.project_root)
+            .with_allowed_write_paths(token.allowed_write_paths.clone())
+    } else {
+        SandboxSpec::new(sandbox_mode, &req.project_root)
+    };
+    crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+        program: cli_path,
+        args: &args,
+        project_root: &req.project_root,
+        sandbox_spec: &sandbox_spec,
+        env_vars: &req.env_vars,
+    })
+}
 
 pub struct CodexAdapter {
     cli_path: PathBuf,
@@ -178,18 +204,18 @@ impl CodexAdapter {
             state.reset_child().await;
         }
 
-        let run_identity = crate::resolve_agent_run_identity(&HashMap::new());
-        let mut cmd = tokio::process::Command::new(&self.cli_path);
-        cmd.arg("app-server")
-            .arg("--listen")
-            .arg("stdio://")
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
+        let prepared_spawn = prepare_app_server_spawn(&self.cli_path, req)?;
+        let mut cmd = tokio::process::Command::new(&prepared_spawn.program);
+        cmd.args(&prepared_spawn.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .current_dir(&req.project_root)
+            .current_dir(&prepared_spawn.current_dir)
             .kill_on_drop(true);
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
+        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
         crate::strip_claude_env(&mut cmd);
         crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
 

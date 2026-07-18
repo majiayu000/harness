@@ -189,10 +189,10 @@ async fn runtime_task_response_by_handle(
         .runtime_usage_for_workflow(&workflow.id)
         .await?
         .map(|usage| harness_core::types::TokenUsage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: usage.total_tokens(),
-            cost_usd: 0.0,
+            input_tokens: usage.metrics.input_tokens,
+            output_tokens: usage.metrics.output_tokens,
+            total_tokens: usage.metrics.total_tokens(),
+            cost_usd: usage.cost_usd,
         });
     let description = Some(super::runtime_submissions::runtime_submission_description(
         &workflow, task_kind, issue,
