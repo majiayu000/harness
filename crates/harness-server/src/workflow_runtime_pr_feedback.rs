@@ -582,16 +582,6 @@ async fn persist_local_review_request(
     }
 }
 
-pub(crate) async fn approve_runtime_merge_by_task_id(
-    store: &WorkflowRuntimeStore,
-    task_id: &str,
-) -> anyhow::Result<RuntimeMergeApprovalOutcome> {
-    let Some(instance) = store.get_instance_by_task_id(task_id).await? else {
-        return Ok(RuntimeMergeApprovalOutcome::NotFound);
-    };
-    approve_runtime_merge(store, instance, Some(task_id)).await
-}
-
 pub(crate) fn synthesized_pr_feedback_task_id(
     project_id: &str,
     repo: Option<&str>,
@@ -601,6 +591,17 @@ pub(crate) fn synthesized_pr_feedback_task_id(
         "github-pr-feedback::{project_id}::repo:{}::pr:{pr_number}:feedback",
         repo.unwrap_or("<none>")
     ))
+}
+
+#[cfg(test)]
+pub(crate) async fn approve_runtime_merge_by_task_id(
+    store: &WorkflowRuntimeStore,
+    task_id: &str,
+) -> anyhow::Result<RuntimeMergeApprovalOutcome> {
+    let Some(instance) = store.get_instance_by_task_id(task_id).await? else {
+        return Ok(RuntimeMergeApprovalOutcome::NotFound);
+    };
+    approve_runtime_merge(store, instance, Some(task_id)).await
 }
 
 pub(crate) async fn approve_runtime_merge_by_workflow_id(

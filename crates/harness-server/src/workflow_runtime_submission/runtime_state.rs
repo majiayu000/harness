@@ -396,6 +396,47 @@ pub struct TaskSummary {
     pub scheduler: TaskSchedulerState,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RuntimeSubmissionSummaryFilter {
+    pub statuses: Vec<TaskStatus>,
+    pub scheduler_states: Vec<SchedulerAuthorityState>,
+    pub kinds: Vec<TaskKind>,
+    pub source: Option<String>,
+    pub repo: Option<String>,
+    pub project: Option<String>,
+    pub active: bool,
+}
+
+impl RuntimeSubmissionSummaryFilter {
+    pub fn matches_summary(&self, summary: &TaskSummary) -> bool {
+        (self.statuses.is_empty() || self.statuses.contains(&summary.status))
+            && (!self.active || !summary.status.is_terminal())
+            && (self.scheduler_states.is_empty()
+                || self
+                    .scheduler_states
+                    .contains(&summary.scheduler.authority_state))
+            && (self.kinds.is_empty() || self.kinds.contains(&summary.task_kind))
+            && self
+                .source
+                .as_deref()
+                .is_none_or(|source| summary.source.as_deref() == Some(source))
+            && self
+                .repo
+                .as_deref()
+                .is_none_or(|repo| summary.repo.as_deref() == Some(repo))
+            && self
+                .project
+                .as_deref()
+                .is_none_or(|project| summary.project.as_deref() == Some(project))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSubmissionSummaryCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: String,
+}
+
 /// Lightweight recent-failure row used by the operator snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecentFailureTask {

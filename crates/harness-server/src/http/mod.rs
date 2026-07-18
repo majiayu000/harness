@@ -35,7 +35,6 @@ pub(crate) mod task_mutation_routes;
 pub(crate) mod task_query_routes;
 mod task_retention;
 pub(crate) mod task_routes;
-pub(crate) mod task_submission_routes;
 mod workflow_watchdog;
 
 #[cfg(test)]
@@ -57,16 +56,18 @@ pub use state::{
     NotificationServices, ObservabilityServices,
 };
 
+#[cfg(test)]
+pub(crate) use sse_routes::stream_runtime_submission_sse as stream_task_sse;
+#[cfg(test)]
+pub(crate) use task_query_routes::{
+    get_runtime_submission as get_task, list_runtime_submissions as list_tasks,
+};
+
 // Handler re-exports — moved to focused submodules, kept accessible via `crate::http::`.
 pub(crate) use misc_routes::{
     get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
     get_workflow_runtime_tree, github_webhook, handle_rpc, health_check, ingest_signal,
     intake_status, password_reset, project_queue_stats, reset_runtime_circuit_breaker,
-};
-pub(crate) use sse_routes::stream_task_sse;
-pub(crate) use task_query_routes::get_task_proof;
-pub(crate) use task_submission_routes::{
-    get_task, get_task_artifacts, get_task_prompts, list_tasks,
 };
 
 /// Extract the PR number from a GitHub PR URL.

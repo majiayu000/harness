@@ -2,11 +2,9 @@ use super::AppState;
 use crate::{
     runtime_projection::RuntimeWorkflowProjection,
     services::execution::{EnqueueBackgroundOptions, EnqueueTaskError},
-    task_runner,
-    workflow_runtime_submission::{RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome},
+    workflow_runtime_submission::{CreateTaskRequest, TaskId},
 };
 use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, Json};
-use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -14,25 +12,25 @@ pub(crate) use crate::services::execution::QueueDomain;
 
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,
-    req: task_runner::CreateTaskRequest,
-) -> Result<task_runner::TaskId, EnqueueTaskError> {
+    req: CreateTaskRequest,
+) -> Result<TaskId, EnqueueTaskError> {
     state.execution_svc.enqueue(req).await
 }
 
 pub(crate) async fn enqueue_task_background(
     state: Arc<AppState>,
-    req: task_runner::CreateTaskRequest,
+    req: CreateTaskRequest,
     group_sem: Option<Arc<tokio::sync::Semaphore>>,
-) -> Result<task_runner::TaskId, EnqueueTaskError> {
+) -> Result<TaskId, EnqueueTaskError> {
     enqueue_task_background_in_domain(state, req, group_sem, QueueDomain::Primary).await
 }
 
 pub(crate) async fn enqueue_task_background_in_domain(
     state: Arc<AppState>,
-    req: task_runner::CreateTaskRequest,
+    req: CreateTaskRequest,
     _group_sem: Option<Arc<tokio::sync::Semaphore>>,
     _queue_domain: QueueDomain,
-) -> Result<task_runner::TaskId, EnqueueTaskError> {
+) -> Result<TaskId, EnqueueTaskError> {
     state
         .execution_svc
         .enqueue_background_with_options(req, EnqueueBackgroundOptions)
@@ -41,378 +39,64 @@ pub(crate) async fn enqueue_task_background_in_domain(
 
 pub(crate) struct TaskResponseDetails {
     pub(crate) status: String,
-    pub(crate) workflow_state: Option<String>,
-    pub(crate) execution_path: &'static str,
-    pub(crate) submission_id: Option<String>,
-    pub(crate) workflow_id: Option<String>,
+    pub(crate) workflow_state: String,
+    pub(crate) submission_id: String,
+    pub(crate) workflow_id: String,
 }
 
 pub(crate) async fn task_response_details(
     state: &AppState,
-    task_id: &task_runner::TaskId,
-    is_issue_submission: bool,
+    task_id: &TaskId,
 ) -> Result<TaskResponseDetails, EnqueueTaskError> {
-    if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-        if let Some(workflow) = store
-            .get_instance_by_submission_id(task_id.as_str())
-            .await
-            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
-        {
-            let submission_id =
-                crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
-                    .map(|task_id| task_id.0)
-                    .unwrap_or_else(|| task_id.as_str().to_string());
-            let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
-            return Ok(TaskResponseDetails {
-                status: projection.task_status.as_ref().to_string(),
-                workflow_state: Some(workflow.state),
-                execution_path: "workflow_runtime",
-                submission_id: Some(submission_id),
-                workflow_id: Some(workflow.id),
-            });
-        }
-    }
-
-    if !is_issue_submission {
-        return Ok(TaskResponseDetails {
-            status: "queued".to_string(),
-            workflow_state: None,
-            execution_path: "task_runner",
-            submission_id: None,
-            workflow_id: None,
-        });
-    }
-
-    if state
-        .core
-        .tasks
-        .get_with_db_fallback(task_id)
+    let store =
+        state.core.workflow_runtime_store.as_ref().ok_or_else(|| {
+            EnqueueTaskError::Internal("workflow runtime store unavailable".into())
+        })?;
+    let workflow = store
+        .get_instance_by_submission_id(task_id.as_str())
         .await
         .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
-        .is_some()
-    {
-        return Ok(TaskResponseDetails {
-            status: "queued".to_string(),
-            workflow_state: None,
-            execution_path: "task_runner",
-            submission_id: None,
-            workflow_id: None,
-        });
-    }
-
-    Err(EnqueueTaskError::Internal(format!(
-        "submission not found for task {}",
-        task_id.as_str()
-    )))
+        .ok_or_else(|| {
+            EnqueueTaskError::Internal(format!(
+                "workflow runtime submission not found for {}",
+                task_id.as_str()
+            ))
+        })?;
+    let submission_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
+        .map(|task_id| task_id.0)
+        .unwrap_or_else(|| task_id.as_str().to_string());
+    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+    Ok(TaskResponseDetails {
+        status: projection.task_status.as_ref().to_string(),
+        workflow_state: workflow.state,
+        submission_id,
+        workflow_id: workflow.id,
+    })
 }
 
-/// A single task entry in the detailed batch format.
-#[derive(Debug, Deserialize)]
-pub struct BatchTaskItem {
-    /// Free-text task description.
-    pub description: Option<String>,
-    /// GitHub issue number to implement.
-    pub issue: Option<u64>,
-}
-
-/// Request body for `POST /tasks/batch`.
-///
-/// Supports two formats:
-/// - Shorthand: `{ "issues": [300, 301, 302], "agent": "claude", ... }`
-/// - Detailed: `{ "tasks": [{"description": "fix X", "issue": 300}, ...] }`
-#[derive(Debug, Deserialize)]
-pub struct BatchCreateTaskRequest {
-    /// Shorthand list of GitHub issue numbers (one task per issue).
-    pub issues: Option<Vec<u64>>,
-    /// Detailed list of task specifications.
-    pub tasks: Option<Vec<BatchTaskItem>>,
-    /// Agent name override applied to all tasks in this batch.
-    pub agent: Option<String>,
-    /// Maximum rounds override applied to all tasks.
-    pub max_rounds: Option<u32>,
-    /// Per-turn timeout override in seconds applied to all tasks.
-    pub turn_timeout_secs: Option<u64>,
-    /// Project root or registry ID applied to all tasks in this batch.
-    pub project: Option<std::path::PathBuf>,
-}
-
-fn task_submission_response(
-    task_id: &task_runner::TaskId,
-    details: TaskResponseDetails,
-) -> serde_json::Value {
-    let submission_id = details.submission_id;
-    let response_task_id = submission_id
-        .as_deref()
-        .unwrap_or_else(|| task_id.as_str())
-        .to_string();
-    let mut response = json!({
-        "task_id": response_task_id,
+fn task_submission_response(task_id: &TaskId, details: TaskResponseDetails) -> serde_json::Value {
+    json!({
+        "task_id": details.submission_id,
+        "submission_id": details.submission_id,
         "status": details.status,
-        "execution_path": details.execution_path,
-    });
-    if let Some(workflow_state) = details.workflow_state {
-        response["workflow_state"] = json!(workflow_state);
-    }
-    if let Some(submission_id) = submission_id {
-        response["submission_id"] = json!(submission_id);
-    }
-    if let Some(workflow_id) = details.workflow_id {
-        response["workflow_id"] = json!(workflow_id);
-    }
-    response
-}
-
-/// Compute connected conflict groups from per-task file-reference sets.
-///
-/// Two tasks are in the same group when their file-reference sets overlap
-/// (directly or transitively). Tasks whose file-reference set is empty form
-/// singleton groups and are never serialised against other tasks.
-fn build_conflict_groups(file_refs: &[Vec<String>]) -> Vec<Vec<usize>> {
-    let n = file_refs.len();
-    let mut visited = vec![false; n];
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-
-    for start in 0..n {
-        if visited[start] {
-            continue;
-        }
-        let mut group = vec![start];
-        visited[start] = true;
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(start);
-
-        while let Some(curr) = queue.pop_front() {
-            for other in 0..n {
-                if visited[other] {
-                    continue;
-                }
-                let has_overlap = !file_refs[curr].is_empty()
-                    && !file_refs[other].is_empty()
-                    && file_refs[curr].iter().any(|f| file_refs[other].contains(f));
-                if has_overlap {
-                    visited[other] = true;
-                    group.push(other);
-                    queue.push_back(other);
-                }
-            }
-        }
-
-        groups.push(group);
-    }
-
-    groups
-}
-
-pub(super) async fn create_tasks_batch(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<BatchCreateTaskRequest>,
-) -> Response {
-    let has_issues = req.issues.as_ref().is_some_and(|v| !v.is_empty());
-    let has_tasks = req.tasks.as_ref().is_some_and(|v| !v.is_empty());
-
-    if !has_issues && !has_tasks {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "at least one of issues or tasks must be provided" })),
-        )
-            .into_response();
-    }
-
-    // Build the list of per-task CreateTaskRequests.
-    let mut task_requests: Vec<task_runner::CreateTaskRequest> = Vec::new();
-
-    if let Some(issues) = req.issues {
-        for issue in issues {
-            let mut t = task_runner::CreateTaskRequest::default();
-            t.issue = Some(issue);
-            t.agent = req.agent.clone();
-            t.project = req.project.clone();
-            if let Some(rounds) = req.max_rounds {
-                t.max_rounds = Some(rounds);
-            }
-            if let Some(timeout) = req.turn_timeout_secs {
-                t.turn_timeout_secs = timeout;
-            }
-            task_requests.push(t);
-        }
-    }
-
-    if let Some(tasks) = req.tasks {
-        for item in tasks {
-            let mut t = task_runner::CreateTaskRequest::default();
-            t.prompt = item.description;
-            t.issue = item.issue;
-            t.agent = req.agent.clone();
-            t.project = req.project.clone();
-            if let Some(rounds) = req.max_rounds {
-                t.max_rounds = Some(rounds);
-            }
-            if let Some(timeout) = req.turn_timeout_secs {
-                t.turn_timeout_secs = timeout;
-            }
-            task_requests.push(t);
-        }
-    }
-
-    // Detect file-reference overlaps and build conflict groups.
-    // Tasks sharing at least one file reference (directly or transitively) are
-    // placed in the same group and assigned a shared Semaphore(1) so they execute
-    // sequentially instead of concurrently.
-    let task_file_refs: Vec<Vec<String>> = task_requests
-        .iter()
-        .map(|t| {
-            if let Some(p) = t.prompt.as_deref() {
-                crate::parallel_dispatch::extract_file_refs(p)
-            } else if t.issue.is_some() {
-                // Issue-only task: no prompt to extract file refs from.
-                // Treat as independent (empty refs → singleton group) so batch
-                // submissions run in parallel. Real conflicts are caught by git
-                // worktree isolation and GitHub merge conflict detection.
-                Vec::new()
-            } else {
-                Vec::new()
-            }
-        })
-        .collect();
-
-    let conflict_groups = build_conflict_groups(&task_file_refs);
-
-    let n = task_requests.len();
-    let mut task_semaphores: Vec<Option<Arc<tokio::sync::Semaphore>>> = vec![None; n];
-    let mut task_conflict_files: Vec<Vec<String>> = vec![Vec::new(); n];
-    let mut task_conflict_group: Vec<Option<usize>> = vec![None; n];
-    let mut conflict_group_tail: Vec<Option<task_runner::TaskId>> =
-        vec![None; conflict_groups.len()];
-
-    for (group_idx, group) in conflict_groups.iter().enumerate() {
-        if group.len() < 2 {
-            continue;
-        }
-        let sem = Arc::new(tokio::sync::Semaphore::new(1));
-        for &idx in group {
-            task_semaphores[idx] = Some(Arc::clone(&sem));
-            task_conflict_group[idx] = Some(group_idx);
-            // Collect files from this task that overlap with any other group member.
-            let mut shared: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for &other in group {
-                if other == idx {
-                    continue;
-                }
-                for f in &task_file_refs[idx] {
-                    if task_file_refs[other].contains(f) {
-                        shared.insert(f.clone());
-                    }
-                }
-            }
-            let mut files: Vec<String> = shared.into_iter().collect();
-            files.sort();
-            task_conflict_files[idx] = files;
-        }
-    }
-
-    // Register each task without blocking on concurrency permit acquisition.
-    // Each task gets an ID immediately; a background tokio task handles permit
-    // waiting and execution. The HTTP handler returns as soon as all tasks are registered.
-    let mut results = Vec::with_capacity(n);
-    let mut all_maintenance_window = n > 0;
-    let mut mw_retry_after: Option<u64> = None;
-    for (i, mut task_req) in task_requests.into_iter().enumerate() {
-        let sem = task_semaphores[i].take();
-        let is_serialized = sem.is_some();
-        let conflict_files = std::mem::take(&mut task_conflict_files[i]);
-        let conflict_group = task_conflict_group[i];
-        if let Some(group_idx) = conflict_group {
-            if let Some(previous_task_id) = conflict_group_tail[group_idx].clone() {
-                task_req.serialization_depends_on.push(previous_task_id);
-            }
-        }
-        let is_issue_submission = task_req.issue.is_some();
-        let entry = match enqueue_task_background(state.clone(), task_req, sem).await {
-            Ok(task_id) => {
-                if let Some(group_idx) = conflict_group {
-                    conflict_group_tail[group_idx] = Some(task_id.clone());
-                }
-                all_maintenance_window = false;
-                match task_response_details(&state, &task_id, is_issue_submission).await {
-                    Ok(details) => {
-                        let mut response = task_submission_response(&task_id, details);
-                        if is_serialized {
-                            response["serialized"] = json!(true);
-                            response["conflict_files"] = json!(conflict_files);
-                        }
-                        response
-                    }
-                    Err(EnqueueTaskError::BadRequest(error)) => json!({ "error": error }),
-                    Err(EnqueueTaskError::Internal(error)) => json!({ "error": error }),
-                    Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs }) => {
-                        mw_retry_after.get_or_insert(retry_after_secs);
-                        json!({ "error": "maintenance_window", "retry_after": retry_after_secs })
-                    }
-                }
-            }
-            Err(EnqueueTaskError::BadRequest(error)) => {
-                all_maintenance_window = false;
-                json!({ "error": error })
-            }
-            Err(EnqueueTaskError::Internal(error)) => {
-                all_maintenance_window = false;
-                json!({ "error": error })
-            }
-            Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs }) => {
-                mw_retry_after.get_or_insert(retry_after_secs);
-                json!({ "error": "maintenance_window", "retry_after": retry_after_secs })
-            }
-        };
-        results.push(entry);
-    }
-
-    if all_maintenance_window {
-        let retry_after = mw_retry_after.unwrap_or(0);
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
-            Json(json!(results)),
-        )
-            .into_response();
-    }
-
-    (StatusCode::ACCEPTED, Json(json!(results))).into_response()
-}
-
-pub(super) async fn create_task(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<task_runner::CreateTaskRequest>,
-) -> Response {
-    create_task_response(state, req, false).await
+        "workflow_state": details.workflow_state,
+        "execution_path": "workflow_runtime",
+        "workflow_id": details.workflow_id,
+        "request_id": task_id.as_str(),
+    })
 }
 
 pub(super) async fn create_runtime_submission(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<task_runner::CreateTaskRequest>,
+    Json(req): Json<CreateTaskRequest>,
 ) -> Response {
-    create_task_response(state, req, true).await
-}
-
-async fn create_task_response(
-    state: Arc<AppState>,
-    req: task_runner::CreateTaskRequest,
-    require_runtime_submission: bool,
-) -> Response {
-    let is_issue_submission = req.issue.is_some();
     match enqueue_task_background(state.clone(), req, None).await {
-        Ok(task_id) => match task_response_details(&state, &task_id, is_issue_submission).await {
-            Ok(details) if require_runtime_submission && details.execution_path != "workflow_runtime" => (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": "legacy_submission_active",
-                    "message": "an active pre-migration task already owns this submission; no workflow-runtime submission was created"
-                })),
+        Ok(task_id) => match task_response_details(&state, &task_id).await {
+            Ok(details) => (
+                StatusCode::ACCEPTED,
+                Json(task_submission_response(&task_id, details)),
             )
                 .into_response(),
-            Ok(details) => {
-                (StatusCode::ACCEPTED, Json(task_submission_response(&task_id, details)))
-                    .into_response()
-            }
             Err(EnqueueTaskError::BadRequest(error)) => {
                 (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
             }
@@ -451,118 +135,50 @@ async fn create_task_response(
     }
 }
 
-/// POST /tasks/{id}/cancel — abort a running task.
-///
-/// Sets task status to `Cancelled` then aborts the Tokio future (which kills
-/// the child CLI process via `kill_on_drop(true)`).  Returns 409 if the task
-/// is already in a terminal state.
+#[cfg(test)]
+pub(super) async fn create_task(
+    state: State<Arc<AppState>>,
+    request: Json<CreateTaskRequest>,
+) -> Response {
+    create_runtime_submission(state, request).await
+}
+
+#[cfg(test)]
 pub(super) async fn cancel_task(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use task_runner::TaskStatus;
-
-    let task_id = harness_core::types::TaskId(id);
-
-    let task = match state.core.tasks.get_with_db_fallback(&task_id).await {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            let Some(runtime_store) = state.core.workflow_runtime_store.as_ref() else {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "task not found" })),
-                );
-            };
-            return match crate::workflow_runtime_submission::cancel_issue_submission_by_task_id(
-                runtime_store,
-                &task_id,
-            )
-            .await
-            {
-                Ok(RuntimeSubmissionCancelOutcome::Cancelled(workflow)) => {
-                    if let Err(error) =
-                        crate::workflow_runtime_worker::notify_runtime_submission_terminal_workflow(
-                            &state,
-                            &workflow.id,
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            workflow_id = %workflow.id,
-                            "cancel_task: runtime completion notification failed: {error}"
-                        );
-                    }
-                    (
-                        StatusCode::OK,
-                        Json(json!({
-                            "status": "cancelled",
-                            "execution_path": "workflow_runtime",
-                            "workflow_id": workflow.id,
-                        })),
-                    )
-                }
-                Ok(RuntimeSubmissionCancelOutcome::AlreadyTerminal(_)) => (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": "task already in terminal state" })),
-                ),
-                Ok(RuntimeSubmissionCancelOutcome::NotFound) => (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "task not found" })),
-                ),
-                Err(RuntimeSubmissionCancelError::UnsupportedDefinition { definition_id }) => (
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "error": "task cannot be cancelled as a runtime submission",
-                        "definition_id": definition_id,
-                    })),
-                ),
-                Err(e) => {
-                    tracing::error!(
-                        "cancel_task: runtime workflow lookup failed for {task_id:?}: {e}"
-                    );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": "failed to cancel runtime workflow" })),
-                    )
-                }
-            };
-        }
-        Err(e) => {
-            tracing::error!("cancel_task: DB lookup failed for {task_id:?}: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal server error" })),
-            );
-        }
-    };
-
-    if task.status.is_terminal() {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "task already in terminal state" })),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "workflow runtime store unavailable"})),
         );
-    }
-
-    // Persist Cancelled status before aborting the future so the watcher sees
-    // it and skips the record_task_failure path.
-    if let Err(e) = task_runner::mutate_and_persist(&state.core.tasks, &task_id, |s| {
-        s.status = TaskStatus::Cancelled;
-        s.scheduler.mark_terminal(&TaskStatus::Cancelled);
-    })
+    };
+    match crate::workflow_runtime_submission::cancel_issue_submission_by_task_id(
+        store,
+        &TaskId::from_str(&id),
+    )
     .await
     {
-        tracing::error!("cancel_task: failed to persist Cancelled for {task_id:?}: {e}");
-        return (
+        Ok(crate::workflow_runtime_submission::RuntimeSubmissionCancelOutcome::Cancelled(
+            workflow,
+        )) => (
+            StatusCode::OK,
+            Json(json!({"status": "cancelled", "workflow_id": workflow.id})),
+        ),
+        Ok(
+            crate::workflow_runtime_submission::RuntimeSubmissionCancelOutcome::AlreadyTerminal(_),
+        ) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "runtime submission already terminal"})),
+        ),
+        Ok(crate::workflow_runtime_submission::RuntimeSubmissionCancelOutcome::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "runtime submission not found"})),
+        ),
+        Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "failed to persist cancellation" })),
-        );
+            Json(json!({"error": error.to_string()})),
+        ),
     }
-
-    // abort() is a no-op if the task already finished. Workspace release is
-    // handled by the task watcher after it observes the aborted future, so the
-    // pool slot stays reserved while the child process is still being torn down.
-    state.core.tasks.abort_task(&task_id);
-
-    (StatusCode::OK, Json(json!({ "status": "cancelled" })))
 }

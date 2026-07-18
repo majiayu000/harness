@@ -40,9 +40,10 @@ pub(crate) use runtime_request::{
     fill_missing_repo_from_project, CreateTaskRequest, MAX_TASK_PRIORITY,
 };
 
+#[cfg(test)]
+pub(crate) use cancel::cancel_issue_submission_by_task_id;
 pub(crate) use cancel::{
-    cancel_issue_submission_by_task_id, cancel_submission_by_workflow_id,
-    RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
+    cancel_submission_by_workflow_id, RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
 };
 use commit::{apply_decision, apply_prompt_decision};
 pub(crate) use declarative::{

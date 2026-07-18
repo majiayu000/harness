@@ -5,8 +5,8 @@ use std::collections::HashSet;
 pub(super) async fn append_runtime_submission_summaries(
     state: &AppState,
     summaries: &mut Vec<TaskSummary>,
-    filter: &TaskSummaryFilter,
-    cursor: Option<&TaskSummaryPageCursor>,
+    filter: &RuntimeSubmissionSummaryFilter,
+    cursor: Option<&RuntimeSubmissionSummaryCursor>,
     limit: usize,
 ) -> anyhow::Result<()> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
@@ -18,7 +18,10 @@ pub(super) async fn append_runtime_submission_summaries(
     append_runtime_definition_summaries(store, summaries, filter, cursor, limit).await
 }
 
-fn workflow_runtime_summaries_required(state: &AppState, filter: &TaskSummaryFilter) -> bool {
+fn workflow_runtime_summaries_required(
+    state: &AppState,
+    filter: &RuntimeSubmissionSummaryFilter,
+) -> bool {
     workflow_runtime_store_required(state) && filter_includes_runtime_submission_kinds(filter)
 }
 
@@ -32,7 +35,7 @@ pub(crate) fn workflow_runtime_store_required(state: &AppState) -> bool {
             .contains(&"workflow_runtime_store")
 }
 
-fn filter_includes_runtime_submission_kinds(filter: &TaskSummaryFilter) -> bool {
+fn filter_includes_runtime_submission_kinds(filter: &RuntimeSubmissionSummaryFilter) -> bool {
     filter.kinds.is_empty()
         || filter.kinds.contains(&TaskKind::Issue)
         || filter.kinds.contains(&TaskKind::Pr)
@@ -42,8 +45,8 @@ fn filter_includes_runtime_submission_kinds(filter: &TaskSummaryFilter) -> bool 
 async fn append_runtime_definition_summaries(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
     summaries: &mut Vec<TaskSummary>,
-    filter: &TaskSummaryFilter,
-    cursor: Option<&TaskSummaryPageCursor>,
+    filter: &RuntimeSubmissionSummaryFilter,
+    cursor: Option<&RuntimeSubmissionSummaryCursor>,
     limit: usize,
 ) -> anyhow::Result<()> {
     let target_len = summaries.len().saturating_add(limit);

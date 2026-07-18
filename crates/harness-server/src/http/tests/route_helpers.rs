@@ -51,10 +51,14 @@ fn run_git(root: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
 pub(super) fn task_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_check))
-        .route("/tasks", post(task_routes::create_task))
-        .route("/tasks/batch", post(task_routes::create_tasks_batch))
-        .route("/tasks/{id}", get(get_task))
-        .route("/tasks/{id}/proof", get(get_task_proof))
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/proof",
+            get(task_query_routes::get_runtime_submission_proof),
+        )
         .with_state(state)
 }
 
@@ -137,7 +141,9 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
     let response = task_app(state)
         .oneshot(
             Request::builder()
-                .uri(format!("/tasks/{task_id}/proof"))
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{task_id}/proof"
+                ))
                 .body(Body::empty())?,
         )
         .await?;
@@ -190,7 +196,9 @@ async fn get_task_proof_rejects_nonterminal_runtime_task() -> anyhow::Result<()>
     let response = task_app(state)
         .oneshot(
             Request::builder()
-                .uri(format!("/tasks/{task_id}/proof"))
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{task_id}/proof"
+                ))
                 .body(Body::empty())?,
         )
         .await?;
@@ -381,7 +389,7 @@ pub(super) async fn assert_runtime_issue_submission(
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/tasks/{}", task_id.0))
+                .uri(format!("/api/workflows/runtime/submissions/{}", task_id.0))
                 .body(Body::empty())?,
         )
         .await?;

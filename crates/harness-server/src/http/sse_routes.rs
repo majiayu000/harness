@@ -8,6 +8,7 @@ use axum::{
     },
     Json,
 };
+use futures::{stream::BoxStream, StreamExt};
 use harness_core::agent::StreamItem;
 use serde_json::json;
 use std::{
@@ -17,127 +18,6 @@ use std::{
     time::Duration,
 };
 
-use futures::{stream::BoxStream, StreamExt};
-
-/// GET /tasks/{id}/stream — real-time SSE stream of agent execution events.
-///
-/// For active tasks, subscribes to the broadcast channel and forwards each
-/// [`StreamItem`] as a JSON-encoded SSE data event.
-///
-/// For completed tasks (stream channel already closed), replays stored round
-/// history as synthetic [`StreamItem::MessageDelta`] events followed by
-/// [`StreamItem::Done`], so the Logs view is never blank.
-///
-/// If the receiver lags on a live stream, a synthetic "lag" event notes how
-/// many events were dropped; streaming then continues.
-pub(crate) async fn stream_task_sse(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    let task_id = harness_core::types::TaskId(id);
-
-    let rx = match state.core.tasks.subscribe_task_stream(&task_id) {
-        Some(rx) => rx,
-        None => {
-            match state.core.tasks.get_with_db_fallback(&task_id).await {
-                Ok(None) => match runtime_task_sse_stream(state.clone(), task_id.clone()).await {
-                    Ok(Some(stream)) => {
-                        return Sse::new(stream)
-                            .keep_alive(sse_keep_alive())
-                            .into_response();
-                    }
-                    Ok(None) => {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(json!({"error": "task not found"})),
-                        )
-                            .into_response();
-                    }
-                    Err(e) => {
-                        tracing::error!("stream_task_sse: runtime workflow lookup failed: {e}");
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({"error": "internal server error"})),
-                        )
-                            .into_response();
-                    }
-                },
-                Err(e) => {
-                    tracing::error!("stream_task_sse: database error: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "internal server error"})),
-                    )
-                        .into_response();
-                }
-                Ok(Some(task)) => {
-                    // Task exists but stream already closed — replay stored
-                    // round history so the Logs view is not blank.
-                    let mut events: Vec<Result<Event, std::convert::Infallible>> = task
-                        .rounds
-                        .iter()
-                        .filter_map(|r| {
-                            let mut text = format!("[turn {}] {}\n{}", r.turn, r.action, r.result);
-                            if let Some(detail) = &r.detail {
-                                text.push_str("\n\n");
-                                text.push_str(detail);
-                            }
-                            if let Some(telemetry) = &r.telemetry {
-                                text.push_str("\n\ntelemetry=");
-                                text.push_str(&serde_json::to_string(telemetry).ok()?);
-                            }
-                            if let Some(failure) = &r.failure {
-                                text.push_str("\nfailure=");
-                                text.push_str(&serde_json::to_string(failure).ok()?);
-                            }
-                            let item = StreamItem::MessageDelta { text };
-                            serde_json::to_string(&item)
-                                .ok()
-                                .map(|data| Ok(Event::default().data(data)))
-                        })
-                        .collect();
-                    if let Ok(data) = serde_json::to_string(&StreamItem::Done) {
-                        events.push(Ok(Event::default().data(data)));
-                    }
-                    return Sse::new(futures::stream::iter(events)).into_response();
-                }
-            }
-        }
-    };
-
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Ok(item) => {
-                let data = match serde_json::to_string(&item) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("sse: failed to serialize event: {e}");
-                        String::new()
-                    }
-                };
-                Some((
-                    Ok::<Event, std::convert::Infallible>(Event::default().data(data)),
-                    rx,
-                ))
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                let event = Event::default()
-                    .event("lag")
-                    .data(format!("dropped {n} events due to slow consumer"));
-                Some((Ok(event), rx))
-            }
-        }
-    });
-
-    // Send a heartbeat comment every 30 s so reverse proxies (nginx default
-    // 60 s idle timeout) don't drop the connection while the agent is silent.
-    Sse::new(stream)
-        .keep_alive(sse_keep_alive())
-        .into_response()
-}
-
-/// Stream a workflow-runtime submission without consulting the legacy task store.
 pub(crate) async fn stream_runtime_submission_sse(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -150,7 +30,7 @@ pub(crate) async fn stream_runtime_submission_sse(
             .into_response();
     }
     let task_id = harness_core::types::TaskId(id);
-    match runtime_task_sse_stream(state, task_id).await {
+    match runtime_submission_sse_stream(state, task_id).await {
         Ok(Some(stream)) => Sse::new(stream)
             .keep_alive(sse_keep_alive())
             .into_response(),
@@ -180,7 +60,7 @@ fn sse_keep_alive() -> KeepAlive {
 
 type SseEvent = Result<Event, Infallible>;
 
-async fn runtime_task_sse_stream(
+async fn runtime_submission_sse_stream(
     state: Arc<AppState>,
     task_id: harness_core::types::TaskId,
 ) -> anyhow::Result<Option<BoxStream<'static, SseEvent>>> {
@@ -194,7 +74,7 @@ async fn runtime_task_sse_stream(
         return Ok(None);
     };
 
-    let mut cursor = RuntimeTaskSseCursor::new(store, workflow.id);
+    let mut cursor = RuntimeSubmissionSseCursor::new(store, workflow.id);
     cursor.refresh().await?;
     Ok(Some(
         futures::stream::unfold(cursor, |mut cursor| async move {
@@ -208,7 +88,7 @@ async fn runtime_task_sse_stream(
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 if let Err(error) = cursor.refresh().await {
                     tracing::error!(
-                        "runtime_task_sse_stream: runtime workflow refresh failed: {error}"
+                        "runtime_submission_sse_stream: workflow refresh failed: {error}"
                     );
                     cursor.push_item(StreamItem::Error {
                         message: "runtime workflow stream failed".to_string(),
@@ -221,7 +101,7 @@ async fn runtime_task_sse_stream(
     ))
 }
 
-struct RuntimeTaskSseCursor {
+struct RuntimeSubmissionSseCursor {
     store: Arc<harness_workflow::runtime::WorkflowRuntimeStore>,
     workflow_id: String,
     pending: VecDeque<SseEvent>,
@@ -231,7 +111,7 @@ struct RuntimeTaskSseCursor {
     finished: bool,
 }
 
-impl RuntimeTaskSseCursor {
+impl RuntimeSubmissionSseCursor {
     fn new(
         store: Arc<harness_workflow::runtime::WorkflowRuntimeStore>,
         workflow_id: String,
@@ -307,7 +187,7 @@ impl RuntimeTaskSseCursor {
         match serde_json::to_string(&item) {
             Ok(data) => self.pending.push_back(Ok(Event::default().data(data))),
             Err(error) => {
-                tracing::warn!("runtime_task_sse_stream: failed to serialize event: {error}")
+                tracing::warn!("runtime_submission_sse_stream: failed to serialize event: {error}")
             }
         }
     }
