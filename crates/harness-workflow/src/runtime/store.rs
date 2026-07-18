@@ -9,6 +9,7 @@ use super::model::{
 };
 use super::status::WorkflowCommandStatus;
 use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
+use super::transcript::PendingRuntimeTranscript;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use harness_core::db::PgStoreContext;
@@ -20,6 +21,8 @@ use std::path::Path;
 
 #[path = "store/activity_completion.rs"]
 mod activity_completion;
+#[path = "store/artifacts.rs"]
+mod artifacts;
 #[path = "store/command_facade.rs"]
 mod command_facade;
 #[path = "store/commands.rs"]

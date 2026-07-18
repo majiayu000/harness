@@ -45,6 +45,11 @@ pub const STOP_REASON_CI_BACKEND_UNAVAILABLE: &str = "ci_backend_unavailable";
 pub const STOP_REASON_MERGE_BASE_DRIFT: &str = "merge_base_drift";
 /// Stop reason code for a runtime circuit-breaker cooldown (transient).
 pub const STOP_REASON_CIRCUIT_BREAKER_COOLDOWN: &str = "circuit_breaker_cooldown";
+/// Stop reason code for a transient runtime transcript store failure.
+pub const STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE: &str =
+    "runtime_transcript_store_unavailable";
+/// Stop reason code for confirmed runtime transcript loss or corruption.
+pub const STOP_REASON_RUNTIME_TRANSCRIPT_LOST: &str = "runtime_transcript_lost";
 /// Stop reason code for a block that needs maintainer/operator input (terminal).
 pub const STOP_REASON_MAINTAINER_INPUT_REQUIRED: &str = "maintainer_input_required";
 /// Stop reason code for structurally invalid agent output (terminal).
@@ -57,6 +62,7 @@ pub const TRANSIENT_STOP_REASON_CODES: &[&str] = &[
     STOP_REASON_CI_BACKEND_UNAVAILABLE,
     STOP_REASON_MERGE_BASE_DRIFT,
     STOP_REASON_CIRCUIT_BREAKER_COOLDOWN,
+    STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE,
 ];
 
 /// Single classifier used by the scheduler, API serialization, and audit

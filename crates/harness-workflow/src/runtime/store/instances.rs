@@ -536,6 +536,21 @@ impl WorkflowRuntimeStore {
                         WHERE terminal.definition_id = family.definition_id
                           AND terminal.state = family.state
                     ))
+                    AND bool_and(NOT EXISTS (
+                        SELECT 1
+                        FROM workflow_artifacts AS artifact
+                        JOIN workflow_artifact_dependencies AS dependency
+                          ON dependency.artifact_ref = artifact.id
+                        JOIN workflow_instances AS dependent
+                          ON dependent.id = dependency.workflow_id
+                        WHERE artifact.workflow_id = family.id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM terminal_states AS dependent_terminal
+                              WHERE dependent_terminal.definition_id = dependent.definition_id
+                                AND dependent_terminal.state = dependent.state
+                          )
+                    ))
              )
              SELECT family.id
              FROM family

@@ -11,8 +11,9 @@ use tower::ServiceExt;
 
 use chrono::Utc;
 use harness_workflow::runtime::{
-    ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeKind, WorkflowCommand, WorkflowInstance,
-    WorkflowRuntimeStore, WorkflowSubject,
+    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeKind,
+    RuntimeTranscriptRead, WorkflowCommand, WorkflowInstance, WorkflowRuntimeStore,
+    WorkflowSubject, RUNTIME_TRANSCRIPT_ARTIFACT, RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT,
 };
 
 pub(super) fn runtime_hosts_workflow_app(state: Arc<crate::http::AppState>) -> Router {
@@ -379,6 +380,82 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
         .expect("runtime job should be persisted");
     assert_eq!(persisted.status, RuntimeJobStatus::Failed);
     assert!(persisted.lease.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_completion_endpoint_persists_transcript_before_accepting_result(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host(&app, "host-a").await?;
+
+    let workflow_id = "runtime-host-test-transcript";
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "transcript",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "remote_check",
+            "workflow_id": workflow_id,
+        }),
+    )
+    .await?;
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    let lease_expires_at = claimed["lease_expires_at"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("lease_expires_at must be a string"))?;
+    let result = ActivityResult::succeeded("remote_check", "Remote host completed the activity.")
+        .with_artifact(ActivityArtifact::new(
+            RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT,
+            json!({
+                "content": "provider transcript bytes",
+                "format": "provider.export.v1",
+            }),
+        ));
+
+    let completed = post_json(
+        &app,
+        format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
+        json!({
+            "lease_expires_at": lease_expires_at,
+            "result": result,
+        }),
+    )
+    .await?;
+    assert_eq!(completed["completed"], true);
+    let artifacts = completed["runtime_job"]["output"]["artifacts"]
+        .as_array()
+        .expect("completed job artifacts");
+    assert!(artifacts
+        .iter()
+        .any(|artifact| artifact["artifact_type"] == RUNTIME_TRANSCRIPT_ARTIFACT));
+    assert!(artifacts
+        .iter()
+        .all(|artifact| artifact["artifact_type"] != RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT));
+
+    let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&job.id);
+    match store.read_runtime_transcript(&artifact_ref).await? {
+        RuntimeTranscriptRead::Verified(record) => {
+            assert_eq!(record.workflow_id, workflow_id);
+            assert_eq!(record.content, "provider transcript bytes");
+        }
+        other => anyhow::bail!("expected verified remote transcript, got {other:?}"),
+    }
+    let events = store.runtime_events_for(&job.id).await?;
+    assert!(events.iter().all(|event| !event
+        .event
+        .to_string()
+        .contains("provider transcript bytes")));
     Ok(())
 }
 

@@ -178,6 +178,19 @@ impl WorkflowRuntimeStore {
         let data = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
         let runtime_kind = enum_str(&job.runtime_kind)?;
+        let mut tx = self.pool.begin().await?;
+        let workflow_id: Option<(String,)> =
+            sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                .bind(command_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((workflow_id,)) = workflow_id else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+        if let Some(command) = job.input.get("command") {
+            super::artifacts::pin_runtime_transcript_dependency_tx(&mut tx, &workflow_id, command)
+                .await?;
+        }
         sqlx::query(
             "INSERT INTO runtime_jobs
                 (id, command_id, runtime_kind, runtime_profile, status, not_before, data)
@@ -190,8 +203,9 @@ impl WorkflowRuntimeStore {
         .bind(&status)
         .bind(job.not_before)
         .bind(&data)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(job)
     }
 

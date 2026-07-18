@@ -32,6 +32,7 @@ observes results. The following capabilities are **only available over HTTP**:
 | `POST /api/workflows/runtime/submissions` | submit | Create a durable workflow-runtime submission |
 | `GET  /api/workflows/runtime/submissions/{id}` | get | Read runtime submission status |
 | `GET  /api/workflows/runtime/submissions/{id}/artifacts` | artifacts | Read runtime output artifacts |
+| `POST /api/workflows/runtime/transcripts/reconstruct` | transcript reconstruction | Restore a missing or corrupt runtime transcript from an upstream provider re-export |
 | `GET  /api/workflows/runtime/submissions/{id}/stream` | stream | Stream runtime submission events |
 | `POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}` | approval | Respond to a live runtime approval request |
 | `POST /webhook` | webhook | GitHub webhook (HMAC-verified) |

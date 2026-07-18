@@ -6,8 +6,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{
-    ActivityResult, RuntimeJobClaimDecision, RuntimeJobClaimGuard, RuntimeJobNotFoundError,
-    RuntimeKind, WorkflowRuntimeStore,
+    prepare_runtime_transcript, ActivityResult, RuntimeJobClaimDecision, RuntimeJobClaimGuard,
+    RuntimeJobNotFoundError, RuntimeKind, WorkflowRuntimeStore,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -382,7 +382,37 @@ pub async fn complete_runtime_job_for_runtime_host(
         Ok(store) => store,
         Err(response) => return response,
     };
-    let result_payload = match serde_json::to_value(&req.result) {
+    let job = match store.get_runtime_job(&runtime_job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("runtime job not found: {runtime_job_id}") })),
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                host_id = %host_id,
+                runtime_job_id = %runtime_job_id,
+                %error,
+                "runtime host failed to load workflow runtime job before completion"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to load runtime job" })),
+            );
+        }
+    };
+    let (result, transcript) = match prepare_runtime_transcript(&job, req.result) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid runtime transcript source: {error}") })),
+            );
+        }
+    };
+    let result_payload = match serde_json::to_value(&result) {
         Ok(value) => value,
         Err(e) => {
             return (
@@ -393,12 +423,13 @@ pub async fn complete_runtime_job_for_runtime_host(
     };
 
     let completion = match store
-        .commit_runtime_activity_completion_if_owned_with_generation(
+        .commit_runtime_activity_completion_with_transcript_if_owned_with_generation(
             &runtime_job_id,
             &host_id,
             req.lease_expires_at,
             req.lease_generation,
-            &req.result,
+            &result,
+            transcript.as_ref(),
         )
         .await
     {

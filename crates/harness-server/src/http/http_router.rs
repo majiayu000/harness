@@ -115,6 +115,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(task_mutation_routes::retry_workflow_runtime),
         )
         .route(
+            "/api/workflows/runtime/transcripts/reconstruct",
+            post(task_mutation_routes::reconstruct_runtime_transcript),
+        )
+        .route(
             "/api/projects/{id}/memory",
             get(crate::handlers::repo_memory_api::list_project_repo_memory_route),
         )

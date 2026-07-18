@@ -161,3 +161,66 @@ fn runtime_failure_scope_too_large_block_sets_maintainer_input_required_code() {
     );
     assert_eq!(payload["reason_class"], json!("terminal"));
 }
+
+#[test]
+fn runtime_transcript_store_failure_uses_bounded_default_backoff() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult::failed(
+        "exact_replay",
+        "transcript preflight failed",
+        "transcript store unavailable",
+    )
+    .with_error_kind(ActivityErrorKind::Retryable)
+    .with_signal(ActivitySignal::new(
+        "RuntimeTranscriptUnavailable",
+        json!({
+            "stop_reason_code": "runtime_transcript_store_unavailable",
+        }),
+    ));
+    let event = runtime_completion_event(&instance, "exact_replay", result.clone());
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("transient transcript failure should retry");
+    assert_eq!(decision.next_state, "implementing");
+    assert_eq!(decision.decision, "retry_failed_runtime_activity");
+    assert_eq!(decision.commands[0].command["retry_attempt"], 1);
+    assert_eq!(decision.commands[0].command["max_failed_activity_retries"], 3);
+    assert_eq!(decision.commands[0].command["retry_delay_secs"], 5);
+
+    let mut exhausted = runtime_completion_event(&instance, "exact_replay", result);
+    exhausted.event["command"]["command"]["retry_attempt"] = json!(3);
+    let decision = reduce_runtime_job_completed(&instance, &exhausted)
+        .expect("event should parse")
+        .expect("exhausted transcript failure should terminate");
+    assert_eq!(decision.next_state, "failed");
+    assert_eq!(decision.decision, "fail_after_runtime_activity");
+}
+
+#[test]
+fn confirmed_runtime_transcript_loss_is_terminal() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult::failed(
+        "implement_issue",
+        "transcript preflight failed",
+        "required transcript is missing; reconstruct it before retrying",
+    )
+    .with_error_kind(ActivityErrorKind::Fatal)
+    .with_signal(ActivitySignal::new(
+        "RuntimeTranscriptUnavailable",
+        json!({ "stop_reason_code": "runtime_transcript_lost" }),
+    ));
+    let event = runtime_completion_event(&instance, "implement_issue", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("confirmed transcript loss should terminate");
+    assert_eq!(decision.next_state, "failed");
+    let payload = &mark_stop_command(&decision, WorkflowCommandType::MarkFailed).command;
+    assert_eq!(payload["stop_reason_code"], "runtime_transcript_lost");
+    assert_eq!(payload["reason_class"], "terminal");
+    assert!(payload["retry_hint"]
+        .as_str()
+        .expect("retry hint")
+        .contains("non-retryable"));
+}

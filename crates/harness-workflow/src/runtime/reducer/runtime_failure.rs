@@ -79,20 +79,28 @@ fn retry_failed_activity_decision_inner(
     if !is_retryable_error_kind(result.error_kind) {
         return None;
     }
+    let transcript_store_retry = result_stop_reason_code(result).as_deref()
+        == Some(crate::runtime::reason_class::STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE);
     if !declarative && !supports_same_state_activity_retry(&instance.definition_id, &instance.state)
     {
         return None;
     }
     let retry_attempt = failed_activity_retry_attempt(event);
     let activity = retry_activity_name(event, result)?;
-    let retry_limit = failed_activity_retry_limit(instance, &activity)?;
+    let retry_limit = failed_activity_retry_limit(instance, &activity)
+        .or_else(|| transcript_store_retry.then_some(3))?;
     if retry_attempt >= retry_limit {
         return None;
     }
     let next_attempt = retry_attempt + 1;
     let reason = runtime_failure_reason(result, "Runtime activity failed.");
-    let retry_schedule =
-        failed_activity_retry_schedule(instance, &activity, next_attempt, event.created_at);
+    let retry_schedule = failed_activity_retry_schedule(
+        instance,
+        &activity,
+        next_attempt,
+        event.created_at,
+        transcript_store_retry,
+    );
     Some(
         WorkflowDecision::new(
             &instance.id,
@@ -182,8 +190,10 @@ fn failed_activity_retry_schedule(
     activity: &str,
     next_attempt: u64,
     base_time: DateTime<Utc>,
+    transcript_store_retry: bool,
 ) -> Option<RetrySchedule> {
-    let base_delay = retry_policy_u64(instance, activity, "retry_delay_secs")?;
+    let base_delay = retry_policy_u64(instance, activity, "retry_delay_secs")
+        .or_else(|| transcript_store_retry.then_some(5))?;
     if base_delay == 0 {
         return None;
     }
@@ -192,6 +202,7 @@ fn failed_activity_retry_schedule(
         .unwrap_or(u64::MAX);
     let mut delay_secs = base_delay.saturating_mul(multiplier);
     if let Some(max_delay) = retry_policy_u64(instance, activity, "max_retry_delay_secs")
+        .or_else(|| transcript_store_retry.then_some(60))
         .filter(|max_delay| *max_delay > 0)
     {
         delay_secs = delay_secs.min(max_delay);

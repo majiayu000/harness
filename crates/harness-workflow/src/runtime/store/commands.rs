@@ -123,19 +123,9 @@ pub(super) async fn insert(
     command: &WorkflowCommand,
     status: WorkflowCommandStatus,
 ) -> anyhow::Result<String> {
-    let data = to_jsonb_string(command)?;
-    let command_type = enum_str(&command.command_type)?;
-    let (id,): (String,) = sqlx::query_as(insert_sql())
-        .bind(Uuid::new_v4().to_string())
-        .bind(workflow_id)
-        .bind(decision_id)
-        .bind(&command_type)
-        .bind(&command.dedupe_key)
-        .bind(status.as_str())
-        .bind(&data)
-        .bind(WorkflowCommandStatus::Pending.as_str())
-        .fetch_one(pool)
-        .await?;
+    let mut tx = pool.begin().await?;
+    let id = insert_tx(&mut tx, workflow_id, decision_id, command, status).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -158,6 +148,8 @@ pub(super) async fn insert_tx(
         .bind(&data)
         .bind(WorkflowCommandStatus::Pending.as_str())
         .fetch_one(&mut **tx)
+        .await?;
+    super::artifacts::pin_runtime_transcript_dependency_tx(tx, workflow_id, &command.command)
         .await?;
     Ok(id)
 }
@@ -316,6 +308,10 @@ pub(super) async fn enqueue_runtime_job_for_command(
             "_dispatch_claim".to_string(),
             json!({ "owner": claim.owner, "generation": claim.generation }),
         );
+    }
+    if let Some(command) = job.input.get("command") {
+        super::artifacts::pin_runtime_transcript_dependency_tx(&mut tx, &workflow_id, command)
+            .await?;
     }
     let data = to_jsonb_string(&job)?;
     let status = enum_str(&job.status)?;

@@ -69,3 +69,4 @@ mod replay_determinism;
 mod retry;
 mod runtime_store;
 mod runtime_usage;
+mod transcript_durability;

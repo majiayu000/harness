@@ -577,4 +577,20 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               ADD CONSTRAINT runtime_usage_events_cost_nonnegative
               CHECK (cost_usd_micros >= 0)",
     },
+    Migration {
+        version: 23,
+        description: "pin runtime transcripts for dependent workflows",
+        sql: "CREATE TABLE IF NOT EXISTS workflow_artifact_dependencies (
+            artifact_ref   TEXT NOT NULL,
+            workflow_id    TEXT NOT NULL,
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (artifact_ref, workflow_id),
+            CONSTRAINT workflow_artifact_dependencies_workflow_id_fkey
+                FOREIGN KEY (workflow_id)
+                REFERENCES workflow_instances(id)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_workflow_artifact_dependencies_workflow
+          ON workflow_artifact_dependencies (workflow_id)",
+    },
 ];

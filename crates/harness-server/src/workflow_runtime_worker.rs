@@ -6,6 +6,7 @@ mod child_workflow_non_issue;
 mod child_workflow_replay;
 mod data_helpers;
 mod executor;
+mod executor_contract;
 mod merge_completion;
 mod otel_trajectory;
 mod pr_feedback_inspection;
@@ -17,6 +18,7 @@ mod runtime_profile;
 mod runtime_turn_control;
 mod runtime_usage;
 mod server_merge;
+mod transcript_durability;
 pub(crate) mod turn_engine;
 mod workspace;
 
@@ -112,6 +114,22 @@ pub(crate) async fn run_runtime_job_worker_tick(
         }
     }
     Ok(RuntimeJobWorkerTick::from_completed_job(completed))
+}
+
+#[cfg(test)]
+pub(crate) async fn exact_replay_preflight_for_test(
+    state: &Arc<AppState>,
+    job: &RuntimeJob,
+) -> Option<ActivityResult> {
+    transcript_durability::exact_replay_preflight_result(state, job).await
+}
+
+#[cfg(test)]
+pub(crate) async fn hydrate_exact_replay_for_test(
+    state: &Arc<AppState>,
+    job: &mut RuntimeJob,
+) -> Result<(), ActivityResult> {
+    transcript_durability::hydrate_exact_replay_transcript(state, job).await
 }
 
 async fn defer_open_runtime_profiles(

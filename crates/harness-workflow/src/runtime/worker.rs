@@ -168,6 +168,7 @@ impl<'a> RuntimeWorker<'a> {
                 }
             }
         };
+        let (result, transcript) = super::transcript::prepare_runtime_transcript(&job, result)?;
         self.store
             .record_runtime_event(
                 &job.id,
@@ -177,11 +178,12 @@ impl<'a> RuntimeWorker<'a> {
             .await?;
         let Some(completion) = self
             .store
-            .commit_runtime_activity_completion_if_owned(
+            .commit_runtime_activity_completion_with_transcript_if_owned(
                 &job.id,
                 &self.owner,
                 lease_expires_at,
                 &result,
+                transcript.as_ref(),
             )
             .await?
         else {
