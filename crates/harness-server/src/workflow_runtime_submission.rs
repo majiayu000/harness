@@ -11,11 +11,6 @@ use harness_workflow::runtime::{
 use serde_json::json;
 use std::path::Path;
 
-#[cfg(test)]
-use crate::task_runner::{TaskStatus, TaskStore};
-#[cfg(test)]
-use harness_workflow::runtime::WorkflowCommandType;
-
 const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
 const EXECUTION_PATH_WORKFLOW_RUNTIME: &str = "workflow_runtime";
 const PROMPT_TASK_DESCRIPTION: &str = "prompt task";
@@ -59,10 +54,7 @@ pub(crate) use dependencies::{
 pub(crate) use prompt_memory::clear_prompt_submission_prompt_cache_for_test;
 use prompt_memory::prompt_ref_for_submission;
 #[cfg(test)]
-use prompt_memory::{
-    cache_prompt_submission_prompt, remove_prompt_submission_prompt,
-    remove_terminal_prompt_submission_prompt,
-};
+use prompt_memory::{cache_prompt_submission_prompt, remove_terminal_prompt_submission_prompt};
 pub(crate) use prompt_memory::{
     lookup_prompt_submission_prompt, lookup_prompt_submission_prompt_durable,
     remove_terminal_prompt_submission_payload,

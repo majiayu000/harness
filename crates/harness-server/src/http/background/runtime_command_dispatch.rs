@@ -35,18 +35,12 @@ pub(in crate::http) async fn run_runtime_command_dispatch_tick(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(RuntimeCommandDispatchTick::default());
     };
-    let release = crate::workflow_runtime_submission::release_ready_issue_dependencies(
-        store,
-        &state.core.tasks,
-        batch_limit,
-    )
-    .await?;
-    let prompt_release = crate::workflow_runtime_submission::release_ready_prompt_dependencies(
-        store,
-        &state.core.tasks,
-        batch_limit,
-    )
-    .await?;
+    let release =
+        crate::workflow_runtime_submission::release_ready_issue_dependencies(store, batch_limit)
+            .await?;
+    let prompt_release =
+        crate::workflow_runtime_submission::release_ready_prompt_dependencies(store, batch_limit)
+            .await?;
     if release.released > 0 || release.failed > 0 || release.skipped > 0 {
         tracing::info!(
             released = release.released,

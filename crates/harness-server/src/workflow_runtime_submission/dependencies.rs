@@ -1,4 +1,4 @@
-use crate::task_runner::{TaskId, TaskStatus, TaskStore};
+use super::TaskId;
 use harness_workflow::runtime::{
     activity_result_value_has_closed_issue_evidence, build_issue_submission_decision,
     build_prompt_submission_decision, value_has_closed_issue_evidence,
@@ -40,28 +40,17 @@ pub(crate) enum RuntimeDependencyStatus {
 
 pub(crate) async fn resolve_issue_dependency_status(
     store: Option<&WorkflowRuntimeStore>,
-    tasks: &TaskStore,
     task_id: &TaskId,
 ) -> anyhow::Result<RuntimeDependencyStatus> {
-    resolve_issue_dependency_status_by_exact_id(store, tasks, task_id)
+    resolve_issue_dependency_status_by_exact_id(store, task_id)
         .await
         .map(|status| status.unwrap_or(RuntimeDependencyStatus::Waiting))
 }
 
 async fn resolve_issue_dependency_status_by_exact_id(
     store: Option<&WorkflowRuntimeStore>,
-    tasks: &TaskStore,
     task_id: &TaskId,
 ) -> anyhow::Result<Option<RuntimeDependencyStatus>> {
-    if let Some(status) = tasks.dep_status(task_id).await {
-        return Ok(Some(match status {
-            TaskStatus::Done => RuntimeDependencyStatus::Done,
-            TaskStatus::Failed => RuntimeDependencyStatus::Failed,
-            TaskStatus::Cancelled => RuntimeDependencyStatus::Cancelled,
-            _ => RuntimeDependencyStatus::Waiting,
-        }));
-    }
-
     let Some(store) = store else {
         return Ok(None);
     };
@@ -75,13 +64,10 @@ async fn resolve_issue_dependency_status_by_exact_id(
 
 async fn resolve_issue_dependency_status_for_instance(
     store: &WorkflowRuntimeStore,
-    tasks: &TaskStore,
     waiting_instance: &WorkflowInstance,
     task_id: &TaskId,
 ) -> anyhow::Result<RuntimeDependencyStatus> {
-    if let Some(status) =
-        resolve_issue_dependency_status_by_exact_id(Some(store), tasks, task_id).await?
-    {
+    if let Some(status) = resolve_issue_dependency_status_by_exact_id(Some(store), task_id).await? {
         return Ok(status);
     }
     let Some(instance) =
@@ -180,7 +166,6 @@ fn parse_github_issue_dependency(task_id: &str) -> Option<(&str, u64)> {
 
 pub(crate) async fn release_ready_issue_dependencies(
     store: &WorkflowRuntimeStore,
-    tasks: &TaskStore,
     limit: i64,
 ) -> anyhow::Result<DependencyReleaseSummary> {
     let instances = store
@@ -207,9 +192,7 @@ pub(crate) async fn release_ready_issue_dependencies(
         let mut all_done = true;
         let mut terminal_failure: Option<(TaskId, &'static str)> = None;
         for dep_id in &depends_on {
-            match resolve_issue_dependency_status_for_instance(store, tasks, &instance, dep_id)
-                .await?
-            {
+            match resolve_issue_dependency_status_for_instance(store, &instance, dep_id).await? {
                 RuntimeDependencyStatus::Done => {}
                 RuntimeDependencyStatus::Failed => {
                     terminal_failure = Some((dep_id.clone(), "failed"));
@@ -238,7 +221,6 @@ pub(crate) async fn release_ready_issue_dependencies(
 
 pub(crate) async fn release_ready_prompt_dependencies(
     store: &WorkflowRuntimeStore,
-    tasks: &TaskStore,
     limit: i64,
 ) -> anyhow::Result<DependencyReleaseSummary> {
     let instances = store
@@ -288,7 +270,7 @@ pub(crate) async fn release_ready_prompt_dependencies(
         let mut all_done = true;
         let mut terminal_failure: Option<(TaskId, &'static str)> = None;
         for dep_id in &depends_on {
-            match resolve_issue_dependency_status(Some(store), tasks, dep_id).await? {
+            match resolve_issue_dependency_status(Some(store), dep_id).await? {
                 RuntimeDependencyStatus::Done => {}
                 RuntimeDependencyStatus::Failed
                     if serialization_depends_on.iter().any(|id| id == dep_id)

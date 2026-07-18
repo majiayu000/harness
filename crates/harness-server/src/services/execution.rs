@@ -577,7 +577,6 @@ impl DefaultExecutionService {
         for dep_id in &req.depends_on {
             let status = crate::workflow_runtime_submission::resolve_issue_dependency_status(
                 self.workflow_runtime_store.as_deref(),
-                &self.tasks,
                 dep_id,
             )
             .await
@@ -607,7 +606,6 @@ impl DefaultExecutionService {
         for dep_id in &req.serialization_depends_on {
             let status = crate::workflow_runtime_submission::resolve_issue_dependency_status(
                 self.workflow_runtime_store.as_deref(),
-                &self.tasks,
                 dep_id,
             )
             .await
