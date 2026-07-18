@@ -9,6 +9,9 @@ use harness_workflow::runtime::{
 use serde_json::json;
 use std::path::Path;
 
+use super::github_coverage_recovery::{
+    cancel_superseded_commands, preserve_submission_handles, recovered_workflow_data,
+};
 use super::github_issue_links::{
     closing_pr_belongs_to_repo, fetch_github_issue_closing_prs_with_client,
     recovery_expected_base_ref,
@@ -361,31 +364,16 @@ async fn persist_recovered_workflow(
     state: &str,
 ) -> anyhow::Result<RecoveredWorkflowPersistence> {
     let id = workflow_id(project_id, Some(repo), issue_number);
-    let mut data = json!({
-        "project_id": project_id,
-        "repo": repo,
-        "issue_number": issue_number,
-        "pr_number": candidate.number,
-        "pr_url": candidate.url,
-        "pr_head_ref": candidate.head_ref_name,
-        "pr_head_sha": snapshot.get("head_oid").cloned().unwrap_or(serde_json::Value::Null),
-        "expected_base_ref": snapshot.get("expected_base_ref").cloned().unwrap_or(serde_json::Value::Null),
-        "last_remote_fact_hash": fact_hash,
-        "coverage_recovered_from_github": true,
-        "recovered_pr_snapshot": snapshot,
-    });
-    if state == "done" {
-        data["terminal_evidence"] = json!({
-            "source": "server_github_graphql",
-            "reason": "closing_pr_merged",
-            "fact_hash": fact_hash,
-            "merge_commit_sha": snapshot
-                .get("merge_commit_sha")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        });
-    }
-    data = crate::workflow_runtime_policy::merge_runtime_retry_policy(project_root, data);
+    let mut data = recovered_workflow_data(
+        project_root,
+        project_id,
+        repo,
+        issue_number,
+        candidate,
+        snapshot,
+        fact_hash,
+        state,
+    );
 
     if state == "quality_gate_pending" {
         return persist_recovered_quality_gate(
@@ -410,6 +398,8 @@ async fn persist_recovered_workflow(
                 existing.state,
             ));
         }
+        preserve_submission_handles(&mut data, &existing.data);
+        cancel_superseded_commands(runtime_store, &id).await?;
         existing.state = state.to_string();
         existing.data = data;
         existing.version = existing.version.saturating_add(1);
@@ -442,7 +432,7 @@ async fn persist_recovered_quality_gate(
     repo: &str,
     issue_number: u64,
     candidate: &ClosingPullRequestCandidate,
-    data: serde_json::Value,
+    mut data: serde_json::Value,
 ) -> anyhow::Result<RecoveredWorkflowPersistence> {
     let id = workflow_id(project_id, Some(repo), issue_number);
     let existing = runtime_store.get_instance(&id).await?;
@@ -457,6 +447,8 @@ async fn persist_recovered_quality_gate(
                 workflow.state.clone(),
             ));
         }
+        preserve_submission_handles(&mut data, &workflow.data);
+        cancel_superseded_commands(runtime_store, &id).await?;
     }
 
     let create_if_missing = existing.is_none();

@@ -130,8 +130,20 @@ async fn recovery_maps_open_pr_facts() -> anyhow::Result<()> {
             "planning",
             WorkflowSubject::new("issue", format!("issue:{issue_number}")),
         )
-        .with_id(workflow_id(&project_id, Some(REPO), issue_number));
+        .with_id(workflow_id(&project_id, Some(REPO), issue_number))
+        .with_data(json!({
+            "submission_id": format!("existing-handle-{issue_number}"),
+            "task_id": format!("github-issue:{REPO}:issue:{issue_number}"),
+            "task_ids": [format!("existing-handle-{issue_number}")],
+        }));
         store.upsert_instance(&existing).await?;
+        store
+            .enqueue_command(
+                &existing.id,
+                None,
+                &WorkflowCommand::enqueue_activity("plan_issue", format!("stale-{issue_number}")),
+            )
+            .await?;
         let rest_url = spawn_json_server(
             "200 OK",
             vec![rest_candidates(&[(pr_number, issue_number)])],
@@ -170,6 +182,14 @@ async fn recovery_maps_open_pr_facts() -> anyhow::Result<()> {
         );
         assert_recovered_binding(&store, &project_id, issue_number, pr_number, expected_state)
             .await?;
+        let recovered = store
+            .get_instance_by_submission_id(&format!("existing-handle-{issue_number}"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("recovered workflow missing"))?;
+        assert_eq!(
+            recovered.data["submission_id"],
+            format!("existing-handle-{issue_number}")
+        );
         let fact = store
             .get_remote_fact_snapshot("github", REPO, "pull_request", pr_number as i64)
             .await?
@@ -622,7 +642,11 @@ async fn assert_no_agent_work(
     issue_number: u64,
 ) -> anyhow::Result<()> {
     let id = workflow_id(project_id, Some(REPO), issue_number);
-    assert!(store.commands_for(&id).await?.is_empty());
+    assert!(store
+        .commands_for(&id)
+        .await?
+        .iter()
+        .all(|command| command.status == WorkflowCommandStatus::Cancelled));
     assert!(store.pending_commands(500).await?.is_empty());
     Ok(())
 }

@@ -16,6 +16,7 @@ mod declarative_routing;
 mod direct_dispatch;
 pub mod feishu;
 mod github_coverage_gate;
+mod github_coverage_recovery;
 mod github_issue_links;
 pub mod github_issues;
 
