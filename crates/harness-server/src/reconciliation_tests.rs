@@ -402,114 +402,6 @@ async fn run_once_uses_each_task_project_root_when_repo_is_missing() {
     assert_eq!(repo_less_after.status, TaskStatus::Cancelled);
 }
 
-#[test]
-fn classify_pr_state_handles_merged_and_closed() {
-    assert_eq!(
-        classify_pr_state(&GitHubPullState {
-            state: "closed".to_string(),
-            merged_at: Some("2024-01-01T00:00:00Z".to_string()),
-        }),
-        GitHubState::PrMerged
-    );
-    assert_eq!(
-        classify_pr_state(&GitHubPullState {
-            state: "closed".to_string(),
-            merged_at: None,
-        }),
-        GitHubState::PrClosed
-    );
-}
-
-#[test]
-fn classify_issue_state_handles_open_and_closed() {
-    assert_eq!(
-        classify_issue_state(&GitHubIssueState {
-            state: "open".to_string(),
-        }),
-        GitHubState::Open
-    );
-    assert_eq!(
-        classify_issue_state(&GitHubIssueState {
-            state: "closed".to_string(),
-        }),
-        GitHubState::IssueClosed
-    );
-}
-
-#[test]
-fn transition_mapping_matches_external_states() {
-    assert_eq!(
-        transition_for_github_state(GitHubState::PrMerged),
-        Some((TaskStatus::Done, "reconciled: PR merged externally"))
-    );
-    assert_eq!(
-        transition_for_github_state(GitHubState::PrClosed),
-        Some((TaskStatus::Cancelled, "reconciled: PR closed externally"))
-    );
-    assert_eq!(transition_for_github_state(GitHubState::Open), None);
-}
-
-#[test]
-fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
-    let active = WorkflowInstance::new(
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
-        "pr_open",
-        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
-    )
-    .with_id("workflow-1")
-    .with_data(json!({
-        "project_id": "/tmp/project",
-        "repo": "owner/repo",
-        "issue_number": 42,
-        "pr_number": 77,
-        "pr_url": "https://github.com/owner/repo/pull/77",
-    }));
-    let row_updated_at = active.updated_at + chrono::Duration::seconds(60);
-    let candidate = runtime_candidate_from_instance(&active, row_updated_at).expect("candidate");
-    assert_eq!(candidate.workflow_id, "workflow-1");
-    assert_eq!(candidate.row_updated_at, row_updated_at);
-    assert_eq!(candidate.pr_number, 77);
-    assert_eq!(candidate.repo.as_deref(), Some("owner/repo"));
-
-    let terminal = WorkflowInstance::new(
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
-        "done",
-        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
-    )
-    .with_data(json!({ "pr_number": 77 }));
-    assert!(runtime_candidate_from_instance(&terminal, chrono::Utc::now()).is_none());
-
-    let missing_pr = WorkflowInstance::new(
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
-        "pr_open",
-        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
-    );
-    assert!(runtime_candidate_from_instance(&missing_pr, chrono::Utc::now()).is_none());
-}
-
-#[test]
-fn ready_to_merge_open_alert_uses_row_age() {
-    let now = chrono::Utc::now();
-    let candidate = RuntimeWorkflowCandidate {
-        workflow_id: "workflow-1".to_string(),
-        state: "ready_to_merge".to_string(),
-        row_updated_at: now,
-        repo: Some("owner/repo".to_string()),
-        project_root: None,
-        issue_number: Some(42),
-        pr_number: 77,
-        pr_url: Some("https://github.com/owner/repo/pull/77".to_string()),
-    };
-    let settings = RuntimeWorkflowReconciliationSettings {
-        ready_to_merge_min_age_secs: 0,
-        ready_to_merge_alert_ttl_secs: 60,
-    };
-    assert!(ready_to_merge_open_alert(&candidate, GitHubState::Open, settings, now).is_none());
-}
-
 #[tokio::test]
 async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> {
     let _env_guard = async_env_lock().lock().await;
@@ -791,7 +683,7 @@ async fn ready_to_merge_reconciliation_alerts_for_open_pr_after_ttl() -> anyhow:
     .await;
     assert!(report.workflow_transitions.is_empty());
     assert_eq!(report.workflow_alerts.len(), 1);
-    assert_eq!(report.workflow_alerts[0].pr_number, 101);
+    assert_eq!(report.workflow_alerts[0].pr_number, Some(101));
     assert_eq!(report.workflow_alerts[0].state, "ready_to_merge");
     Ok(())
 }

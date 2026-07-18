@@ -79,11 +79,11 @@ fn raise_reconciliation_alerts(state: &Arc<AppState>, report: &ReconciliationRep
     );
     for alert in &report.workflow_alerts {
         let pr_ref = alert.pr_url.clone().unwrap_or_else(|| {
-            format!(
-                "{}#{}",
-                alert.repo.as_deref().unwrap_or("unknown"),
-                alert.pr_number
-            )
+            let number = alert
+                .pr_number
+                .map(|number| number.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{}#{number}", alert.repo.as_deref().unwrap_or("unknown"))
         });
         alerts.raise_with_cooldown_override(
             crate::alerting::producers::ready_to_merge_aging(

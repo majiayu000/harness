@@ -320,6 +320,7 @@ fn workflow_active_bucket(
     scheduler: &TaskSchedulerState,
 ) -> Option<RuntimeActiveBucket> {
     if status.is_terminal()
+        || state == "blocked"
         || state == "idle"
         || (definition_id == QUALITY_GATE_DEFINITION_ID && state == "pending")
     {
@@ -608,6 +609,20 @@ mod tests {
             "pending",
             serde_json::json!({}),
         );
+
+        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+
+        assert_eq!(projection.task_status, TaskStatus::Waiting);
+        assert_eq!(
+            projection.scheduler.authority_state,
+            SchedulerAuthorityState::Queued
+        );
+        assert_eq!(projection.active_bucket(), None);
+    }
+
+    #[test]
+    fn projection_excludes_blocked_workflows_from_active_counts() {
+        let workflow = workflow("blocked", serde_json::json!({}));
 
         let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
 

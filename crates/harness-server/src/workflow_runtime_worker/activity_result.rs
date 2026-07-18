@@ -14,6 +14,8 @@ use super::prompt_packet::workflow_prompt_artifact;
 
 const CODEX_SKILL_BUDGET_WARNING: &str =
     "Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter.";
+const CODEX_SKILL_BUDGET_WARNING_ADVICE: &str =
+    " Disable unused skills or plugins to leave more room for the rest.";
 const CODEX_SKILL_BUDGET_AGENT_ERROR: &str =
     "agent execution failed: Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter.";
 const CODEX_SKILL_BUDGET_STRUCTURED_AGENT_ERROR: &str =
@@ -488,6 +490,9 @@ fn failed_turn_warning_allows_structured_result(items: &[Item]) -> Option<String
 
 fn failed_turn_error_allows_structured_result(error: &str) -> bool {
     let error = error.trim();
+    let error = error
+        .strip_suffix(CODEX_SKILL_BUDGET_WARNING_ADVICE)
+        .unwrap_or(error);
     error == CODEX_SKILL_BUDGET_WARNING
         || error == CODEX_SKILL_BUDGET_AGENT_ERROR
         || error == CODEX_SKILL_BUDGET_STRUCTURED_AGENT_ERROR

@@ -55,6 +55,28 @@ fn blocked_done_slug_pr_merge_decision(instance: &WorkflowInstance) -> WorkflowD
     ))
 }
 
+fn blocked_done_issue_completed_decision(instance: &WorkflowInstance) -> WorkflowDecision {
+    WorkflowDecision::new(
+        instance.id.clone(),
+        "blocked",
+        "reconcile_issue_completed",
+        "done",
+        "reconciled: issue completed externally",
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::MarkDone,
+        "runtime-reconcile:workflow-1:done:issue-123",
+        json!({
+            "issue_number": 123,
+            "repo": "owner/repo"
+        }),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "github_issue",
+        "repo=owner/repo issue=123",
+    ))
+}
+
 fn local_review_gate_done_pr_merge_decision(instance: &WorkflowInstance) -> WorkflowDecision {
     WorkflowDecision::new(
         instance.id.clone(),
@@ -117,6 +139,20 @@ fn github_issue_pr_validator_allows_slug_only_blocked_done_reconciliation() {
             &ValidationContext::new("reconciliation", Utc::now()),
         )
         .expect("PR-merge reconciliation can use repo plus pr_number without pr_url");
+}
+
+#[test]
+fn github_issue_pr_validator_allows_completed_issue_done_reconciliation() {
+    let instance = issue_instance("blocked");
+    let decision = blocked_done_issue_completed_decision(&instance);
+
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("reconciliation", Utc::now()),
+        )
+        .expect("completed issue reconciliation should finish a blocked issue workflow");
 }
 
 #[test]

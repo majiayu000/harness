@@ -6,6 +6,7 @@ const SKILL_BUDGET_AGENT_ERROR_WITH_STDERR: &str = "agent execution failed: Skil
 const SKILL_BUDGET_CODEX_STRUCTURED_AGENT_ERROR: &str = "agent execution failed: codex structured error: Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter.";
 const SKILL_BUDGET_EXIT_STRUCTURED_AGENT_ERROR: &str = "agent execution failed: codex structured error: exit exit status: 1: Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter.";
 const SKILL_BUDGET_EXIT_STRUCTURED_AGENT_ERROR_WITH_STDERR: &str = "agent execution failed: codex structured error: exit exit status: 1: Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter.; stderr=[adapter failed]";
+const SKILL_BUDGET_CODEX_STRUCTURED_AGENT_ERROR_WITH_ADVICE: &str = "agent execution failed: codex structured error: Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.";
 
 #[test]
 fn activity_result_from_turn_marks_quota_failure_non_retryable() {
@@ -102,6 +103,54 @@ fn failed_skill_budget_warning_accepts_structured_activity_result() {
         .as_str()
         .is_some_and(|error| error.contains("Skill descriptions were shortened")));
     assert_eq!(envelope["final_result"]["status"], "succeeded");
+}
+
+#[test]
+fn failed_skill_budget_warning_with_advice_accepts_structured_activity_result() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "plan_issue"
+        }),
+    );
+    let items = vec![
+        Item::AgentReasoning {
+            content: r#"```harness-activity-result
+{"activity":"plan_issue","status":"succeeded","summary":"Planning completed.","artifacts":[{"artifact_type":"issue_plan","artifact":{"summary":"Verify the existing PR.","task_class":"bugfix","target_files":[],"validation_plan":["cargo test"],"blockers":[]}}]}
+```"#
+                .to_string(),
+        },
+        Item::Error {
+            code: 1,
+            message: SKILL_BUDGET_CODEX_STRUCTURED_AGENT_ERROR_WITH_ADVICE.to_string(),
+        },
+    ];
+
+    let result = activity_result_from_turn(
+        &job,
+        &TurnStatus::Failed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    );
+
+    assert_eq!(result.activity, "plan_issue");
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+    assert_eq!(result.summary, "Planning completed.");
+    assert!(result.error.is_none());
+    assert!(result
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.artifact_type == "issue_plan"));
+    assert_eq!(
+        envelope_artifact(&result)["outcome"],
+        "accepted_with_turn_warning"
+    );
 }
 
 #[test]
