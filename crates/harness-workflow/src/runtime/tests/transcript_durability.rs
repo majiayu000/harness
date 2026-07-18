@@ -315,3 +315,126 @@ async fn transcript_retention_waits_for_every_dependent_workflow_to_finish() -> 
     ));
     Ok(())
 }
+
+#[tokio::test]
+async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let producer = issue_instance("implementing").with_id("missing-pin-producer");
+    let (job, lease_expires_at) = claimed_transcript_job(&store, &producer).await?;
+    let (result, pending) = prepare_runtime_transcript(&job, result_with_transcript("original"))?;
+    let artifact_ref = runtime_transcript_artifact_ref(&job.id);
+    store
+        .commit_runtime_activity_completion_with_transcript_if_owned(
+            &job.id,
+            "transcript-test",
+            lease_expires_at,
+            &result,
+            pending.as_ref(),
+        )
+        .await?
+        .expect("producer completion should commit");
+    let mut terminal_producer = producer.clone();
+    terminal_producer.state = "done".to_string();
+    store.upsert_instance(&terminal_producer).await?;
+
+    let dependent = issue_instance("implementing").with_id("missing-pin-dependent");
+    store.upsert_instance(&dependent).await?;
+    let replay = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "missing-dependent-replay",
+        json!({
+            "activity": "exact_replay",
+            "exact_replay": {"transcript_artifact_ref": artifact_ref},
+        }),
+    );
+    store.enqueue_command(&dependent.id, None, &replay).await?;
+    sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
+        .bind(&artifact_ref)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
+        .bind(&producer.id)
+        .bind(Utc::now() - Duration::days(45))
+        .execute(store.pool())
+        .await?;
+
+    let summary = store
+        .prune_terminal_runtime_history(Utc::now() - Duration::days(30), 100)
+        .await?;
+    assert!(summary.is_empty(), "missing artifact must remain pinned");
+    assert!(store.get_instance(&producer.id).await?.is_some());
+    assert!(store.get_runtime_job(&job.id).await?.is_some());
+    let reconstructed = store
+        .reconstruct_runtime_transcript(
+            &producer.id,
+            &job.id,
+            "provider re-export",
+            None,
+            "operator",
+        )
+        .await?;
+    assert_eq!(reconstructed.content, "provider re-export");
+    Ok(())
+}
+
+#[tokio::test]
+async fn transcript_dependencies_follow_the_persisted_dedupe_command() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = issue_instance("implementing").with_id("transcript-dependency-reconcile");
+    store.upsert_instance(&workflow).await?;
+    let replay = |artifact_ref: &str| {
+        WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "shared-replay-dedupe",
+            json!({
+                "activity": "exact_replay",
+                "exact_replay": {"transcript_artifact_ref": artifact_ref},
+            }),
+        )
+    };
+
+    let command_id = store
+        .enqueue_command(&workflow.id, None, &replay("runtime-transcript:old"))
+        .await?;
+    store
+        .enqueue_command(&workflow.id, None, &replay("runtime-transcript:current"))
+        .await?;
+    let mut dependencies: Vec<(String,)> = sqlx::query_as(
+        "SELECT artifact_ref FROM workflow_artifact_dependencies
+         WHERE workflow_id = $1 ORDER BY artifact_ref",
+    )
+    .bind(&workflow.id)
+    .fetch_all(store.pool())
+    .await?;
+    assert_eq!(
+        dependencies,
+        vec![("runtime-transcript:current".to_string(),)]
+    );
+
+    store
+        .mark_command_status(&command_id, WorkflowCommandStatus::Dispatched)
+        .await?;
+    store
+        .enqueue_command(&workflow.id, None, &replay("runtime-transcript:ignored"))
+        .await?;
+    dependencies = sqlx::query_as(
+        "SELECT artifact_ref FROM workflow_artifact_dependencies
+         WHERE workflow_id = $1 ORDER BY artifact_ref",
+    )
+    .bind(&workflow.id)
+    .fetch_all(store.pool())
+    .await?;
+    assert_eq!(
+        dependencies,
+        vec![("runtime-transcript:current".to_string(),)]
+    );
+    Ok(())
+}

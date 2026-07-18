@@ -187,10 +187,6 @@ impl WorkflowRuntimeStore {
         let Some((workflow_id,)) = workflow_id else {
             anyhow::bail!("workflow command not found: {command_id}");
         };
-        if let Some(command) = job.input.get("command") {
-            super::artifacts::pin_runtime_transcript_dependency_tx(&mut tx, &workflow_id, command)
-                .await?;
-        }
         sqlx::query(
             "INSERT INTO runtime_jobs
                 (id, command_id, runtime_kind, runtime_profile, status, not_before, data)
@@ -205,6 +201,8 @@ impl WorkflowRuntimeStore {
         .bind(&data)
         .execute(&mut *tx)
         .await?;
+        super::artifacts::reconcile_runtime_transcript_dependencies_tx(&mut tx, &workflow_id)
+            .await?;
         tx.commit().await?;
         Ok(job)
     }

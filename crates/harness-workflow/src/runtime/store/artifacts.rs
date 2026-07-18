@@ -147,31 +147,66 @@ pub(super) async fn insert_runtime_transcript_tx(
     Ok(())
 }
 
-pub(super) async fn pin_runtime_transcript_dependency_tx(
+pub(super) async fn reconcile_runtime_transcript_dependencies_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
-    command: &Value,
 ) -> anyhow::Result<()> {
-    let Some(exact_replay) = command.get("exact_replay") else {
-        return Ok(());
-    };
-    let Some(artifact_ref) = exact_replay
-        .as_object()
-        .and_then(|value| value.get("transcript_artifact_ref"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        // Malformed exact-replay input remains dispatchable so the runtime
-        // preflight can persist an explicit terminal failure with guidance.
-        return Ok(());
-    };
+    sqlx::query(
+        "DELETE FROM workflow_artifact_dependencies AS dependency
+         WHERE dependency.workflow_id = $1
+           AND NOT EXISTS (
+               SELECT 1
+               FROM workflow_commands AS command
+               WHERE command.workflow_id = $1
+                 AND jsonb_typeof(
+                     command.data #> '{command,exact_replay,transcript_artifact_ref}'
+                 ) = 'string'
+                 AND btrim(
+                     command.data #>> '{command,exact_replay,transcript_artifact_ref}'
+                 ) = dependency.artifact_ref
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM runtime_jobs AS job
+               JOIN workflow_commands AS command ON command.id = job.command_id
+               WHERE command.workflow_id = $1
+                 AND jsonb_typeof(
+                     job.data #> '{input,command,exact_replay,transcript_artifact_ref}'
+                 ) = 'string'
+                 AND btrim(
+                     job.data #>> '{input,command,exact_replay,transcript_artifact_ref}'
+                 ) = dependency.artifact_ref
+           )",
+    )
+    .bind(workflow_id)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query(
         "INSERT INTO workflow_artifact_dependencies (artifact_ref, workflow_id)
-         VALUES ($1, $2)
+         SELECT DISTINCT refs.artifact_ref, $1
+         FROM (
+             SELECT btrim(
+                 command.data #>> '{command,exact_replay,transcript_artifact_ref}'
+             ) AS artifact_ref
+             FROM workflow_commands AS command
+             WHERE command.workflow_id = $1
+               AND jsonb_typeof(
+                   command.data #> '{command,exact_replay,transcript_artifact_ref}'
+               ) = 'string'
+             UNION
+             SELECT btrim(
+                 job.data #>> '{input,command,exact_replay,transcript_artifact_ref}'
+             ) AS artifact_ref
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             WHERE command.workflow_id = $1
+               AND jsonb_typeof(
+                   job.data #> '{input,command,exact_replay,transcript_artifact_ref}'
+               ) = 'string'
+         ) AS refs
+         WHERE refs.artifact_ref <> ''
          ON CONFLICT (artifact_ref, workflow_id) DO NOTHING",
     )
-    .bind(artifact_ref)
     .bind(workflow_id)
     .execute(&mut **tx)
     .await?;

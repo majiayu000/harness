@@ -56,15 +56,17 @@ pub fn prepare_runtime_transcript(
 ) -> anyhow::Result<(ActivityResult, Option<PendingRuntimeTranscript>)> {
     let mut source = None;
     let mut source_count = 0_u8;
-    result.artifacts.retain(|artifact| {
-        if artifact.artifact_type == RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT {
-            source_count = source_count.saturating_add(1);
-            source = Some(artifact.artifact.clone());
-            false
-        } else {
-            true
-        }
-    });
+    result
+        .artifacts
+        .retain(|artifact| match artifact.artifact_type.as_str() {
+            RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT => {
+                source_count = source_count.saturating_add(1);
+                source = Some(artifact.artifact.clone());
+                false
+            }
+            RUNTIME_TRANSCRIPT_ARTIFACT => false,
+            _ => true,
+        });
     anyhow::ensure!(
         source_count <= 1,
         "activity result contains multiple runtime transcript sources"
@@ -175,8 +177,12 @@ mod tests {
     #[test]
     fn transcript_preparation_replaces_source_with_stable_reference() -> anyhow::Result<()> {
         let job = job();
-        let result =
-            ActivityResult::succeeded("implement", "done").with_artifact(ActivityArtifact::new(
+        let result = ActivityResult::succeeded("implement", "done")
+            .with_artifact(ActivityArtifact::new(
+                RUNTIME_TRANSCRIPT_ARTIFACT,
+                json!({"artifact_ref": "runtime-transcript:forged"}),
+            ))
+            .with_artifact(ActivityArtifact::new(
                 RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT,
                 json!({"content": "exact bytes", "turn_id": "turn-1"}),
             ));
@@ -194,10 +200,34 @@ mod tests {
             .artifacts
             .iter()
             .all(|artifact| artifact.artifact_type != RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT));
+        let references = result
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.artifact_type == RUNTIME_TRANSCRIPT_ARTIFACT)
+            .collect::<Vec<_>>();
+        assert_eq!(references.len(), 1);
+        assert_eq!(
+            references[0].artifact["artifact_ref"],
+            runtime_transcript_artifact_ref(&job.id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_preparation_discards_unverified_reference_without_source() -> anyhow::Result<()> {
+        let result =
+            ActivityResult::succeeded("implement", "done").with_artifact(ActivityArtifact::new(
+                RUNTIME_TRANSCRIPT_ARTIFACT,
+                json!({"artifact_ref": "runtime-transcript:forged"}),
+            ));
+
+        let (result, pending) = prepare_runtime_transcript(&job(), result)?;
+
+        assert!(pending.is_none());
         assert!(result
             .artifacts
             .iter()
-            .any(|artifact| artifact.artifact_type == RUNTIME_TRANSCRIPT_ARTIFACT));
+            .all(|artifact| artifact.artifact_type != RUNTIME_TRANSCRIPT_ARTIFACT));
         Ok(())
     }
 

@@ -149,8 +149,7 @@ pub(super) async fn insert_tx(
         .bind(WorkflowCommandStatus::Pending.as_str())
         .fetch_one(&mut **tx)
         .await?;
-    super::artifacts::pin_runtime_transcript_dependency_tx(tx, workflow_id, &command.command)
-        .await?;
+    super::artifacts::reconcile_runtime_transcript_dependencies_tx(tx, workflow_id).await?;
     Ok(id)
 }
 
@@ -309,10 +308,6 @@ pub(super) async fn enqueue_runtime_job_for_command(
             json!({ "owner": claim.owner, "generation": claim.generation }),
         );
     }
-    if let Some(command) = job.input.get("command") {
-        super::artifacts::pin_runtime_transcript_dependency_tx(&mut tx, &workflow_id, command)
-            .await?;
-    }
     let data = to_jsonb_string(&job)?;
     let status = enum_str(&job.status)?;
     let runtime_kind = enum_str(&job.runtime_kind)?;
@@ -330,6 +325,7 @@ pub(super) async fn enqueue_runtime_job_for_command(
     .bind(&data)
     .execute(&mut *tx)
     .await?;
+    super::artifacts::reconcile_runtime_transcript_dependencies_tx(&mut tx, &workflow_id).await?;
     let mut update = sqlx::query(
         "UPDATE workflow_commands
          SET status = $2, dispatch_owner = NULL, dispatch_lease_expires_at = NULL,

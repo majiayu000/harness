@@ -538,12 +538,23 @@ impl WorkflowRuntimeStore {
                     ))
                     AND bool_and(NOT EXISTS (
                         SELECT 1
-                        FROM workflow_artifacts AS artifact
-                        JOIN workflow_artifact_dependencies AS dependency
-                          ON dependency.artifact_ref = artifact.id
+                        FROM workflow_artifact_dependencies AS dependency
                         JOIN workflow_instances AS dependent
                           ON dependent.id = dependency.workflow_id
-                        WHERE artifact.workflow_id = family.id
+                        LEFT JOIN workflow_artifacts AS artifact
+                          ON artifact.id = dependency.artifact_ref
+                        LEFT JOIN runtime_jobs AS producer_job
+                          ON producer_job.id = CASE
+                              WHEN dependency.artifact_ref LIKE 'runtime-transcript:%'
+                              THEN substr(dependency.artifact_ref, length('runtime-transcript:') + 1)
+                              ELSE NULL
+                          END
+                        LEFT JOIN workflow_commands AS producer_command
+                          ON producer_command.id = producer_job.command_id
+                        WHERE (
+                            artifact.workflow_id = family.id
+                            OR producer_command.workflow_id = family.id
+                        )
                           AND NOT EXISTS (
                               SELECT 1
                               FROM terminal_states AS dependent_terminal

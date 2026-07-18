@@ -264,7 +264,7 @@ async fn runtime_job_claim_endpoint_completes_missing_exact_replay_before_dispat
     let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
         return Ok(());
     };
-    let app = runtime_hosts_workflow_app(state);
+    let app = runtime_hosts_workflow_app(state.clone());
     register_host(&app, "host-a").await?;
     let job = enqueue_runtime_host_test_job(
         &store,
@@ -304,6 +304,13 @@ async fn runtime_job_claim_endpoint_completes_missing_exact_replay_before_dispat
         .expect("preflight-failed job should remain auditable");
     assert_eq!(persisted.status, RuntimeJobStatus::Failed);
     assert!(persisted.lease.is_none());
+    assert!(
+        state
+            .runtime_circuit_breakers
+            .snapshots(Utc::now())
+            .is_empty(),
+        "transcript preflight failures must not count against the agent runtime"
+    );
     Ok(())
 }
 
