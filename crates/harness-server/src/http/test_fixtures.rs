@@ -6,7 +6,7 @@ use crate::{
     project_registry::Project,
     server::HarnessServer,
     services::{
-        execution::{EnqueueBackgroundOptions, EnqueueTaskError, ExecutionService, QueueDomain},
+        execution::{EnqueueTaskError, ExecutionService, QueueDomain},
         project::ProjectService,
         task::DefaultTaskService,
     },
@@ -108,14 +108,6 @@ impl ExecutionService for ReadOnlyRouteExecutionService {
     async fn enqueue_background(
         &self,
         _req: CreateTaskRequest,
-    ) -> Result<TaskId, EnqueueTaskError> {
-        Err(Self::rejected())
-    }
-
-    async fn enqueue_background_with_options(
-        &self,
-        _req: CreateTaskRequest,
-        _options: EnqueueBackgroundOptions,
     ) -> Result<TaskId, EnqueueTaskError> {
         Err(Self::rejected())
     }

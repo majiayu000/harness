@@ -74,11 +74,11 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     assert_eq!(instance.data["tracker_source"], "github");
     assert_eq!(instance.data["tracker_external_id"], "issue:106");
 
-    let detail_response = task_app(state.clone())
+    let detail_response = runtime_submission_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/tasks/{task_id}"))
+                .uri(format!("/api/workflows/runtime/submissions/{task_id}"))
                 .body(Body::empty())?,
         )
         .await?;
@@ -430,14 +430,14 @@ async fn create_task_with_prompt_requires_workflow_runtime_store() -> anyhow::Re
     let dir = tempfile::tempdir()?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
     let before_count = state.core.tasks.count();
-    let app = task_app(state.clone());
+    let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({ "prompt": "fix the bug" });
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )
@@ -445,11 +445,9 @@ async fn create_task_with_prompt_requires_workflow_runtime_store() -> anyhow::Re
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let resp = response_json(response).await?;
-    assert!(
-        resp["error"].as_str().is_some_and(
-            |error| error.contains("workflow runtime store is required for prompt submissions")
-        ),
-        "unexpected response: {resp}"
+    assert_eq!(
+        resp["error"],
+        "workflow runtime store is required for submissions"
     );
     assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
@@ -472,7 +470,7 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
     )
     .await?;
     let before_count = state.core.tasks.count();
-    let app = task_app(state.clone());
+    let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({
         "project": project_root.display().to_string(),
@@ -485,7 +483,7 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )
@@ -553,7 +551,10 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
     let detail_response = app
         .oneshot(
             Request::builder()
-                .uri(format!("/tasks/{}", task_id.as_str()))
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{}",
+                    task_id.as_str()
+                ))
                 .body(Body::empty())?,
         )
         .await?;
@@ -580,7 +581,7 @@ async fn create_task_with_issue_requires_workflow_runtime_store() -> anyhow::Res
     init_fake_git_repo(dir.path())?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
     let before_count = state.core.tasks.count();
-    let app = task_app(state.clone());
+    let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({
         "repo": "owner/repo",
@@ -591,7 +592,7 @@ async fn create_task_with_issue_requires_workflow_runtime_store() -> anyhow::Res
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )
@@ -599,10 +600,9 @@ async fn create_task_with_issue_requires_workflow_runtime_store() -> anyhow::Res
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let resp = response_json(response).await?;
-    assert!(
-        resp["error"].as_str().is_some_and(|error| error
-            .contains("workflow runtime store is required for GitHub issue submissions")),
-        "unexpected response: {resp}"
+    assert_eq!(
+        resp["error"],
+        "workflow runtime store is required for submissions"
     );
     assert_eq!(state.core.tasks.count(), before_count);
 
@@ -626,7 +626,7 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
     )
     .await?;
     let before_count = state.core.tasks.count();
-    let app = task_app(state.clone());
+    let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({
         "project": project_root.display().to_string(),
@@ -638,7 +638,7 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )
@@ -703,7 +703,7 @@ async fn create_task_with_terminal_issue_retry_returns_stable_submission_handle(
     )
     .await?;
     let before_count = state.core.tasks.count();
-    let app = task_app(state.clone());
+    let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({
         "project": project_root.display().to_string(),
@@ -716,7 +716,7 @@ async fn create_task_with_terminal_issue_retry_returns_stable_submission_handle(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )
@@ -751,7 +751,7 @@ async fn create_task_with_terminal_issue_retry_returns_stable_submission_handle(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )

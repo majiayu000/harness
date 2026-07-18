@@ -346,7 +346,7 @@ fn operator_actions_link_evidence_to_current_legacy_task_id() {
     assert_eq!(actions[0].task_id.as_deref(), Some("current-task"));
     assert_eq!(
         actions[0].evidence_url.as_deref(),
-        Some("/tasks/current-task")
+        Some("/api/workflows/runtime/submissions/current-task")
     );
 }
 

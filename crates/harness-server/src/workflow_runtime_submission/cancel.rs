@@ -53,24 +53,18 @@ impl From<anyhow::Error> for RuntimeSubmissionCancelError {
     }
 }
 
-pub(crate) async fn cancel_issue_submission_by_submission_id(
+#[cfg(test)]
+pub(crate) async fn cancel_issue_submission_by_task_id(
     store: &WorkflowRuntimeStore,
-    submission_id: &crate::task_runner::TaskId,
+    task_id: &crate::workflow_runtime_submission::TaskId,
 ) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
     let Some(instance) = store
-        .get_instance_by_submission_id(submission_id.as_str())
+        .get_instance_by_submission_id(task_id.as_str())
         .await?
     else {
         return Ok(RuntimeSubmissionCancelOutcome::NotFound);
     };
-    cancel_submission_instance(store, instance, submission_id.as_str()).await
-}
-
-pub(crate) async fn cancel_issue_submission_by_task_id(
-    store: &WorkflowRuntimeStore,
-    task_id: &crate::task_runner::TaskId,
-) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
-    cancel_issue_submission_by_submission_id(store, task_id).await
+    cancel_submission_instance(store, instance, task_id.as_str()).await
 }
 
 pub(crate) async fn cancel_submission_by_workflow_id(

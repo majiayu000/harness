@@ -1,5 +1,6 @@
 use super::tick_helpers::{
-    format_violations_for_prompt, pick_secondary_review_agent, poll_task_output,
+    format_violations_for_prompt, pick_secondary_review_agent, review_output_from_turn,
+    runtime_turn_ref, terminal_result_disposition, TerminalResultDisposition,
     MAX_INLINE_VIOLATIONS,
 };
 use super::*;
@@ -389,26 +390,42 @@ fn test_review_skipped_detection() {
     assert!(!is_skipped(None));
 }
 
-#[tokio::test]
-async fn poll_task_output_returns_none_for_cancelled_tasks() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let store = crate::task_runner::TaskStore::open(&dir.path().join("tasks.db")).await?;
-    let task_id = harness_core::types::TaskId("cancelled-review".to_string());
-    let mut task = crate::task_runner::TaskState::new(task_id.clone());
-    task.status = crate::task_runner::TaskStatus::Cancelled;
-    task.rounds.push(crate::task_runner::RoundResult::new(
-        1,
-        "review",
-        "cancelled",
-        Some("cancelled output should be ignored".to_string()),
-        None,
-        None,
-    ));
-    store.insert(&task).await;
+#[test]
+fn runtime_review_output_uses_completion_disposition_and_turn_reference() {
+    use harness_core::types::{AgentId, Item, ThreadId, Turn};
+    use harness_workflow::runtime::{ActivityArtifact, ActivityResult};
+    use serde_json::json;
 
-    let output = poll_task_output(&store, &task_id, 0).await;
-    assert!(output.is_none(), "cancelled tasks must not yield output");
-    Ok(())
+    let cancelled = ActivityResult::cancelled("implement", "cancelled");
+    assert!(matches!(
+        terminal_result_disposition(&cancelled),
+        TerminalResultDisposition::Ignore
+    ));
+
+    let skipped = ActivityResult::failed("implement", "REVIEW_SKIPPED", "missing result");
+    assert!(matches!(
+        terminal_result_disposition(&skipped),
+        TerminalResultDisposition::Return(ref output) if output == "REVIEW_SKIPPED"
+    ));
+
+    let result = ActivityResult::succeeded("implement", "review complete").with_artifact(
+        ActivityArtifact::new(
+            "runtime_turn",
+            json!({ "thread_id": "thread-1", "turn_id": "turn-1" }),
+        ),
+    );
+    let (thread_id, turn_id) = runtime_turn_ref(&result).expect("runtime turn reference");
+    assert_eq!(thread_id.as_str(), "thread-1");
+    assert_eq!(turn_id.as_str(), "turn-1");
+
+    let mut turn = Turn::new(ThreadId::from_str("thread-1"), AgentId::from_str("codex"));
+    turn.items.push(Item::AgentReasoning {
+        content: "REVIEW_JSON_START\n{}\nREVIEW_JSON_END".to_string(),
+    });
+    assert_eq!(
+        review_output_from_turn(&turn).as_deref(),
+        Some("REVIEW_JSON_START\n{}\nREVIEW_JSON_END")
+    );
 }
 
 /// On first boot (no prior event, no fallback), since_arg must be the

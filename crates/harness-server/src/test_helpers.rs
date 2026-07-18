@@ -5,7 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use harness_core::db::{pg_open_pool, pg_schema_for_path, resolve_test_database_url};
+use harness_core::db::{pg_open_pool, resolve_test_database_url};
 use tokio::sync::OnceCell;
 
 /// Serialises every test that reads or mutates the process-global `HOME` env
@@ -142,18 +142,6 @@ pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> 
     .await
 }
 
-pub async fn drop_tasks_table(dir: &std::path::Path) -> anyhow::Result<()> {
-    let db_path = harness_core::config::dirs::default_db_path(dir, "tasks");
-    let database_url = harness_core::db::resolve_test_database_url(None)?;
-    let schema = pg_schema_for_path(&db_path)?;
-    let pool = harness_core::db::pg_open_pool_schematized(&database_url, &schema).await?;
-    sqlx::query("DROP TABLE tasks CASCADE")
-        .execute(&pool)
-        .await?;
-    pool.close().await;
-    Ok(())
-}
-
 pub async fn make_test_state_with_registry(
     dir: &std::path::Path,
     agent_registry: AgentRegistry,
@@ -233,19 +221,16 @@ async fn make_state_inner(
         project_root.to_path_buf(),
     );
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let workflow_runtime_store = Arc::new(
+        harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir, "workflow_runtime"),
+            Some(&database_url),
+        )
+        .await?,
+    );
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
-        tasks.clone(),
-        server.agent_registry.clone(),
         Arc::new(server.config.clone()),
-        Default::default(),
-        events.clone(),
-        vec![],
-        None,
-        task_queue.clone(),
-        task_queue.clone(),
-        None,
-        None,
-        None,
+        Some(workflow_runtime_store.clone()),
         None,
         vec![],
     );
@@ -261,7 +246,7 @@ async fn make_state_inner(
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
             project_workflow_store: None,
-            workflow_runtime_store: None,
+            workflow_runtime_store: Some(workflow_runtime_store),
             project_registry: None,
             runtime_state_store: None,
             maintenance_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -2,21 +2,20 @@
 //!
 //! Feeds the `/overview` HTML page (served from `crate::overview::index`).
 //! Aggregates data from existing services rather than introducing new
-//! tracking: task counts come from `TaskService`, runtime fleet state from
+//! tracking: task counts come from the workflow runtime, runtime fleet state from
 //! `RuntimeHostManager`, quality grade and rule-fail rate from the event
 //! store. Metrics that harness does not yet track (runtime CPU/RAM) are
 //! returned as `null` so the UI degrades gracefully.
 
 use crate::http::AppState;
 use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
-use crate::task_runner::{SchedulerAuthorityState, TaskSummary};
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Duration, Timelike, Utc};
 use harness_core::types::{Decision, Event, EventFilters};
 use harness_observe::quality::QualityGrader;
 use harness_observe::usage::UsageMetrics;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Rolling window for the overview page. Matches the `24h` segment pill in
@@ -49,16 +48,24 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     let queued = active_counts.queued;
     let max_concurrent = tq.global_limit();
 
-    let dashboard_counts = state.task_svc.count_for_dashboard().await;
-    let global_done = dashboard_counts.global_done;
-    let global_failed = dashboard_counts.global_failed;
-    let global_stalled = dashboard_counts.global_stalled;
-
-    let merged_24h = state.task_svc.count_done_since(since_dt).await;
+    let submission_metrics =
+        match super::runtime_submission_metrics::load_submission_metrics(&state, since_dt).await {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                tracing::error!("overview: workflow runtime metrics query failed: {error}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "workflow runtime metrics unavailable"})),
+                );
+            }
+        };
+    let global_done = submission_metrics.global_done;
+    let global_failed = submission_metrics.global_failed;
+    let global_stalled = submission_metrics.global_stalled;
+    let merged_24h = submission_metrics.done_since;
 
     // Per-project hourly done counts — drives both the fleet throughput chart
     // and each project's 24h trend sparkline.
-    let hour_rows = state.task_svc.done_per_project_hour_since(since_dt).await;
     let hours = build_hour_axis(now);
     let hour_index: HashMap<String, usize> = hours
         .iter()
@@ -66,12 +73,12 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         .map(|(i, h)| (h.clone(), i))
         .collect();
     let mut per_project_buckets: HashMap<String, Vec<u64>> = HashMap::new();
-    for (project_key, hour, count) in hour_rows {
-        if let Some(&idx) = hour_index.get(&hour) {
+    for row in &submission_metrics.hourly_done {
+        if let Some(&idx) = hour_index.get(&row.hour) {
             let entry = per_project_buckets
-                .entry(project_key)
+                .entry(row.project_id.clone())
                 .or_insert_with(|| vec![0; THROUGHPUT_BUCKETS]);
-            entry[idx] = entry[idx].saturating_add(count);
+            entry[idx] = entry[idx].saturating_add(row.count);
         }
     }
 
@@ -95,7 +102,6 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     let usage_summary = aggregate_llm_usage(&usage_events);
 
     // ---- projects table ----
-    let project_pr_urls = state.task_svc.latest_done_pr_urls_all_projects().await;
     let project_list = state.project_svc.list().await.unwrap_or_else(|e| {
         tracing::warn!("overview: failed to list projects: {e}");
         Vec::new()
@@ -109,7 +115,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
             .get(&key)
             .copied()
             .unwrap_or_default();
-        let counts = dashboard_counts.by_project.get(&key);
+        let counts = submission_metrics.by_project.get(&key);
         let done = counts.map_or(0, |c| c.done);
         let failed = counts.map_or(0, |c| c.failed);
         let stalled = counts.map_or(0, |c| c.stalled);
@@ -131,7 +137,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
             "worktrees": Value::Null,
             "tokens_24h": usage_summary.project_tokens_json(&key),
             "agents": Vec::<String>::new(),
-            "latest_pr": project_pr_urls.get(&key),
+            "latest_pr": counts.and_then(|counts| counts.latest_pr_url.as_ref()),
         }));
         throughput_series.push(json!({
             "project": p.id,
@@ -172,10 +178,22 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         .workspace_mgr
         .as_ref()
         .map_or(0, |m| m.live_count());
+    let active_lease_counts =
+        match super::runtime_hosts::active_runtime_job_lease_counts(&state).await {
+            Ok(counts) => Some(counts),
+            Err(error) => {
+                tracing::warn!("overview: failed to count runtime-job leases: {error}");
+                None
+            }
+        };
     let mut worktrees_used: u64 = local_worktrees;
     for host in &runtime_hosts {
-        let active_leases = state.core.tasks.active_runtime_host_lease_count(&host.id) as u64;
-        worktrees_used = worktrees_used.saturating_add(active_leases);
+        let active_leases = active_lease_counts
+            .as_ref()
+            .map(|counts| counts.get(&host.id).copied().unwrap_or(0));
+        if let Some(active_leases) = active_leases {
+            worktrees_used = worktrees_used.saturating_add(active_leases);
+        }
         let watched_projects = state
             .runtime_project_cache
             .get_host_cache(&host.id)
@@ -462,23 +480,7 @@ impl ActiveTaskOverviewCounts {
 
 pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCounts {
     let mut counts = ActiveTaskOverviewCounts::default();
-    let mut active_legacy_task_ids = HashSet::new();
-    let mut loaded_legacy_tasks = false;
-    let mut counted_runtime_active_workflows = false;
-
-    match state.core.tasks.list_active_summaries().await {
-        Ok(summaries) => {
-            loaded_legacy_tasks = true;
-            for summary in summaries {
-                if add_active_summary(&mut counts, &summary) {
-                    active_legacy_task_ids.insert(summary.id.as_str().to_string());
-                }
-            }
-        }
-        Err(error) => {
-            tracing::warn!("overview: failed to list task summaries for active counts: {error}");
-        }
-    }
+    let runtime_counts_available = state.core.workflow_runtime_store.is_some();
 
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
         match crate::handlers::definition_ids::active_count_definition_ids() {
@@ -490,14 +492,7 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
                     {
                         Ok(workflows) => {
                             for workflow in workflows {
-                                if runtime_workflow_matches_active_legacy_task(
-                                    &workflow,
-                                    &active_legacy_task_ids,
-                                ) {
-                                    continue;
-                                }
-                                counted_runtime_active_workflows |=
-                                    add_active_runtime_workflow(&mut counts, &workflow);
+                                add_active_runtime_workflow(&mut counts, &workflow);
                             }
                         }
                         Err(error) => {
@@ -515,7 +510,7 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
         }
     }
 
-    if !loaded_legacy_tasks && !counted_runtime_active_workflows {
+    if !runtime_counts_available {
         for _ in 0..state.concurrency.task_queue.running_count() {
             counts.add(None, ActiveTaskBucket::Running);
         }
@@ -525,20 +520,6 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
     }
 
     counts
-}
-
-fn add_active_summary(counts: &mut ActiveTaskOverviewCounts, summary: &TaskSummary) -> bool {
-    if summary.status.is_terminal() {
-        return false;
-    }
-    let bucket = match summary.scheduler.authority_state {
-        SchedulerAuthorityState::Running | SchedulerAuthorityState::Leased => {
-            ActiveTaskBucket::Running
-        }
-        _ => ActiveTaskBucket::Queued,
-    };
-    counts.add(summary.project.as_deref(), bucket);
-    true
 }
 
 fn add_active_runtime_workflow(
@@ -557,16 +538,6 @@ fn add_active_runtime_workflow(
     true
 }
 
-fn runtime_workflow_matches_active_legacy_task(
-    workflow: &harness_workflow::runtime::WorkflowInstance,
-    active_legacy_task_ids: &HashSet<String>,
-) -> bool {
-    RuntimeWorkflowProjection::from_workflow(workflow)
-        .legacy_dedupe_task_handle
-        .as_ref()
-        .is_some_and(|task_id| active_legacy_task_ids.contains(task_id.as_str()))
-}
-
 /// Top of the current hour (i.e. `HH:00:00Z`). Falls back to `now` on the
 /// near-impossible DST-style failure of `with_minute(0)`.
 fn hour_top(now: DateTime<Utc>) -> DateTime<Utc> {
@@ -578,7 +549,7 @@ fn hour_top(now: DateTime<Utc>) -> DateTime<Utc> {
 
 /// Build an ISO-8601 hour axis covering the last [`THROUGHPUT_BUCKETS`] hours
 /// ending at `now`, oldest first. Each element matches the format produced by
-/// `TaskDb::done_per_project_hour_since` so the two can be joined by string
+/// `WorkflowRuntimeStore::submission_metrics_since` so the two can be joined by string
 /// equality.
 fn build_hour_axis(now: DateTime<Utc>) -> Vec<String> {
     let top = hour_top(now);

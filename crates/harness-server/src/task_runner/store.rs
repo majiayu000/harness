@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use super::metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
-use super::state::{SchedulerAuthorityState, SchedulerOwnerKind, TaskState, TaskSummary};
+use super::state::{SchedulerAuthorityState, TaskState, TaskSummary};
 use super::types::{TaskId, TaskKind, TaskStatus, TaskTerminalOutcome};
 use super::CompletionCallback;
 
@@ -19,7 +19,6 @@ mod projections;
 mod queries;
 mod recovered_prs;
 mod runtime_control;
-mod runtime_hosts;
 mod startup;
 mod transitions;
 

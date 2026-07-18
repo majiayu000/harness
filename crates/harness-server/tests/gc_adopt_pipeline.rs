@@ -4,7 +4,7 @@
 //! 1. A draft is stored in the GcAgent's DraftStore.
 //! 2. `gc_adopt` writes artifact files to disk.
 //! 3. A task is dispatched to the agent with the correct prompt (rationale, validation, paths).
-//! 4. The response carries `adopted: true` and a non-null `task_id`.
+//! 4. The response carries `adopted: true` and a non-null `submission_id`.
 
 mod common;
 
@@ -25,7 +25,7 @@ use harness_server::{
     thread_manager::ThreadManager,
 };
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 // ---------------------------------------------------------------------------
@@ -187,16 +187,16 @@ async fn gc_adopt_dispatches_task_with_prompt() -> anyhow::Result<()> {
     let result = resp.result.expect("missing result");
     assert_eq!(result["adopted"], true);
     assert!(
-        !result["task_id"].is_null(),
-        "task_id should be set when an agent is registered"
+        !result["submission_id"].is_null(),
+        "submission_id should be set when an agent is registered"
     );
 
     Ok(())
 }
 
-/// gc_adopt returns adopted=true with null task_id when there are no artifacts.
+/// gc_adopt returns adopted=true with null submission_id when there are no artifacts.
 #[tokio::test]
-async fn gc_adopt_no_artifacts_returns_null_task_id() -> anyhow::Result<()> {
+async fn gc_adopt_no_artifacts_returns_null_submission_id() -> anyhow::Result<()> {
     let sandbox = common::tempdir_in_home("gc-adopt-no-artifacts-")?;
     let Some(state) = make_state(sandbox.path()).await? else {
         return Ok(());
@@ -225,7 +225,7 @@ async fn gc_adopt_no_artifacts_returns_null_task_id() -> anyhow::Result<()> {
     assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
     let result = resp.result.expect("missing result");
     assert_eq!(result["adopted"], true);
-    assert!(result["task_id"].is_null());
+    assert!(result["submission_id"].is_null());
 
     Ok(())
 }
@@ -250,7 +250,7 @@ async fn gc_adopt_unknown_draft_returns_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// gc_adopt with auto_pr=false skips task dispatch and returns null task_id.
+/// gc_adopt with auto_pr=false skips task dispatch and returns null submission_id.
 #[tokio::test]
 async fn gc_adopt_auto_pr_false_skips_task_dispatch() -> anyhow::Result<()> {
     let sandbox = common::tempdir_in_home("gc-adopt-no-auto-pr-")?;
@@ -273,8 +273,8 @@ async fn gc_adopt_auto_pr_false_skips_task_dispatch() -> anyhow::Result<()> {
     let result = resp.result.expect("missing result");
     assert_eq!(result["adopted"], true);
     assert!(
-        result["task_id"].is_null(),
-        "task_id should be null when auto_pr=false"
+        result["submission_id"].is_null(),
+        "submission_id should be null when auto_pr=false"
     );
 
     Ok(())
@@ -303,16 +303,16 @@ async fn gc_adopt_auto_pr_true_dispatches_task() -> anyhow::Result<()> {
     let result = resp.result.expect("missing result");
     assert_eq!(result["adopted"], true);
     assert!(
-        !result["task_id"].is_null(),
-        "task_id should be set when auto_pr=true and agent is registered"
+        !result["submission_id"].is_null(),
+        "submission_id should be set when auto_pr=true and agent is registered"
     );
 
     Ok(())
 }
 
-/// gc_adopt with auto_pr=true fails before adopt when no default agent is registered.
+/// gc_adopt records a runtime submission without requiring an agent at intake time.
 #[tokio::test]
-async fn gc_adopt_auto_pr_requires_default_agent() -> anyhow::Result<()> {
+async fn gc_adopt_auto_pr_defers_agent_resolution_to_runtime() -> anyhow::Result<()> {
     let sandbox = common::tempdir_in_home("gc-adopt-no-default-agent-")?;
     let Some(state) = make_state_without_default_agent(sandbox.path()).await? else {
         return Ok(());
@@ -324,10 +324,14 @@ async fn gc_adopt_auto_pr_requires_default_agent() -> anyhow::Result<()> {
 
     let draft_id = draft.id.clone();
     let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft_id.clone()).await;
-    assert!(
-        resp.error.is_some(),
-        "expected error when default agent is missing"
-    );
+    assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+    let result = resp.result.expect("missing result");
+    let submission_id = result["submission_id"]
+        .as_str()
+        .expect("submission_id should be set");
+    let workflow_id = result["workflow_id"]
+        .as_str()
+        .expect("workflow_id should be set");
 
     let stored = state
         .engines
@@ -335,76 +339,31 @@ async fn gc_adopt_auto_pr_requires_default_agent() -> anyhow::Result<()> {
         .draft_store()
         .get(&draft_id)?
         .expect("draft should exist");
-    assert_eq!(stored.status, DraftStatus::Pending);
+    assert_eq!(stored.status, DraftStatus::Adopted);
+    let workflow = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured")
+        .get_instance(workflow_id)
+        .await?
+        .expect("runtime submission should be persisted");
+    assert_eq!(workflow.data["submission_id"], submission_id);
     assert!(
-        !state
+        state
             .core
             .project_root
             .join(".harness/drafts/test-guard.sh")
             .exists(),
-        "artifact file should not be written when preflight fails"
+        "artifact file should be written before deferred runtime execution"
     );
 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Capturing agent — records project_root from AgentRequest (issue #78 regression guard).
-// ---------------------------------------------------------------------------
-
-struct CapturingAgent {
-    captured_root: Arc<Mutex<Option<PathBuf>>>,
-}
-
-#[async_trait]
-impl CodeAgent for CapturingAgent {
-    fn name(&self) -> &str {
-        "capturing"
-    }
-
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability::Read, Capability::Write]
-    }
-
-    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
-        *self.captured_root.lock().unwrap() = Some(req.project_root.clone());
-        Ok(AgentResponse {
-            output: "Agent: project root captured, nothing to implement".to_string(),
-            stderr: String::new(),
-            items: vec![],
-            token_usage: TokenUsage::default(),
-            model: "capturing".to_string(),
-            exit_code: Some(0),
-        })
-    }
-
-    async fn execute_stream(
-        &self,
-        req: AgentRequest,
-        tx: Sender<StreamItem>,
-    ) -> harness_core::error::Result<()> {
-        *self.captured_root.lock().unwrap() = Some(req.project_root.clone());
-        tx.send(StreamItem::MessageDelta {
-            text: "Agent: project root captured, nothing to implement".to_string(),
-        })
-        .await
-        .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
-        tx.send(StreamItem::Done)
-            .await
-            .map_err(|e| HarnessError::AgentExecution(format!("stream closed: {e}")))?;
-        Ok(())
-    }
-}
-
-/// gc_adopt dispatches a task whose project_root matches the AppState project_root (issue #78).
-///
-/// Before the fix, `gc_adopt_task_request` set `project: None`, causing the task executor to
-/// fall back to worktree detection instead of using the server's configured project root.
-///
-/// Setup: workspace isolation is disabled by blocking the workspace root dir so the task
-/// runs directly against the project_root (no git worktree indirection).
+/// gc_adopt records the configured project root in the runtime submission (issue #78).
 #[tokio::test]
-async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
+async fn gc_adopt_submission_uses_appstate_project_root() -> anyhow::Result<()> {
     let Some(database_url) = configured_test_database_url()? else {
         return Ok(());
     };
@@ -412,97 +371,51 @@ async fn gc_adopt_task_uses_appstate_project_root() -> anyhow::Result<()> {
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root)?;
 
-    // Block workspace isolation: write a file where the workspace root dir would be,
-    // so WorkspaceManager::new fails and build_app_state falls back to workspace_mgr = None.
-    // With no workspace manager the task runs directly against project_root.
-    let ws_blocker = sandbox.path().join("ws-blocker");
-    std::fs::write(&ws_blocker, "blocker")?;
-
-    let captured_root: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
-    let agent = Arc::new(CapturingAgent {
-        captured_root: captured_root.clone(),
-    });
-
     let mut config = HarnessConfig::default();
     config.server.data_dir = sandbox.path().join("server-data");
     config.server.database_url = Some(database_url);
     config.server.project_root = project_root.clone();
     config.server.allow_unauthenticated = true;
-    config.agents.default_agent = "capturing".to_string();
     config.gc.auto_pr = true;
-    // Point workspace root at a path under the blocker file so create_dir_all fails.
-    config.workspace.root = ws_blocker.join("workspaces");
 
-    let mut registry = AgentRegistry::new("capturing");
-    registry.register("capturing", agent);
-
-    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let server = Arc::new(HarnessServer::new(
+        config,
+        ThreadManager::new(),
+        AgentRegistry::new("test"),
+    ));
     let state = build_app_state(server).await?;
 
     let artifact_rel = PathBuf::from(".harness/drafts/test-guard.sh");
     let draft = make_draft(&artifact_rel, "#!/usr/bin/env bash\necho 'guard'");
     state.engines.gc_agent.draft_store().save(&draft)?;
 
-    let draft_id = draft.id.clone();
-    let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft_id).await;
+    let resp = gc_adopt(&state, Some(serde_json::json!(1)), draft.id).await;
     assert!(resp.error.is_none(), "expected success: {:?}", resp.error);
-
-    let task_id_val = resp
-        .result
+    let result = resp.result.expect("missing result");
+    let submission_id = result["submission_id"]
+        .as_str()
+        .expect("submission_id should be set");
+    let workflow_id = result["workflow_id"]
+        .as_str()
+        .expect("workflow_id should be set");
+    let workflow = state
+        .core
+        .workflow_runtime_store
         .as_ref()
-        .and_then(|r| r.get("task_id"))
-        .expect("result must have task_id field");
-    assert!(!task_id_val.is_null(), "task_id should be set");
-    let task_id = harness_core::types::TaskId(
-        task_id_val
-            .as_str()
-            .expect("task_id should be a string")
-            .to_string(),
-    );
+        .expect("workflow runtime store should be configured")
+        .get_instance(workflow_id)
+        .await?
+        .expect("runtime submission should be persisted");
 
-    // Poll until task reaches a terminal state, with a 10-second limit.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let final_state = loop {
-        if let Some(ts) = state.core.tasks.get(&task_id) {
-            match ts.status {
-                harness_server::task_runner::TaskStatus::Done
-                | harness_server::task_runner::TaskStatus::Failed => break ts,
-                _ => {}
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("task did not reach terminal state within 10 seconds");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    };
-
-    assert!(
-        matches!(
-            final_state.status,
-            harness_server::task_runner::TaskStatus::Done
-        ),
-        "task should be Done but was {:?}: {:?}",
-        final_state.status,
-        final_state.error
-    );
-
-    let actual = captured_root
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("capturing agent must have recorded project_root");
+    assert_eq!(workflow.data["submission_id"], submission_id);
     assert_eq!(
-        actual,
-        project_root.canonicalize()?,
-        "gc_adopt must pass AppState project_root to the spawned task, not None/CWD"
+        workflow.data["project_id"],
+        project_root.canonicalize()?.to_string_lossy().as_ref()
     );
-
     Ok(())
 }
 
 /// gc_adopt returns CONFLICT when the draft is not in Pending status.
-///
-/// Covers the repeat-adopt and reject/adopt-race scenarios identified in review round 1.
 #[tokio::test]
 async fn gc_adopt_non_pending_draft_returns_conflict() -> anyhow::Result<()> {
     let sandbox = common::tempdir_in_home("gc-adopt-non-pending-")?;

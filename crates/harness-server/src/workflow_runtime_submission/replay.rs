@@ -1,4 +1,4 @@
-use crate::task_runner::TaskId;
+use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowRuntimeStore,
 };

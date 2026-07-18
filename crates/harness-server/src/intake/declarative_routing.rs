@@ -8,7 +8,7 @@
 
 use super::{binding::binding_project_key, build_prompt_from_issue, IncomingIssue, IntakeSource};
 use crate::http::AppState;
-use crate::task_runner::TaskId;
+use harness_core::types::TaskId;
 use harness_core::types::{Decision, Event, SessionId};
 use harness_workflow::runtime::WorkflowRuntimeStore;
 use serde_json::json;

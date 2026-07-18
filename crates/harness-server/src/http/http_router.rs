@@ -8,11 +8,10 @@ use std::sync::Arc;
 
 use super::{
     auth, get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
-    get_task, get_task_artifacts, get_task_prompts, get_task_proof, get_workflow_runtime_tree,
-    github_webhook, handle_rpc, health_check, ingest_signal, intake_status, list_tasks,
-    password_reset, project_queue_stats, reset_runtime_circuit_breaker, runtime_submission_routes,
-    sse_routes, state::AppState, stream_task_sse, task_mutation_routes, task_query_routes,
-    task_routes,
+    get_workflow_runtime_tree, github_webhook, handle_rpc, health_check, ingest_signal,
+    intake_status, password_reset, project_queue_stats, reset_runtime_circuit_breaker,
+    runtime_submission_routes, sse_routes, state::AppState, task_mutation_routes,
+    task_query_routes, task_routes,
 };
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
@@ -30,16 +29,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))
         .route("/ws", get(crate::websocket::ws_handler))
-        .route("/tasks", post(task_routes::create_task))
-        .route("/tasks", get(list_tasks))
-        .route("/tasks/batch", post(task_routes::create_tasks_batch))
-        .route("/tasks/{id}", get(get_task))
-        .route("/tasks/{id}/cancel", post(task_routes::cancel_task))
-        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
-        .route("/tasks/{id}/artifacts", get(get_task_artifacts))
-        .route("/tasks/{id}/prompts", get(get_task_prompts))
-        .route("/tasks/{id}/proof", get(get_task_proof))
-        .route("/tasks/{id}/stream", get(stream_task_sse))
         .route(
             "/projects",
             post(crate::handlers::projects::register_project)
@@ -150,10 +139,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/runtime-hosts/{host_id}/deregister",
             post(crate::handlers::runtime_hosts::deregister_runtime_host),
-        )
-        .route(
-            "/api/runtime-hosts/{host_id}/tasks/claim",
-            post(crate::handlers::runtime_hosts::claim_task_for_runtime_host),
         )
         .route(
             "/api/runtime-hosts/{host_id}/runtime-jobs/claim",

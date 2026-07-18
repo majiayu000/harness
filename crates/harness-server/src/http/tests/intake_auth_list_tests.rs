@@ -516,7 +516,10 @@ fn authed_app(state: Arc<AppState>) -> Router {
         .route("/", get(crate::dashboard::index))
         .route("/dashboard", get(crate::dashboard::index))
         .route("/health", get(health_check))
-        .route("/tasks", get(list_tasks))
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions),
+        )
         .route(
             "/api/workflows/runtime/unblock",
             post(task_mutation_routes::unblock_workflow_runtime),
@@ -589,8 +592,7 @@ async fn query_param_token_rejected_on_protected_endpoint() -> anyhow::Result<()
 }
 
 #[tokio::test]
-async fn query_param_token_authorizes_legacy_and_runtime_sse_stream_endpoints() -> anyhow::Result<()>
-{
+async fn query_param_token_authorizes_runtime_sse_stream_endpoint() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = harness_core::config::HarnessConfig::default();
     config.server.api_token = Some("secret123".to_string());
@@ -601,7 +603,6 @@ async fn query_param_token_authorizes_legacy_and_runtime_sse_stream_endpoints() 
     )
     .await?;
     let app = Router::new()
-        .route("/tasks/{id}/stream", get(|| async { StatusCode::OK }))
         .route(
             "/api/workflows/runtime/submissions/{id}/stream",
             get(|| async { StatusCode::OK }),
@@ -612,16 +613,11 @@ async fn query_param_token_authorizes_legacy_and_runtime_sse_stream_endpoints() 
         ))
         .with_state(state);
 
-    for path in [
-        "/tasks/task-1/stream?token=secret123",
-        "/api/workflows/runtime/submissions/task-1/stream?token=secret123",
-    ] {
-        let response = app
-            .clone()
-            .oneshot(Request::builder().uri(path).body(Body::empty())?)
-            .await?;
-        assert_eq!(response.status(), StatusCode::OK, "path: {path}");
-    }
+    let path = "/api/workflows/runtime/submissions/task-1/stream?token=secret123";
+    let response = app
+        .oneshot(Request::builder().uri(path).body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
 
@@ -655,7 +651,8 @@ async fn protected_route_passes_with_explicit_unauthenticated_opt_in() -> anyhow
     let dir = tempfile::tempdir()?;
     let mut config = harness_core::config::HarnessConfig::default();
     config.server.allow_unauthenticated = true;
-    let state = make_read_only_route_test_state_with(
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
         dir.path(),
         config,
         harness_agents::registry::AgentRegistry::new("test"),
@@ -664,102 +661,14 @@ async fn protected_route_passes_with_explicit_unauthenticated_opt_in() -> anyhow
     let app = authed_app(state);
 
     let response = app
-        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/submissions")
+                .body(Body::empty())?,
+        )
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
-    Ok(())
-}
-
-#[tokio::test]
-async fn list_tasks_exposes_task_kind_and_non_implementation_statuses() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state = make_read_only_route_test_state(dir.path()).await?;
-    let app = Router::new()
-        .route("/tasks", get(list_tasks))
-        .with_state(state.clone());
-
-    let review_task = task_runner::TaskState {
-        id: task_runner::TaskId::new(),
-        task_kind: task_runner::TaskKind::Review,
-        status: task_runner::TaskStatus::ReviewWaiting,
-        turn: 0,
-        pr_url: None,
-        rounds: vec![],
-        error: None,
-        source: Some("periodic_review".to_string()),
-        external_id: None,
-        parent_id: None,
-        depends_on: vec![],
-        subtask_ids: vec![],
-        project_root: Some(dir.path().to_path_buf()),
-        issue: None,
-        repo: Some("owner/repo".to_string()),
-        description: Some("periodic review".to_string()),
-        created_at: None,
-        updated_at: None,
-        priority: 0,
-        phase: task_runner::TaskPhase::Review,
-        triage_output: None,
-        plan_output: None,
-        request_settings: None,
-        scheduler: task_runner::TaskSchedulerState::queued(),
-        failure_kind: None,
-        workspace_path: None,
-        workspace_owner: None,
-        run_generation: 0,
-
-        version: 0,
-    };
-    let planner_task = task_runner::TaskState {
-        id: task_runner::TaskId::new(),
-        task_kind: task_runner::TaskKind::Planner,
-        status: task_runner::TaskStatus::PlannerGenerating,
-        turn: 1,
-        pr_url: None,
-        rounds: vec![],
-        error: None,
-        source: Some("sprint_planner".to_string()),
-        external_id: None,
-        parent_id: None,
-        depends_on: vec![],
-        subtask_ids: vec![],
-        project_root: Some(dir.path().to_path_buf()),
-        issue: None,
-        repo: Some("owner/repo".to_string()),
-        description: Some("sprint planner".to_string()),
-        created_at: None,
-        updated_at: None,
-        priority: 0,
-        phase: task_runner::TaskPhase::Plan,
-        triage_output: None,
-        plan_output: None,
-        request_settings: None,
-        scheduler: task_runner::TaskSchedulerState::queued(),
-        failure_kind: None,
-        workspace_path: None,
-        workspace_owner: None,
-        run_generation: 0,
-
-        version: 0,
-    };
-    state.core.tasks.insert(&review_task).await;
-    state.core.tasks.insert(&planner_task).await;
-
-    let response = app
-        .clone()
-        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
-        .await?;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let tasks: serde_json::Value = serde_json::from_slice(&body)?;
-    let tasks = tasks["data"].as_array().expect("tasks array");
-    assert!(tasks
-        .iter()
-        .any(|task| { task["task_kind"] == "review" && task["status"] == "review_waiting" }));
-    assert!(tasks
-        .iter()
-        .any(|task| { task["task_kind"] == "planner" && task["status"] == "planner_generating" }));
     Ok(())
 }
 
@@ -768,13 +677,16 @@ async fn list_tasks_rejects_running_as_task_status() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_read_only_route_test_state(dir.path()).await?;
     let app = Router::new()
-        .route("/tasks", get(list_tasks))
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions),
+        )
         .with_state(state);
 
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/tasks?status=running")
+                .uri("/api/workflows/runtime/submissions?status=running")
                 .body(Body::empty())?,
         )
         .await?;
@@ -794,13 +706,16 @@ async fn list_tasks_rejects_invalid_limit() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_read_only_route_test_state(dir.path()).await?;
     let app = Router::new()
-        .route("/tasks", get(list_tasks))
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions),
+        )
         .with_state(state);
 
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/tasks?limit=0")
+                .uri("/api/workflows/runtime/submissions?limit=0")
                 .body(Body::empty())?,
         )
         .await?;
@@ -808,45 +723,5 @@ async fn list_tasks_rejects_invalid_limit() -> anyhow::Result<()> {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response_json(response).await?;
     assert_eq!(body["error"], "invalid_limit");
-    Ok(())
-}
-
-#[tokio::test]
-async fn list_tasks_filters_by_scheduler_state_and_returns_envelope() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let state = make_read_only_route_test_state(dir.path()).await?;
-    let app = Router::new()
-        .route("/tasks", get(list_tasks))
-        .with_state(state.clone());
-
-    let mut running_task = task_runner::TaskState::new(task_runner::TaskId::new());
-    running_task.status = task_runner::TaskStatus::Implementing;
-    running_task.scheduler.claim_scheduler("test-scheduler");
-    let running_task_id = running_task.id.0.clone();
-
-    let mut queued_task = task_runner::TaskState::new(task_runner::TaskId::new());
-    queued_task.status = task_runner::TaskStatus::Pending;
-    queued_task.scheduler = task_runner::TaskSchedulerState::queued();
-
-    state.core.tasks.insert(&running_task).await;
-    state.core.tasks.insert(&queued_task).await;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/tasks?scheduler_state=running&limit=1")
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response_json(response).await?;
-    let tasks = body["data"].as_array().expect("tasks array");
-
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0]["id"], running_task_id);
-    assert_eq!(tasks[0]["scheduler"]["authority_state"], "running");
-    assert_eq!(body["page"]["limit"], 1);
-    assert_eq!(body["counts"]["total"], 1);
-    assert_eq!(body["counts"]["running"], 1);
     Ok(())
 }

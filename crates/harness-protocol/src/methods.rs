@@ -14,10 +14,10 @@ use std::path::PathBuf;
 ///
 /// | Control-plane capability | HTTP endpoint |
 /// |--------------------------|---------------|
-/// | Enqueue a task           | `POST /tasks` |
-/// | List tasks               | `GET  /tasks` |
-/// | Batch-create tasks       | `POST /tasks/batch` |
-/// | Stream task output       | `GET  /tasks/{id}/stream` |
+/// | Submit runtime work      | `POST /api/workflows/runtime/submissions` |
+/// | List runtime submissions | `GET  /api/workflows/runtime/submissions` |
+/// | Get runtime submission   | `GET  /api/workflows/runtime/submissions/{id}` |
+/// | Stream runtime output    | `GET  /api/workflows/runtime/submissions/{id}/stream` |
 /// | Register a project       | `POST /projects` |
 /// | List projects            | `GET  /projects` |
 /// | Dashboard API            | `GET  /api/dashboard` |

@@ -6,8 +6,7 @@ use chrono::Utc;
 use harness_core::config::agents::SandboxMode;
 use harness_core::{
     agent::AgentRequest, agent::AgentResponse, agent::CodeAgent, agent::StreamItem,
-    types::Capability, types::Item, types::TokenUsage, types::TurnFailure, types::TurnFailureKind,
-    types::TurnTelemetry,
+    types::Capability, types::Item, types::TokenUsage,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -30,8 +29,6 @@ mod health_route_tests;
 mod intake_auth_list_tests;
 mod prompt_continuation_runtime_tests;
 mod queue_stats_route_tests;
-mod recovery_followup_tests;
-mod recovery_tests;
 mod repo_memory_api_tests;
 mod runtime_approval_route_tests;
 mod runtime_deferred_tree_tests;
@@ -46,4 +43,3 @@ mod runtime_worker_workspace_tests;
 mod task_detail_sse_tests;
 mod webhook_runtime_tests;
 mod webhook_task_tests;
-mod workflow_list_tests;

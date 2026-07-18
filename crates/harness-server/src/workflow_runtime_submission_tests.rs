@@ -107,7 +107,14 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
     std::fs::create_dir(&project_root)?;
     let task_id = TaskId::from_str("prompt-task-1");
 
-    let result = record_prompt_submission(
+    let execution_policy = runtime_models::PromptExecutionPolicy {
+        task_kind: runtime_models::TaskKind::Review,
+        agent: Some("claude".to_string()),
+        turn_timeout_secs: Some(77),
+        queue_domain: runtime_models::QueueDomain::Review,
+        priority: 2,
+    };
+    let result = record_prompt_submission_with_policy(
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
@@ -120,6 +127,7 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
             external_id: Some("manual:prompt:1"),
             continuation: None,
         },
+        execution_policy.clone(),
     )
     .await?;
 
@@ -158,6 +166,7 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
     );
     assert_eq!(instance.data["source"], "dashboard");
     assert_eq!(instance.data["external_id"], "manual:prompt:1");
+    assert_eq!(instance.data["execution_policy"], json!(execution_policy));
     assert_eq!(instance.data["last_decision"], "submit_prompt");
     assert_eq!(
         instance.data["execution_path"],
@@ -170,6 +179,10 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
         .find(|event| event.event_type == "PromptSubmitted")
         .expect("prompt submission event");
     assert!(submitted_event.event.get("continuation").is_none());
+    assert_eq!(
+        submitted_event.event["execution_policy"],
+        instance.data["execution_policy"]
+    );
 
     let commands = store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
@@ -713,75 +726,5 @@ async fn rejected_issue_submission_keeps_existing_runtime_data() -> anyhow::Resu
     assert!(events
         .iter()
         .any(|event| event.event_type == "IssueSubmitted"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn issue_submission_waits_for_dependencies_then_releases_runtime_command(
-) -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(());
-    }
-
-    let dir = tempfile::tempdir()?;
-    let store = open_runtime_store(dir.path()).await?;
-    let task_store = TaskStore::open(&dir.path().join("tasks.db")).await?;
-    let project_root = dir.path().join("project");
-    std::fs::create_dir(&project_root)?;
-    let dep_id = TaskId::from_str("dep-1");
-    let mut dep = crate::task_runner::TaskState::new(dep_id.clone());
-    dep.status = TaskStatus::Pending;
-    task_store.insert(&dep).await;
-
-    let task_id = TaskId::from_str("runtime-handle-1");
-    let labels = vec!["bug".to_string()];
-    let result = record_issue_submission(
-        &store,
-        IssueSubmissionRuntimeContext {
-            project_root: &project_root,
-            repo: Some("owner/repo"),
-            issue_number: 77,
-            task_id: &task_id,
-            labels: &labels,
-            force_execute: false,
-            additional_prompt: None,
-            depends_on: std::slice::from_ref(&dep_id),
-            dependencies_blocked: true,
-            source: None,
-            external_id: None,
-            remote_fact_hash: None,
-            author_trust_class: None,
-        },
-    )
-    .await?;
-
-    assert!(result.accepted);
-    assert!(result.command_ids.is_empty());
-    let workflow = store
-        .get_instance(&result.workflow_id)
-        .await?
-        .expect("workflow should be persisted");
-    assert_eq!(workflow.state, "awaiting_dependencies");
-    assert_eq!(workflow.data["depends_on"], serde_json::json!(["dep-1"]));
-    assert!(store.commands_for(&result.workflow_id).await?.is_empty());
-
-    let waiting = release_ready_issue_dependencies(&store, &task_store, 10).await?;
-    assert_eq!(waiting.waiting, 1);
-    assert_eq!(waiting.released, 0);
-
-    dep.status = TaskStatus::Done;
-    task_store.insert(&dep).await;
-    let released = release_ready_issue_dependencies(&store, &task_store, 10).await?;
-    assert_eq!(released.released, 1);
-    let workflow = store
-        .get_instance(&result.workflow_id)
-        .await?
-        .expect("workflow should remain persisted");
-    assert_eq!(workflow.state, "planning");
-    assert_eq!(workflow.data["dependencies_blocked"], false);
-    let commands = store.commands_for(&result.workflow_id).await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].status, "pending");
-    assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
     Ok(())
 }

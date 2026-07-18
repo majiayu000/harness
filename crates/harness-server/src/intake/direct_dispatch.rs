@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::http::AppState;
-use crate::task_runner::TaskId;
+use harness_core::types::TaskId;
 
 use super::{IncomingIssue, IntakeSource};
 

@@ -148,7 +148,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::task_runner::TaskId;
+    use harness_core::types::TaskId;
 
     #[test]
     fn lifecycle_coverage_includes_quiescent_and_terminal_states() {

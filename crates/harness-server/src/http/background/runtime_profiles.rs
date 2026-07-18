@@ -48,6 +48,49 @@ pub(super) fn runtime_profile_from_agent(
     }
 }
 
+pub(super) fn runtime_profile_with_prompt_execution_policy(
+    config: &harness_core::config::HarnessConfig,
+    base_profile: &RuntimeProfile,
+    policy: &crate::workflow_runtime_submission::runtime_models::PromptExecutionPolicy,
+) -> anyhow::Result<RuntimeProfile> {
+    let mut profile = match policy.agent.as_deref() {
+        None => base_profile.clone(),
+        Some(agent_name) => {
+            let requested = runtime_profile_from_agent(config, agent_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workflow runtime does not support requested agent `{agent_name}` for prompt execution"
+                )
+            })?;
+            if runtime_kinds_share_agent(requested.kind, base_profile.kind) {
+                base_profile.clone()
+            } else {
+                RuntimeProfile {
+                    sandbox: base_profile.sandbox.clone(),
+                    approval_policy: None,
+                    max_turns: base_profile.max_turns,
+                    timeout_secs: base_profile.timeout_secs,
+                    ..requested
+                }
+            }
+        }
+    };
+    if let Some(timeout_secs) = policy.turn_timeout_secs {
+        profile.timeout_secs = Some(timeout_secs);
+    }
+    Ok(profile)
+}
+
+fn runtime_kinds_share_agent(left: RuntimeKind, right: RuntimeKind) -> bool {
+    left == right
+        || matches!(
+            (left, right),
+            (
+                RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc,
+                RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
+            )
+        )
+}
+
 async fn runtime_default_agent_name_for_project(
     state: &Arc<AppState>,
     project_root: &Path,
@@ -365,4 +408,29 @@ fn runtime_dispatch_approval_policy(
 
 fn runtime_kind_supports_approval_policy(kind: RuntimeKind) -> bool {
     matches!(kind, RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_agent_policy_preserves_configured_codex_surface() -> anyhow::Result<()> {
+        let base = RuntimeProfile::new("codex-exec-review", RuntimeKind::CodexExec);
+        let policy = crate::workflow_runtime_submission::runtime_models::PromptExecutionPolicy {
+            agent: Some("codex".to_string()),
+            turn_timeout_secs: Some(45),
+            ..Default::default()
+        };
+
+        let profile = runtime_profile_with_prompt_execution_policy(
+            &harness_core::config::HarnessConfig::default(),
+            &base,
+            &policy,
+        )?;
+        assert_eq!(profile.kind, RuntimeKind::CodexExec);
+        assert_eq!(profile.name, "codex-exec-review");
+        assert_eq!(profile.timeout_secs, Some(45));
+        Ok(())
+    }
 }

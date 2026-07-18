@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use crate::server::HarnessServer;
 
-use super::{
-    engines::EnginesBundle, intake::IntakeBundle, registry::RegistryBundle, storage::StorageBundle,
-};
+use super::{engines::EnginesBundle, registry::RegistryBundle, storage::StorageBundle};
 
 /// Outputs of the service layer initialization phase.
 pub(crate) struct ServicesBundle {
@@ -26,13 +24,12 @@ pub(crate) struct ServicesBundle {
 ///
 /// Also spawns the background task-recovery validator.
 ///
-/// Depends on: `storage`, `engines`, `registry`, `intake` — must follow all four.
+/// Depends on: `storage`, `engines`, and `registry` — must follow all three.
 pub(crate) async fn build_services(
     server: &Arc<HarnessServer>,
     storage: &StorageBundle,
     engines: &EnginesBundle,
     registry: &RegistryBundle,
-    intake: &IntakeBundle,
     project_root: &Path,
 ) -> anyhow::Result<ServicesBundle> {
     let tasks = storage
@@ -75,17 +72,7 @@ pub(crate) async fn build_services(
     );
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
-        tasks.clone(),
-        server.agent_registry.clone(),
         Arc::new(server.config.clone()),
-        engines.skills.clone(),
-        events.clone(),
-        interceptors.clone(),
-        registry.workspace_mgr.clone(),
-        intake.task_queue.clone(),
-        intake.review_task_queue.clone(),
-        intake.completion_callback.clone(),
-        registry.issue_workflow_store.clone(),
         registry.workflow_runtime_store.clone(),
         Some(project_registry.clone()),
         server.config.server.allowed_project_roots.clone(),
@@ -142,20 +129,6 @@ pub(crate) async fn build_services(
         }
     }
 
-    // Spawn background validator for recovered pending tasks.
-    // The completion callback is passed so that tasks marked Failed (closed PR)
-    // trigger intake cleanup (e.g. removing the issue from the dispatched map).
-    {
-        let tasks_for_recovery = tasks.clone();
-        let cb_for_recovery = intake.completion_callback.clone();
-        let github_token = server.config.server.github_token.clone();
-        tokio::spawn(async move {
-            tasks_for_recovery
-                .validate_recovered_tasks_with_token(cb_for_recovery, github_token.as_deref())
-                .await;
-        });
-    }
-
     Ok(ServicesBundle {
         interceptors,
         project_svc,
@@ -181,7 +154,6 @@ mod tests {
         StorageBundle,
         EnginesBundle,
         RegistryBundle,
-        IntakeBundle,
     ) {
         let server = Arc::new(HarnessServer::new(
             HarnessConfig::default(),
@@ -202,19 +174,14 @@ mod tests {
         )
         .await
         .expect("registry");
-        let intake = crate::http::builders::intake::build_intake(
-            &server, &storage, &engines, &registry, dir, dir,
-        )
-        .await
-        .expect("intake");
-        (server, storage, engines, registry, intake)
+        (server, storage, engines, registry)
     }
 
     #[tokio::test]
     async fn interceptor_count_matches_registered() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (server, storage, engines, registry, intake) = make_all_bundles(dir.path()).await;
-        let bundle = build_services(&server, &storage, &engines, &registry, &intake, dir.path())
+        let (server, storage, engines, registry) = make_all_bundles(dir.path()).await;
+        let bundle = build_services(&server, &storage, &engines, &registry, dir.path())
             .await
             .expect("build_services");
         // 3 interceptors: ContractValidator, HookEnforcer, PostExecutionValidator

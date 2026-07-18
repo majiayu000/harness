@@ -30,7 +30,7 @@ pub struct RuntimeHostInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskClaimResult {
-    pub task_id: crate::task_runner::TaskId,
+    pub task_id: harness_core::types::TaskId,
     pub lease_expires_at: String,
 }
 

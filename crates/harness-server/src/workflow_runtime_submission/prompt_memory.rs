@@ -1,4 +1,4 @@
-use crate::task_runner::TaskId;
+use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     WorkflowInstance, WorkflowRuntimeStore, PROMPT_TASK_DEFINITION_ID,
 };

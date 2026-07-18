@@ -1,4 +1,4 @@
-use crate::{http::AppState, task_runner::DashboardCounts};
+use crate::http::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use harness_core::types::EventFilters;
 use harness_observe::{quality::QualityGrader, stats};
@@ -19,7 +19,7 @@ pub(crate) static SERVER_START: std::sync::OnceLock<std::time::Instant> =
 
 /// GET /api/dashboard — JSON summary of all registered projects and global concurrency.
 ///
-/// Per-project entries include active runtime/legacy work stats
+/// Per-project entries include active runtime work stats
 /// (running/queued) plus historical done/failed counts and the latest PR URL
 /// for the project. Per-host entries include active lease count and assignment
 /// pressure (active_leases / max(watched_projects, 1)).
@@ -30,18 +30,24 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
 
     let tq = &state.concurrency.task_queue;
 
-    // Global and per-project done/failed counts from in-memory cache in one pass,
-    // avoiding both full TaskState cloning and double iteration.
-    let DashboardCounts {
-        global_done,
-        global_failed,
-        global_stalled,
-        by_project: project_counts,
-    } = state.task_svc.count_for_dashboard().await;
-
-    // Most recent completed task with a PR URL, queried from the DB which is
-    // ordered by updated_at DESC — reflects completion time, not creation time.
-    let latest_pr: Option<String> = state.task_svc.latest_done_pr_url().await;
+    let (submission_metrics, turn_counts) = match tokio::try_join!(
+        super::runtime_submission_metrics::load_submission_metrics(&state, chrono::Utc::now()),
+        super::runtime_submission_metrics::load_runtime_turn_counts(&state),
+    ) {
+        Ok(metrics) => metrics,
+        Err(error) => {
+            tracing::error!("dashboard: workflow runtime metrics query failed: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "workflow runtime metrics unavailable"})),
+            );
+        }
+    };
+    let global_done = submission_metrics.global_done;
+    let global_failed = submission_metrics.global_failed;
+    let global_stalled = submission_metrics.global_stalled;
+    let latest_pr = submission_metrics.latest_pr_url.as_deref();
+    let project_counts = &submission_metrics.by_project;
     let project_list = state.project_svc.list().await;
     let visible_project_ids = project_list.as_ref().ok().map(|projects| {
         projects
@@ -93,34 +99,17 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         }
     };
 
-    // LLM-specific metrics derived from in-memory task state and event store.
-    //
-    // collect_llm_metrics_inputs() avoids two pitfalls:
-    // 1. Performance: does NOT call list_all() which would clone full TaskState
-    //    values (including large rounds.detail strings) on every 5-second poll.
-    //    Turn counts come from lightweight DB summaries; latencies are read
-    //    in-place from cache refs without any full-TaskState allocation.
-    // 2. Correctness: turn counts include terminal tasks from the DB so the
-    //    metrics are not zero when the queue is idle.  Latency computation skips
-    //    the synthetic "resumed_checkpoint" round injected at recovery time so
-    //    resumed tasks are not silently excluded from the p50.
+    // LLM-specific metrics derived from durable runtime usage and event data.
     let llm_metrics: Value = {
-        let inputs = state.core.tasks.collect_llm_metrics_inputs().await;
-        let turn_counts = inputs.turn_counts;
         let avg_turns: Option<f64> = if turn_counts.is_empty() {
             None
         } else {
             Some(turn_counts.iter().map(|&t| t as f64).sum::<f64>() / turn_counts.len() as f64)
         };
         let p50_turns = stats::p50_turns(&turn_counts);
-        let mut latencies = inputs.first_token_latencies;
-        latencies.sort_unstable();
-        let p50_first_token_latency_ms: Option<u64> = if latencies.is_empty() {
-            None
-        } else {
-            // Lower-median: index (len-1)/2 avoids overstating p50 for even-length slices.
-            Some(latencies[(latencies.len() - 1) / 2])
-        };
+        // Workflow runtime does not persist first-token latency yet. Returning
+        // null keeps missing evidence distinct from a measured zero.
+        let p50_first_token_latency_ms: Option<u64> = None;
         // total_linter_feedback from events already queried above.
         // Bounded to the same rolling window as the grade query to avoid a
         // full-history scan on every 5-second dashboard poll.
@@ -147,9 +136,6 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             "p50_first_token_latency_ms": p50_first_token_latency_ms,
         })
     };
-
-    // Fetch latest PR URLs for all projects in one bulk query to avoid N+1.
-    let project_pr_urls = state.task_svc.latest_done_pr_urls_all_projects().await;
 
     // Build per-project entries from the registry.
     let projects: Vec<Value> = match project_list {
@@ -178,7 +164,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                 let done = counts.map_or(0, |c| c.done);
                 let failed = counts.map_or(0, |c| c.failed);
                 let stalled = counts.map_or(0, |c| c.stalled);
-                let latest_pr = project_pr_urls.get(&key);
+                let latest_pr = counts.and_then(|counts| counts.latest_pr_url.as_ref());
                 entries.push(json!({
                     "id": p.id,
                     "root": p.root,
@@ -196,32 +182,39 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         }
     };
 
-    let runtime_hosts: Vec<Value> = state
-        .runtime_hosts
-        .list_hosts()
-        .into_iter()
-        .map(|host| {
-            let snapshot = state.runtime_project_cache.get_host_cache(&host.id);
-            let watched_projects = snapshot.as_ref().map(|s| s.project_count).unwrap_or(0);
-            let watched_project_roots: Vec<&str> = snapshot
-                .as_ref()
-                .map(|s| s.projects.iter().map(|p| p.root.as_str()).collect())
-                .unwrap_or_default();
-            let active_leases = state.core.tasks.active_runtime_host_lease_count(&host.id);
-            let assignment_pressure = active_leases as f64 / watched_projects.max(1) as f64;
-            json!({
-                "id": host.id,
-                "display_name": host.display_name,
-                "capabilities": host.capabilities,
-                "online": host.online,
-                "last_heartbeat_at": host.last_heartbeat_at,
-                "watched_projects": watched_projects,
-                "watched_project_roots": watched_project_roots,
-                "active_leases": active_leases,
-                "assignment_pressure": assignment_pressure,
-            })
-        })
-        .collect();
+    let active_lease_counts =
+        match super::runtime_hosts::active_runtime_job_lease_counts(&state).await {
+            Ok(counts) => Some(counts),
+            Err(error) => {
+                tracing::warn!("dashboard: failed to count runtime-job leases: {error}");
+                None
+            }
+        };
+    let mut runtime_hosts = Vec::new();
+    for host in state.runtime_hosts.list_hosts() {
+        let snapshot = state.runtime_project_cache.get_host_cache(&host.id);
+        let watched_projects = snapshot.as_ref().map(|s| s.project_count).unwrap_or(0);
+        let watched_project_roots: Vec<&str> = snapshot
+            .as_ref()
+            .map(|s| s.projects.iter().map(|p| p.root.as_str()).collect())
+            .unwrap_or_default();
+        let active_leases = active_lease_counts
+            .as_ref()
+            .map(|counts| counts.get(&host.id).copied().unwrap_or(0));
+        let assignment_pressure =
+            active_leases.map(|count| count as f64 / watched_projects.max(1) as f64);
+        runtime_hosts.push(json!({
+            "id": host.id,
+            "display_name": host.display_name,
+            "capabilities": host.capabilities,
+            "online": host.online,
+            "last_heartbeat_at": host.last_heartbeat_at,
+            "watched_projects": watched_projects,
+            "watched_project_roots": watched_project_roots,
+            "active_leases": active_leases,
+            "assignment_pressure": assignment_pressure,
+        }));
+    }
     let runtime_hosts_total = runtime_hosts.len() as u64;
     let runtime_hosts_online = runtime_hosts
         .iter()
@@ -269,12 +262,29 @@ mod tests {
 
     async fn make_test_state_with_config(mut config: HarnessConfig) -> anyhow::Result<AppState> {
         config.server.allow_unauthenticated = true;
+        let database_url = config
+            .server
+            .database_url
+            .clone()
+            .or_else(|| crate::test_helpers::test_database_url().ok());
+        let runtime_path = harness_core::config::dirs::default_db_path(
+            &config.server.data_dir,
+            "workflow_runtime_dashboard_test",
+        );
         let server = Arc::new(HarnessServer::new(
             config,
             ThreadManager::new(),
             AgentRegistry::new("test"),
         ));
-        build_app_state(server).await
+        let mut state = build_app_state(server).await?;
+        state.core.workflow_runtime_store = Some(Arc::new(
+            harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+                &runtime_path,
+                database_url.as_deref(),
+            )
+            .await?,
+        ));
+        Ok(state)
     }
 
     async fn dashboard_body(state: Arc<AppState>) -> anyhow::Result<serde_json::Value> {
@@ -377,9 +387,11 @@ mod tests {
 
         assert_eq!(body["global"]["running"], 0);
         assert_eq!(body["global"]["queued"], 0);
+        assert_eq!(body["global"]["done"], 1);
         let project = project_entry(&body, &project_root)?;
         assert_eq!(project["tasks"]["running"], 0);
         assert_eq!(project["tasks"]["queued"], 0);
+        assert_eq!(project["tasks"]["done"], 1);
         Ok(())
     }
 
@@ -390,24 +402,24 @@ mod tests {
             return Ok(());
         }
         let dir = crate::test_helpers::tempdir_in_home("harness-test-dashboard-stalled-")?;
-        let canonical_root = dir.path().canonicalize()?;
-        let project_root = canonical_root.to_string_lossy().into_owned();
+        let project_root = dir.path().canonicalize()?.to_string_lossy().into_owned();
         let state = Arc::new(make_test_state(dir.path()).await?);
-        let mut task = TaskState::new(TaskId::from_str("dashboard-stalled-task"));
-        task.project_root = Some(canonical_root);
-        task.status = crate::task_runner::TaskStatus::Failed;
-        task.phase = crate::task_runner::TaskPhase::Terminal;
-        task.error = Some(
-            crate::task_runner::TaskTerminalFailure::round_budget_exhausted(
-                1,
-                crate::task_runner::TaskStatus::Reviewing,
-                Some("local_review_gate".to_string()),
+        let store = state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
+        store
+            .upsert_instance(
+                &runtime_workflow("failed", &project_root, "dashboard-stalled-task").with_data(
+                    serde_json::json!({
+                        "project_id": project_root,
+                        "task_id": "dashboard-stalled-task",
+                        "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
+                    }),
+                ),
             )
-            .to_reason_string(),
-        );
-        task.scheduler
-            .mark_terminal(&crate::task_runner::TaskStatus::Failed);
-        state.core.tasks.insert(&task).await;
+            .await?;
 
         let body = dashboard_body(state).await?;
 
@@ -422,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_dedupes_runtime_workflow_with_active_legacy_task() -> anyhow::Result<()> {
+    async fn dashboard_uses_runtime_workflow_when_legacy_task_exists() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -451,16 +463,16 @@ mod tests {
 
         let body = dashboard_body(state).await?;
 
-        assert_eq!(body["global"]["running"], 0);
-        assert_eq!(body["global"]["queued"], 1);
+        assert_eq!(body["global"]["running"], 1);
+        assert_eq!(body["global"]["queued"], 0);
         let project = project_entry(&body, &project_root)?;
-        assert_eq!(project["tasks"]["running"], 0);
-        assert_eq!(project["tasks"]["queued"], 1);
+        assert_eq!(project["tasks"]["running"], 1);
+        assert_eq!(project["tasks"]["queued"], 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn dashboard_counts_recovering_legacy_task_as_running() -> anyhow::Result<()> {
+    async fn dashboard_ignores_recovering_legacy_task() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -477,16 +489,16 @@ mod tests {
 
         let body = dashboard_body(state).await?;
 
-        assert_eq!(body["global"]["running"], 1);
+        assert_eq!(body["global"]["running"], 0);
         assert_eq!(body["global"]["queued"], 0);
         let project = project_entry(&body, &project_root)?;
-        assert_eq!(project["tasks"]["running"], 1);
+        assert_eq!(project["tasks"]["running"], 0);
         assert_eq!(project["tasks"]["queued"], 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn dashboard_counts_unregistered_project_work_in_global_totals() -> anyhow::Result<()> {
+    async fn dashboard_ignores_unregistered_legacy_project_work() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -509,7 +521,7 @@ mod tests {
 
         let body = dashboard_body(state).await?;
 
-        assert_eq!(body["global"]["running"], 1);
+        assert_eq!(body["global"]["running"], 0);
         assert_eq!(body["global"]["queued"], 0);
         let registered_project = project_entry(&body, &registered_root)?;
         assert_eq!(registered_project["tasks"]["running"], 0);
@@ -522,8 +534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_counts_unregistered_allowed_root_work_in_global_totals() -> anyhow::Result<()>
-    {
+    async fn dashboard_ignores_unregistered_allowed_root_legacy_work() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -557,7 +568,7 @@ mod tests {
 
         let body = dashboard_body(state).await?;
 
-        assert_eq!(body["global"]["running"], 1);
+        assert_eq!(body["global"]["running"], 0);
         assert_eq!(body["global"]["queued"], 0);
         let registered_project = project_entry(&body, &registered_root)?;
         assert_eq!(registered_project["tasks"]["running"], 0);
@@ -570,7 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_preserves_foreground_task_queue_waiters() -> anyhow::Result<()> {
+    async fn dashboard_ignores_task_queue_waiters_with_runtime_store() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -604,15 +615,16 @@ mod tests {
         assert!(join_error.is_cancelled());
 
         assert_eq!(body["global"]["running"], 0);
-        assert_eq!(body["global"]["queued"], 1);
+        assert_eq!(body["global"]["queued"], 0);
         let project = project_entry(&body, &project_root)?;
         assert_eq!(project["tasks"]["running"], 0);
-        assert_eq!(project["tasks"]["queued"], 1);
+        assert_eq!(project["tasks"]["queued"], 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn dashboard_does_not_double_count_background_queue_waiters() -> anyhow::Result<()> {
+    async fn dashboard_ignores_background_task_queue_waiters_with_runtime_store(
+    ) -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -651,10 +663,10 @@ mod tests {
         assert!(join_error.is_cancelled());
 
         assert_eq!(body["global"]["running"], 0);
-        assert_eq!(body["global"]["queued"], 1);
+        assert_eq!(body["global"]["queued"], 0);
         let project = project_entry(&body, &project_root)?;
         assert_eq!(project["tasks"]["running"], 0);
-        assert_eq!(project["tasks"]["queued"], 1);
+        assert_eq!(project["tasks"]["queued"], 0);
         Ok(())
     }
 

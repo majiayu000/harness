@@ -36,7 +36,6 @@ pub mod notify;
 pub(crate) mod observation_compression;
 pub mod overview;
 pub mod parallel_dispatch;
-pub mod periodic_retry;
 pub mod periodic_reviewer;
 pub mod reconciliation;
 pub use harness_workflow::plan_db;

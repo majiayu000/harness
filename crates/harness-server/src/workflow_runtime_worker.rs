@@ -12,6 +12,7 @@ mod pr_feedback_inspection;
 mod prompt_input_telemetry;
 mod prompt_packet;
 mod repo_memory_prompt;
+mod runtime_execution_queue;
 mod runtime_profile;
 mod runtime_turn_control;
 mod runtime_usage;
@@ -24,7 +25,10 @@ use crate::runtime_circuit_breaker::{
     classify_agent_failure, CircuitBreakerEvent, CircuitBreakerEventKind, FailureClass,
 };
 use crate::runtime_projection::RuntimeWorkflowProjection;
-use crate::task_runner::{TaskFailureKind, TaskKind, TaskState, TaskStatus};
+use crate::workflow_runtime_submission::{
+    runtime_models::{TaskFailureKind, TaskKind, TaskStatus},
+    runtime_state::TaskState,
+};
 use chrono::Duration;
 use data_helpers::{optional_data_string, optional_data_u64};
 use executor::ServerRuntimeJobExecutor;
@@ -283,7 +287,7 @@ pub(crate) async fn notify_runtime_submission_terminal_workflow(
     let Some(callback) = state.intake.completion_callback.as_ref() else {
         return Ok(false);
     };
-    let Some(task) = runtime_submission_completion_task(&instance, result) else {
+    let Some(task) = runtime_submission_completion_task(&instance, result)? else {
         return Ok(false);
     };
     callback(task).await;
@@ -293,21 +297,32 @@ pub(crate) async fn notify_runtime_submission_terminal_workflow(
 fn runtime_submission_completion_task(
     instance: &WorkflowInstance,
     result: Option<&ActivityResult>,
-) -> Option<TaskState> {
+) -> anyhow::Result<Option<TaskState>> {
     let projection = RuntimeWorkflowProjection::from_workflow(instance);
     let status = projection.task_status;
     if !status.is_terminal() {
-        return None;
+        return Ok(None);
     }
     let task_kind = match instance.definition_id.as_str() {
         GITHUB_ISSUE_PR_DEFINITION_ID => TaskKind::Issue,
-        PROMPT_TASK_DEFINITION_ID => TaskKind::Prompt,
+        PROMPT_TASK_DEFINITION_ID => {
+            crate::workflow_runtime_submission::prompt_execution_policy(&instance.data)?
+                .map(|policy| policy.task_kind)
+                .unwrap_or(TaskKind::Prompt)
+        }
         _ if instance.subject.subject_type == "declarative" => TaskKind::Prompt,
-        _ => return None,
+        _ => return Ok(None),
     };
-    let source = optional_data_string(instance, "source")?;
-    let external_id = optional_data_string(instance, "external_id")?;
-    let task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(instance)?;
+    let Some(source) = optional_data_string(instance, "source") else {
+        return Ok(None);
+    };
+    let Some(external_id) = optional_data_string(instance, "external_id") else {
+        return Ok(None);
+    };
+    let Some(task_id) = crate::workflow_runtime_submission::runtime_issue_task_handle(instance)
+    else {
+        return Ok(None);
+    };
     let mut task = TaskState::new(task_id);
     task.task_kind = task_kind;
     task.status = status.clone();
@@ -324,12 +339,14 @@ fn runtime_submission_completion_task(
     task.pr_url = optional_data_string(instance, "last_pr_url");
     task.description = match task_kind {
         TaskKind::Issue => task.issue.map(|issue| format!("issue #{issue}")),
-        TaskKind::Prompt => optional_data_string(instance, "prompt_summary")
-            .or_else(|| Some("prompt task".to_string())),
-        _ => None,
+        TaskKind::Prompt | TaskKind::Review | TaskKind::Planner => {
+            optional_data_string(instance, "prompt_summary")
+                .or_else(|| task_kind.prompt_task_label().map(str::to_string))
+        }
+        TaskKind::Pr => Some("PR feedback".to_string()),
     };
     task.error = runtime_completion_error(&status, result);
-    Some(task)
+    Ok(Some(task))
 }
 
 fn runtime_job_activity_result(job: &RuntimeJob) -> Option<ActivityResult> {
@@ -445,7 +462,9 @@ mod tests {
         let instance = issue_instance("done");
         let result = ActivityResult::succeeded("implement_issue", "Runtime job passed.");
 
-        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result))
+            .expect("valid runtime submission")
+        else {
             panic!("projected terminal runtime issue should map to an intake task");
         };
 
@@ -468,7 +487,9 @@ mod tests {
         let instance = issue_instance("cancelled");
         let result = ActivityResult::cancelled("implement_issue", "Runtime job was cancelled.");
 
-        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result))
+            .expect("valid runtime submission")
+        else {
             panic!("terminal runtime issue should map to an intake task");
         };
 
@@ -486,7 +507,9 @@ mod tests {
         let instance = prompt_instance("done");
         let result = ActivityResult::succeeded("implement_prompt", "Prompt task completed.");
 
-        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result))
+            .expect("valid runtime submission")
+        else {
             panic!("terminal runtime prompt should map to an intake task");
         };
 
@@ -500,11 +523,36 @@ mod tests {
     }
 
     #[test]
+    fn runtime_submission_completion_task_preserves_review_intake_identity() {
+        let mut instance = prompt_instance("done");
+        instance.data["execution_policy"] = json!({
+            "task_kind": "review",
+            "agent": "codex",
+            "turn_timeout_secs": 90,
+            "queue_domain": "review",
+            "priority": 0,
+        });
+        let result = ActivityResult::succeeded("implement_prompt", "Review completed.");
+
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result))
+            .expect("valid review runtime submission")
+        else {
+            panic!("terminal runtime review should map to an intake task");
+        };
+
+        assert_eq!(task.task_kind, TaskKind::Review);
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.description.as_deref(), Some("prompt task"));
+    }
+
+    #[test]
     fn runtime_submission_completion_task_preserves_declarative_intake_identity() {
         let instance = declarative_intake_instance("passed");
         let result = ActivityResult::succeeded("quality_gate", "Declared workflow completed.");
 
-        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result))
+            .expect("valid runtime submission")
+        else {
             panic!("terminal declarative intake should map to an intake task");
         };
 
@@ -526,7 +574,9 @@ mod tests {
         )
         .with_error_kind(ActivityErrorKind::ExternalDependency);
 
-        let Some(task) = runtime_submission_completion_task(&instance, Some(&result)) else {
+        let Some(task) = runtime_submission_completion_task(&instance, Some(&result))
+            .expect("valid runtime submission")
+        else {
             panic!("terminal runtime issue should map to an intake task");
         };
 
@@ -587,6 +637,8 @@ mod tests {
     fn runtime_submission_completion_task_ignores_nonterminal_projection_status() {
         let instance = issue_instance("local_review_gate");
 
-        assert!(runtime_submission_completion_task(&instance, None).is_none());
+        assert!(runtime_submission_completion_task(&instance, None)
+            .expect("valid runtime submission")
+            .is_none());
     }
 }

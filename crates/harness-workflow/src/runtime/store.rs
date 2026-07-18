@@ -107,6 +107,29 @@ pub struct WorkflowRuntimeSummaryCounts {
     pub activity_outcomes: BTreeMap<String, usize>,
     pub jobs_without_activity_envelope: usize,
 }
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkflowSubmissionMetrics {
+    pub global_done: u64,
+    pub global_failed: u64,
+    pub global_stalled: u64,
+    pub latest_pr_url: Option<String>,
+    pub done_since: u64,
+    pub by_project: BTreeMap<String, WorkflowSubmissionProjectMetrics>,
+    pub hourly_done: Vec<WorkflowSubmissionHourlyDone>,
+}
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkflowSubmissionProjectMetrics {
+    pub done: u64,
+    pub failed: u64,
+    pub stalled: u64,
+    pub latest_pr_url: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowSubmissionHourlyDone {
+    pub project_id: String,
+    pub hour: String,
+    pub count: u64,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRuntimeStateCount {
     pub definition_id: String,

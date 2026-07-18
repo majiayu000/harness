@@ -1,5 +1,5 @@
 use super::pr_workflow_id;
-use crate::task_runner::TaskId;
+use harness_core::types::TaskId;
 use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore};
 use serde_json::json;
 use std::{future::Future, path::Path, time::Duration};

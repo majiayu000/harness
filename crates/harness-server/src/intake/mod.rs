@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::AppState;
-use crate::task_runner::{TaskFailureKind, TaskId, TaskStatus};
+use crate::workflow_runtime_submission::{
+    runtime_models::{TaskFailureKind, TaskId, TaskStatus},
+    CreateTaskRequest, MAX_TASK_PRIORITY,
+};
 
 pub mod binding;
 mod declarative_routing;
@@ -187,13 +190,11 @@ impl IntakeOrchestrator {
                 .first()
                 .and_then(|(_, i)| i.project_root.clone())
                 .unwrap_or_else(|| state.core.project_root.clone());
-            let project_id =
-                match crate::task_runner::resolve_canonical_project(Some(project_root.clone()))
-                    .await
-                {
-                    Ok(path) => path.to_string_lossy().into_owned(),
-                    Err(_) => state.core.project_root.to_string_lossy().into_owned(),
-                };
+            let project_id = tokio::fs::canonicalize(&project_root)
+                .await
+                .unwrap_or_else(|_| state.core.project_root.clone())
+                .to_string_lossy()
+                .into_owned();
             if let Some(workflows) = state.core.project_workflow_store.as_ref() {
                 if let Err(e) = workflows
                     .record_poll_started(&project_id, Some(&repo))
@@ -349,7 +350,7 @@ async fn enqueue_fallback_intake_issue(
 ) {
     let external_id = issue.external_id.clone();
     let req = fallback_intake_task_request(&issue, source.name(), default_project_root);
-    match crate::http::task_routes::enqueue_task_background(Arc::clone(state), req, None).await {
+    match crate::http::task_routes::enqueue_task_background(Arc::clone(state), req).await {
         Ok(task_id) => {
             if let Err(error) = source.mark_dispatched(&external_id, &task_id).await {
                 tracing::warn!(
@@ -375,13 +376,13 @@ fn fallback_intake_task_request(
     issue: &IncomingIssue,
     source_name: &str,
     default_project_root: std::path::PathBuf,
-) -> crate::task_runner::CreateTaskRequest {
+) -> CreateTaskRequest {
     let priority = issue
         .priority
         .and_then(|priority| u8::try_from(priority).ok())
-        .filter(|priority| *priority <= crate::task_runner::MAX_TASK_PRIORITY)
+        .filter(|priority| *priority <= MAX_TASK_PRIORITY)
         .unwrap_or_default();
-    crate::task_runner::CreateTaskRequest {
+    CreateTaskRequest {
         prompt: Some(build_prompt_from_issue(issue)),
         project: Some(issue.project_root.clone().unwrap_or(default_project_root)),
         source: Some(source_name.to_string()),

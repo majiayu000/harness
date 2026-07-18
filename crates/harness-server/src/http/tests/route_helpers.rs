@@ -48,16 +48,6 @@ fn run_git(root: &std::path::Path, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn task_app(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(health_check))
-        .route("/tasks", post(task_routes::create_task))
-        .route("/tasks/batch", post(task_routes::create_tasks_batch))
-        .route("/tasks/{id}", get(get_task))
-        .route("/tasks/{id}/proof", get(get_task_proof))
-        .with_state(state)
-}
-
 pub(super) async fn call_health(state: Arc<AppState>) -> anyhow::Result<HealthResponse> {
     use http_body_util::BodyExt;
     let app = Router::new()
@@ -134,10 +124,12 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
         "runtime-backed task should not have a legacy task row"
     );
 
-    let response = task_app(state)
+    let response = runtime_submission_app(state)
         .oneshot(
             Request::builder()
-                .uri(format!("/tasks/{task_id}/proof"))
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{task_id}/proof"
+                ))
                 .body(Body::empty())?,
         )
         .await?;
@@ -187,17 +179,22 @@ async fn get_task_proof_rejects_nonterminal_runtime_task() -> anyhow::Result<()>
     }));
     store.upsert_instance(&workflow).await?;
 
-    let response = task_app(state)
+    let response = runtime_submission_app(state)
         .oneshot(
             Request::builder()
-                .uri(format!("/tasks/{task_id}/proof"))
+                .uri(format!(
+                    "/api/workflows/runtime/submissions/{task_id}/proof"
+                ))
                 .body(Body::empty())?,
         )
         .await?;
 
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = response_json(response).await?;
-    assert_eq!(body["error"], "task is not in a terminal state");
+    assert_eq!(
+        body["error"],
+        "runtime submission is not in a terminal state"
+    );
     assert_eq!(body["status"], "implementing");
     Ok(())
 }
@@ -222,6 +219,32 @@ pub(super) fn workflow_runtime_app(state: Arc<AppState>) -> Router {
         .route(
             "/api/workflows/runtime/tree",
             get(get_workflow_runtime_tree),
+        )
+        .with_state(state)
+}
+
+pub(super) fn runtime_submission_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions)
+                .post(task_routes::create_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/artifacts",
+            get(runtime_submission_routes::get_artifacts),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/prompts",
+            get(runtime_submission_routes::get_prompts),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/proof",
+            get(task_query_routes::get_runtime_submission_proof),
         )
         .with_state(state)
 }
@@ -351,11 +374,11 @@ pub(super) async fn assert_runtime_issue_submission(
     assert_eq!(commands[0].status, "pending");
     assert_eq!(commands[0].command.activity_name(), Some("plan_issue"));
 
-    let get_response = task_app(state.clone())
+    let get_response = runtime_submission_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/tasks/{}", task_id.0))
+                .uri(format!("/api/workflows/runtime/submissions/{}", task_id.0))
                 .body(Body::empty())?,
         )
         .await?;

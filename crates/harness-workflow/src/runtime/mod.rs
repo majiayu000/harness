@@ -174,7 +174,8 @@ pub use store::{
     WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeRecoveryAction,
     WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore,
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
-    WorkflowSubmissionFilter, WorkflowSubmissionPromptPayload,
+    WorkflowSubmissionFilter, WorkflowSubmissionHourlyDone, WorkflowSubmissionMetrics,
+    WorkflowSubmissionProjectMetrics, WorkflowSubmissionPromptPayload,
 };
 pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,
