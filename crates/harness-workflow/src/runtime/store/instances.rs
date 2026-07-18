@@ -555,12 +555,13 @@ impl WorkflowRuntimeStore {
                             artifact.workflow_id = family.id
                             OR producer_command.workflow_id = family.id
                         )
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM terminal_states AS dependent_terminal
+                          AND (NOT EXISTS (
+                              SELECT 1 FROM terminal_states AS dependent_terminal
                               WHERE dependent_terminal.definition_id = dependent.definition_id
                                 AND dependent_terminal.state = dependent.state
-                          )
+                          ) OR COALESCE(dependent.data->'data'->>'stop_reason_code',
+                              dependent.data->'data'->'last_stop'->>'stop_reason_code')
+                              = 'runtime_transcript_lost')
                     ))
              )
              SELECT family.id

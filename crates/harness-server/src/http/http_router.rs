@@ -14,7 +14,7 @@ use super::{
     task_query_routes, task_routes,
 };
 
-const MAX_RUNTIME_TRANSCRIPT_RECONSTRUCTION_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RUNTIME_TRANSCRIPT_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -118,9 +118,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/workflows/runtime/transcripts/reconstruct",
-            post(task_mutation_routes::reconstruct_runtime_transcript).layer(
-                DefaultBodyLimit::max(MAX_RUNTIME_TRANSCRIPT_RECONSTRUCTION_BODY_BYTES),
-            ),
+            post(task_mutation_routes::reconstruct_runtime_transcript)
+                .layer(DefaultBodyLimit::max(MAX_RUNTIME_TRANSCRIPT_BODY_BYTES)),
         )
         .route(
             "/api/projects/{id}/memory",
@@ -154,7 +153,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/runtime-hosts/{host_id}/runtime-jobs/{runtime_job_id}/complete",
-            post(crate::handlers::runtime_hosts::complete_runtime_job_for_runtime_host),
+            post(crate::handlers::runtime_hosts::complete_runtime_job_for_runtime_host)
+                .layer(DefaultBodyLimit::max(MAX_RUNTIME_TRANSCRIPT_BODY_BYTES)),
         )
         .route(
             "/api/runtime-hosts/{host_id}/runtime-jobs/{runtime_job_id}/lease/renew",

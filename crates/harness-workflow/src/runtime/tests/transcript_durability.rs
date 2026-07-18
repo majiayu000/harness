@@ -341,7 +341,12 @@ async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyho
     terminal_producer.state = "done".to_string();
     store.upsert_instance(&terminal_producer).await?;
 
-    let dependent = issue_instance("implementing").with_id("missing-pin-dependent");
+    let dependent = issue_instance("failed")
+        .with_id("missing-pin-dependent")
+        .with_data(json!({
+            "stop_reason_code": "runtime_transcript_lost",
+            "last_stop": {"stop_reason_code": "runtime_transcript_lost"},
+        }));
     store.upsert_instance(&dependent).await?;
     let replay = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,

@@ -4,8 +4,9 @@ use crate::http::task_mutation_routes::{
 };
 use axum::Json;
 use harness_workflow::runtime::{
-    ActivityErrorKind, RuntimeJob, RuntimeKind, RuntimeTranscriptRead, WorkflowCommand,
-    WorkflowInstance, WorkflowSubject,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeKind,
+    RuntimeTranscriptRead, WorkflowCommand, WorkflowInstance, WorkflowSubject,
+    RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT,
 };
 use serde_json::json;
 
@@ -87,6 +88,83 @@ async fn transcript_reconstruction_route_accepts_provider_exports_above_axum_def
         store.read_runtime_transcript(&artifact_ref).await?
     else {
         anyhow::bail!("large provider export was not stored as a verified transcript");
+    };
+    assert_eq!(record.content.len(), content.len());
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_completion_route_accepts_transcripts_above_axum_default_limit() -> anyhow::Result<()>
+{
+    if harness_core::db::resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.allow_unauthenticated = true;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store")
+        .clone();
+    let app = super::http_router::build_router(state);
+    crate::handlers::runtime_hosts_workflow_api_tests::register_host(&app, "large-host").await?;
+    let job = crate::handlers::runtime_hosts_workflow_api_tests::enqueue_runtime_host_test_job(
+        &store,
+        "large-transcript",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "remote_check",
+            "workflow_id": "runtime-host-test-large-transcript",
+        }),
+    )
+    .await?;
+    let claimed = crate::handlers::runtime_hosts_workflow_api_tests::post_json(
+        &app,
+        "/api/runtime-hosts/large-host/runtime-jobs/claim".to_string(),
+        json!({"lease_secs": 60}),
+    )
+    .await?;
+    let content = "x".repeat(2 * 1024 * 1024 + 1);
+    let result = ActivityResult::succeeded("remote_check", "completed").with_artifact(
+        ActivityArtifact::new(
+            RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT,
+            json!({"content": content, "format": "provider.export.v1"}),
+        ),
+    );
+    let body = json!({
+        "lease_expires_at": claimed["lease_expires_at"],
+        "result": result,
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/runtime-hosts/large-host/runtime-jobs/{}/complete",
+                    job.id
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&job.id);
+    let RuntimeTranscriptRead::Verified(record) =
+        store.read_runtime_transcript(&artifact_ref).await?
+    else {
+        anyhow::bail!("large remote transcript was not stored");
     };
     assert_eq!(record.content.len(), content.len());
     Ok(())

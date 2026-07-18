@@ -61,7 +61,7 @@ pub(super) async fn make_test_state_with_runtime_store(
     Ok(Some((state, store)))
 }
 
-pub(super) async fn register_host(app: &Router, host_id: &str) -> anyhow::Result<()> {
+pub(crate) async fn register_host(app: &Router, host_id: &str) -> anyhow::Result<()> {
     let response = app
         .clone()
         .oneshot(
@@ -76,7 +76,7 @@ pub(super) async fn register_host(app: &Router, host_id: &str) -> anyhow::Result
     Ok(())
 }
 
-pub(super) async fn enqueue_runtime_host_test_job(
+pub(crate) async fn enqueue_runtime_host_test_job(
     store: &WorkflowRuntimeStore,
     key: &str,
     runtime_kind: RuntimeKind,
@@ -102,7 +102,7 @@ pub(super) async fn enqueue_runtime_host_test_job(
         .await
 }
 
-pub(super) async fn post_json(
+pub(crate) async fn post_json(
     app: &Router,
     uri: String,
     body: serde_json::Value,
