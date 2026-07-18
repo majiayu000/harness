@@ -9,14 +9,13 @@
 
 use crate::http::AppState;
 use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
-use crate::task_runner::{SchedulerAuthorityState, TaskSummary};
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Duration, Timelike, Utc};
 use harness_core::types::{Decision, Event, EventFilters};
 use harness_observe::quality::QualityGrader;
 use harness_observe::usage::UsageMetrics;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Rolling window for the overview page. Matches the `24h` segment pill in
@@ -462,23 +461,7 @@ impl ActiveTaskOverviewCounts {
 
 pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCounts {
     let mut counts = ActiveTaskOverviewCounts::default();
-    let mut active_legacy_task_ids = HashSet::new();
-    let mut loaded_legacy_tasks = false;
     let mut counted_runtime_active_workflows = false;
-
-    match state.core.tasks.list_active_summaries().await {
-        Ok(summaries) => {
-            loaded_legacy_tasks = true;
-            for summary in summaries {
-                if add_active_summary(&mut counts, &summary) {
-                    active_legacy_task_ids.insert(summary.id.as_str().to_string());
-                }
-            }
-        }
-        Err(error) => {
-            tracing::warn!("overview: failed to list task summaries for active counts: {error}");
-        }
-    }
 
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
         match crate::handlers::definition_ids::active_count_definition_ids() {
@@ -490,12 +473,6 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
                     {
                         Ok(workflows) => {
                             for workflow in workflows {
-                                if runtime_workflow_matches_active_legacy_task(
-                                    &workflow,
-                                    &active_legacy_task_ids,
-                                ) {
-                                    continue;
-                                }
                                 counted_runtime_active_workflows |=
                                     add_active_runtime_workflow(&mut counts, &workflow);
                             }
@@ -515,7 +492,7 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
         }
     }
 
-    if !loaded_legacy_tasks && !counted_runtime_active_workflows {
+    if !counted_runtime_active_workflows {
         for _ in 0..state.concurrency.task_queue.running_count() {
             counts.add(None, ActiveTaskBucket::Running);
         }
@@ -525,20 +502,6 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
     }
 
     counts
-}
-
-fn add_active_summary(counts: &mut ActiveTaskOverviewCounts, summary: &TaskSummary) -> bool {
-    if summary.status.is_terminal() {
-        return false;
-    }
-    let bucket = match summary.scheduler.authority_state {
-        SchedulerAuthorityState::Running | SchedulerAuthorityState::Leased => {
-            ActiveTaskBucket::Running
-        }
-        _ => ActiveTaskBucket::Queued,
-    };
-    counts.add(summary.project.as_deref(), bucket);
-    true
 }
 
 fn add_active_runtime_workflow(
@@ -555,16 +518,6 @@ fn add_active_runtime_workflow(
     };
     counts.add(projection.project_id.as_deref(), bucket);
     true
-}
-
-fn runtime_workflow_matches_active_legacy_task(
-    workflow: &harness_workflow::runtime::WorkflowInstance,
-    active_legacy_task_ids: &HashSet<String>,
-) -> bool {
-    RuntimeWorkflowProjection::from_workflow(workflow)
-        .legacy_dedupe_task_handle
-        .as_ref()
-        .is_some_and(|task_id| active_legacy_task_ids.contains(task_id.as_str()))
 }
 
 /// Top of the current hour (i.e. `HH:00:00Z`). Falls back to `now` on the
