@@ -72,6 +72,40 @@ async fn runtime_approval_route_forwards_decision_to_live_adapter() -> anyhow::R
 }
 
 #[tokio::test]
+async fn runtime_approval_route_trims_turn_and_request_ids() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let thread_manager = crate::thread_manager::ThreadManager::new();
+    let thread_id = thread_manager.start_thread(dir.path().to_path_buf());
+    let turn_id =
+        thread_manager.start_turn(&thread_id, "test approval".to_string(), AgentId::new())?;
+    let called = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(None));
+    thread_manager.register_active_adapter(
+        &turn_id,
+        Arc::new(ApprovalTrackingAdapter {
+            called: called.clone(),
+            received: received.clone(),
+        }),
+    );
+
+    let response = runtime_submission_routes::respond_to_approval_with_manager(
+        &thread_manager,
+        format!("  {turn_id}  "),
+        "  request-1  ".to_string(),
+        ApprovalDecision::Accept,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(called.load(Ordering::SeqCst));
+    assert_eq!(
+        *received.lock().await,
+        Some(("request-1".to_string(), ApprovalDecision::Accept))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_approval_route_resolves_submission_handle_to_live_turn() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let thread_manager = crate::thread_manager::ThreadManager::new();

@@ -192,7 +192,7 @@ async fn runtime_task_response_by_handle(
             input_tokens: usage.metrics.input_tokens,
             output_tokens: usage.metrics.output_tokens,
             total_tokens: usage.metrics.total_tokens(),
-            cost_usd: usage.cost_usd,
+            cost_usd: harness_workflow::runtime::cost_usd_from_micros(usage.cost_usd_micros),
         });
     let description = Some(super::runtime_submissions::runtime_submission_description(
         &workflow, task_kind, issue,

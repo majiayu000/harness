@@ -35,7 +35,9 @@ pub(super) async fn respond_to_approval_with_manager(
     request_id: String,
     decision: ApprovalDecision,
 ) -> Response {
-    if turn_id.trim().is_empty() || request_id.trim().is_empty() {
+    let turn_id = turn_id.trim().to_string();
+    let request_id = request_id.trim().to_string();
+    if turn_id.is_empty() || request_id.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "turn_id and request_id must not be empty"})),

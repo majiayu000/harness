@@ -65,8 +65,8 @@ pub use recovery::{
     WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
 };
 pub use runtime_usage::{
-    RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
-    RuntimeWorkflowUsage,
+    cost_usd_from_micros, cost_usd_to_micros, RuntimeUsageMetrics, RuntimeUsageRecord,
+    RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,
 };
 pub use submission_commit::{
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,

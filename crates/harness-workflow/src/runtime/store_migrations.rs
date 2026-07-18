@@ -551,4 +551,30 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                 END IF;
               END $$",
     },
+    Migration {
+        version: 22,
+        description: "store workflow runtime usage costs as integer micros",
+        sql: "ALTER TABLE runtime_usage_events
+              ADD COLUMN IF NOT EXISTS cost_usd_micros BIGINT NOT NULL DEFAULT 0;
+              DO $$
+              BEGIN
+                IF EXISTS (
+                  SELECT 1 FROM pg_attribute
+                  WHERE attrelid = 'runtime_usage_events'::regclass
+                    AND attname = 'cost_usd'
+                    AND NOT attisdropped
+                ) THEN
+                  UPDATE runtime_usage_events
+                  SET cost_usd_micros = ROUND(cost_usd * 1000000)::BIGINT
+                  WHERE cost_usd_micros = 0 AND cost_usd <> 0;
+                END IF;
+              END $$;
+              ALTER TABLE runtime_usage_events
+              DROP CONSTRAINT IF EXISTS runtime_usage_events_cost_nonnegative;
+              ALTER TABLE runtime_usage_events
+              DROP COLUMN IF EXISTS cost_usd;
+              ALTER TABLE runtime_usage_events
+              ADD CONSTRAINT runtime_usage_events_cost_nonnegative
+              CHECK (cost_usd_micros >= 0)",
+    },
 ];

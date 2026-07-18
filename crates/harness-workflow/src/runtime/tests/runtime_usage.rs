@@ -1,5 +1,8 @@
 use super::*;
-use crate::runtime::{RuntimeUsageMetrics, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome};
+use crate::runtime::{
+    cost_usd_from_micros, cost_usd_to_micros, RuntimeUsageMetrics, RuntimeUsageUpsert,
+    RuntimeUsageUpsertOutcome,
+};
 
 #[tokio::test]
 async fn runtime_usage_upsert_skips_zero_placeholders() -> anyhow::Result<()> {
@@ -37,7 +40,7 @@ async fn runtime_usage_upsert_replaces_cumulative_turn_usage() -> anyhow::Result
         reported_total_tokens: Some(15),
     });
     let first = RuntimeUsageUpsert {
-        cost_usd: 0.5,
+        cost_usd_micros: 500_000,
         ..first
     };
     let mut second = first.clone();
@@ -48,7 +51,7 @@ async fn runtime_usage_upsert_replaces_cumulative_turn_usage() -> anyhow::Result
         cache_creation_input_tokens: 0,
         reported_total_tokens: Some(30),
     };
-    second.cost_usd = 1.25;
+    second.cost_usd_micros = 1_250_000;
     second.model = "gpt-5.1".to_string();
 
     store.upsert_runtime_usage(&first).await?;
@@ -59,14 +62,14 @@ async fn runtime_usage_upsert_replaces_cumulative_turn_usage() -> anyhow::Result
 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].metrics.total_tokens(), 30);
-    assert_eq!(records[0].cost_usd, 1.25);
+    assert_eq!(records[0].cost_usd_micros, 1_250_000);
     assert_eq!(records[0].model, "gpt-5.1");
     assert!(matches!(outcome, RuntimeUsageUpsertOutcome::Persisted));
     Ok(())
 }
 
 #[tokio::test]
-async fn runtime_usage_upsert_validates_and_persists_cost() -> anyhow::Result<()> {
+async fn runtime_usage_upsert_persists_cost_only() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
@@ -76,17 +79,22 @@ async fn runtime_usage_upsert_validates_and_persists_cost() -> anyhow::Result<()
     let mut usage = runtime_usage_upsert(RuntimeUsageMetrics::default());
     usage.runtime_job_id = "runtime-job-cost-only".to_string();
     usage.turn_id = Some("turn-cost-only".to_string());
-    usage.cost_usd = 0.25;
+    usage.cost_usd_micros = 250_000;
 
     let outcome = store.upsert_runtime_usage(&usage).await?;
     assert_eq!(outcome, RuntimeUsageUpsertOutcome::Persisted);
+    Ok(())
+}
 
-    usage.cost_usd = f64::NAN;
-    let error = store
-        .upsert_runtime_usage(&usage)
-        .await
-        .expect_err("non-finite costs must be rejected");
-    assert!(error.to_string().contains("finite and nonnegative"));
+#[test]
+fn runtime_usage_cost_converts_to_exact_micros() -> anyhow::Result<()> {
+    assert_eq!(cost_usd_to_micros(0.1)?, 100_000);
+    assert_eq!(cost_usd_to_micros(0.2)?, 200_000);
+    assert_eq!(cost_usd_to_micros(0.123_456_4)?, 123_456);
+    assert_eq!(cost_usd_from_micros(300_000), 0.3);
+    assert!(cost_usd_to_micros(f64::NAN).is_err());
+    assert!(cost_usd_to_micros(-0.01).is_err());
+    assert!(cost_usd_to_micros(f64::MAX).is_err());
     Ok(())
 }
 
@@ -106,7 +114,7 @@ async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Resul
         reported_total_tokens: Some(17),
     });
     let first = RuntimeUsageUpsert {
-        cost_usd: 0.75,
+        cost_usd_micros: 750_000,
         ..first
     };
     let mut second = first.clone();
@@ -119,7 +127,7 @@ async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Resul
         cache_creation_input_tokens: 1,
         reported_total_tokens: Some(31),
     };
-    second.cost_usd = 1.25;
+    second.cost_usd_micros = 1_250_000;
 
     store.upsert_runtime_usage(&first).await?;
     store.upsert_runtime_usage(&second).await?;
@@ -133,7 +141,7 @@ async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Resul
     assert_eq!(usage.metrics.cache_read_input_tokens, 5);
     assert_eq!(usage.metrics.cache_creation_input_tokens, 1);
     assert_eq!(usage.metrics.total_tokens(), 48);
-    assert_eq!(usage.cost_usd, 2.0);
+    assert_eq!(usage.cost_usd_micros, 2_000_000);
     assert!(store
         .runtime_usage_for_workflow("missing-workflow")
         .await?
@@ -158,7 +166,7 @@ fn runtime_usage_upsert(metrics: RuntimeUsageMetrics) -> RuntimeUsageUpsert {
         candidate_index: None,
         candidate_count: None,
         metrics,
-        cost_usd: 0.0,
+        cost_usd_micros: 0,
         reported_at: Utc::now(),
     }
 }
