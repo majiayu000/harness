@@ -1,9 +1,20 @@
 use chrono::Utc;
 use harness_workflow::issue_lifecycle::{workflow_id, IssueLifecycleState, IssueWorkflowStore};
-use harness_workflow::runtime::{RemoteFactSnapshot, WorkflowRuntimeStore};
+use harness_workflow::runtime::{
+    RemoteFactSnapshot, WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+};
 use serde_json::json;
+use std::path::Path;
 
 use super::IncomingIssue;
+use crate::github_pr_snapshot::{
+    fetch_github_pr_snapshot_with_client, github_graphql_url, pr_readiness_for_snapshot,
+    GitHubPrSnapshotTarget, PrReadiness,
+};
+use crate::workflow_runtime_pr_feedback::pr_detection::{
+    find_closing_prs_for_issue_in_repo, github_api_base_url, ClosingPullRequestCandidate,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GitHubIssueCoverage {
@@ -103,9 +114,11 @@ pub(crate) async fn record_issue_remote_fact_snapshot(
 pub(crate) async fn check_github_issue_coverage(
     issue_store: Option<&IssueWorkflowStore>,
     runtime_store: Option<&WorkflowRuntimeStore>,
+    project_root: &Path,
     project_id: &str,
     repo: &str,
     issue_number: u64,
+    github_token: Option<&str>,
 ) -> anyhow::Result<GitHubIssueCoverage> {
     if let Some(issue_store) = issue_store {
         if let Some(workflow) = issue_store
@@ -127,7 +140,9 @@ pub(crate) async fn check_github_issue_coverage(
     if let Some(runtime_store) = runtime_store {
         let id = workflow_id(project_id, Some(repo), issue_number);
         if let Some(workflow) = runtime_store.get_instance(&id).await? {
-            if runtime_issue_state_is_covered(&workflow.state) {
+            if runtime_issue_state_is_covered(&workflow.state)
+                && !recovered_closed_pr_requires_lookup(&workflow)
+            {
                 return Ok(GitHubIssueCoverage::Covered {
                     source: "workflow_runtime",
                     state: workflow.state,
@@ -136,8 +151,206 @@ pub(crate) async fn check_github_issue_coverage(
         }
     }
 
+    let Some(runtime_store) = runtime_store else {
+        return Ok(GitHubIssueCoverage::Uncovered);
+    };
+    recover_github_pr_coverage(
+        runtime_store,
+        project_root,
+        project_id,
+        repo,
+        issue_number,
+        github_token,
+    )
+    .await
+}
+
+fn recovered_closed_pr_requires_lookup(workflow: &WorkflowInstance) -> bool {
+    workflow.state == "cancelled"
+        && workflow
+            .data
+            .get("coverage_recovered_from_github")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && workflow.data.get("pr_number").is_some()
+}
+
+async fn recover_github_pr_coverage(
+    runtime_store: &WorkflowRuntimeStore,
+    project_root: &Path,
+    project_id: &str,
+    repo: &str,
+    issue_number: u64,
+    github_token: Option<&str>,
+) -> anyhow::Result<GitHubIssueCoverage> {
+    let client = reqwest::Client::new();
+    recover_github_pr_coverage_with_client(
+        runtime_store,
+        project_root,
+        project_id,
+        repo,
+        issue_number,
+        github_token,
+        &client,
+        &github_api_base_url(),
+        &github_graphql_url(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_github_pr_coverage_with_client(
+    runtime_store: &WorkflowRuntimeStore,
+    project_root: &Path,
+    project_id: &str,
+    repo: &str,
+    issue_number: u64,
+    github_token: Option<&str>,
+    client: &reqwest::Client,
+    api_base_url: &str,
+    graphql_url: &str,
+) -> anyhow::Result<GitHubIssueCoverage> {
+    let candidates = find_closing_prs_for_issue_in_repo(
+        client,
+        repo,
+        issue_number,
+        github_token,
+        api_base_url,
+        "all",
+    )
+    .await?;
+
+    for candidate in candidates {
+        let target = GitHubPrSnapshotTarget::new(repo, candidate.number)?;
+        let artifacts =
+            fetch_github_pr_snapshot_with_client(client, &target, github_token, graphql_url)
+                .await?;
+        if !snapshot_closes_issue(&artifacts.normalized_snapshot, issue_number) {
+            continue;
+        }
+
+        let remote_fact = artifacts.remote_fact_snapshot()?;
+        runtime_store
+            .upsert_remote_fact_snapshot(&remote_fact)
+            .await?;
+        let readiness = pr_readiness_for_snapshot(&artifacts.normalized_snapshot);
+        if readiness == PrReadiness::ClosedUnmerged {
+            continue;
+        }
+
+        let state = recovered_runtime_state(readiness);
+        runtime_store
+            .upsert_definition(&WorkflowDefinition::new(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                1,
+                "GitHub issue PR workflow",
+            ))
+            .await?;
+        persist_recovered_workflow(
+            runtime_store,
+            project_root,
+            project_id,
+            repo,
+            issue_number,
+            &candidate,
+            &artifacts.normalized_snapshot,
+            &remote_fact.fact_hash,
+            state,
+        )
+        .await?;
+        return Ok(GitHubIssueCoverage::Covered {
+            source: "github_closing_pr",
+            state: state.to_string(),
+        });
+    }
+
     Ok(GitHubIssueCoverage::Uncovered)
 }
+
+fn snapshot_closes_issue(snapshot: &serde_json::Value, issue_number: u64) -> bool {
+    snapshot
+        .get("closing_issues")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|issues| {
+            issues.iter().any(|issue| {
+                issue.get("number").and_then(serde_json::Value::as_u64) == Some(issue_number)
+            })
+        })
+}
+
+fn recovered_runtime_state(readiness: PrReadiness) -> &'static str {
+    match readiness {
+        PrReadiness::NeedsFeedbackRepair | PrReadiness::NeedsCiRepair => "awaiting_feedback",
+        PrReadiness::WaitingForChecks | PrReadiness::WaitingForMergeability => "pr_open",
+        PrReadiness::ReadyToMerge => "ready_to_merge",
+        PrReadiness::Merged => "done",
+        PrReadiness::ClosedUnmerged => "cancelled",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_recovered_workflow(
+    runtime_store: &WorkflowRuntimeStore,
+    project_root: &Path,
+    project_id: &str,
+    repo: &str,
+    issue_number: u64,
+    candidate: &ClosingPullRequestCandidate,
+    snapshot: &serde_json::Value,
+    fact_hash: &str,
+    state: &str,
+) -> anyhow::Result<()> {
+    let id = workflow_id(project_id, Some(repo), issue_number);
+    let mut data = json!({
+        "project_id": project_id,
+        "repo": repo,
+        "issue_number": issue_number,
+        "pr_number": candidate.number,
+        "pr_url": candidate.url,
+        "pr_head_ref": candidate.head_ref_name,
+        "pr_head_sha": snapshot.get("head_oid").cloned().unwrap_or(serde_json::Value::Null),
+        "last_remote_fact_hash": fact_hash,
+        "coverage_recovered_from_github": true,
+        "recovered_pr_snapshot": snapshot,
+    });
+    if state == "done" {
+        data["terminal_evidence"] = json!({
+            "source": "server_github_graphql",
+            "reason": "closing_pr_merged",
+            "fact_hash": fact_hash,
+            "merge_commit_sha": snapshot
+                .get("merge_commit_sha")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        });
+    }
+    data = crate::workflow_runtime_policy::merge_runtime_retry_policy(project_root, data);
+
+    if let Some(mut existing) = runtime_store.get_instance(&id).await? {
+        if recovered_closed_pr_requires_lookup(&existing) {
+            existing.state = state.to_string();
+            existing.data = data;
+            existing.version = existing.version.saturating_add(1);
+            runtime_store.upsert_instance(&existing).await?;
+        }
+        return Ok(());
+    }
+
+    let recovered = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        state,
+        WorkflowSubject::new("issue", format!("issue:{issue_number}")),
+    )
+    .with_id(id)
+    .with_data(data);
+    runtime_store.insert_instance_if_absent(&recovered).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "github_coverage_recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -207,8 +420,16 @@ mod tests {
             .await?;
 
             assert_eq!(
-                check_github_issue_coverage(None, Some(&store), &project_id, repo, issue_number,)
-                    .await?,
+                check_github_issue_coverage(
+                    None,
+                    Some(&store),
+                    &project_root,
+                    &project_id,
+                    repo,
+                    issue_number,
+                    None,
+                )
+                .await?,
                 GitHubIssueCoverage::Covered {
                     source: "workflow_runtime",
                     state: stopped_state.to_string(),
@@ -231,9 +452,16 @@ mod tests {
                     if workflow.state == "replanning"
             ));
 
-            let coverage =
-                check_github_issue_coverage(None, Some(&store), &project_id, repo, issue_number)
-                    .await?;
+            let coverage = check_github_issue_coverage(
+                None,
+                Some(&store),
+                &project_root,
+                &project_id,
+                repo,
+                issue_number,
+                None,
+            )
+            .await?;
             if coverage == GitHubIssueCoverage::Uncovered {
                 let task_id =
                     TaskId::from_str(&format!("github-issue:{repo}:issue:{issue_number}"));

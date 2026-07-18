@@ -251,9 +251,11 @@ impl IntakeOrchestrator {
                 match github_coverage_gate::check_github_issue_coverage(
                     state.core.issue_workflow_store.as_deref(),
                     state.core.workflow_runtime_store.as_deref(),
+                    &project_root,
                     &project_id,
                     &repo,
                     issue_number,
+                    state.core.server.config.server.github_token.as_deref(),
                 )
                 .await
                 {
