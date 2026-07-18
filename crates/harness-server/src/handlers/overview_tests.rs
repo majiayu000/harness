@@ -261,23 +261,23 @@ async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::
             created_at: Utc::now().to_rfc3339(),
         })
         .await?;
-    let mut task = crate::task_runner::TaskState::new(harness_core::types::TaskId(
-        "overview-stalled-task".to_string(),
-    ));
-    task.project_root = Some(canonical_root.clone());
-    task.status = crate::task_runner::TaskStatus::Failed;
-    task.phase = crate::task_runner::TaskPhase::Terminal;
-    task.error = Some(
-        crate::task_runner::TaskTerminalFailure::round_budget_exhausted(
-            1,
-            crate::task_runner::TaskStatus::Reviewing,
-            Some("local_review_gate".to_string()),
-        )
-        .to_reason_string(),
-    );
-    task.scheduler
-        .mark_terminal(&crate::task_runner::TaskStatus::Failed);
-    state.core.tasks.insert(&task).await;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:overview-stalled"),
+    )
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "task_id": "overview-stalled-task",
+        "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
+    }));
+    store.upsert_instance(&workflow).await?;
 
     let app = Router::new()
         .route("/api/overview", get(overview))

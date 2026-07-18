@@ -2,7 +2,7 @@
 //!
 //! Feeds the `/overview` HTML page (served from `crate::overview::index`).
 //! Aggregates data from existing services rather than introducing new
-//! tracking: task counts come from `TaskService`, runtime fleet state from
+//! tracking: task counts come from the workflow runtime, runtime fleet state from
 //! `RuntimeHostManager`, quality grade and rule-fail rate from the event
 //! store. Metrics that harness does not yet track (runtime CPU/RAM) are
 //! returned as `null` so the UI degrades gracefully.
@@ -48,16 +48,24 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     let queued = active_counts.queued;
     let max_concurrent = tq.global_limit();
 
-    let dashboard_counts = state.task_svc.count_for_dashboard().await;
-    let global_done = dashboard_counts.global_done;
-    let global_failed = dashboard_counts.global_failed;
-    let global_stalled = dashboard_counts.global_stalled;
-
-    let merged_24h = state.task_svc.count_done_since(since_dt).await;
+    let submission_metrics =
+        match super::runtime_submission_metrics::load_submission_metrics(&state, since_dt).await {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                tracing::error!("overview: workflow runtime metrics query failed: {error}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "workflow runtime metrics unavailable"})),
+                );
+            }
+        };
+    let global_done = submission_metrics.global_done;
+    let global_failed = submission_metrics.global_failed;
+    let global_stalled = submission_metrics.global_stalled;
+    let merged_24h = submission_metrics.done_since;
 
     // Per-project hourly done counts — drives both the fleet throughput chart
     // and each project's 24h trend sparkline.
-    let hour_rows = state.task_svc.done_per_project_hour_since(since_dt).await;
     let hours = build_hour_axis(now);
     let hour_index: HashMap<String, usize> = hours
         .iter()
@@ -65,12 +73,12 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         .map(|(i, h)| (h.clone(), i))
         .collect();
     let mut per_project_buckets: HashMap<String, Vec<u64>> = HashMap::new();
-    for (project_key, hour, count) in hour_rows {
-        if let Some(&idx) = hour_index.get(&hour) {
+    for row in &submission_metrics.hourly_done {
+        if let Some(&idx) = hour_index.get(&row.hour) {
             let entry = per_project_buckets
-                .entry(project_key)
+                .entry(row.project_id.clone())
                 .or_insert_with(|| vec![0; THROUGHPUT_BUCKETS]);
-            entry[idx] = entry[idx].saturating_add(count);
+            entry[idx] = entry[idx].saturating_add(row.count);
         }
     }
 
@@ -94,7 +102,6 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
     let usage_summary = aggregate_llm_usage(&usage_events);
 
     // ---- projects table ----
-    let project_pr_urls = state.task_svc.latest_done_pr_urls_all_projects().await;
     let project_list = state.project_svc.list().await.unwrap_or_else(|e| {
         tracing::warn!("overview: failed to list projects: {e}");
         Vec::new()
@@ -108,7 +115,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
             .get(&key)
             .copied()
             .unwrap_or_default();
-        let counts = dashboard_counts.by_project.get(&key);
+        let counts = submission_metrics.by_project.get(&key);
         let done = counts.map_or(0, |c| c.done);
         let failed = counts.map_or(0, |c| c.failed);
         let stalled = counts.map_or(0, |c| c.stalled);
@@ -130,7 +137,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
             "worktrees": Value::Null,
             "tokens_24h": usage_summary.project_tokens_json(&key),
             "agents": Vec::<String>::new(),
-            "latest_pr": project_pr_urls.get(&key),
+            "latest_pr": counts.and_then(|counts| counts.latest_pr_url.as_ref()),
         }));
         throughput_series.push(json!({
             "project": p.id,
@@ -543,7 +550,7 @@ fn hour_top(now: DateTime<Utc>) -> DateTime<Utc> {
 
 /// Build an ISO-8601 hour axis covering the last [`THROUGHPUT_BUCKETS`] hours
 /// ending at `now`, oldest first. Each element matches the format produced by
-/// `TaskDb::done_per_project_hour_since` so the two can be joined by string
+/// `WorkflowRuntimeStore::submission_metrics_since` so the two can be joined by string
 /// equality.
 fn build_hour_axis(now: DateTime<Utc>) -> Vec<String> {
     let top = hour_top(now);

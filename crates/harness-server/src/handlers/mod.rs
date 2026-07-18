@@ -21,6 +21,7 @@ pub mod repo_memory_api;
 pub mod rules;
 pub mod runtime_hosts;
 pub mod runtime_project_cache;
+mod runtime_submission_metrics;
 pub mod skills;
 pub mod token_usage;
 pub mod usage_monitor;
