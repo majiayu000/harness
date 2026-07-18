@@ -557,7 +557,7 @@ impl ThreadManager {
         let turn_id = match matching.as_slice() {
             [turn_id] => turn_id.clone(),
             [] if candidates.len() == 1 => candidates[0].clone(),
-            [] if candidates.is_empty() => {
+            [] => {
                 return Err(harness_core::error::HarnessError::TurnNotFound(
                     handle.to_string(),
                 ));

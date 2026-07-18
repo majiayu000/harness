@@ -605,6 +605,32 @@ async fn respond_approval_on_turn_rejects_unknown_turn() {
 }
 
 #[tokio::test]
+async fn respond_approval_on_runtime_handle_rejects_missing_request_for_multiple_turns(
+) -> anyhow::Result<()> {
+    let tm = ThreadManager::new();
+    let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+    let first_turn = tm.start_turn(&thread_id, "first".to_string(), AgentId::new())?;
+    let second_turn = tm.start_turn(&thread_id, "second".to_string(), AgentId::new())?;
+    tm.register_runtime_turn_alias("submission-1", &first_turn);
+    tm.register_runtime_turn_alias("submission-1", &second_turn);
+
+    let error = tm
+        .respond_approval_on_runtime_handle(
+            "submission-1",
+            "missing-request".to_string(),
+            ApprovalDecision::Accept,
+        )
+        .await
+        .expect_err("a missing approval request must fail");
+
+    assert!(matches!(
+        error,
+        harness_core::error::HarnessError::TurnNotFound(ref id) if id == "submission-1"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn steer_active_turn_after_deregister_is_noop() -> anyhow::Result<()> {
     let tm = ThreadManager::new();
     let thread_id = tm.start_thread(PathBuf::from("/tmp"));
