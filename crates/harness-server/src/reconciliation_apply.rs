@@ -209,10 +209,8 @@ async fn record_runtime_issue_side_effects(
         let Some(issue_number) = candidate.issue_number else {
             return;
         };
-        let final_state = if target_state == "done" {
-            IssueLifecycleState::Done
-        } else {
-            IssueLifecycleState::Cancelled
+        let Some(final_state) = issue_terminal_state(target_state) else {
+            return;
         };
         if let Err(error) = issue_workflows
             .record_terminal_for_issue(
@@ -281,5 +279,13 @@ async fn record_runtime_issue_side_effects(
                 "issue workflow closed PR update failed: {error}"
             );
         }
+    }
+}
+
+pub(super) fn issue_terminal_state(target_state: &str) -> Option<IssueLifecycleState> {
+    match target_state {
+        "done" => Some(IssueLifecycleState::Done),
+        "cancelled" => Some(IssueLifecycleState::Cancelled),
+        _ => None,
     }
 }

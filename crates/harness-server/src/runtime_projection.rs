@@ -1,7 +1,8 @@
 mod stopped_actions;
 
-use crate::task_runner::{
-    SchedulerAuthorityState, TaskFailureKind, TaskId, TaskPhase, TaskSchedulerState, TaskStatus,
+use crate::workflow_runtime_submission::{
+    runtime_models::{TaskFailureKind, TaskId, TaskPhase, TaskStatus},
+    runtime_state::{SchedulerAuthorityState, TaskSchedulerState},
 };
 use harness_workflow::runtime::{
     declarative_workflow_definition_for_instance, workflow_state_definition_for_instance,

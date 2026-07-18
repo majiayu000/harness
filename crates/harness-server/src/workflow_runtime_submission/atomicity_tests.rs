@@ -185,8 +185,15 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
         external_id: None,
         continuation: None,
     };
-    let accepted_data =
-        prompt_submission_data(&ctx, &project_id, &stale_instance.data, &prompt_ref, &[]);
+    let execution_policy = runtime_models::PromptExecutionPolicy::default();
+    let accepted_data = prompt_submission_data(
+        &ctx,
+        &execution_policy,
+        &project_id,
+        &stale_instance.data,
+        &prompt_ref,
+        &[],
+    );
     let output = build_prompt_submission_decision(
         &stale_instance,
         PromptSubmissionDecisionInput {
@@ -207,6 +214,7 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
         false,
         output.decision,
         &ctx,
+        &execution_policy,
         accepted_data,
     )
     .await;

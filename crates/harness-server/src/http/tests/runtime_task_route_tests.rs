@@ -1,15 +1,11 @@
 use super::*;
-use harness_workflow::{
-    issue_lifecycle::IssueLifecycleState,
-    runtime::{
-        RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowInstance,
-        WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
-    },
+use harness_workflow::runtime::{
+    RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowInstance,
+    WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 
 #[tokio::test]
-async fn list_tasks_marks_runtime_submission_summaries_degraded_when_store_failed(
-) -> anyhow::Result<()> {
+async fn list_runtime_submissions_requires_runtime_store() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut state = make_read_only_route_test_state(dir.path()).await?;
     let state_mut =
@@ -21,25 +17,23 @@ async fn list_tasks_marks_runtime_submission_summaries_degraded_when_store_faile
         ];
     state_mut.degraded_subsystems = vec!["workflow_runtime_store"];
     let app = Router::new()
-        .route("/tasks", get(list_tasks))
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions),
+        )
         .with_state(state.clone());
 
     let response = app
-        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/submissions")
+                .body(Body::empty())?,
+        )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = response_json(response).await?;
-    assert_eq!(body["data"].as_array().map(Vec::len), Some(0));
-    assert_eq!(body["degraded"]["partial"], true);
-    assert_eq!(
-        body["degraded"]["missing"],
-        serde_json::json!(["workflow_runtime_submissions"])
-    );
-    assert_eq!(
-        body["degraded"]["reason"],
-        "runtime_submission_summaries_unavailable"
-    );
+    assert_eq!(body["error"], "workflow runtime store unavailable");
     Ok(())
 }
 
@@ -61,7 +55,11 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     .await?;
     let before_count = state.core.tasks.count();
     let app = Router::new()
-        .route("/tasks", get(list_tasks).post(task_routes::create_task))
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions)
+                .post(task_routes::create_runtime_submission),
+        )
         .with_state(state.clone());
 
     let body = serde_json::json!({
@@ -75,7 +73,7 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )
@@ -91,7 +89,11 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
 
     let list_response = app
         .clone()
-        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/submissions")
+                .body(Body::empty())?,
+        )
         .await?;
     assert_eq!(list_response.status(), StatusCode::OK);
     let listed = response_json(list_response).await?;
@@ -126,7 +128,7 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
     let planning_response = app
         .oneshot(
             Request::builder()
-                .uri("/tasks?status=planning")
+                .uri("/api/workflows/runtime/submissions?status=planning")
                 .body(Body::empty())?,
         )
         .await?;
@@ -185,13 +187,16 @@ async fn get_task_runtime_issue_exposes_tracker_identity() -> anyhow::Result<()>
     )
     .await?;
     let app = Router::new()
-        .route("/tasks/{id}", get(get_task))
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
         .with_state(state);
 
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/tasks/runtime-github-issue-detail")
+                .uri("/api/workflows/runtime/submissions/runtime-github-issue-detail")
                 .body(Body::empty())?,
         )
         .await?;
@@ -277,7 +282,10 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
     }
 
     let app = Router::new()
-        .route("/tasks/{id}", get(get_task))
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
         .with_state(state);
 
     for &(_, task_id, workflow_state, status, phase, scheduler_state, failure_kind) in &cases {
@@ -285,7 +293,7 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/tasks/{task_id}"))
+                    .uri(format!("/api/workflows/runtime/submissions/{task_id}"))
                     .body(Body::empty())?,
             )
             .await?;
@@ -312,226 +320,6 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
         }
     }
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn merge_task_accepts_runtime_workflow_task_handle() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(());
-    }
-
-    let dir = tempfile::tempdir()?;
-    let project_root = dir.path().join("project");
-    std::fs::create_dir_all(&project_root)?;
-    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
-    let store = state
-        .core
-        .workflow_runtime_store
-        .as_ref()
-        .expect("workflow runtime store should be configured");
-    let workflow = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
-        "ready_to_merge",
-        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:53"),
-    )
-    .with_id("runtime-ready-53")
-    .with_data(serde_json::json!({
-        "project_id": project_root,
-        "repo": "owner/repo",
-        "issue_number": 53,
-        "pr_number": 125,
-        "pr_url": "https://github.com/owner/repo/pull/125",
-        "task_id": "runtime-ready-task",
-        "merge_method": "rebase",
-        "merge_delete_branch": false,
-        "merge_require_review_threads_resolved": false,
-        "merge_require_clean_merge_state": true,
-    }));
-    store.upsert_instance(&workflow).await?;
-    let app = Router::new()
-        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
-        .with_state(state.clone());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tasks/runtime-ready-task/merge")
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let body = response_json(response).await?;
-    assert_eq!(body["status"], "merge_approved");
-    assert_eq!(body["execution_path"], "workflow_runtime");
-    let updated = store
-        .get_instance("runtime-ready-53")
-        .await?
-        .expect("workflow should still exist");
-    assert_eq!(updated.state, "merging");
-    assert_eq!(updated.data["last_decision"], "approve_merge");
-    assert_eq!(updated.data["merge_approved_task_id"], "runtime-ready-task");
-    assert_eq!(updated.data["merge_delete_branch"], false);
-    assert_eq!(updated.data["merge_require_review_threads_resolved"], false);
-    assert_eq!(updated.data["merge_require_clean_merge_state"], true);
-    let events = store.events_for("runtime-ready-53").await?;
-    assert!(events
-        .iter()
-        .any(|event| event.event_type == "MergeApproved"));
-    let decisions = store.decisions_for("runtime-ready-53").await?;
-    assert!(decisions
-        .iter()
-        .any(|record| record.accepted && record.decision.decision == "approve_merge"));
-    let commands = store.commands_for("runtime-ready-53").await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(
-        commands[0].command.command_type,
-        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity
-    );
-    assert_eq!(commands[0].command.activity_name(), Some("merge_pr"));
-    assert_eq!(commands[0].command.command["merge_method"], "rebase");
-    assert_eq!(commands[0].command.command["delete_branch"], false);
-    assert_eq!(
-        commands[0].command.command["require_review_threads_resolved"],
-        false
-    );
-    assert_eq!(
-        commands[0].command.command["require_clean_merge_state"],
-        true
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn merge_task_reports_legacy_workflow_actual_state_when_not_ready() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(());
-    }
-
-    let dir = tempfile::tempdir()?;
-    let state = make_test_state_with_issue_workflows(dir.path()).await?;
-    let task_id = task_runner::TaskId::from_str("legacy-done-task-56");
-    let project_id = dir.path().to_string_lossy().into_owned();
-    let repo = "owner/repo";
-    let pr_number = 127;
-    let mut task = task_runner::TaskState::new(task_id.clone());
-    task.task_kind = task_runner::TaskKind::Issue;
-    task.pr_url = Some(format!("https://github.com/{repo}/pull/{pr_number}"));
-    task.project_root = Some(dir.path().to_path_buf());
-    task.repo = Some(repo.to_string());
-    state.core.tasks.insert(&task).await;
-
-    let workflows = state
-        .core
-        .issue_workflow_store
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("issue workflow store should be configured"))?;
-    workflows
-        .record_issue_scheduled(&project_id, Some(repo), 56, task_id.as_str(), &[], false)
-        .await?;
-    workflows
-        .record_pr_detected(
-            &project_id,
-            Some(repo),
-            56,
-            task_id.as_str(),
-            pr_number,
-            &format!("https://github.com/{repo}/pull/{pr_number}"),
-        )
-        .await?;
-    workflows
-        .record_terminal_for_issue(&project_id, Some(repo), 56, IssueLifecycleState::Done, None)
-        .await?;
-    let app = Router::new()
-        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
-        .with_state(state.clone());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/tasks/{}/merge", task_id.as_str()))
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let body = response_json(response).await?;
-    assert_eq!(body["error"], "workflow not in ready_to_merge state");
-    assert_eq!(body["state"], "done");
-    let workflow = workflows
-        .get_by_pr(&project_id, Some(repo), pr_number)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("workflow should still exist"))?;
-    assert_eq!(workflow.state, IssueLifecycleState::Done);
-    Ok(())
-}
-
-#[tokio::test]
-async fn merge_task_approves_legacy_ready_workflow() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(());
-    }
-
-    let dir = tempfile::tempdir()?;
-    let state = make_test_state_with_issue_workflows(dir.path()).await?;
-    let task_id = task_runner::TaskId::from_str("legacy-ready-task-57");
-    let project_id = dir.path().to_string_lossy().into_owned();
-    let repo = "owner/repo";
-    let pr_number = 128;
-    let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
-    let mut task = task_runner::TaskState::new(task_id.clone());
-    task.task_kind = task_runner::TaskKind::Issue;
-    task.pr_url = Some(pr_url.clone());
-    task.project_root = Some(dir.path().to_path_buf());
-    task.repo = Some(repo.to_string());
-    state.core.tasks.insert(&task).await;
-
-    let workflows = state
-        .core
-        .issue_workflow_store
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("issue workflow store should be configured"))?;
-    workflows
-        .record_issue_scheduled(&project_id, Some(repo), 57, task_id.as_str(), &[], false)
-        .await?;
-    workflows
-        .record_pr_detected(
-            &project_id,
-            Some(repo),
-            57,
-            task_id.as_str(),
-            pr_number,
-            &pr_url,
-        )
-        .await?;
-    workflows
-        .record_terminal_for_pr(&project_id, Some(repo), pr_number, true, false, None)
-        .await?;
-    let app = Router::new()
-        .route("/tasks/{id}/merge", post(task_mutation_routes::merge_task))
-        .with_state(state.clone());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/tasks/{}/merge", task_id.as_str()))
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let body = response_json(response).await?;
-    assert_eq!(body["status"], "merge_approved");
-    let workflow = workflows
-        .get_by_pr(&project_id, Some(repo), pr_number)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("workflow should still exist"))?;
-    assert_eq!(workflow.state, IssueLifecycleState::Done);
     Ok(())
 }
 
@@ -762,100 +550,6 @@ async fn enqueue_route_test_runtime_job(store: &WorkflowRuntimeStore, workflow_i
 }
 
 #[tokio::test]
-async fn cancel_task_accepts_runtime_submission_handle_without_task_row() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(());
-    }
-
-    let dir = tempfile::tempdir()?;
-    let project_root = dir.path().join("project");
-    std::fs::create_dir_all(&project_root)?;
-    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
-    let store = state
-        .core
-        .workflow_runtime_store
-        .as_ref()
-        .expect("workflow runtime store should be configured");
-    let task_id = harness_core::types::TaskId::from_str("runtime-compat-cancel-task-58");
-    let submission = crate::workflow_runtime_submission::record_issue_submission(
-        store,
-        crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
-            project_root: &project_root,
-            repo: Some("owner/repo"),
-            issue_number: 58,
-            task_id: &task_id,
-            labels: &[],
-            force_execute: false,
-            additional_prompt: None,
-            depends_on: &[],
-            dependencies_blocked: false,
-            source: None,
-            external_id: None,
-            remote_fact_hash: None,
-            author_trust_class: None,
-        },
-    )
-    .await?;
-    assert!(
-        state
-            .core
-            .tasks
-            .get_with_db_fallback(&task_id)
-            .await?
-            .is_none(),
-        "runtime submissions should not require legacy task rows"
-    );
-    let app = Router::new()
-        .route("/tasks/{id}/cancel", post(task_routes::cancel_task))
-        .with_state(state.clone());
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/tasks/{}/cancel", task_id.as_str()))
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response_json(response).await?;
-    assert_eq!(body["status"], "cancelled");
-    assert_eq!(body["execution_path"], "workflow_runtime");
-    assert_eq!(body["workflow_id"], submission.workflow_id);
-    assert!(
-        state
-            .core
-            .tasks
-            .get_with_db_fallback(&task_id)
-            .await?
-            .is_none(),
-        "legacy compatibility cancel must not create a TaskStore row"
-    );
-    let updated = store
-        .get_instance(&submission.workflow_id)
-        .await?
-        .expect("workflow should still exist");
-    assert_eq!(updated.state, "cancelled");
-    assert_eq!(updated.data["last_decision"], "cancel_issue_submission");
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/tasks/{}/cancel", task_id.as_str()))
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let body = response_json(response).await?;
-    assert_eq!(body["error"], "task already in terminal state");
-    Ok(())
-}
-
-#[tokio::test]
 async fn get_task_runtime_issue_surfaces_failure_reason() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -893,13 +587,16 @@ async fn get_task_runtime_issue_surfaces_failure_reason() -> anyhow::Result<()> 
     }));
     store.upsert_instance(&workflow).await?;
     let app = Router::new()
-        .route("/tasks/{id}", get(get_task))
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
         .with_state(state);
 
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/tasks/runtime-task-1299")
+                .uri("/api/workflows/runtime/submissions/runtime-task-1299")
                 .body(Body::empty())?,
         )
         .await?;
@@ -911,72 +608,6 @@ async fn get_task_runtime_issue_surfaces_failure_reason() -> anyhow::Result<()> 
         body["error"],
         "WorktreeCollision: workspace path is managed by another harness session"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn status_stalled_terminal_list_and_detail_surface_terminal_reason() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(());
-    }
-
-    let dir = tempfile::tempdir()?;
-    let state = make_read_only_route_test_state(dir.path()).await?;
-    let task_id = task_runner::TaskId::from_str("stalled-budget-task");
-    let mut task = task_runner::TaskState::new(task_id.clone());
-    task.status = task_runner::TaskStatus::Failed;
-    task.phase = task_runner::TaskPhase::Terminal;
-    task.turn = 2;
-    task.error = Some(
-        task_runner::TaskTerminalFailure::round_budget_exhausted(
-            1,
-            task_runner::TaskStatus::Reviewing,
-            Some("local_review_gate".to_string()),
-        )
-        .to_reason_string(),
-    );
-    task.scheduler
-        .mark_terminal(&task_runner::TaskStatus::Failed);
-    state.core.tasks.insert(&task).await;
-
-    let app = Router::new()
-        .route("/tasks", get(list_tasks))
-        .route("/tasks/{id}", get(get_task))
-        .with_state(state);
-
-    let list_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/tasks?status=failed")
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(list_response.status(), StatusCode::OK);
-    let listed = response_json(list_response).await?;
-    let listed_task = listed["data"]
-        .as_array()
-        .and_then(|tasks| tasks.iter().find(|task| task["id"] == task_id.as_str()))
-        .ok_or_else(|| anyhow::anyhow!("stalled task should be listed"))?;
-    assert_eq!(listed_task["status"], "failed");
-    assert_eq!(listed_task["phase"], "terminal");
-    assert_eq!(listed_task["terminal"]["classification"], "stalled");
-    assert_eq!(listed_task["terminal"]["reason"], "round_budget_exhausted");
-    assert_eq!(listed_task["terminal"]["rounds_used"], 1);
-    assert_eq!(listed_task["terminal"]["last_status"], "reviewing");
-    assert_eq!(listed_task["terminal"]["waiting_on"], "local_review_gate");
-
-    let detail_response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/tasks/{}", task_id.as_str()))
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(detail_response.status(), StatusCode::OK);
-    let detail = response_json(detail_response).await?;
-    assert_eq!(detail["terminal"]["classification"], "stalled");
-    assert_eq!(detail["terminal"]["reason"], "round_budget_exhausted");
     Ok(())
 }
 
@@ -998,7 +629,11 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
     .await?;
     let before_count = state.core.tasks.count();
     let app = Router::new()
-        .route("/tasks", get(list_tasks).post(task_routes::create_task))
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions)
+                .post(task_routes::create_runtime_submission),
+        )
         .with_state(state.clone());
 
     let body = serde_json::json!({
@@ -1012,7 +647,7 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )
@@ -1027,7 +662,11 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
     assert_eq!(state.core.tasks.count(), before_count);
 
     let list_response = app
-        .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/submissions")
+                .body(Body::empty())?,
+        )
         .await?;
     assert_eq!(list_response.status(), StatusCode::OK);
     let listed = response_json(list_response).await?;
@@ -1070,68 +709,7 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let legacy_task_id = task_runner::TaskId::from_str("legacy-only-task");
-    state
-        .core
-        .tasks
-        .insert(&task_runner::TaskState::new(legacy_task_id.clone()))
-        .await;
-
-    let app = Router::new()
-        .route(
-            "/api/workflows/runtime/submissions",
-            get(task_query_routes::list_runtime_submissions)
-                .post(task_routes::create_runtime_submission),
-        )
-        .route(
-            "/api/workflows/runtime/submissions/{id}",
-            get(task_query_routes::get_runtime_submission),
-        )
-        .route(
-            "/api/workflows/runtime/submissions/{id}/artifacts",
-            get(runtime_submission_routes::get_artifacts),
-        )
-        .route(
-            "/api/workflows/runtime/submissions/{id}/prompts",
-            get(runtime_submission_routes::get_prompts),
-        )
-        .route(
-            "/api/workflows/runtime/submissions/{id}/proof",
-            get(task_query_routes::get_runtime_submission_proof),
-        )
-        .with_state(state.clone());
-
-    let legacy_duplicate_request = task_runner::CreateTaskRequest {
-        issue: Some(42),
-        repo: Some("owner/repo".to_string()),
-        project: Some(project_root.canonicalize()?),
-        external_id: Some("issue:42".to_string()),
-        ..Default::default()
-    };
-    task_runner::register_pending_task(state.core.tasks.clone(), &legacy_duplicate_request).await;
-    let legacy_duplicate_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/workflows/runtime/submissions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "project": project_root.display().to_string(),
-                        "repo": "owner/repo",
-                        "issue": 42
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    assert_eq!(legacy_duplicate_response.status(), StatusCode::CONFLICT);
-    let legacy_duplicate = response_json(legacy_duplicate_response).await?;
-    assert_eq!(legacy_duplicate["error"], "legacy_submission_active");
-    assert!(legacy_duplicate.get("task_id").is_none());
-    assert!(legacy_duplicate.get("submission_id").is_none());
-
+    let app = runtime_submission_app(state.clone());
     let request_body = serde_json::json!({
         "project": project_root.display().to_string(),
         "prompt": "exercise runtime-only submission routes",
@@ -1155,6 +733,30 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         .as_str()
         .expect("runtime submission should expose a stable handle")
         .to_string();
+    let live_thread_id = state
+        .core
+        .server
+        .thread_manager
+        .start_thread(project_root.clone());
+    let live_turn_id = state.core.server.thread_manager.start_turn(
+        &live_thread_id,
+        "approval-gated runtime turn".to_string(),
+        harness_core::types::AgentId::new(),
+    )?;
+    state.core.server.thread_manager.add_item(
+        &live_thread_id,
+        &live_turn_id,
+        Item::ApprovalRequest {
+            id: Some("request-1".to_string()),
+            action: "run cargo test".to_string(),
+            approved: None,
+        },
+    )?;
+    state
+        .core
+        .server
+        .thread_manager
+        .register_runtime_turn_alias(&submission_id, &live_turn_id);
     let declarative_submission_id = "declarative-submission-handle";
     let declarative = WorkflowInstance::new(
         "custom_dashboard_flow",
@@ -1266,7 +868,6 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         .collect::<Vec<_>>();
     assert!(listed_ids.contains(&submission_id.as_str()));
     assert!(listed_ids.contains(&declarative_submission_id));
-    assert!(!listed_ids.contains(&legacy_task_id.as_str()));
 
     let declarative_detail_response = app
         .clone()
@@ -1305,22 +906,18 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
     assert_eq!(detail["submission_id"], submission_id);
     assert_eq!(detail["execution_path"], "workflow_runtime");
     assert_eq!(detail["description"], "prompt task");
+    assert_eq!(
+        detail["pending_approvals"],
+        serde_json::json!([{
+            "type": "approval_request",
+            "id": "request-1",
+            "action": "run cargo test",
+            "approved": null
+        }])
+    );
     assert!(detail["pr_url"].is_null());
     assert!(detail["created_at"].as_str().is_some());
     assert!(detail["updated_at"].as_str().is_some());
-
-    let legacy_detail_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "/api/workflows/runtime/submissions/{}",
-                    legacy_task_id.as_str()
-                ))
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(legacy_detail_response.status(), StatusCode::NOT_FOUND);
 
     let prompts_response = app
         .clone()
@@ -1385,7 +982,11 @@ async fn list_tasks_paginates_past_runtime_only_second_page() -> anyhow::Result<
     )
     .await?;
     let app = Router::new()
-        .route("/tasks", get(list_tasks).post(task_routes::create_task))
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions)
+                .post(task_routes::create_runtime_submission),
+        )
         .with_state(state);
 
     let mut created_ids = Vec::new();
@@ -1401,7 +1002,7 @@ async fn list_tasks_paginates_past_runtime_only_second_page() -> anyhow::Result<
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/tasks")
+                    .uri("/api/workflows/runtime/submissions")
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))?,
             )
@@ -1421,13 +1022,13 @@ async fn list_tasks_paginates_past_runtime_only_second_page() -> anyhow::Result<
     for page_index in 0..3 {
         let uri = match cursor.as_deref() {
             Some(cursor) => format!(
-                "/tasks?limit=1&cursor={}",
+                "/api/workflows/runtime/submissions?limit=1&cursor={}",
                 cursor
                     .replace('+', "%2B")
                     .replace(':', "%3A")
                     .replace('|', "%7C")
             ),
-            None => "/tasks?limit=1".to_string(),
+            None => "/api/workflows/runtime/submissions?limit=1".to_string(),
         };
         let response = app
             .clone()
@@ -1475,7 +1076,7 @@ async fn create_task_with_blocked_issue_returns_runtime_state() -> anyhow::Resul
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let app = task_app(state.clone());
+    let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({
         "project": project_root.display().to_string(),
@@ -1487,7 +1088,7 @@ async fn create_task_with_blocked_issue_returns_runtime_state() -> anyhow::Resul
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )
@@ -1527,14 +1128,14 @@ async fn create_task_with_blocked_issue_returns_runtime_state() -> anyhow::Resul
 async fn create_task_empty_request_returns_bad_request() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
-    let app = task_app(state);
+    let app = runtime_submission_app(state);
 
     let body = serde_json::json!({});
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )

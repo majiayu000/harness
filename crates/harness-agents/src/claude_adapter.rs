@@ -706,6 +706,7 @@ mod tests {
             allowed_tools: vec![],
             context: vec![],
             timeout_secs: None,
+            env_vars: HashMap::new(),
             capability_token: None,
         }
     }

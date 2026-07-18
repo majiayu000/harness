@@ -60,7 +60,6 @@ pub struct CoreServices {
     /// project roots against `$HOME` in concurrent requests.
     pub home_dir: std::path::PathBuf,
     pub tasks: Arc<task_runner::TaskStore>,
-    pub thread_db: Option<crate::thread_db::ThreadDb>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
     /// In-memory plan cache hydrated from `plan_db` on startup.
     /// Write-through: every mutation must also persist via `plan_db`.
@@ -72,7 +71,7 @@ pub struct CoreServices {
     pub project_registry: Option<std::sync::Arc<crate::project_registry::ProjectRegistry>>,
     pub runtime_state_store: Option<Arc<crate::runtime_state_store::RuntimeStateStore>>,
     /// Set to `true` while the daily maintenance window is active.
-    /// Pollers skip dispatch and HTTP POST /tasks returns 503 when this is set.
+    /// Pollers skip dispatch and runtime submission requests return 503 while set.
     /// Initialized to the correct value at startup (handles server starting mid-window).
     pub maintenance_active: Arc<AtomicBool>,
 }

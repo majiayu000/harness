@@ -134,6 +134,7 @@ pub(super) async fn apply_prompt_decision(
     new_instance: bool,
     mut decision: WorkflowDecision,
     ctx: &PromptSubmissionRuntimeContext<'_>,
+    execution_policy: &super::runtime_models::PromptExecutionPolicy,
     accepted_data: serde_json::Value,
 ) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
     let validation_context = if instance.is_terminal() {
@@ -180,7 +181,7 @@ pub(super) async fn apply_prompt_decision(
                     new_event_id: new_event_id.as_deref(),
                     event_type: "PromptSubmitted",
                     source: "workflow_runtime_submission",
-                    payload: prompt_submission_event_payload(ctx),
+                    payload: prompt_submission_event_payload(ctx, execution_policy),
                     decision: &decision,
                     existing_record: None,
                     rejection_reason: Some(&reason),
@@ -228,7 +229,7 @@ pub(super) async fn apply_prompt_decision(
             new_event_id: new_event_id.as_deref(),
             event_type: "PromptSubmitted",
             source: "workflow_runtime_submission",
-            payload: prompt_submission_event_payload(ctx),
+            payload: prompt_submission_event_payload(ctx, execution_policy),
             decision: &decision,
             existing_record: existing_record.as_ref(),
             rejection_reason: None,
@@ -308,7 +309,10 @@ fn issue_submission_event_payload(ctx: &IssueSubmissionRuntimeContext<'_>) -> se
     payload
 }
 
-fn prompt_submission_event_payload(ctx: &PromptSubmissionRuntimeContext<'_>) -> serde_json::Value {
+fn prompt_submission_event_payload(
+    ctx: &PromptSubmissionRuntimeContext<'_>,
+    execution_policy: &super::runtime_models::PromptExecutionPolicy,
+) -> serde_json::Value {
     let mut payload = json!({
         "task_id": ctx.task_id.as_str(),
         "prompt_chars": ctx.prompt.chars().count(),
@@ -317,6 +321,7 @@ fn prompt_submission_event_payload(ctx: &PromptSubmissionRuntimeContext<'_>) -> 
         "dependencies_blocked": ctx.dependencies_blocked,
         "source": ctx.source,
         "external_id": ctx.external_id,
+        "execution_policy": execution_policy,
         "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
     });
     if let Some(policy) = ctx.continuation {

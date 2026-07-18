@@ -139,7 +139,7 @@ async fn memory_api_rejects_missing_store() -> anyhow::Result<()> {
     }
 
     let dir = tempfile::tempdir()?;
-    let state = make_test_state(dir.path()).await?;
+    let state = make_read_only_route_test_state(dir.path()).await?;
     let app = memory_api_app(state);
 
     let response = app

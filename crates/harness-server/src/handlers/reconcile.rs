@@ -18,7 +18,6 @@ pub async fn handle(
     Query(params): Query<ReconcileParams>,
 ) -> Result<Json<crate::reconciliation::ReconciliationReport>, StatusCode> {
     let report = crate::reconciliation::run_once_with_runtime_config(
-        &state.core.tasks,
         state.core.workflow_runtime_store.as_deref(),
         state.core.issue_workflow_store.as_deref(),
         &state.core.server.config.reconciliation,

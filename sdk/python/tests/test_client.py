@@ -1,154 +1,296 @@
+from __future__ import annotations
+
+import json
+import socket
 import unittest
+import urllib.error
 from typing import Any
 from unittest import mock
 
-try:
-    from harness_sdk import Harness, HarnessRpcError
-    from harness_sdk.client import _extract_output
-except ModuleNotFoundError:
-    from sdk.python.src.harness_sdk import Harness, HarnessRpcError
-    from sdk.python.src.harness_sdk.client import _extract_output
+from harness_sdk import Harness, HarnessHttpError
 
 
-class MockRpc:
+class FakeRuntime:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.status_polls = 0
+        self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.detail_polls = 0
 
-    def start_thread_and_run_complete(self, method: str, params: dict[str, Any]) -> Any:
-        self.calls.append((method, params))
-        if method == "thread/start":
-            return {"thread_id": "thread-1"}
-        if method == "turn/start":
-            return {"turn_id": "turn-1"}
-        if method == "turn/status":
-            self.status_polls += 1
-            if self.status_polls == 1:
-                return {
-                    "id": "turn-1",
-                    "thread_id": "thread-1",
-                    "status": "running",
-                    "items": [{"type": "user_message", "content": "hello"}],
+    def __call__(
+        self, method: str, path: str, body: dict[str, Any] | None
+    ) -> Any:
+        self.calls.append((method, path, body))
+        if method == "POST" and path == "/api/workflows/runtime/submissions":
+            return {
+                "task_id": "submission-1",
+                "submission_id": "submission-1",
+                "execution_path": "workflow_runtime",
+            }
+        if path == "/api/workflows/runtime/submissions/submission-1":
+            self.detail_polls += 1
+            return {
+                "submission_id": "submission-1",
+                "status": "implementing" if self.detail_polls == 1 else "done",
+                "project": "/repo",
+                "created_at": "2026-07-18T00:00:00Z",
+                "updated_at": "2026-07-18T00:00:01Z",
+                "token_usage": {
+                    "input_tokens": 120,
+                    "output_tokens": 30,
+                    "total_tokens": 150,
+                    "cost_usd": 0.02,
+                },
+            }
+        if path == "/api/workflows/runtime/submissions/submission-1/artifacts":
+            return [
+                {
+                    "artifact_type": "activity_result_envelope",
+                    "content": json.dumps(
+                        {
+                            "final_result": {
+                                "summary": "Repository analyzed.",
+                                "error": None,
+                            }
+                        }
+                    ),
                 }
-            return {
-                "id": "turn-1",
-                "thread_id": "thread-1",
-                "status": "completed",
-                "items": [
-                    {"type": "user_message", "content": "hello"},
-                    {"type": "agent_reasoning", "content": "done"},
-                ],
-            }
-        if method == "thread/resume":
-            return {"resumed": True}
-        raise AssertionError(f"unexpected RPC method: {method}")
-
-    def run_timeout(self, method: str, params: dict[str, Any]) -> Any:
-        self.calls.append((method, params))
-        if method == "thread/start":
-            return {"thread_id": "thread-2"}
-        if method == "turn/start":
-            return {"turn_id": "turn-2"}
-        if method == "turn/status":
-            return {
-                "id": "turn-2",
-                "thread_id": "thread-2",
-                "status": "running",
-                "items": [{"type": "user_message", "content": "still running"}],
-            }
-        raise AssertionError(f"unexpected RPC method: {method}")
-
-    def rpc_error(self, method: str, params: dict[str, Any]) -> Any:
-        self.calls.append((method, params))
-        raise HarnessRpcError(-32001, "thread not found")
+            ]
+        raise AssertionError(f"unexpected request: {method} {path}")
 
 
 class HarnessSdkTests(unittest.TestCase):
-    def test_start_thread_uses_thread_start_rpc(self) -> None:
-        mock = MockRpc()
-        harness = Harness(rpc_handler=mock.start_thread_and_run_complete, cwd="/repo")
+    def test_start_thread_creates_local_project_handle(self) -> None:
+        runtime = FakeRuntime()
+        harness = Harness(cwd="/repo", http_handler=runtime)
 
         thread = harness.start_thread()
 
-        self.assertEqual(thread.id, "thread-1")
-        self.assertEqual(mock.calls[0][0], "thread/start")
-        self.assertEqual(mock.calls[0][1]["cwd"], "/repo")
+        self.assertEqual(thread.id, "/repo")
+        self.assertEqual(runtime.calls, [])
 
-    def test_start_thread_requires_cwd_when_not_configured(self) -> None:
-        mock = MockRpc()
-        harness = Harness(rpc_handler=mock.start_thread_and_run_complete)
+    def test_start_thread_requires_project_root(self) -> None:
+        harness = Harness(http_handler=FakeRuntime())
 
         with self.assertRaisesRegex(
             ValueError,
-            r"`cwd` is required for thread/start; pass Harness\(cwd=\.\.\.\) or start_thread\(cwd=\.\.\.\)\.",
+            r"`cwd` is required; pass Harness\(cwd=\.\.\.\) or start_thread\(cwd=\.\.\.\)\.",
         ):
             harness.start_thread()
-        self.assertEqual(mock.calls, [])
 
-    def test_run_collects_events_and_output(self) -> None:
-        mock = MockRpc()
-        harness = Harness(rpc_handler=mock.start_thread_and_run_complete)
-        thread = harness.start_thread(cwd="/repo")
+    def test_run_submits_and_polls_runtime_workflow(self) -> None:
+        runtime = FakeRuntime()
+        harness = Harness(cwd="/repo", http_handler=runtime)
         emitted: list[dict[str, Any]] = []
 
-        result = thread.run(
-            "Summarize repository",
-            timeout_seconds=1.0,
-            poll_interval_seconds=0.01,
-            on_event=lambda event: emitted.append(event),
+        result = harness.start_thread().run(
+            "Analyze the repository",
+            poll_interval_seconds=0.001,
+            timeout_seconds=0.5,
+            on_event=emitted.append,
         )
 
-        self.assertEqual(result.thread_id, "thread-1")
-        self.assertEqual(result.turn_id, "turn-1")
+        self.assertEqual(result.turn_id, "submission-1")
         self.assertEqual(result.status, "completed")
-        self.assertEqual(result.output, "done")
+        self.assertEqual(result.output, "Repository analyzed.")
         self.assertFalse(result.timed_out)
         self.assertTrue(
             any(event["method"] == "sdk:turn/completed" for event in result.events)
         )
-        self.assertGreaterEqual(len(emitted), 3)
-
-    def test_run_returns_timeout_when_turn_never_completes(self) -> None:
-        mock = MockRpc()
-        harness = Harness(rpc_handler=mock.run_timeout, cwd="/repo")
-        thread = harness.start_thread()
-
-        result = thread.run(
-            "Keep going",
-            timeout_seconds=0.05,
-            poll_interval_seconds=0.01,
+        completed = next(
+            event
+            for event in result.events
+            if event["method"] == "sdk:turn/completed"
+        )
+        self.assertEqual(
+            completed["params"]["token_usage"],
+            {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "total_tokens": 150,
+                "cost_usd": 0.02,
+            },
+        )
+        self.assertEqual(emitted, result.events)
+        self.assertEqual(
+            runtime.calls[0],
+            (
+                "POST",
+                "/api/workflows/runtime/submissions",
+                {"project": "/repo", "prompt": "Analyze the repository"},
+            ),
         )
 
+    def test_run_exposes_terminal_runtime_error(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-failed",
+                    "execution_path": "workflow_runtime",
+                }
+            if path.endswith("/artifacts"):
+                return [
+                    {
+                        "artifact_type": "activity_result_envelope",
+                        "content": json.dumps(
+                            {
+                                "final_result": {
+                                    "summary": "Agent failed.",
+                                    "error": "spawn failed",
+                                }
+                            }
+                        ),
+                    }
+                ]
+            return {
+                "submission_id": "submission-failed",
+                "status": "failed",
+                "project": "/repo",
+            }
+
+        result = Harness(cwd="/repo", http_handler=handler).start_thread().run("Fail")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.output, "Agent failed.\n\nspawn failed")
+
+    def test_run_falls_back_to_task_error_when_artifacts_are_not_found(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-failed-early",
+                    "execution_path": "workflow_runtime",
+                }
+            if path.endswith("/artifacts"):
+                raise HarnessHttpError(404, "runtime submission not found")
+            return {
+                "submission_id": "submission-failed-early",
+                "status": "failed",
+                "project": "/repo",
+                "error": "startup failed",
+            }
+
+        result = Harness(cwd="/repo", http_handler=handler).start_thread().run("Fail")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.output, "startup failed")
+
+    def test_run_times_out_while_submission_is_active(self) -> None:
+        calls: list[str] = []
+
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            calls.append(path)
+            if method == "POST":
+                return {
+                    "task_id": "submission-running",
+                    "execution_path": "workflow_runtime",
+                }
+            return {
+                "submission_id": "submission-running",
+                "status": "implementing",
+                "project": "/repo",
+                "pending_approvals": [
+                    {
+                        "type": "approval_request",
+                        "id": "request-1",
+                        "action": "run pytest",
+                        "approved": None,
+                    }
+                ],
+            }
+
+        result = Harness(cwd="/repo", http_handler=handler).start_thread().run(
+            "Keep going", poll_interval_seconds=0.001, timeout_seconds=0.005
+        )
+
+        self.assertEqual(result.status, "running")
+        self.assertTrue(result.timed_out)
+        self.assertEqual(
+            result.turn["items"] if result.turn else None,
+            [
+                {
+                    "type": "approval_request",
+                    "id": "request-1",
+                    "action": "run pytest",
+                    "approved": None,
+                }
+            ],
+        )
+        self.assertTrue(
+            any(event["method"] == "sdk:turn/timeout" for event in result.events)
+        )
         timeout_event = next(
             event for event in result.events if event["method"] == "sdk:turn/timeout"
         )
-        self.assertEqual(result.thread_id, "thread-2")
-        self.assertEqual(result.turn_id, "turn-2")
+        self.assertEqual(timeout_event["params"]["timeout_ms"], 5)
+        self.assertFalse(any(path.endswith("/artifacts") for path in calls))
+
+    def test_run_converts_poll_socket_timeout_to_timeout_event(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-socket-timeout",
+                    "execution_path": "workflow_runtime",
+                }
+            raise TimeoutError("socket timed out")
+
+        result = Harness(cwd="/repo", http_handler=handler).start_thread().run(
+            "Keep going", timeout_seconds=0.005
+        )
+
         self.assertEqual(result.status, "running")
         self.assertTrue(result.timed_out)
-        self.assertEqual(timeout_event["params"]["timeout_ms"], 50)
-        self.assertEqual(timeout_event["params"]["timeout_seconds"], 0.05)
+        self.assertEqual(result.events[-1]["method"], "sdk:turn/timeout")
 
-    def test_extract_output_handles_multiple_item_shapes(self) -> None:
-        turn = {
-            "items": [
-                {"type": "user_message", "content": "ignored"},
-                {"type": "agent_reasoning", "content": "done"},
-                {"type": "shell_command", "stdout": "ls output"},
-                {"type": "error", "message": "tool failed"},
-            ]
-        }
+    def test_run_rejects_malformed_pending_approvals(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del path, body
+            if method == "POST":
+                return {
+                    "task_id": "submission-running",
+                    "execution_path": "workflow_runtime",
+                }
+            return {
+                "submission_id": "submission-running",
+                "status": "implementing",
+                "project": "/repo",
+                "pending_approvals": {"id": "request-1"},
+            }
 
-        self.assertEqual(_extract_output(turn), "done\n\nls output\n\ntool failed")
+        with self.assertRaisesRegex(
+            RuntimeError, "runtime pending_approvals must be an array"
+        ):
+            Harness(cwd="/repo", http_handler=handler).start_thread().run("Run")
 
-    def test_resume_thread_surfaces_rpc_errors(self) -> None:
-        mock = MockRpc()
-        harness = Harness(rpc_handler=mock.rpc_error)
+    def test_wrapped_socket_timeout_preserves_timeout_type(self) -> None:
+        harness = Harness(base_url="http://127.0.0.1:9800")
 
-        with self.assertRaises(HarnessRpcError):
-            harness.resume_thread("missing-thread")
+        for timeout_type in (TimeoutError, socket.timeout):
+            with self.subTest(timeout_type=timeout_type):
+                with mock.patch(
+                    "urllib.request.urlopen",
+                    side_effect=urllib.error.URLError(timeout_type("socket timed out")),
+                ):
+                    with self.assertRaisesRegex(TimeoutError, "HTTP request timed out"):
+                        harness.turn_status("submission-timeout")
 
-    def test_start_thread_sends_bearer_token_header_when_configured(self) -> None:
+    def test_resume_thread_reuses_project_handle_locally(self) -> None:
+        runtime = FakeRuntime()
+        harness = Harness(http_handler=runtime)
+
+        thread = harness.resume_thread("/repo")
+
+        self.assertEqual(thread.id, "/repo")
+        self.assertEqual(runtime.calls, [])
+
+    def test_http_error_preserves_status_and_data(self) -> None:
+        payload = {"error": "workflow runtime store unavailable"}
+        error = HarnessHttpError(503, payload["error"], payload)
+        self.assertEqual(error.status, 503)
+        self.assertEqual(error.data, payload)
+
+    def test_bearer_token_and_custom_headers_are_sent(self) -> None:
         captured_headers: dict[str, str] = {}
 
         class FakeResponse:
@@ -159,7 +301,12 @@ class HarnessSdkTests(unittest.TestCase):
                 return None
 
             def read(self) -> bytes:
-                return b'{"jsonrpc":"2.0","id":1,"result":{"thread_id":"thread-auth"}}'
+                return json.dumps(
+                    {
+                        "task_id": "submission-auth",
+                        "execution_path": "workflow_runtime",
+                    }
+                ).encode()
 
         def fake_urlopen(request: Any, timeout: float) -> FakeResponse:
             del timeout
@@ -174,12 +321,98 @@ class HarnessSdkTests(unittest.TestCase):
         )
 
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            thread = harness.start_thread()
+            harness.start_turn("/repo", "Run")
 
-        normalized = {k.lower(): v for k, v in captured_headers.items()}
-        self.assertEqual(thread.id, "thread-auth")
+        normalized = {key.lower(): value for key, value in captured_headers.items()}
         self.assertEqual(normalized.get("authorization"), "Bearer token-123")
         self.assertEqual(normalized.get("x-test-header"), "enabled")
+
+    def test_malformed_runtime_result_artifact_fails_loudly(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-bad",
+                    "execution_path": "workflow_runtime",
+                }
+            if path.endswith("/artifacts"):
+                return [
+                    {
+                        "artifact_type": "activity_result_envelope",
+                        "content": "not-json",
+                    }
+                ]
+            return {
+                "submission_id": "submission-bad",
+                "status": "done",
+                "project": "/repo",
+            }
+
+        harness = Harness(cwd="/repo", http_handler=handler)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Invalid activity_result_envelope artifact"
+        ):
+            harness.start_thread().run("Run")
+
+    def test_non_object_runtime_result_artifact_fails_loudly(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-null",
+                    "execution_path": "workflow_runtime",
+                }
+            if path.endswith("/artifacts"):
+                return [
+                    {
+                        "artifact_type": "activity_result_envelope",
+                        "content": "null",
+                    }
+                ]
+            return {
+                "submission_id": "submission-null",
+                "status": "done",
+                "project": "/repo",
+            }
+
+        harness = Harness(cwd="/repo", http_handler=handler)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Invalid activity_result_envelope artifact: expected an object"
+        ):
+            harness.start_thread().run("Run")
+
+    def test_non_string_runtime_result_artifact_skips_to_older_envelope(self) -> None:
+        def handler(method: str, path: str, body: dict[str, Any] | None) -> Any:
+            del body
+            if method == "POST":
+                return {
+                    "task_id": "submission-mixed-artifacts",
+                    "execution_path": "workflow_runtime",
+                }
+            if path.endswith("/artifacts"):
+                return [
+                    {
+                        "artifact_type": "activity_result_envelope",
+                        "content": json.dumps(
+                            {"final_result": {"summary": "Earlier valid result."}}
+                        ),
+                    },
+                    {
+                        "artifact_type": "activity_result_envelope",
+                        "content": None,
+                    },
+                ]
+            return {
+                "submission_id": "submission-mixed-artifacts",
+                "status": "done",
+                "project": "/repo",
+            }
+
+        result = Harness(cwd="/repo", http_handler=handler).start_thread().run("Run")
+
+        self.assertEqual(result.output, "Earlier valid result.")
 
 
 if __name__ == "__main__":

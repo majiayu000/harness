@@ -13,8 +13,7 @@ export function isTerminalStatus(status: TurnStatus): boolean {
 }
 
 export function turnSignature(turn: TurnSnapshot): string {
-  const itemCount = Array.isArray(turn.items) ? turn.items.length : 0;
-  return `${turn.status}|${itemCount}|${turn.completed_at ?? ""}`;
+  return JSON.stringify([turn.status, turn.items, turn.completed_at ?? null]);
 }
 
 function pushCandidate(messages: string[], candidate: unknown): boolean {

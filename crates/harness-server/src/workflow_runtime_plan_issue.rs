@@ -1,4 +1,4 @@
-use crate::task_runner::TaskId;
+use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     build_plan_issue_decision, DecisionValidator, PlanIssueDecisionInput, PlanIssueWorkflowAction,
     ValidationContext, WorkflowCommandStatus, WorkflowDecisionRecord, WorkflowDefinition,

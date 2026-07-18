@@ -13,8 +13,9 @@ pub struct Project {
     pub id: String,
     pub root: PathBuf,
     /// Human-readable name from `[[projects]] name = "..."` config; used as
-    /// a secondary lookup key so `POST /tasks {"project":"litellm"}` resolves
-    /// even though the primary id is the canonical filesystem path.
+    /// a secondary lookup key so runtime submissions with
+    /// `{"project":"litellm"}` resolve even though the primary id is the
+    /// canonical filesystem path.
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]

@@ -1,4 +1,3 @@
-use crate::task_runner::TaskId;
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
     build_issue_submission_decision, build_prompt_submission_decision,
@@ -11,11 +10,6 @@ use harness_workflow::runtime::{
 };
 use serde_json::json;
 use std::path::Path;
-
-#[cfg(test)]
-use crate::task_runner::{TaskStatus, TaskStore};
-#[cfg(test)]
-use harness_workflow::runtime::WorkflowCommandType;
 
 const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
 const EXECUTION_PATH_WORKFLOW_RUNTIME: &str = "workflow_runtime";
@@ -34,10 +28,22 @@ mod dependencies;
 mod prompt_memory;
 #[path = "workflow_runtime_submission/replay.rs"]
 mod replay;
+#[path = "workflow_runtime_submission/runtime_models.rs"]
+pub(crate) mod runtime_models;
+#[path = "workflow_runtime_submission/runtime_request.rs"]
+pub(crate) mod runtime_request;
+#[path = "workflow_runtime_submission/runtime_state.rs"]
+pub(crate) mod runtime_state;
 
+pub use runtime_models::TaskId;
+pub(crate) use runtime_request::{
+    fill_missing_repo_from_project, CreateTaskRequest, MAX_TASK_PRIORITY,
+};
+
+#[cfg(test)]
+pub(crate) use cancel::cancel_issue_submission_by_task_id;
 pub(crate) use cancel::{
-    cancel_issue_submission_by_task_id, cancel_submission_by_workflow_id,
-    RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
+    cancel_submission_by_workflow_id, RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
 };
 use commit::{apply_decision, apply_prompt_decision};
 pub(crate) use declarative::{
@@ -52,10 +58,7 @@ pub(crate) use dependencies::{
 pub(crate) use prompt_memory::clear_prompt_submission_prompt_cache_for_test;
 use prompt_memory::prompt_ref_for_submission;
 #[cfg(test)]
-use prompt_memory::{
-    cache_prompt_submission_prompt, remove_prompt_submission_prompt,
-    remove_terminal_prompt_submission_prompt,
-};
+use prompt_memory::{cache_prompt_submission_prompt, remove_terminal_prompt_submission_prompt};
 pub(crate) use prompt_memory::{
     lookup_prompt_submission_prompt, lookup_prompt_submission_prompt_durable,
     remove_terminal_prompt_submission_payload,
@@ -109,7 +112,31 @@ pub(crate) async fn record_prompt_submission(
     store: &WorkflowRuntimeStore,
     ctx: PromptSubmissionRuntimeContext<'_>,
 ) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
-    persist_prompt_submission(store, &ctx).await
+    record_prompt_submission_with_policy(
+        store,
+        ctx,
+        runtime_models::PromptExecutionPolicy::default(),
+    )
+    .await
+}
+
+pub(crate) async fn record_prompt_submission_with_policy(
+    store: &WorkflowRuntimeStore,
+    ctx: PromptSubmissionRuntimeContext<'_>,
+    execution_policy: runtime_models::PromptExecutionPolicy,
+) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
+    persist_prompt_submission(store, &ctx, &execution_policy).await
+}
+
+pub(crate) fn prompt_execution_policy(
+    data: &serde_json::Value,
+) -> anyhow::Result<Option<runtime_models::PromptExecutionPolicy>> {
+    let Some(value) = data.get("execution_policy") else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("runtime prompt has invalid execution_policy: {error}"))
 }
 
 pub(crate) async fn runtime_issue_by_submission_id(
@@ -184,6 +211,7 @@ async fn persist_issue_submission(
 async fn persist_prompt_submission(
     store: &WorkflowRuntimeStore,
     ctx: &PromptSubmissionRuntimeContext<'_>,
+    execution_policy: &runtime_models::PromptExecutionPolicy,
 ) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
     let project_id = ctx.project_root.to_string_lossy().into_owned();
     let workflow_id = prompt_workflow_id(&project_id, ctx.external_id, ctx.task_id);
@@ -202,8 +230,14 @@ async fn persist_prompt_submission(
     let prompt_ref =
         prompt_ref_for_submission(&project_id, ctx.external_id, ctx.task_id, ctx.prompt);
     let depends_on = prompt_submission_dependency_ids(ctx);
-    let submitted_data =
-        prompt_submission_data(ctx, &project_id, &instance.data, &prompt_ref, &depends_on);
+    let submitted_data = prompt_submission_data(
+        ctx,
+        execution_policy,
+        &project_id,
+        &instance.data,
+        &prompt_ref,
+        &depends_on,
+    );
     let output = build_prompt_submission_decision(
         &instance,
         PromptSubmissionDecisionInput {
@@ -223,6 +257,7 @@ async fn persist_prompt_submission(
         new_instance,
         output.decision,
         ctx,
+        execution_policy,
         submitted_data,
     )
     .await
@@ -473,6 +508,7 @@ fn canonical_issue_external_id(external_id: Option<&str>, issue_number: u64) -> 
 
 fn prompt_submission_data(
     ctx: &PromptSubmissionRuntimeContext<'_>,
+    execution_policy: &runtime_models::PromptExecutionPolicy,
     project_id: &str,
     existing_data: &serde_json::Value,
     prompt_ref: &str,
@@ -494,6 +530,7 @@ fn prompt_submission_data(
             "dependencies_blocked": ctx.dependencies_blocked,
             "source": ctx.source,
             "external_id": ctx.external_id,
+            "execution_policy": execution_policy,
         }),
     );
     if let (Some(object), Some(policy)) = (data.as_object_mut(), ctx.continuation) {

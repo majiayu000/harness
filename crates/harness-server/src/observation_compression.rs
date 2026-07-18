@@ -13,7 +13,7 @@ use harness_core::compress::{
 use harness_core::config::compression::CompressionConfig;
 use std::sync::Arc;
 
-use crate::task_runner::TaskId;
+use harness_core::types::TaskId;
 
 pub(crate) type TaskObservationCompressor = Arc<dyn ObservationCompressor>;
 

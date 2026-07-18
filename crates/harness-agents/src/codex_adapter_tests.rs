@@ -1,5 +1,6 @@
 use super::*;
 use harness_core::types::Item;
+use std::collections::HashMap;
 
 #[test]
 fn parse_no_jsonrpc_thread_started_notification() {
@@ -119,15 +120,15 @@ fn parse_error_notification() {
 
 #[test]
 fn otel_turn_spans_parse_token_usage_notification() {
-    let line = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":15},"total":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":15}}}}"#;
+    let line = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":15},"total":{"inputTokens":25,"cachedInputTokens":9,"outputTokens":8,"reasoningOutputTokens":5,"totalTokens":38}}}}"#;
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
         ParsedCodexMessage::Event(AgentEvent::TokenUsage {
             usage: harness_core::types::TokenUsage {
-                input_tokens: 10,
-                output_tokens: 3,
-                total_tokens: 15,
+                input_tokens: 25,
+                output_tokens: 8,
+                total_tokens: 38,
                 cost_usd: 0.0,
             }
         })
@@ -251,6 +252,7 @@ fn start_params_include_runtime_profile_overrides() {
         allowed_tools: vec![],
         context: vec![],
         timeout_secs: Some(60),
+        env_vars: HashMap::new(),
         capability_token: None,
     };
 
@@ -284,6 +286,143 @@ fn start_params_include_runtime_profile_overrides() {
             ],
         })
     );
+}
+
+#[test]
+fn configured_adapter_applies_defaults_identity_and_secret_filtering() {
+    let adapter = CodexAdapter::from_config(
+        harness_core::config::agents::CodexAgentConfig {
+            cli_path: PathBuf::from("codex"),
+            default_model: "configured-model".to_string(),
+            reasoning_effort: "configured-effort".to_string(),
+            cloud: harness_core::config::agents::CodexCloudConfig {
+                enabled: true,
+                cache_ttl_hours: 0,
+                setup_commands: Vec::new(),
+                setup_secret_env: vec!["SETUP_SECRET".to_string()],
+            },
+        },
+        SandboxMode::ReadOnly,
+    );
+    let mut env_vars = HashMap::new();
+    env_vars.insert("SETUP_SECRET".to_string(), "secret-value".to_string());
+    let request = TurnRequest {
+        prompt: "ping".to_string(),
+        prompt_layers: None,
+        project_root: PathBuf::from("/tmp/project"),
+        model: None,
+        reasoning_effort: None,
+        execution_phase: None,
+        sandbox_mode: None,
+        approval_policy: Some("on-request".to_string()),
+        allowed_tools: vec![],
+        context: vec![],
+        timeout_secs: None,
+        env_vars,
+        capability_token: None,
+    };
+
+    let request = adapter.effective_turn_request(request);
+
+    assert_eq!(request.model.as_deref(), Some("configured-model"));
+    assert_eq!(
+        request.reasoning_effort.as_deref(),
+        Some("configured-effort")
+    );
+    assert_eq!(request.sandbox_mode, Some(SandboxMode::ReadOnly));
+    assert!(!request.env_vars.contains_key("SETUP_SECRET"));
+    assert!(request
+        .env_vars
+        .get(harness_core::run_id::AGENT_RUN_ID_ENV)
+        .is_some_and(|run_id| run_id.starts_with("ar-")));
+}
+
+#[tokio::test]
+async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let marker = dir.path().join("adapter-setup-ran");
+    let adapter = CodexAdapter::from_config(
+        harness_core::config::agents::CodexAgentConfig {
+            cli_path: dir.path().join("missing-codex"),
+            default_model: "configured-model".to_string(),
+            reasoning_effort: "configured-effort".to_string(),
+            cloud: harness_core::config::agents::CodexCloudConfig {
+                enabled: true,
+                cache_ttl_hours: 0,
+                setup_commands: vec!["touch adapter-setup-ran".to_string()],
+                setup_secret_env: Vec::new(),
+            },
+        },
+        SandboxMode::WorkspaceWrite,
+    );
+    let request = TurnRequest {
+        prompt: "ping".to_string(),
+        prompt_layers: None,
+        project_root: dir.path().to_path_buf(),
+        model: None,
+        reasoning_effort: None,
+        execution_phase: None,
+        sandbox_mode: None,
+        approval_policy: Some("on-request".to_string()),
+        allowed_tools: vec![],
+        context: vec![],
+        timeout_secs: None,
+        env_vars: HashMap::new(),
+        capability_token: None,
+    };
+    let (tx, _rx) = mpsc::channel(4);
+
+    adapter
+        .start_turn(request, tx)
+        .await
+        .expect_err("missing codex executable should fail after setup");
+
+    assert!(marker.exists());
+    Ok(())
+}
+
+#[test]
+fn app_server_spawn_honors_container_isolation() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut env_vars = HashMap::new();
+    env_vars.insert(
+        harness_core::agent::AGENT_ISOLATION_TIER_ENV.to_string(),
+        "container".to_string(),
+    );
+    env_vars.insert(
+        harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
+        "github.com".to_string(),
+    );
+    let request = TurnRequest {
+        prompt: "ping".to_string(),
+        prompt_layers: None,
+        project_root: root.path().to_path_buf(),
+        model: None,
+        reasoning_effort: None,
+        execution_phase: None,
+        sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+        approval_policy: Some("on-request".to_string()),
+        allowed_tools: vec![],
+        context: vec![],
+        timeout_secs: None,
+        env_vars,
+        capability_token: None,
+    };
+
+    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request)?;
+    let args = spawn
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(spawn.program, PathBuf::from("docker"));
+    assert!(spawn.clear_inherited_env);
+    assert!(args.contains(&"--network".to_string()));
+    assert!(args.contains(&"none".to_string()));
+    assert!(args.contains(&"app-server".to_string()));
+    assert!(args.contains(&"stdio://".to_string()));
+    Ok(())
 }
 
 #[test]
@@ -357,6 +496,7 @@ async fn start_turn_missing_workspace_reports_workspace_missing() -> anyhow::Res
         allowed_tools: vec![],
         context: vec![],
         timeout_secs: None,
+        env_vars: HashMap::new(),
         capability_token: None,
     };
     let (tx, _rx) = mpsc::channel(4);
@@ -422,6 +562,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         allowed_tools: vec![],
         context: vec![],
         timeout_secs: None,
+        env_vars: HashMap::new(),
         capability_token: None,
     };
     let (tx, mut rx) = mpsc::channel(4);

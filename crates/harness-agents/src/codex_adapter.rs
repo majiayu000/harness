@@ -2,9 +2,10 @@ use crate::codex::{parse_codex_error_item_message, parse_codex_item, parse_codex
 use crate::streaming::capture_agent_stderr_diagnostics;
 use async_trait::async_trait;
 use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
-use harness_core::config::agents::SandboxMode;
+use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig, SandboxMode};
+use harness_sandbox::SandboxSpec;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -14,8 +15,37 @@ use tokio::sync::{mpsc, Mutex};
 type StdoutLines = Lines<BufReader<ChildStdout>>;
 const MAX_PROTOCOL_LINE_PREVIEW: usize = 240;
 
+fn prepare_app_server_spawn(
+    cli_path: &std::path::Path,
+    req: &TurnRequest,
+) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
+    let args = [
+        OsString::from("app-server"),
+        OsString::from("--listen"),
+        OsString::from("stdio://"),
+    ];
+    let sandbox_mode = req.sandbox_mode.unwrap_or(SandboxMode::DangerFullAccess);
+    let sandbox_spec = if let Some(token) = req.capability_token.as_ref() {
+        SandboxSpec::new(sandbox_mode, &req.project_root)
+            .with_allowed_write_paths(token.allowed_write_paths.clone())
+    } else {
+        SandboxSpec::new(sandbox_mode, &req.project_root)
+    };
+    crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+        program: cli_path,
+        args: &args,
+        project_root: &req.project_root,
+        sandbox_spec: &sandbox_spec,
+        env_vars: &req.env_vars,
+    })
+}
+
 pub struct CodexAdapter {
     cli_path: PathBuf,
+    default_model: String,
+    reasoning_effort: String,
+    cloud: CodexCloudConfig,
+    sandbox_mode: SandboxMode,
     state: Arc<Mutex<AdapterState>>,
 }
 
@@ -73,10 +103,42 @@ pub enum ParsedCodexMessage {
 
 impl CodexAdapter {
     pub fn new(cli_path: PathBuf) -> Self {
-        Self {
+        let config = CodexAgentConfig {
             cli_path,
+            ..CodexAgentConfig::default()
+        };
+        Self::from_config(config, SandboxMode::DangerFullAccess)
+    }
+
+    pub fn from_config(config: CodexAgentConfig, sandbox_mode: SandboxMode) -> Self {
+        Self {
+            cli_path: config.cli_path,
+            default_model: config.default_model,
+            reasoning_effort: config.reasoning_effort,
+            cloud: config.cloud,
+            sandbox_mode,
             state: Arc::new(Mutex::new(AdapterState::new())),
         }
+    }
+
+    fn effective_turn_request(&self, mut req: TurnRequest) -> TurnRequest {
+        if req.model.is_none() {
+            req.model = Some(self.default_model.clone());
+        }
+        if req.reasoning_effort.is_none() {
+            req.reasoning_effort = Some(self.reasoning_effort.clone());
+        }
+        if req.sandbox_mode.is_none() {
+            req.sandbox_mode = Some(self.sandbox_mode);
+        }
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
+        run_identity.write_env_vars(&mut req.env_vars);
+        if self.cloud.enabled {
+            for key in &self.cloud.setup_secret_env {
+                req.env_vars.remove(key);
+            }
+        }
+        req
     }
 
     async fn send_json_line(
@@ -178,20 +240,25 @@ impl CodexAdapter {
             state.reset_child().await;
         }
 
-        let run_identity = crate::resolve_agent_run_identity(&HashMap::new());
-        let mut cmd = tokio::process::Command::new(&self.cli_path);
-        cmd.arg("app-server")
-            .arg("--listen")
-            .arg("stdio://")
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
+        let prepared_spawn = prepare_app_server_spawn(&self.cli_path, req)?;
+        let mut cmd = tokio::process::Command::new(&prepared_spawn.program);
+        cmd.args(&prepared_spawn.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .current_dir(&req.project_root)
+            .current_dir(&prepared_spawn.current_dir)
             .kill_on_drop(true);
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
+        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
         crate::strip_claude_env(&mut cmd);
         crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
+        if self.cloud.enabled {
+            for key in &self.cloud.setup_secret_env {
+                cmd.env_remove(key);
+            }
+        }
 
         let mut child = cmd.spawn().map_err(|error| {
             let message = crate::classify_missing_workspace_spawn_failure(
@@ -322,6 +389,8 @@ impl AgentAdapter for CodexAdapter {
         req: TurnRequest,
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
+        let req = self.effective_turn_request(req);
+        crate::cloud_setup::run_setup_phase(&self.cloud, &req.project_root).await?;
         let mut state = self.state.lock().await;
         self.ensure_child(&req, &mut state).await?;
 
@@ -635,7 +704,7 @@ fn parse_app_server_agent_event(
             .unwrap_or(ParsedCodexMessage::Ignore),
         "thread/tokenUsage/updated" => params
             .get("tokenUsage")
-            .and_then(|usage| usage.get("last"))
+            .and_then(|usage| usage.get("total"))
             .and_then(parse_codex_token_usage)
             .map(|usage| ParsedCodexMessage::Event(AgentEvent::TokenUsage { usage }))
             .unwrap_or(ParsedCodexMessage::Ignore),

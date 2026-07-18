@@ -6,7 +6,10 @@ use subtle::ConstantTimeEq;
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
 use crate::http::AppState;
-use crate::task_runner::{TaskId, TaskStatus};
+use crate::workflow_runtime_submission::{
+    runtime_models::{TaskId, TaskStatus},
+    CreateTaskRequest,
+};
 
 /// Feishu Bot intake: webhook-driven task creation from chat messages.
 pub struct FeishuIntake {
@@ -325,7 +328,7 @@ pub async fn feishu_webhook(
 
     // 10. Dispatch task.
     let prompt = super::build_prompt_from_issue(&issue);
-    let req = crate::task_runner::CreateTaskRequest {
+    let req = CreateTaskRequest {
         prompt: Some(prompt),
         project: Some(state.core.project_root.clone()),
         ..Default::default()

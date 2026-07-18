@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
-use crate::task_runner::TaskId;
+use crate::workflow_runtime_submission::runtime_models::{TaskFailureKind, TaskId};
 
 const GITHUB_ISSUES_MAX_PAGES: usize = 20;
 const DEFAULT_RATE_LIMIT_RETRY_SECS: i64 = 60;
@@ -21,9 +21,12 @@ pub(crate) trait DispatchedTaskChecker: Send + Sync {
 }
 
 #[async_trait]
-impl DispatchedTaskChecker for crate::task_runner::TaskStore {
+impl DispatchedTaskChecker for harness_workflow::runtime::WorkflowRuntimeStore {
     async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool> {
-        self.exists_with_db_fallback(task_id).await
+        Ok(self
+            .get_instance_by_submission_id(task_id.as_str())
+            .await?
+            .is_some())
     }
 }
 
@@ -56,10 +59,7 @@ impl DispatchedTaskChecker for RuntimeAwareDispatchedTaskChecker {
         let Some(store) = self.workflow_runtime_store.as_ref() else {
             return Ok(false);
         };
-        Ok(store
-            .get_instance_by_task_id(task_id.as_str())
-            .await?
-            .is_some())
+        store.exists(task_id).await
     }
 }
 
@@ -150,7 +150,6 @@ impl GitHubIssuesPoller {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn with_task_checker(
         mut self,
         task_checker: Arc<dyn DispatchedTaskChecker>,
@@ -666,11 +665,11 @@ impl IntakeSource for GitHubIssuesPoller {
         let needs_manual = result
             .error
             .as_deref()
-            .map(|e| e.contains(crate::task_executor::gates::MANUAL_RESOLUTION_REQUIRED))
+            .map(|e| e.contains("manual resolution required"))
             .unwrap_or(false);
         let is_workspace_lifecycle = matches!(
             result.failure_kind,
-            Some(crate::task_runner::TaskFailureKind::WorkspaceLifecycle)
+            Some(TaskFailureKind::WorkspaceLifecycle)
         );
         // Remove transient failed or cancelled issues from dispatched so the poller can
         // retry them later if they remain open. Done tasks and permanent failures stay

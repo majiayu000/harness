@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- *(breaking)* remove Harness-owned thread/turn lifecycle RPC methods and the
+  unwritten `context/manifest/get` request surface.
+
 ## [0.6.34](https://github.com/majiayu000/harness/releases/tag/harness-protocol-v0.6.34) - 2026-06-29
 
 ### Added

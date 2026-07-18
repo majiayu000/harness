@@ -1,5 +1,4 @@
 use super::*;
-use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::test_helpers;
 use axum::{body::to_bytes, routing::get, Router};
 use harness_core::types::SessionId;
@@ -189,169 +188,6 @@ fn planning_runtime_workflow_counts_as_running_work() {
     assert_eq!(counts.by_project["/repo"].running, 1);
 }
 
-#[test]
-fn runtime_workflow_without_task_handle_still_counts_active_work() {
-    let mut counts = ActiveTaskOverviewCounts::default();
-    let active_legacy_task_ids = HashSet::from(["legacy-task".to_string()]);
-    let runtime = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
-        "implementing",
-        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
-    )
-    .with_data(serde_json::json!({
-        "project_id": "/repo",
-    }));
-
-    assert!(RuntimeWorkflowProjection::from_workflow(&runtime)
-        .legacy_dedupe_task_handle
-        .is_none());
-    assert!(!runtime_workflow_matches_active_legacy_task(
-        &runtime,
-        &active_legacy_task_ids,
-    ));
-    if !runtime_workflow_matches_active_legacy_task(&runtime, &active_legacy_task_ids) {
-        add_active_runtime_workflow(&mut counts, &runtime);
-    }
-
-    assert_eq!(counts.total, 1);
-    assert_eq!(counts.running, 1);
-    assert_eq!(counts.by_project["/repo"].running, 1);
-}
-
-#[test]
-fn terminal_legacy_summary_does_not_suppress_active_runtime_workflow() {
-    let mut counts = ActiveTaskOverviewCounts::default();
-    let mut active_legacy_task_ids = HashSet::new();
-    let mut terminal_legacy = crate::task_runner::TaskState::new(harness_core::types::TaskId(
-        "runtime-task-1".to_string(),
-    ))
-    .summary();
-    terminal_legacy.status = crate::task_runner::TaskStatus::Failed;
-    terminal_legacy.scheduler.authority_state = SchedulerAuthorityState::Failed;
-    terminal_legacy.project = Some("/repo".to_string());
-    if add_active_summary(&mut counts, &terminal_legacy) {
-        active_legacy_task_ids.insert(terminal_legacy.id.as_str().to_string());
-    }
-
-    let runtime = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
-        "implementing",
-        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
-    )
-    .with_data(serde_json::json!({
-        "project_id": "/repo",
-        "task_id": "runtime-task-1",
-    }));
-    let task_id = RuntimeWorkflowProjection::from_workflow(&runtime)
-        .legacy_dedupe_task_handle
-        .expect("runtime workflow should expose a task handle");
-    if !active_legacy_task_ids.contains(task_id.as_str()) {
-        add_active_runtime_workflow(&mut counts, &runtime);
-    }
-
-    assert_eq!(counts.total, 1);
-    assert_eq!(counts.running, 1);
-    assert_eq!(counts.by_project["/repo"].running, 1);
-}
-
-#[test]
-fn active_legacy_summary_still_suppresses_matching_runtime_workflow() {
-    let mut counts = ActiveTaskOverviewCounts::default();
-    let mut active_legacy_task_ids = HashSet::new();
-    let mut active_legacy = crate::task_runner::TaskState::new(harness_core::types::TaskId(
-        "runtime-task-1".to_string(),
-    ))
-    .summary();
-    active_legacy.status = crate::task_runner::TaskStatus::Implementing;
-    active_legacy.scheduler.authority_state = SchedulerAuthorityState::Running;
-    active_legacy.project = Some("/repo".to_string());
-    if add_active_summary(&mut counts, &active_legacy) {
-        active_legacy_task_ids.insert(active_legacy.id.as_str().to_string());
-    }
-
-    let runtime = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
-        "implementing",
-        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
-    )
-    .with_data(serde_json::json!({
-        "project_id": "/repo",
-        "task_id": "runtime-task-1",
-    }));
-    let task_id = RuntimeWorkflowProjection::from_workflow(&runtime)
-        .legacy_dedupe_task_handle
-        .expect("runtime workflow should expose a task handle");
-    if !active_legacy_task_ids.contains(task_id.as_str()) {
-        add_active_runtime_workflow(&mut counts, &runtime);
-    }
-
-    assert_eq!(counts.total, 1);
-    assert_eq!(counts.running, 1);
-    assert_eq!(counts.by_project["/repo"].running, 1);
-}
-
-#[test]
-fn leased_legacy_summary_counts_as_running_work() {
-    let mut counts = ActiveTaskOverviewCounts::default();
-    let mut leased = crate::task_runner::TaskState::new(harness_core::types::TaskId(
-        "leased-runtime-task".to_string(),
-    ))
-    .summary();
-    leased.status = crate::task_runner::TaskStatus::Implementing;
-    leased.scheduler.authority_state = SchedulerAuthorityState::Leased;
-    leased.project = Some("/repo".to_string());
-
-    assert!(add_active_summary(&mut counts, &leased));
-
-    assert_eq!(counts.total, 1);
-    assert_eq!(counts.running, 1);
-    assert_eq!(counts.queued, 0);
-    assert_eq!(counts.by_project["/repo"].running, 1);
-    assert_eq!(counts.by_project["/repo"].queued, 0);
-}
-
-#[test]
-fn active_legacy_summary_suppresses_runtime_workflow_by_current_task_id() {
-    let mut counts = ActiveTaskOverviewCounts::default();
-    let mut active_legacy_task_ids = HashSet::new();
-    let mut active_legacy = crate::task_runner::TaskState::new(harness_core::types::TaskId(
-        "current-runtime-task".to_string(),
-    ))
-    .summary();
-    active_legacy.status = crate::task_runner::TaskStatus::Implementing;
-    active_legacy.scheduler.authority_state = SchedulerAuthorityState::Running;
-    active_legacy.project = Some("/repo".to_string());
-    if add_active_summary(&mut counts, &active_legacy) {
-        active_legacy_task_ids.insert(active_legacy.id.as_str().to_string());
-    }
-
-    let runtime = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
-        "implementing",
-        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
-    )
-    .with_data(serde_json::json!({
-        "project_id": "/repo",
-        "task_id": "current-runtime-task",
-        "task_ids": ["historical-runtime-task", "current-runtime-task"],
-    }));
-    let task_id = RuntimeWorkflowProjection::from_workflow(&runtime)
-        .legacy_dedupe_task_handle
-        .expect("runtime workflow should expose a task handle");
-    assert_eq!(task_id.as_str(), "current-runtime-task");
-    if !active_legacy_task_ids.contains(task_id.as_str()) {
-        add_active_runtime_workflow(&mut counts, &runtime);
-    }
-
-    assert_eq!(counts.total, 1);
-    assert_eq!(counts.running, 1);
-    assert_eq!(counts.by_project["/repo"].running, 1);
-}
-
 #[tokio::test]
 async fn overview_returns_expected_shape() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
@@ -359,7 +195,18 @@ async fn overview_returns_expected_shape() -> anyhow::Result<()> {
         return Ok(());
     }
     let dir = test_helpers::tempdir_in_home("harness-test-overview-")?;
-    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    state.core.workflow_runtime_store = Some(Arc::new(
+        harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(
+                dir.path(),
+                "workflow_runtime_overview_test",
+            ),
+            Some(&test_helpers::test_database_url()?),
+        )
+        .await?,
+    ));
+    let state = Arc::new(state);
 
     let app = Router::new()
         .route("/api/overview", get(overview))
@@ -412,7 +259,18 @@ async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::
     let dir = test_helpers::tempdir_in_home("harness-test-overview-stalled-")?;
     let canonical_root = dir.path().canonicalize()?;
     let project_root = canonical_root.to_string_lossy().into_owned();
-    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    state.core.workflow_runtime_store = Some(Arc::new(
+        harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(
+                dir.path(),
+                "workflow_runtime_overview_stalled_test",
+            ),
+            Some(&test_helpers::test_database_url()?),
+        )
+        .await?,
+    ));
+    let state = Arc::new(state);
     state
         .project_svc
         .register(crate::project_registry::Project {
@@ -425,23 +283,23 @@ async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::
             created_at: Utc::now().to_rfc3339(),
         })
         .await?;
-    let mut task = crate::task_runner::TaskState::new(harness_core::types::TaskId(
-        "overview-stalled-task".to_string(),
-    ));
-    task.project_root = Some(canonical_root.clone());
-    task.status = crate::task_runner::TaskStatus::Failed;
-    task.phase = crate::task_runner::TaskPhase::Terminal;
-    task.error = Some(
-        crate::task_runner::TaskTerminalFailure::round_budget_exhausted(
-            1,
-            crate::task_runner::TaskStatus::Reviewing,
-            Some("local_review_gate".to_string()),
-        )
-        .to_reason_string(),
-    );
-    task.scheduler
-        .mark_terminal(&crate::task_runner::TaskStatus::Failed);
-    state.core.tasks.insert(&task).await;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:overview-stalled"),
+    )
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "task_id": "overview-stalled-task",
+        "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
+    }));
+    store.upsert_instance(&workflow).await?;
 
     let app = Router::new()
         .route("/api/overview", get(overview))

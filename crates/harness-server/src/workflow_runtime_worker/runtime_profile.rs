@@ -1,5 +1,5 @@
 use anyhow::Context;
-use harness_core::config::agents::SandboxMode;
+use harness_core::config::agents::{CodexAgentConfig, SandboxMode};
 use harness_workflow::runtime::{RuntimeJob, RuntimeKind, RuntimeProfile};
 
 pub(super) fn agent_name_for_runtime_kind(kind: RuntimeKind) -> anyhow::Result<&'static str> {
@@ -40,6 +40,26 @@ pub(super) fn runtime_profile_sandbox_mode(
     Ok(Some(mode))
 }
 
+pub(super) fn runtime_profile_model_and_reasoning(
+    profile: &RuntimeProfile,
+    runtime_kind: RuntimeKind,
+    codex: &CodexAgentConfig,
+) -> (Option<String>, Option<String>) {
+    let is_codex = matches!(
+        runtime_kind,
+        RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
+    );
+    let model = profile
+        .model
+        .clone()
+        .or_else(|| is_codex.then(|| codex.default_model.clone()));
+    let reasoning_effort = profile
+        .reasoning_effort
+        .clone()
+        .or_else(|| is_codex.then(|| codex.reasoning_effort.clone()));
+    (model, reasoning_effort)
+}
+
 pub(super) fn runtime_profile_approval_policy(
     profile: &RuntimeProfile,
     runtime_kind: RuntimeKind,
@@ -76,6 +96,34 @@ mod tests {
                 Some(value.to_string())
             );
         }
+    }
+
+    #[test]
+    fn runtime_profile_codex_defaults_preserve_explicit_overrides() {
+        let codex = CodexAgentConfig {
+            default_model: "configured-model".to_string(),
+            reasoning_effort: "configured-effort".to_string(),
+            ..CodexAgentConfig::default()
+        };
+        let profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        assert_eq!(
+            runtime_profile_model_and_reasoning(&profile, RuntimeKind::CodexJsonrpc, &codex),
+            (
+                Some("configured-model".to_string()),
+                Some("configured-effort".to_string())
+            )
+        );
+
+        let mut profile = profile;
+        profile.model = Some("profile-model".to_string());
+        profile.reasoning_effort = Some("profile-effort".to_string());
+        assert_eq!(
+            runtime_profile_model_and_reasoning(&profile, RuntimeKind::CodexJsonrpc, &codex),
+            (
+                Some("profile-model".to_string()),
+                Some("profile-effort".to_string())
+            )
+        );
     }
 
     #[test]

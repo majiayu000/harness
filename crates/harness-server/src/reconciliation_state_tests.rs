@@ -46,18 +46,33 @@ fn classify_issue_state_preserves_completion_reason() {
 #[test]
 fn transition_mapping_matches_external_states() {
     assert_eq!(
-        transition_for_github_state(GitHubState::PrMerged),
-        Some((TaskStatus::Done, "reconciled: PR merged externally"))
+        runtime_transition_for_github_state(GitHubState::PrMerged),
+        Some(("done", "reconciled: PR merged externally"))
     );
     assert_eq!(
-        transition_for_github_state(GitHubState::PrClosed),
-        Some((TaskStatus::Cancelled, "reconciled: PR closed externally"))
+        runtime_transition_for_github_state(GitHubState::PrClosed),
+        Some(("cancelled", "reconciled: PR closed externally"))
     );
     assert_eq!(
-        transition_for_github_state(GitHubState::IssueCompleted),
-        Some((TaskStatus::Done, "reconciled: issue completed externally"))
+        runtime_transition_for_github_state(GitHubState::IssueCompleted),
+        Some(("done", "reconciled: issue completed externally"))
     );
-    assert_eq!(transition_for_github_state(GitHubState::Open), None);
+    assert_eq!(runtime_transition_for_github_state(GitHubState::Open), None);
+}
+
+#[test]
+fn issue_terminal_state_rejects_non_terminal_targets() {
+    use harness_workflow::issue_lifecycle::IssueLifecycleState;
+
+    assert_eq!(
+        reconciliation_apply::issue_terminal_state("done"),
+        Some(IssueLifecycleState::Done)
+    );
+    assert_eq!(
+        reconciliation_apply::issue_terminal_state("cancelled"),
+        Some(IssueLifecycleState::Cancelled)
+    );
+    assert_eq!(reconciliation_apply::issue_terminal_state("blocked"), None);
 }
 
 #[test]

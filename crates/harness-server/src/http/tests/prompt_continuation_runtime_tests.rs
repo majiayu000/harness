@@ -108,11 +108,11 @@ async fn submit_continuation_prompt(
     external_id: &str,
     no_progress_limit: u32,
 ) -> anyhow::Result<String> {
-    let response = task_app(state.clone())
+    let response = runtime_submission_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({

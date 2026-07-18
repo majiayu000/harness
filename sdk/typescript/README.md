@@ -1,6 +1,6 @@
 # Harness TypeScript SDK
 
-TypeScript client for the Harness JSON-RPC app server.
+TypeScript client for Harness workflow-runtime submissions.
 
 ## Install
 
@@ -24,6 +24,11 @@ const result = await thread.run("Summarize the repository", {
 
 console.log(result.status, result.output);
 ```
+
+`startThread()` creates a local project-scoped handle. Each `run()` call submits a
+new prompt through `POST /api/workflows/runtime/submissions` and polls the durable
+runtime submission until it is terminal. `resumeThread(project)` reconstructs the
+same local handle; it does not restore removed server-side thread history.
 
 ### Authenticated server
 

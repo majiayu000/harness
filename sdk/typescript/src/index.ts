@@ -1,5 +1,5 @@
 export { Harness } from "./client";
-export { HarnessRpcError } from "./errors";
+export { HarnessHttpError, HarnessRpcError } from "./errors";
 export {
   HarnessThread,
   SDK_TURN_COMPLETED,

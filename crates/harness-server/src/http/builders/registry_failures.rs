@@ -6,7 +6,6 @@ use crate::http::state::StoreStartupResult;
 
 pub(crate) fn failed_registry_startup_results(error: &str) -> Vec<StoreStartupResult> {
     vec![
-        StoreStartupResult::critical("thread_db").failed(error),
         StoreStartupResult::critical("plan_db").failed(error),
         StoreStartupResult::optional("issue_workflow_store").failed(error),
         StoreStartupResult::optional("project_workflow_store").failed(error),
@@ -23,7 +22,6 @@ pub(crate) fn failed_registry_bundle(
     error: &str,
 ) -> RegistryBundle {
     RegistryBundle {
-        thread_db: None,
         plan_db: None,
         plan_cache,
         issue_workflow_store: None,

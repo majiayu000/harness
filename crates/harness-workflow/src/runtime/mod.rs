@@ -168,12 +168,14 @@ pub use state_registry::{
 };
 pub use status::WorkflowCommandStatus;
 pub use store::{
-    DriverlessProgressInstance, DriverlessProgressProvenanceStatus, RuntimeHistoryPruneSummary,
-    RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
+    cost_usd_from_micros, cost_usd_to_micros, DriverlessProgressInstance,
+    DriverlessProgressProvenanceStatus, RuntimeHistoryPruneSummary, RuntimeUsageMetrics,
+    RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,
     WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeRecoveryAction,
     WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore,
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
-    WorkflowSubmissionFilter, WorkflowSubmissionPromptPayload,
+    WorkflowSubmissionFilter, WorkflowSubmissionHourlyDone, WorkflowSubmissionMetrics,
+    WorkflowSubmissionProjectMetrics, WorkflowSubmissionPromptPayload,
 };
 pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,

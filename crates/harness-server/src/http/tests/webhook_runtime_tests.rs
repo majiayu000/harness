@@ -195,10 +195,9 @@ async fn webhook_issues_opened_requires_workflow_runtime_store() -> anyhow::Resu
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let json = response_json(response).await?;
-    assert!(
-        json["error"].as_str().is_some_and(|error| error
-            .contains("workflow runtime store is required for GitHub issue submissions")),
-        "unexpected response: {json}"
+    assert_eq!(
+        json["error"],
+        "workflow runtime store is required for submissions"
     );
     assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
@@ -555,7 +554,7 @@ async fn build_router_auth_middleware_blocks_unauthenticated_requests() -> anyho
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/tasks")
+                .uri("/api/workflows/runtime/submissions")
                 .body(Body::empty())?,
         )
         .await?;

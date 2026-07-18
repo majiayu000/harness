@@ -200,15 +200,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     // Depends on: engines.rules + engines.events (interceptors),
     //             registry.workspace_mgr + registry.project_registry (execution service),
     //             intake.task_queue + intake.completion_callback (execution service).
-    let services = builders::services::build_services(
-        &server,
-        &storage,
-        &engines,
-        &registry,
-        &intake,
-        &project_root,
-    )
-    .await?;
+    let services =
+        builders::services::build_services(&server, &storage, &engines, &registry, &project_root)
+            .await?;
 
     let configured_capacity = server.config.server.notification_broadcast_capacity;
     let notification_broadcast_capacity = configured_capacity.max(1);
@@ -274,11 +268,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             project_root,
             home_dir,
             tasks,
-            thread_db: Some(
-                registry
-                    .thread_db
-                    .expect("critical thread DB should be present after startup validation"),
-            ),
             plan_db: Some(
                 registry
                     .plan_db

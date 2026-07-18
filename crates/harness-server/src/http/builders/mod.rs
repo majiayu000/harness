@@ -77,10 +77,6 @@ mod tests {
                 crate::task_db::TaskDb::shared_schema_context(Some(TEST_DATABASE_URL))?,
             ),
             (
-                "thread_db",
-                crate::thread_db::ThreadDb::shared_schema_context(Some(TEST_DATABASE_URL))?,
-            ),
-            (
                 "plan_db",
                 crate::plan_db::PlanDb::shared_schema_context(Some(TEST_DATABASE_URL))?,
             ),
@@ -133,11 +129,11 @@ mod tests {
             Some(TEST_DATABASE_URL),
         )?;
 
-        let err = ensure_startup_context_not_path_derived("thread_db", &context)
+        let err = ensure_startup_context_not_path_derived("plan_db", &context)
             .expect_err("path-derived startup context should be rejected");
         let message = err.to_string();
         assert!(
-            message.contains("thread_db"),
+            message.contains("plan_db"),
             "error should name the startup opener: {message}"
         );
         assert!(

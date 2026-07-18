@@ -1,5 +1,5 @@
 use harness_core::types::{
-    DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId, ThreadId, TurnId,
+    DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId,
 };
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
@@ -14,10 +14,10 @@ use std::path::PathBuf;
 ///
 /// | Control-plane capability | HTTP endpoint |
 /// |--------------------------|---------------|
-/// | Enqueue a task           | `POST /tasks` |
-/// | List tasks               | `GET  /tasks` |
-/// | Batch-create tasks       | `POST /tasks/batch` |
-/// | Stream task output       | `GET  /tasks/{id}/stream` |
+/// | Submit runtime work      | `POST /api/workflows/runtime/submissions` |
+/// | List runtime submissions | `GET  /api/workflows/runtime/submissions` |
+/// | Get runtime submission   | `GET  /api/workflows/runtime/submissions/{id}` |
+/// | Stream runtime output    | `GET  /api/workflows/runtime/submissions/{id}/stream` |
 /// | Register a project       | `POST /projects` |
 /// | List projects            | `GET  /projects` |
 /// | Dashboard API            | `GET  /api/dashboard` |
@@ -31,46 +31,6 @@ pub enum Method {
     /// Sent by the client after receiving an `initialize` response to confirm
     /// the handshake is complete.  No params required.
     Initialized,
-
-    // === Thread management ===
-    ThreadStart {
-        cwd: PathBuf,
-    },
-    ThreadResume {
-        thread_id: ThreadId,
-    },
-    ThreadFork {
-        thread_id: ThreadId,
-        from_turn: Option<TurnId>,
-    },
-    ThreadList,
-    ThreadDelete {
-        thread_id: ThreadId,
-    },
-    ThreadCompact {
-        thread_id: ThreadId,
-    },
-
-    // === Turn control ===
-    TurnStart {
-        thread_id: ThreadId,
-        input: String,
-    },
-    TurnSteer {
-        turn_id: TurnId,
-        instruction: String,
-    },
-    TurnCancel {
-        turn_id: TurnId,
-    },
-    TurnStatus {
-        turn_id: TurnId,
-    },
-    TurnRespondApproval {
-        turn_id: TurnId,
-        request_id: String,
-        decision: harness_core::agent::ApprovalDecision,
-    },
 
     // === GC Agent ===
     GcRun {
@@ -195,9 +155,6 @@ pub enum Method {
         #[serde(default)]
         supplied_items: Vec<harness_context::ContextItem>,
     },
-    ContextManifestGet {
-        thread_id: ThreadId,
-    },
 }
 
 /// JSON-RPC 2.0 request envelope.
@@ -233,7 +190,7 @@ impl<'de> Deserialize<'de> for RpcRequest {
         } = RawRpcRequest::deserialize(deserializer)?;
 
         // Normalize slash-style method names to snake_case for serde:
-        // "thread/start" -> "thread_start", "exec_plan/init" -> "exec_plan_init"
+        // "gc/run" -> "gc_run", "exec_plan/init" -> "exec_plan_init"
         let method = method.replace('/', "_");
 
         let method = if method == "initialized" {
@@ -321,22 +278,11 @@ impl RpcResponse {
 }
 
 impl Method {
-    /// Returns the canonical slash-style method name (e.g. `"thread/start"`).
+    /// Returns the canonical slash-style method name (e.g. `"exec_plan/init"`).
     pub fn method_name(&self) -> &'static str {
         match self {
             Self::Initialize => "initialize",
             Self::Initialized => "initialized",
-            Self::ThreadStart { .. } => "thread/start",
-            Self::ThreadResume { .. } => "thread/resume",
-            Self::ThreadFork { .. } => "thread/fork",
-            Self::ThreadList => "thread/list",
-            Self::ThreadDelete { .. } => "thread/delete",
-            Self::ThreadCompact { .. } => "thread/compact",
-            Self::TurnStart { .. } => "turn/start",
-            Self::TurnSteer { .. } => "turn/steer",
-            Self::TurnCancel { .. } => "turn/cancel",
-            Self::TurnStatus { .. } => "turn/status",
-            Self::TurnRespondApproval { .. } => "turn/respond_approval",
             Self::GcRun { .. } => "gc/run",
             Self::GcStatus => "gc/status",
             Self::GcDrafts { .. } => "gc/drafts",
@@ -364,7 +310,6 @@ impl Method {
             Self::Preflight { .. } => "preflight",
             Self::CrossReview { .. } => "cross_review",
             Self::ContextPreview { .. } => "context/preview",
-            Self::ContextManifestGet { .. } => "context/manifest/get",
             Self::SkillGovernanceView { .. } => "skill/governance/view",
             Self::SkillGovernanceHistory { .. } => "skill/governance/history",
             Self::SkillStale => "skill/stale",
@@ -426,26 +371,6 @@ mod context_tests {
             } => {
                 assert_eq!(request.thread_id.as_str(), "thread-1");
                 assert_eq!(supplied_items.len(), 1);
-            }
-            other => panic!("unexpected method: {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn context_rpc_manifest_get_slash_method_deserializes() -> anyhow::Result<()> {
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "context/manifest/get",
-            "params": {"thread_id": "thread-1"}
-        });
-
-        let parsed: RpcRequest = serde_json::from_value(request)?;
-        assert_eq!(parsed.method.method_name(), "context/manifest/get");
-        match parsed.method {
-            Method::ContextManifestGet { thread_id } => {
-                assert_eq!(thread_id.as_str(), "thread-1");
             }
             other => panic!("unexpected method: {other:?}"),
         }

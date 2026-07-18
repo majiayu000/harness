@@ -19,7 +19,7 @@ mod local_review_completion_gate_tests;
 #[cfg(test)]
 mod local_review_completion_tests;
 pub(crate) mod non_implementation;
-pub(crate) mod pr_detection;
+pub(crate) use crate::workflow_runtime_pr_feedback::pr_detection;
 pub(crate) mod review_loop;
 #[cfg(test)]
 mod review_loop_wait_budget_tests;

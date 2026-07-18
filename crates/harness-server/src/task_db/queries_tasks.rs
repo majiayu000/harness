@@ -293,6 +293,7 @@ impl TaskDb {
     /// Update only the `status` column without touching `updated_at`. Still
     /// bumps `version` so that any concurrent reader-then-writer using
     /// optimistic locking observes this write and refuses to overwrite it.
+    #[cfg(test)]
     pub(crate) async fn update_status_only(
         &self,
         id: &str,
@@ -493,12 +494,6 @@ impl TaskDb {
             }
         }
         Ok(summaries)
-    }
-
-    /// Expose the raw pool for test-only SQL setup (e.g. back-dating `updated_at`).
-    #[cfg(test)]
-    pub(crate) fn pool_for_test(&self) -> &sqlx::PgPool {
-        &self.pool
     }
 
     /// Overwrite the `rounds` column with arbitrary raw text.

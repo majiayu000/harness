@@ -198,10 +198,6 @@ mod tests {
             draft_store,
             dir.to_path_buf(),
         ));
-        let thread_db = crate::thread_db::ThreadDb::open(
-            &harness_core::config::dirs::default_db_path(dir, "threads"),
-        )
-        .await?;
         let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
             &harness_core::config::dirs::default_db_path(dir, "projects"),
         )
@@ -212,17 +208,7 @@ mod tests {
         );
         let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
         let execution_svc = crate::services::execution::DefaultExecutionService::new(
-            tasks.clone(),
-            server.agent_registry.clone(),
             Arc::new(server.config.clone()),
-            Default::default(),
-            events.clone(),
-            vec![],
-            None,
-            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-            Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-            None,
-            None,
             None,
             None,
             vec![],
@@ -237,7 +223,6 @@ mod tests {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|_| dir.to_path_buf()),
                 tasks,
-                thread_db: Some(thread_db),
                 plan_db: None,
                 plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
                 issue_workflow_store: None,
@@ -375,109 +360,6 @@ mod tests {
         assert_eq!(writer.bytes, b"first\n");
         assert_eq!(writer.flushes, 1);
         assert_eq!(rx.try_recv()?, "second");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn thread_start_emits_notification() -> anyhow::Result<()> {
-        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
-        let dir = tempfile::tempdir()?;
-        let mut state = make_test_state(dir.path()).await?;
-
-        let (notify_tx, mut notify_rx) = crate::notify::channel(8);
-        state.notifications.notify_tx = Some(notify_tx);
-
-        let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
-
-        let line = serde_json::to_string(&RpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(1)),
-            method: Method::ThreadStart {
-                cwd: proj_dir.path().to_path_buf(),
-            },
-        })?;
-
-        let out = process_line(&state, &line)
-            .await?
-            .expect("should return a response");
-        let resp: harness_protocol::methods::RpcResponse = codec::decode_response(&out)?;
-        assert!(
-            resp.error.is_none(),
-            "thread_start failed: {:?}",
-            resp.error
-        );
-
-        let notif = notify_rx
-            .try_recv()
-            .expect("thread_start should emit a notification");
-        let json = serde_json::to_string(&notif)?;
-        assert!(
-            json.contains("thread/status_changed"),
-            "expected thread/status_changed notification, got: {json}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn turn_start_emits_notification() -> anyhow::Result<()> {
-        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
-        let dir = tempfile::tempdir()?;
-        let mut state = make_test_state(dir.path()).await?;
-
-        let (notify_tx, mut notify_rx) = crate::notify::channel(8);
-        state.notifications.notify_tx = Some(notify_tx);
-
-        let proj_dir = crate::test_helpers::tempdir_in_home("harness-test-")?;
-
-        // First create a thread.
-        let thread_line = serde_json::to_string(&RpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(1)),
-            method: Method::ThreadStart {
-                cwd: proj_dir.path().to_path_buf(),
-            },
-        })?;
-        let thread_out = process_line(&state, &thread_line)
-            .await?
-            .expect("thread_start should return a response");
-        let thread_resp: harness_protocol::methods::RpcResponse =
-            codec::decode_response(&thread_out)?;
-        let thread_id_str = thread_resp.result.unwrap()["thread_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let thread_id = harness_core::types::ThreadId::from_str(&thread_id_str);
-
-        // Drain the thread_start notification.
-        let _ = notify_rx.try_recv();
-
-        // Start a turn.
-        let turn_line = serde_json::to_string(&RpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(2)),
-            method: Method::TurnStart {
-                thread_id,
-                input: "hello".to_string(),
-            },
-        })?;
-        let turn_out = process_line(&state, &turn_line)
-            .await?
-            .expect("turn_start should return a response");
-        let turn_resp: harness_protocol::methods::RpcResponse = codec::decode_response(&turn_out)?;
-        assert!(
-            turn_resp.error.is_none(),
-            "turn_start failed: {:?}",
-            turn_resp.error
-        );
-
-        let notif = notify_rx
-            .try_recv()
-            .expect("turn_start should emit a notification");
-        let json = serde_json::to_string(&notif)?;
-        assert!(
-            json.contains("turn/started"),
-            "expected turn/started notification, got: {json}"
-        );
         Ok(())
     }
 }

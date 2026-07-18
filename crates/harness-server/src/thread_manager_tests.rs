@@ -575,6 +575,15 @@ async fn respond_approval_on_turn_propagates_unsupported_error() -> anyhow::Resu
     let tm = ThreadManager::new();
     let thread_id = tm.start_thread(PathBuf::from("/tmp"));
     let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+    tm.add_item(
+        &thread_id,
+        &turn_id,
+        Item::ApprovalRequest {
+            id: Some("req-1".to_string()),
+            action: "run tests".to_string(),
+            approved: None,
+        },
+    )?;
     tm.register_active_adapter(&turn_id, Arc::new(AlwaysUnsupportedAdapter));
 
     let err = tm
@@ -585,6 +594,89 @@ async fn respond_approval_on_turn_propagates_unsupported_error() -> anyhow::Resu
         err.to_string().contains("unsupported"),
         "error must mention unsupported, got: {err}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn respond_approval_on_turn_rejects_unknown_turn() {
+    let tm = ThreadManager::new();
+    let turn_id = TurnId::from_str("missing-turn");
+
+    let error = tm
+        .respond_approval_on_turn(&turn_id, "req-1".to_string(), ApprovalDecision::Accept)
+        .await
+        .expect_err("unknown turn must fail");
+
+    assert!(matches!(
+        error,
+        harness_core::error::HarnessError::TurnNotFound(ref id) if id == "missing-turn"
+    ));
+}
+
+#[tokio::test]
+async fn respond_approval_on_runtime_handle_rejects_missing_request_for_multiple_turns(
+) -> anyhow::Result<()> {
+    let tm = ThreadManager::new();
+    let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+    let first_turn = tm.start_turn(&thread_id, "first".to_string(), AgentId::new())?;
+    let second_turn = tm.start_turn(&thread_id, "second".to_string(), AgentId::new())?;
+    tm.register_runtime_turn_alias("submission-1", &first_turn);
+    tm.register_runtime_turn_alias("submission-1", &second_turn);
+
+    let error = tm
+        .respond_approval_on_runtime_handle(
+            "submission-1",
+            "missing-request".to_string(),
+            ApprovalDecision::Accept,
+        )
+        .await
+        .expect_err("a missing approval request must fail");
+
+    assert!(matches!(
+        error,
+        harness_core::error::HarnessError::TurnNotFound(ref id) if id == "submission-1"
+    ));
+    Ok(())
+}
+
+#[test]
+fn pending_approval_items_for_runtime_handle_returns_only_actionable_running_items(
+) -> anyhow::Result<()> {
+    let tm = ThreadManager::new();
+    let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+    let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+    tm.add_item(
+        &thread_id,
+        &turn_id,
+        Item::ApprovalRequest {
+            id: Some("request-1".to_string()),
+            action: "run tests".to_string(),
+            approved: None,
+        },
+    )?;
+    tm.add_item(
+        &thread_id,
+        &turn_id,
+        Item::ApprovalRequest {
+            id: Some("request-2".to_string()),
+            action: "run formatter".to_string(),
+            approved: Some(true),
+        },
+    )?;
+    tm.register_runtime_turn_alias("submission-1", &turn_id);
+
+    assert_eq!(
+        tm.pending_approval_items_for_runtime_handle("submission-1"),
+        vec![Item::ApprovalRequest {
+            id: Some("request-1".to_string()),
+            action: "run tests".to_string(),
+            approved: None,
+        }]
+    );
+    tm.complete_turn(&thread_id, &turn_id)?;
+    assert!(tm
+        .pending_approval_items_for_runtime_handle("submission-1")
+        .is_empty());
     Ok(())
 }
 

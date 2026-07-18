@@ -21,8 +21,6 @@ pub const KNOWN_TEST_SCHEMA_PREFIXES: &[&str] = &[
     "task_db_retention_batch_test",
     "task_db_retention_scope_test",
     "task_db_scope_test",
-    "thread_db_shared_scope_test",
-    "thread_db_test",
     "workspace_lease_scope_test",
 ];
 

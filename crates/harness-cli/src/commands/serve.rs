@@ -234,13 +234,15 @@ pub async fn run(
             .with_stream_timeout(serve_config.agents.stream_timeout_secs),
         ),
     );
-    let codex_cli_path = serve_config.agents.codex.cli_path.clone();
+    let codex_adapter_config = serve_config.agents.codex.clone();
+    let codex_adapter_sandbox_mode = serve_config.agents.sandbox_mode;
     agent_registry
         .register_adapter_factory_with_strategy(
             "codex",
             move || {
-                Arc::new(harness_agents::codex_adapter::CodexAdapter::new(
-                    codex_cli_path.clone(),
+                Arc::new(harness_agents::codex_adapter::CodexAdapter::from_config(
+                    codex_adapter_config.clone(),
+                    codex_adapter_sandbox_mode,
                 ))
             },
             harness_agents::registry::AdapterExecutionStrategy::ExecuteTurns,

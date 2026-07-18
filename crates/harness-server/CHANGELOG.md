@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- *(breaking)* remove Harness-owned thread/turn lifecycle RPC handlers and
+  migrate supported clients to workflow-runtime HTTP submissions; live approval
+  responses are available through the authenticated runtime approval endpoint.
 - *(security)* fail closed during server startup when neither `api_token` nor
   `HARNESS_API_TOKEN` is configured; tokenless operation now requires
   `allow_unauthenticated = true`, and a configured token wins over the opt-in.
