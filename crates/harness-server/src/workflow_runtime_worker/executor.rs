@@ -66,6 +66,11 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 ));
             }
         }
+        let _queue_permit = super::runtime_execution_queue::acquire_runtime_execution_queue_permit(
+            self.state,
+            workflow.as_ref(),
+        )
+        .await?;
         if let Some(result) = self
             .execute_server_owned_activity(&job, workflow.as_ref())
             .await?

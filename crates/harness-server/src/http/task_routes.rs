@@ -1,7 +1,7 @@
 use super::AppState;
 use crate::{
     runtime_projection::RuntimeWorkflowProjection,
-    services::execution::{EnqueueBackgroundOptions, EnqueueTaskError},
+    services::execution::EnqueueTaskError,
     workflow_runtime_submission::{CreateTaskRequest, TaskId},
 };
 use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, Json};
@@ -20,20 +20,18 @@ pub(crate) async fn enqueue_task(
 pub(crate) async fn enqueue_task_background(
     state: Arc<AppState>,
     req: CreateTaskRequest,
-    group_sem: Option<Arc<tokio::sync::Semaphore>>,
 ) -> Result<TaskId, EnqueueTaskError> {
-    enqueue_task_background_in_domain(state, req, group_sem, QueueDomain::Primary).await
+    enqueue_task_background_in_domain(state, req, QueueDomain::Primary).await
 }
 
 pub(crate) async fn enqueue_task_background_in_domain(
     state: Arc<AppState>,
     req: CreateTaskRequest,
-    _group_sem: Option<Arc<tokio::sync::Semaphore>>,
-    _queue_domain: QueueDomain,
+    queue_domain: QueueDomain,
 ) -> Result<TaskId, EnqueueTaskError> {
     state
         .execution_svc
-        .enqueue_background_with_options(req, EnqueueBackgroundOptions)
+        .enqueue_in_domain(req, queue_domain)
         .await
 }
 
@@ -90,7 +88,7 @@ pub(super) async fn create_runtime_submission(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTaskRequest>,
 ) -> Response {
-    match enqueue_task_background(state.clone(), req, None).await {
+    match enqueue_task_background(state.clone(), req).await {
         Ok(task_id) => match task_response_details(&state, &task_id).await {
             Ok(details) => (
                 StatusCode::ACCEPTED,

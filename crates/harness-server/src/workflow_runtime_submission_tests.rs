@@ -107,7 +107,14 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
     std::fs::create_dir(&project_root)?;
     let task_id = TaskId::from_str("prompt-task-1");
 
-    let result = record_prompt_submission(
+    let execution_policy = runtime_models::PromptExecutionPolicy {
+        task_kind: runtime_models::TaskKind::Review,
+        agent: Some("claude".to_string()),
+        turn_timeout_secs: Some(77),
+        queue_domain: runtime_models::QueueDomain::Review,
+        priority: 2,
+    };
+    let result = record_prompt_submission_with_policy(
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
@@ -120,6 +127,7 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
             external_id: Some("manual:prompt:1"),
             continuation: None,
         },
+        execution_policy.clone(),
     )
     .await?;
 
@@ -158,6 +166,7 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
     );
     assert_eq!(instance.data["source"], "dashboard");
     assert_eq!(instance.data["external_id"], "manual:prompt:1");
+    assert_eq!(instance.data["execution_policy"], json!(execution_policy));
     assert_eq!(instance.data["last_decision"], "submit_prompt");
     assert_eq!(
         instance.data["execution_path"],
@@ -170,6 +179,10 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
         .find(|event| event.event_type == "PromptSubmitted")
         .expect("prompt submission event");
     assert!(submitted_event.event.get("continuation").is_none());
+    assert_eq!(
+        submitted_event.event["execution_policy"],
+        instance.data["execution_policy"]
+    );
 
     let commands = store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);

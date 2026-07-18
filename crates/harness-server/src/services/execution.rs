@@ -18,19 +18,7 @@ use std::sync::Arc;
 
 mod runtime_submissions;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QueueDomain {
-    Primary,
-    Review,
-}
-
-pub struct EnqueueBackgroundOptions;
-
-impl Default for EnqueueBackgroundOptions {
-    fn default() -> Self {
-        Self
-    }
-}
+pub use crate::workflow_runtime_submission::runtime_models::QueueDomain;
 
 #[derive(Debug)]
 pub enum EnqueueTaskError {
@@ -67,12 +55,6 @@ pub trait ExecutionService: Send + Sync {
     ) -> Result<TaskId, EnqueueTaskError>;
 
     async fn enqueue_background(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError>;
-
-    async fn enqueue_background_with_options(
-        &self,
-        req: CreateTaskRequest,
-        options: EnqueueBackgroundOptions,
-    ) -> Result<TaskId, EnqueueTaskError>;
 }
 
 pub struct DefaultExecutionService {
@@ -450,14 +432,19 @@ impl DefaultExecutionService {
         )))
     }
 
-    async fn submit(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
+    async fn submit(
+        &self,
+        req: CreateTaskRequest,
+        queue_domain: QueueDomain,
+    ) -> Result<TaskId, EnqueueTaskError> {
         match self.prepare_enqueue(req).await? {
             PreparedEnqueueResult::Existing(task_id) => Ok(task_id),
             PreparedEnqueueResult::RuntimeIssueSubmission(prepared) => {
                 self.submit_issue_to_workflow_runtime(*prepared).await
             }
             PreparedEnqueueResult::RuntimePromptSubmission(prepared) => {
-                self.submit_prompt_to_workflow_runtime(*prepared).await
+                self.submit_prompt_to_workflow_runtime(*prepared, queue_domain)
+                    .await
             }
             PreparedEnqueueResult::RuntimeDeclarativeSubmission(prepared) => {
                 self.submit_declarative_to_workflow_runtime(*prepared).await
@@ -521,27 +508,19 @@ fn workflow_runtime_loops_enabled(project_root: &Path) -> Result<bool, EnqueueTa
 #[async_trait]
 impl ExecutionService for DefaultExecutionService {
     async fn enqueue(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
-        self.submit(req).await
+        self.submit(req, QueueDomain::Primary).await
     }
 
     async fn enqueue_in_domain(
         &self,
         req: CreateTaskRequest,
-        _queue_domain: QueueDomain,
+        queue_domain: QueueDomain,
     ) -> Result<TaskId, EnqueueTaskError> {
-        self.submit(req).await
+        self.submit(req, queue_domain).await
     }
 
     async fn enqueue_background(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
-        self.submit(req).await
-    }
-
-    async fn enqueue_background_with_options(
-        &self,
-        req: CreateTaskRequest,
-        _options: EnqueueBackgroundOptions,
-    ) -> Result<TaskId, EnqueueTaskError> {
-        self.submit(req).await
+        self.submit(req, QueueDomain::Primary).await
     }
 }
 
@@ -552,3 +531,7 @@ mod continuation_tests;
 #[cfg(test)]
 #[path = "execution_declarative_tests.rs"]
 mod declarative_tests;
+
+#[cfg(test)]
+#[path = "execution_runtime_policy_tests.rs"]
+mod runtime_policy_tests;

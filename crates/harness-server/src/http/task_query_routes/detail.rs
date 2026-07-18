@@ -107,7 +107,7 @@ async fn runtime_task_response_by_handle(
         return Ok(None);
     }
 
-    let task_kind = runtime_submission_task_kind(&workflow);
+    let task_kind = runtime_submission_task_kind(&workflow)?;
     let RuntimeWorkflowProjection {
         task_status,
         failure_kind,

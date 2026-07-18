@@ -92,6 +92,71 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn runtime_command_dispatch_tick_honors_prompt_execution_policy() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("prompt-policy-project");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "periodic-review:test"),
+    )
+    .with_id("prompt-execution-policy")
+    .with_data(serde_json::json!({
+        "project_id": project_root,
+        "execution_policy": {
+            "task_kind": "review",
+            "agent": "claude",
+            "turn_timeout_secs": 47,
+            "queue_domain": "review",
+            "priority": 1,
+        }
+    }));
+    store.upsert_instance(&workflow).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "implement_prompt",
+        "prompt-policy-implement",
+    );
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "codex-default",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 1);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].runtime_kind,
+        harness_workflow::runtime::RuntimeKind::ClaudeCode
+    );
+    assert_eq!(jobs[0].runtime_profile, "claude-default");
+    assert_eq!(jobs[0].input["runtime_profile"]["timeout_secs"], 47);
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fallback(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {

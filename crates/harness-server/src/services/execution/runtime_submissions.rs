@@ -77,6 +77,7 @@ impl DefaultExecutionService {
     pub(super) async fn submit_prompt_to_workflow_runtime(
         &self,
         prepared: PreparedRuntimePromptSubmission,
+        queue_domain: QueueDomain,
     ) -> Result<TaskId, EnqueueTaskError> {
         let Some(store) = self.workflow_runtime_store.as_deref() else {
             return Err(EnqueueTaskError::Internal(
@@ -96,7 +97,15 @@ impl DefaultExecutionService {
             .project
             .as_deref()
             .unwrap_or_else(|| std::path::Path::new(&prepared.project_id));
-        let record = crate::workflow_runtime_submission::record_prompt_submission(
+        let execution_policy =
+            crate::workflow_runtime_submission::runtime_models::PromptExecutionPolicy {
+                task_kind: prepared.req.task_kind(),
+                agent: prepared.req.agent.clone(),
+                turn_timeout_secs: Some(prepared.req.turn_timeout_secs),
+                queue_domain,
+                priority: prepared.req.priority,
+            };
+        let record = crate::workflow_runtime_submission::record_prompt_submission_with_policy(
             store,
             crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
                 project_root,
@@ -109,6 +118,7 @@ impl DefaultExecutionService {
                 external_id: prepared.req.external_id.as_deref(),
                 continuation: prepared.req.continuation.as_ref(),
             },
+            execution_policy,
         )
         .await
         .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;

@@ -9,6 +9,23 @@ pub const ROUND_BUDGET_EXHAUSTED_REASON: &str = "round_budget_exhausted";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum QueueDomain {
+    #[default]
+    Primary,
+    Review,
+}
+
+impl QueueDomain {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Review => "review",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     Issue,
     Pr,
@@ -136,6 +153,29 @@ impl AsRef<str> for TaskKind {
             Self::Prompt => "prompt",
             Self::Review => "review",
             Self::Planner => "planner",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptExecutionPolicy {
+    pub task_kind: TaskKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_timeout_secs: Option<u64>,
+    pub queue_domain: QueueDomain,
+    pub priority: u8,
+}
+
+impl Default for PromptExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            task_kind: TaskKind::Prompt,
+            agent: None,
+            turn_timeout_secs: None,
+            queue_domain: QueueDomain::Primary,
+            priority: 0,
         }
     }
 }

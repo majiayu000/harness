@@ -350,7 +350,7 @@ async fn enqueue_fallback_intake_issue(
 ) {
     let external_id = issue.external_id.clone();
     let req = fallback_intake_task_request(&issue, source.name(), default_project_root);
-    match crate::http::task_routes::enqueue_task_background(Arc::clone(state), req, None).await {
+    match crate::http::task_routes::enqueue_task_background(Arc::clone(state), req).await {
         Ok(task_id) => {
             if let Err(error) = source.mark_dispatched(&external_id, &task_id).await {
                 tracing::warn!(

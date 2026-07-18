@@ -25,7 +25,7 @@ mod runtime_workers;
 use runtime_command_dispatch::workflow_project_root;
 use runtime_profiles::{
     persist_runtime_profile_manifest, runtime_default_profile_for_project,
-    runtime_dispatch_profile_selector,
+    runtime_dispatch_profile_selector, runtime_profile_with_prompt_execution_policy,
 };
 const RUNTIME_WORKFLOW_CONFIG_RETRY_SECS: u64 = 30;
 

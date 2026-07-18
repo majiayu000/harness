@@ -359,14 +359,36 @@ async fn runtime_dispatch_profile_selector_for_command(
     )
     .await
     .map_err(RuntimeDispatchProfileSelectionError::Other)?;
-    Ok(Some(
-        runtime_dispatch_profile_selector(
-            &state.core.server.config,
-            &workflow_cfg.runtime_dispatch,
-            &inherited_profile,
-        )
-        .map_err(RuntimeDispatchProfileSelectionError::Other)?,
-    ))
+    let mut profile_selector = runtime_dispatch_profile_selector(
+        &state.core.server.config,
+        &workflow_cfg.runtime_dispatch,
+        &inherited_profile,
+    )
+    .map_err(RuntimeDispatchProfileSelectionError::Other)?;
+    if let Some(instance) = store
+        .get_instance(&command.workflow_id)
+        .await
+        .map_err(RuntimeDispatchProfileSelectionError::Other)?
+    {
+        if let Some(execution_policy) =
+            crate::workflow_runtime_submission::prompt_execution_policy(&instance.data)
+                .map_err(RuntimeDispatchProfileSelectionError::Other)?
+        {
+            let activity = command.command.runtime_activity_key();
+            let profile = runtime_profile_with_prompt_execution_policy(
+                &state.core.server.config,
+                profile_selector.select(Some(&instance.definition_id), Some(activity)),
+                &execution_policy,
+            )
+            .map_err(RuntimeDispatchProfileSelectionError::Other)?;
+            profile_selector = profile_selector.with_workflow_activity_profile(
+                instance.definition_id,
+                activity,
+                profile,
+            );
+        }
+    }
+    Ok(Some(profile_selector))
 }
 
 #[derive(Debug)]

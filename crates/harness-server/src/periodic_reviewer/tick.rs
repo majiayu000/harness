@@ -156,7 +156,6 @@ pub(super) async fn run_review_tick(
     let primary_review_id = task_routes::enqueue_task_background_in_domain(
         state.clone(),
         review_req,
-        None,
         task_routes::QueueDomain::Review,
     )
     .await
@@ -262,7 +261,6 @@ pub(super) async fn run_review_tick(
             match task_routes::enqueue_task_background_in_domain(
                 state_for_synthesis.clone(),
                 req,
-                None,
                 task_routes::QueueDomain::Review,
             )
             .await
@@ -349,7 +347,6 @@ pub(super) async fn run_review_tick(
                 match task_routes::enqueue_task_background_in_domain(
                     state_for_synthesis.clone(),
                     synth_req,
-                    None,
                     task_routes::QueueDomain::Review,
                 )
                 .await

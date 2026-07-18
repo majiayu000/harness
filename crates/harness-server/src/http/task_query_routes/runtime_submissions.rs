@@ -40,6 +40,8 @@ fn filter_includes_runtime_submission_kinds(filter: &RuntimeSubmissionSummaryFil
         || filter.kinds.contains(&TaskKind::Issue)
         || filter.kinds.contains(&TaskKind::Pr)
         || filter.kinds.contains(&TaskKind::Prompt)
+        || filter.kinds.contains(&TaskKind::Review)
+        || filter.kinds.contains(&TaskKind::Planner)
 }
 
 async fn append_runtime_definition_summaries(
@@ -60,7 +62,10 @@ async fn append_runtime_definition_summaries(
         repo: filter.repo.clone(),
         include_issue: include_all_kinds || filter.kinds.contains(&TaskKind::Issue),
         include_pr: include_all_kinds || filter.kinds.contains(&TaskKind::Pr),
-        include_prompt: include_all_kinds || filter.kinds.contains(&TaskKind::Prompt),
+        include_prompt: include_all_kinds
+            || filter.kinds.contains(&TaskKind::Prompt)
+            || filter.kinds.contains(&TaskKind::Review)
+            || filter.kinds.contains(&TaskKind::Planner),
         active_only: filter.active,
         task_statuses: filter
             .statuses
@@ -94,7 +99,7 @@ async fn append_runtime_definition_summaries(
             let Some(task_id) = projection.submission_handle.clone() else {
                 continue;
             };
-            let task_kind = runtime_submission_task_kind(&workflow);
+            let task_kind = runtime_submission_task_kind(&workflow)?;
             if !filter.kinds.is_empty() && !filter.kinds.contains(&task_kind) {
                 continue;
             }
@@ -123,7 +128,7 @@ async fn append_runtime_definition_summaries(
 
 pub(crate) fn runtime_submission_task_kind(
     workflow: &harness_workflow::runtime::WorkflowInstance,
-) -> TaskKind {
+) -> anyhow::Result<TaskKind> {
     if workflow.definition_id == harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID {
         if workflow
             .data
@@ -131,12 +136,16 @@ pub(crate) fn runtime_submission_task_kind(
             .and_then(|value| value.as_u64())
             .is_some()
         {
-            TaskKind::Issue
+            Ok(TaskKind::Issue)
         } else {
-            TaskKind::Pr
+            Ok(TaskKind::Pr)
         }
     } else {
-        TaskKind::Prompt
+        Ok(
+            crate::workflow_runtime_submission::prompt_execution_policy(&workflow.data)?
+                .map(|policy| policy.task_kind)
+                .unwrap_or(TaskKind::Prompt),
+        )
     }
 }
 
@@ -188,8 +197,11 @@ pub(crate) fn runtime_submission_description(
         TaskKind::Issue => issue
             .map(|issue_number| format!("issue #{issue_number}"))
             .unwrap_or_else(|| workflow.subject.subject_key.clone()),
-        TaskKind::Prompt => runtime_string_field(&workflow.data, "prompt_summary")
-            .unwrap_or_else(|| "prompt task".to_string()),
+        TaskKind::Prompt | TaskKind::Review | TaskKind::Planner => {
+            runtime_string_field(&workflow.data, "prompt_summary")
+                .or_else(|| task_kind.prompt_task_label().map(str::to_string))
+                .unwrap_or_else(|| "prompt task".to_string())
+        }
         _ => workflow.subject.subject_key.clone(),
     }
 }
@@ -201,8 +213,50 @@ pub(crate) fn runtime_external_id(
 ) -> Option<String> {
     match task_kind {
         TaskKind::Issue => issue.map(|issue_number| format!("issue:{issue_number}")),
-        TaskKind::Prompt => runtime_string_field(workflow_data, "external_id"),
-        TaskKind::Pr | TaskKind::Review | TaskKind::Planner => None,
+        TaskKind::Prompt | TaskKind::Review | TaskKind::Planner => {
+            runtime_string_field(workflow_data, "external_id")
+        }
+        TaskKind::Pr => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_workflow::runtime::{WorkflowInstance, WorkflowSubject};
+    use serde_json::json;
+
+    #[test]
+    fn runtime_submission_projection_preserves_review_kind() -> anyhow::Result<()> {
+        let workflow = WorkflowInstance::new(
+            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("prompt", "periodic-review:test"),
+        )
+        .with_data(json!({
+            "prompt_summary": "periodic review",
+            "external_id": "periodic-review:test",
+            "execution_policy": {
+                "task_kind": "review",
+                "agent": "codex",
+                "turn_timeout_secs": 90,
+                "queue_domain": "review",
+                "priority": 0,
+            }
+        }));
+
+        let task_kind = runtime_submission_task_kind(&workflow)?;
+        assert_eq!(task_kind, TaskKind::Review);
+        assert_eq!(
+            runtime_submission_description(&workflow, task_kind, None),
+            "periodic review"
+        );
+        assert_eq!(
+            runtime_external_id(task_kind, &workflow.data, None).as_deref(),
+            Some("periodic-review:test")
+        );
+        Ok(())
     }
 }
 
