@@ -175,10 +175,8 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
 
     let dashboard_counts = state.task_svc.count_for_dashboard().await;
     let runtime_hosts = state.runtime_hosts.list_hosts();
-    let runtime_host_leases: u64 = runtime_hosts
-        .iter()
-        .map(|host| state.core.tasks.active_runtime_host_lease_count(&host.id) as u64)
-        .sum();
+    let runtime_host_leases =
+        super::runtime_hosts::active_runtime_job_lease_count_total(state).await?;
     let runtime_log_state = state.core.server.runtime_logs.state.as_str();
     let degraded_subsystems = state.degraded_subsystems.clone();
     let runtime_state_dirty = state.is_runtime_state_dirty();

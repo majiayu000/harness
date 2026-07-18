@@ -196,32 +196,39 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         }
     };
 
-    let runtime_hosts: Vec<Value> = state
-        .runtime_hosts
-        .list_hosts()
-        .into_iter()
-        .map(|host| {
-            let snapshot = state.runtime_project_cache.get_host_cache(&host.id);
-            let watched_projects = snapshot.as_ref().map(|s| s.project_count).unwrap_or(0);
-            let watched_project_roots: Vec<&str> = snapshot
-                .as_ref()
-                .map(|s| s.projects.iter().map(|p| p.root.as_str()).collect())
-                .unwrap_or_default();
-            let active_leases = state.core.tasks.active_runtime_host_lease_count(&host.id);
-            let assignment_pressure = active_leases as f64 / watched_projects.max(1) as f64;
-            json!({
-                "id": host.id,
-                "display_name": host.display_name,
-                "capabilities": host.capabilities,
-                "online": host.online,
-                "last_heartbeat_at": host.last_heartbeat_at,
-                "watched_projects": watched_projects,
-                "watched_project_roots": watched_project_roots,
-                "active_leases": active_leases,
-                "assignment_pressure": assignment_pressure,
-            })
-        })
-        .collect();
+    let mut runtime_hosts = Vec::new();
+    for host in state.runtime_hosts.list_hosts() {
+        let snapshot = state.runtime_project_cache.get_host_cache(&host.id);
+        let watched_projects = snapshot.as_ref().map(|s| s.project_count).unwrap_or(0);
+        let watched_project_roots: Vec<&str> = snapshot
+            .as_ref()
+            .map(|s| s.projects.iter().map(|p| p.root.as_str()).collect())
+            .unwrap_or_default();
+        let active_leases =
+            match super::runtime_hosts::active_runtime_job_lease_count(&state, &host.id).await {
+                Ok(count) => Some(count),
+                Err(error) => {
+                    tracing::warn!(
+                        host_id = %host.id,
+                        "dashboard: failed to count runtime-job leases: {error}"
+                    );
+                    None
+                }
+            };
+        let assignment_pressure =
+            active_leases.map(|count| count as f64 / watched_projects.max(1) as f64);
+        runtime_hosts.push(json!({
+            "id": host.id,
+            "display_name": host.display_name,
+            "capabilities": host.capabilities,
+            "online": host.online,
+            "last_heartbeat_at": host.last_heartbeat_at,
+            "watched_projects": watched_projects,
+            "watched_project_roots": watched_project_roots,
+            "active_leases": active_leases,
+            "assignment_pressure": assignment_pressure,
+        }));
+    }
     let runtime_hosts_total = runtime_hosts.len() as u64;
     let runtime_hosts_online = runtime_hosts
         .iter()

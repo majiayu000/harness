@@ -5,7 +5,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use harness_core::db::{pg_open_pool, pg_schema_for_path, resolve_test_database_url};
+use harness_core::db::{pg_open_pool, resolve_test_database_url};
 use tokio::sync::OnceCell;
 
 /// Serialises every test that reads or mutates the process-global `HOME` env
@@ -140,18 +140,6 @@ pub async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> 
         HarnessConfig::default(),
     )
     .await
-}
-
-pub async fn drop_tasks_table(dir: &std::path::Path) -> anyhow::Result<()> {
-    let db_path = harness_core::config::dirs::default_db_path(dir, "tasks");
-    let database_url = harness_core::db::resolve_test_database_url(None)?;
-    let schema = pg_schema_for_path(&db_path)?;
-    let pool = harness_core::db::pg_open_pool_schematized(&database_url, &schema).await?;
-    sqlx::query("DROP TABLE tasks CASCADE")
-        .execute(&pool)
-        .await?;
-    pool.close().await;
-    Ok(())
 }
 
 pub async fn make_test_state_with_registry(

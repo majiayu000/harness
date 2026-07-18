@@ -141,10 +141,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(crate::handlers::runtime_hosts::deregister_runtime_host),
         )
         .route(
-            "/api/runtime-hosts/{host_id}/tasks/claim",
-            post(crate::handlers::runtime_hosts::claim_task_for_runtime_host),
-        )
-        .route(
             "/api/runtime-hosts/{host_id}/runtime-jobs/claim",
             post(crate::handlers::runtime_hosts::claim_runtime_job_for_runtime_host),
         )

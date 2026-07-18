@@ -25,12 +25,6 @@ pub struct RegisterRuntimeHostRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ClaimTaskRequest {
-    pub lease_secs: Option<u64>,
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct CompleteRuntimeJobRequest {
     pub lease_expires_at: DateTime<Utc>,
     #[serde(default)]
@@ -43,6 +37,27 @@ pub async fn list_runtime_hosts(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let hosts = state.runtime_hosts.list_hosts();
     (StatusCode::OK, Json(json!({ "hosts": hosts })))
+}
+
+pub(crate) async fn active_runtime_job_lease_count(
+    state: &AppState,
+    host_id: &str,
+) -> anyhow::Result<u64> {
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("workflow runtime store unavailable"))?;
+    let count = store.count_remote_host_runtime_job_leases(host_id).await?;
+    u64::try_from(count).map_err(|_| anyhow::anyhow!("runtime job lease count is negative"))
+}
+
+pub(crate) async fn active_runtime_job_lease_count_total(state: &AppState) -> anyhow::Result<u64> {
+    let mut total = 0_u64;
+    for host in state.runtime_hosts.list_hosts() {
+        total = total.saturating_add(active_runtime_job_lease_count(state, &host.id).await?);
+    }
+    Ok(total)
 }
 
 pub async fn register_runtime_host(
@@ -177,31 +192,6 @@ pub async fn deregister_runtime_host(
             }
         }
 
-        match state.core.tasks.release_runtime_host_claims(&host_id).await {
-            Ok(released) => {
-                if !released.is_empty() {
-                    tracing::info!(
-                        host_id = %host_id,
-                        released_tasks = released.len(),
-                        "runtime host deregistration released pending scheduler leases"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    host_id = %host_id,
-                    error = %e,
-                    "failed to release runtime-host-owned task leases during deregistration"
-                );
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({
-                        "error": format!("failed to release task leases for runtime host: {e}")
-                    })),
-                );
-            }
-        }
-
         let draining_record = state
             .runtime_hosts
             .hosts
@@ -222,104 +212,6 @@ pub async fn deregister_runtime_host(
         }
         (StatusCode::OK, Json(json!({ "deregistered": true })))
     }
-}
-
-pub async fn claim_task_for_runtime_host(
-    State(state): State<Arc<AppState>>,
-    Path(host_id): Path<String>,
-    Json(req): Json<ClaimTaskRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
-    if !state.runtime_hosts.hosts.contains_key(&host_id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("runtime host '{host_id}' is not registered") })),
-        );
-    }
-    if !state.runtime_hosts.is_active(&host_id) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "runtime host is draining" })),
-        );
-    }
-
-    let project_filter = req
-        .project
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    let mut tasks: Vec<(crate::task_runner::TaskId, Option<String>, Option<String>)> = state
-        .core
-        .tasks
-        .list_all()
-        .into_iter()
-        .filter(|task| task.status.as_ref() == "pending")
-        .map(|task| {
-            (
-                task.id,
-                task.created_at,
-                task.project_root.map(|p| p.to_string_lossy().into_owned()),
-            )
-        })
-        .filter(|(_, _, project)| match project_filter {
-            Some(filter) => project.as_deref() == Some(filter),
-            None => true,
-        })
-        .collect();
-    tasks.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
-
-    let lease_secs = match req.lease_secs {
-        Some(value) => match i64::try_from(value) {
-            Ok(v) => Some(v),
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "lease_secs must be <= i64::MAX" })),
-                )
-            }
-        },
-        None => None,
-    };
-
-    for (task_id, _, _) in tasks {
-        match state
-            .core
-            .tasks
-            .claim_for_runtime_host(&task_id, &host_id, lease_secs)
-            .await
-        {
-            Ok(Some(claim)) => {
-                return (
-                    StatusCode::OK,
-                    Json(json!({
-                        "claimed": true,
-                        "task_id": claim.task_id,
-                        "lease_expires_at": claim.lease_expires_at
-                    })),
-                );
-            }
-            Ok(None) => continue,
-            Err(e) => {
-                let message = e.to_string();
-                if message.contains("too large to compute a valid expiration timestamp") {
-                    return (StatusCode::BAD_REQUEST, Json(json!({ "error": message })));
-                }
-                tracing::error!(
-                    host_id = %host_id,
-                    task_id = %task_id,
-                    error = %message,
-                    "runtime host claim failed to persist authoritative scheduler state"
-                );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("failed to claim task: {message}") })),
-                );
-            }
-        }
-    }
-
-    (StatusCode::OK, Json(json!({ "claimed": false })))
 }
 
 pub async fn claim_runtime_job_for_runtime_host(
