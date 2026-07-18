@@ -49,7 +49,7 @@ runtime_dispatch:
 runtime_worker:
   enabled: true
   interval_secs: 5
-  concurrency: 32
+  concurrency: 8
   lease_ttl_secs: 600
 runtime_retry_policy:
   max_failed_activity_retries: 6
