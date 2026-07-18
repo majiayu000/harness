@@ -30,8 +30,6 @@ mod health_route_tests;
 mod intake_auth_list_tests;
 mod prompt_continuation_runtime_tests;
 mod queue_stats_route_tests;
-mod recovery_followup_tests;
-mod recovery_tests;
 mod repo_memory_api_tests;
 mod runtime_approval_route_tests;
 mod runtime_deferred_tree_tests;

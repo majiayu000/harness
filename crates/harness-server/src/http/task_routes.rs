@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-pub(crate) use crate::services::execution::{select_agent, QueueDomain};
+pub(crate) use crate::services::execution::QueueDomain;
 
 pub(crate) async fn enqueue_task(
     state: &Arc<AppState>,

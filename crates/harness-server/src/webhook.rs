@@ -1,8 +1,8 @@
-use crate::task_executor::pr_detection::{
+use crate::task_runner::CreateTaskRequest;
+use crate::workflow_runtime_pr_feedback::pr_detection::{
     build_fix_ci_prompt, build_pr_approved_prompt, parse_harness_mention_command,
     HarnessMentionCommand,
 };
-use crate::task_runner::CreateTaskRequest;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]

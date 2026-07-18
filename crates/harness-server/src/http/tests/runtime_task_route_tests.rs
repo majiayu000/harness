@@ -1070,68 +1070,7 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let legacy_task_id = task_runner::TaskId::from_str("legacy-only-task");
-    state
-        .core
-        .tasks
-        .insert(&task_runner::TaskState::new(legacy_task_id.clone()))
-        .await;
-
-    let app = Router::new()
-        .route(
-            "/api/workflows/runtime/submissions",
-            get(task_query_routes::list_runtime_submissions)
-                .post(task_routes::create_runtime_submission),
-        )
-        .route(
-            "/api/workflows/runtime/submissions/{id}",
-            get(task_query_routes::get_runtime_submission),
-        )
-        .route(
-            "/api/workflows/runtime/submissions/{id}/artifacts",
-            get(runtime_submission_routes::get_artifacts),
-        )
-        .route(
-            "/api/workflows/runtime/submissions/{id}/prompts",
-            get(runtime_submission_routes::get_prompts),
-        )
-        .route(
-            "/api/workflows/runtime/submissions/{id}/proof",
-            get(task_query_routes::get_runtime_submission_proof),
-        )
-        .with_state(state.clone());
-
-    let legacy_duplicate_request = task_runner::CreateTaskRequest {
-        issue: Some(42),
-        repo: Some("owner/repo".to_string()),
-        project: Some(project_root.canonicalize()?),
-        external_id: Some("issue:42".to_string()),
-        ..Default::default()
-    };
-    task_runner::register_pending_task(state.core.tasks.clone(), &legacy_duplicate_request).await;
-    let legacy_duplicate_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/workflows/runtime/submissions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "project": project_root.display().to_string(),
-                        "repo": "owner/repo",
-                        "issue": 42
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    assert_eq!(legacy_duplicate_response.status(), StatusCode::CONFLICT);
-    let legacy_duplicate = response_json(legacy_duplicate_response).await?;
-    assert_eq!(legacy_duplicate["error"], "legacy_submission_active");
-    assert!(legacy_duplicate.get("task_id").is_none());
-    assert!(legacy_duplicate.get("submission_id").is_none());
-
+    let app = runtime_submission_app(state.clone());
     let request_body = serde_json::json!({
         "project": project_root.display().to_string(),
         "prompt": "exercise runtime-only submission routes",
@@ -1290,7 +1229,6 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         .collect::<Vec<_>>();
     assert!(listed_ids.contains(&submission_id.as_str()));
     assert!(listed_ids.contains(&declarative_submission_id));
-    assert!(!listed_ids.contains(&legacy_task_id.as_str()));
 
     let declarative_detail_response = app
         .clone()
@@ -1341,19 +1279,6 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
     assert!(detail["pr_url"].is_null());
     assert!(detail["created_at"].as_str().is_some());
     assert!(detail["updated_at"].as_str().is_some());
-
-    let legacy_detail_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "/api/workflows/runtime/submissions/{}",
-                    legacy_task_id.as_str()
-                ))
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(legacy_detail_response.status(), StatusCode::NOT_FOUND);
 
     let prompts_response = app
         .clone()

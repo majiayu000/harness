@@ -226,6 +226,32 @@ pub(super) fn workflow_runtime_app(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+pub(super) fn runtime_submission_app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/api/workflows/runtime/submissions",
+            get(task_query_routes::list_runtime_submissions)
+                .post(task_routes::create_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/artifacts",
+            get(runtime_submission_routes::get_artifacts),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/prompts",
+            get(runtime_submission_routes::get_prompts),
+        )
+        .route(
+            "/api/workflows/runtime/submissions/{id}/proof",
+            get(task_query_routes::get_runtime_submission_proof),
+        )
+        .with_state(state)
+}
+
 pub(super) fn webhook_app(state: Arc<AppState>) -> Router {
     let body_limit = state.core.server.config.server.max_webhook_body_bytes;
     Router::new()

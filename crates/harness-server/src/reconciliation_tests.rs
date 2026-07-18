@@ -329,7 +329,7 @@ async fn resolve_repo_slug_uses_candidate_project_root_when_repo_missing() {
     write_git_remote_config(repo_a.path(), "https://github.com/example/repo-a.git");
     write_git_remote_config(repo_b.path(), "https://github.com/example/repo-b.git");
     assert_eq!(
-        crate::task_executor::pr_detection::detect_repo_slug(repo_a.path()).await,
+        crate::workflow_runtime_pr_feedback::pr_detection::detect_repo_slug(repo_a.path()).await,
         Some("example/repo-a".to_string())
     );
 

@@ -1,8 +1,5 @@
-use crate::http::{resolve_reviewer, AppState};
-use harness_core::{
-    config::resolve::resolve_config,
-    types::{Decision, DraftId, DraftStatus, Event, ProjectId, SessionId},
-};
+use crate::http::AppState;
+use harness_core::types::{Decision, DraftId, DraftStatus, Event, ProjectId, SessionId};
 use harness_protocol::{
     methods::RpcResponse, methods::CONFLICT, methods::INTERNAL_ERROR, methods::NOT_FOUND,
 };
@@ -12,8 +9,8 @@ fn gc_adopt_task_request(
     prompt: String,
     gc_config: &harness_core::config::misc::GcConfig,
     project_root: std::path::PathBuf,
-) -> crate::task_runner::CreateTaskRequest {
-    crate::task_runner::CreateTaskRequest {
+) -> crate::workflow_runtime_submission::CreateTaskRequest {
+    crate::workflow_runtime_submission::CreateTaskRequest {
         prompt: Some(prompt),
         project: Some(project_root),
         wait_secs: gc_config.adopt_wait_secs,
@@ -253,13 +250,6 @@ pub async fn gc_adopt(
     let needs_task_dispatch = !artifact_paths.is_empty() && state.core.server.config.gc.auto_pr;
 
     let task_dispatch_plan = if needs_task_dispatch {
-        let Some(agent) = state.core.server.agent_registry.default_agent() else {
-            return RpcResponse::error(
-                id,
-                INTERNAL_ERROR,
-                "gc_adopt auto_pr requires a registered default agent",
-            );
-        };
         let path_refs: Vec<&str> = artifact_paths.iter().map(String::as_str).collect();
         let prompt = harness_core::prompts::gc_adopt_prompt(
             &draft_id.to_string(),
@@ -272,29 +262,7 @@ pub async fn gc_adopt(
             &state.core.server.config.gc,
             state.core.project_root.clone(),
         );
-        let project_config =
-            match harness_core::config::project::load_project_config(&state.core.project_root) {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    return RpcResponse::error(
-                        id,
-                        INTERNAL_ERROR,
-                        format!("failed to load project config: {e}"),
-                    );
-                }
-            };
-        let resolved = resolve_config(&state.core.server.config, &project_config);
-        let (reviewer, _review_config) = resolve_reviewer(
-            &state.core.server.agent_registry,
-            &resolved.review,
-            agent.name(),
-        );
-        Some((
-            agent,
-            reviewer,
-            req,
-            state.core.project_root.to_string_lossy().into_owned(),
-        ))
+        Some(req)
     } else {
         None
     };
@@ -315,40 +283,16 @@ pub async fn gc_adopt(
                     serde_json::json!({ "adopted": true, "task_id": null }),
                 );
             }
-            let dispatch_result =
-                if let Some((agent, reviewer, req, project_id)) = task_dispatch_plan {
-                    match state.concurrency.task_queue.acquire(&project_id, 0).await {
-                        Ok(permit) => {
-                            let tid = crate::task_runner::spawn_task(
-                                state.core.tasks.clone(),
-                                agent,
-                                reviewer,
-                                std::sync::Arc::new(state.core.server.config.clone()),
-                                state.engines.skills.clone(),
-                                state.observability.events.clone(),
-                                state.interceptors.clone(),
-                                req,
-                                state.concurrency.workspace_mgr.clone(),
-                                permit,
-                                None,
-                                state.core.issue_workflow_store.clone(),
-                                state.core.workflow_runtime_store.clone(),
-                                state
-                                    .core
-                                    .server
-                                    .config
-                                    .server
-                                    .allowed_project_roots
-                                    .clone(),
-                            )
-                            .await;
-                            Ok(Some(tid.0))
-                        }
-                        Err(e) => Err(format!("task queue full: {e}")),
-                    }
-                } else {
-                    Ok(None)
-                };
+            let dispatch_result = if let Some(req) = task_dispatch_plan {
+                state
+                    .execution_svc
+                    .enqueue(req)
+                    .await
+                    .map(|task_id| Some(task_id.0))
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(None)
+            };
 
             let (task_id, dispatch_error) = match dispatch_result {
                 Ok(task_id) => (task_id, None),

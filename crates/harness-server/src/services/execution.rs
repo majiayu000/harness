@@ -5,15 +5,12 @@
 //! mandatory for declarative, issue, PR-feedback, and prompt requests.
 
 use crate::{
-    complexity_router,
     project_registry::{check_allowed_roots, ProjectRegistry},
     workflow_runtime_submission::{
         self, CreateTaskRequest, RuntimeDependencyStatus, TaskId, MAX_TASK_PRIORITY,
     },
 };
 use async_trait::async_trait;
-use harness_agents::registry::AgentRegistry;
-use harness_core::agent::CodeAgent;
 use harness_core::config::HarnessConfig;
 use harness_workflow::runtime::{WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID};
 use std::path::{Path, PathBuf};
@@ -149,48 +146,6 @@ pub(crate) async fn resolve_project_from_registry(
         ))),
         Err(error) => Err(EnqueueTaskError::Internal(error.to_string())),
     }
-}
-
-pub(crate) fn select_agent(
-    req: &CreateTaskRequest,
-    registry: &AgentRegistry,
-    registry_agent: Option<&str>,
-) -> Result<Arc<dyn CodeAgent>, EnqueueTaskError> {
-    if let Some(name) = &req.agent {
-        return registry
-            .get(name)
-            .ok_or_else(|| EnqueueTaskError::BadRequest(format!("agent '{name}' not registered")));
-    }
-
-    if let Some(project_root) = &req.project {
-        let project_config = harness_core::config::project::load_project_config(project_root)
-            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
-        if let Some(agent_name) = project_config
-            .agent
-            .as_ref()
-            .and_then(|agents| agents.default.as_ref())
-        {
-            if agent_name != "auto" {
-                return registry.get(agent_name).ok_or_else(|| {
-                    EnqueueTaskError::BadRequest(format!("agent '{agent_name}' not registered"))
-                });
-            }
-        }
-    }
-
-    if let Some(name) = registry_agent {
-        if name != "auto" {
-            return registry.get(name).ok_or_else(|| {
-                EnqueueTaskError::BadRequest(format!("agent '{name}' not registered"))
-            });
-        }
-    }
-
-    let classification =
-        complexity_router::classify(req.prompt.as_deref().unwrap_or_default(), req.issue, req.pr);
-    registry
-        .dispatch(&classification)
-        .map_err(|error| EnqueueTaskError::Internal(error.to_string()))
 }
 
 impl DefaultExecutionService {

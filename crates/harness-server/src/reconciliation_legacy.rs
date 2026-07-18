@@ -43,8 +43,10 @@ pub(super) async fn resolve_repo_slug(
                     return cached.clone();
                 }
 
-                let detected =
-                    crate::task_executor::pr_detection::detect_repo_slug(project_root).await;
+                let detected = crate::workflow_runtime_pr_feedback::pr_detection::detect_repo_slug(
+                    project_root,
+                )
+                .await;
                 repo_slug_cache.insert(project_root.clone(), detected.clone());
                 detected
             }

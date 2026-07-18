@@ -101,21 +101,6 @@ impl TaskStore {
         self.db.load_checkpoint(task_id.as_str()).await
     }
 
-    /// Return pending tasks that have a plan or triage checkpoint but no `pr_url`.
-    ///
-    /// Used at startup to re-dispatch tasks recovered from plan/triage checkpoints
-    /// that were not caught by the PR-based redispatch path.
-    pub(crate) async fn pending_tasks_with_checkpoint(
-        &self,
-    ) -> anyhow::Result<Vec<(TaskState, crate::task_db::TaskCheckpoint)>> {
-        self.db.pending_tasks_with_checkpoint().await
-    }
-
-    /// Return pending tasks that have no PR URL and no checkpoint row.
-    pub(crate) async fn pending_orphan_tasks(&self) -> anyhow::Result<Vec<TaskState>> {
-        self.db.pending_orphan_tasks().await
-    }
-
     /// Overwrite `external_id` on an auto-fix task, even if one is already set.
     ///
     /// Used during streaming to implement "last sentinel wins" — the agent may

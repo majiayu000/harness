@@ -435,7 +435,7 @@ pub(in crate::http) async fn github_repo_project_root(
         .filter(|path| !path.trim().is_empty())
         .map(|path| expand_home_path(path))
         .unwrap_or_else(|| fallback.to_path_buf());
-    match task_runner::resolve_canonical_project(Some(configured.clone())).await {
+    match tokio::fs::canonicalize(&configured).await {
         Ok(path) => path,
         Err(error) => {
             tracing::warn!(

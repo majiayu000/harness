@@ -39,8 +39,6 @@ pub(crate) mod task_submission_routes;
 mod workflow_watchdog;
 
 #[cfg(test)]
-mod reviewer_resolution_tests;
-#[cfg(test)]
 mod shutdown_test;
 #[cfg(test)]
 mod startup_tests;
@@ -70,47 +68,6 @@ pub(crate) use task_query_routes::get_task_proof;
 pub(crate) use task_submission_routes::{
     get_task, get_task_artifacts, get_task_prompts, list_tasks,
 };
-
-/// Resolve the reviewer agent for independent agent review.
-///
-/// 1. If `config.reviewer_agent` is set, use it.
-/// 2. Otherwise, auto-select the first registered agent that isn't the implementor.
-/// 3. If none found, return None (agent review will be skipped).
-pub(crate) fn resolve_reviewer(
-    registry: &harness_agents::registry::AgentRegistry,
-    config: &harness_core::config::agents::AgentReviewConfig,
-    implementor_name: &str,
-) -> (
-    Option<Arc<dyn harness_core::agent::CodeAgent>>,
-    harness_core::config::agents::AgentReviewConfig,
-) {
-    if !config.enabled {
-        return (None, config.clone());
-    }
-
-    // Explicit reviewer
-    if !config.reviewer_agent.is_empty() {
-        if let Some(agent) = registry.get(&config.reviewer_agent) {
-            return (Some(agent), config.clone());
-        }
-        tracing::warn!(
-            "agents.review.reviewer_agent '{}' not registered, skipping agent review",
-            config.reviewer_agent
-        );
-        return (None, config.clone());
-    }
-
-    // Auto-select: first agent != implementor
-    for name in registry.list() {
-        if name != implementor_name {
-            if let Some(agent) = registry.get(name) {
-                return (Some(agent), config.clone());
-            }
-        }
-    }
-
-    (None, config.clone())
-}
 
 /// Extract the PR number from a GitHub PR URL.
 ///
@@ -212,9 +169,6 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         );
     }
 
-    // Spawn background watcher for AwaitingDeps tasks.
-    background::spawn_awaiting_deps_watcher(&state);
-
     // Watch the notify drop counter and raise external alerts (GH1582).
     // The handle is registered with the dispatcher so shutdown aborts it.
     if let Some(watcher) =
@@ -239,22 +193,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         tracing::info!("startup reconciliation disabled by config");
     }
 
-    // Re-dispatch tasks that were recovered to pending after server restart.
-    // These had PRs when the server crashed and need their review loop re-started.
-    background::spawn_pr_recovery(&state);
-
-    // Re-dispatch recovered review/planner tasks that have restart-safe input bundles.
-    background::spawn_system_task_recovery(&state);
-
     // Opt-in bounded auto-recovery rechecks for transient-classified stopped
     // workflow-runtime instances (GH-1584). Not spawned when globally disabled.
     background::spawn_auto_recovery(&state);
-
-    // Re-dispatch tasks recovered from plan/triage checkpoints but without a PR.
-    background::spawn_checkpoint_recovery(&state).await;
-
-    // Re-dispatch leftover pending tasks that crashed before their first checkpoint.
-    background::spawn_orphan_pending_recovery(&state).await;
 
     // Periodically sweep runtime issue workflows with attached PRs and emit
     // workflow command outbox rows.

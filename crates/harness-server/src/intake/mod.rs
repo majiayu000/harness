@@ -187,13 +187,11 @@ impl IntakeOrchestrator {
                 .first()
                 .and_then(|(_, i)| i.project_root.clone())
                 .unwrap_or_else(|| state.core.project_root.clone());
-            let project_id =
-                match crate::task_runner::resolve_canonical_project(Some(project_root.clone()))
-                    .await
-                {
-                    Ok(path) => path.to_string_lossy().into_owned(),
-                    Err(_) => state.core.project_root.to_string_lossy().into_owned(),
-                };
+            let project_id = tokio::fs::canonicalize(&project_root)
+                .await
+                .unwrap_or_else(|_| state.core.project_root.clone())
+                .to_string_lossy()
+                .into_owned();
             if let Some(workflows) = state.core.project_workflow_store.as_ref() {
                 if let Err(e) = workflows
                     .record_poll_started(&project_id, Some(&repo))

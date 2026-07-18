@@ -666,7 +666,7 @@ impl IntakeSource for GitHubIssuesPoller {
         let needs_manual = result
             .error
             .as_deref()
-            .map(|e| e.contains(crate::task_executor::gates::MANUAL_RESOLUTION_REQUIRED))
+            .map(|e| e.contains("manual resolution required"))
             .unwrap_or(false);
         let is_workspace_lifecycle = matches!(
             result.failure_kind,
