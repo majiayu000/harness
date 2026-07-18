@@ -3,6 +3,7 @@ use crate::runtime::model::{RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeK
 use chrono::{DateTime, TimeDelta, Timelike, Utc};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +368,22 @@ impl WorkflowRuntimeStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(count)
+    }
+
+    pub async fn count_remote_host_runtime_job_leases_by_owner(
+        &self,
+    ) -> anyhow::Result<BTreeMap<String, i64>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT data #>> '{lease,owner}' AS owner, COUNT(*) AS count
+             FROM runtime_jobs
+             WHERE status = 'running'
+               AND runtime_kind = 'remote_host'
+               AND data #>> '{lease,owner}' IS NOT NULL
+             GROUP BY data #>> '{lease,owner}'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 }
 

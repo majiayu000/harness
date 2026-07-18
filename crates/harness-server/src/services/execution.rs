@@ -478,7 +478,7 @@ async fn resolve_canonical_project(project: Option<PathBuf>) -> anyhow::Result<P
         .await
         .map_err(|error| anyhow::anyhow!("detect_main_worktree failed: {error}"))?,
     };
-    Ok(raw.canonicalize().unwrap_or(raw))
+    Ok(tokio::fs::canonicalize(&raw).await.unwrap_or(raw))
 }
 
 fn runtime_prompt_duplicate_allows_resubmission(

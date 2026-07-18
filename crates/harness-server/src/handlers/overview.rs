@@ -178,19 +178,19 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         .workspace_mgr
         .as_ref()
         .map_or(0, |m| m.live_count());
+    let active_lease_counts =
+        match super::runtime_hosts::active_runtime_job_lease_counts(&state).await {
+            Ok(counts) => Some(counts),
+            Err(error) => {
+                tracing::warn!("overview: failed to count runtime-job leases: {error}");
+                None
+            }
+        };
     let mut worktrees_used: u64 = local_worktrees;
     for host in &runtime_hosts {
-        let active_leases =
-            match super::runtime_hosts::active_runtime_job_lease_count(&state, &host.id).await {
-                Ok(count) => Some(count),
-                Err(error) => {
-                    tracing::warn!(
-                        host_id = %host.id,
-                        "overview: failed to count runtime-job leases: {error}"
-                    );
-                    None
-                }
-            };
+        let active_leases = active_lease_counts
+            .as_ref()
+            .map(|counts| counts.get(&host.id).copied().unwrap_or(0));
         if let Some(active_leases) = active_leases {
             worktrees_used = worktrees_used.saturating_add(active_leases);
         }

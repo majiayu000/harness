@@ -182,6 +182,14 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         }
     };
 
+    let active_lease_counts =
+        match super::runtime_hosts::active_runtime_job_lease_counts(&state).await {
+            Ok(counts) => Some(counts),
+            Err(error) => {
+                tracing::warn!("dashboard: failed to count runtime-job leases: {error}");
+                None
+            }
+        };
     let mut runtime_hosts = Vec::new();
     for host in state.runtime_hosts.list_hosts() {
         let snapshot = state.runtime_project_cache.get_host_cache(&host.id);
@@ -190,17 +198,9 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             .as_ref()
             .map(|s| s.projects.iter().map(|p| p.root.as_str()).collect())
             .unwrap_or_default();
-        let active_leases =
-            match super::runtime_hosts::active_runtime_job_lease_count(&state, &host.id).await {
-                Ok(count) => Some(count),
-                Err(error) => {
-                    tracing::warn!(
-                        host_id = %host.id,
-                        "dashboard: failed to count runtime-job leases: {error}"
-                    );
-                    None
-                }
-            };
+        let active_leases = active_lease_counts
+            .as_ref()
+            .map(|counts| counts.get(&host.id).copied().unwrap_or(0));
         let assignment_pressure =
             active_leases.map(|count| count as f64 / watched_projects.max(1) as f64);
         runtime_hosts.push(json!({

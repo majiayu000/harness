@@ -11,7 +11,7 @@ use harness_workflow::runtime::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 mod lease;
 pub use lease::renew_runtime_job_lease_for_runtime_host;
@@ -39,25 +39,35 @@ pub async fn list_runtime_hosts(
     (StatusCode::OK, Json(json!({ "hosts": hosts })))
 }
 
-pub(crate) async fn active_runtime_job_lease_count(
+pub(crate) async fn active_runtime_job_lease_counts(
     state: &AppState,
-    host_id: &str,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<BTreeMap<String, u64>> {
     let store = state
         .core
         .workflow_runtime_store
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("workflow runtime store unavailable"))?;
-    let count = store.count_remote_host_runtime_job_leases(host_id).await?;
-    u64::try_from(count).map_err(|_| anyhow::anyhow!("runtime job lease count is negative"))
+    store
+        .count_remote_host_runtime_job_leases_by_owner()
+        .await?
+        .into_iter()
+        .map(|(host_id, count)| {
+            u64::try_from(count)
+                .map(|count| (host_id, count))
+                .map_err(|_| anyhow::anyhow!("runtime job lease count is negative"))
+        })
+        .collect()
 }
 
 pub(crate) async fn active_runtime_job_lease_count_total(state: &AppState) -> anyhow::Result<u64> {
-    let mut total = 0_u64;
-    for host in state.runtime_hosts.list_hosts() {
-        total = total.saturating_add(active_runtime_job_lease_count(state, &host.id).await?);
-    }
-    Ok(total)
+    let counts = active_runtime_job_lease_counts(state).await?;
+    Ok(state
+        .runtime_hosts
+        .list_hosts()
+        .iter()
+        .filter_map(|host| counts.get(&host.id))
+        .copied()
+        .fold(0_u64, u64::saturating_add))
 }
 
 pub async fn register_runtime_host(

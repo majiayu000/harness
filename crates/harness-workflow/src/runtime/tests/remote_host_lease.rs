@@ -110,6 +110,34 @@ fn assert_rejected(
 }
 
 #[tokio::test]
+async fn runtime_store_remote_host_lease_counts_are_grouped_by_owner() -> anyhow::Result<()> {
+    let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
+    let store = remote_lease_store().await?;
+    let expires_at = Utc::now() + Duration::minutes(5);
+
+    for (key, owner) in [
+        ("count-a-1", "host-a"),
+        ("count-a-2", "host-a"),
+        ("count-b", "host-b"),
+    ] {
+        enqueue_remote_lease_job(&store, key).await?;
+        store
+            .claim_next_runtime_job_for_runtime_kind(RuntimeKind::RemoteHost, owner, expires_at)
+            .await?
+            .expect("remote job should be claimed");
+    }
+    enqueue_remote_lease_job(&store, "count-pending").await?;
+
+    let counts = store
+        .count_remote_host_runtime_job_leases_by_owner()
+        .await?;
+    assert_eq!(counts.get("host-a"), Some(&2));
+    assert_eq!(counts.get("host-b"), Some(&1));
+    assert_eq!(counts.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Result<()> {
     let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
     let store = remote_lease_store().await?;
