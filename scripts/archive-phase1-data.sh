@@ -37,7 +37,7 @@ write_schema_bootstrap() {
   local output_file="$2"
   local schemas=()
   local table schema
-  while IFS= read -r table; do
+  while IFS= read -r table || [[ -n "$table" ]]; do
     validate_phase1_table "$table"
     schemas+=("${table%%.*}")
   done < "$tables_file"
@@ -53,7 +53,7 @@ write_row_count_verification() {
   local table schema name
   {
     printf 'COPY (\n'
-    while IFS= read -r table; do
+    while IFS= read -r table || [[ -n "$table" ]]; do
       validate_phase1_table "$table"
       schema="${table%%.*}"
       name="${table#*.}"
@@ -109,10 +109,11 @@ EOF
 self_test() {
   local test_dir
   test_dir="$(mktemp -d "${TMPDIR:-/tmp}/archive-phase1-data-test.XXXXXX")"
-  printf '%s\n' \
-    'eval_store.eval_runs' \
-    'task_db.tasks' \
-    'task_db.workspace_leases' > "$test_dir/tables.txt"
+  trap 'rm -r -- "$test_dir"' EXIT
+  {
+    printf '%s\n' 'eval_store.eval_runs' 'task_db.tasks'
+    printf '%s' 'task_db.workspace_leases'
+  } > "$test_dir/tables.txt"
   write_schema_bootstrap "$test_dir/tables.txt" "$test_dir/schema-bootstrap.sql"
   write_row_count_verification "$test_dir/tables.txt" "$test_dir/verify-row-counts.sql"
   write_restore_readme "$test_dir/RESTORE.md" '2026-07-21T00:00:00Z' '5s' '3'
@@ -123,7 +124,8 @@ self_test() {
   grep -Fq 'DELIMITER E'\''\t'\''' "$test_dir/verify-row-counts.sql"
   grep -Fq -- '--file schema-bootstrap.sql' "$test_dir/RESTORE.md"
   grep -Fq 'diff -u table_counts.tsv restored_table_counts.tsv' "$test_dir/RESTORE.md"
-  rm -r "$test_dir"
+  rm -r -- "$test_dir"
+  trap - EXIT
   printf 'archive-phase1-data self-test passed\n'
 }
 
