@@ -123,19 +123,9 @@ pub(super) async fn insert(
     command: &WorkflowCommand,
     status: WorkflowCommandStatus,
 ) -> anyhow::Result<String> {
-    let data = to_jsonb_string(command)?;
-    let command_type = enum_str(&command.command_type)?;
-    let (id,): (String,) = sqlx::query_as(insert_sql())
-        .bind(Uuid::new_v4().to_string())
-        .bind(workflow_id)
-        .bind(decision_id)
-        .bind(&command_type)
-        .bind(&command.dedupe_key)
-        .bind(status.as_str())
-        .bind(&data)
-        .bind(WorkflowCommandStatus::Pending.as_str())
-        .fetch_one(pool)
-        .await?;
+    let mut tx = pool.begin().await?;
+    let id = insert_tx(&mut tx, workflow_id, decision_id, command, status).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -159,6 +149,7 @@ pub(super) async fn insert_tx(
         .bind(WorkflowCommandStatus::Pending.as_str())
         .fetch_one(&mut **tx)
         .await?;
+    super::artifacts::reconcile_runtime_transcript_dependencies_tx(tx, workflow_id).await?;
     Ok(id)
 }
 
@@ -383,6 +374,7 @@ pub(super) async fn enqueue_runtime_job_for_command(
     .bind(&data)
     .execute(&mut *tx)
     .await?;
+    super::artifacts::reconcile_runtime_transcript_dependencies_tx(&mut tx, &workflow_id).await?;
     let mut update = sqlx::query(
         "UPDATE workflow_commands
          SET status = $2, dispatch_owner = NULL, dispatch_lease_expires_at = NULL,

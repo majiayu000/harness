@@ -69,6 +69,25 @@ impl WorkflowRuntimeStore {
         .await
     }
 
+    pub async fn commit_runtime_activity_completion_with_transcript_if_owned(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        lease_expires_at: DateTime<Utc>,
+        result: &ActivityResult,
+        transcript: Option<&PendingRuntimeTranscript>,
+    ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
+        self.commit_runtime_activity_completion_inner(
+            runtime_job_id,
+            owner,
+            lease_expires_at,
+            None,
+            result,
+            transcript,
+        )
+        .await
+    }
+
     pub async fn commit_runtime_activity_completion_if_owned_with_generation(
         &self,
         runtime_job_id: &str,
@@ -76,6 +95,46 @@ impl WorkflowRuntimeStore {
         lease_expires_at: DateTime<Utc>,
         lease_generation: Option<u64>,
         result: &ActivityResult,
+    ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
+        self.commit_runtime_activity_completion_inner(
+            runtime_job_id,
+            owner,
+            lease_expires_at,
+            lease_generation,
+            result,
+            None,
+        )
+        .await
+    }
+
+    pub async fn commit_runtime_activity_completion_with_transcript_if_owned_with_generation(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        lease_expires_at: DateTime<Utc>,
+        lease_generation: Option<u64>,
+        result: &ActivityResult,
+        transcript: Option<&PendingRuntimeTranscript>,
+    ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
+        self.commit_runtime_activity_completion_inner(
+            runtime_job_id,
+            owner,
+            lease_expires_at,
+            lease_generation,
+            result,
+            transcript,
+        )
+        .await
+    }
+
+    async fn commit_runtime_activity_completion_inner(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        lease_expires_at: DateTime<Utc>,
+        lease_generation: Option<u64>,
+        result: &ActivityResult,
+        transcript: Option<&PendingRuntimeTranscript>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         let mut tx = self.pool.begin().await?;
         let command_id_row: Option<(String,)> =
@@ -119,6 +178,22 @@ impl WorkflowRuntimeStore {
             return Ok(None);
         }
 
+        let mut command = command_row
+            .map(workflow_command_record_from_row)
+            .transpose()?;
+        if let Some(transcript) = transcript {
+            let command = command.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("runtime transcript cannot be persisted without its command")
+            })?;
+            artifacts::insert_runtime_transcript_tx(
+                &mut tx,
+                &command.workflow_id,
+                runtime_job_id,
+                transcript,
+            )
+            .await?;
+        }
+
         job.complete(result)?;
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
@@ -139,7 +214,7 @@ impl WorkflowRuntimeStore {
             job.lease_generation,
         )
         .await?;
-        let Some(command_row) = command_row else {
+        let Some(mut command) = command.take() else {
             tx.commit().await?;
             return Ok(Some(RuntimeActivityCompletion {
                 runtime_job: job,
@@ -148,7 +223,6 @@ impl WorkflowRuntimeStore {
                 decision: None,
             }));
         };
-        let mut command = workflow_command_record_from_row(command_row)?;
         let command_status = command_status_for_activity(result.status);
         sqlx::query(
             "UPDATE workflow_commands

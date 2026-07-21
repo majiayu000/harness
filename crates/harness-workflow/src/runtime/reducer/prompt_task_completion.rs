@@ -8,14 +8,16 @@ use crate::runtime::prompt_task::{
     PromptContinuationState, PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 use crate::runtime::remote_facts::stable_remote_fact_hash;
+use crate::runtime::RUNTIME_TRANSCRIPT_ARTIFACT;
 use chrono::Duration;
 use serde_json::{json, Value};
 
-const SERVER_GENERATED_ARTIFACTS: [&str; 4] = [
+const SERVER_GENERATED_ARTIFACTS: [&str; 5] = [
     "activity_result_envelope",
     "runtime_prompt_packet",
     "runtime_turn",
     "repo_memory_config",
+    RUNTIME_TRANSCRIPT_ARTIFACT,
 ];
 
 pub(super) fn prompt_task_success_decision(
@@ -523,6 +525,22 @@ mod tests {
             stalled_decision.commands[0].command["continuation"]["same_state_count"],
             2
         );
+    }
+
+    #[test]
+    fn runtime_transcript_reference_does_not_count_as_prompt_progress() {
+        let mut first = result(Some("In Progress"));
+        first.artifacts.push(crate::runtime::ActivityArtifact::new(
+            RUNTIME_TRANSCRIPT_ARTIFACT,
+            json!({"artifact_ref": "runtime-transcript:job-1"}),
+        ));
+        let mut second = result(Some("In Progress"));
+        second.artifacts.push(crate::runtime::ActivityArtifact::new(
+            RUNTIME_TRANSCRIPT_ARTIFACT,
+            json!({"artifact_ref": "runtime-transcript:job-2"}),
+        ));
+
+        assert_eq!(progress_fingerprint(&first), progress_fingerprint(&second));
     }
 
     #[test]

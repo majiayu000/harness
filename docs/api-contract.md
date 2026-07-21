@@ -28,6 +28,7 @@ observes results. The following capabilities are **only available over HTTP**:
 | `GET  /api/workflows/runtime/submissions` | list | List runtime submissions |
 | `GET  /api/workflows/runtime/submissions/{id}` | get | Read runtime submission status |
 | `GET  /api/workflows/runtime/submissions/{id}/artifacts` | artifacts | Read runtime output artifacts |
+| `POST /api/workflows/runtime/transcripts/reconstruct` | transcript reconstruction | Restore a missing or corrupt runtime transcript from an upstream provider re-export |
 | `GET  /api/workflows/runtime/submissions/{id}/prompts` | prompts | Read recorded runtime prompts |
 | `GET  /api/workflows/runtime/submissions/{id}/proof` | proof | Read terminal proof of work |
 | `GET  /api/workflows/runtime/submissions/{id}/stream` | stream | Stream runtime submission events |

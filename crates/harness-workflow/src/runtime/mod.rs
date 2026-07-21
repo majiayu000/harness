@@ -39,6 +39,7 @@ mod store_summary;
 pub mod submission;
 pub mod terminal_state;
 pub mod tier_resolution;
+pub mod transcript;
 pub mod validator;
 mod validator_progress;
 pub mod worker;
@@ -136,6 +137,7 @@ pub use reason_class::{
     classify_stop, StopReasonClass, STOP_REASON_CIRCUIT_BREAKER_COOLDOWN,
     STOP_REASON_CI_BACKEND_UNAVAILABLE, STOP_REASON_INVALID_AGENT_OUTPUT,
     STOP_REASON_MAINTAINER_INPUT_REQUIRED, STOP_REASON_MERGE_BASE_DRIFT, STOP_REASON_RATE_LIMITED,
+    STOP_REASON_RUNTIME_TRANSCRIPT_LOST, STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE,
     TRANSIENT_STOP_REASON_CODES,
 };
 pub use reducer::{
@@ -188,6 +190,12 @@ pub use terminal_state::{
     workflow_terminal_state_for_version, WorkflowTerminalState,
 };
 pub use tier_resolution::{resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution};
+pub use transcript::{
+    prepare_runtime_transcript, runtime_transcript_artifact_ref, runtime_transcript_checksum,
+    PendingRuntimeTranscript, RuntimeTranscriptRead, RuntimeTranscriptRecord,
+    RuntimeTranscriptReference, RUNTIME_TRANSCRIPT_ARTIFACT, RUNTIME_TRANSCRIPT_SCHEMA,
+    RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT,
+};
 pub use validator::{
     DecisionValidator, TransitionAllowlist, TransitionRule, ValidationContext,
     WorkflowDecisionRejection, WorkflowDecisionRejectionKind,

@@ -34,7 +34,7 @@ mod runtime_project_cache_api_tests;
 mod runtime_hosts_api_tests;
 
 #[cfg(test)]
-mod runtime_hosts_workflow_api_tests;
+pub(crate) mod runtime_hosts_workflow_api_tests;
 
 #[cfg(test)]
 mod runtime_hosts_workflow_review_tests;
