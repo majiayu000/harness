@@ -81,9 +81,9 @@ impl WorkflowRuntimeStore {
         };
         let mut tx = self.pool.begin().await?;
         ensure_runtime_job_belongs_to_workflow_tx(&mut tx, workflow_id, runtime_job_id).await?;
-        upsert_reconstructed_transcript_tx(&mut tx, &record).await?;
+        let persisted_record = upsert_reconstructed_transcript_tx(&mut tx, &record).await?;
         tx.commit().await?;
-        Ok(record)
+        Ok(persisted_record)
     }
 }
 
@@ -240,7 +240,7 @@ async fn ensure_runtime_job_belongs_to_workflow_tx(
 async fn upsert_reconstructed_transcript_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     record: &RuntimeTranscriptRecord,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RuntimeTranscriptRecord> {
     let existing: Option<(String, String, String)> = sqlx::query_as(
         "SELECT workflow_id, artifact_type, data::text
          FROM workflow_artifacts
@@ -263,6 +263,7 @@ async fn upsert_reconstructed_transcript_tx(
                     existing.reference.checksum == record.reference.checksum,
                     "a verified transcript already exists with different content"
                 );
+                return Ok(existing);
             }
         }
     }
@@ -284,5 +285,5 @@ async fn upsert_reconstructed_transcript_tx(
     .bind(to_jsonb_string(record)?)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(record.clone())
 }

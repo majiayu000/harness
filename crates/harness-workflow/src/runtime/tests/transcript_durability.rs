@@ -195,6 +195,61 @@ async fn transcript_integrity_loss_can_be_reconstructed_from_provider_export() -
 }
 
 #[tokio::test]
+async fn duplicate_reconstruction_preserves_verified_transcript_provenance() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = issue_instance("implementing").with_id("transcript-reconstruct-idempotent");
+    let (job, lease_expires_at) = claimed_transcript_job(&store, &workflow).await?;
+    let (result, pending) = prepare_runtime_transcript(&job, result_with_transcript("original"))?;
+    let artifact_ref = runtime_transcript_artifact_ref(&job.id);
+    store
+        .commit_runtime_activity_completion_with_transcript_if_owned(
+            &job.id,
+            "transcript-test",
+            lease_expires_at,
+            &result,
+            pending.as_ref(),
+        )
+        .await?
+        .expect("completion should commit");
+
+    let before: (String, DateTime<Utc>) =
+        sqlx::query_as("SELECT data::text, created_at FROM workflow_artifacts WHERE id = $1")
+            .bind(&artifact_ref)
+            .fetch_one(store.pool())
+            .await?;
+    let expected = runtime_transcript_checksum("original");
+
+    let returned = store
+        .reconstruct_runtime_transcript(
+            &workflow.id,
+            &job.id,
+            "original",
+            Some(&expected),
+            "different-operator",
+        )
+        .await?;
+
+    assert!(!returned.reconstructed);
+    assert_eq!(returned.reconstructed_by, None);
+    assert_ne!(returned.source, json!({"kind": "provider_reexport"}));
+    let after: (String, DateTime<Utc>) =
+        sqlx::query_as("SELECT data::text, created_at FROM workflow_artifacts WHERE id = $1")
+            .bind(&artifact_ref)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(after, before, "duplicate reconstruction must be a no-op");
+    assert!(matches!(
+        store.read_runtime_transcript(&artifact_ref).await?,
+        RuntimeTranscriptRead::Verified(record) if record == returned
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn transcript_persistence_failure_rolls_back_runtime_completion() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
