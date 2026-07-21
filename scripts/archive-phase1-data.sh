@@ -61,9 +61,10 @@ write_row_count_verification() {
         printf 'UNION ALL\n'
       fi
       printf 'SELECT '\''%s'\''::text AS "table", count(*)::bigint AS rows FROM "%s"."%s"\n' \
-        "$table" "$schema" "$name"
+      "$table" "$schema" "$name"
       first=0
     done < "$tables_file"
+    printf 'ORDER BY "table"\n'
     printf ') TO STDOUT WITH (FORMAT csv, DELIMITER E'\''\\t'\'', HEADER true);\n'
   } > "$output_file"
 }
@@ -121,6 +122,7 @@ self_test() {
   grep -Fqx 'CREATE SCHEMA IF NOT EXISTS "eval_store";' "$test_dir/schema-bootstrap.sql"
   grep -Fqx 'CREATE SCHEMA IF NOT EXISTS "task_db";' "$test_dir/schema-bootstrap.sql"
   grep -Fq 'FROM "task_db"."tasks"' "$test_dir/verify-row-counts.sql"
+  grep -Fqx 'ORDER BY "table"' "$test_dir/verify-row-counts.sql"
   grep -Fq 'DELIMITER E'\''\t'\''' "$test_dir/verify-row-counts.sql"
   grep -Fq -- '--file schema-bootstrap.sql' "$test_dir/RESTORE.md"
   grep -Fq 'diff -u table_counts.tsv restored_table_counts.tsv' "$test_dir/RESTORE.md"
