@@ -9,7 +9,7 @@ GH-1707
 See `specs/GH1707/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1707,"complete":true,"paths":["crates/harness-server/src/github_pr_snapshot.rs","crates/harness-server/src/github_pr_snapshot_tests.rs","crates/harness-server/src/intake/github_coverage_gate.rs","crates/harness-server/src/intake/github_coverage_recovery.rs","crates/harness-server/src/intake/github_coverage_recovery_test_support.rs","crates/harness-server/src/intake/github_coverage_recovery_tests.rs","crates/harness-server/src/intake/github_issue_links.rs","crates/harness-server/src/intake/mod.rs","crates/harness-server/src/task_executor/pr_detection.rs","crates/harness-server/src/task_executor/pr_detection_tests.rs","crates/harness-server/src/workflow_runtime_pr_feedback/pr_detection.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010"]}
+{"issue":1707,"complete":true,"paths":["crates/harness-server/src/github_pr_snapshot.rs","crates/harness-server/src/github_pr_snapshot_tests.rs","crates/harness-server/src/intake/github_coverage_gate.rs","crates/harness-server/src/intake/github_coverage_recovery.rs","crates/harness-server/src/intake/github_coverage_recovery_tests.rs","crates/harness-server/src/intake/github_coverage_recovery_tests/support.rs","crates/harness-server/src/intake/github_issue_links.rs","crates/harness-server/src/intake/mod.rs","crates/harness-server/src/task_executor/pr_detection.rs","crates/harness-server/src/task_executor/pr_detection_tests.rs","crates/harness-server/src/workflow_runtime_pr_feedback/pr_detection.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010"]}
 -->
 
 ## Current System
@@ -27,26 +27,49 @@ See `specs/GH1707/product.md`.
 
 ## Proposed Design
 
-1. Discover exact closing PR candidates from repository-qualified GitHub issue
-   links and bounded REST fallback.
-2. Fetch a complete server-owned snapshot for each candidate and reject
-   incomplete, inconsistent, cross-repository, or closed-unmerged evidence.
-3. Derive the target workflow state from PR state, checks, review decision,
-   review threads, and merge facts.
-4. Upsert the issue-bound workflow, PR binding, remote fact snapshot, and only
+1. Page the GitHub GraphQL `issue.closedByPullRequestsReferences` connection to
+   completion. This repository-qualified connection is the only source of
+   closing candidates; do not run a REST keyword fallback or require a closing
+   keyword in the linked PR body.
+2. Fetch a complete server-owned snapshot for every same-repository candidate.
+   Any transport, parsing, pagination, or completeness error aborts the poll;
+   do not choose from a partial candidate set.
+3. Classify and select candidates with a stable comparison key, never API
+   order. If the issue is closed, eligible merged candidates have precedence
+   over eligible active candidates; if the issue is open, merged candidates
+   are ineligible. Closed-unmerged candidates are always ineligible. Within the
+   selected class, choose the highest PR number.
+4. Derive the target workflow state from PR state, checks, review decision,
+   review threads, and merge facts using the exact matrix below.
+5. Upsert the issue-bound workflow, PR binding, remote fact snapshot, and only
    the commands required for the derived state. Cancel stale implementation
    work before the coverage gate returns `Covered`.
-5. Reuse stable workflow and command dedupe keys so repeated polls and restarts
+6. Reuse stable workflow and command dedupe keys so repeated polls and restarts
    converge.
-6. Propagate every lookup/completeness error to intake. Page-limit exhaustion
+7. Propagate every lookup/completeness error to intake. Page-limit exhaustion
    and repeated pagination URLs are errors in both compiled PR-discovery
    implementations, not warning-plus-partial-result paths.
 
+## Recovery State Matrix
+
+| Complete GitHub facts | Recovery result |
+| --- | --- |
+| Open PR waiting for checks or mergeability | `pr_open` |
+| Open PR requiring CI or review repair | `awaiting_feedback` |
+| Open PR with ready snapshot | `quality_gate_pending` plus one deduplicated quality-gate child command |
+| Successful quality-gate child completion from `quality_gate_pending` | `ready_to_merge` |
+| Merged PR and closed issue | terminal `done` with merge evidence |
+| Merged PR and open issue | ineligible; not durable coverage |
+| Closed-unmerged PR | ineligible; not durable coverage |
+
+Recovery must never map a ready snapshot directly to `ready_to_merge`.
+
 ## Data Flow
 
-`GitHub poll -> local coverage lookup -> authoritative issue/PR discovery ->
-complete PR snapshot -> validate exact closing relation -> derive workflow
-state -> transactional persistence/deduped commands -> Covered/Uncovered/error`.
+`GitHub poll -> local coverage lookup -> complete authoritative GraphQL issue
+links -> complete snapshots for all same-repository candidates -> deterministic
+class/PR-number arbitration -> derive workflow state -> transactional
+persistence/deduped commands -> Covered/Uncovered/error`.
 
 Only a complete authoritative fact set can return `Covered` or `Uncovered`.
 An external read failure returns an error, and intake skips dispatch for that
@@ -58,14 +81,14 @@ poll.
 | --- | --- | --- |
 | B-001 | `intake/github_coverage_gate.rs`, `github_coverage_recovery.rs` | `cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart` |
 | B-002 | recovery persistence and PR snapshot modules | `cargo test -p harness-server recovery_maps_open_pr_facts` |
-| B-003 | recovery state derivation | `cargo test -p harness-server recovery_maps_open_pr_facts` |
-| B-004 | merged-state recovery | `cargo test -p harness-server merged_pr_closed_issue_recovers_terminal_coverage_without_agent_work` |
-| B-005 | candidate validation | `cargo test -p harness-server closed_pr_is_uncovered_but_a_later_valid_pr_recovers_coverage` |
+| B-003 | recovery state derivation and quality-gate parent propagation | `cargo test -p harness-server recovery_maps_open_pr_facts`; `cargo test -p harness-workflow runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass` |
+| B-004 | merged-state recovery | `cargo test -p harness-server merged_pr_and_closed_issue_recover_terminal_coverage_without_agent_work` |
+| B-005 | candidate eligibility | `cargo test -p harness-server merged_pr_does_not_cover_an_issue_github_still_reports_open`; `cargo test -p harness-server closed_pr_is_uncovered_but_a_later_valid_pr_recovers_coverage` |
 | B-006 | stable IDs and command dedupe | `cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart` |
 | B-007 | stale-work cancellation | `cargo test -p harness-server recovery_maps_open_pr_facts` |
 | B-008 | GitHub adapters and pagination guards | `cargo test -p harness-server github_lookup_failure_fails_closed_without_agent_work`; `cargo test -p harness-server existing_pr_lookup_fails_closed` |
-| B-009 | closing-reference validation | `cargo test -p harness-server issue_linked_pr_without_closing_keyword_recovers_coverage` plus negative PR-detection tests |
-| B-010 | recovery transaction/dedupe paths | restart test and `cargo test -p harness-server github_coverage_recovery` |
+| B-009 | GraphQL issue-link authority | `cargo test -p harness-server issue_linked_pr_without_closing_keyword_recovers_coverage`; negative test `rest_keyword_without_authoritative_issue_link_is_uncovered` |
+| B-010 | deterministic arbitration and recovery transaction/dedupe paths | `cargo test -p harness-server multiple_closing_pr_candidates_are_selected_deterministically`; barrier-controlled `cargo test -p harness-server concurrent_recovery_attempts_converge_on_one_binding_and_command_set` |
 
 ## Alternatives Considered
 
@@ -83,7 +106,8 @@ poll.
 - Security: GitHub tokens remain read-only for evidence collection; errors and
   redaction must not expose credentials.
 - Data integrity: incorrect candidate selection could bind the wrong PR; exact
-  repository-qualified closing evidence is mandatory.
+  repository-qualified GraphQL closing evidence and deterministic arbitration
+  are mandatory.
 - Compatibility: stale/cancelled local workflows must be reconciled without
   regressing newer or terminal state.
 - Availability: GitHub outages intentionally defer intake instead of silently
@@ -94,6 +118,12 @@ poll.
 ## Test Plan
 
 - [ ] Run every command in the Product-to-Test Mapping.
+- [ ] Run the multi-candidate test with the same candidates in forward and
+      reverse GraphQL order and assert the same selected PR.
+- [ ] Run the concurrency test with an explicit barrier that holds two
+      recovery attempts after candidate selection and releases both to race the
+      persistence boundary; assert one binding, one state, and one deduplicated
+      command set.
 - [ ] Run `cargo check -p harness-server --all-targets`.
 - [ ] Run `cargo fmt --all -- --check` and
       `cargo clippy --workspace --all-targets -- -D warnings`.
