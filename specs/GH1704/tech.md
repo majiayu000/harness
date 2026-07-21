@@ -43,6 +43,14 @@ delete transcript rows only when every family member is terminal. An
 authenticated bounded reconstruction endpoint accepts provider-exported bytes,
 verifies the expected identity contract, and atomically restores the artifact.
 
+Transcript read and reconstruction routes are sensitive endpoints. Route
+construction must require an effective endpoint-specific authenticated mode.
+When the server resolves to open API mode through
+`allow_unauthenticated = true`, those endpoints fail closed as unavailable
+before request-body parsing or store access; presenting an arbitrary bearer
+header does not activate them. This restriction does not silently change the
+availability contract of unrelated open-mode routes.
+
 ## Data Flow
 
 `agent/RemoteHost output -> trusted transcript extraction -> checksum/size ->
@@ -50,8 +58,10 @@ completion transaction (transcript + job + event + decision) -> durable
 reference -> dependency-aware retention -> exact-replay preflight -> hydrated
 consumer`.
 
-Recovery uses `authenticated re-export -> bounded body -> identity/ownership
-validation -> atomic insert/verify -> subsequent preflight`.
+Recovery uses `endpoint-specific authenticated authorization -> bounded
+re-export body -> identity/ownership validation -> atomic insert/verify ->
+subsequent preflight`. Open API mode stops before the bounded body enters this
+flow.
 
 ## Product-to-Test Mapping
 
@@ -59,14 +69,14 @@ validation -> atomic insert/verify -> subsequent preflight`.
 | --- | --- | --- |
 | B-001 | activity completion transaction and transcript store | `cargo test -p harness-workflow transcript_completion_is_atomic` |
 | B-002 | transcript model/store constraints | checksum, size, and producer ownership tests under `runtime::tests::transcript_durability` |
-| B-003 | dependency-aware retention query | `cargo test -p harness-workflow transcript_retention_waits_for_workflow_family` |
+| B-003 | dependency-aware retention query | `cargo test -p harness-workflow 'runtime::tests::transcript_durability::transcript_retention_waits_for_every_dependent_workflow_to_finish' -- --exact` |
 | B-004 | worker preflight and hydration | missing/corrupt/readable exact-replay tests |
-| B-005 | reason classification and reducer retry | `cargo test -p harness-workflow runtime_failure_classification` |
-| B-006 | terminal failure mapping and active-queue projection | missing/corrupt transcript integration tests and server projection tests |
+| B-005 | reason classification and reducer retry | `cargo test -p harness-workflow 'runtime::tests::runtime_transcript_store_failure_uses_bounded_default_backoff' -- --exact` and `cargo test -p harness-workflow 'runtime::tests::runtime_transcript_store_failure_honors_explicit_zero_retry_limits' -- --exact` |
+| B-006 | terminal failure mapping and active-queue projection | `cargo test -p harness-workflow 'runtime::tests::confirmed_runtime_transcript_loss_is_terminal' -- --exact`, plus missing/corrupt transcript integration tests and server projection tests |
 | B-007 | reconstruction handler/store operation | `cargo test -p harness-server runtime_transcript_route` |
 | B-008 | local executor and runtime-host handlers | executor contract and runtime-host transcript tests |
 | B-009 | transaction rollback and restart | transcript rollback/reopen tests under `runtime::tests::transcript_durability` |
-| B-010 | authenticated bounded HTTP routes | `cargo test -p harness-server runtime_transcript_route` |
+| B-010 | endpoint-specific authenticated bounded HTTP routes | reconstruction route tests prove enforced-mode success and prove open API mode is unavailable before body parsing or store mutation; `cargo test -p harness-server runtime_transcript_route` |
 
 ## Alternatives Considered
 
@@ -83,8 +93,11 @@ validation -> atomic insert/verify -> subsequent preflight`.
 
 ## Risks
 
-- Security: transcript bytes are sensitive; routes require existing API auth,
-  bounded bodies, and sanitized errors.
+- Security: transcript bytes are sensitive; read/reconstruction routes require
+  endpoint-specific authenticated authorization, remain unavailable in open
+  API mode, enforce bounded bodies, and return sanitized errors. Because this
+  changes an authentication boundary, SEC-11 requires a human security review
+  of implementation PR #1710 at its exact merge head.
 - Data integrity: completion must never commit a reference without verified
   bytes or accept an agent-forged server reference.
 - Compatibility: the migration is additive, but historical workflows lacking
@@ -102,9 +115,15 @@ validation -> atomic insert/verify -> subsequent preflight`.
       `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Run PostgreSQL-backed workflow/server suites with an isolated
       `HARNESS_DATABASE_URL`, including restart and retention/GC cases.
+- [ ] Prove transcript read/reconstruction succeeds only under enforced
+      endpoint-specific authentication and remains unavailable in
+      `allow_unauthenticated = true` open API mode without parsing or mutation.
 - [ ] Run `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1704`.
 - [ ] Collect exact-head CI, Gemini review, independent reviewer evidence,
       GraphQL review-thread state, and SpecRail PR-gate evidence.
+- [ ] Collect named human security-review approval for PR #1710 at the exact
+      merge head. This blocking SEC-11 evidence cannot be supplied by an agent,
+      independent AI reviewer lane, or implx auto standing authorization.
 
 ## Rollback Plan
 

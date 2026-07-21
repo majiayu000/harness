@@ -22,7 +22,8 @@ explicit terminal or reconstruction path when it cannot be read.
 - Validate transcript availability and integrity before exact-replay dispatch.
 - Retry only transient storage failures with bounded policy.
 - Classify confirmed evidence loss terminally with operator guidance.
-- Support authenticated provider re-export reconstruction.
+- Support provider re-export reconstruction only behind endpoint-specific
+  authenticated authorization.
 
 ## Non-Goals
 
@@ -51,16 +52,20 @@ explicit terminal or reconstruction path when it cannot be read.
 6. **B-006:** Confirmed missing or corrupt evidence becomes a terminal,
    explicitly classified failure with actionable operator guidance and is not
    projected as queued active work.
-7. **B-007:** An authenticated reconstruction operation may import a provider
-   re-export only when its workflow/job identity and checksum contract match;
-   successful reconstruction makes a later preflight readable.
+7. **B-007:** An endpoint-specifically authenticated reconstruction operation
+   may import a provider re-export only when its workflow/job identity and
+   checksum contract match; successful reconstruction makes a later preflight
+   readable.
 8. **B-008:** Local agent and `RemoteHost` completion paths produce the same
    durable transcript contract, including large transcripts.
 9. **B-009:** Restart/replay is deterministic: committed evidence remains
    readable and an interrupted uncommitted transaction exposes neither a
    successful completion nor a partial transcript reference.
-10. **B-010:** Transcript read/reconstruction APIs enforce existing server
-    authentication, bounded bodies, and non-secret error reporting.
+10. **B-010:** Transcript read/reconstruction APIs enforce endpoint-specific
+    authenticated authorization, bounded bodies, and non-secret error
+    reporting. When the server runs with `allow_unauthenticated = true` and no
+    endpoint-specific authenticated authorization is enforced, these sensitive
+    endpoints are unavailable and cannot read or mutate transcript evidence.
 
 ## Acceptance Criteria
 
@@ -71,9 +76,13 @@ explicit terminal or reconstruction path when it cannot be read.
       evidence all fail closed.
 - [ ] Local and `RemoteHost` exact replay preflight behavior is equivalent.
 - [ ] Authenticated reconstruction restores valid evidence and rejects invalid
-      or oversized input.
+      or oversized input; open API mode cannot reach transcript read or
+      reconstruction operations.
 - [ ] Exact-head CI, Gemini, independent review, thread audit, and SpecRail PR
       gate pass before implementation merge.
+- [ ] PR #1710 has mandatory SEC-11 human security-review approval recorded at
+      its exact merge head; implx auto standing authorization and agent review
+      cannot satisfy this gate.
 
 ## Boundary Checklist
 
@@ -99,6 +108,8 @@ explicit terminal or reconstruction path when it cannot be read.
 - A parent terminates while a dependent child still requires replay.
 - A transient read error becomes a confirmed missing object after retries.
 - Reconstruction is repeated after a prior successful import.
+- The server runs in `allow_unauthenticated = true` open mode and a caller
+  attempts transcript reconstruction with or without a bearer header.
 - Remote-host completion submits a transcript near the request-body limit.
 
 ## Rollout Notes
@@ -108,3 +119,7 @@ before accepting transcript-bearing completion. Existing workflows without a
 durable transcript cannot be silently upgraded; exact replay for those rows
 must fail with the classified recovery guidance. Revert application code only
 after confirming no active workflow depends on the new reconstruction route.
+Because reconstruction handles sensitive transcript contents and changes an
+authentication boundary, implementation PR #1710 cannot merge until a human
+security reviewer records an exact-head SEC-11 approval. Queue-drain or implx
+auto standing authorization is not a substitute for that evidence.
