@@ -159,6 +159,21 @@ async fn endless_prs_handler(
     (headers, body)
 }
 
+async fn repeated_page_handler(State(state): State<Arc<PaginatedPrState>>) -> impl IntoResponse {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    let body = serde_json::json!([]).to_string();
+    let next_url = format!(
+        "{}/repos/owner/repo/pulls?state=open&per_page=100",
+        state.base_url
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::LINK,
+        HeaderValue::from_str(&format!("<{next_url}>; rel=\"next\"")).expect("valid link header"),
+    );
+    (headers, body)
+}
+
 async fn failing_prs_handler() -> impl IntoResponse {
     (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
 }
@@ -254,7 +269,7 @@ async fn existing_pr_lookup_stops_after_first_match() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn existing_pr_lookup_stops_after_page_limit_without_error() -> anyhow::Result<()> {
+async fn existing_pr_lookup_fails_closed_after_page_limit() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base_url = format!("http://{}", listener.local_addr()?);
     let state = Arc::new(PaginatedPrState {
@@ -268,22 +283,55 @@ async fn existing_pr_lookup_stops_after_page_limit_without_error() -> anyhow::Re
         let _ = axum::serve(listener, app).await;
     });
 
-    let found = find_existing_pr_for_issue_in_repo(
+    let error = find_existing_pr_for_issue_in_repo(
         &reqwest::Client::new(),
         "owner/repo",
         998,
         None,
         &base_url,
     )
-    .await?;
+    .await
+    .expect_err("an incomplete paginated lookup must fail closed");
 
     server.abort();
 
-    assert_eq!(found, None);
+    assert!(error.to_string().contains("exceeded the pagination limit"));
     assert_eq!(
         state.requests.load(Ordering::SeqCst),
         GITHUB_PR_LOOKUP_MAX_PAGES
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn existing_pr_lookup_fails_closed_on_repeated_page_url() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let state = Arc::new(PaginatedPrState {
+        base_url: base_url.clone(),
+        requests: AtomicUsize::new(0),
+    });
+    let app = Router::new()
+        .route("/repos/owner/repo/pulls", get(repeated_page_handler))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let error = find_existing_pr_for_issue_in_repo(
+        &reqwest::Client::new(),
+        "owner/repo",
+        998,
+        None,
+        &base_url,
+    )
+    .await
+    .expect_err("a repeated pagination URL must fail closed");
+
+    server.abort();
+
+    assert!(error.to_string().contains("repeated pagination URL"));
+    assert_eq!(state.requests.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
