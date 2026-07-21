@@ -18,7 +18,7 @@ async fn transcript_reconstruction_route_accepts_provider_exports_above_axum_def
     }
     let dir = tempfile::tempdir()?;
     let mut config = harness_core::config::HarnessConfig::default();
-    config.server.allow_unauthenticated = true;
+    config.server.api_token = Some("transcript-test-token".to_string());
     let state = make_test_state_with_workflow_runtime_config_and_registry(
         dir.path(),
         dir.path(),
@@ -69,6 +69,7 @@ async fn transcript_reconstruction_route_accepts_provider_exports_above_axum_def
                 .method("POST")
                 .uri("/api/workflows/runtime/transcripts/reconstruct")
                 .header("content-type", "application/json")
+                .header("authorization", "Bearer transcript-test-token")
                 .body(Body::from(body.to_string()))?,
         )
         .await?;
@@ -90,6 +91,49 @@ async fn transcript_reconstruction_route_accepts_provider_exports_above_axum_def
         anyhow::bail!("large provider export was not stored as a verified transcript");
     };
     assert_eq!(record.content.len(), content.len());
+    Ok(())
+}
+
+#[tokio::test]
+async fn transcript_reconstruction_route_rejects_open_mode_before_body_parsing(
+) -> anyhow::Result<()> {
+    if harness_core::db::resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.server.allow_unauthenticated = true;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = super::http_router::build_router(state);
+
+    for authorization in [None, Some("Bearer arbitrary-token")] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/workflows/runtime/transcripts/reconstruct")
+            .header("content-type", "application/json");
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from("not-json"))?)
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response_body = http_body_util::BodyExt::collect(response.into_body())
+            .await?
+            .to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response_body)?["error"],
+            "transcript_reconstruction_requires_authentication"
+        );
+    }
     Ok(())
 }
 

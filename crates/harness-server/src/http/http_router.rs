@@ -119,7 +119,11 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/workflows/runtime/transcripts/reconstruct",
             post(task_mutation_routes::reconstruct_runtime_transcript)
-                .layer(DefaultBodyLimit::max(MAX_RUNTIME_TRANSCRIPT_BODY_BYTES)),
+                .layer(DefaultBodyLimit::max(MAX_RUNTIME_TRANSCRIPT_BODY_BYTES))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    task_mutation_routes::require_authenticated_transcript_access,
+                )),
         )
         .route(
             "/api/projects/{id}/memory",

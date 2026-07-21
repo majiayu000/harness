@@ -2,7 +2,13 @@ use super::AppState;
 use crate::workflow_runtime_submission::{
     RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
 };
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+    Json,
+};
 use harness_workflow::runtime::{
     WorkflowEvidence, WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,
     WorkflowRuntimeRecoveryRequest,
@@ -38,6 +44,33 @@ pub(super) struct RuntimeTranscriptReconstructionRequest {
     pub content: String,
     #[serde(default)]
     pub expected_checksum: Option<String>,
+}
+
+pub(super) async fn require_authenticated_transcript_access(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match super::auth::resolve_api_auth_mode(&state.core.server.config.server) {
+        Ok(super::auth::ApiAuthMode::Enforced(_)) => next.run(request).await,
+        Ok(super::auth::ApiAuthMode::Open) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "transcript_reconstruction_requires_authentication"
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(
+                "transcript reconstruction authentication configuration is invalid: {error}"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "authentication_misconfigured" })),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub(super) async fn merge_workflow_runtime(
