@@ -6,6 +6,7 @@ mod child_workflow_non_issue;
 mod child_workflow_replay;
 mod data_helpers;
 mod executor;
+mod executor_contract;
 mod merge_completion;
 mod otel_trajectory;
 mod pr_feedback_inspection;
@@ -17,8 +18,13 @@ mod runtime_profile;
 mod runtime_turn_control;
 mod runtime_usage;
 mod server_merge;
+mod transcript_durability;
 pub(crate) mod turn_engine;
 mod workspace;
+
+pub(crate) use transcript_durability::{
+    hydrate_exact_replay_transcript, strip_caller_transcript_unavailable_signal,
+};
 
 use crate::http::AppState;
 use crate::runtime_circuit_breaker::{
@@ -36,6 +42,7 @@ use harness_core::types::{Decision, Event, SessionId};
 use harness_workflow::runtime::{
     ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeWorker,
     WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
+    STOP_REASON_RUNTIME_TRANSCRIPT_LOST, STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE,
 };
 use otel_trajectory::emit_runtime_job_trajectory_completion;
 use serde_json::{json, Value};
@@ -114,6 +121,22 @@ pub(crate) async fn run_runtime_job_worker_tick(
     Ok(RuntimeJobWorkerTick::from_completed_job(completed))
 }
 
+#[cfg(test)]
+pub(crate) async fn exact_replay_preflight_for_test(
+    state: &Arc<AppState>,
+    job: &RuntimeJob,
+) -> Option<ActivityResult> {
+    transcript_durability::exact_replay_preflight_result(state, job).await
+}
+
+#[cfg(test)]
+pub(crate) async fn hydrate_exact_replay_for_test(
+    state: &Arc<AppState>,
+    job: &mut RuntimeJob,
+) -> Result<(), ActivityResult> {
+    transcript_durability::hydrate_exact_replay_transcript(state, job).await
+}
+
 async fn defer_open_runtime_profiles(
     state: &AppState,
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
@@ -142,6 +165,9 @@ pub(crate) async fn record_runtime_circuit_breaker_completion(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
     job: &mut RuntimeJob,
 ) -> anyhow::Result<()> {
+    if job.status == RuntimeJobStatus::Failed && runtime_job_is_transcript_preflight_failure(job) {
+        return Ok(());
+    }
     let events = match job.status {
         RuntimeJobStatus::Succeeded => state.runtime_circuit_breakers.record_success(
             &job.runtime_profile,
@@ -353,6 +379,32 @@ fn runtime_job_activity_result(job: &RuntimeJob) -> Option<ActivityResult> {
     job.output
         .as_ref()
         .and_then(|output| serde_json::from_value(output.clone()).ok())
+}
+
+fn runtime_job_is_transcript_preflight_failure(job: &RuntimeJob) -> bool {
+    if job
+        .input
+        .pointer("/command/exact_replay")
+        .and_then(Value::as_object)
+        .is_none()
+    {
+        return false;
+    }
+    runtime_job_activity_result(job).is_some_and(|result| {
+        result.signals.iter().any(|signal| {
+            signal.signal_type == "RuntimeTranscriptUnavailable"
+                && matches!(
+                    signal
+                        .signal
+                        .get("stop_reason_code")
+                        .and_then(Value::as_str),
+                    Some(
+                        STOP_REASON_RUNTIME_TRANSCRIPT_LOST
+                            | STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE
+                    )
+                )
+        })
+    })
 }
 
 fn runtime_job_failure_class(job: &RuntimeJob) -> FailureClass {
@@ -630,6 +682,54 @@ mod tests {
             runtime_job_failure_class(&job),
             FailureClass::QuotaInteractiveWait
         );
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_preflight_failures_are_not_agent_runtime_failures() -> anyhow::Result<()> {
+        for stop_reason_code in [
+            STOP_REASON_RUNTIME_TRANSCRIPT_LOST,
+            STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE,
+        ] {
+            let mut job = RuntimeJob::pending(
+                "command-1",
+                harness_workflow::runtime::RuntimeKind::CodexExec,
+                "codex-default",
+                json!({
+                    "activity": "exact_replay",
+                    "command": {
+                        "exact_replay": {
+                            "transcript_artifact_ref": "runtime-transcript:missing"
+                        }
+                    }
+                }),
+            );
+            let result = ActivityResult::failed(
+                "exact_replay",
+                "Exact replay transcript preflight failed.",
+                "transcript unavailable",
+            )
+            .with_signal(harness_workflow::runtime::ActivitySignal::new(
+                "RuntimeTranscriptUnavailable",
+                json!({"stop_reason_code": stop_reason_code}),
+            ));
+            job.complete(&result)?;
+            assert!(runtime_job_is_transcript_preflight_failure(&job));
+        }
+
+        let mut agent_job = RuntimeJob::pending(
+            "command-2",
+            harness_workflow::runtime::RuntimeKind::CodexExec,
+            "codex-default",
+            json!({"activity": "implement_issue"}),
+        );
+        let result = ActivityResult::failed("implement_issue", "failed", "agent failed")
+            .with_signal(harness_workflow::runtime::ActivitySignal::new(
+                "RuntimeTranscriptUnavailable",
+                json!({"stop_reason_code": STOP_REASON_RUNTIME_TRANSCRIPT_LOST}),
+            ));
+        agent_job.complete(&result)?;
+        assert!(!runtime_job_is_transcript_preflight_failure(&agent_job));
         Ok(())
     }
 

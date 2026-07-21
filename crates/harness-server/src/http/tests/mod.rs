@@ -34,6 +34,7 @@ mod runtime_approval_route_tests;
 mod runtime_deferred_tree_tests;
 mod runtime_dispatch_tests;
 mod runtime_task_route_tests;
+mod runtime_transcript_route_tests;
 mod runtime_tree_tests;
 mod runtime_worker_followup_tests;
 mod runtime_worker_non_issue_replay_tests;

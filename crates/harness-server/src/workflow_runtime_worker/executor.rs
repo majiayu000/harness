@@ -1,11 +1,9 @@
 use crate::http::AppState;
-use async_trait::async_trait;
 use harness_core::agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
 use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
 use harness_core::types::AgentId;
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobExecutor, RuntimeProfile,
-    WorkflowInstance,
+    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeProfile, WorkflowInstance,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -45,7 +43,7 @@ const RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT: &str =
     "runtime_workspace_finalization_warning";
 
 pub(super) struct ServerRuntimeJobExecutor<'a> {
-    state: &'a Arc<AppState>,
+    pub(super) state: &'a Arc<AppState>,
 }
 
 impl<'a> ServerRuntimeJobExecutor<'a> {
@@ -53,7 +51,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         Self { state }
     }
 
-    async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
+    pub(super) async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
         let workflow = self.workflow_for_job(&job).await?;
         if let Some(workflow) = workflow.as_ref() {
             if workflow.is_terminal() {
@@ -233,8 +231,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 agent_name,
                 &project_root,
                 &prompt_packet_digest,
-            )
-            .with_artifact(repo_memory_config_artifact(memory_enabled));
+            );
+            let result =
+                super::transcript_durability::attach_runtime_transcript_source(result, &turn)?
+                    .with_artifact(repo_memory_config_artifact(memory_enabled));
             let result = if let Some(degradation) = repo_memory.degradation {
                 result.with_artifact(degradation)
             } else {
@@ -339,7 +339,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         Ok(self.state.core.project_root.clone())
     }
 
-    async fn runtime_worker_disabled_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
+    pub(super) async fn runtime_worker_disabled_result(
+        &self,
+        job: &RuntimeJob,
+    ) -> Option<ActivityResult> {
         let activity = activity_name(job);
         // If any preflight helper fails (e.g. a transient database error or a
         // missing project root), defer to the main `execute` path rather than
@@ -358,36 +361,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
     }
 }
 
-#[async_trait]
-impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
-    fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
-        !is_internal_non_agent_activity(job)
-    }
-
-    async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
-        // Internal server-owned activities do not run a user agent. They must keep
-        // flowing even when the runtime worker is disabled, otherwise disabling the
-        // worker would strand workflows or prevent server-owned PR snapshots.
-        if is_internal_non_agent_activity(job) {
-            return None;
-        }
-        self.runtime_worker_disabled_result(job).await
-    }
-
-    async fn execute(&self, job: RuntimeJob) -> ActivityResult {
-        let activity = activity_name(&job);
-        match self.execute_inner(job).await {
-            Ok(result) => result,
-            Err(error) => ActivityResult::failed(
-                activity,
-                "Runtime job execution failed before the agent completed.",
-                error.to_string(),
-            ),
-        }
-    }
-}
-
-fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
+pub(super) fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
     is_builtin_lifecycle_activity(job) || is_server_owned_pr_feedback_inspection(job)
 }
 

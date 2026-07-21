@@ -536,6 +536,34 @@ impl WorkflowRuntimeStore {
                         WHERE terminal.definition_id = family.definition_id
                           AND terminal.state = family.state
                     ))
+                    AND bool_and(NOT EXISTS (
+                        SELECT 1
+                        FROM workflow_artifact_dependencies AS dependency
+                        JOIN workflow_instances AS dependent
+                          ON dependent.id = dependency.workflow_id
+                        LEFT JOIN workflow_artifacts AS artifact
+                          ON artifact.id = dependency.artifact_ref
+                        LEFT JOIN runtime_jobs AS producer_job
+                          ON producer_job.id = CASE
+                              WHEN dependency.artifact_ref LIKE 'runtime-transcript:%'
+                              THEN substr(dependency.artifact_ref, length('runtime-transcript:') + 1)
+                              ELSE NULL
+                          END
+                        LEFT JOIN workflow_commands AS producer_command
+                          ON producer_command.id = producer_job.command_id
+                        WHERE (
+                            artifact.workflow_id = family.id
+                            OR producer_command.workflow_id = family.id
+                            OR dependency.workflow_id = family.id
+                        )
+                          AND (NOT EXISTS (
+                              SELECT 1 FROM terminal_states AS dependent_terminal
+                              WHERE dependent_terminal.definition_id = dependent.definition_id
+                                AND dependent_terminal.state = dependent.state
+                          ) OR COALESCE(dependent.data->'data'->>'stop_reason_code',
+                              dependent.data->'data'->'last_stop'->>'stop_reason_code')
+                              = 'runtime_transcript_lost')
+                    ))
              )
              SELECT family.id
              FROM family

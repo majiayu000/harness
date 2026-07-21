@@ -2,7 +2,13 @@ use super::AppState;
 use crate::workflow_runtime_submission::{
     RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
 };
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+    Json,
+};
 use harness_workflow::runtime::{
     WorkflowEvidence, WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,
     WorkflowRuntimeRecoveryRequest,
@@ -29,6 +35,42 @@ pub(super) struct WorkflowRuntimeRecoveryRouteRequest {
     pub target_state: Option<String>,
     #[serde(default)]
     pub evidence: Vec<WorkflowEvidence>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RuntimeTranscriptReconstructionRequest {
+    pub workflow_id: String,
+    pub runtime_job_id: String,
+    pub content: String,
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
+}
+
+pub(super) async fn require_authenticated_transcript_access(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match super::auth::resolve_api_auth_mode(&state.core.server.config.server) {
+        Ok(super::auth::ApiAuthMode::Enforced(_)) => next.run(request).await,
+        Ok(super::auth::ApiAuthMode::Open) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "transcript_reconstruction_requires_authentication"
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(
+                "transcript reconstruction authentication configuration is invalid: {error}"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "authentication_misconfigured" })),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub(super) async fn merge_workflow_runtime(
@@ -138,6 +180,98 @@ pub(super) async fn retry_workflow_runtime(
     Json(request): Json<WorkflowRuntimeRecoveryRouteRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     recover_workflow_runtime(state, request, WorkflowRuntimeRecoveryAction::Retry).await
+}
+
+pub(super) async fn reconstruct_runtime_transcript(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RuntimeTranscriptReconstructionRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let workflow_id = request.workflow_id.trim();
+    let runtime_job_id = request.runtime_job_id.trim();
+    if workflow_id.is_empty() || runtime_job_id.is_empty() || request.content.trim().is_empty() {
+        return runtime_recovery_error(
+            StatusCode::BAD_REQUEST,
+            "workflow_id, runtime_job_id, and content are required",
+        );
+    }
+    let expected_checksum = request
+        .expected_checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if expected_checksum.is_some_and(|expected| {
+        expected != harness_workflow::runtime::runtime_transcript_checksum(&request.content)
+    }) {
+        return runtime_recovery_error(
+            StatusCode::BAD_REQUEST,
+            "re-exported transcript checksum does not match expected_checksum",
+        );
+    }
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return runtime_recovery_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workflow runtime store unavailable",
+        );
+    };
+    let sources = match store
+        .command_sources_for_runtime_jobs(&[runtime_job_id.to_string()])
+        .await
+    {
+        Ok(sources) => sources,
+        Err(error) => {
+            tracing::error!(
+                workflow_id,
+                runtime_job_id,
+                "reconstruct_runtime_transcript: ownership lookup failed: {error}"
+            );
+            return runtime_recovery_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to verify transcript producer ownership",
+            );
+        }
+    };
+    if sources
+        .get(runtime_job_id)
+        .is_none_or(|source| source.workflow_id != workflow_id)
+    {
+        return runtime_recovery_error(
+            StatusCode::CONFLICT,
+            "runtime job does not belong to the requested workflow",
+        );
+    }
+    match store
+        .reconstruct_runtime_transcript(
+            workflow_id,
+            runtime_job_id,
+            &request.content,
+            expected_checksum,
+            "operator_api",
+        )
+        .await
+    {
+        Ok(record) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "reconstructed",
+                "workflow_id": record.workflow_id,
+                "artifact_ref": record.reference.artifact_ref,
+                "producer_runtime_job_id": record.reference.producer_runtime_job_id,
+                "size_bytes": record.reference.size_bytes,
+                "checksum": record.reference.checksum,
+            })),
+        ),
+        Err(error) => {
+            tracing::error!(
+                workflow_id,
+                runtime_job_id,
+                "reconstruct_runtime_transcript: persistence failed: {error}"
+            );
+            runtime_recovery_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to reconstruct runtime transcript",
+            )
+        }
+    }
 }
 
 async fn recover_workflow_runtime(
