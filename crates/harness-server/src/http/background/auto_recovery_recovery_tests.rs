@@ -48,11 +48,12 @@ async fn auto_recovery_transition_matches_manual_unblock_except_actor() -> anyho
     let auto_after = refreshed(&store, &auto.id).await?;
     let manual_after = refreshed(&store, &manual.id).await?;
     assert_eq!(auto_after.state, manual_after.state);
-    assert_eq!(auto_after.data.get("last_stop"), auto.data.get("last_stop"));
-    assert_eq!(
-        manual_after.data.get("last_stop"),
-        manual.data.get("last_stop")
-    );
+    assert!(auto_after.data.get("last_stop").is_none());
+    assert!(manual_after.data.get("last_stop").is_none());
+    for cleared_key in ["stop_reason_code", "reason_class", "error_kind"] {
+        assert!(auto_after.data.get(cleared_key).is_none());
+        assert!(manual_after.data.get(cleared_key).is_none());
+    }
     assert_eq!(
         auto_after.data.pointer("/last_operator_recovery/actor"),
         Some(&json!(AUTO_RECOVERY_ACTOR))

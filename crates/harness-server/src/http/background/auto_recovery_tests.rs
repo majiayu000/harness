@@ -259,11 +259,13 @@ async fn auto_recovery_selects_transient_and_skips_terminal_and_legacy() -> anyh
         recovered.data.get("auto_recovery").is_none(),
         "successful recovery clears attempt state"
     );
-    // last_stop evidence is preserved by the recovery path (B-005).
-    assert_eq!(
-        recovered.data.pointer("/last_stop/stop_reason_code"),
-        Some(&json!("rate_limited"))
+    assert!(
+        recovered.data.get("last_stop").is_none(),
+        "successful recovery clears the resolved stop episode"
     );
+    assert!(recovered.data.get("stop_reason_code").is_none());
+    assert!(recovered.data.get("reason_class").is_none());
+    assert!(recovered.data.get("error_kind").is_none());
     for untouched in [&terminal, &forged, &legacy] {
         let after = refreshed(&store, &untouched.id).await?;
         assert_eq!(
