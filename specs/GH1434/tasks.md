@@ -18,9 +18,9 @@ GH-1434
 - [x] `SP1434-T005` Owner: `server` | Dependencies: `SP1434-T003` | Done when: `review_store` modules and router/handler references are removed | Verify: `cargo test --workspace && test "$(rg -l review_store crates | wc -l)" -eq 0`
 - [x] `SP1434-T006` Owner: `consumers` | Dependencies: runtime replacement APIs for any live compatibility behavior being moved | Done when: CLI, dashboard, and websocket references to thread/turn/task endpoints are removed or repointed to workflow-runtime equivalents before the old endpoints are deleted | Verify: `cargo test --workspace` plus dashboard first-viewport smoke
 - [x] `SP1434-T007` Owner: `server` | Dependencies: `SP1434-T003`, `SP1434-T006` | Done when: thread/turn RPC methods are removed from protocol definitions, router registration, and handlers; thread persistence is removed; the live in-memory role is retained or safely inlined | Verify: `cargo test --workspace && ! rg 'Thread(Start|Resume|Fork|List|Delete|Compact)|Turn(Start|Steer|Cancel|Status|RespondApproval)' crates/harness-protocol/src/methods.rs && ! rg 'Method::(Thread(Start|Resume|Fork|List|Delete|Compact)|Turn(Start|Steer|Cancel|Status|RespondApproval))' crates/harness-server/src/router crates/harness-server/src/handlers && ! rg 'thread_db|ThreadDb' crates --glob '!CHANGELOG.md'`
-- [ ] `SP1434-T008` Owner: `server` | Dependencies: `SP1434-T003`, `SP1434-T006`, extraction evidence for live workflow-runtime turn-engine dependencies | Done when: dependency scanning identifies live `task_*` references; live pieces are moved without semantic changes into workflow-runtime-adjacent modules; removable task-layer code is deleted | Verify: `cargo test --workspace` plus a PR migration table showing moved code and unchanged behavior
-- [ ] `SP1434-T009` Owner: `docs` | Dependencies: all removal PRs | Done when: CHANGELOG documents removed RPC methods, task endpoint compatibility changes, and archive/restore instructions; final summary reports net deleted LOC | Verify: reviewer checks method list and `git diff --shortstat`
-- [ ] `SP1434-T010` Owner: `tests` | Dependencies: all removal PRs | Done when: full workspace tests, clippy, and smoke checks pass | Verify: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `SP1434-T008` Owner: `server` | Dependencies: `SP1434-T003`, `SP1434-T006`, extraction evidence for live workflow-runtime turn-engine dependencies | Done when: dependency scanning identifies live `task_*` references; live pieces are moved without semantic changes into workflow-runtime-adjacent modules; removable task-layer code is deleted | Verify: `cargo test --workspace` plus a PR migration table showing moved code and unchanged behavior
+- [x] `SP1434-T009` Owner: `docs` | Dependencies: all removal PRs | Done when: CHANGELOG documents removed RPC methods, task endpoint compatibility changes, and archive/restore instructions; final summary reports net deleted LOC | Verify: reviewer checks method list and `git diff --shortstat`
+- [x] `SP1434-T010` Owner: `tests` | Dependencies: all removal PRs | Done when: full workspace tests, clippy, and smoke checks pass | Verify: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`
 
 ## Parallelization
 
@@ -45,22 +45,23 @@ GH-1434
 
 - PR #1453 is the evidence for `SP1434-T001` and the archive tooling. Archive
   execution completed on 2026-07-16 at `archives/phase1-20260716T092438Z`.
+  The archive comment records dump creation, restore instructions, and table
+  counts, but neither it nor the scoped T007/T008 waiver records an executed
+  scratch restore. The referenced operator-owned archive is not present in this
+  PR worktree, so this PR does not claim restore rehearsal completion.
 - The explicit maintainer waiver on GH-1434 satisfies `SP1434-T003` for T004
   and T005 based on the recorded zero-traffic evidence and completed archive:
   <https://github.com/majiayu000/harness/issues/1434#issuecomment-4993856096>.
-- Dashboard `/tasks` references are live compatibility paths for
-  workflow-runtime submission handles, details, streams, proof, artifacts,
-  merge, and cancel. Do not remove them until equivalent runtime APIs exist and
-  tests cover the replacement.
+- Dashboard consumers moved from `/tasks` to runtime-native submission routes in
+  `SP1434-T006`; PR #1706 subsequently removed the compatibility paths.
 - The GH-1434 maintainer comment from 2026-07-03 narrows the deletion boundary:
   `task_executor/turn_lifecycle.rs` and `task_executor/helpers.rs` are live,
   and the in-memory `thread_manager` role is live. Treat that as boundary
   evidence, not as a broad deletion waiver.
 - The GH-1434 gate comment from 2026-07-05 records that deletion PRs need either
   7 days of probe evidence or an explicit waiver with scope and reason.
-- `/tasks` is currently a workflow-runtime compatibility API for dashboard
-  submission handles and observation. Removing it requires replacement runtime
-  APIs first.
+- `/api/workflows/runtime/submissions` is now the only public submission list,
+  detail, and stream surface. Workflow actions use `workflow_id`.
 - `SP1434-T004` landed under the explicit maintainer waiver recorded on GH-1434
   (<https://github.com/majiayu000/harness/issues/1434#issuecomment-4993856096>),
   which waives the 7-day probe window for T004/T005 based on zero-count
@@ -90,3 +91,17 @@ GH-1434
   submissions, live approval responses use the authenticated runtime HTTP
   endpoint, and the unwritten context-manifest getter is removed with its sole
   legacy writer.
+- `SP1434-T008` landed in PR #1706. The legacy `/tasks` compatibility routes,
+  background recovery loops, task retention, and legacy remote-host task claim
+  path are removed. Runtime submission request/state models now live beside the
+  workflow-runtime submission layer. Review/planner execution policy and review
+  queue serialization remain enforced by the workflow runtime.
+- `SP1434-T009` records the exact removed RPC and HTTP compatibility surfaces,
+  the archive restore safety contract, and the Phase 1 implementation total:
+  34,156 deletions minus 11,246 additions equals 22,910 net deleted lines
+  across PRs #1663, #1701, #1702, #1703, and #1706.
+- `SP1434-T010` passed `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, PostgreSQL-backed
+  `cargo test --workspace`, both SpecRail checks, and runtime smoke for serve,
+  status, `pr fix --help`, health, dashboard first viewport, runtime submission
+  list, intake status, and a signed GitHub webhook ping.

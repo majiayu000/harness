@@ -144,14 +144,14 @@ ANTHROPIC_API_KEY=sk-ant-xxx ./target/release/harness --config config/default.to
   --port 9800
 ```
 
-## Submitting Tasks
+## Submitting Work
 
 ### By Prompt
 
 For ad-hoc work without a GitHub issue:
 
 ```bash
-curl -X POST http://127.0.0.1:9800/tasks \
+curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -163,18 +163,25 @@ curl -X POST http://127.0.0.1:9800/tasks \
 Response:
 
 ```json
-{ "status": "queued", "task_id": "a1b2c3d4-..." }
+{
+  "status": "implementing",
+  "execution_path": "workflow_runtime",
+  "submission_id": "prompt-task:...",
+  "task_id": "prompt-task:...",
+  "workflow_id": "workflow-..."
+}
 ```
 
-The task is accepted immediately and registered as pending work. Use
-`GET /tasks/{task_id}` to observe when execution actually starts.
+The submission is accepted immediately and persisted as active runtime work in
+the `implementing` state. Use
+`GET /api/workflows/runtime/submissions/{submission_id}` to observe progress.
 
 ### By GitHub Issue
 
 The agent reads the issue title and body, then implements it:
 
 ```bash
-curl -X POST http://127.0.0.1:9800/tasks \
+curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -188,7 +195,7 @@ curl -X POST http://127.0.0.1:9800/tasks \
 For reviewing or fixing an existing PR:
 
 ```bash
-curl -X POST http://127.0.0.1:9800/tasks \
+curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -196,31 +203,21 @@ curl -X POST http://127.0.0.1:9800/tasks \
   }'
 ```
 
-### Batch Submit
+### Submit Multiple Issues
 
-Submit multiple issues at once:
+The removed `/tasks/batch` compatibility route has no direct replacement.
+Submit each issue separately so each request receives a durable runtime result:
 
 ```bash
-curl -X POST http://127.0.0.1:9800/tasks/batch \
-  -H "Content-Type: application/json" \
-  -d '{
-    "project": "/path/to/project",
-    "issues": [10, 11, 12, 13]
-  }'
+for issue in 10 11 12 13; do
+  curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+    -H "Content-Type: application/json" \
+    -d "{\"project\":\"/path/to/project\",\"issue\":$issue}"
+done
 ```
 
-Response:
-
-```json
-[
-  { "task_id": "...", "status": "queued" },
-  { "task_id": "...", "status": "queued" },
-  { "task_id": "...", "status": "queued" },
-  { "task_id": "...", "status": "queued" }
-]
-```
-
-Tasks respect concurrency limits — excess tasks are queued.
+Runtime submissions respect project and review concurrency limits. Excess work
+remains pending until a worker acquires the corresponding queue permit.
 
 ## Monitoring
 
@@ -258,14 +255,14 @@ curl -s http://127.0.0.1:9800/api/dashboard | python3 -m json.tool
 }
 ```
 
-### Task Status
+### Submission Status
 
 ```bash
-# Single task
-curl http://127.0.0.1:9800/tasks/{task_id}
+# Single submission
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}
 
-# All tasks
-curl http://127.0.0.1:9800/tasks
+# All submissions
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions
 ```
 
 ### SSE Streaming
@@ -273,7 +270,7 @@ curl http://127.0.0.1:9800/tasks
 Stream real-time output from a running task:
 
 ```bash
-curl -N http://127.0.0.1:9800/tasks/{task_id}/stream
+curl -N http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}/stream
 ```
 
 ### Health Check
@@ -551,21 +548,17 @@ Tempo walkthrough.
 | `default_agent` | no | — | Override `agents.default_agent` for this project |
 | `max_concurrent` | no | — | Override `concurrency.max_concurrent_tasks` for this project |
 
-## Task Execution Pipeline
+## Workflow Runtime Execution Pipeline
 
 ```
-1. POST /tasks                    → validate request, resolve project
-2. TaskQueue.acquire()            → acquire per-project + global semaphore
-3. WorkspaceManager.create()      → create isolated git worktree
-4. Agent.execute_stream()         → agent runs in worktree (Claude/Codex/API)
-5. PostValidator.run()            → cargo fmt, cargo check (language-detected)
-   └─ on failure: retry up to max_retries, agent fixes issues
-6. Agent creates PR               → git push + gh pr create
-7. Codex review                   → independent review, up to max_rounds
-   └─ on issues: agent fixes → Codex re-reviews → repeat
-8. QualityGrader.score()          → compute quality grade (A/B/C/D/F)
-9. WorkspaceManager.cleanup()     → remove worktree
-10. Task status → done/failed
+1. POST /api/workflows/runtime/submissions → validate request and resolve project
+2. WorkflowRuntimeStore                  → persist workflow and implementation command
+3. Runtime dispatcher                    → claim the command and create a runtime job
+4. Runtime worker                        → acquire the project queue permit
+5. WorkspaceManager.create()             → create an isolated git worktree
+6. Agent executes                        → stream work through the configured agent adapter
+7. Runtime validation/review             → persist evidence and follow-up commands
+8. Workflow terminal transition          → expose done, failed, blocked, or cancelled state
 ```
 
 ## Workflow Runtime Recovery API
@@ -619,8 +612,8 @@ Every 24 hours, runs `RuleEngine::scan()` on the project root:
 
 ### Workflow Runtime Sweepers
 
-The watchdog is read-only; runtime and task retention remain disabled by
-default. Configure and roll them out in that order using
+The watchdog is read-only; workflow-runtime recovery remains opt-in. Configure
+it using
 [Workflow Runtime Operations](workflow-runtime-operations.md). See
 [Postgres Schema Cleanup](postgres-schema-cleanup.md) for orphan schema reaping.
 

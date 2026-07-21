@@ -9,11 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **breaking:** removed Harness-owned JSON-RPC thread/turn lifecycle methods and
-  the unwritten `context/manifest/get` endpoint. Use workflow-runtime HTTP
-  submissions for durable work; live approval responses now use
+- **breaking:** removed the Harness-owned JSON-RPC methods `thread/start`,
+  `thread/resume`, `thread/fork`, `thread/list`, `thread/delete`,
+  `thread/compact`, `turn/start`, `turn/steer`, `turn/cancel`, `turn/status`,
+  `turn/respond_approval`, and the unwritten `context/manifest/get` endpoint.
+  Use workflow-runtime HTTP submissions for durable work; live approval
+  responses now use
   `POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}`. The
   TypeScript and Python SDKs have migrated to these HTTP surfaces.
+- **breaking:** removed the legacy `/tasks` compatibility routes. Submit and
+  list work through `POST` and `GET /api/workflows/runtime/submissions`; use
+  `/api/workflows/runtime/submissions/{id}` for detail and append `/stream`,
+  `/artifacts`, `/prompts`, or `/proof` for the corresponding read surface.
+  Cancel and merge now use `POST /api/workflows/runtime/cancel` and
+  `POST /api/workflows/runtime/merge` with `workflow_id`. There is no direct
+  replacement for `POST /tasks/batch`; callers must submit each request to the
+  runtime endpoint. Runtime hosts must claim
+  `/api/runtime-hosts/{host_id}/runtime-jobs/claim`; the legacy
+  `/api/runtime-hosts/{host_id}/tasks/claim` route has been removed.
+- **migration:** Phase 1 data was archived before removal as
+  `archives/phase1-20260716T092438Z`. The archive is operator-owned and may
+  contain sensitive prompt or repository data. Inspect `table_counts.tsv` and
+  `phase1-data.list`, then restore `phase1-data.dump` only into an empty scratch
+  database with
+  `pg_restore --exit-on-error --no-owner --no-acl --dbname "$SCRATCH_DATABASE_URL" phase1-data.dump`.
+  Never restore it into a live Harness database and do not pass `--clean`.
+- **maintenance:** the GH-1434 Phase 1 implementation series (#1663, #1701,
+  #1702, #1703, and #1706) removed 34,156 lines and added 11,246 lines, for a
+  net deletion of 22,910 lines.
 - **security:** HTTP API authentication now fails closed when neither
   `api_token` nor `HARNESS_API_TOKEN` is configured. Operators must set a token
   or explicitly opt in to tokenless local development with

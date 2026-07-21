@@ -1,5 +1,10 @@
 # Workflow Runtime V2 State Machine Spec
 
+> Historical design record: references to `/tasks` and live legacy task rows
+> describe the pre-GH-1434 migration state. The compatibility routes and legacy
+> orchestration branches were removed in PR #1706. Current clients use
+> `/api/workflows/runtime/submissions` and workflow-runtime action endpoints.
+
 Status: Draft v1
 Date: 2026-05-21
 Compatibility: no backward compatibility with live legacy task orchestration

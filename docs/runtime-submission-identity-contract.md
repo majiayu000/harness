@@ -2,190 +2,126 @@
 
 Issue: #1127
 
-This document defines the identity model for runtime-owned submissions and the
-compatibility rules that must stay in place while Harness migrates away from
-legacy task-row semantics.
+This document defines the identity model after removal of the legacy task HTTP
+compatibility layer. Workflow-runtime state is authoritative for every public
+submission route.
 
 ## Terms
 
 ### `workflow_id`
 
-`workflow_id` is the workflow runtime instance id. It identifies the state
-machine row in `WorkflowRuntimeStore` and is the authoritative handle for
-workflow-runtime operations:
+`workflow_id` identifies the state-machine instance in
+`WorkflowRuntimeStore`. Use it for workflow actions and correlation:
 
-- runtime cancellation
-- runtime merge or approve actions
+- cancel, merge, unblock, and retry
 - runtime tree inspection
 - workflow event, decision, command, and job correlation
 
-`workflow_id` is not a legacy task row id and must not be used as a `/tasks/{id}`
-path parameter unless an endpoint explicitly documents workflow-id addressing.
+Do not use a `workflow_id` as a submission path parameter unless a route
+explicitly documents workflow-id addressing.
 
 ### `submission_id`
 
-`submission_id` is the long-term public submission handle. It identifies the
-operator-facing submission across task-compatible routes such as detail, stream,
-proof, artifacts, and prompts.
+`submission_id` is the public handle for an operator-facing submission. Use it
+with list-derived links for detail, stream, proof, artifacts, and prompts.
 
-During the migration, existing runtime workflows may not have a stored
-`submission_id`. For those rows, the compatibility submission handle is:
-
-1. the first string in `data.task_ids`, when present
-2. otherwise `data.task_id`
-
-That rule preserves links created before explicit `submission_id` support while
-still allowing newer `data.task_id` values to be recorded as retry or
-resubmission correlation handles.
+Historical runtime rows created before explicit submission ids may derive the
+handle from the first string in `data.task_ids`, or from `data.task_id` when the
+array is absent. For those legacy rows, every existing string in
+`data.task_ids` remains a resolvable lookup alias, as does `data.task_id`. These
+lookup rules preserve old runtime links; they do not imply that a legacy task
+row exists.
 
 ### `task_id`
 
-`task_id` has two meanings today:
+`task_id` is a deprecated response alias for `submission_id`. Runtime responses
+keep the alias for serialized-client compatibility, but callers must not infer
+task-store ownership from it. New clients should persist `submission_id` and
+`workflow_id` instead.
 
-- for legacy task-runner rows, it is the real `TaskStore` row id
-- for runtime-owned submissions, it is a compatibility alias for the submission
-  handle
+### `request_id`
 
-New runtime-owned API contracts must treat `task_id` as an alias only. The
-presence of `task_id` in a runtime response must not imply that a legacy
-`TaskStore` row exists.
+`request_id` identifies the accepted intake request. It may differ from the
+stable public submission handle after a retry or resubmission. It is a
+correlation value, not a detail-route handle.
 
-### Runtime Workspace Task Id
+### Runtime workspace task id
 
 Runtime worktree leases may use synthetic workspace ids such as
-`runtime-wf-...`. Those ids are workspace lease identifiers, not public
-submission handles. Worktree cards must carry `workflow_id` separately when a
-runtime workflow owns the lease.
+`runtime-wf-...`. Those ids identify workspace leases only. They are neither
+submission handles nor workflow ids.
 
-## API Contract
+## HTTP Contract
 
-### `POST /tasks`
+### Create and list
 
-Runtime-owned issue and prompt submissions return:
+`POST /api/workflows/runtime/submissions` returns an accepted runtime
+submission with:
 
 - `execution_path: "workflow_runtime"`
 - `workflow_id`
-- `task_id` as the current compatibility alias
+- `submission_id`
+- `task_id`, equal to `submission_id`, as a deprecated alias
+- `request_id`
 
-After #1128, runtime-owned submissions should also return `submission_id`.
-During the migration, `submission_id` and `task_id` must be equal for runtime
-responses.
+`GET /api/workflows/runtime/submissions` lists only workflow-runtime
+projections. Every row exposes the public submission handle and the underlying
+workflow identity needed by dashboard actions.
 
-Legacy task-runner submissions may keep returning only `task_id` when no
-runtime workflow exists.
+### Detail and evidence
 
-### `GET /tasks`
+The following routes address `{id}` as a submission handle:
 
-Runtime-owned rows returned by the list endpoint must expose enough identity for
-all dashboard actions:
+- `GET /api/workflows/runtime/submissions/{id}`
+- `GET /api/workflows/runtime/submissions/{id}/stream`
+- `GET /api/workflows/runtime/submissions/{id}/proof`
+- `GET /api/workflows/runtime/submissions/{id}/artifacts`
+- `GET /api/workflows/runtime/submissions/{id}/prompts`
 
-- `workflow_id` for workflow-runtime actions
-- `submission_id` once #1128 lands
-- `task_id` as a temporary compatibility alias
-- `execution_path: "workflow_runtime"`
+Rows with an explicit `submission_id` resolve through that value. Historical
+runtime rows may continue to resolve through the pre-existing alias derivation
+described above. All data comes from workflow-runtime state and must not require
+a legacy `TaskStore` row.
 
-Legacy task rows keep `task_id` as the primary id and omit `workflow_id`.
+### Workflow actions
 
-### `GET /tasks/{id}`
+Use `workflow_id`, not a submission handle, with these authenticated actions:
 
-The `{id}` parameter addresses a submission handle during migration:
+- `POST /api/workflows/runtime/cancel`
+- `POST /api/workflows/runtime/merge`
+- `POST /api/workflows/runtime/unblock`
+- `POST /api/workflows/runtime/retry`
 
-- runtime-owned rows with explicit `submission_id` resolve by `submission_id`
-- persisted runtime rows without `submission_id` continue to resolve by the
-  historical `task_id` alias recorded in `data.task_ids` or `data.task_id`
-- legacy rows resolve by real `TaskStore` task id
+Live approval responses use the turn and request ids supplied by runtime events:
 
-The response for a runtime-owned row must include `workflow_id` so clients do
-not need to infer runtime ownership from the path id.
+`POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}`.
 
-### `GET /tasks/{id}/stream`
+## Removed Compatibility
 
-The stream route accepts the same submission handle as `GET /tasks/{id}`.
-Runtime-owned streams are resolved through workflow-runtime metadata and events.
-
-### `POST /tasks/{id}/cancel`
-
-This route remains a compatibility endpoint during migration. It may accept a
-runtime submission handle, but clients that have `workflow_id` must prefer:
-
-```text
-POST /api/workflows/runtime/cancel
-```
-
-with `workflow_id` in the request body.
-
-### `GET /tasks/{id}/proof`
-
-The proof route accepts the submission handle. Runtime-owned proof responses
-must include `workflow_id` as a quality signal or explicit field so proof
-consumers can trace the underlying workflow.
-
-### `GET /tasks/{id}/artifacts`
-
-The artifacts route accepts the submission handle. Runtime-owned artifact lookup
-must not require a legacy `TaskStore` row once #1128 lands.
-
-### `GET /tasks/{id}/prompts`
-
-The prompts route accepts the submission handle. Runtime-owned prompt lookup
-must not require a legacy `TaskStore` row once #1128 lands.
-
-## Migration Phases
-
-### Phase 0: Current Compatibility
-
-- Runtime workflows persist `data.task_id` and `data.task_ids`.
-- The public runtime submission handle is the compatibility handle derived from
-  `data.task_ids[0]` or `data.task_id`.
-- Historical handles in `data.task_ids` remain lookup aliases.
-- `task_id` in runtime API responses is an alias, not proof of a legacy row.
-
-### Phase 1: Add Explicit `submission_id`
-
-- Runtime workflow data gains `data.submission_id`.
-- New runtime workflow rows write `submission_id` at creation.
-- Existing rows derive `submission_id` from the Phase 0 compatibility handle.
-- Runtime responses include both `submission_id` and `task_id`.
-- `task_id` remains equal to `submission_id` for runtime-owned responses.
-
-### Phase 2: Prefer Runtime-Native Handles
-
-- Dashboard and SDK flows store `submission_id` for task-compatible routes.
-- Dashboard and SDK flows store `workflow_id` for runtime workflow actions.
-- Runtime-owned detail, stream, cancel, proof, artifacts, and prompts work
-  without a legacy task row.
-- Legacy task rows continue to use real `task_id` values.
-
-### Phase 3: Remove Legacy Compatibility
-
-- Remove runtime-owned reliance on `data.task_id` as the public handle.
-- Keep historical alias lookup only for persisted workflows that predate
-  `submission_id`; rows with explicit `submission_id` must not use retry
-  `task_id` values as public lookup aliases.
-- Remove `/tasks` compatibility branches that only exist to make runtime-owned
-  workflows look like legacy task rows.
+The `/tasks` create, batch, list, detail, stream, proof, artifact, prompt,
+cancel, and merge routes have been removed. Callers must not construct those
+paths from `task_id`. Batch callers submit each item separately to the runtime
+submission endpoint so every request receives its own durable workflow result.
 
 ## Route Ownership Rules
 
 - Use `workflow_id` for workflow-runtime actions.
-- Use `submission_id` for task-compatible read and stream routes.
-- Use `task_id` only for real legacy task rows or as a temporary response alias.
-- Do not use runtime workspace ids as submission handles.
-- Do not infer runtime ownership from id shape. Use `execution_path` or
-  `workflow_id`.
+- Use `submission_id` for submission read and stream routes.
+- Treat `task_id` as a deprecated serialized alias only.
+- Treat `request_id` as intake correlation only.
+- Do not use runtime workspace ids as public handles.
+- Do not infer ownership from id shape; use explicit response fields.
 
 ## Test Contract
 
-Contract tests must lock these invariants before #1128 and #1129 change the
-implementation:
+Contract tests lock these invariants:
 
-- runtime submissions preserve historical task handles for lookup
-- the Phase 0 compatibility handle is stable even if `data.task_id` changes on a
-  later resubmission
-- runtime create, list, detail, stream, cancel, proof, artifact, and prompt
-  routes document their identity ownership
-- runtime-owned responses expose `workflow_id`
-- runtime-owned flows do not require a legacy `TaskStore` row
-- rows with explicit `submission_id` resolve through that handle, while
-  historical `task_id` aliases remain limited to rows that predate
-  `submission_id`
+- new submissions persist and return stable `submission_id` values
+- `task_id` equals `submission_id` in runtime responses
+- retries do not change the public submission handle
+- historical runtime aliases remain resolvable
+- create, list, detail, stream, proof, artifact, and prompt routes do not depend
+  on a legacy task row
+- workflow actions require `workflow_id`
+- missing workflow-runtime persistence fails closed rather than returning
+  partial legacy data
