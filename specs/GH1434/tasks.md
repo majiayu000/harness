@@ -45,10 +45,14 @@ GH-1434
 
 - PR #1453 is the evidence for `SP1434-T001` and the archive tooling. Archive
   execution completed on 2026-07-16 at `archives/phase1-20260716T092438Z`.
-  The archive comment records dump creation, restore instructions, and table
-  counts, but neither it nor the scoped T007/T008 waiver records an executed
-  scratch restore. The referenced operator-owned archive is not present in this
-  PR worktree, so this PR does not claim restore rehearsal completion.
+  The scratch restore rehearsal completed on 2026-07-21 against PostgreSQL
+  16.14: all 29 tables and 1,689 rows matched the archived counts with an empty
+  diff. The evidence and archive SHA-256 are recorded on GH-1434:
+  <https://github.com/majiayu000/harness/issues/1434#issuecomment-5033352086>.
+  The first attempt also proved that selected-table dumps omit schema creation;
+  the archive tooling now generates a validated schema bootstrap and a
+  deterministic row-count verification query. The failure-first evidence is
+  retained in the preceding GH-1434 evidence comment.
 - The explicit maintainer waiver on GH-1434 satisfies `SP1434-T003` for T004
   and T005 based on the recorded zero-traffic evidence and completed archive:
   <https://github.com/majiayu000/harness/issues/1434#issuecomment-4993856096>.

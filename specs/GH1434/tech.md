@@ -99,9 +99,12 @@ merge, and cancel before the compatibility endpoint can be removed.
 - [x] Archive creation produced a dump, restore instructions, and table counts
       before related code was deleted, as recorded in the archive evidence:
       <https://github.com/majiayu000/harness/issues/1434#issuecomment-4990260785>.
-- [ ] A scratch-database restore rehearsal is not evidenced. The referenced
-      operator-owned archive is not present in this PR worktree, and the scoped
-      waiver does not include restore command output or row-count comparisons.
+- [x] A scratch-database restore rehearsal completed on 2026-07-21 against
+      PostgreSQL 16.14. The same archived dump restored 29 tables and 1,689
+      rows with an empty row-count diff; the failure-first evidence, SHA-256,
+      successful command contract, and retained operator artifact path are
+      recorded in
+      <https://github.com/majiayu000/harness/issues/1434#issuecomment-5033352086>.
 
 ## Rollback Plan
 
