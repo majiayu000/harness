@@ -8,6 +8,7 @@ use crate::runtime::{
     RemoteFactSnapshot, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
     WorkflowInstance,
 };
+use harness_core::config::isolation::IsolationTrustClass;
 use serde_json::Value;
 
 pub enum WorkflowCoverageRecoveryExpected<'a> {
@@ -38,6 +39,49 @@ pub enum WorkflowCoverageRecoveryOutcome {
 }
 
 impl WorkflowRuntimeStore {
+    pub async fn reconcile_instance_author_trust_class(
+        &self,
+        workflow_id: &str,
+        incoming: IsolationTrustClass,
+    ) -> anyhow::Result<Option<WorkflowInstance>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(mut instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let current = instance
+            .data
+            .get("author_trust_class")
+            .map(|value| {
+                serde_json::from_value::<IsolationTrustClass>(value.clone()).map_err(|error| {
+                    anyhow::anyhow!(
+                        "invalid durable author_trust_class for workflow `{workflow_id}`: {error}"
+                    )
+                })
+            })
+            .transpose()?;
+        let effective = if current == Some(IsolationTrustClass::NonCollaborator)
+            || incoming == IsolationTrustClass::NonCollaborator
+        {
+            IsolationTrustClass::NonCollaborator
+        } else {
+            IsolationTrustClass::Trusted
+        };
+        if current != Some(effective) {
+            let data = instance.data.as_object_mut().ok_or_else(|| {
+                anyhow::anyhow!("workflow `{workflow_id}` data must be an object")
+            })?;
+            data.insert(
+                "author_trust_class".to_string(),
+                serde_json::to_value(effective)?,
+            );
+            instance.version = instance.version.saturating_add(1);
+            upsert_instance_tx(&mut tx, &instance).await?;
+        }
+        tx.commit().await?;
+        Ok(Some(instance))
+    }
+
     pub async fn commit_coverage_recovery_transition(
         &self,
         transition: WorkflowCoverageRecoveryTransition<'_>,
