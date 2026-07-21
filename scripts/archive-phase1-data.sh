@@ -35,10 +35,13 @@ validate_phase1_table() {
 write_schema_bootstrap() {
   local tables_file="$1"
   local output_file="$2"
+  local schemas=()
+  local table schema
   while IFS= read -r table; do
     validate_phase1_table "$table"
-    printf '%s\n' "${table%%.*}"
-  done < "$tables_file" | sort -u | while IFS= read -r schema; do
+    schemas+=("${table%%.*}")
+  done < "$tables_file"
+  printf '%s\n' "${schemas[@]}" | sort -u | while IFS= read -r schema; do
     printf 'CREATE SCHEMA IF NOT EXISTS "%s";\n' "$schema"
   done > "$output_file"
 }
@@ -47,11 +50,13 @@ write_row_count_verification() {
   local tables_file="$1"
   local output_file="$2"
   local first=1
+  local table schema name
   {
     printf 'COPY (\n'
     while IFS= read -r table; do
       validate_phase1_table "$table"
-      IFS=. read -r schema name <<<"$table"
+      schema="${table%%.*}"
+      name="${table#*.}"
       if [[ "$first" -eq 0 ]]; then
         printf 'UNION ALL\n'
       fi
