@@ -70,17 +70,17 @@ direction is direct deletion after safety evidence, not plugin extraction.
 
 - [x] Usage probes have landed for the Phase 1 target surfaces. PR #1453 added
       `UsageProbe`, `probe_report`, and target-surface instrumentation.
-- [ ] Deletion PRs cite at least 7 days of zero-count `probe_report` evidence
+- [x] Deletion PRs cite at least 7 days of zero-count `probe_report` evidence
       or a maintainer waiver recorded on GH-1434 with scope and reason.
-- [ ] Thread/task archive execution has produced dump artifacts and restore
+- [x] Thread/task archive execution has produced dump artifacts and restore
       instructions before related code is removed.
-- [ ] After all removal PRs merge, `harness-eval` is no longer a workspace
+- [x] After all removal PRs merge, `harness-eval` is no longer a workspace
       member, `review_store` is gone, removable thread/turn and task layers are
       gone, and no dangling protocol/router/CLI/dashboard references remain.
-- [ ] The final Phase 1 summary reports net deleted LOC. The expected target is
+- [x] The final Phase 1 summary reports net deleted LOC. The expected target is
       more than 10,000 net deleted LOC.
-- [ ] `cargo test --workspace` exits 0.
-- [ ] Smoke checks pass: serve startup, status, `pr fix --help`, webhook
+- [x] `cargo test --workspace` exits 0.
+- [x] Smoke checks pass: serve startup, status, `pr fix --help`, webhook
       health, and dashboard first viewport.
 
 ## Edge Cases
@@ -93,16 +93,14 @@ direction is direct deletion after safety evidence, not plugin extraction.
 - `thread_manager` has a hot in-memory role for workflow-runtime jobs. Phase 1
   may delete thread/turn RPCs and `thread_db` persistence, but the in-memory
   role must remain or be inlined safely.
-- The dashboard currently uses `/tasks` as a compatibility surface for
-  workflow-runtime submission handles, details, logs, proof, and artifacts.
-  Deleting those consumers before equivalent runtime APIs exist would regress
-  the dashboard.
+- Before `SP1434-T006`, the dashboard used `/tasks` as a compatibility surface
+  for workflow-runtime submission handles, details, logs, proof, and artifacts.
+  The consumer migration landed before those compatibility routes were removed.
 - CLI compatibility changes for thread/turn/task endpoints are breaking
   changes and must be documented.
 
 ## Rollout Notes
 
-PR #1453 provided the probe and archive-script prerequisite, but the 7-day
-deletion gate is not satisfied as of 2026-07-05. Future removal PRs must either
-attach fresh zero-count probe evidence from the required window or cite an
-explicit maintainer waiver comment on GH-1434.
+PR #1453 provided the probe and archive-script prerequisite. The removal series
+used the scoped maintainer waivers recorded on GH-1434, preserved the archived
+database tables, and completed consumer migration before endpoint deletion.

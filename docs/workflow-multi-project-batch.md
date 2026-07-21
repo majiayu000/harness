@@ -53,7 +53,7 @@ Example for vibeguard:
 ### By prompt (for new work)
 
 ```bash
-curl -s -X POST http://127.0.0.1:9800/tasks \
+curl -s -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H 'Content-Type: application/json' \
   -d '{
     "project": "/path/to/project",
@@ -65,7 +65,7 @@ curl -s -X POST http://127.0.0.1:9800/tasks \
 ### By issue number (for existing GitHub issues)
 
 ```bash
-curl -s -X POST http://127.0.0.1:9800/tasks \
+curl -s -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H 'Content-Type: application/json' \
   -d '{
     "project": "/path/to/project",

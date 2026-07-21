@@ -2,7 +2,8 @@
 
 ## Goal
 
-Add a runtime host control surface so Harness can track external executors and safely lease either legacy pending tasks or workflow runtime jobs to them.
+Add a runtime host control surface so Harness can track external executors and
+safely lease workflow-runtime jobs to them.
 
 ## Why
 
@@ -15,26 +16,21 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 - host `deregister`
 - host `heartbeat`
 - host listing with `online` status derived from heartbeat freshness
-2. Task leases stored on the authoritative task scheduler state:
-- runtime host can claim one pending task
-- duplicate claim prevention across hosts
-- lease TTL support
-3. Legacy task HTTP API endpoints:
+2. Runtime-host lifecycle HTTP API endpoints:
 - `GET /api/runtime-hosts`
 - `POST /api/runtime-hosts/register`
 - `POST /api/runtime-hosts/{id}/heartbeat`
 - `POST /api/runtime-hosts/{id}/deregister`
-- `POST /api/runtime-hosts/{id}/tasks/claim`
-4. Workflow runtime job HTTP API endpoints:
+3. Workflow runtime job HTTP API endpoints:
 - `POST /api/runtime-hosts/{id}/runtime-jobs/claim`
 - `POST /api/runtime-hosts/{id}/runtime-jobs/{runtime_job_id}/lease/renew`
 - `POST /api/runtime-hosts/{id}/runtime-jobs/{runtime_job_id}/complete`
-5. Tests for lease correctness, heartbeat-driven status, runtime job claim ownership, and terminal callback ownership.
+4. Tests for lease correctness, heartbeat-driven status, runtime job claim ownership, and terminal callback ownership.
 
 ## Out of Scope
 
 1. Progress streaming callbacks.
-2. Scheduler integration that auto-routes all legacy tasks to runtime hosts.
+2. Compatibility with the removed legacy task claim protocol.
 3. Workspace/multi-tenant model migration.
 
 ## Data Model (V1)
@@ -47,10 +43,6 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 - `last_heartbeat_at: DateTime<Utc>`
 - `lifecycle: active | draining` (legacy records default to `active`)
 
-`TaskScheduler` runtime-host lease fields
-- `runtime_host_id: Option<String>`
-- `lease_expires_at: Option<DateTime<Utc>>`
-
 `RuntimeJob` workflow runtime lease fields
 - `runtime_kind: RuntimeKind`
 - `runtime_profile: String`
@@ -62,25 +54,27 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 
 1. `register` is idempotent by `host_id` (upsert metadata and refresh heartbeat).
 2. `heartbeat` on unknown host returns error.
-3. `deregister` first persists `draining`, revokes every owned workflow runtime-job lease, releases pending task claims, and removes the host only after no workflow leases remain. A failed or interrupted cleanup leaves the host visibly draining and retryable.
-4. Legacy task `claim` selects only tasks in `pending` status.
-5. A non-expired lease blocks claims by other hosts.
-6. Expired leases are reclaimable by any host.
-7. Workflow runtime-job claims select only `runtime_kind = remote_host` jobs.
-8. In-process runtime workers do not claim `remote_host` jobs.
-9. Runtime-job completion requires the host id and exact lease expiration timestamp from the claim response. Upgraded clients also send the additive lease generation; legacy clients may omit it.
-10. Runtime-job claim and renewal lease durations default to 60 seconds and accept only `1..=3600` seconds.
-11. A draining host cannot claim or renew work. Heartbeat only updates host liveness and never extends a job lease.
+3. `deregister` first persists `draining`, revokes every owned workflow
+   runtime-job lease, and removes the host only after no workflow leases remain.
+   A failed or interrupted cleanup leaves the host visibly draining and
+   retryable.
+4. A non-expired lease blocks claims by other hosts.
+5. Expired leases are reclaimable by any host.
+6. Workflow runtime-job claims select only `runtime_kind = remote_host` jobs.
+7. In-process runtime workers do not claim `remote_host` jobs.
+8. Runtime-job completion requires the host id and exact lease expiration
+   timestamp from the claim response. Upgraded clients also send the additive
+   lease generation; legacy clients may omit it.
+9. Runtime-job claim and renewal lease durations default to 60 seconds and
+   accept only `1..=3600` seconds.
+10. A draining host cannot claim or renew work. Heartbeat only updates host
+    liveness and never extends a job lease.
 
 ## API Response Shape
 
 `GET /api/runtime-hosts`
 - `hosts: [{ id, display_name, capabilities, registered_at, last_heartbeat_at, online, lifecycle }]`
 - `online` is computed as `now - last_heartbeat_at <= heartbeat_timeout_secs`
-
-`POST /api/runtime-hosts/{id}/tasks/claim`
-- success: `{ claimed: true, task_id, lease_expires_at }`
-- none available: `{ claimed: false }`
 
 `POST /api/runtime-hosts/{id}/runtime-jobs/claim`
 - request: `{ lease_secs?: number }`
@@ -118,8 +112,8 @@ Stop remote clients from calling renewal before disabling the renew route. The a
 ## Risks
 
 1. Claim fairness is best-effort because pending selection is linear scan.
-2. Host state is lightweight; legacy task lease truth is intentionally owned by the task store.
-3. Workflow runtime-job lease truth is owned by `WorkflowRuntimeStore`.
+2. Host state is lightweight; workflow runtime-job lease truth is owned by
+   `WorkflowRuntimeStore`.
 
 ## Verification
 
@@ -127,8 +121,8 @@ Stop remote clients from calling renewal before disabling the renew route. The a
 - registration upserts host metadata
 - heartbeat updates online status
 - stale heartbeat marks a host offline
-2. Task-store and handler tests:
+2. Runtime-host handler tests:
 - register + heartbeat + list returns online host
-- claim endpoint returns expected payload and prevents double-claim
+- runtime-job claim returns the expected payload and prevents double-claim
 - workflow runtime-job claim endpoint ignores local runtime jobs
 - workflow runtime-job completion accepts terminal `ActivityResult` only when the exact lease is still owned by that host
