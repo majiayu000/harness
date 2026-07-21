@@ -71,10 +71,17 @@ as the coverage authority after recovery.
     class. Barrier-synchronized concurrent and repeated attempts must converge
     on that candidate without duplicate commands, regressed terminal state, or
     overwritten newer evidence.
+11. **B-011:** Recovery is one compare-and-swap transaction: only its winner may
+    replace the binding, persist the selected fact, cancel superseded work, or
+    reactivate the deterministic quality-gate command. A cancelled command is
+    runnable again even when a terminal runtime job exists from its prior run.
+12. **B-012:** Recovery preserves non-collaborator trust on the recovered parent
+    and every repair, review, and quality-gate child workflow; missing or
+    malformed trust evidence fails closed instead of defaulting to trusted.
 
 ## Acceptance Criteria
 
-- [ ] B-001 through B-010 have deterministic tests and implementation
+- [ ] B-001 through B-012 have deterministic tests and implementation
       evidence.
 - [ ] The Remem canary scenario—empty store plus open closing PR—reconstructs
       coverage with zero `implement_issue` jobs.

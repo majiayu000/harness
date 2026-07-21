@@ -9,7 +9,7 @@ GH-1707
 See `specs/GH1707/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1707,"complete":true,"paths":["crates/harness-server/src/github_pr_snapshot.rs","crates/harness-server/src/github_pr_snapshot_tests.rs","crates/harness-server/src/intake/github_coverage_gate.rs","crates/harness-server/src/intake/github_coverage_recovery.rs","crates/harness-server/src/intake/github_coverage_recovery_tests.rs","crates/harness-server/src/intake/github_coverage_recovery_tests/support.rs","crates/harness-server/src/intake/github_issue_links.rs","crates/harness-server/src/intake/mod.rs","crates/harness-server/src/task_executor/pr_detection.rs","crates/harness-server/src/task_executor/pr_detection_tests.rs","crates/harness-server/src/workflow_runtime_pr_feedback/pr_detection.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010"]}
+{"issue":1707,"complete":true,"paths":["crates/harness-server/src/http/tests/runtime_worker_non_issue_replay_tests.rs","crates/harness-server/src/github_pr_snapshot.rs","crates/harness-server/src/github_pr_snapshot_tests.rs","crates/harness-server/src/intake/github_coverage_gate.rs","crates/harness-server/src/intake/github_coverage_recovery.rs","crates/harness-server/src/intake/github_coverage_recovery_tests.rs","crates/harness-server/src/intake/github_coverage_recovery_tests/atomic.rs","crates/harness-server/src/intake/github_coverage_recovery_tests/support.rs","crates/harness-server/src/intake/github_issue_links.rs","crates/harness-server/src/intake/mod.rs","crates/harness-server/src/task_executor/pr_detection.rs","crates/harness-server/src/task_executor/pr_detection_tests.rs","crates/harness-server/src/workflow_runtime_pr_feedback/pr_detection.rs","crates/harness-server/src/workflow_runtime_worker/child_workflow.rs","crates/harness-server/src/workflow_runtime_worker/child_workflow_non_issue.rs","crates/harness-workflow/src/runtime/remote_facts.rs","crates/harness-workflow/src/runtime/store.rs","crates/harness-workflow/src/runtime/store/commands.rs","crates/harness-workflow/src/runtime/store/coverage_recovery.rs","crates/harness-workflow/src/runtime/store/runtime_job_state.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012"]}
 -->
 
 ## Current System
@@ -42,14 +42,21 @@ See `specs/GH1707/product.md`.
    choose the highest PR number.
 4. Derive the target workflow state from PR state, checks, review decision,
    review threads, and merge facts using the exact matrix below.
-5. Upsert the issue-bound workflow, PR binding, remote fact snapshot, and only
-   the commands required for the derived state. Cancel stale implementation
-   work before the coverage gate returns `Covered`.
+5. Atomically compare-and-swap the issue-bound workflow, selected PR fact,
+   recovery event/decision, stale-command cancellation, and only the commands
+   required for the derived state. A losing recovery performs no cancellation
+   or partial fact/binding write. A cancelled deterministic quality-gate
+   command is reactivated and can enqueue a fresh job after a terminal prior
+   job.
 6. Reuse stable workflow and command dedupe keys so repeated polls and restarts
    converge.
 7. Propagate every lookup/completeness error to intake. Page-limit exhaustion
    and repeated pagination URLs are errors in both compiled PR-discovery
    implementations, not warning-plus-partial-result paths.
+8. Preserve the issue author's trust class through recovery and child-workflow
+   creation. If either current intake or durable workflow metadata identifies
+   a non-collaborator, recovery must retain `non_collaborator`; missing or
+   malformed recovery trust evidence must never elevate execution to trusted.
 
 ## Recovery State Matrix
 
@@ -128,6 +135,14 @@ poll.
       recovery attempts after candidate selection and releases both to race the
       persistence boundary; assert one binding, one state, and one deduplicated
       command set.
+- [ ] Race recovery against an ordinary workflow transition and assert a losing
+      recovery cannot cancel the winner's command or overwrite its state/data.
+- [ ] Cancel a recovered deterministic quality-gate command both before and
+      after a runtime job exists; recovery reactivates it and dispatches one
+      fresh job while retaining terminal job history.
+- [ ] Recover a non-collaborator issue and assert both the parent and its
+      quality-gate/feedback child commands resolve to non-collaborator
+      isolation.
 - [ ] Run `cargo check -p harness-server --all-targets`.
 - [ ] Run `cargo fmt --all -- --check` and
       `cargo clippy --workspace --all-targets -- -D warnings`.

@@ -35,10 +35,12 @@ GH-1707
 
 - Owner: implementation agent.
 - Dependencies: SP1707-T1.
-- Covers: B-002, B-003, B-004, B-007.
+- Covers: B-002, B-003, B-004, B-007, B-011, B-012.
 - Work: persist the PR snapshot and binding, derive the workflow state, cancel
   stale implementation commands, and enqueue only state-appropriate deduped
-  follow-up commands.
+  follow-up commands in one expected-version transaction. Preserve
+  non-collaborator trust through parent and child workflows and reactivate a
+  cancelled deterministic quality-gate command.
 - Done when: waiting facts map to `pr_open`, repair facts map to
   `awaiting_feedback`, a ready snapshot maps to `quality_gate_pending`, only a
   passing quality gate advances to `ready_to_merge`, and merged-plus-closed
@@ -53,7 +55,7 @@ GH-1707
 
 - Owner: verification owner.
 - Dependencies: SP1707-T2.
-- Covers: B-001, B-002, B-004, B-006, B-010.
+- Covers: B-001, B-002, B-004, B-006, B-010, B-011, B-012.
 - Work: execute recovery twice, reopen the store, repeat intake, then use an
   explicit barrier to hold two attempts after candidate selection and release
   them together at the persistence boundary. Inspect commands, bindings,
@@ -84,7 +86,7 @@ may run after the implementation head is pushed.
 
 ## Verification
 
-- [ ] Product invariant set equals task coverage union: B-001 through B-010.
+- [ ] Product invariant set equals task coverage union: B-001 through B-012.
 - [ ] Global and GH-1707 SpecRail checks pass.
 - [ ] Focused fail-closed and state-recovery tests pass.
 - [ ] Forward/reverse candidate ordering and GraphQL-only authority tests pass.

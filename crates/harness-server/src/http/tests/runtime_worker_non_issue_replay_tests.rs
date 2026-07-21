@@ -162,6 +162,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         "issue_number": 227,
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
+        "author_trust_class": "non_collaborator",
     }));
     store.upsert_instance(&parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
@@ -265,7 +266,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
             .enqueue_command(&child.id, Some(&record.id), command)
             .await?;
     }
-    child.state = "pending".to_string();
+    child.state = "checking".to_string();
     store.upsert_instance(&child).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
@@ -281,6 +282,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         .await?
         .expect("quality gate child workflow should still exist");
     assert_eq!(child_after.state, "checking");
+    assert_eq!(child_after.data["author_trust_class"], "non_collaborator");
     let child_events = store.events_for(&child_id).await?;
     assert_eq!(
         child_events
@@ -300,6 +302,45 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
     assert_eq!(child_decisions.len(), 1);
     let child_commands = store.commands_for(&child_id).await?;
     assert_eq!(child_commands.len(), 1);
+    let dispatcher = harness_workflow::runtime::RuntimeCommandDispatcher::new(
+        store,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "codex-default",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+    )
+    .with_isolation_config(harness_core::config::isolation::IsolationConfig {
+        default_tier: harness_core::config::isolation::IsolationTier::Host,
+        rules: vec![harness_core::config::isolation::IsolationRule {
+            trust: harness_core::config::isolation::IsolationTrustClass::NonCollaborator,
+            tier: harness_core::config::isolation::IsolationTier::Container,
+        }],
+        network_allowlist: Vec::new(),
+    })
+    .with_isolation_availability(harness_core::config::isolation::IsolationAvailability::new(
+        vec![
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Host,
+            ),
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Container,
+            ),
+        ],
+    ));
+    let dispatched = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("quality gate child command should dispatch");
+    let harness_workflow::runtime::CommandDispatchOutcome::Enqueued { runtime_job, .. } =
+        dispatched
+    else {
+        panic!("unexpected dispatch outcome: {dispatched:?}");
+    };
+    assert_eq!(runtime_job.input["isolation"]["tier"], "container");
+    assert_eq!(
+        runtime_job.input["isolation"]["trust_class"],
+        "non_collaborator"
+    );
     Ok(())
 }
 

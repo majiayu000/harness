@@ -135,9 +135,20 @@ impl WorkflowRuntimeStore {
         &self,
         snapshot: &RemoteFactSnapshot,
     ) -> anyhow::Result<RemoteFactSnapshot> {
-        let facts = serde_json::to_string(&snapshot.facts)?;
-        let row = sqlx::query_as::<_, RemoteFactSnapshotRow>(
-            "INSERT INTO remote_fact_snapshots (
+        let mut tx = self.pool().begin().await?;
+        let upserted = upsert_remote_fact_snapshot_tx(&mut tx, snapshot).await?;
+        tx.commit().await?;
+        Ok(upserted)
+    }
+}
+
+pub(in crate::runtime) async fn upsert_remote_fact_snapshot_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot: &RemoteFactSnapshot,
+) -> anyhow::Result<RemoteFactSnapshot> {
+    let facts = serde_json::to_string(&snapshot.facts)?;
+    let row = sqlx::query_as::<_, RemoteFactSnapshotRow>(
+        "INSERT INTO remote_fact_snapshots (
                 id, provider, repo, subject_type, subject_number, subject_url,
                 head_sha, state, fact_hash, facts, fetched_at
              )
@@ -152,25 +163,42 @@ impl WorkflowRuntimeStore {
                 facts = EXCLUDED.facts,
                 fetched_at = EXCLUDED.fetched_at,
                 updated_at = CURRENT_TIMESTAMP
+             WHERE remote_fact_snapshots.fetched_at <= EXCLUDED.fetched_at
              RETURNING id, provider, repo, subject_type, subject_number, subject_url,
                 head_sha, state, fact_hash, facts::text, fetched_at",
-        )
-        .bind(snapshot.id)
-        .bind(&snapshot.provider)
-        .bind(&snapshot.repo)
-        .bind(&snapshot.subject_type)
-        .bind(snapshot.subject_number)
-        .bind(&snapshot.subject_url)
-        .bind(&snapshot.head_sha)
-        .bind(&snapshot.state)
-        .bind(&snapshot.fact_hash)
-        .bind(&facts)
-        .bind(snapshot.fetched_at)
-        .fetch_one(self.pool())
-        .await?;
-        snapshot_from_row(row)
+    )
+    .bind(snapshot.id)
+    .bind(&snapshot.provider)
+    .bind(&snapshot.repo)
+    .bind(&snapshot.subject_type)
+    .bind(snapshot.subject_number)
+    .bind(&snapshot.subject_url)
+    .bind(&snapshot.head_sha)
+    .bind(&snapshot.state)
+    .bind(&snapshot.fact_hash)
+    .bind(&facts)
+    .bind(snapshot.fetched_at)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = row {
+        return snapshot_from_row(row);
     }
+    let row = sqlx::query_as::<_, RemoteFactSnapshotRow>(
+        "SELECT id, provider, repo, subject_type, subject_number, subject_url,
+                head_sha, state, fact_hash, facts::text, fetched_at
+             FROM remote_fact_snapshots
+             WHERE provider = $1 AND repo = $2 AND subject_type = $3 AND subject_number = $4",
+    )
+    .bind(&snapshot.provider)
+    .bind(&snapshot.repo)
+    .bind(&snapshot.subject_type)
+    .bind(snapshot.subject_number)
+    .fetch_one(&mut **tx)
+    .await?;
+    snapshot_from_row(row)
+}
 
+impl WorkflowRuntimeStore {
     pub async fn get_remote_fact_snapshot(
         &self,
         provider: &str,
@@ -270,6 +298,39 @@ mod tests {
         assert_eq!(loaded.state, "closed");
         assert_eq!(loaded.fact_hash, second.fact_hash);
         assert_eq!(loaded, upserted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_store_does_not_overwrite_newer_remote_fact() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let fetched_at = Utc::now();
+        let newer = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            9,
+            "merged",
+            json!({"state": "merged"}),
+            fetched_at,
+        );
+        store.upsert_remote_fact_snapshot(&newer).await?;
+        let older = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            9,
+            "open",
+            json!({"state": "open"}),
+            fetched_at - chrono::Duration::seconds(1),
+        );
+        let persisted = store.upsert_remote_fact_snapshot(&older).await?;
+        assert_eq!(persisted.fact_hash, newer.fact_hash);
+        assert_eq!(persisted.state, "merged");
         Ok(())
     }
 }

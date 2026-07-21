@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
+const DEFAULT_GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const SERVER_PR_SNAPSHOT_SCHEMA: &str = "harness.github.pr_snapshot.v1";
 pub(crate) const GITHUB_PR_SNAPSHOT_ARTIFACT: &str = "github_pr_snapshot";
 pub(crate) const SERVER_PR_SNAPSHOT_ERROR_ARTIFACT: &str = "server_pr_snapshot_error";
@@ -137,15 +137,16 @@ pub(crate) async fn fetch_github_pr_snapshot(
     github_token: Option<&str>,
 ) -> anyhow::Result<GitHubPrSnapshotArtifacts> {
     let client = reqwest::Client::new();
-    fetch_github_pr_snapshot_with_client(&client, target, github_token).await
+    fetch_github_pr_snapshot_with_client(&client, target, github_token, &github_graphql_url()).await
 }
 
-async fn fetch_github_pr_snapshot_with_client(
+pub(crate) async fn fetch_github_pr_snapshot_with_client(
     client: &reqwest::Client,
     target: &GitHubPrSnapshotTarget,
     github_token: Option<&str>,
+    graphql_url: &str,
 ) -> anyhow::Result<GitHubPrSnapshotArtifacts> {
-    let raw_pr = fetch_github_pr_snapshot_value(client, target, github_token).await?;
+    let raw_pr = fetch_github_pr_snapshot_value(client, target, github_token, graphql_url).await?;
     let normalized_snapshot = normalize_github_pr_snapshot(target, &raw_pr)?;
     Ok(GitHubPrSnapshotArtifacts {
         raw_pr,
@@ -157,6 +158,7 @@ async fn fetch_github_pr_snapshot_value(
     client: &reqwest::Client,
     target: &GitHubPrSnapshotTarget,
     github_token: Option<&str>,
+    graphql_url: &str,
 ) -> anyhow::Result<Value> {
     let (owner, repo) = target
         .repo_slug
@@ -216,6 +218,10 @@ async fn fetch_github_pr_snapshot_value(
                 }
               }
               closingIssuesReferences(first: 20) {
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
                 nodes {
                   number
                   url
@@ -227,7 +233,7 @@ async fn fetch_github_pr_snapshot_value(
     "#;
 
     let mut request = client
-        .post(GITHUB_GRAPHQL_URL)
+        .post(graphql_url)
         .header(ACCEPT, "application/vnd.github+json")
         .header(USER_AGENT, "harness-server")
         .json(&json!({
@@ -259,6 +265,13 @@ async fn fetch_github_pr_snapshot_value(
         .and_then(|repository| repository.get("pullRequest").cloned())
         .filter(|pr| !pr.is_null())
         .ok_or_else(|| anyhow::anyhow!("GitHub PR snapshot query returned no PR data"))
+}
+
+pub(crate) fn github_graphql_url() -> String {
+    std::env::var("HARNESS_GITHUB_GRAPHQL_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_GITHUB_GRAPHQL_URL.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,6 +317,7 @@ fn normalize_github_pr_snapshot(
     let observed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let review_threads_complete = !connection_has_next_page(pr, "reviewThreads");
     let changed_files_complete = !connection_has_next_page(pr, "files");
+    let closing_issues_complete = !connection_has_next_page(pr, "closingIssuesReferences");
 
     Ok(json!({
         "schema": SERVER_PR_SNAPSHOT_SCHEMA,
@@ -340,6 +354,7 @@ fn normalize_github_pr_snapshot(
         "changed_files": changed_files,
         "changed_files_complete": changed_files_complete,
         "closing_issues": closing_issues,
+        "closing_issues_complete": closing_issues_complete,
     }))
 }
 

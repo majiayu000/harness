@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
 const GITHUB_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_PR_LOOKUP_MAX_PAGES: usize = 20;
 const GITHUB_ERROR_BODY_SNIPPET_CHARS: usize = 300;
@@ -24,6 +24,14 @@ struct GhPrListItem {
     title: String,
     #[serde(default)]
     body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClosingPullRequestCandidate {
+    pub(crate) repo_slug: String,
+    pub(crate) number: u64,
+    pub(crate) head_ref_name: String,
+    pub(crate) url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,7 +227,7 @@ pub(crate) async fn find_existing_pr_for_issue_with_token(
         &repo_slug,
         issue,
         github_token,
-        GITHUB_API_BASE_URL,
+        &github_api_base_url(),
     )
     .await
 }
@@ -231,51 +239,87 @@ async fn find_existing_pr_for_issue_in_repo(
     github_token: Option<&str>,
     api_base_url: &str,
 ) -> anyhow::Result<Option<(u64, String, String)>> {
-    let mut next_url = Some(github_pulls_url(api_base_url, repo_slug));
+    Ok(find_closing_prs_for_issue_in_repo(
+        client,
+        repo_slug,
+        issue,
+        github_token,
+        api_base_url,
+        "open",
+        Some(1),
+    )
+    .await?
+    .into_iter()
+    .next()
+    .map(|candidate| (candidate.number, candidate.head_ref_name, candidate.url)))
+}
+
+pub(crate) async fn find_closing_prs_for_issue_in_repo(
+    client: &reqwest::Client,
+    repo_slug: &str,
+    issue: u64,
+    github_token: Option<&str>,
+    api_base_url: &str,
+    state: &str,
+    candidate_limit: Option<usize>,
+) -> anyhow::Result<Vec<ClosingPullRequestCandidate>> {
+    let mut next_url = Some(github_pulls_url(api_base_url, repo_slug, state));
     let mut seen_urls = HashSet::new();
     let mut page_count = 0usize;
+    let mut candidates = Vec::new();
 
     while let Some(url) = next_url {
         if page_count >= GITHUB_PR_LOOKUP_MAX_PAGES {
-            tracing::warn!(
-                issue,
-                repo = %repo_slug,
-                page_limit = GITHUB_PR_LOOKUP_MAX_PAGES,
-                "existing PR lookup stopped after reaching the GitHub pagination page limit"
+            anyhow::bail!(
+                "GitHub pull request lookup for {repo_slug} issue #{issue} exceeded the pagination limit of {} pages",
+                GITHUB_PR_LOOKUP_MAX_PAGES
             );
-            break;
         }
         page_count += 1;
 
         if !seen_urls.insert(url.clone()) {
-            tracing::debug!(
-                issue,
-                repo = %repo_slug,
-                url = %url,
-                "existing PR lookup stopped because GitHub pagination repeated a URL"
+            anyhow::bail!(
+                "GitHub pull request lookup for {repo_slug} issue #{issue} repeated pagination URL {url}"
             );
-            break;
         }
 
         let page = fetch_github_pr_page(client, &url, repo_slug, issue, github_token).await?;
 
-        if let Some(item) = page
-            .items
-            .into_iter()
-            .find(|item| pr_claims_to_close_issue(item, issue, Some(repo_slug)))
-        {
-            return Ok(Some((item.number, item.head_ref_name, item.url)));
+        candidates.extend(
+            page.items
+                .into_iter()
+                .filter(|item| pr_claims_to_close_issue(item, issue, Some(repo_slug)))
+                .map(|item| ClosingPullRequestCandidate {
+                    repo_slug: repo_slug.to_string(),
+                    number: item.number,
+                    head_ref_name: item.head_ref_name,
+                    url: item.url,
+                }),
+        );
+
+        if let Some(limit) = candidate_limit {
+            if candidates.len() >= limit {
+                candidates.truncate(limit);
+                break;
+            }
         }
 
         next_url = page.next_url;
     }
 
-    Ok(None)
+    Ok(candidates)
 }
 
-fn github_pulls_url(api_base_url: &str, repo_slug: &str) -> String {
+pub(crate) fn github_api_base_url() -> String {
+    std::env::var("HARNESS_GITHUB_API_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_GITHUB_API_BASE_URL.to_string())
+}
+
+fn github_pulls_url(api_base_url: &str, repo_slug: &str, state: &str) -> String {
     format!(
-        "{}/repos/{repo_slug}/pulls?state=open&per_page=100",
+        "{}/repos/{repo_slug}/pulls?state={state}&per_page=100",
         api_base_url.trim_end_matches('/')
     )
 }

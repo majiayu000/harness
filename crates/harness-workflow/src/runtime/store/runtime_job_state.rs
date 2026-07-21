@@ -235,40 +235,8 @@ impl WorkflowRuntimeStore {
                 .bind(command_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, data::text FROM runtime_jobs
-             WHERE command_id = $1
-               AND status IN ('pending', 'running')
-             FOR UPDATE",
-        )
-        .bind(command_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut cancelled = 0usize;
-        for (id, data) in rows {
-            let mut job: RuntimeJob = serde_json::from_str(&data)?;
-            job.complete(&ActivityResult::cancelled(activity, summary))?;
-            let updated = to_jsonb_string(&job)?;
-            let status = enum_str(&job.status)?;
-            sqlx::query(
-                "UPDATE runtime_jobs
-                 SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = $4",
-            )
-            .bind(&status)
-            .bind(job.not_before)
-            .bind(&updated)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-            runtime_job_leases::delete_runtime_job_lease_receipts_tx(
-                &mut tx,
-                &id,
-                job.lease_generation,
-            )
-            .await?;
-            cancelled += 1;
-        }
+        let cancelled =
+            cancel_unfinished_runtime_jobs_tx(&mut tx, command_id, activity, summary).await?;
         sqlx::query(
             "UPDATE workflow_commands
              SET status = $2,
@@ -291,4 +259,36 @@ impl WorkflowRuntimeStore {
         tx.commit().await?;
         Ok(cancelled)
     }
+}
+
+pub(super) async fn cancel_unfinished_runtime_jobs_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    command_id: &str,
+    activity: &str,
+    summary: &str,
+) -> anyhow::Result<usize> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, data::text FROM runtime_jobs
+         WHERE command_id = $1 AND status IN ('pending', 'running') FOR UPDATE",
+    )
+    .bind(command_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for (id, data) in &rows {
+        let mut job: RuntimeJob = serde_json::from_str(data)?;
+        job.complete(&ActivityResult::cancelled(activity, summary))?;
+        sqlx::query(
+            "UPDATE runtime_jobs SET status = $1, not_before = $2, data = $3::jsonb,
+                updated_at = CURRENT_TIMESTAMP WHERE id = $4",
+        )
+        .bind(enum_str(&job.status)?)
+        .bind(job.not_before)
+        .bind(to_jsonb_string(&job)?)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+        runtime_job_leases::delete_runtime_job_lease_receipts_tx(tx, id, job.lease_generation)
+            .await?;
+    }
+    Ok(rows.len())
 }

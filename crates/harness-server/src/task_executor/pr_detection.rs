@@ -235,24 +235,17 @@ async fn find_existing_pr_for_issue_in_repo(
 
     while let Some(url) = next_url {
         if page_count >= GITHUB_PR_LOOKUP_MAX_PAGES {
-            tracing::warn!(
-                issue,
-                repo = %repo_slug,
-                page_limit = GITHUB_PR_LOOKUP_MAX_PAGES,
-                "existing PR lookup stopped after reaching the GitHub pagination page limit"
+            anyhow::bail!(
+                "GitHub pull request lookup for {repo_slug} issue #{issue} exceeded the pagination limit of {} pages",
+                GITHUB_PR_LOOKUP_MAX_PAGES
             );
-            break;
         }
         page_count += 1;
 
         if !seen_urls.insert(url.clone()) {
-            tracing::debug!(
-                issue,
-                repo = %repo_slug,
-                url = %url,
-                "existing PR lookup stopped because GitHub pagination repeated a URL"
+            anyhow::bail!(
+                "GitHub pull request lookup for {repo_slug} issue #{issue} repeated pagination URL {url}"
             );
-            break;
         }
 
         let page = fetch_github_pr_page(client, &url, repo_slug, issue, github_token).await?;

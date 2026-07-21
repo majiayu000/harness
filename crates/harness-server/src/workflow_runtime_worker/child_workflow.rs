@@ -132,6 +132,12 @@ pub(super) async fn execute_start_child_workflow(
                 optional_string(command, "external_id").unwrap_or_else(|| issue_number.to_string());
             let depends_on =
                 dependency_task_ids_from_command(command, repo, issue_task_prefix.as_deref());
+            let author_trust_class = parent
+                .and_then(|workflow| workflow.data.get("author_trust_class"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| anyhow::anyhow!("invalid parent author_trust_class: {error}"))?;
             let submission = crate::workflow_runtime_submission::record_issue_submission(
                 store,
                 crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
@@ -147,7 +153,7 @@ pub(super) async fn execute_start_child_workflow(
                     source: Some(source.as_str()),
                     external_id: Some(external_id.as_str()),
                     remote_fact_hash: None,
-                    author_trust_class: None,
+                    author_trust_class,
                 },
             )
             .await?;
