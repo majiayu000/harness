@@ -2,6 +2,7 @@ use super::data_helpers::activity_name;
 use super::executor::{is_internal_non_agent_activity, ServerRuntimeJobExecutor};
 use super::transcript_durability::{
     exact_replay_preflight_result, hydrate_exact_replay_transcript,
+    strip_caller_transcript_unavailable_signal,
 };
 use async_trait::async_trait;
 use harness_workflow::runtime::{ActivityResult, RuntimeJob, RuntimeJobExecutor};
@@ -31,7 +32,7 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
         }
         let activity = activity_name(&job);
         match self.execute_inner(job).await {
-            Ok(result) => result,
+            Ok(result) => strip_caller_transcript_unavailable_signal(result),
             Err(error) => ActivityResult::failed(
                 activity,
                 "Runtime job execution failed before the agent completed.",

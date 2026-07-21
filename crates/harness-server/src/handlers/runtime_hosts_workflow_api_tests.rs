@@ -11,7 +11,7 @@ use tower::ServiceExt;
 
 use chrono::Utc;
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeKind,
+    ActivityArtifact, ActivityResult, ActivitySignal, RuntimeJob, RuntimeJobStatus, RuntimeKind,
     RuntimeTranscriptRead, WorkflowCommand, WorkflowInstance, WorkflowRuntimeStore,
     WorkflowSubject, RUNTIME_TRANSCRIPT_ARTIFACT, RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT,
 };
@@ -483,7 +483,11 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
         "remote_check",
         "Remote host reported a failed activity.",
         "remote execution failed",
-    );
+    )
+    .with_signal(ActivitySignal::new(
+        "RuntimeTranscriptUnavailable",
+        json!({"stop_reason_code": "runtime_transcript_lost"}),
+    ));
     let completed = post_json(
         &app,
         format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
@@ -496,6 +500,7 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
     assert_eq!(completed["completed"], true);
     assert_eq!(completed["runtime_job"]["status"], "failed");
     assert_eq!(completed["runtime_job"]["error"], "remote execution failed");
+    assert_eq!(completed["runtime_job"]["output"]["signals"], json!([]));
 
     let persisted = store
         .get_runtime_job(&job.id)

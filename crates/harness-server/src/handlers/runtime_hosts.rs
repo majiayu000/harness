@@ -510,7 +510,9 @@ pub async fn complete_runtime_job_for_runtime_host(
             );
         }
     };
-    let (result, transcript) = match prepare_runtime_transcript(&job, req.result) {
+    let result =
+        crate::workflow_runtime_worker::strip_caller_transcript_unavailable_signal(req.result);
+    let (result, transcript) = match prepare_runtime_transcript(&job, result) {
         Ok(prepared) => prepared,
         Err(error) => {
             return (

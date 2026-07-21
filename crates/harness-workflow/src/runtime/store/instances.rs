@@ -554,6 +554,7 @@ impl WorkflowRuntimeStore {
                         WHERE (
                             artifact.workflow_id = family.id
                             OR producer_command.workflow_id = family.id
+                            OR dependency.workflow_id = family.id
                         )
                           AND (NOT EXISTS (
                               SELECT 1 FROM terminal_states AS dependent_terminal

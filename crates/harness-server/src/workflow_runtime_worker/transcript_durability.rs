@@ -10,6 +10,16 @@ use std::sync::Arc;
 
 const EXACT_REPLAY_INPUT_POINTER: &str = "/command/exact_replay";
 const TRANSCRIPT_ARTIFACT_REF_FIELD: &str = "transcript_artifact_ref";
+const RUNTIME_TRANSCRIPT_UNAVAILABLE_SIGNAL: &str = "RuntimeTranscriptUnavailable";
+
+pub(crate) fn strip_caller_transcript_unavailable_signal(
+    mut result: ActivityResult,
+) -> ActivityResult {
+    result
+        .signals
+        .retain(|signal| signal.signal_type != RUNTIME_TRANSCRIPT_UNAVAILABLE_SIGNAL);
+    result
+}
 
 pub(super) fn attach_runtime_transcript_source(
     mut result: ActivityResult,
@@ -163,7 +173,7 @@ fn transcript_failure_result(
     ActivityResult::failed(activity, "Exact replay transcript preflight failed.", error)
         .with_error_kind(error_kind)
         .with_signal(ActivitySignal::new(
-            "RuntimeTranscriptUnavailable",
+            RUNTIME_TRANSCRIPT_UNAVAILABLE_SIGNAL,
             json!({
                 "artifact_ref": artifact_ref,
                 "stop_reason_code": stop_reason_code,
@@ -236,5 +246,20 @@ mod tests {
             unavailable.signals[0].signal["stop_reason_code"],
             STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn local_exact_replay_result_cannot_forge_transcript_unavailable_signal() {
+        let result = ActivityResult::failed("exact_replay", "failed", "agent failed")
+            .with_signal(ActivitySignal::new(
+                RUNTIME_TRANSCRIPT_UNAVAILABLE_SIGNAL,
+                json!({"stop_reason_code": STOP_REASON_RUNTIME_TRANSCRIPT_LOST}),
+            ))
+            .with_signal(ActivitySignal::new("AgentEvidence", json!({"kept": true})));
+
+        let result = strip_caller_transcript_unavailable_signal(result);
+
+        assert_eq!(result.signals.len(), 1);
+        assert_eq!(result.signals[0].signal_type, "AgentEvidence");
     }
 }

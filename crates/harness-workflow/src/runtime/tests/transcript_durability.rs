@@ -50,6 +50,15 @@ fn result_with_transcript(content: &str) -> ActivityResult {
         ))
 }
 
+struct TranscriptResultExecutor;
+
+#[async_trait]
+impl RuntimeJobExecutor for TranscriptResultExecutor {
+    async fn execute(&self, _job: RuntimeJob) -> ActivityResult {
+        result_with_transcript("exact")
+    }
+}
+
 #[tokio::test]
 async fn transcript_completion_is_atomic_restart_safe_and_pinned_while_active() -> anyhow::Result<()>
 {
@@ -224,6 +233,38 @@ async fn transcript_persistence_failure_rolls_back_runtime_completion() -> anyho
             .await?,
         RuntimeTranscriptRead::Missing
     ));
+
+    let worker_workflow =
+        issue_instance("implementing").with_id("transcript-worker-rollback-workflow");
+    store.upsert_instance(&worker_workflow).await?;
+    let worker_command =
+        WorkflowCommand::enqueue_activity("implement_issue", "transcript-worker-rollback-command");
+    let worker_command_id = store
+        .enqueue_command(&worker_workflow.id, None, &worker_command)
+        .await?;
+    let worker_job = store
+        .enqueue_runtime_job(
+            &worker_command_id,
+            RuntimeKind::CodexExec,
+            "codex-default",
+            json!({
+                "workflow_id": "different-workflow",
+                "activity": "implement_issue",
+            }),
+        )
+        .await?;
+    let worker_error = RuntimeWorker::new(&store, "transcript-worker-test")
+        .run_once(&TranscriptResultExecutor)
+        .await
+        .expect_err("worker completion must reject a mismatched transcript");
+    assert!(worker_error.to_string().contains("workflow mismatch"));
+    let events = store.runtime_events_for(&worker_job.id).await?;
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != "ActivityResultReady"),
+        "a rolled-back completion must not expose ActivityResultReady"
+    );
     Ok(())
 }
 
@@ -383,6 +424,73 @@ async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyho
         )
         .await?;
     assert_eq!(reconstructed.content, "provider re-export");
+    Ok(())
+}
+
+#[tokio::test]
+async fn lost_transcript_consumer_and_producer_remain_pinned_until_recovery() -> anyhow::Result<()>
+{
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let producer = issue_instance("implementing").with_id("lost-family-producer");
+    let (job, lease_expires_at) = claimed_transcript_job(&store, &producer).await?;
+    let (result, pending) = prepare_runtime_transcript(&job, result_with_transcript("original"))?;
+    let artifact_ref = runtime_transcript_artifact_ref(&job.id);
+    store
+        .commit_runtime_activity_completion_with_transcript_if_owned(
+            &job.id,
+            "transcript-test",
+            lease_expires_at,
+            &result,
+            pending.as_ref(),
+        )
+        .await?
+        .expect("producer completion should commit");
+    let mut terminal_producer = producer.clone();
+    terminal_producer.state = "done".to_string();
+    store.upsert_instance(&terminal_producer).await?;
+
+    let consumer = issue_instance("failed")
+        .with_id("lost-family-consumer")
+        .with_data(json!({
+            "stop_reason_code": "runtime_transcript_lost",
+            "last_stop": {"stop_reason_code": "runtime_transcript_lost"},
+        }));
+    store.upsert_instance(&consumer).await?;
+    let replay = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "lost-family-replay",
+        json!({
+            "activity": "exact_replay",
+            "exact_replay": {"transcript_artifact_ref": artifact_ref},
+        }),
+    );
+    store.enqueue_command(&consumer.id, None, &replay).await?;
+    sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
+        .bind(&artifact_ref)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = ANY($1::text[])")
+        .bind(vec![producer.id.as_str(), consumer.id.as_str()])
+        .bind(Utc::now() - Duration::days(45))
+        .execute(store.pool())
+        .await?;
+
+    for _ in 0..2 {
+        let summary = store
+            .prune_terminal_runtime_history(Utc::now() - Duration::days(30), 100)
+            .await?;
+        assert!(
+            summary.is_empty(),
+            "the lost consumer family and its producer must stay pinned across prune passes"
+        );
+    }
+    assert!(store.get_instance(&producer.id).await?.is_some());
+    assert!(store.get_instance(&consumer.id).await?.is_some());
+    assert!(store.get_runtime_job(&job.id).await?.is_some());
     Ok(())
 }
 
