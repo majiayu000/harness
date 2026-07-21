@@ -1,12 +1,9 @@
 use super::*;
-use serde_json::{json, Value};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde_json::json;
 
-const REPO: &str = "owner/repo";
+#[path = "github_coverage_recovery_test_support.rs"]
+mod support;
+use support::*;
 
 #[tokio::test]
 async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> anyhow::Result<()> {
@@ -218,7 +215,7 @@ async fn merged_pr_does_not_cover_an_issue_github_still_reports_open() -> anyhow
     let graphql_url = spawn_json_server(
         "200 OK",
         vec![
-            issue_links_response("OPEN", &[]),
+            issue_links_response("OPEN", &[pr_number]),
             graphql_response(pr_snapshot(
                 pr_number,
                 issue_number,
@@ -249,6 +246,71 @@ async fn merged_pr_does_not_cover_an_issue_github_still_reports_open() -> anyhow
 }
 
 #[tokio::test]
+async fn merged_pr_and_closed_issue_recover_terminal_coverage_without_agent_work(
+) -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("merged-closed-issue");
+    std::fs::create_dir(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let issue_number = 1730;
+    let pr_number = 1740;
+    let rest_url = spawn_json_server("200 OK", vec![rest_candidates(&[])]).await;
+    let graphql_url = spawn_json_server(
+        "200 OK",
+        vec![
+            issue_links_response("CLOSED", &[pr_number]),
+            graphql_response(pr_snapshot(
+                pr_number,
+                issue_number,
+                "MERGED",
+                "SUCCESS",
+                true,
+            )),
+        ],
+    )
+    .await;
+
+    let coverage = recover_with_urls(
+        &store,
+        &project_root,
+        &project_id,
+        issue_number,
+        &rest_url,
+        &graphql_url,
+    )
+    .await?;
+
+    assert_eq!(
+        coverage,
+        GitHubIssueCoverage::Covered {
+            source: "github_closing_pr",
+            state: "done".to_string(),
+        }
+    );
+    assert_recovered_binding(&store, &project_id, issue_number, pr_number, "done").await?;
+    let recovered = store
+        .get_instance(&workflow_id(&project_id, Some(REPO), issue_number))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("terminal recovered workflow is missing"))?;
+    assert_eq!(
+        recovered.data["terminal_evidence"]["reason"],
+        "closing_pr_merged"
+    );
+    assert_eq!(
+        recovered.data["terminal_evidence"]["merge_commit_sha"],
+        "merge-sha"
+    );
+    assert_eq!(
+        recovered.data["terminal_evidence"]["fact_hash"],
+        recovered.data["last_remote_fact_hash"]
+    );
+    assert_no_agent_work(&store, &project_id, issue_number).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn closed_pr_is_uncovered_but_a_later_valid_pr_recovers_coverage() -> anyhow::Result<()> {
     let Some((dir, store)) = open_runtime_store().await? else {
         return Ok(());
@@ -262,7 +324,7 @@ async fn closed_pr_is_uncovered_but_a_later_valid_pr_recovers_coverage() -> anyh
     let graphql_url = spawn_json_server(
         "200 OK",
         vec![
-            issue_links_response("OPEN", &[]),
+            issue_links_response("OPEN", &[1741]),
             graphql_response(pr_snapshot(1741, issue_number, "CLOSED", "SUCCESS", true)),
         ],
     )
@@ -331,7 +393,8 @@ async fn github_lookup_failure_is_visible_and_leaves_no_dispatchable_work() -> a
     let project_id = project_root.to_string_lossy().into_owned();
     let rest_url =
         spawn_json_server("503 Service Unavailable", vec![json!({"error": "down"})]).await;
-    let graphql_url = spawn_json_server("200 OK", vec![issue_links_response("OPEN", &[])]).await;
+    let graphql_url =
+        spawn_json_server("503 Service Unavailable", vec![json!({"error": "down"})]).await;
 
     let error = recover_with_urls(
         &store,
@@ -353,7 +416,8 @@ async fn github_lookup_failure_is_visible_and_leaves_no_dispatchable_work() -> a
 }
 
 #[tokio::test]
-async fn incomplete_closing_issue_snapshot_preserves_exact_rest_candidate() -> anyhow::Result<()> {
+async fn authoritative_issue_link_survives_incomplete_pr_closing_issue_snapshot(
+) -> anyhow::Result<()> {
     let Some((dir, store)) = open_runtime_store().await? else {
         return Ok(());
     };
@@ -380,7 +444,7 @@ async fn incomplete_closing_issue_snapshot_preserves_exact_rest_candidate() -> a
     let graphql_url = spawn_json_server(
         "200 OK",
         vec![
-            issue_links_response("OPEN", &[]),
+            issue_links_response("OPEN", &[pr_number]),
             graphql_response(snapshot),
         ],
     )
@@ -580,211 +644,4 @@ async fn recovery_preserves_project_base_branch_for_later_merge_gates() -> anyho
     );
     assert_no_agent_work(&store, &project_id, issue_number).await?;
     Ok(())
-}
-
-async fn open_runtime_store() -> anyhow::Result<Option<(tempfile::TempDir, WorkflowRuntimeStore)>> {
-    if !crate::test_helpers::db_tests_enabled().await {
-        return Ok(None);
-    }
-    let dir = crate::test_helpers::tempdir_in_home("harness-test-coverage-recovery-")?;
-    let store = WorkflowRuntimeStore::open_with_database_url(
-        &dir.path().join("runtime"),
-        Some(&crate::test_helpers::test_database_url()?),
-    )
-    .await?;
-    Ok(Some((dir, store)))
-}
-
-async fn recover_with_urls(
-    store: &WorkflowRuntimeStore,
-    project_root: &Path,
-    project_id: &str,
-    issue_number: u64,
-    rest_url: &str,
-    graphql_url: &str,
-) -> anyhow::Result<GitHubIssueCoverage> {
-    recover_github_pr_coverage_with_client(
-        store,
-        project_root,
-        project_id,
-        REPO,
-        issue_number,
-        None,
-        &reqwest::Client::new(),
-        rest_url,
-        graphql_url,
-    )
-    .await
-}
-
-async fn assert_recovered_binding(
-    store: &WorkflowRuntimeStore,
-    project_id: &str,
-    issue_number: u64,
-    pr_number: u64,
-    state: &str,
-) -> anyhow::Result<()> {
-    let workflow = store
-        .get_instance(&workflow_id(project_id, Some(REPO), issue_number))
-        .await?
-        .expect("recovered workflow");
-    assert_eq!(workflow.state, state);
-    assert_eq!(workflow.data["issue_number"], issue_number);
-    assert_eq!(workflow.data["pr_number"], pr_number);
-    assert_eq!(workflow.data["coverage_recovered_from_github"], true);
-    assert!(workflow.data["last_remote_fact_hash"].as_str().is_some());
-    Ok(())
-}
-
-async fn assert_no_agent_work(
-    store: &WorkflowRuntimeStore,
-    project_id: &str,
-    issue_number: u64,
-) -> anyhow::Result<()> {
-    let id = workflow_id(project_id, Some(REPO), issue_number);
-    assert!(store
-        .commands_for(&id)
-        .await?
-        .iter()
-        .all(|command| command.status == WorkflowCommandStatus::Cancelled));
-    assert!(store.pending_commands(500).await?.is_empty());
-    Ok(())
-}
-
-async fn assert_quality_gate_queued(
-    store: &WorkflowRuntimeStore,
-    project_id: &str,
-    issue_number: u64,
-    pr_number: u64,
-) -> anyhow::Result<()> {
-    let id = workflow_id(project_id, Some(REPO), issue_number);
-    let commands = store.commands_for(&id).await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(
-        commands[0].command.command_type,
-        WorkflowCommandType::StartChildWorkflow
-    );
-    assert_eq!(
-        commands[0].command.command["definition_id"],
-        QUALITY_GATE_DEFINITION_ID
-    );
-    assert_eq!(commands[0].command.command["pr_number"], pr_number);
-    Ok(())
-}
-
-fn rest_candidates(prs: &[(u64, u64)]) -> Value {
-    Value::Array(
-        prs.iter()
-            .map(|(pr, issue)| {
-                json!({
-                    "number": pr,
-                    "html_url": format!("https://github.com/{REPO}/pull/{pr}"),
-                    "title": format!("Fix issue {issue}"),
-                    "body": format!("Closes #{issue}"),
-                    "head": {"ref": format!("fix-{issue}-{pr}")},
-                })
-            })
-            .collect(),
-    )
-}
-
-fn pr_snapshot(
-    pr_number: u64,
-    issue_number: u64,
-    state: &str,
-    checks: &str,
-    approved: bool,
-) -> Value {
-    json!({
-        "number": pr_number,
-        "state": state,
-        "merged": state == "MERGED",
-        "url": format!("https://github.com/{REPO}/pull/{pr_number}"),
-        "title": format!("Fix issue {issue_number}"),
-        "baseRefName": "main",
-        "headRefName": format!("fix-{issue_number}-{pr_number}"),
-        "headRefOid": format!("head-{pr_number}"),
-        "mergeCommit": {"oid": if state == "MERGED" { Some("merge-sha") } else { None }},
-        "isDraft": false,
-        "mergeStateStatus": "CLEAN",
-        "reviewDecision": if approved { "APPROVED" } else { "REVIEW_REQUIRED" },
-        "statusCheckRollup": {"state": checks},
-        "reviewThreads": {
-            "pageInfo": {"hasNextPage": false, "endCursor": null},
-            "nodes": [],
-        },
-        "files": {
-            "pageInfo": {"hasNextPage": false, "endCursor": null},
-            "nodes": [],
-        },
-        "closingIssuesReferences": {
-            "pageInfo": {"hasNextPage": false, "endCursor": null},
-            "nodes": [{
-                "number": issue_number,
-                "url": format!("https://github.com/{REPO}/issues/{issue_number}"),
-            }],
-        },
-    })
-}
-
-fn graphql_response(pr: Value) -> Value {
-    json!({"data": {"repository": {"pullRequest": pr}}})
-}
-
-fn issue_links_response(issue_state: &str, prs: &[u64]) -> Value {
-    json!({
-        "data": {
-            "repository": {
-                "issue": {
-                    "state": issue_state,
-                    "closedByPullRequestsReferences": {
-                        "pageInfo": {"hasNextPage": false, "endCursor": null},
-                        "nodes": prs
-                            .iter()
-                            .map(|pr| json!({
-                                "number": pr,
-                                "url": format!("https://github.com/{REPO}/pull/{pr}"),
-                                "headRefName": format!("linked-{pr}"),
-                                "repository": {"nameWithOwner": REPO},
-                            }))
-                            .collect::<Vec<_>>(),
-                    },
-                },
-            },
-        },
-    })
-}
-
-async fn spawn_json_server(status: &'static str, bodies: Vec<Value>) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind GitHub mock");
-    let address = listener.local_addr().expect("GitHub mock address");
-    let bodies = Arc::new(
-        bodies
-            .into_iter()
-            .map(|body| body.to_string())
-            .collect::<Vec<_>>(),
-    );
-    let request_count = Arc::new(AtomicUsize::new(0));
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            let bodies = Arc::clone(&bodies);
-            let index = request_count.fetch_add(1, Ordering::SeqCst);
-            tokio::spawn(async move {
-                let mut request = [0_u8; 16_384];
-                let _ = socket.read(&mut request).await;
-                let body = &bodies[index.min(bodies.len().saturating_sub(1))];
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-    format!("http://{address}")
 }

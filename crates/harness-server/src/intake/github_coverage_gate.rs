@@ -21,9 +21,7 @@ use crate::github_pr_snapshot::{
     fetch_github_pr_snapshot_with_client, github_graphql_url, pr_readiness_for_snapshot,
     GitHubPrSnapshotTarget, PrReadiness,
 };
-use crate::workflow_runtime_pr_feedback::pr_detection::{
-    find_closing_prs_for_issue_in_repo, github_api_base_url, ClosingPullRequestCandidate,
-};
+use crate::workflow_runtime_pr_feedback::pr_detection::ClosingPullRequestCandidate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GitHubIssueCoverage {
@@ -209,7 +207,6 @@ async fn recover_github_pr_coverage(
         issue_number,
         github_token,
         &client,
-        &github_api_base_url(),
         &github_graphql_url(),
     )
     .await
@@ -224,7 +221,6 @@ async fn recover_github_pr_coverage_with_client(
     issue_number: u64,
     github_token: Option<&str>,
     client: &reqwest::Client,
-    api_base_url: &str,
     graphql_url: &str,
 ) -> anyhow::Result<GitHubIssueCoverage> {
     let issue_links = fetch_github_issue_closing_prs_with_client(
@@ -235,26 +231,11 @@ async fn recover_github_pr_coverage_with_client(
         graphql_url,
     )
     .await?;
-    let (candidates, issue_link_authoritative) = if issue_links.candidates.is_empty() {
-        (
-            find_closing_prs_for_issue_in_repo(
-                client,
-                repo,
-                issue_number,
-                github_token,
-                api_base_url,
-                "all",
-                None,
-            )
-            .await?,
-            false,
-        )
-    } else {
-        (issue_links.candidates, true)
-    };
+    let candidates = issue_links.candidates;
     let expected_base_ref =
         recovery_expected_base_ref(runtime_store, project_root, project_id, repo, issue_number)
             .await?;
+    let mut definition_registered = false;
 
     for candidate in candidates {
         if !closing_pr_belongs_to_repo(&candidate, repo) {
@@ -265,12 +246,6 @@ async fn recover_github_pr_coverage_with_client(
         let artifacts =
             fetch_github_pr_snapshot_with_client(client, &target, github_token, graphql_url)
                 .await?;
-        if !issue_link_authoritative
-            && !snapshot_confirms_closing_candidate(&artifacts.normalized_snapshot, issue_number)
-        {
-            continue;
-        }
-
         let remote_fact = artifacts.remote_fact_snapshot()?;
         runtime_store
             .upsert_remote_fact_snapshot(&remote_fact)
@@ -286,13 +261,16 @@ async fn recover_github_pr_coverage_with_client(
         }
 
         let state = recovered_runtime_state(readiness);
-        runtime_store
-            .upsert_definition(&WorkflowDefinition::new(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                1,
-                "GitHub issue PR workflow",
-            ))
-            .await?;
+        if !definition_registered {
+            runtime_store
+                .upsert_definition(&WorkflowDefinition::new(
+                    GITHUB_ISSUE_PR_DEFINITION_ID,
+                    1,
+                    "GitHub issue PR workflow",
+                ))
+                .await?;
+            definition_registered = true;
+        }
         let persistence = persist_recovered_workflow(
             runtime_store,
             project_root,
@@ -323,22 +301,6 @@ async fn recover_github_pr_coverage_with_client(
     }
 
     Ok(GitHubIssueCoverage::Uncovered)
-}
-
-fn snapshot_confirms_closing_candidate(snapshot: &serde_json::Value, issue_number: u64) -> bool {
-    let contains_issue = snapshot
-        .get("closing_issues")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|issues| {
-            issues.iter().any(|issue| {
-                issue.get("number").and_then(serde_json::Value::as_u64) == Some(issue_number)
-            })
-        });
-    contains_issue
-        || snapshot
-            .get("closing_issues_complete")
-            .and_then(serde_json::Value::as_bool)
-            == Some(false)
 }
 
 fn recovered_runtime_state(readiness: PrReadiness) -> &'static str {
