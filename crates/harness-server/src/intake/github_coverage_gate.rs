@@ -231,13 +231,12 @@ async fn recover_github_pr_coverage_with_client(
         graphql_url,
     )
     .await?;
-    let candidates = issue_links.candidates;
     let expected_base_ref =
         recovery_expected_base_ref(runtime_store, project_root, project_id, repo, issue_number)
             .await?;
-    let mut definition_registered = false;
+    let mut snapshots = Vec::new();
 
-    for candidate in candidates {
+    for candidate in issue_links.candidates {
         if !closing_pr_belongs_to_repo(&candidate, repo) {
             continue;
         }
@@ -247,60 +246,62 @@ async fn recover_github_pr_coverage_with_client(
             fetch_github_pr_snapshot_with_client(client, &target, github_token, graphql_url)
                 .await?;
         let remote_fact = artifacts.remote_fact_snapshot()?;
-        runtime_store
-            .upsert_remote_fact_snapshot(&remote_fact)
-            .await?;
         let readiness = pr_readiness_for_snapshot(&artifacts.normalized_snapshot);
-        if readiness == PrReadiness::ClosedUnmerged {
-            continue;
-        }
-        if readiness == PrReadiness::Merged
-            && !issue_links.issue_state.eq_ignore_ascii_case("closed")
-        {
-            continue;
-        }
-
-        let state = recovered_runtime_state(readiness);
-        if !definition_registered {
-            runtime_store
-                .upsert_definition(&WorkflowDefinition::new(
-                    GITHUB_ISSUE_PR_DEFINITION_ID,
-                    1,
-                    "GitHub issue PR workflow",
-                ))
-                .await?;
-            definition_registered = true;
-        }
-        let persistence = persist_recovered_workflow(
-            runtime_store,
-            project_root,
-            project_id,
-            repo,
-            issue_number,
-            &candidate,
-            &artifacts.normalized_snapshot,
-            &remote_fact.fact_hash,
-            state,
-        )
-        .await?;
-        match persistence {
-            RecoveredWorkflowPersistence::Persisted => {
-                return Ok(GitHubIssueCoverage::Covered {
-                    source: "github_closing_pr",
-                    state: state.to_string(),
-                });
-            }
-            RecoveredWorkflowPersistence::ExistingCoverage(state) => {
-                return Ok(GitHubIssueCoverage::Covered {
-                    source: "workflow_runtime",
-                    state,
-                });
-            }
-            RecoveredWorkflowPersistence::Rejected => continue,
-        }
+        snapshots.push((
+            candidate,
+            artifacts.normalized_snapshot,
+            remote_fact,
+            readiness,
+        ));
     }
 
-    Ok(GitHubIssueCoverage::Uncovered)
+    for (_, _, remote_fact, _) in &snapshots {
+        runtime_store
+            .upsert_remote_fact_snapshot(remote_fact)
+            .await?;
+    }
+
+    let Some((candidate, snapshot, remote_fact, readiness)) = snapshots
+        .into_iter()
+        .filter(|(_, _, _, readiness)| *readiness != PrReadiness::ClosedUnmerged)
+        .max_by_key(|(candidate, _, _, readiness)| {
+            (*readiness == PrReadiness::Merged, candidate.number)
+        })
+    else {
+        return Ok(GitHubIssueCoverage::Uncovered);
+    };
+
+    let state = recovered_runtime_state(readiness);
+    runtime_store
+        .upsert_definition(&WorkflowDefinition::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "GitHub issue PR workflow",
+        ))
+        .await?;
+    let persistence = persist_recovered_workflow(
+        runtime_store,
+        project_root,
+        project_id,
+        repo,
+        issue_number,
+        &candidate,
+        &snapshot,
+        &remote_fact.fact_hash,
+        state,
+    )
+    .await?;
+    match persistence {
+        RecoveredWorkflowPersistence::Persisted => Ok(GitHubIssueCoverage::Covered {
+            source: "github_closing_pr",
+            state: state.to_string(),
+        }),
+        RecoveredWorkflowPersistence::ExistingCoverage(state) => Ok(GitHubIssueCoverage::Covered {
+            source: "workflow_runtime",
+            state,
+        }),
+        RecoveredWorkflowPersistence::Rejected => Ok(GitHubIssueCoverage::Uncovered),
+    }
 }
 
 fn recovered_runtime_state(readiness: PrReadiness) -> &'static str {

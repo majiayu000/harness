@@ -198,7 +198,7 @@ async fn recovery_maps_open_pr_facts() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn merged_pr_does_not_cover_an_issue_github_still_reports_open() -> anyhow::Result<()> {
+async fn merged_pr_recovers_terminal_coverage_even_when_issue_is_open() -> anyhow::Result<()> {
     let Some((dir, store)) = open_runtime_store().await? else {
         return Ok(());
     };
@@ -237,11 +237,31 @@ async fn merged_pr_does_not_cover_an_issue_github_still_reports_open() -> anyhow
     )
     .await?;
 
-    assert_eq!(coverage, GitHubIssueCoverage::Uncovered);
-    assert!(store
-        .get_instance(&workflow_id(&project_id, Some(REPO), issue_number))
-        .await?
-        .is_none());
+    assert_eq!(
+        coverage,
+        GitHubIssueCoverage::Covered {
+            source: "github_closing_pr",
+            state: "done".to_string(),
+        }
+    );
+    assert_recovered_binding(&store, &project_id, issue_number, pr_number, "done").await?;
+    assert_no_agent_work(&store, &project_id, issue_number).await?;
+    assert_eq!(
+        check_github_issue_coverage(
+            None,
+            Some(&store),
+            &project_root,
+            &project_id,
+            REPO,
+            issue_number,
+            None,
+        )
+        .await?,
+        GitHubIssueCoverage::Covered {
+            source: "workflow_runtime",
+            state: "done".to_string(),
+        }
+    );
     Ok(())
 }
 
@@ -586,16 +606,15 @@ async fn ready_pr_recovery_transitions_existing_uncovered_workflow_before_report
 }
 
 #[tokio::test]
-async fn recovery_preserves_project_base_branch_for_later_merge_gates() -> anyhow::Result<()> {
+async fn recovery_uses_workflow_base_branch_for_later_merge_gates() -> anyhow::Result<()> {
     let Some((dir, store)) = open_runtime_store().await? else {
         return Ok(());
     };
     let project_root = dir.path().join("release-base");
     std::fs::create_dir(&project_root)?;
-    std::fs::create_dir(project_root.join(".harness"))?;
     std::fs::write(
-        project_root.join(".harness/config.toml"),
-        "[git]\nbase_branch = \"release\"\n",
+        project_root.join("WORKFLOW.md"),
+        "---\nbase:\n  branch: release\n---\n",
     )?;
     let project_id = project_root.to_string_lossy().into_owned();
     let issue_number = 1_784;

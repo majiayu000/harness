@@ -144,13 +144,13 @@ pub(super) async fn recovery_expected_base_ref(
     }) {
         return Ok(expected);
     }
-    let expected = harness_core::config::project::load_project_config(project_root)?
-        .git
-        .base_branch;
+    let expected = harness_core::config::workflow::load_workflow_config(project_root)?
+        .base
+        .branch;
     let expected = expected.trim();
     anyhow::ensure!(
         !expected.is_empty(),
-        "project git.base_branch must not be empty during closing PR recovery"
+        "workflow base.branch must not be empty during closing PR recovery"
     );
     Ok(expected.to_string())
 }

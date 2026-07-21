@@ -196,3 +196,159 @@ pub(super) async fn spawn_json_server(status: &'static str, bodies: Vec<Value>) 
     });
     format!("http://{address}")
 }
+
+#[tokio::test]
+async fn tokenless_unauthorized_graphql_fails_closed_without_persistence() -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("tokenless-unauthorized");
+    std::fs::create_dir(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let issue_number = 1_751;
+    let graphql_url = spawn_json_server(
+        "401 Unauthorized",
+        vec![json!({"message": "Bad credentials"})],
+    )
+    .await;
+
+    let error = recover_with_urls(
+        &store,
+        &project_root,
+        &project_id,
+        issue_number,
+        "unused",
+        &graphql_url,
+    )
+    .await
+    .expect_err("tokenless unauthorized lookup must fail closed");
+
+    assert!(error.to_string().contains("401 Unauthorized"));
+    assert!(store
+        .get_instance(&workflow_id(&project_id, Some(REPO), issue_number))
+        .await?
+        .is_none());
+    assert_no_agent_work(&store, &project_id, issue_number).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn linked_candidates_rank_merged_before_open_independent_of_graphql_order(
+) -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+
+    for (index, order) in [[1_762, 1_761], [1_761, 1_762]].into_iter().enumerate() {
+        let project_root = dir.path().join(format!("candidate-order-{index}"));
+        std::fs::create_dir(&project_root)?;
+        let project_id = project_root.to_string_lossy().into_owned();
+        let issue_number = 1_760 + index as u64;
+        let snapshots = order.map(|pr_number| {
+            let state = if pr_number == 1_761 { "MERGED" } else { "OPEN" };
+            graphql_response(pr_snapshot(
+                pr_number,
+                issue_number,
+                state,
+                if state == "MERGED" {
+                    "SUCCESS"
+                } else {
+                    "PENDING"
+                },
+                state == "MERGED",
+            ))
+        });
+        let graphql_url = spawn_json_server(
+            "200 OK",
+            std::iter::once(issue_links_response("OPEN", &order))
+                .chain(snapshots)
+                .collect(),
+        )
+        .await;
+
+        let coverage = recover_with_urls(
+            &store,
+            &project_root,
+            &project_id,
+            issue_number,
+            "unused",
+            &graphql_url,
+        )
+        .await?;
+
+        assert_eq!(
+            coverage,
+            GitHubIssueCoverage::Covered {
+                source: "github_closing_pr",
+                state: "done".to_string(),
+            }
+        );
+        assert_recovered_binding(&store, &project_id, issue_number, 1_761, "done").await?;
+        for pr_number in order {
+            assert!(store
+                .get_remote_fact_snapshot("github", REPO, "pull_request", pr_number as i64)
+                .await?
+                .is_some());
+        }
+        assert_no_agent_work(&store, &project_id, issue_number).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn linked_candidates_rank_highest_pr_number_independent_of_graphql_order(
+) -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+
+    for (index, order) in [[1_772, 1_771], [1_771, 1_772]].into_iter().enumerate() {
+        let project_root = dir.path().join(format!("candidate-number-order-{index}"));
+        std::fs::create_dir(&project_root)?;
+        let project_id = project_root.to_string_lossy().into_owned();
+        let issue_number = 1_770 + index as u64;
+        let snapshots = order.map(|pr_number| {
+            graphql_response(pr_snapshot(
+                pr_number,
+                issue_number,
+                "OPEN",
+                "PENDING",
+                false,
+            ))
+        });
+        let graphql_url = spawn_json_server(
+            "200 OK",
+            std::iter::once(issue_links_response("OPEN", &order))
+                .chain(snapshots)
+                .collect(),
+        )
+        .await;
+
+        let coverage = recover_with_urls(
+            &store,
+            &project_root,
+            &project_id,
+            issue_number,
+            "unused",
+            &graphql_url,
+        )
+        .await?;
+
+        assert_eq!(
+            coverage,
+            GitHubIssueCoverage::Covered {
+                source: "github_closing_pr",
+                state: "pr_open".to_string(),
+            }
+        );
+        assert_recovered_binding(&store, &project_id, issue_number, 1_772, "pr_open").await?;
+        for pr_number in order {
+            assert!(store
+                .get_remote_fact_snapshot("github", REPO, "pull_request", pr_number as i64)
+                .await?
+                .is_some());
+        }
+        assert_no_agent_work(&store, &project_id, issue_number).await?;
+    }
+    Ok(())
+}
