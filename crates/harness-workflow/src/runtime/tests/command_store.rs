@@ -390,6 +390,40 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "lost-transcript-retry");
+    let mut instance =
+        store_stopped_failed_command(&store, 1704, "implement_issue", &command).await?;
+    instance.data["stop_reason_code"] = json!("runtime_transcript_lost");
+    instance.data["reason_class"] = json!("terminal");
+    instance.data["last_stop"]["stop_reason_code"] = json!("runtime_transcript_lost");
+    store.upsert_instance(&instance).await?;
+
+    let recovered = recovered_workflow(
+        recover(
+            &store,
+            &instance.id,
+            super::WorkflowRuntimeRecoveryAction::Retry,
+        )
+        .await?,
+        "lost transcript recovery",
+    )?;
+    for field in ["last_stop", "stop_reason_code", "reason_class", "error_kind"] {
+        assert!(
+            recovered.data.get(field).is_none(),
+            "successful recovery must clear stale {field}"
+        );
+    }
+    assert_eq!(recovered.data["last_operator_recovery"]["action"], "retry");
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_recovery_waiting_on_command_does_not_lock_instance() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

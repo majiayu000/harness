@@ -123,6 +123,56 @@ async fn transcript_completion_is_atomic_restart_safe_and_pinned_while_active() 
 }
 
 #[tokio::test]
+async fn transcript_persistence_and_reconstruction_preserve_nul_content() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = issue_instance("implementing").with_id("transcript-nul-workflow");
+    let (job, lease_expires_at) = claimed_transcript_job(&store, &workflow).await?;
+    let content = "before\0after";
+    let (result, pending) = prepare_runtime_transcript(&job, result_with_transcript(content))?;
+    let artifact_ref = runtime_transcript_artifact_ref(&job.id);
+
+    store
+        .commit_runtime_activity_completion_with_transcript_if_owned(
+            &job.id,
+            "transcript-test",
+            lease_expires_at,
+            &result,
+            pending.as_ref(),
+        )
+        .await?
+        .expect("completion should commit");
+    assert!(matches!(
+        store.read_runtime_transcript(&artifact_ref).await?,
+        RuntimeTranscriptRead::Verified(record) if record.content == content
+    ));
+    let stored: (String,) =
+        sqlx::query_as("SELECT data::text FROM workflow_artifacts WHERE id = $1")
+            .bind(&artifact_ref)
+            .fetch_one(store.pool())
+            .await?;
+    assert!(stored.0.contains("nul_segments_v1"));
+
+    sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
+        .bind(&artifact_ref)
+        .execute(store.pool())
+        .await?;
+    let expected = runtime_transcript_checksum(content);
+    let reconstructed = store
+        .reconstruct_runtime_transcript(&workflow.id, &job.id, content, Some(&expected), "operator")
+        .await?;
+    assert_eq!(reconstructed.content, content);
+    assert!(matches!(
+        store.read_runtime_transcript(&artifact_ref).await?,
+        RuntimeTranscriptRead::Verified(record) if record.content == content
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn transcript_integrity_loss_can_be_reconstructed_from_provider_export() -> anyhow::Result<()>
 {
     if resolve_database_url(None).is_err() {

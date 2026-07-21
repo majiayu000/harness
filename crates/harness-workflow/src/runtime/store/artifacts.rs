@@ -26,7 +26,7 @@ impl WorkflowRuntimeStore {
                 detail: format!("artifact `{artifact_ref}` is not a runtime transcript"),
             });
         }
-        let record: RuntimeTranscriptRecord = match serde_json::from_str(&data) {
+        let record = match deserialize_runtime_transcript_record(&data) {
             Ok(record) => record,
             Err(error) => {
                 return Ok(RuntimeTranscriptRead::InvalidMetadata {
@@ -125,7 +125,7 @@ pub(super) async fn insert_runtime_transcript_tx(
                 && artifact_type == RUNTIME_TRANSCRIPT_ARTIFACT,
             "runtime transcript identity already exists with different ownership"
         );
-        let existing: RuntimeTranscriptRecord = serde_json::from_str(&data)?;
+        let existing = deserialize_runtime_transcript_record(&data)?;
         anyhow::ensure!(
             existing == *record,
             "runtime transcript identity already exists with different content"
@@ -141,7 +141,7 @@ pub(super) async fn insert_runtime_transcript_tx(
     .bind(workflow_id)
     .bind(runtime_job_id)
     .bind(RUNTIME_TRANSCRIPT_ARTIFACT)
-    .bind(to_jsonb_string(record)?)
+    .bind(serialize_runtime_transcript_record(record)?)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -255,7 +255,7 @@ async fn upsert_reconstructed_transcript_tx(
             workflow_id == record.workflow_id && artifact_type == RUNTIME_TRANSCRIPT_ARTIFACT,
             "existing artifact identity does not match the transcript reconstruction target"
         );
-        if let Ok(existing) = serde_json::from_str::<RuntimeTranscriptRecord>(&data) {
+        if let Ok(existing) = deserialize_runtime_transcript_record(&data) {
             if let RuntimeTranscriptRead::Verified(existing) =
                 verify_runtime_transcript_record(existing)
             {
@@ -282,8 +282,57 @@ async fn upsert_reconstructed_transcript_tx(
     .bind(&record.workflow_id)
     .bind(&record.reference.producer_runtime_job_id)
     .bind(RUNTIME_TRANSCRIPT_ARTIFACT)
-    .bind(to_jsonb_string(record)?)
+    .bind(serialize_runtime_transcript_record(record)?)
     .execute(&mut **tx)
     .await?;
     Ok(record.clone())
+}
+
+const NUL_SEGMENTS_ENCODING: &str = "nul_segments_v1";
+
+fn serialize_runtime_transcript_record(record: &RuntimeTranscriptRecord) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(record)?;
+    if record.content.contains('\0') {
+        let object = value.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("runtime transcript record must serialize as an object")
+        })?;
+        object.remove("content");
+        object.insert("content_encoding".to_string(), json!(NUL_SEGMENTS_ENCODING));
+        object.insert(
+            "content_segments".to_string(),
+            serde_json::to_value(record.content.split('\0').collect::<Vec<_>>())?,
+        );
+    }
+    Ok(serde_json::to_string(&value)?)
+}
+
+fn deserialize_runtime_transcript_record(data: &str) -> anyhow::Result<RuntimeTranscriptRecord> {
+    let mut value: Value = serde_json::from_str(data)?;
+    let Some(encoding) = value.get("content_encoding") else {
+        return Ok(serde_json::from_value(value)?);
+    };
+    anyhow::ensure!(
+        encoding.as_str() == Some(NUL_SEGMENTS_ENCODING),
+        "unsupported runtime transcript content encoding"
+    );
+    let segments = value
+        .get("content_segments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("encoded runtime transcript content is missing segments"))?;
+    let content = segments
+        .iter()
+        .map(|segment| {
+            segment.as_str().ok_or_else(|| {
+                anyhow::anyhow!("runtime transcript content segment is not a string")
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .join("\0");
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("runtime transcript record must be an object"))?;
+    object.remove("content_encoding");
+    object.remove("content_segments");
+    object.insert("content".to_string(), json!(content));
+    Ok(serde_json::from_value(value)?)
 }
