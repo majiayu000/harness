@@ -131,7 +131,7 @@ async fn transcript_persistence_and_reconstruction_preserve_nul_content() -> any
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = issue_instance("implementing").with_id("transcript-nul-workflow");
     let (job, lease_expires_at) = claimed_transcript_job(&store, &workflow).await?;
-    let content = "before\0after";
+    let content = "\0before\0\0after\0";
     let (result, pending) = prepare_runtime_transcript(&job, result_with_transcript(content))?;
     let artifact_ref = runtime_transcript_artifact_ref(&job.id);
 
@@ -145,16 +145,36 @@ async fn transcript_persistence_and_reconstruction_preserve_nul_content() -> any
         )
         .await?
         .expect("completion should commit");
-    assert!(matches!(
-        store.read_runtime_transcript(&artifact_ref).await?,
-        RuntimeTranscriptRead::Verified(record) if record.content == content
-    ));
+    match store.read_runtime_transcript(&artifact_ref).await? {
+        RuntimeTranscriptRead::Verified(record) => {
+            assert_eq!(record.content, content);
+            assert_eq!(record.reference.size_bytes, content.len() as u64);
+            assert_eq!(
+                record.reference.checksum,
+                runtime_transcript_checksum(content)
+            );
+        }
+        other => panic!("NUL transcript must verify, got {other:?}"),
+    }
     let stored: (String,) =
         sqlx::query_as("SELECT data::text FROM workflow_artifacts WHERE id = $1")
             .bind(&artifact_ref)
             .fetch_one(store.pool())
             .await?;
     assert!(stored.0.contains("nul_segments_v1"));
+
+    sqlx::query(
+        "UPDATE workflow_artifacts
+         SET data = jsonb_set(data, '{content_segments,1}', '1'::jsonb)
+         WHERE id = $1",
+    )
+    .bind(&artifact_ref)
+    .execute(store.pool())
+    .await?;
+    assert!(matches!(
+        store.read_runtime_transcript(&artifact_ref).await?,
+        RuntimeTranscriptRead::InvalidMetadata { .. }
+    ));
 
     sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
         .bind(&artifact_ref)
