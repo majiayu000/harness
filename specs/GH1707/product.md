@@ -45,11 +45,12 @@ as the coverage authority after recovery.
    `awaiting_feedback`; a ready snapshot becomes `quality_gate_pending` and
    starts the quality gate; only a successful quality gate may later advance
    it to `ready_to_merge`.
-4. **B-004:** A merged PR plus a closed issue reconstructs terminal evidence
-   and produces zero implementation or repair agent jobs.
-5. **B-005:** Neither a closed-unmerged PR nor a merged PR while the issue is
-   still open is durable coverage; a later eligible active PR, or a merged PR
-   observed with the issue closed, may independently restore coverage.
+4. **B-004:** An authoritative linked merged PR reconstructs terminal `done`
+   evidence and produces zero implementation or repair agent jobs even when
+   GitHub still reports the issue `OPEN`; that combination is a fail-safe
+   issue-state propagation race, not evidence that implementation is missing.
+5. **B-005:** A closed-unmerged PR does not cover the issue; a later eligible
+   active or merged PR may independently restore coverage.
 6. **B-006:** Repeated polls and restart recovery are idempotent: they preserve
    one binding, one current workflow state, and no duplicate agent work.
 7. **B-007:** A cancelled or stale local workflow cannot override a current
@@ -64,12 +65,12 @@ as the coverage authority after recovery.
    cross-repository links, and non-closing mentions without an authoritative
    issue link do not create coverage.
 10. **B-010:** After complete snapshots are collected for every same-repository
-    linked candidate, selection is independent of GraphQL/API order: when the
-    issue is closed, eligible merged candidates outrank eligible active
-    candidates; otherwise only eligible active candidates qualify; the highest
-    PR number wins within the selected class. Barrier-synchronized concurrent
-    and repeated attempts must converge on that candidate without duplicate
-    commands, regressed terminal state, or overwritten newer evidence.
+    linked candidate, selection is independent of GraphQL/API order: eligible
+    merged candidates outrank eligible active candidates regardless of the
+    lagging issue state, and the highest PR number wins within the selected
+    class. Barrier-synchronized concurrent and repeated attempts must converge
+    on that candidate without duplicate commands, regressed terminal state, or
+    overwritten newer evidence.
 
 ## Acceptance Criteria
 
@@ -80,8 +81,8 @@ as the coverage authority after recovery.
 - [ ] Open, feedback, ready, merged, and closed-unmerged PR states are covered.
 - [ ] A ready snapshot first reconstructs `quality_gate_pending`; a passing
       quality gate is the only tested path from that state to `ready_to_merge`.
-- [ ] Merged-plus-open is tested as uncovered, while merged-plus-closed is
-      tested as terminal `done` coverage.
+- [ ] Merged-plus-open and merged-plus-closed are both tested as terminal
+      `done` coverage with zero implementation or repair agent jobs.
 - [ ] Reversed GraphQL candidate orders select the same precedence class and
       highest PR number.
 - [ ] Restart and repeated-poll tests prove idempotency.
@@ -114,7 +115,9 @@ as the coverage authority after recovery.
   consult REST as an alternate authority.
 - The GraphQL closing-reference connection is truncated, exceeds its page
   limit, repeats an unusable cursor, or changes issue state during pagination.
-- The matching PR is merged while GitHub still reports the issue open.
+- The authoritative linked PR is merged while GitHub still reports the issue
+  open; recovery treats the issue state as propagation lag and fails safe to
+  terminal coverage.
 - Multiple linked PRs arrive in opposite API orders, including merged, active,
   and closed-unmerged candidates with different PR numbers.
 - A stale cancelled workflow has pending commands when recovery begins.

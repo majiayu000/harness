@@ -35,10 +35,11 @@ See `specs/GH1707/product.md`.
    Any transport, parsing, pagination, or completeness error aborts the poll;
    do not choose from a partial candidate set.
 3. Classify and select candidates with a stable comparison key, never API
-   order. If the issue is closed, eligible merged candidates have precedence
-   over eligible active candidates; if the issue is open, merged candidates
-   are ineligible. Closed-unmerged candidates are always ineligible. Within the
-   selected class, choose the highest PR number.
+   order. Eligible merged candidates have precedence over eligible active
+   candidates even while the linked issue remains `OPEN`; that combination is
+   treated as GitHub propagation lag and fails safe to terminal coverage.
+   Closed-unmerged candidates are always ineligible. Within the selected class,
+   choose the highest PR number.
 4. Derive the target workflow state from PR state, checks, review decision,
    review threads, and merge facts using the exact matrix below.
 5. Upsert the issue-bound workflow, PR binding, remote fact snapshot, and only
@@ -58,8 +59,8 @@ See `specs/GH1707/product.md`.
 | Open PR requiring CI or review repair | `awaiting_feedback` |
 | Open PR with ready snapshot | `quality_gate_pending` plus one deduplicated quality-gate child command |
 | Successful quality-gate child completion from `quality_gate_pending` | `ready_to_merge` |
-| Merged PR and closed issue | terminal `done` with merge evidence |
-| Merged PR and open issue | ineligible; not durable coverage |
+| Authoritative linked merged PR and closed issue | terminal `done` with merge evidence |
+| Authoritative linked merged PR and open issue | terminal `done` with merge evidence; issue state is treated as propagation lag |
 | Closed-unmerged PR | ineligible; not durable coverage |
 
 Recovery must never map a ready snapshot directly to `ready_to_merge`.
@@ -82,8 +83,8 @@ poll.
 | B-001 | `intake/github_coverage_gate.rs`, `github_coverage_recovery.rs` | `cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart` |
 | B-002 | recovery persistence and PR snapshot modules | `cargo test -p harness-server recovery_maps_open_pr_facts` |
 | B-003 | recovery state derivation and quality-gate parent propagation | `cargo test -p harness-server recovery_maps_open_pr_facts`; `cargo test -p harness-workflow runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass` |
-| B-004 | merged-state recovery | `cargo test -p harness-server merged_pr_and_closed_issue_recover_terminal_coverage_without_agent_work` |
-| B-005 | candidate eligibility | `cargo test -p harness-server merged_pr_does_not_cover_an_issue_github_still_reports_open`; `cargo test -p harness-server closed_pr_is_uncovered_but_a_later_valid_pr_recovers_coverage` |
+| B-004 | merged-state recovery under settled and lagging issue state | `cargo test -p harness-server merged_pr_and_closed_issue_recover_terminal_coverage_without_agent_work`; `cargo test -p harness-server merged_pr_and_open_issue_recover_terminal_coverage_without_agent_work` |
+| B-005 | candidate eligibility | `cargo test -p harness-server closed_pr_is_uncovered_but_a_later_valid_pr_recovers_coverage` |
 | B-006 | stable IDs and command dedupe | `cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart` |
 | B-007 | stale-work cancellation | `cargo test -p harness-server recovery_maps_open_pr_facts` |
 | B-008 | GitHub adapters and pagination guards | `cargo test -p harness-server github_lookup_failure_fails_closed_without_agent_work`; `cargo test -p harness-server existing_pr_lookup_fails_closed` |
@@ -119,7 +120,10 @@ poll.
 
 - [ ] Run every command in the Product-to-Test Mapping.
 - [ ] Run the multi-candidate test with the same candidates in forward and
-      reverse GraphQL order and assert the same selected PR.
+      reverse GraphQL order and assert the same selected PR, including a
+      merged candidate while the issue remains open.
+- [ ] Run merged-plus-open and merged-plus-closed terminal recovery tests and
+      assert `done`, merge evidence, and zero implementation or repair work.
 - [ ] Run the concurrency test with an explicit barrier that holds two
       recovery attempts after candidate selection and releases both to race the
       persistence boundary; assert one binding, one state, and one deduplicated

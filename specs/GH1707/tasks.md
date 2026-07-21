@@ -27,9 +27,9 @@ GH-1707
   consult REST keywords or depend on API order.
 - Done when: only exact repository-qualified GraphQL links can produce
   coverage; forward and reverse candidate orders select the same PR; merged
-  plus open and closed-unmerged candidates remain ineligible; incomplete scans
-  return errors.
-- Verify: `cargo test -p harness-server multiple_closing_pr_candidates_are_selected_deterministically`; `cargo test -p harness-server rest_keyword_without_authoritative_issue_link_is_uncovered`; PR-discovery, lookup-failure, page-limit, repeated-cursor, merged-open, and closed-unmerged focused tests from `tech.md`.
+  candidates outrank active candidates even while the issue remains open;
+  closed-unmerged candidates remain ineligible; incomplete scans return errors.
+- Verify: `cargo test -p harness-server multiple_closing_pr_candidates_are_selected_deterministically`; `cargo test -p harness-server rest_keyword_without_authoritative_issue_link_is_uncovered`; PR-discovery, lookup-failure, page-limit, repeated-cursor, merged-open terminal, and closed-unmerged focused tests from `tech.md`.
 
 ### SP1707-T2 — Reconstruct durable workflow ownership
 
@@ -42,9 +42,11 @@ GH-1707
 - Done when: waiting facts map to `pr_open`, repair facts map to
   `awaiting_feedback`, a ready snapshot maps to `quality_gate_pending`, only a
   passing quality gate advances to `ready_to_merge`, and merged-plus-closed
-  maps to terminal `done`, all with no competing agent work.
+  or merged-plus-open maps to terminal `done`, all with no competing agent
+  work. The merged-plus-open combination is recorded as issue-state propagation
+  lag rather than treated as missing coverage.
 - Verify: open-state matrix, quality-gate parent propagation,
-  merged-plus-closed terminal, merged-plus-open negative, stale-work, and
+  merged-plus-closed terminal, merged-plus-open terminal, stale-work, and
   persistence tests from the Product-to-Test Mapping.
 
 ### SP1707-T3 — Prove restart and repeated-poll idempotency
@@ -59,7 +61,7 @@ GH-1707
 - Done when: serial repetition and the controlled race preserve one selected
   binding, one current state, one deduplicated command set, and zero duplicate
   implementation jobs.
-- Verify: `cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart`; `cargo test -p harness-server merged_pr_and_closed_issue_recover_terminal_coverage_without_agent_work`; barrier-controlled `cargo test -p harness-server concurrent_recovery_attempts_converge_on_one_binding_and_command_set`.
+- Verify: `cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart`; `cargo test -p harness-server merged_pr_and_closed_issue_recover_terminal_coverage_without_agent_work`; `cargo test -p harness-server merged_pr_and_open_issue_recover_terminal_coverage_without_agent_work`; barrier-controlled `cargo test -p harness-server concurrent_recovery_attempts_converge_on_one_binding_and_command_set`.
 
 ### SP1707-T4 — Complete repository and PR gates
 
