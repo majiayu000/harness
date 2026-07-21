@@ -10,24 +10,38 @@ fn identity_contract_doc_covers_runtime_submission_api_surface() {
         "workflow_id",
         "submission_id",
         "task_id",
-        "POST /tasks",
-        "GET /tasks",
-        "GET /tasks/{id}",
-        "GET /tasks/{id}/stream",
-        "POST /tasks/{id}/cancel",
-        "GET /tasks/{id}/proof",
-        "GET /tasks/{id}/artifacts",
-        "GET /tasks/{id}/prompts",
-        "Phase 0: Current Compatibility",
-        "Phase 1: Add Explicit `submission_id`",
-        "Phase 2: Prefer Runtime-Native Handles",
-        "Phase 3: Remove Legacy Compatibility",
+        "request_id",
+        "POST /api/workflows/runtime/submissions",
+        "GET /api/workflows/runtime/submissions",
+        "GET /api/workflows/runtime/submissions/{id}",
+        "GET /api/workflows/runtime/submissions/{id}/stream",
+        "GET /api/workflows/runtime/submissions/{id}/proof",
+        "GET /api/workflows/runtime/submissions/{id}/artifacts",
+        "GET /api/workflows/runtime/submissions/{id}/prompts",
+        "POST /api/workflows/runtime/cancel",
+        "POST /api/workflows/runtime/merge",
+        "POST /api/workflows/runtime/unblock",
+        "POST /api/workflows/runtime/retry",
+        "POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}",
+        "Removed Compatibility",
     ] {
         assert!(
             doc.contains(required),
             "identity contract should document {required}"
         );
     }
+
+    let (current_contract, removed_compatibility) = doc
+        .split_once("## Removed Compatibility")
+        .expect("identity contract should separate removed compatibility routes");
+    assert!(
+        !current_contract.contains("/tasks"),
+        "current identity contract must not advertise removed /tasks routes"
+    );
+    assert!(
+        removed_compatibility.contains("have been removed"),
+        "removed compatibility section should explicitly mark /tasks routes as removed"
+    );
 }
 
 #[tokio::test]

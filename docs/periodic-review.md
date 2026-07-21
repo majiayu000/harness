@@ -20,7 +20,8 @@ A scheduled review job that:
 2. Skips if no new commits since last review
 3. Spawns an agent (Claude) to review the entire codebase
 4. Agent produces a structured report with severity-ranked findings
-5. Results stored via existing task pipeline (TaskStore)
+5. Results stored in the workflow runtime and projected through runtime
+   submission APIs
 
 No static analysis code. The agent IS the checker.
 
@@ -41,7 +42,7 @@ Scheduler::start()
        ├─ build review prompt (11-item checklist)
        │
        └─ enqueue_task(CreateTaskRequest { prompt, source: "periodic_review" })
-            └─ existing pipeline: agent → TaskState → EventStore
+            └─ workflow runtime: command → job → agent → terminal evidence
 ```
 
 ## Review Checklist (11 Items)
@@ -248,14 +249,16 @@ review_loop tick
   → local commit gate since watermark → skip if empty
   → gather context (repo structure, diff stat, recent commits)
   → prompts::periodic_review_prompt() → build prompt
-  → enqueue_task() → existing task pipeline
-      → agent runs → report in TaskState.rounds[0].result
-      → TaskStatus::Done
+  → enqueue_task() → workflow-runtime submission
+      → agent runs → report persisted as runtime activity output
+      → workflow reaches a terminal state
   → EventStore.log("periodic_review") → timestamp for next skip
 ```
 
-Report is stored in `TaskState.rounds[0].result`. Query via `GET /tasks/{id}`.
-Dashboard can filter by `source == "periodic_review"` for review history.
+Query the report through
+`GET /api/workflows/runtime/submissions/{submission_id}` and its artifact or
+proof routes. The dashboard can filter runtime submissions by
+`source == "periodic_review"` for review history.
 
 ## Implementation
 

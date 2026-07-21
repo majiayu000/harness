@@ -61,11 +61,11 @@ Start Harness:
 
 ## Submit an Issue Run
 
-Submit a real issue-backed task in a repository where the configured agent can
+Submit a real issue-backed workflow in a repository where the configured agent can
 open a PR:
 
 ```bash
-curl -X POST http://127.0.0.1:9800/tasks \
+curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/absolute/path/to/target-repo",
@@ -74,10 +74,10 @@ curl -X POST http://127.0.0.1:9800/tasks \
   }'
 ```
 
-Poll the task until it reaches a terminal state:
+Poll the submission until it reaches a terminal state:
 
 ```bash
-curl -s http://127.0.0.1:9800/tasks/{task_id} | python3 -m json.tool
+curl -s http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id} | python3 -m json.tool
 ```
 
 ## Inspect the Trace

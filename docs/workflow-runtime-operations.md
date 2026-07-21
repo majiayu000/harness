@@ -56,11 +56,11 @@ definition-id collisions. Each instance is pinned to the declaration's SHA-256
 content hash; an instance whose pinned version is unavailable blocks with
 `definition_version_missing` instead of running under a changed shape.
 
-Submit the registered workflow through the normal task endpoint. Declarative
-v1 submissions do not support `depends_on`.
+Submit the registered workflow through the runtime submission endpoint.
+Declarative v1 submissions do not support `depends_on`.
 
 ```bash
-curl -sS -X POST http://127.0.0.1:9800/tasks \
+curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
   -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{

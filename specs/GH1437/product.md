@@ -32,7 +32,7 @@ GH-1437
 ## Acceptance Criteria
 
 - [ ] With a simulated silent agent stream, the turn fails with a stall reason within the stall window (not after 3600 s).
-- [ ] Failure reason strings differ between stall and wall-clock timeout; both appear in `GET /tasks` failure output.
+- [ ] Failure reason strings differ between stall and wall-clock timeout; both appear in runtime submission detail output from `GET /api/workflows/runtime/submissions/{id}`.
 - [ ] Default config ships a stall window ≤ 15 min while wall-clock stays 3600 s; `config/default.toml.example` documents both.
 - [ ] Workflow runtime (codex_exec) jobs demonstrate the same stall abort in a test.
 

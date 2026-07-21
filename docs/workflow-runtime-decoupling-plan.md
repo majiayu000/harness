@@ -1,5 +1,10 @@
 # Workflow Runtime Decoupling Plan
 
+> Historical migration record: `/tasks` references below document the
+> compatibility path used while the workflow runtime was being decoupled. PR
+> #1706 removed those routes; the current public surface is
+> `/api/workflows/runtime/submissions` plus workflow-runtime action endpoints.
+
 ## Goal
 
 Split Harness into two explicit layers:
