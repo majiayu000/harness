@@ -43,6 +43,7 @@ jobs:
               - 'crates/harness-core/**'
             ci:
               - '.github/workflows/**'
+              - '.bun-version'
               - 'scripts/check_storage_legacy_openers.py'
             workspace:
               - 'Cargo.toml'
@@ -88,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
       - name: Build web bundle
         working-directory: web
         run: |
