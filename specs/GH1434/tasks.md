@@ -45,9 +45,10 @@ GH-1434
 
 - PR #1453 is the evidence for `SP1434-T001` and the archive tooling. Archive
   execution completed on 2026-07-16 at `archives/phase1-20260716T092438Z`.
-  The scoped T007/T008 maintainer waiver records the archive/restore evidence
-  as complete:
-  <https://github.com/majiayu000/harness/issues/1434#issuecomment-5006185197>.
+  The archive comment records dump creation, restore instructions, and table
+  counts, but neither it nor the scoped T007/T008 waiver records an executed
+  scratch restore. The referenced operator-owned archive is not present in this
+  PR worktree, so this PR does not claim restore rehearsal completion.
 - The explicit maintainer waiver on GH-1434 satisfies `SP1434-T003` for T004
   and T005 based on the recorded zero-traffic evidence and completed archive:
   <https://github.com/majiayu000/harness/issues/1434#issuecomment-4993856096>.

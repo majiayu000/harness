@@ -155,48 +155,29 @@ Also changed test signature from `async fn skills_are_injected_into_agent_contex
 
 ---
 
-## Issue 3: No Serial Task Execution — Parallel Agents Cause Merge Conflicts
+## Historical Issue 3: Legacy Task Execution Caused Parallel Merge Conflicts
 
 ### Symptom
 
-Submitting issues #20, #21, #22 simultaneously to `POST /tasks` causes agents to run in parallel. All three modify the same files (`router.rs`, `http.rs`), producing git merge conflicts when creating PRs.
+Before the workflow-runtime migration, submitting issues #20, #21, and #22 simultaneously to the legacy task endpoint caused agents to run in parallel. All three modified the same files (`router.rs`, `http.rs`), producing git merge conflicts when creating PRs.
 
 ### Root Cause
 
-`POST /tasks` immediately calls `tokio::spawn(run_task(...))`. There is no queue, no dependency mechanism, no locking. Each task gets its own worktree branch, but merging back to main is sequential — the second PR conflicts with the first.
+The removed task layer immediately spawned each request without a dependency mechanism or repository-level coordination. Each task used its own worktree branch, but merging back to main was sequential, so later PRs conflicted.
 
 ### Workaround
 
-External bash script for serial execution:
-
-```bash
-#!/bin/bash
-for issue in 20 21 22; do
-    # Submit
-    TASK_ID=$(curl -s -X POST http://localhost:9800/tasks \
-        -H 'Content-Type: application/json' \
-        -d "{\"issue\": $issue}" | jq -r '.task_id')
-
-    # Poll until done
-    while true; do
-        STATUS=$(curl -s http://localhost:9800/tasks/$TASK_ID | jq -r '.status')
-        [ "$STATUS" = "done" ] || [ "$STATUS" = "failed" ] && break
-        sleep 30
-    done
-
-    # Merge
-    PR_URL=$(curl -s http://localhost:9800/tasks/$TASK_ID | jq -r '.pr_url')
-    PR_NUM=$(echo $PR_URL | grep -oP '\d+$')
-    [ -n "$PR_NUM" ] && gh pr merge $PR_NUM --squash --delete-branch
-done
-```
+The legacy workaround is no longer valid because the task endpoints were
+removed. Submit one durable request per issue through
+`POST /api/workflows/runtime/submissions`, then observe each request through
+`GET /api/workflows/runtime/submissions/{id}` or its SSE stream before
+submitting dependent work. See the current examples in `README.md`.
 
 ### Proper Fix (Not Yet Implemented)
 
-Need one of:
-- `POST /tasks/queue` endpoint that internally serializes dependent tasks
-- Task dependency mechanism (`blockedBy` field linking tasks)
-- Repository-level locking that prevents concurrent modifications
+The workflow runtime now owns durable submission state. Dependency-aware
+dispatch and repository coordination belong in that runtime rather than in a
+replacement compatibility endpoint.
 
 ---
 

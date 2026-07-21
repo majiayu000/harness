@@ -96,10 +96,12 @@ merge, and cancel before the compatibility endpoint can be removed.
 - [x] Final readiness runs `cargo clippy --workspace --all-targets -- -D warnings`.
 - [x] Smoke checks cover serve startup, status, `pr fix --help`, webhook health,
       and dashboard first viewport.
-- [x] Archive restore is exercised against a temporary database before deleting
-      related code. The maintainer records the archive/restore evidence as
-      complete in the scoped T007/T008 waiver:
-      <https://github.com/majiayu000/harness/issues/1434#issuecomment-5006185197>.
+- [x] Archive creation produced a dump, restore instructions, and table counts
+      before related code was deleted, as recorded in the archive evidence:
+      <https://github.com/majiayu000/harness/issues/1434#issuecomment-4990260785>.
+- [ ] A scratch-database restore rehearsal is not evidenced. The referenced
+      operator-owned archive is not present in this PR worktree, and the scoped
+      waiver does not include restore command output or row-count comparisons.
 
 ## Rollback Plan
 

@@ -33,7 +33,7 @@ See `specs/GH1437/product.md`.
 | P1 stall aborts early | `turn_lifecycle.rs` + shared driver | Mock stream: no items → failure within window (test clock) |
 | P2 default ordering enforced | `config/misc.rs` validation | Unit test: equal/larger stall default clamps + warns |
 | P3 activity resets clock | stall arm reset on item | Test: item every window/2 → runs to wall-clock |
-| P4 distinct reasons | failure strings | Assert both strings; `GET /tasks` fixture |
+| P4 distinct reasons | failure strings | Assert both strings in the runtime submission detail fixture |
 | P5 uniform coverage | workflow runtime path | Runtime-job test with silent codex_exec stream |
 | P6 override clamped | `task_runner/request.rs` | Unit test: override > wall-clock → clamped with warning |
 
@@ -58,7 +58,7 @@ Input: agent stream items (stdout/events) per turn; config `concurrency.stall_ti
 
 - [ ] Unit tests: config validation/clamping, floor, override clamp.
 - [ ] Integration tests: silent stream stall abort (task executor and workflow runtime paths), activity-reset behavior, post-abort late-result rejection.
-- [ ] Manual verification: replay a proxy-drop window locally (kill upstream mid-turn) and confirm failure within the stall window with the stall reason in `GET /tasks`.
+- [ ] Manual verification: replay a proxy-drop window locally (kill upstream mid-turn) and confirm failure within the stall window with the stall reason in `GET /api/workflows/runtime/submissions/{id}`.
 
 ## Rollback Plan
 
