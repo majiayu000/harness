@@ -1,4 +1,5 @@
 use super::*;
+use harness_workflow::runtime::WorkflowCommandStatus;
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -30,12 +31,32 @@ pub(super) async fn recover_with_urls(
     _rest_url: &str,
     graphql_url: &str,
 ) -> anyhow::Result<GitHubIssueCoverage> {
+    recover_with_urls_and_trust(
+        store,
+        project_root,
+        project_id,
+        issue_number,
+        graphql_url,
+        IsolationTrustClass::Trusted,
+    )
+    .await
+}
+
+pub(super) async fn recover_with_urls_and_trust(
+    store: &WorkflowRuntimeStore,
+    project_root: &Path,
+    project_id: &str,
+    issue_number: u64,
+    graphql_url: &str,
+    author_trust_class: IsolationTrustClass,
+) -> anyhow::Result<GitHubIssueCoverage> {
     recover_github_pr_coverage_with_client(
         store,
         project_root,
         project_id,
         REPO,
         issue_number,
+        author_trust_class,
         None,
         &reqwest::Client::new(),
         graphql_url,

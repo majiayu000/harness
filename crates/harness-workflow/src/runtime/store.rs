@@ -24,6 +24,8 @@ mod activity_completion;
 mod command_facade;
 #[path = "store/commands.rs"]
 mod command_store;
+#[path = "store/coverage_recovery.rs"]
+mod coverage_recovery;
 #[path = "store/decisions.rs"]
 mod decisions;
 #[path = "store/definitions.rs"]
@@ -60,6 +62,10 @@ mod submission_instances;
 mod terminal_instance_queries;
 #[path = "store/transaction_helpers.rs"]
 mod transaction_helpers;
+pub use coverage_recovery::{
+    WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
+    WorkflowCoverageRecoveryTransition,
+};
 pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};
 pub use recovery::{
     WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,

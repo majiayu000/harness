@@ -199,6 +199,7 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
             "validation_commands": validation_commands.clone(),
         }),
     );
+    inherit_author_trust_class(&mut child.data, &parent.data)?;
     if !child_started_by_command || !child_start_event_recorded {
         store.upsert_instance(&child).await?;
         if !child_start_event_recorded {
@@ -390,6 +391,7 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             command_id: job.command_id.as_str(),
         },
     );
+    inherit_author_trust_class(&mut child.data, &parent.data)?;
     if !child_started_by_command || !child_start_event_recorded {
         store.upsert_instance(&child).await?;
         if !child_start_event_recorded {
@@ -538,4 +540,44 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             "command_ids": child_command_ids,
         }),
     )))
+}
+
+fn inherit_author_trust_class(child: &mut Value, parent: &Value) -> anyhow::Result<()> {
+    let Some(value) = parent.get("author_trust_class") else {
+        return Ok(());
+    };
+    let _: harness_core::config::isolation::IsolationTrustClass =
+        serde_json::from_value(value.clone())
+            .map_err(|error| anyhow::anyhow!("invalid parent author_trust_class: {error}"))?;
+    let child = child
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("child workflow data must be an object"))?;
+    child.insert("author_trust_class".to_string(), value.clone());
+    Ok(())
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn child_inherits_non_collaborator_trust() -> anyhow::Result<()> {
+        let mut child = json!({});
+        inherit_author_trust_class(
+            &mut child,
+            &json!({"author_trust_class": "non_collaborator"}),
+        )?;
+        assert_eq!(child["author_trust_class"], "non_collaborator");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_parent_trust_fails_closed() {
+        let error =
+            inherit_author_trust_class(&mut json!({}), &json!({"author_trust_class": "unknown"}))
+                .expect_err("invalid trust metadata must fail");
+        assert!(error
+            .to_string()
+            .contains("invalid parent author_trust_class"));
+    }
 }

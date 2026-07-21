@@ -5,6 +5,9 @@ use serde_json::json;
 mod support;
 use support::*;
 
+#[path = "github_coverage_recovery_tests/atomic.rs"]
+mod atomic;
+
 #[tokio::test]
 async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> anyhow::Result<()> {
     let Some((dir, store)) = open_runtime_store().await? else {
@@ -68,6 +71,7 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
         &project_id,
         REPO,
         issue_number,
+        IsolationTrustClass::Trusted,
         None,
     )
     .await?;
@@ -87,6 +91,7 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
         &project_id,
         REPO,
         issue_number,
+        IsolationTrustClass::Trusted,
         None,
     )
     .await?;
@@ -254,6 +259,7 @@ async fn merged_pr_recovers_terminal_coverage_even_when_issue_is_open() -> anyho
             &project_id,
             REPO,
             issue_number,
+            IsolationTrustClass::Trusted,
             None,
         )
         .await?,

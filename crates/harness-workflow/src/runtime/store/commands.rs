@@ -162,6 +162,44 @@ pub(super) async fn insert_tx(
     Ok(id)
 }
 
+pub(super) async fn insert_or_reactivate_cancelled_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+    decision_id: Option<&str>,
+    command: &WorkflowCommand,
+    status: WorkflowCommandStatus,
+) -> anyhow::Result<String> {
+    let data = to_jsonb_string(command)?;
+    let command_type = enum_str(&command.command_type)?;
+    let (id,): (String,) = sqlx::query_as(
+        "INSERT INTO workflow_commands
+            (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+         ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
+            decision_id = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.decision_id ELSE workflow_commands.decision_id END,
+            command_type = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.command_type ELSE workflow_commands.command_type END,
+            data = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.data ELSE workflow_commands.data END,
+            status = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.status ELSE workflow_commands.status END,
+            dispatch_owner = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_owner END,
+            dispatch_lease_expires_at = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_lease_expires_at END,
+            dispatch_not_before = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_not_before END,
+            dispatch_barrier = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_barrier END,
+            updated_at = CASE WHEN workflow_commands.status = $8 THEN CURRENT_TIMESTAMP ELSE workflow_commands.updated_at END
+         RETURNING id",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(workflow_id)
+    .bind(decision_id)
+    .bind(command_type)
+    .bind(&command.dedupe_key)
+    .bind(status.as_str())
+    .bind(data)
+    .bind(WorkflowCommandStatus::Cancelled.as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(id)
+}
+
 fn insert_sql() -> &'static str {
     "INSERT INTO workflow_commands
         (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
@@ -288,7 +326,13 @@ pub(super) async fn enqueue_runtime_job_for_command(
                 status: terminal_status,
             });
         }
-        if existing.is_some() {
+        if existing.as_ref().is_some_and(|job| {
+            matches!(
+                job.status,
+                crate::runtime::RuntimeJobStatus::Pending
+                    | crate::runtime::RuntimeJobStatus::Running
+            )
+        }) {
             tx.rollback().await?;
             return Ok(RuntimeJobEnqueueOutcome::StaleClaim);
         }
@@ -300,7 +344,12 @@ pub(super) async fn enqueue_runtime_job_for_command(
                 status: command_status,
             },
         });
-    } else if let Some(existing) = existing {
+    } else if let Some(existing) = existing.filter(|job| {
+        matches!(
+            job.status,
+            crate::runtime::RuntimeJobStatus::Pending | crate::runtime::RuntimeJobStatus::Running
+        )
+    }) {
         tx.rollback().await?;
         return Ok(RuntimeJobEnqueueOutcome::AlreadyExists(existing));
     }

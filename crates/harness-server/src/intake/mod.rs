@@ -257,6 +257,7 @@ impl IntakeOrchestrator {
                     &project_id,
                     &repo,
                     issue_number,
+                    issue.author_trust_class,
                     state.core.server.config.server.github_token.as_deref(),
                 )
                 .await
