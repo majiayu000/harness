@@ -37,8 +37,13 @@ GH-1704
 - Work: pin by workflow family, verify evidence before dispatch, hydrate replay,
   and map transient versus terminal failures without active-queue ambiguity.
 - Done when: GC cannot remove live dependencies, invalid evidence never starts
-  a consumer, and retries/terminal outcomes are deterministic.
-- Verify: retention/GC, missing/corrupt/read failure, retry, and projection tests.
+  a consumer, verified evidence hydrates the consumer before dispatch, and
+  retries/terminal outcomes are deterministic.
+- Verify: retention/GC, retry, and projection tests, plus
+  `cargo test -p harness-server 'http::tests::runtime_transcript_route_tests::exact_replay_preflight_fails_terminal_on_missing_or_corrupt_transcript' -- --exact`
+  for dispatch suppression and
+  `cargo test -p harness-server 'http::tests::runtime_transcript_route_tests::exact_replay_hydrates_verified_transcript_before_dispatch' -- --exact`
+  for successful pre-dispatch hydration.
 
 ### SP1704-T3 — Unify local and RemoteHost transcript completion
 
@@ -94,6 +99,8 @@ completion transaction, and retention logic remain under one owner.
 - [ ] Product invariant set equals task coverage union: B-001 through B-010.
 - [ ] Global and GH-1704 SpecRail checks pass.
 - [ ] Workflow and server focused tests pass with an isolated database.
+- [ ] B-004 exact tests prove both invalid-evidence dispatch suppression and
+      verified-evidence hydration before dispatch.
 - [ ] Exact `cargo test -- --list` names are used for retention and runtime
       transcript failure-classification coverage.
 - [ ] Workspace format/check/clippy/tests and exact-head CI pass.

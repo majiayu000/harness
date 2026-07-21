@@ -70,7 +70,7 @@ flow.
 | B-001 | activity completion transaction and transcript store | `cargo test -p harness-workflow transcript_completion_is_atomic` |
 | B-002 | transcript model/store constraints | checksum, size, and producer ownership tests under `runtime::tests::transcript_durability` |
 | B-003 | dependency-aware retention query | `cargo test -p harness-workflow 'runtime::tests::transcript_durability::transcript_retention_waits_for_every_dependent_workflow_to_finish' -- --exact` |
-| B-004 | worker preflight and hydration | missing/corrupt/readable exact-replay tests |
+| B-004 | worker preflight dispatch suppression and verified hydration | `cargo test -p harness-server 'http::tests::runtime_transcript_route_tests::exact_replay_preflight_fails_terminal_on_missing_or_corrupt_transcript' -- --exact` and `cargo test -p harness-server 'http::tests::runtime_transcript_route_tests::exact_replay_hydrates_verified_transcript_before_dispatch' -- --exact` |
 | B-005 | reason classification and reducer retry | `cargo test -p harness-workflow 'runtime::tests::runtime_transcript_store_failure_uses_bounded_default_backoff' -- --exact` and `cargo test -p harness-workflow 'runtime::tests::runtime_transcript_store_failure_honors_explicit_zero_retry_limits' -- --exact` |
 | B-006 | terminal failure mapping and active-queue projection | `cargo test -p harness-workflow 'runtime::tests::confirmed_runtime_transcript_loss_is_terminal' -- --exact`, plus missing/corrupt transcript integration tests and server projection tests |
 | B-007 | reconstruction handler/store operation | `cargo test -p harness-server runtime_transcript_route` |
@@ -110,6 +110,9 @@ flow.
 ## Test Plan
 
 - [ ] Run every Product-to-Test Mapping command/filter.
+- [ ] Run both exact B-004 selectors: the missing/corrupt case must prove the
+      consumer is not dispatched, and the verified case must prove transcript
+      hydration completes before dispatch.
 - [ ] Run `cargo check --workspace --all-targets`.
 - [ ] Run `cargo fmt --all -- --check` and
       `cargo clippy --workspace --all-targets -- -D warnings`.
