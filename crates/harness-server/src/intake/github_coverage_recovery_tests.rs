@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-#[path = "github_coverage_recovery_test_support.rs"]
+#[path = "github_coverage_recovery_tests/support.rs"]
 mod support;
 use support::*;
 
