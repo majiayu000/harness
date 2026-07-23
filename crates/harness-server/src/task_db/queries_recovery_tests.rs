@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
+use tracing::subscriber::Interest;
 use tracing::{Event, Id, Metadata, Subscriber};
 
 const PR_URL: &str = "https://github.com/owner/repo/pull/1716";
@@ -52,6 +53,10 @@ impl Visit for EventVisitor {
 }
 
 impl Subscriber for CapturedSubscriber {
+    fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+        Interest::always()
+    }
+
     fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
         true
     }
@@ -241,6 +246,49 @@ async fn bump_version(db: &TaskDb, task_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn assert_applied_target(
+    db: &TaskDb,
+    site: RecoverySite,
+    task_id: &str,
+) -> anyhow::Result<()> {
+    let task = db
+        .get(task_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("applied task {task_id} disappeared"))?;
+    let expected_status = match site {
+        RecoverySite::TerminalReplay => TaskStatus::Done,
+        RecoverySite::PrReplay => TaskStatus::Implementing,
+        RecoverySite::ResumeWithPr | RecoverySite::ResumeWithoutPr => TaskStatus::Pending,
+        RecoverySite::NoCheckpointFailure | RecoverySite::TransientFailure => TaskStatus::Failed,
+    };
+    let expected_pr = match site {
+        RecoverySite::TerminalReplay
+        | RecoverySite::PrReplay
+        | RecoverySite::ResumeWithPr
+        | RecoverySite::ResumeWithoutPr => Some(PR_URL),
+        RecoverySite::NoCheckpointFailure | RecoverySite::TransientFailure => None,
+    };
+    let expected_error = match site {
+        RecoverySite::NoCheckpointFailure | RecoverySite::TransientFailure => Some(FAILURE_ERROR),
+        _ => None,
+    };
+    let expected_scheduler = target_scheduler(site);
+
+    assert_eq!(task.status, expected_status, "{site:?} durable status");
+    assert_eq!(task.pr_url.as_deref(), expected_pr, "{site:?} durable PR");
+    assert_eq!(
+        task.error.as_deref(),
+        expected_error,
+        "{site:?} durable error"
+    );
+    assert_eq!(
+        task.scheduler, expected_scheduler,
+        "{site:?} durable scheduler state"
+    );
+    assert_eq!(task.version, 1, "{site:?} must commit exactly one write");
+    Ok(())
+}
+
 #[test]
 fn write_outcomes_are_closed_and_exclusive() {
     assert!(TaskRecoveryWriteOutcome::Applied
@@ -272,16 +320,17 @@ async fn all_six_version_guarded_sites_apply_exactly_once() -> anyhow::Result<()
     let _guard = crate::test_helpers::acquire_db_state_guard().await;
     let dir = tempfile::tempdir()?;
     let db = TaskDb::open(&dir.path().join("tasks.db")).await?;
+    let mut applied_count = 0;
 
     for site in RECOVERY_SITES {
         let task_id = format!("applied-{}", site_name(site));
         db.insert(&seed_task(site, &task_id)).await?;
-        assert_eq!(
-            apply_site(&db, site, &task_id, 0).await?,
-            TaskRecoveryWriteOutcome::Applied,
-            "{site:?} should apply"
-        );
+        let outcome = apply_site(&db, site, &task_id, 0).await?;
+        assert_eq!(outcome, TaskRecoveryWriteOutcome::Applied, "{site:?}");
+        applied_count += u32::from(outcome == TaskRecoveryWriteOutcome::Applied);
+        assert_applied_target(&db, site, &task_id).await?;
     }
+    assert_eq!(applied_count, RECOVERY_SITES.len() as u32);
     Ok(())
 }
 
@@ -316,6 +365,38 @@ async fn lost_cas_is_superseded_only_with_authoritative_evidence() -> anyhow::Re
     assert_eq!(
         apply_site(&db, RecoverySite::PrReplay, deleted_id, 0).await?,
         TaskRecoveryWriteOutcome::Superseded
+    );
+
+    let terminal_without_replay_pr_id = "superseded-terminal-with-actor-pr";
+    db.insert(&seed_task(
+        RecoverySite::TerminalReplay,
+        terminal_without_replay_pr_id,
+    ))
+    .await?;
+    let scheduler = target_scheduler(RecoverySite::TerminalReplay);
+    let scheduler_json = serde_json::to_string(&scheduler)?;
+    sqlx::query(
+        "UPDATE tasks SET status = 'done', pr_url = $1, scheduler_state = $2, \
+         version = version + 1 WHERE store_key = $3 AND id = $4",
+    )
+    .bind(PR_URL)
+    .bind(&scheduler_json)
+    .bind(db.store_key())
+    .bind(terminal_without_replay_pr_id)
+    .execute(&db.postgres_pool())
+    .await?;
+    assert_eq!(
+        db.apply_terminal_replay_at_version(
+            terminal_without_replay_pr_id,
+            None,
+            &TaskStatus::Done,
+            &scheduler,
+            &scheduler_json,
+            0,
+        )
+        .await?,
+        TaskRecoveryWriteOutcome::Superseded,
+        "a replay without PR evidence must not conflict with an equivalent terminal writer that supplied a PR"
     );
     Ok(())
 }
@@ -428,8 +509,62 @@ async fn repeated_recovery_converges_without_rewrite() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn recovery_counts_and_success_logs_require_applied_write() {
+#[tokio::test]
+async fn recovery_counts_and_success_logs_require_applied_write() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+    let _guard = crate::test_helpers::acquire_db_state_guard().await;
+    let dir = tempfile::tempdir()?;
+    let db = TaskDb::open(&dir.path().join("tasks.db")).await?;
+
+    let resume_with_pr_id = "caller-resume-with-pr";
+    db.insert(&seed_task(RecoverySite::ResumeWithPr, resume_with_pr_id))
+        .await?;
+    db.write_checkpoint(
+        resume_with_pr_id,
+        None,
+        Some("plan"),
+        Some(PR_URL),
+        "pr_created",
+    )
+    .await?;
+    db.insert(&seed_task(
+        RecoverySite::ResumeWithoutPr,
+        "caller-resume-without-pr",
+    ))
+    .await?;
+    db.insert(&seed_task(
+        RecoverySite::NoCheckpointFailure,
+        "caller-no-checkpoint",
+    ))
+    .await?;
+    db.insert(&seed_task(
+        RecoverySite::TransientFailure,
+        "caller-transient",
+    ))
+    .await?;
+
+    let applied_output = CapturedSubscriber::default();
+    let recovery = {
+        let _subscriber_guard = tracing::subscriber::set_default(applied_output.clone());
+        db.recover_in_progress().await?
+    };
+    assert_eq!(recovery.resumed, 2);
+    assert_eq!(recovery.failed, 1);
+    assert_eq!(recovery.transient_failed, 1);
+    let applied_output = applied_output.output();
+    for success_wording in [
+        "wrote back pr_url from checkpoint",
+        "resumed task",
+        "pending mid-transient-retry",
+    ] {
+        assert!(
+            applied_output.contains(success_wording),
+            "real recovery caller must log applied action {success_wording:?}: {applied_output}"
+        );
+    }
+
     let captured = CapturedSubscriber::default();
     let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
     let mut applied_count = 0;
@@ -472,4 +607,5 @@ fn recovery_counts_and_success_logs_require_applied_write() {
             "non-applied outcomes must not emit success wording {success_wording:?}: {output}"
         );
     }
+    Ok(())
 }

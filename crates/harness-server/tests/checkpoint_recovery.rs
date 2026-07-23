@@ -645,3 +645,40 @@ async fn replay_conflict_fails_startup_before_checkpoint_recovery() -> anyhow::R
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn non_conflict_replay_failure_remains_non_fatal_at_startup() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+    db.insert(&make_task(
+        "checkpoint-after-replay-error",
+        TaskStatus::Implementing,
+    ))
+    .await?;
+    db.write_checkpoint(
+        "checkpoint-after-replay-error",
+        None,
+        Some("plan text"),
+        None,
+        "plan_done",
+    )
+    .await?;
+    drop(db);
+
+    std::fs::create_dir(tmp.path().join("task-events.jsonl"))?;
+    let store = TaskStore::open(&db_path)
+        .await
+        .expect("a non-conflict replay I/O error remains non-fatal");
+    let recovered = store
+        .get_with_db_fallback(&CoreTaskId("checkpoint-after-replay-error".into()))
+        .await?
+        .expect("checkpoint recovery must still run after a non-conflict replay error");
+    assert_eq!(recovered.status, TaskStatus::Pending);
+    assert_eq!(recovered.scheduler.recovery_generation, 1);
+    Ok(())
+}

@@ -85,10 +85,9 @@ impl TaskDb {
             }
             scheduler.mark_terminal(&task_status);
             let scheduler_json = serde_json::to_string(&scheduler)?;
-            let intended_pr_url = pr_url.or(snapshot.pr_url.as_deref());
             self.apply_terminal_replay_at_version(
                 task_id,
-                intended_pr_url,
+                pr_url,
                 &task_status,
                 &scheduler,
                 &scheduler_json,
@@ -517,9 +516,8 @@ impl TaskDb {
                 pr_url,
                 scheduler,
             } => {
-                current_status == status
-                    && snapshot.pr_url.as_deref() == pr_url
-                    && current_scheduler == *scheduler
+                let pr_matches = pr_url.is_none() || snapshot.pr_url.as_deref() == pr_url;
+                current_status == status && pr_matches && current_scheduler == *scheduler
             }
             RecoveryWriteIntent::PrReplay { pr_url } => snapshot.pr_url.as_deref() == Some(pr_url),
             RecoveryWriteIntent::Resume { pr_url, scheduler } => {
