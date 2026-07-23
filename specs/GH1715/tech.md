@@ -101,6 +101,13 @@ authorizes `labels_snapshot` and `force_execute` for `IssueScheduled`, and the
 compatible `review_fallback` snapshot for `Mergeable`; a rejected event applies
 none of those fields.
 
+Fallback compatibility compares the logical identity fields `tier`, `trigger`,
+and `active_bot`, not the newly constructed `activated_at`. The first supplied
+snapshot fills an empty field. A retry with the same logical identity preserves
+the complete existing snapshot, including its original `activated_at`; it does
+not replace audit evidence with the retry timestamp. A supplied fallback with a
+different logical identity returns the typed binding-conflict error.
+
 ### Transactional Error Propagation
 
 Change `update_issue`, `update_existing_issue`, and `update_by_pr` mutation
@@ -124,6 +131,12 @@ The lifecycle and task stores do not share a transaction. This ordering makes
 the fail-closed direction explicit: a lifecycle rejection cannot report task
 success, while a later task-store failure leaves an idempotently retryable
 `Mergeable` lifecycle result rather than a false task completion.
+
+On retry after a task-store failure, the repeated `Mergeable` update accepts
+only the same logical fallback and preserves the first snapshot. The task
+completion mutation appends the round only after the lifecycle retry succeeds;
+runtime feedback and the completion event remain after that task mutation, so
+the converged path records each completion-shaped effect once.
 
 Because validation finishes before mutation and persistence occurs only after
 the callback succeeds, an illegal event rolls back the transaction and
@@ -185,7 +198,7 @@ append completion event -> return success`.
 | B-006 | placeholder conditional transitions | `cargo test -p harness-workflow feedback_claim_placeholder_transitions_remain_recoverable --lib` |
 | B-007 | blocked terminal recovery rows | `cargo test -p harness-workflow blocked_issue_lifecycle_can_converge_to_terminal_state --lib` |
 | B-008 | fallible store callbacks and transaction order | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::rejected_issue_lifecycle_store_update_rolls_back -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
-| B-009 | typed error propagation, direct callers, batch claiming, merge approval, and Tier-C fallback ordering | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib`; `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::feedback_claim_batch_aborts_on_illegal_transition -- --ignored --exact`; `cargo test -p harness-workflow merge_approval_wrong_state_returns_transition_error --lib`; `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-server --lib task_executor::review_loop_wait_budget_tests::tier_c_lifecycle_rejection_records_no_completion_evidence -- --ignored --exact`; `cargo check -p harness-server --all-targets`; `python3 -c 'from pathlib import Path; text = Path("crates/harness-server/src/task_executor/review_loop/flow.rs").read_text(); lifecycle = text.index("record_ready_to_merge_with_fallback"); assert lifecycle < text.index("s.status = TaskStatus::Done", lifecycle)'` |
+| B-009 | typed error propagation, direct callers, batch claiming, merge approval, and Tier-C fallback ordering | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib`; `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::feedback_claim_batch_aborts_on_illegal_transition -- --ignored --exact`; `cargo test -p harness-workflow merge_approval_wrong_state_returns_transition_error --lib`; `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-server --lib task_executor::review_loop_wait_budget_tests::tier_c_lifecycle_rejection_records_no_completion_evidence -- --ignored --exact`; `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-server --lib task_executor::review_loop_wait_budget_tests::tier_c_task_store_failure_retry_records_completion_once -- --ignored --exact`; `cargo check -p harness-server --all-targets`; `python3 -c 'from pathlib import Path; text = Path("crates/harness-server/src/task_executor/review_loop/flow.rs").read_text(); lifecycle = text.index("record_ready_to_merge_with_fallback"); assert lifecycle < text.index("s.status = TaskStatus::Done", lifecycle)'` |
 | B-010 | serde and existing valid store behavior | `cargo test -p harness-workflow issue_lifecycle --lib`; `cargo test -p harness-workflow issue_workflow_store --lib` |
 | B-011 | row-lock race coverage | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::concurrent_valid_and_invalid_issue_transitions_preserve_winner -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
 | B-012 | manifest scope and workspace compatibility | `git diff --name-only origin/main...HEAD`; `cargo check --workspace --all-targets` |
@@ -254,6 +267,15 @@ append completion event -> return success`.
       rejection and proves the task remains non-`Done`, no `ready_to_merge`
       round is appended, no runtime ready-to-merge feedback is persisted, and
       no completion event is logged.
+- [ ] Add a required-DB server retry test that lets the lifecycle write succeed,
+      forces the following task-store mutation to fail, then retries with a
+      fresh timestamp and proves the original fallback snapshot is preserved
+      and exactly one completion-shaped task round, runtime feedback result, and
+      completion event are recorded.
+- [ ] The two new server tests must use a non-skipping required-DB helper that
+      reads and validates `HARNESS_DATABASE_URL` and errors on missing
+      configuration or open failure. They must not use the existing
+      `db_tests_enabled() -> Ok(())` skip pattern.
 - [ ] Add a required-DB test helper for the four new persistence tests. It reads
       `HARNESS_DATABASE_URL`, validates an isolated test database through the
       existing database-safety helpers, calls

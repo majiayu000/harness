@@ -103,7 +103,7 @@ row explicitly authorizes a new stage binding.
 | `FeedbackTaskScheduled` | `PrOpen`, `FeedbackClaimed` | `AddressingFeedback` | Bind the new feedback task, clear claim time and review fallback, and fill only compatible PR fields. |
 | `FeedbackTaskScheduled` | placeholder-backed or same-task `AddressingFeedback` | same | Retain the same task or replace only the placeholder with the real task; clear claim time and review fallback. |
 | `NoFeedbackFound` | `FeedbackClaimed`, `AwaitingFeedback` | `AwaitingFeedback` | Clear active task, feedback claim, and review fallback. |
-| `Mergeable` | `PrOpen`, `AwaitingFeedback`, `AddressingFeedback`, `ReadyToMerge` | `ReadyToMerge` | Clear active task and feedback claim; fill only a missing or matching PR head; set or preserve the compatible Tier-C `review_fallback` snapshot supplied by the store call. |
+| `Mergeable` | `PrOpen`, `AwaitingFeedback`, `AddressingFeedback`, `ReadyToMerge` | `ReadyToMerge` | Clear active task and feedback claim; fill only a missing or matching PR head. A supplied Tier-C fallback fills an empty `review_fallback`; when `tier`, `trigger`, and `active_bot` match an existing snapshot, preserve that complete first snapshot including `activated_at`; a different logical fallback is illegal. |
 | `MergeStarted` | `ReadyToMerge`, same-task/head-attempt `Merging` | `Merging` | Bind the merge task and compatible head attempt; clear feedback claim. |
 | `HumanMergeApproved` | `ReadyToMerge`, `Done` | `Done` | Clear feedback claim; a repeated `Done` event is audit-refresh only. |
 | `WorkflowBlocked` | any nonterminal state | `Blocked` | Clear active task and feedback claim; preserve other bindings. |
@@ -133,6 +133,9 @@ illegal.
 - [ ] A server behavior test proves a rejected Tier-C lifecycle update leaves
       the task non-`Done`, appends no `ready_to_merge` round, emits no runtime
       ready-to-merge feedback, and records no completion event.
+- [ ] A server retry test proves a lifecycle-success/task-store-failure retry
+      preserves the first fallback snapshot and ultimately records exactly one
+      `ready_to_merge` round, runtime feedback result, and completion event.
 - [ ] Store tests prove rejected updates roll back without changing the
       persisted row.
 - [ ] Tests retain `Blocked -> Done`, human approval, repeated terminal event,
