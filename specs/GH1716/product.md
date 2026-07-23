@@ -45,12 +45,14 @@ task can remain unrecovered without an explicit error.
    `updated`, `resumed`, `failed`, or `transient_failed`, and only `Applied`
    may emit success wording for that action.
 3. **B-003:** A zero-row write is `Superseded` only after a fresh authoritative
-   read proves that the task row is absent, already contains the intended
-   durable result, or no longer satisfies that recovery action's eligibility
-   predicate.
-4. **B-004:** A zero-row write is `Conflict` when the fresh row still satisfies
-   the action's eligibility predicate but does not contain the intended
-   durable result. The conflict is an explicit error that identifies the task,
+   read proves that the task row is absent, already contains the exact intended
+   durable result, or has reached an action-specific state that conclusively
+   makes the recovery action obsolete without contradicting its evidence.
+   Merely failing the original eligibility predicate is insufficient.
+4. **B-004:** A zero-row write is `Conflict` when the fresh row lacks the
+   intended durable result and either remains eligible or contains
+   contradictory durable evidence. A different PR URL or a nonmatching
+   terminal replay result is always a conflict. The error identifies the task,
    recovery action, expected version, and current version when available.
 5. **B-005:** Event replay increments its applied-task count only for
    `Applied`. Any unresolved `Conflict` aborts replay before terminal event-log
@@ -80,7 +82,9 @@ task can remain unrecovered without an explicit error.
 - [ ] All six version-guarded recovery UPDATE sites inspect their affected-row
       result.
 - [ ] Applied, superseded, and conflicting interleavings are covered against
-      PostgreSQL using stale-version fixtures or controlled concurrent actors.
+      PostgreSQL for each of the six write sites: terminal replay, PR-only
+      replay, checkpoint resume with PR writeback, checkpoint resume without
+      PR writeback, no-checkpoint failure, and transient-retry failure.
 - [ ] Recovery counters and success logs exclude superseded and conflicting
       writes.
 - [ ] A replay conflict leaves terminal JSONL evidence uncompacted.
@@ -108,8 +112,10 @@ task can remain unrecovered without an explicit error.
 
 - The row is deleted after recovery selects it but before the UPDATE.
 - Another writer applies the same target status or PR URL first.
-- Another writer advances the row to a state that is no longer eligible for
-  the selected recovery action.
+- Another writer advances the row to a state that conclusively makes the
+  action obsolete without contradicting its evidence.
+- Another writer stores a different PR URL or terminal result, making the row
+  ineligible but contradicting replay evidence.
 - Another writer bumps the version but leaves the row eligible and without the
   intended recovery result.
 - Event replay contains both a terminal status and a PR URL.

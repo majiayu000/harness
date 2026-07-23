@@ -50,20 +50,27 @@ See `specs/GH1716/product.md`.
    violation even though `(store_key, id)` uniqueness should prevent it.
 3. On zero affected rows, reload the minimum authoritative task fields needed
    by the current action and classify conservatively:
-   - `Superseded` when the row is absent, already contains the intended result,
-     or no longer matches that action's original eligibility predicate.
-   - `Conflict` when the row remains eligible but lacks the intended result.
+   - `Superseded` when the row is absent, already contains the exact intended
+     result, or has reached an action-specific state that conclusively makes
+     the action obsolete without contradicting its evidence.
+   - `Conflict` when the row lacks the intended result and remains eligible or
+     contains contradictory durable evidence. Failure of the original
+     eligibility predicate alone never proves supersession.
 4. Keep classification action-specific. Terminal replay checks resumable
-   status and intended terminal state; PR replay checks nullable/current PR
-   ownership; checkpoint resume checks resumable status plus pending/recovering
-   target; no-checkpoint and transient recovery check their original failure
-   predicates.
+   status and requires the exact intended terminal state before superseding;
+   a different terminal result conflicts. PR replay requires the same PR URL;
+   a different non-null URL conflicts. Checkpoint resume checks resumable
+   status plus the exact pending/scheduler/PR target, while no-checkpoint and
+   transient recovery classify only explicit newer terminal outcomes as
+   action-obsoleting.
 5. Do not retry `Conflict` within the same invocation. A blind reload-and-write
    loop could overwrite a live writer and defeat optimistic locking. Return an
    error so a later startup or explicit rerun begins from a fresh snapshot.
 6. Increment `RecoveryResult` fields and emit action success logs only for
-   `Applied`. Emit bounded diagnostic evidence for `Superseded` without
-   success wording. Stop and return an error on `Conflict`.
+   `Applied`. Route outcome-to-log wording through one inspectable decision
+   function: `Superseded` produces bounded non-success diagnostics and
+   `Conflict` produces an error before aggregate success logging. Test this
+   decision with a test-local tracing subscriber and captured writer.
 7. Return the replay write outcome from `apply_replayed_state`. In
    `replay_and_recover`, increment `updated` only for `Applied`, skip counting
    `Superseded`, and return before `compact_log` on `Conflict`.
@@ -91,14 +98,14 @@ or artifact is added.
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
 | B-001 | `task_db.rs`, `task_db/queries_recovery.rs` | `cargo test -p harness-server --lib task_db::queries_recovery_tests::write_outcomes_are_closed_and_exclusive` |
-| B-002 | `task_db/queries_recovery.rs`, `event_replay.rs` | `cargo test -p harness-server --lib task_db::queries_recovery_tests::recovery_counts_only_applied_writes` |
+| B-002 | `task_db/queries_recovery.rs`, `event_replay.rs` | `cargo test -p harness-server --lib task_db::queries_recovery_tests::recovery_counts_and_success_logs_require_applied_write` captures tracing output and counters |
 | B-003 | action-specific fresh-read classifiers | `cargo test -p harness-server --lib task_db::queries_recovery_tests::lost_cas_is_superseded_only_with_authoritative_evidence` |
-| B-004 | conflict outcome and error conversion | `cargo test -p harness-server --lib task_db::queries_recovery_tests::still_eligible_stale_write_is_conflict` |
+| B-004 | conflict outcome and error conversion | `cargo test -p harness-server --lib task_db::queries_recovery_tests::contradictory_or_still_eligible_stale_write_is_conflict` covers a different PR URL and nonmatching terminal result |
 | B-005 | `event_replay.rs`, `event_replay_tests.rs` | `cargo test -p harness-server --lib event_replay::tests::replay_conflict_preserves_terminal_log` |
 | B-006 | no in-call retry and repeat behavior | `cargo test -p harness-server --lib task_db::queries_recovery_tests::repeated_recovery_converges_without_rewrite` |
 | B-007 | existing SQL/decode propagation plus new classifier | `cargo test -p harness-server --test task_db_rounds`; existing corrupted scheduler-state tests remain green |
 | B-008 | existing recovery policy | `cargo test -p harness-server --test checkpoint_recovery` |
-| B-009 | per-action and aggregate logging/count branches | `cargo test -p harness-server --lib task_db::queries_recovery_tests::recovery_counts_only_applied_writes` |
+| B-009 | centralized outcome-to-log decision and aggregate branches | `cargo test -p harness-server --lib task_db::queries_recovery_tests::recovery_counts_and_success_logs_require_applied_write` uses a test-local tracing subscriber/captured writer to reject success wording for `Superseded` and `Conflict` |
 | B-010 | exact path scope and package checks | `git diff --name-only origin/main...HEAD`; `cargo check -p harness-server --all-targets` |
 
 ## PostgreSQL Interleaving Tests
@@ -110,12 +117,17 @@ or artifact is added.
 - For `Applied`, leave the selected version current and assert one affected
   row, one aggregate increment, and the intended durable status/scheduler/PR
   fields.
-- For `Superseded`, have actor B delete the row, apply the equivalent target,
-  or move it outside the action's eligibility predicate. Assert no rewrite and
-  no success count.
+- For `Superseded`, have actor B delete the row, apply the exact equivalent
+  target, or move it to an explicitly enumerated action-obsoleting state that
+  does not contradict the evidence. Assert no rewrite and no success count.
 - For `Conflict`, have actor B bump the version while leaving the row eligible
-  and without the target result. Assert structured conflict context and no
-  count.
+  without the target result, store a different PR URL, or store a nonmatching
+  terminal replay result. Assert structured conflict context and no count.
+- Repeat the applied/superseded/conflict matrix for all six UPDATE sites:
+  terminal replay, PR-only replay, checkpoint resume with PR writeback,
+  checkpoint resume without PR writeback, no-checkpoint failure, and
+  transient-retry failure. Each case asserts that its own `PgQueryResult` is
+  inspected rather than relying only on shared classifier tests.
 - For replay, create terminal JSONL evidence, force the stale eligible row
   conflict, and assert replay returns an error before compaction; rerun after
   applying an equivalent terminal result and assert idempotent supersession.
@@ -123,8 +135,8 @@ or artifact is added.
 ## Alternatives Considered
 
 - Check only `rows_affected() == 0` and return a generic error: rejected
-  because equivalent or ineligible newer state is a safe, diagnosable
-  supersession rather than an unresolved conflict.
+  because an exact equivalent or explicitly action-obsoleting newer state is a
+  safe, diagnosable supersession rather than an unresolved conflict.
 - Retry automatically with the fresh version: rejected because the competing
   process may still own the row and recovery would overwrite newer work.
 - Count selected rows and add warning logs: rejected because selection is not
@@ -154,11 +166,13 @@ or artifact is added.
 ## Test Plan
 
 - [ ] Run all commands in the Product-to-Test Mapping.
-- [ ] Run the deterministic PostgreSQL applied/superseded/conflict
-      interleavings for replay, checkpoint resume, no-checkpoint failure, and
+- [ ] Run the deterministic PostgreSQL applied/superseded/conflict matrix for
+      terminal replay, PR-only replay, checkpoint resume with PR writeback,
+      checkpoint resume without PR writeback, no-checkpoint failure, and
       transient-retry failure.
-- [ ] Assert every success counter and log branch is reached only after one
-      affected row.
+- [ ] Capture tracing with a test-local subscriber and assert every success
+      counter and success-worded log branch is reached only after one affected
+      row; `Superseded` and `Conflict` output must contain no success wording.
 - [ ] Assert an unresolved replay conflict leaves terminal event-log contents
       byte-for-byte unchanged.
 - [ ] Run `cargo test -p harness-server --lib event_replay`.
