@@ -9,6 +9,10 @@ fn make_event_log(dir: &std::path::Path) -> TaskEventLog {
     TaskEventLog::open(&dir.join("task-events.jsonl")).unwrap()
 }
 
+fn postgres_tests_configured() -> bool {
+    std::env::var("HARNESS_DATABASE_URL").is_ok_and(|url| !url.trim().is_empty())
+}
+
 // ── apply_event tests ─────────────────────────────────────────────────────
 
 #[test]
@@ -544,6 +548,52 @@ async fn replay_terminal_failed_overrides_implementing() -> anyhow::Result<()> {
     let t = tasks.iter().find(|t| t.id.0 == "t-term").unwrap();
     assert!(matches!(t.status, TaskStatus::Failed));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_conflict_preserves_terminal_log() -> anyhow::Result<()> {
+    if !postgres_tests_configured() {
+        return Ok(());
+    }
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    let mut state = crate::task_runner::TaskState::new(TaskId("replay-conflict".into()));
+    state.status = TaskStatus::Failed;
+    state.pr_url = Some("https://github.com/o/r/pull/999".to_string());
+    db.insert(&state).await?;
+
+    let log_path = dir.path().join("task-events.jsonl");
+    let log = TaskEventLog::open(&log_path)?;
+    log.append(&TaskEvent::PrDetected {
+        task_id: "replay-conflict".into(),
+        ts: 1,
+        pr_url: "https://github.com/o/r/pull/1716".into(),
+    });
+    log.append(&TaskEvent::Completed {
+        task_id: "replay-conflict".into(),
+        ts: 2,
+    });
+    drop(log);
+    let before = std::fs::read(&log_path)?;
+
+    let error = replay_and_recover(&db, &log_path)
+        .await
+        .expect_err("contradictory terminal replay must fail closed");
+    assert!(
+        error
+            .downcast_ref::<crate::task_db::TaskRecoveryConflict>()
+            .is_some(),
+        "replay conflict should retain its typed error: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read(&log_path)?,
+        before,
+        "terminal replay evidence must remain byte-for-byte unchanged"
+    );
     Ok(())
 }
 

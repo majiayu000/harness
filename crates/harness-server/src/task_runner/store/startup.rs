@@ -72,6 +72,11 @@ impl TaskStore {
             .join("task-events.jsonl");
         if run_startup_recovery {
             if let Err(e) = crate::event_replay::replay_and_recover(&db, &event_log_path).await {
+                if e.downcast_ref::<crate::task_db::TaskRecoveryConflict>()
+                    .is_some()
+                {
+                    return Err(e);
+                }
                 tracing::warn!("startup: event replay failed (non-fatal): {e}");
             }
 

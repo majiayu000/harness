@@ -2,6 +2,8 @@ mod migrations;
 mod queries_aux;
 mod queries_metrics;
 mod queries_recovery;
+#[cfg(test)]
+mod queries_recovery_tests;
 mod queries_retention;
 mod queries_tasks;
 mod raw_column_test_overrides;
@@ -17,6 +19,7 @@ use harness_core::store_backend::{PostgresBackend, StoreLocation};
 use migrations::TASK_MIGRATIONS;
 use sqlx::postgres::PgPool;
 use std::path::Path;
+use std::{error::Error, fmt};
 
 pub const TASK_DB_SCHEMA: &str = "task_db";
 
@@ -24,6 +27,66 @@ pub struct TaskDb {
     pool: PgPool,
     schema: String,
     store_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TaskRecoveryWriteOutcome {
+    Applied,
+    Superseded,
+    Conflict {
+        action: &'static str,
+        task_id: String,
+        expected_version: i32,
+        current_version: Option<i32>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskRecoveryConflict {
+    pub(crate) action: &'static str,
+    pub(crate) task_id: String,
+    pub(crate) expected_version: i32,
+    pub(crate) current_version: Option<i32>,
+}
+
+impl fmt::Display for TaskRecoveryConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.current_version {
+            Some(current_version) => write!(
+                formatter,
+                "task recovery conflict: task {}, action {}, expected version {}, current version {}",
+                self.task_id, self.action, self.expected_version, current_version
+            ),
+            None => write!(
+                formatter,
+                "task recovery conflict: task {}, action {}, expected version {}, current version unavailable",
+                self.task_id, self.action, self.expected_version
+            ),
+        }
+    }
+}
+
+impl Error for TaskRecoveryConflict {}
+
+impl TaskRecoveryWriteOutcome {
+    pub(crate) fn applied_or_error(self) -> anyhow::Result<bool> {
+        match self {
+            Self::Applied => Ok(true),
+            Self::Superseded => Ok(false),
+            Self::Conflict {
+                action,
+                task_id,
+                expected_version,
+                current_version,
+            } => Err(TaskRecoveryConflict {
+                action,
+                task_id,
+                expected_version,
+                current_version,
+            }
+            .into()),
+        }
+    }
 }
 
 fn record_task_db_usage() {
