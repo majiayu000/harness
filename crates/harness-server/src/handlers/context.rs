@@ -52,7 +52,7 @@ fn into_task_profile(task_profile: ContextPreviewTaskProfile) -> TaskProfile {
 
 fn into_context_item(item: ContextPreviewItem) -> ContextItem {
     ContextItem {
-        id: ItemId::new(item.id.0),
+        id: ItemId::new(item.id.into_inner()),
         class: into_item_class(item.class),
         content: item.content,
         est_tokens: item.est_tokens,

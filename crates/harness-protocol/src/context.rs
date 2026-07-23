@@ -30,7 +30,7 @@ pub struct ContextPreviewTaskProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ContextPreviewItemId(pub String);
+pub struct ContextPreviewItemId(String);
 
 impl ContextPreviewItemId {
     pub fn new(value: impl Into<String>) -> Self {
@@ -39,6 +39,10 @@ impl ContextPreviewItemId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
 
@@ -112,6 +116,13 @@ mod tests {
             },
             budget_hint: 4096,
         }
+    }
+
+    #[test]
+    fn context_preview_item_id_accessors_preserve_value() {
+        let id = ContextPreviewItemId::new("rule:accessors");
+        assert_eq!(id.as_str(), "rule:accessors");
+        assert_eq!(id.into_inner(), "rule:accessors");
     }
 
     fn item(
