@@ -72,6 +72,11 @@ metadata and the incoming event:
   without collapsing the lifecycle to `Implementing`.
 
 The allowlist implements the exact Transition Contract in `product.md`.
+Its accepted result records both the target state and a closed metadata-effect
+policy. All accepted events share only the three audit updates defined there;
+event-specific code may mutate only the fields named for that row. This makes
+same-state repetition testable rather than implicitly inheriting every current
+assignment.
 
 ### Transactional Error Propagation
 
@@ -124,14 +129,14 @@ No external calls or new persistence records are introduced.
 | B-001 | centralized transition decision in `issue_lifecycle.rs` | `cargo test -p harness-workflow issue_lifecycle_transition_matrix --lib` evaluates all 224 pairs |
 | B-002 | pre-mutation validation and transition error | `cargo test -p harness-workflow illegal_issue_lifecycle_transition_preserves_complete_snapshot --lib` |
 | B-003 | terminal-state rows in the transition matrix | `cargo test -p harness-workflow terminal_issue_lifecycle_states_cannot_reopen --lib` |
-| B-004 | transition matrix and accepted same-state outcomes | `cargo test -p harness-workflow issue_lifecycle_transition_matrix --lib` |
+| B-004 | transition matrix and closed metadata-effect policies | `cargo test -p harness-workflow issue_lifecycle_transition_matrix --lib`; `cargo test -p harness-workflow accepted_issue_lifecycle_events_mutate_only_declared_fields --lib` |
 | B-005 | PR/task/merge identity guards | `cargo test -p harness-workflow repeated_issue_lifecycle_bindings_require_matching_identity --lib` |
 | B-006 | placeholder conditional transitions | `cargo test -p harness-workflow feedback_claim_placeholder_transitions_remain_recoverable --lib` |
 | B-007 | blocked terminal recovery rows | `cargo test -p harness-workflow blocked_issue_lifecycle_can_converge_to_terminal_state --lib` |
-| B-008 | fallible store callbacks and transaction order | PostgreSQL-backed `cargo test -p harness-workflow rejected_issue_lifecycle_store_update_rolls_back --lib` |
+| B-008 | fallible store callbacks and transaction order | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::rejected_issue_lifecycle_store_update_rolls_back -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
 | B-009 | typed error propagation from store methods | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib` |
 | B-010 | serde and existing valid store behavior | `cargo test -p harness-workflow issue_lifecycle --lib`; `cargo test -p harness-workflow issue_workflow_store --lib` |
-| B-011 | row-lock race coverage | PostgreSQL-backed `cargo test -p harness-workflow concurrent_valid_and_invalid_issue_transitions_preserve_winner --lib` |
+| B-011 | row-lock race coverage | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::concurrent_valid_and_invalid_issue_transitions_preserve_winner -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
 | B-012 | manifest scope and workspace compatibility | `git diff --name-only origin/main...HEAD`; `cargo check -p harness-workflow --all-targets` |
 
 ## Alternatives Considered
@@ -174,10 +179,20 @@ No external calls or new persistence records are introduced.
 - [ ] Add full-snapshot immutability assertions for each rejection class.
 - [ ] Add positive and negative identity tests for repeated PR detection,
       feedback task binding, placeholder reclaim, and merge-start repetition.
+- [ ] Add field-diff assertions for every accepted metadata-effect policy,
+      including audit-only terminal repetition and preservation of unlisted
+      fields.
 - [ ] Retain and update existing merge approval and feedback recovery tests.
-- [ ] With an isolated `HARNESS_DATABASE_URL`, prove store rejection performs
+- [ ] Add a required-DB test helper for the two new persistence tests. It reads
+      `HARNESS_DATABASE_URL`, validates an isolated test database through the
+      existing database-safety helpers, calls
+      `IssueWorkflowStore::open_with_database_url`, and errors rather than
+      returning `Ok(None)` when configuration/open fails. Keep the existing
+      optional helper only for legacy tests.
+- [ ] With an isolated `HARNESS_DATABASE_URL`, run the two named ignored tests
+      with `--ignored --exact`; their output must prove store rejection performs
       no persisted update and a valid/invalid race preserves the serialized
-      winner.
+      winner. A run without executed database assertions is not evidence.
 - [ ] Run `cargo test -p harness-workflow issue_lifecycle --lib`.
 - [ ] Run `cargo test -p harness-workflow issue_workflow_store --lib`.
 - [ ] Run `cargo check -p harness-workflow --all-targets`.

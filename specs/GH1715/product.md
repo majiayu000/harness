@@ -75,30 +75,35 @@ request processing depends on.
 
 ## Transition Contract
 
-`same` means the event is accepted without changing the lifecycle state.
-Identity conditions in B-005 and B-006 still apply.
+`same` means the event is accepted without changing the lifecycle state. Every
+accepted event may replace `last_event`, advance `updated_at`, and replace
+`last_remote_fact_hash` only when the event supplies a hash. Only the
+event-specific fields named below may otherwise change; unlisted fields are
+preserved. A compatible optional binding may fill an empty stored field, but a
+different non-empty PR, task, or merge-attempt identity is illegal unless the
+row explicitly authorizes a new stage binding.
 
-| Event | Valid source state(s) | Result |
-| --- | --- | --- |
-| `DependenciesDetected` | `Discovered`, `AwaitingDependencies` | `AwaitingDependencies` |
-| `IssueScheduled` | `Discovered`, `AwaitingDependencies`, `Scheduled` | `Scheduled` |
-| `ImplementStarted` | `Discovered`, `AwaitingDependencies`, `Scheduled`, `Implementing` | `Implementing` |
-| `ImplementStarted` | `AddressingFeedback` | same; retain feedback-stage ownership |
-| `PlanIssueDetected` | `Implementing` | same |
-| `PrDetected` | `Implementing`, `AddressingFeedback`, `PrOpen` | `PrOpen` |
-| `FeedbackSweepCompleted` | `PrOpen`, `AwaitingFeedback` | `AwaitingFeedback` |
-| `FeedbackFound` | `PrOpen`, `AwaitingFeedback`, `FeedbackClaimed` | `FeedbackClaimed` |
-| `FeedbackFound` | placeholder-backed `AddressingFeedback` | `FeedbackClaimed` |
-| `FeedbackTaskScheduled` | `FeedbackClaimed` | `AddressingFeedback` |
-| `FeedbackTaskScheduled` | placeholder-backed or same-task `AddressingFeedback` | same |
-| `NoFeedbackFound` | `FeedbackClaimed`, `AwaitingFeedback` | `AwaitingFeedback` |
-| `Mergeable` | `PrOpen`, `AwaitingFeedback`, `AddressingFeedback`, `ReadyToMerge` | `ReadyToMerge` |
-| `MergeStarted` | `ReadyToMerge`, same-attempt `Merging` | `Merging` |
-| `HumanMergeApproved` | `ReadyToMerge`, `Done` | `Done` |
-| `WorkflowBlocked` | any nonterminal state, `Blocked` | `Blocked` |
-| `WorkflowFailed` | any nonterminal state, `Blocked`, `Failed` | `Failed` |
-| `WorkflowCancelled` | any nonterminal state, `Blocked`, `Cancelled` | `Cancelled` |
-| `WorkflowDone` | any nonterminal state, `Blocked`, `Done` | `Done` |
+| Event | Valid source state(s) | Result | Accepted metadata effect |
+| --- | --- | --- | --- |
+| `DependenciesDetected` | `Discovered`, `AwaitingDependencies` | `AwaitingDependencies` | Clear active task and review fallback. |
+| `IssueScheduled` | `Discovered`, `AwaitingDependencies`, same-task `Scheduled` | `Scheduled` | Bind the scheduling task; clear review fallback. |
+| `ImplementStarted` | `Discovered`, `AwaitingDependencies`, same-task `Scheduled`, same-task `Implementing` | `Implementing` | Bind the implementation task; clear review fallback. |
+| `ImplementStarted` | same-task `AddressingFeedback` | same | Retain feedback-stage state and task; clear review fallback. |
+| `PlanIssueDetected` | same-task `Scheduled`, same-task `Implementing` | `Implementing` | Bind the same task, replace `plan_concern` with the supplied detail, and clear review fallback. |
+| `PrDetected` | same-task `Scheduled`, same-task `Implementing`, same-task `AddressingFeedback`, same-PR/task `PrOpen` | `PrOpen` | Bind the compatible PR number/URL/head and task; clear review fallback. |
+| `FeedbackSweepCompleted` | `PrOpen`, `AwaitingFeedback` | `AwaitingFeedback` | Clear active task, feedback claim, and review fallback. |
+| `FeedbackFound` | `PrOpen`, `AwaitingFeedback`, `FeedbackClaimed` | `FeedbackClaimed` | Clear active task, refresh claim time, and fill only compatible PR fields. |
+| `FeedbackFound` | placeholder-backed `AddressingFeedback` | `FeedbackClaimed` | Reclaim the placeholder, clear active task, refresh claim time, and fill only compatible PR fields. |
+| `FeedbackTaskScheduled` | `PrOpen`, `FeedbackClaimed` | `AddressingFeedback` | Bind the new feedback task, clear claim time and review fallback, and fill only compatible PR fields. |
+| `FeedbackTaskScheduled` | placeholder-backed or same-task `AddressingFeedback` | same | Retain the same task or replace only the placeholder with the real task; clear claim time and review fallback. |
+| `NoFeedbackFound` | `FeedbackClaimed`, `AwaitingFeedback` | `AwaitingFeedback` | Clear active task, feedback claim, and review fallback. |
+| `Mergeable` | `PrOpen`, `AwaitingFeedback`, `AddressingFeedback`, `ReadyToMerge` | `ReadyToMerge` | Clear active task and feedback claim; fill only a missing or matching PR head. |
+| `MergeStarted` | `ReadyToMerge`, same-task/head-attempt `Merging` | `Merging` | Bind the merge task and compatible head attempt; clear feedback claim. |
+| `HumanMergeApproved` | `ReadyToMerge`, `Done` | `Done` | Clear feedback claim; a repeated `Done` event is audit-refresh only. |
+| `WorkflowBlocked` | any nonterminal state | `Blocked` | Clear active task and feedback claim; preserve other bindings. |
+| `WorkflowFailed` | any nonterminal state, `Failed` | `Failed` | Clear feedback claim; a repeated `Failed` event otherwise refreshes audit fields only. |
+| `WorkflowCancelled` | any nonterminal state, `Cancelled` | `Cancelled` | Clear feedback claim; a repeated `Cancelled` event otherwise refreshes audit fields only. |
+| `WorkflowDone` | any nonterminal state, `Done` | `Done` | Clear feedback claim and fill only missing or matching PR fields; a repeated `Done` event cannot replace bindings. |
 
 For this contract, `Blocked` is nonterminal and recoverable. `Done`, `Failed`,
 and `Cancelled` are terminal. All state/event pairs not represented above are
@@ -115,10 +120,13 @@ illegal.
       feedback, readiness, and merge-start events cannot reopen a workflow.
 - [ ] Conditional tests cover matching and conflicting PR/task identities,
       placeholder reclaim, and placeholder-to-real-task binding.
+- [ ] Accepted-event tests prove the metadata effects above, including
+      audit-only terminal repetition and preservation of every unlisted field.
 - [ ] Store tests prove rejected updates roll back without changing the
       persisted row.
 - [ ] Tests retain `Blocked -> Done`, human approval, repeated terminal event,
-      and feedback-claim recovery behavior.
+      feedback-claim recovery, `Scheduled -> PlanIssueDetected`,
+      `Scheduled -> PrDetected`, and `PrOpen -> FeedbackTaskScheduled`.
 - [ ] No lifecycle enum, wire tag, database schema, canonical runtime file, or
       SpecRail workflow file changes.
 
