@@ -115,9 +115,14 @@ Run the dependency assertion as an actual shell pipeline from this fenced
 block; do not copy an escaped table delimiter:
 
 ```sh
-cargo tree -p harness-protocol --edges normal --prefix none > /tmp/harness-protocol-tree.txt
-if rg -q 'harness-(context|rules|skills|gc|exec) ' /tmp/harness-protocol-tree.txt; then
+tree_file="$(mktemp)"
+trap 'rm -f "$tree_file"' EXIT
+cargo tree -p harness-protocol --edges normal --prefix none > "$tree_file" || exit 1
+if rg -q 'harness-(context|rules|skills|gc|exec) ' "$tree_file"; then
   exit 1
+else
+  rg_status=$?
+  test "$rg_status" -eq 1 || exit "$rg_status"
 fi
 ```
 
