@@ -1367,7 +1367,6 @@ version = "0.6.34"
 dependencies = [
  "anyhow",
  "chrono",
- "harness-context",
  "harness-core",
  "serde",
  "serde_json",

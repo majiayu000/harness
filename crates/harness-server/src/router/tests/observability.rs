@@ -1,5 +1,49 @@
 use super::*;
 
+static CONTEXT_RUN_ID_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct ContextRunIdEnvGuard {
+    original_run_id: Option<String>,
+    original_parent: Option<String>,
+}
+
+impl ContextRunIdEnvGuard {
+    fn set(run_id: &str) -> Self {
+        use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
+
+        let original_run_id = std::env::var(AGENT_RUN_ID_ENV).ok();
+        let original_parent = std::env::var(AGENT_RUN_PARENT_ENV).ok();
+        // SAFETY: context tests serialize access with CONTEXT_RUN_ID_ENV_LOCK
+        // and this guard restores both variables on drop.
+        unsafe {
+            std::env::set_var(AGENT_RUN_ID_ENV, run_id);
+            std::env::remove_var(AGENT_RUN_PARENT_ENV);
+        }
+        Self {
+            original_run_id,
+            original_parent,
+        }
+    }
+}
+
+impl Drop for ContextRunIdEnvGuard {
+    fn drop(&mut self) {
+        use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
+
+        // SAFETY: the guard is dropped while CONTEXT_RUN_ID_ENV_LOCK is held.
+        unsafe {
+            match self.original_run_id.take() {
+                Some(value) => std::env::set_var(AGENT_RUN_ID_ENV, value),
+                None => std::env::remove_var(AGENT_RUN_ID_ENV),
+            }
+            match self.original_parent.take() {
+                Some(value) => std::env::set_var(AGENT_RUN_PARENT_ENV, value),
+                None => std::env::remove_var(AGENT_RUN_PARENT_ENV),
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn rule_check_returns_warning_when_no_guards_loaded() -> anyhow::Result<()> {
     let _lock = crate::test_helpers::HOME_LOCK.lock().await;
@@ -609,26 +653,31 @@ async fn skill_delete_removes_skill() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn context_rpc_preview_with_supplied_items_returns_manifest() -> anyhow::Result<()> {
+    use harness_protocol::context::{
+        ContextPreviewDegraded, ContextPreviewItem, ContextPreviewItemClass, ContextPreviewItemId,
+        ContextPreviewPriority, ContextPreviewRequest, ContextPreviewTaskProfile,
+    };
+
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
-    let request = harness_context::ComposeRequest {
+    let request = ContextPreviewRequest {
         thread_id: harness_core::types::ThreadId::from_str("thread-preview"),
         run_id: None,
         project: harness_core::types::ProjectId::from_str("project-preview"),
-        task_profile: harness_context::TaskProfile {
+        task_profile: ContextPreviewTaskProfile {
             prompt: Some("preview supplied context".to_string()),
             ..Default::default()
         },
         budget_hint: 100,
     };
-    let supplied = vec![harness_context::ContextItem {
-        id: harness_context::ItemId::new("rule:supplied"),
-        class: harness_context::ItemClass::Rule,
+    let supplied = vec![ContextPreviewItem {
+        id: ContextPreviewItemId::new("rule:supplied"),
+        class: ContextPreviewItemClass::Rule,
         content: "Follow the supplied rule.".to_string(),
         est_tokens: 0,
-        priority: harness_context::Priority::P1,
+        priority: ContextPreviewPriority::P1,
         relevance: 1.0,
-        degrade: vec![harness_context::Degraded::Pointer(
+        degrade: vec![ContextPreviewDegraded::Pointer(
             "See supplied rule.".to_string(),
         )],
         dedupe_key: None,
@@ -663,6 +712,93 @@ async fn context_rpc_preview_with_supplied_items_returns_manifest() -> anyhow::R
     assert!(manifest_items
         .iter()
         .any(|item| item["id"] == serde_json::json!("rule:supplied")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_preview_uses_current_run_id_when_request_omits_run_id() -> anyhow::Result<()> {
+    use harness_protocol::context::{ContextPreviewRequest, ContextPreviewTaskProfile};
+
+    let _env_lock = CONTEXT_RUN_ID_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let run_id = "ar-01j1qb3c9r7v5m2k8x4tznq6wf";
+    let _env_guard = ContextRunIdEnvGuard::set(run_id);
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(2)),
+        method: Method::ContextPreview {
+            request: ContextPreviewRequest {
+                thread_id: harness_core::types::ThreadId::from_str("thread-run-fallback"),
+                run_id: None,
+                project: harness_core::types::ProjectId::from_str("project-run-fallback"),
+                task_profile: ContextPreviewTaskProfile::default(),
+                budget_hint: 100,
+            },
+            supplied_items: Vec::new(),
+        },
+    };
+
+    let resp = handle_request(&state, req).await.expect("response");
+    assert!(
+        resp.error.is_none(),
+        "context preview should succeed: {:?}",
+        resp.error
+    );
+    let result = resp
+        .result
+        .ok_or_else(|| anyhow::anyhow!("missing result"))?;
+    assert_eq!(result["manifest"]["run_id"], serde_json::json!(run_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_preview_preserves_composer_error_mapping() -> anyhow::Result<()> {
+    use harness_protocol::context::{
+        ContextPreviewItem, ContextPreviewItemClass, ContextPreviewItemId, ContextPreviewPriority,
+        ContextPreviewRequest, ContextPreviewTaskProfile,
+    };
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state(dir.path()).await?;
+    let req = RpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(3)),
+        method: Method::ContextPreview {
+            request: ContextPreviewRequest {
+                thread_id: harness_core::types::ThreadId::from_str("thread-overflow"),
+                run_id: None,
+                project: harness_core::types::ProjectId::from_str("project-overflow"),
+                task_profile: ContextPreviewTaskProfile::default(),
+                budget_hint: 1,
+            },
+            supplied_items: vec![ContextPreviewItem {
+                id: ContextPreviewItemId::new("rule:mandatory-overflow"),
+                class: ContextPreviewItemClass::Rule,
+                content: "mandatory content that cannot fit in the effective budget".repeat(4),
+                est_tokens: 0,
+                priority: ContextPreviewPriority::P0,
+                relevance: 1.0,
+                degrade: Vec::new(),
+                dedupe_key: None,
+                instruction_bearing: true,
+            }],
+        },
+    };
+
+    let resp = handle_request(&state, req).await.expect("response");
+    let error = resp
+        .error
+        .ok_or_else(|| anyhow::anyhow!("expected composer error"))?;
+    assert_eq!(error.code, harness_protocol::methods::INTERNAL_ERROR);
+    assert!(
+        error
+            .message
+            .contains("mandatory context exceeds effective budget"),
+        "unexpected error message: {}",
+        error.message
+    );
+    assert!(resp.result.is_none());
     Ok(())
 }
 
