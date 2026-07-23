@@ -49,14 +49,20 @@ serde-derived DTOs dedicated to `context/preview`:
   `task_profile`, and `budget_hint`.
 - `ContextPreviewTaskProfile` with the current optional strings and defaulted
   `target_paths`.
-- `ContextPreviewItem` with the current item fields and defaults.
+- `ContextPreviewItemId(pub String)`, a protocol-local
+  `#[serde(transparent)]` newtype whose JSON representation is the same string
+  representation as the current composer `ItemId`.
+- `ContextPreviewItem` with the current item fields and defaults, using
+  `ContextPreviewItemId` for `id`.
 - Closed wire enums for item class, priority, and degradation. The degradation
   enum retains the current internally tagged `level`, `content`, snake_case
   representation, including structured `summarized` content and `NapStatus`.
 
-Use existing `harness-core` ID and NAP types where they are already protocol
-dependencies and exactly match the wire contract. Do not use the unrelated
-core agent `ContextItem`.
+Use existing `harness-core` thread, project, run, and NAP types where they are
+already protocol dependencies and exactly match the wire contract. Convert
+`ContextPreviewItemId` explicitly to `harness_context::ItemId` in the server
+handler. Do not move the composer `ItemId` or use the unrelated core agent
+`ContextItem`.
 
 Change `Method::ContextPreview` to hold the protocol DTOs. Keep the field names
 `request` and `supplied_items` and the existing serde default on
@@ -90,8 +96,8 @@ fallback, filtering, sorting, or persistence.
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
 | B-001 | protocol manifest and lockfile | `cargo check -p harness-protocol --all-targets`; `! cargo tree -p harness-protocol --edges normal \| rg -q 'harness-(context\|rules\|skills\|gc\|exec) '` |
-| B-002 | protocol DTO serde definitions and `Method` | `cargo test -p harness-protocol context_preview_wire_json_round_trips --lib` |
-| B-003 | DTO serde defaults | `cargo test -p harness-protocol context_preview_defaults_and_empty_collections_deserialize --lib` |
+| B-002 | protocol DTO serde definitions, item-ID newtype, and `Method` | `cargo test -p harness-protocol context_preview_wire_json_matches_legacy_golden_fixtures --lib` compares literal JSON captured from the current composer-owned types with the new DTO output |
+| B-003 | DTO serde defaults | `cargo test -p harness-protocol context_preview_defaults_and_empty_collections_are_equivalent --lib` proves omitted and explicit-empty vectors deserialize equally and asserts current `None` serialization |
 | B-004 | closed enums and required DTO fields | `cargo test -p harness-protocol context_preview_rejects_malformed_payloads --lib` |
 | B-005 | server conversion functions | `cargo test -p harness-server context_preview_conversion_preserves_every_field --lib` |
 | B-006 | server conversion functions | `cargo test -p harness-server context_preview_conversion_is_deterministic_and_order_preserving --lib` |
@@ -127,7 +133,7 @@ fallback, filtering, sorting, or persistence.
   compatibility is mandatory, return to spec review for the shared-types
   alternative.
 - Data integrity: duplicated wire/domain fields can drift. Exhaustive
-  conversion and full-shape round-trip tests must change whenever either side
+  conversion and legacy golden JSON fixtures must change whenever either side
   adds a field or enum variant.
 - Performance: conversion clones or moves bounded request data once before
   composition. Tests should use owned conversion so no avoidable second clone
@@ -138,9 +144,13 @@ fallback, filtering, sorting, or persistence.
 ## Test Plan
 
 - [ ] Run every command in the Product-to-Test Mapping.
-- [ ] Cover omitted and empty collections independently.
-- [ ] Round-trip every item class, priority, and degradation variant,
-      including every valid `NapStatus`.
+- [ ] Compare new DTO serialization against literal golden JSON captured from
+      the current composer-owned types, including omitted versus explicit-empty
+      inputs, `None` serialization, every item class and priority, `summary`,
+      `pointer`, structured `summarized`, and every valid `NapStatus`
+      representation including `failed { fell_back }`.
+- [ ] Prove omitted and explicit-empty `supplied_items`, `degrade`, and
+      `target_paths` deserialize to equal typed values.
 - [ ] Assert malformed required fields, enum values, and nested summarized
       content fail deserialization before handler execution.
 - [ ] Use a full-field fixture to assert conversion equality field by field

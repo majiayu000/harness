@@ -44,9 +44,10 @@ implementation graph cannot evolve independently.
 2. **B-002:** Every JSON request that is valid under the current
    `context/preview` contract remains valid with identical field names,
    nesting, snake_case enum values, and serialized representation.
-3. **B-003:** Missing optional `run_id` and `dedupe_key`, omitted `degrade` and
-   `supplied_items`, empty lists, and absent optional task-profile fields keep
-   their current distinct meanings and defaults.
+3. **B-003:** Missing optional `run_id` and `dedupe_key` remain absent.
+   Omitted `degrade`, `supplied_items`, and `target_paths` remain equivalent
+   to explicit empty lists, and absent optional task-profile fields retain
+   their current default and serialization behavior.
 4. **B-004:** Missing required fields, unknown enum values, and malformed
    degradation payloads remain explicit request-deserialization failures. The
    boundary must not invent values or continue with a partial request.
@@ -68,7 +69,8 @@ implementation graph cannot evolve independently.
 
 - [ ] B-001 through B-008 have deterministic implementation and verification
       evidence.
-- [ ] Protocol tests cover the full valid wire shape, all defaults, every
+- [ ] Golden protocol fixtures captured from the current composer-owned types
+      prove the full valid wire shape, defaults, `None` serialization, every
       degradation variant, and representative malformed payloads.
 - [ ] Server tests prove exhaustive field preservation and unchanged
       `ContextComposer::compose_supplied` behavior.
@@ -95,7 +97,8 @@ implementation graph cannot evolve independently.
 
 ## Edge Cases
 
-- `supplied_items` omitted versus explicitly empty.
+- `supplied_items`, `degrade`, and `target_paths` omitted versus explicitly
+  empty; each pair must deserialize to the same typed value.
 - A task profile with every optional field absent and `target_paths` omitted.
 - `run_id` and `dedupe_key` omitted independently.
 - Empty content, zero `est_tokens`, zero `budget_hint`, and boundary relevance
