@@ -186,35 +186,27 @@ mod lifecycle_transition_tests {
                 if !pair_allowed(state, kind) {
                     continue;
                 }
+                let policy = metadata_policy(state, kind);
                 let mut workflow = workflow_in(state);
-                workflow.updated_at = Utc::now() - Duration::hours(1);
-                workflow.feedback_claimed_at = Some(Utc::now() - Duration::minutes(1));
-                workflow.review_fallback = Some(fallback(Utc::now() - Duration::minutes(2)));
-                workflow.labels_snapshot = vec!["preserved".into()];
-                workflow.last_remote_fact_hash = Some("old-hash".into());
-                if state == IssueLifecycleState::AddressingFeedback
-                    && kind == IssueLifecycleEventKind::FeedbackFound
-                {
-                    workflow.active_task_id = Some("claim:1".into());
-                }
+                let event = prepare_metadata_fixture(&mut workflow, state, kind, policy);
                 let before = serde_json::to_value(&workflow).unwrap();
                 workflow
-                    .apply_event(matching_event(kind).with_remote_fact_hash("new-hash"))
+                    .apply_event(event.with_remote_fact_hash("new-hash"))
                     .unwrap();
                 let after = serde_json::to_value(&workflow).unwrap();
                 let changed = changed_fields(&before, &after);
-                let allowed = allowed_mutated_fields(kind);
+                let allowed = allowed_mutated_fields(policy);
                 assert!(
                     changed.is_subset(&allowed),
-                    "{state:?}/{kind:?} changed undeclared fields: {:?}",
+                    "{state:?}/{kind:?}/{policy:?} changed undeclared fields: {:?}",
                     changed.difference(&allowed).collect::<Vec<_>>()
                 );
-                for required in ["last_event", "updated_at", "last_remote_fact_hash"] {
-                    assert!(changed.contains(required), "{state:?}/{kind:?}: {required}");
-                }
-                if expected_target(state, kind) != state {
-                    assert!(changed.contains("state"), "{state:?}/{kind:?}: state");
-                }
+                let required = required_mutated_fields(state, policy);
+                assert!(
+                    required.is_subset(&changed),
+                    "{state:?}/{kind:?}/{policy:?} missed required mutations: {:?}",
+                    required.difference(&changed).collect::<Vec<_>>()
+                );
             }
         }
     }
@@ -250,6 +242,14 @@ mod lifecycle_transition_tests {
         assert_binding_conflict_preserves(
             &mut merging,
             matching_event(IssueLifecycleEventKind::MergeStarted).with_pr_head_sha("other-head"),
+        );
+
+        let mut feedback = workflow_in(IssueLifecycleState::AddressingFeedback);
+        feedback.active_task_id = Some("feedback-task-a".into());
+        assert_binding_conflict_preserves(
+            &mut feedback,
+            matching_event(IssueLifecycleEventKind::FeedbackTaskScheduled)
+                .with_task_id("feedback-task-b"),
         );
     }
 
@@ -343,30 +343,146 @@ mod lifecycle_transition_tests {
             .collect()
     }
 
-    fn allowed_mutated_fields(kind: IssueLifecycleEventKind) -> BTreeSet<String> {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MetadataPolicy {
+        DependenciesDetected,
+        IssueScheduled,
+        ImplementStarted,
+        PlanIssueDetected,
+        PrDetected,
+        FeedbackSweepCompleted,
+        FeedbackFound,
+        FeedbackTaskScheduled,
+        NoFeedbackFound,
+        Mergeable,
+        MergeStarted,
+        HumanMergeApproved,
+        WorkflowBlocked,
+        WorkflowFailed,
+        WorkflowCancelled,
+        WorkflowDone,
+        AuditOnly,
+    }
+
+    fn metadata_policy(
+        source: IssueLifecycleState,
+        kind: IssueLifecycleEventKind,
+    ) -> MetadataPolicy {
         use IssueLifecycleEventKind as E;
+        use IssueLifecycleState as S;
+        use MetadataPolicy as P;
+        match (source, kind) {
+            (S::Done, E::HumanMergeApproved)
+            | (S::Failed, E::WorkflowFailed)
+            | (S::Cancelled, E::WorkflowCancelled) => P::AuditOnly,
+            (_, E::DependenciesDetected) => P::DependenciesDetected,
+            (_, E::IssueScheduled) => P::IssueScheduled,
+            (_, E::ImplementStarted) => P::ImplementStarted,
+            (_, E::PlanIssueDetected) => P::PlanIssueDetected,
+            (_, E::PrDetected) => P::PrDetected,
+            (_, E::FeedbackSweepCompleted) => P::FeedbackSweepCompleted,
+            (_, E::FeedbackFound) => P::FeedbackFound,
+            (_, E::FeedbackTaskScheduled) => P::FeedbackTaskScheduled,
+            (_, E::NoFeedbackFound) => P::NoFeedbackFound,
+            (_, E::Mergeable) => P::Mergeable,
+            (_, E::MergeStarted) => P::MergeStarted,
+            (_, E::HumanMergeApproved) => P::HumanMergeApproved,
+            (_, E::WorkflowBlocked) => P::WorkflowBlocked,
+            (_, E::WorkflowFailed) => P::WorkflowFailed,
+            (_, E::WorkflowCancelled) => P::WorkflowCancelled,
+            (_, E::WorkflowDone) => P::WorkflowDone,
+        }
+    }
+
+    fn prepare_metadata_fixture(
+        workflow: &mut IssueWorkflowInstance,
+        source: IssueLifecycleState,
+        kind: IssueLifecycleEventKind,
+        policy: MetadataPolicy,
+    ) -> IssueLifecycleEvent {
+        use IssueLifecycleState as S;
+        use MetadataPolicy as P;
+        workflow.updated_at = Utc::now() - Duration::hours(1);
+        workflow.feedback_claimed_at = Some(Utc::now() - Duration::minutes(1));
+        workflow.review_fallback = Some(fallback(Utc::now() - Duration::minutes(2)));
+        workflow.labels_snapshot = vec!["preserved".into()];
+        workflow.plan_concern = Some("old concern".into());
+        workflow.last_remote_fact_hash = Some("old-hash".into());
+        match policy {
+            P::IssueScheduled | P::ImplementStarted
+                if matches!(source, S::Discovered | S::AwaitingDependencies) =>
+            {
+                workflow.active_task_id = None;
+            }
+            P::PrDetected => {
+                workflow.pr_number = None;
+                workflow.pr_url = None;
+                workflow.pr_head_sha = None;
+                if source == S::Discovered {
+                    workflow.active_task_id = None;
+                }
+            }
+            P::FeedbackFound => {
+                workflow.pr_number = None;
+                workflow.pr_url = None;
+                workflow.pr_head_sha = None;
+                if source == S::AddressingFeedback {
+                    workflow.active_task_id = Some("claim:metadata".into());
+                }
+            }
+            P::FeedbackTaskScheduled => {
+                workflow.pr_number = None;
+                workflow.pr_url = None;
+                workflow.pr_head_sha = None;
+                if source == S::AddressingFeedback {
+                    workflow.active_task_id = Some("claim:metadata".into());
+                }
+            }
+            P::Mergeable => workflow.pr_head_sha = None,
+            P::MergeStarted if source == S::ReadyToMerge => {
+                workflow.active_task_id = None;
+                workflow.pr_head_sha = None;
+                workflow.merge_attempted_head_sha = None;
+            }
+            P::WorkflowDone => {
+                workflow.pr_number = None;
+                workflow.pr_url = None;
+                workflow.pr_head_sha = None;
+            }
+            _ => {}
+        }
+        let event = matching_event(kind);
+        match policy {
+            P::PlanIssueDetected => event.with_detail("new concern"),
+            P::FeedbackTaskScheduled => event.with_task_id("feedback-task"),
+            _ => event,
+        }
+    }
+
+    fn allowed_mutated_fields(policy: MetadataPolicy) -> BTreeSet<String> {
+        use MetadataPolicy as P;
         let mut fields = BTreeSet::from(
             ["state", "last_event", "updated_at", "last_remote_fact_hash"].map(str::to_string),
         );
-        let specific: &[&str] = match kind {
-            E::DependenciesDetected => &["active_task_id", "review_fallback"],
-            E::IssueScheduled | E::ImplementStarted => &["active_task_id", "review_fallback"],
-            E::PlanIssueDetected => &["active_task_id", "plan_concern", "review_fallback"],
-            E::PrDetected => &[
+        let specific: &[&str] = match policy {
+            P::DependenciesDetected => &["active_task_id", "review_fallback"],
+            P::IssueScheduled | P::ImplementStarted => &["active_task_id", "review_fallback"],
+            P::PlanIssueDetected => &["active_task_id", "plan_concern", "review_fallback"],
+            P::PrDetected => &[
                 "active_task_id",
                 "pr_number",
                 "pr_url",
                 "pr_head_sha",
                 "review_fallback",
             ],
-            E::FeedbackFound => &[
+            P::FeedbackFound => &[
                 "active_task_id",
                 "feedback_claimed_at",
                 "pr_number",
                 "pr_url",
                 "pr_head_sha",
             ],
-            E::FeedbackTaskScheduled => &[
+            P::FeedbackTaskScheduled => &[
                 "active_task_id",
                 "feedback_claimed_at",
                 "review_fallback",
@@ -374,23 +490,115 @@ mod lifecycle_transition_tests {
                 "pr_url",
                 "pr_head_sha",
             ],
-            E::FeedbackSweepCompleted | E::NoFeedbackFound => {
+            P::FeedbackSweepCompleted | P::NoFeedbackFound => {
                 &["active_task_id", "feedback_claimed_at", "review_fallback"]
             }
-            E::Mergeable => &["active_task_id", "feedback_claimed_at", "pr_head_sha"],
-            E::MergeStarted => &[
+            P::Mergeable => &["active_task_id", "feedback_claimed_at", "pr_head_sha"],
+            P::MergeStarted => &[
                 "active_task_id",
                 "feedback_claimed_at",
                 "pr_head_sha",
                 "merge_attempted_head_sha",
             ],
-            E::HumanMergeApproved => &["feedback_claimed_at"],
-            E::WorkflowBlocked => &["active_task_id", "feedback_claimed_at"],
-            E::WorkflowFailed | E::WorkflowCancelled => &["feedback_claimed_at"],
-            E::WorkflowDone => &["feedback_claimed_at", "pr_number", "pr_url", "pr_head_sha"],
+            P::HumanMergeApproved => &["feedback_claimed_at"],
+            P::WorkflowBlocked => &["active_task_id", "feedback_claimed_at"],
+            P::WorkflowFailed | P::WorkflowCancelled => &["feedback_claimed_at"],
+            P::WorkflowDone => &["feedback_claimed_at", "pr_number", "pr_url", "pr_head_sha"],
+            P::AuditOnly => &[],
         };
         fields.extend(specific.iter().map(|field| (*field).to_string()));
         fields
+    }
+
+    fn required_mutated_fields(
+        source: IssueLifecycleState,
+        policy: MetadataPolicy,
+    ) -> BTreeSet<String> {
+        use IssueLifecycleState as S;
+        use MetadataPolicy as P;
+        let mut fields = BTreeSet::from(
+            ["last_event", "updated_at", "last_remote_fact_hash"].map(str::to_string),
+        );
+        if expected_target_for_policy(source, policy) != source {
+            fields.insert("state".into());
+        }
+        let specific: &[&str] = match policy {
+            P::DependenciesDetected => &["active_task_id", "review_fallback"],
+            P::IssueScheduled | P::ImplementStarted
+                if matches!(source, S::Discovered | S::AwaitingDependencies) =>
+            {
+                &["active_task_id", "review_fallback"]
+            }
+            P::IssueScheduled | P::ImplementStarted => &["review_fallback"],
+            P::PlanIssueDetected => &["plan_concern", "review_fallback"],
+            P::PrDetected if source == S::PrOpen => &["review_fallback"],
+            P::PrDetected if source == S::Discovered => &[
+                "active_task_id",
+                "pr_number",
+                "pr_url",
+                "pr_head_sha",
+                "review_fallback",
+            ],
+            P::PrDetected => &["pr_number", "pr_url", "pr_head_sha", "review_fallback"],
+            P::FeedbackFound => &[
+                "active_task_id",
+                "feedback_claimed_at",
+                "pr_number",
+                "pr_url",
+                "pr_head_sha",
+            ],
+            P::FeedbackTaskScheduled => &[
+                "active_task_id",
+                "feedback_claimed_at",
+                "review_fallback",
+                "pr_number",
+                "pr_url",
+                "pr_head_sha",
+            ],
+            P::FeedbackSweepCompleted | P::NoFeedbackFound => {
+                &["active_task_id", "feedback_claimed_at", "review_fallback"]
+            }
+            P::Mergeable => &["active_task_id", "feedback_claimed_at", "pr_head_sha"],
+            P::MergeStarted if source == S::Merging => &["feedback_claimed_at"],
+            P::MergeStarted => &[
+                "active_task_id",
+                "feedback_claimed_at",
+                "pr_head_sha",
+                "merge_attempted_head_sha",
+            ],
+            P::HumanMergeApproved => &["feedback_claimed_at"],
+            P::WorkflowBlocked => &["active_task_id", "feedback_claimed_at"],
+            P::WorkflowFailed | P::WorkflowCancelled => &["feedback_claimed_at"],
+            P::WorkflowDone => &["feedback_claimed_at", "pr_number", "pr_url", "pr_head_sha"],
+            P::AuditOnly => &[],
+        };
+        fields.extend(specific.iter().map(|field| (*field).to_string()));
+        fields
+    }
+
+    fn expected_target_for_policy(
+        source: IssueLifecycleState,
+        policy: MetadataPolicy,
+    ) -> IssueLifecycleState {
+        use IssueLifecycleState as S;
+        use MetadataPolicy as P;
+        match policy {
+            P::DependenciesDetected => S::AwaitingDependencies,
+            P::IssueScheduled => S::Scheduled,
+            P::ImplementStarted if source == S::AddressingFeedback => S::AddressingFeedback,
+            P::ImplementStarted | P::PlanIssueDetected => S::Implementing,
+            P::PrDetected => S::PrOpen,
+            P::FeedbackTaskScheduled => S::AddressingFeedback,
+            P::FeedbackSweepCompleted | P::NoFeedbackFound => S::AwaitingFeedback,
+            P::FeedbackFound => S::FeedbackClaimed,
+            P::Mergeable => S::ReadyToMerge,
+            P::MergeStarted => S::Merging,
+            P::HumanMergeApproved | P::WorkflowDone => S::Done,
+            P::WorkflowBlocked => S::Blocked,
+            P::WorkflowFailed => S::Failed,
+            P::WorkflowCancelled => S::Cancelled,
+            P::AuditOnly => source,
+        }
     }
 
     fn all_states() -> [IssueLifecycleState; 14] {
