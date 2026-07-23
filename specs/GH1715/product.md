@@ -64,6 +64,8 @@ request processing depends on.
 9. **B-009:** Rejection is never reported as success or downgraded to an
    ignored event inside the lifecycle/store boundary. Existing outer callers
    may log or map the returned error according to their own contract.
+   Repeating merge approval from `Done` is an accepted idempotent event;
+   merge approval from every other non-`ReadyToMerge` state is an error.
 10. **B-010:** Existing serialized workflow rows remain readable without a
     migration, and valid existing paths retain their current wire states and
     metadata effects.

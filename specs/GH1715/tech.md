@@ -98,9 +98,12 @@ remains unchanged.
 
 - Keep every enum variant, serde tag, event payload, workflow schema version,
   and SQL migration unchanged.
-- Preserve the existing `IssueMergeApprovalOutcome` API. Its explicit
-  wrong-state outcome remains the route-level contract; the lifecycle error is
-  the lower-level fail-closed boundary.
+- Preserve the existing `IssueMergeApprovalOutcome` type and variants for
+  source compatibility, but align `record_merge_approved` with the lifecycle
+  boundary: `ReadyToMerge` and the idempotent `Done` repetition return
+  `Applied`; every other existing state returns the typed transition error.
+  The legacy `IgnoredWrongState` variant remains defined but is no longer
+  produced for an illegal lifecycle event.
 - Do not change canonical workflow runtime reducers, validators, persistence,
   or state definitions.
 - Do not change SpecRail `states.yaml` or interpret its process states as
@@ -128,13 +131,13 @@ No external calls or new persistence records are introduced.
 | --- | --- | --- |
 | B-001 | centralized transition decision in `issue_lifecycle.rs` | `cargo test -p harness-workflow issue_lifecycle_transition_matrix --lib` evaluates all 224 pairs |
 | B-002 | pre-mutation validation and transition error | `cargo test -p harness-workflow illegal_issue_lifecycle_transition_preserves_complete_snapshot --lib` |
-| B-003 | terminal-state rows in the transition matrix | `cargo test -p harness-workflow terminal_issue_lifecycle_states_cannot_reopen --lib` |
+| B-003 | terminal-state rows and idempotent merge approval | `cargo test -p harness-workflow terminal_issue_lifecycle_states_cannot_reopen --lib`; `cargo test -p harness-workflow repeated_merge_approval_from_done_is_applied_idempotently --lib` |
 | B-004 | transition matrix and closed metadata-effect policies | `cargo test -p harness-workflow issue_lifecycle_transition_matrix --lib`; `cargo test -p harness-workflow accepted_issue_lifecycle_events_mutate_only_declared_fields --lib` |
 | B-005 | PR/task/merge identity guards | `cargo test -p harness-workflow repeated_issue_lifecycle_bindings_require_matching_identity --lib` |
 | B-006 | placeholder conditional transitions | `cargo test -p harness-workflow feedback_claim_placeholder_transitions_remain_recoverable --lib` |
 | B-007 | blocked terminal recovery rows | `cargo test -p harness-workflow blocked_issue_lifecycle_can_converge_to_terminal_state --lib` |
 | B-008 | fallible store callbacks and transaction order | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::rejected_issue_lifecycle_store_update_rolls_back -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
-| B-009 | typed error propagation from store methods | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib` |
+| B-009 | typed error propagation from store methods and merge approval | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib`; `cargo test -p harness-workflow merge_approval_wrong_state_returns_transition_error --lib` |
 | B-010 | serde and existing valid store behavior | `cargo test -p harness-workflow issue_lifecycle --lib`; `cargo test -p harness-workflow issue_workflow_store --lib` |
 | B-011 | row-lock race coverage | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::concurrent_valid_and_invalid_issue_transitions_preserve_winner -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
 | B-012 | manifest scope and workspace compatibility | `git diff --name-only origin/main...HEAD`; `cargo check -p harness-workflow --all-targets` |
@@ -183,6 +186,10 @@ No external calls or new persistence records are introduced.
       including audit-only terminal repetition and preservation of unlisted
       fields.
 - [ ] Retain and update existing merge approval and feedback recovery tests.
+- [ ] Prove repeated merge approval from `Done` returns `Applied` with only the
+      declared audit refresh, while merge approval from every other illegal
+      source state returns the typed transition error and never
+      `IgnoredWrongState`.
 - [ ] Add a required-DB test helper for the two new persistence tests. It reads
       `HARNESS_DATABASE_URL`, validates an isolated test database through the
       existing database-safety helpers, calls
