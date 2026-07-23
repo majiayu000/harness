@@ -9,7 +9,7 @@ GH-1715
 See `specs/GH1715/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1715,"complete":true,"paths":["crates/harness-workflow/src/issue_lifecycle.rs","crates/harness-workflow/src/issue_workflow_store.rs","crates/harness-workflow/src/issue_workflow_store/maintenance.rs","crates/harness-workflow/src/issue_workflow_store/merge_approval.rs","crates/harness-workflow/src/issue_workflow_store/remote_facts.rs","crates/harness-workflow/src/issue_workflow_store_tests.rs","crates/harness-server/src/task_executor/review_loop/flow.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012"]}
+{"issue":1715,"complete":true,"paths":["crates/harness-workflow/src/issue_lifecycle.rs","crates/harness-workflow/src/issue_workflow_store.rs","crates/harness-workflow/src/issue_workflow_store/maintenance.rs","crates/harness-workflow/src/issue_workflow_store/merge_approval.rs","crates/harness-workflow/src/issue_workflow_store/remote_facts.rs","crates/harness-workflow/src/issue_workflow_store_tests.rs","crates/harness-server/src/task_executor/review_loop/flow.rs","crates/harness-server/src/task_executor/review_loop_wait_budget_tests.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012"]}
 -->
 
 ## Current System
@@ -112,10 +112,18 @@ Update all event-producing closures in the manifest to return the result from
 call sites such as feedback claiming, maintenance failure marking, and merge
 approval use `?`.
 
-Propagate the Tier-C `record_ready_to_merge_with_fallback` error from
-`task_executor/review_loop/flow.rs` instead of assigning it to `_`. The review
-loop must not report completion or continue to runtime feedback after the
-legacy state update was rejected.
+Move the Tier-C `record_ready_to_merge_with_fallback` call before the task
+completion mutation in `task_executor/review_loop/flow.rs`, and propagate its
+error instead of assigning it to `_`. Only after that lifecycle write succeeds
+may the review loop persist `TaskStatus::Done` and the `ready_to_merge` round,
+record runtime ready-to-merge feedback, append the completion event, and return
+success. A lifecycle rejection therefore leaves all completion-shaped task and
+runtime evidence absent.
+
+The lifecycle and task stores do not share a transaction. This ordering makes
+the fail-closed direction explicit: a lifecycle rejection cannot report task
+success, while a later task-store failure leaves an idempotently retryable
+`Mergeable` lifecycle result rather than a false task completion.
 
 Because validation finishes before mutation and persistence occurs only after
 the callback succeeds, an illegal event rolls back the transaction and
@@ -159,6 +167,12 @@ receives error`.
 
 No external calls or new persistence records are introduced.
 
+For the Tier-C server path:
+
+`construct fallback snapshot -> validate and persist Mergeable lifecycle update
+-> persist task Done plus ready_to_merge round -> record runtime feedback ->
+append completion event -> return success`.
+
 ## Product-to-Test Mapping
 
 | Behavior invariant | Implementation area | Verification |
@@ -171,7 +185,7 @@ No external calls or new persistence records are introduced.
 | B-006 | placeholder conditional transitions | `cargo test -p harness-workflow feedback_claim_placeholder_transitions_remain_recoverable --lib` |
 | B-007 | blocked terminal recovery rows | `cargo test -p harness-workflow blocked_issue_lifecycle_can_converge_to_terminal_state --lib` |
 | B-008 | fallible store callbacks and transaction order | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::rejected_issue_lifecycle_store_update_rolls_back -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
-| B-009 | typed error propagation, direct callers, batch claiming, merge approval, and Tier-C fallback | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib`; `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::feedback_claim_batch_aborts_on_illegal_transition -- --ignored --exact`; `cargo test -p harness-workflow merge_approval_wrong_state_returns_transition_error --lib`; `cargo check -p harness-server --all-targets`; `python3 -c 'from pathlib import Path; text = Path("crates/harness-server/src/task_executor/review_loop/flow.rs").read_text(); assert "let _ = workflows" not in text'` |
+| B-009 | typed error propagation, direct callers, batch claiming, merge approval, and Tier-C fallback ordering | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib`; `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::feedback_claim_batch_aborts_on_illegal_transition -- --ignored --exact`; `cargo test -p harness-workflow merge_approval_wrong_state_returns_transition_error --lib`; `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-server --lib task_executor::review_loop_wait_budget_tests::tier_c_lifecycle_rejection_records_no_completion_evidence -- --ignored --exact`; `cargo check -p harness-server --all-targets`; `python3 -c 'from pathlib import Path; text = Path("crates/harness-server/src/task_executor/review_loop/flow.rs").read_text(); lifecycle = text.index("record_ready_to_merge_with_fallback"); assert lifecycle < text.index("s.status = TaskStatus::Done", lifecycle)'` |
 | B-010 | serde and existing valid store behavior | `cargo test -p harness-workflow issue_lifecycle --lib`; `cargo test -p harness-workflow issue_workflow_store --lib` |
 | B-011 | row-lock race coverage | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::concurrent_valid_and_invalid_issue_transitions_preserve_winner -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
 | B-012 | manifest scope and workspace compatibility | `git diff --name-only origin/main...HEAD`; `cargo check --workspace --all-targets` |
@@ -236,6 +250,10 @@ No external calls or new persistence records are introduced.
       returned `Result`; do not add lint suppression.
 - [ ] Propagate a Tier-C fallback store error out of the server review loop; do
       not continue to runtime feedback or completion after rejection.
+- [ ] Add a required-DB server behavior test that forces a Tier-C lifecycle
+      rejection and proves the task remains non-`Done`, no `ready_to_merge`
+      round is appended, no runtime ready-to-merge feedback is persisted, and
+      no completion event is logged.
 - [ ] Add a required-DB test helper for the four new persistence tests. It reads
       `HARNESS_DATABASE_URL`, validates an isolated test database through the
       existing database-safety helpers, calls
@@ -255,7 +273,7 @@ No external calls or new persistence records are introduced.
       `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Run
       `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1715`.
-- [ ] Confirm the implementation diff contains only the seven paths in the
+- [ ] Confirm the implementation diff contains only the eight paths in the
       planned-changes manifest.
 
 ## Rollback Plan

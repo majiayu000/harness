@@ -64,9 +64,12 @@ request processing depends on.
 9. **B-009:** Rejection is never reported as success or downgraded to an
    ignored event. Store errors propagate to existing outer callers for logging
    or mapping according to their own contract; the Tier-C review fallback must
-   not discard a failed `record_ready_to_merge_with_fallback` call. Repeating
-   merge approval from `Done` is an accepted idempotent event; merge approval
-   from every other non-`ReadyToMerge` state is an error.
+   not discard a failed `record_ready_to_merge_with_fallback` call or persist
+   task completion first. The lifecycle write must succeed before the server
+   records `TaskStatus::Done`, a `ready_to_merge` round, runtime feedback, or a
+   completion event. Repeating merge approval from `Done` is an accepted
+   idempotent event; merge approval from every other non-`ReadyToMerge` state is
+   an error.
 10. **B-010:** Existing serialized workflow rows remain readable without a
     migration, and valid existing paths retain their current wire states and
     metadata effects.
@@ -127,6 +130,9 @@ illegal.
       audit-only terminal repetition and preservation of every unlisted field.
 - [ ] Store tests prove scheduling metadata and the Tier-C review fallback
       snapshot are applied only after their lifecycle event validates.
+- [ ] A server behavior test proves a rejected Tier-C lifecycle update leaves
+      the task non-`Done`, appends no `ready_to_merge` round, emits no runtime
+      ready-to-merge feedback, and records no completion event.
 - [ ] Store tests prove rejected updates roll back without changing the
       persisted row.
 - [ ] Tests retain `Blocked -> Done`, human approval, repeated terminal event,
