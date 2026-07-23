@@ -62,10 +62,11 @@ request processing depends on.
    Rejection aborts the transaction, persists no partial field changes, and
    returns the error to the caller.
 9. **B-009:** Rejection is never reported as success or downgraded to an
-   ignored event inside the lifecycle/store boundary. Existing outer callers
-   may log or map the returned error according to their own contract.
-   Repeating merge approval from `Done` is an accepted idempotent event;
-   merge approval from every other non-`ReadyToMerge` state is an error.
+   ignored event. Store errors propagate to existing outer callers for logging
+   or mapping according to their own contract; the Tier-C review fallback must
+   not discard a failed `record_ready_to_merge_with_fallback` call. Repeating
+   merge approval from `Done` is an accepted idempotent event; merge approval
+   from every other non-`ReadyToMerge` state is an error.
 10. **B-010:** Existing serialized workflow rows remain readable without a
     migration, and valid existing paths retain their current wire states and
     metadata effects.
@@ -88,18 +89,18 @@ row explicitly authorizes a new stage binding.
 | Event | Valid source state(s) | Result | Accepted metadata effect |
 | --- | --- | --- | --- |
 | `DependenciesDetected` | `Discovered`, `AwaitingDependencies` | `AwaitingDependencies` | Clear active task and review fallback. |
-| `IssueScheduled` | `Discovered`, `AwaitingDependencies`, same-task `Scheduled` | `Scheduled` | Bind the scheduling task; clear review fallback. |
+| `IssueScheduled` | `Discovered`, `AwaitingDependencies`, same-task `Scheduled` | `Scheduled` | Bind the scheduling task, replace `labels_snapshot` and `force_execute` with the supplied scheduling snapshot, and clear review fallback. |
 | `ImplementStarted` | `Discovered`, `AwaitingDependencies`, same-task `Scheduled`, same-task `Implementing` | `Implementing` | Bind the implementation task; clear review fallback. |
 | `ImplementStarted` | same-task `AddressingFeedback` | same | Retain feedback-stage state and task; clear review fallback. |
 | `PlanIssueDetected` | same-task `Scheduled`, same-task `Implementing` | `Implementing` | Bind the same task, replace `plan_concern` with the supplied detail, and clear review fallback. |
-| `PrDetected` | same-task `Scheduled`, same-task `Implementing`, same-task `AddressingFeedback`, same-PR/task `PrOpen` | `PrOpen` | Bind the compatible PR number/URL/head and task; clear review fallback. |
+| `PrDetected` | `Discovered`, same-task `Scheduled`, same-task `Implementing`, same-task `AddressingFeedback`, same-PR/task `PrOpen` | `PrOpen` | Bind the compatible PR number/URL/head and task; clear review fallback. `Discovered` preserves first-success recovery when PR evidence arrives before an earlier lifecycle write. |
 | `FeedbackSweepCompleted` | `PrOpen`, `AwaitingFeedback` | `AwaitingFeedback` | Clear active task, feedback claim, and review fallback. |
 | `FeedbackFound` | `PrOpen`, `AwaitingFeedback`, `FeedbackClaimed` | `FeedbackClaimed` | Clear active task, refresh claim time, and fill only compatible PR fields. |
 | `FeedbackFound` | placeholder-backed `AddressingFeedback` | `FeedbackClaimed` | Reclaim the placeholder, clear active task, refresh claim time, and fill only compatible PR fields. |
 | `FeedbackTaskScheduled` | `PrOpen`, `FeedbackClaimed` | `AddressingFeedback` | Bind the new feedback task, clear claim time and review fallback, and fill only compatible PR fields. |
 | `FeedbackTaskScheduled` | placeholder-backed or same-task `AddressingFeedback` | same | Retain the same task or replace only the placeholder with the real task; clear claim time and review fallback. |
 | `NoFeedbackFound` | `FeedbackClaimed`, `AwaitingFeedback` | `AwaitingFeedback` | Clear active task, feedback claim, and review fallback. |
-| `Mergeable` | `PrOpen`, `AwaitingFeedback`, `AddressingFeedback`, `ReadyToMerge` | `ReadyToMerge` | Clear active task and feedback claim; fill only a missing or matching PR head. |
+| `Mergeable` | `PrOpen`, `AwaitingFeedback`, `AddressingFeedback`, `ReadyToMerge` | `ReadyToMerge` | Clear active task and feedback claim; fill only a missing or matching PR head; set or preserve the compatible Tier-C `review_fallback` snapshot supplied by the store call. |
 | `MergeStarted` | `ReadyToMerge`, same-task/head-attempt `Merging` | `Merging` | Bind the merge task and compatible head attempt; clear feedback claim. |
 | `HumanMergeApproved` | `ReadyToMerge`, `Done` | `Done` | Clear feedback claim; a repeated `Done` event is audit-refresh only. |
 | `WorkflowBlocked` | any nonterminal state | `Blocked` | Clear active task and feedback claim; preserve other bindings. |
@@ -124,11 +125,14 @@ illegal.
       placeholder reclaim, and placeholder-to-real-task binding.
 - [ ] Accepted-event tests prove the metadata effects above, including
       audit-only terminal repetition and preservation of every unlisted field.
+- [ ] Store tests prove scheduling metadata and the Tier-C review fallback
+      snapshot are applied only after their lifecycle event validates.
 - [ ] Store tests prove rejected updates roll back without changing the
       persisted row.
 - [ ] Tests retain `Blocked -> Done`, human approval, repeated terminal event,
       feedback-claim recovery, `Scheduled -> PlanIssueDetected`,
-      `Scheduled -> PrDetected`, and `PrOpen -> FeedbackTaskScheduled`.
+      first-success `Discovered -> PrDetected`, `Scheduled -> PrDetected`, and
+      `PrOpen -> FeedbackTaskScheduled`.
 - [ ] No lifecycle enum, wire tag, database schema, canonical runtime file, or
       SpecRail workflow file changes.
 
