@@ -183,6 +183,24 @@ pub(crate) async fn run_review_loop(
                 {
                     let fallback = decision.fallback.expect("tier C fallback");
                     let detail = fallback.detail();
+                    if let Some(workflows) = issue_workflow_store {
+                        let project_id = project_root.to_string_lossy().into_owned();
+                        let snapshot = harness_workflow::issue_lifecycle::ReviewFallbackSnapshot {
+                            tier: fallback.tier,
+                            trigger: fallback.trigger,
+                            active_bot: fallback.active_bot.map(|bot| bot.as_str().to_string()),
+                            activated_at: Utc::now(),
+                        };
+                        workflows
+                            .record_ready_to_merge_with_fallback(
+                                &project_id,
+                                req.repo.as_deref(),
+                                pr_num,
+                                Some(&detail),
+                                snapshot,
+                            )
+                            .await?;
+                    }
                     mutate_and_persist(store, task_id, |s| {
                         s.status = TaskStatus::Done;
                         s.turn = round;
@@ -197,24 +215,6 @@ pub(crate) async fn run_review_loop(
                         ));
                     })
                     .await?;
-                    if let Some(workflows) = issue_workflow_store {
-                        let project_id = project_root.to_string_lossy().into_owned();
-                        let snapshot = harness_workflow::issue_lifecycle::ReviewFallbackSnapshot {
-                            tier: fallback.tier,
-                            trigger: fallback.trigger,
-                            active_bot: fallback.active_bot.map(|bot| bot.as_str().to_string()),
-                            activated_at: Utc::now(),
-                        };
-                        let _ = workflows
-                            .record_ready_to_merge_with_fallback(
-                                &project_id,
-                                req.repo.as_deref(),
-                                pr_num,
-                                Some(&detail),
-                                snapshot,
-                            )
-                            .await;
-                    }
                     record_runtime_pr_feedback(
                         issue_workflow_store,
                         workflow_runtime_store,
