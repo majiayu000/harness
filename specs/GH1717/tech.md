@@ -36,6 +36,9 @@ See `specs/GH1717/product.md`.
   `ContextComposer::compose_supplied`.
 - `crates/harness-server/src/router/tests/observability.rs:610-666` verifies
   that a supplied rule reaches the preview manifest.
+- `crates/harness-protocol/src/methods.rs:239-245` stores every successful
+  JSON-RPC response payload in `RpcResponse.result: serde_json::Value`; the
+  protocol crate does not currently expose a typed context-preview response.
 - `crates/harness-core/src/types.rs:596-606` defines a different
   `ContextItem` enum for agent execution; its tagged variants cannot represent
   the composer preview item contract.
@@ -81,6 +84,10 @@ Remove `harness-context` from `harness-protocol/Cargo.toml` and refresh the
 router dispatch, public endpoint documentation, response schema, or
 persistence changes are required.
 
+Do not add response DTOs in this change. The existing JSON response remains
+byte-compatible inside `RpcResponse.result`; protocol-only Rust consumers keep
+their current choice of a local response type or JSON inspection.
+
 ## Data Flow
 
 `JSON-RPC bytes -> RpcRequest/Method deserialization into protocol DTOs ->
@@ -95,14 +102,24 @@ fallback, filtering, sorting, or persistence.
 
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
-| B-001 | protocol manifest and lockfile | `cargo check -p harness-protocol --all-targets`; `! cargo tree -p harness-protocol --edges normal \| rg -q 'harness-(context\|rules\|skills\|gc\|exec) '` |
+| B-001 | protocol manifest and lockfile | `cargo check -p harness-protocol --all-targets` plus the dependency assertion below |
 | B-002 | protocol DTO serde definitions, item-ID newtype, and `Method` | `cargo test -p harness-protocol context_preview_wire_json_matches_legacy_golden_fixtures --lib` compares literal JSON captured from the current composer-owned types with the new DTO output |
 | B-003 | DTO serde defaults | `cargo test -p harness-protocol context_preview_defaults_and_empty_collections_are_equivalent --lib` proves omitted and explicit-empty vectors deserialize equally and asserts current `None` serialization |
 | B-004 | closed enums and required DTO fields | `cargo test -p harness-protocol context_preview_rejects_malformed_payloads --lib` |
 | B-005 | server conversion functions | `cargo test -p harness-server context_preview_conversion_preserves_every_field --lib` |
 | B-006 | server conversion functions | `cargo test -p harness-server context_preview_conversion_is_deterministic_and_order_preserving --lib` |
-| B-007 | existing handler/composer path and router integration | `cargo test -p harness-server context_rpc_preview_with_supplied_items_returns_manifest --lib` |
+| B-007 | existing handler/composer path and router integration | `cargo test -p harness-server context_rpc_preview_with_supplied_items_returns_manifest --lib`; `cargo test -p harness-server context_preview_uses_current_run_id_when_request_omits_run_id --lib`; `cargo test -p harness-server context_preview_preserves_composer_error_mapping --lib` |
 | B-008 | protocol/server tests and dependency evidence | Run all commands above and `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1717` |
+
+Run the dependency assertion as an actual shell pipeline from this fenced
+block; do not copy an escaped table delimiter:
+
+```sh
+cargo tree -p harness-protocol --edges normal --prefix none > /tmp/harness-protocol-tree.txt
+if rg -q 'harness-(context|rules|skills|gc|exec) ' /tmp/harness-protocol-tree.txt; then
+  exit 1
+fi
+```
 
 ## Alternatives Considered
 
@@ -131,7 +148,8 @@ fallback, filtering, sorting, or persistence.
   construction of `Method::ContextPreview` changes from `harness-context`
   types to protocol DTOs. The implementation PR must call this out. If source
   compatibility is mandatory, return to spec review for the shared-types
-  alternative.
+  alternative. This change deliberately leaves responses in the existing
+  untyped `RpcResponse.result`; typed response DTOs require a separate spec.
 - Data integrity: duplicated wire/domain fields can drift. Exhaustive
   conversion and legacy golden JSON fixtures must change whenever either side
   adds a field or enum variant.
@@ -155,6 +173,10 @@ fallback, filtering, sorting, or persistence.
       content fail deserialization before handler execution.
 - [ ] Use a full-field fixture to assert conversion equality field by field
       and preserve supplied-item and degradation-ladder ordering.
+- [ ] Set a current run identity, omit request `run_id`, and assert the
+      existing fallback reaches the preview manifest.
+- [ ] Force the context-composer error path and assert the existing JSON-RPC
+      error code/message mapping remains unchanged.
 - [ ] Run `cargo check -p harness-protocol --all-targets`.
 - [ ] Run `cargo check -p harness-server --all-targets`.
 - [ ] Run `cargo fmt --all -- --check`.

@@ -26,6 +26,9 @@ implementation graph cannot evolve independently.
 
 - Changing context composition, provider selection, budgeting, degradation,
   manifests, endpoint names, or response payloads.
+- Adding protocol-owned response DTOs. `RpcResponse.result` remains
+  `serde_json::Value`; protocol-only Rust consumers continue to deserialize the
+  stable response JSON into their own type or inspect it as JSON.
 - Reusing `harness_core::types::ContextItem`, which models agent execution
   context and has a different shape and meaning.
 - Replacing typed fields with `serde_json::Value`, `Any`, aliases, or silent
