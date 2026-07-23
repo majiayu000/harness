@@ -658,6 +658,7 @@ async fn context_rpc_preview_with_supplied_items_returns_manifest() -> anyhow::R
         ContextPreviewPriority, ContextPreviewRequest, ContextPreviewTaskProfile,
     };
 
+    let _env_lock = CONTEXT_RUN_ID_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
     let request = ContextPreviewRequest {
@@ -759,6 +760,7 @@ async fn context_preview_preserves_composer_error_mapping() -> anyhow::Result<()
         ContextPreviewRequest, ContextPreviewTaskProfile,
     };
 
+    let _env_lock = CONTEXT_RUN_ID_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir()?;
     let state = make_test_state(dir.path()).await?;
     let req = RpcRequest {
