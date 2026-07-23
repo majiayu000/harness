@@ -150,7 +150,7 @@ No external calls or new persistence records are introduced.
 | B-006 | placeholder conditional transitions | `cargo test -p harness-workflow feedback_claim_placeholder_transitions_remain_recoverable --lib` |
 | B-007 | blocked terminal recovery rows | `cargo test -p harness-workflow blocked_issue_lifecycle_can_converge_to_terminal_state --lib` |
 | B-008 | fallible store callbacks and transaction order | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::rejected_issue_lifecycle_store_update_rolls_back -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
-| B-009 | typed error propagation, direct callers, batch claiming, and merge approval | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib`; `cargo test -p harness-workflow feedback_claim_batch_aborts_on_illegal_transition --lib`; `cargo test -p harness-workflow merge_approval_wrong_state_returns_transition_error --lib`; `cargo check -p harness-workflow --all-targets` |
+| B-009 | typed error propagation, direct callers, batch claiming, and merge approval | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib`; `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::feedback_claim_batch_aborts_on_illegal_transition -- --ignored --exact`; `cargo test -p harness-workflow merge_approval_wrong_state_returns_transition_error --lib`; `cargo check -p harness-workflow --all-targets` |
 | B-010 | serde and existing valid store behavior | `cargo test -p harness-workflow issue_lifecycle --lib`; `cargo test -p harness-workflow issue_workflow_store --lib` |
 | B-011 | row-lock race coverage | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::concurrent_valid_and_invalid_issue_transitions_preserve_winner -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
 | B-012 | manifest scope and workspace compatibility | `git diff --name-only origin/main...HEAD`; `cargo check -p harness-workflow --all-targets` |
@@ -208,13 +208,13 @@ No external calls or new persistence records are introduced.
       committed.
 - [ ] Update every direct `apply_event` unit test and caller to handle the
       returned `Result`; do not add lint suppression.
-- [ ] Add a required-DB test helper for the two new persistence tests. It reads
+- [ ] Add a required-DB test helper for the three new persistence tests. It reads
       `HARNESS_DATABASE_URL`, validates an isolated test database through the
       existing database-safety helpers, calls
       `IssueWorkflowStore::open_with_database_url`, and errors rather than
       returning `Ok(None)` when configuration/open fails. Keep the existing
       optional helper only for legacy tests.
-- [ ] With an isolated `HARNESS_DATABASE_URL`, run the two named ignored tests
+- [ ] With an isolated `HARNESS_DATABASE_URL`, run the three named ignored tests
       with `--ignored --exact`; their output must prove store rejection performs
       no persisted update and a valid/invalid race preserves the serialized
       winner. A run without executed database assertions is not evidence.
