@@ -42,6 +42,25 @@ static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
     },
 ];
 
+#[cfg(test)]
+tokio::task_local! {
+    static FEEDBACK_CLAIM_EVENT_OVERRIDE: (String, IssueLifecycleEventKind);
+}
+
+#[cfg(test)]
+async fn with_feedback_claim_event_override<F>(
+    workflow_id: String,
+    event_kind: IssueLifecycleEventKind,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    FEEDBACK_CLAIM_EVENT_OVERRIDE
+        .scope((workflow_id, event_kind), future)
+        .await
+}
+
 mod maintenance;
 mod merge_approval;
 mod remote_facts;
@@ -507,10 +526,20 @@ impl IssueWorkflowStore {
             };
             if let Some(pr_number) = workflow.pr_number {
                 let pr_url = workflow.pr_url.clone().unwrap_or_default();
-                workflow.apply_event(
-                    IssueLifecycleEvent::new(IssueLifecycleEventKind::FeedbackFound)
-                        .with_pr(pr_number, pr_url),
-                )?;
+                #[cfg(test)]
+                let event_kind = FEEDBACK_CLAIM_EVENT_OVERRIDE
+                    .try_with(|(id, kind)| {
+                        if id == &workflow_id {
+                            *kind
+                        } else {
+                            IssueLifecycleEventKind::FeedbackFound
+                        }
+                    })
+                    .unwrap_or(IssueLifecycleEventKind::FeedbackFound);
+                #[cfg(not(test))]
+                let event_kind = IssueLifecycleEventKind::FeedbackFound;
+                workflow
+                    .apply_event(IssueLifecycleEvent::new(event_kind).with_pr(pr_number, pr_url))?;
                 self.upsert_in_tx(&mut tx, &workflow).await?;
                 debug_assert_eq!(workflow.id, workflow_id);
                 claimed.push(workflow);

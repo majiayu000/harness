@@ -1,7 +1,7 @@
-use super::{IssueMergeApprovalOutcome, IssueWorkflowStore};
+use super::{with_feedback_claim_event_override, IssueMergeApprovalOutcome, IssueWorkflowStore};
 use crate::issue_lifecycle::{
-    IssueLifecycleEvent, IssueLifecycleEventKind, IssueLifecycleState, ReviewFallbackSnapshot,
-    ReviewFallbackTier, ReviewFallbackTrigger,
+    IssueLifecycleEventKind, IssueLifecycleState, ReviewFallbackSnapshot, ReviewFallbackTier,
+    ReviewFallbackTrigger,
 };
 use chrono::Utc;
 
@@ -545,12 +545,7 @@ async fn record_ready_to_merge_with_fallback_persists_snapshot() -> anyhow::Resu
             Some("owner/repo"),
             121,
             Some("fallback via silence"),
-            ReviewFallbackSnapshot {
-                tier: ReviewFallbackTier::C,
-                trigger: ReviewFallbackTrigger::Silence,
-                active_bot: Some("codex".to_string()),
-                activated_at,
-            },
+            fallback_snapshot(ReviewFallbackTrigger::Silence, activated_at),
         )
         .await?
         .expect("workflow");
@@ -558,12 +553,10 @@ async fn record_ready_to_merge_with_fallback_persists_snapshot() -> anyhow::Resu
     assert_eq!(workflow.state, IssueLifecycleState::ReadyToMerge);
     assert_eq!(
         workflow.review_fallback,
-        Some(ReviewFallbackSnapshot {
-            tier: ReviewFallbackTier::C,
-            trigger: ReviewFallbackTrigger::Silence,
-            active_bot: Some("codex".to_string()),
-            activated_at,
-        })
+        Some(fallback_snapshot(
+            ReviewFallbackTrigger::Silence,
+            activated_at
+        ))
     );
     assert_eq!(
         workflow.last_event.and_then(|event| event.detail),
@@ -575,12 +568,7 @@ async fn record_ready_to_merge_with_fallback_persists_snapshot() -> anyhow::Resu
             Some("owner/repo"),
             121,
             Some("retry"),
-            ReviewFallbackSnapshot {
-                tier: ReviewFallbackTier::C,
-                trigger: ReviewFallbackTrigger::Silence,
-                active_bot: Some("codex".to_string()),
-                activated_at: Utc::now(),
-            },
+            fallback_snapshot(ReviewFallbackTrigger::Silence, Utc::now()),
         )
         .await?
         .expect("workflow");
@@ -594,16 +582,23 @@ async fn record_ready_to_merge_with_fallback_persists_snapshot() -> anyhow::Resu
             Some("owner/repo"),
             121,
             Some("conflict"),
-            ReviewFallbackSnapshot {
-                tier: ReviewFallbackTier::C,
-                trigger: ReviewFallbackTrigger::GeminiQuota,
-                active_bot: Some("codex".to_string()),
-                activated_at: Utc::now(),
-            },
+            fallback_snapshot(ReviewFallbackTrigger::GeminiQuota, Utc::now()),
         )
         .await
         .expect_err("different fallback identity must fail");
     Ok(())
+}
+
+fn fallback_snapshot(
+    trigger: ReviewFallbackTrigger,
+    activated_at: chrono::DateTime<Utc>,
+) -> ReviewFallbackSnapshot {
+    ReviewFallbackSnapshot {
+        tier: ReviewFallbackTier::C,
+        trigger,
+        active_bot: Some("codex".into()),
+        activated_at,
+    }
 }
 
 async fn required_test_store() -> anyhow::Result<IssueWorkflowStore> {
@@ -672,6 +667,23 @@ async fn issue_workflow_store_metadata_requires_valid_transition() -> anyhow::Re
         .await?
         .expect("workflow");
     assert_eq!(after, before);
+    store
+        .record_ready_to_merge_with_fallback(
+            project,
+            Some("owner/repo"),
+            201,
+            Some("late fallback"),
+            fallback_snapshot(ReviewFallbackTrigger::AllBotsQuota, Utc::now()),
+        )
+        .await
+        .expect_err("fallback metadata must be applied only after transition validation");
+    assert_eq!(
+        store
+            .get_by_issue(project, Some("owner/repo"), 101)
+            .await?
+            .expect("workflow"),
+        before
+    );
     Ok(())
 }
 
@@ -709,38 +721,46 @@ async fn feedback_claim_batch_aborts_on_illegal_transition() -> anyhow::Result<(
     let project = "/tmp/gh1715-batch";
     seed_pr(&store, project, 103, 203).await?;
     seed_pr(&store, project, 104, 204).await?;
-    let first_before = store
+    let legal_before = store
         .get_by_pr(project, Some("owner/repo"), 203)
         .await?
-        .expect("first");
-    let result: anyhow::Result<()> = async {
-        let mut tx = store.pool.begin().await?;
-        let (_, mut first) = store
-            .load_for_update_by_pr(&mut tx, project, Some("owner/repo"), 203)
-            .await?
-            .expect("first");
-        first.apply_event(IssueLifecycleEvent::new(
-            IssueLifecycleEventKind::FeedbackFound,
-        ))?;
-        store.upsert_in_tx(&mut tx, &first).await?;
-        let (_, mut illegal) = store
-            .load_for_update_by_pr(&mut tx, project, Some("owner/repo"), 204)
-            .await?
-            .expect("second");
-        illegal.apply_event(IssueLifecycleEvent::new(
-            IssueLifecycleEventKind::IssueScheduled,
-        ))?;
-        tx.commit().await?;
-        Ok(())
-    }
+        .expect("legal candidate");
+    let illegal_before = store
+        .get_by_pr(project, Some("owner/repo"), 204)
+        .await?
+        .expect("illegal candidate");
+    sqlx::query(
+        "UPDATE issue_workflows
+         SET updated_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+         WHERE id = $1",
+    )
+    .bind(&illegal_before.id)
+    .execute(&store.pool)
+    .await?;
+
+    let result = with_feedback_claim_event_override(
+        illegal_before.id.clone(),
+        IssueLifecycleEventKind::IssueScheduled,
+        store.claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5)),
+    )
     .await;
-    assert!(result.is_err());
+    assert!(result
+        .expect_err("one illegal candidate must abort the real claim batch")
+        .to_string()
+        .contains("transition_not_allowed"));
     assert_eq!(
         store
             .get_by_pr(project, Some("owner/repo"), 203)
             .await?
-            .expect("first"),
-        first_before
+            .expect("legal candidate"),
+        legal_before
+    );
+    assert_eq!(
+        store
+            .get_by_pr(project, Some("owner/repo"), 204)
+            .await?
+            .expect("illegal candidate"),
+        illegal_before
     );
     Ok(())
 }
