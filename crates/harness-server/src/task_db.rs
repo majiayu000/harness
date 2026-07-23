@@ -23,6 +23,70 @@ use std::{error::Error, fmt};
 
 pub const TASK_DB_SCHEMA: &str = "task_db";
 
+#[cfg(test)]
+struct RecoveryWriteInterleaveState {
+    selected: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RecoveryWriteInterleave {
+    task_id: String,
+    state: std::sync::Arc<RecoveryWriteInterleaveState>,
+}
+
+#[cfg(test)]
+fn recovery_write_interleaves() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<RecoveryWriteInterleaveState>>,
+> {
+    static INTERLEAVES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<RecoveryWriteInterleaveState>>,
+        >,
+    > = std::sync::OnceLock::new();
+    INTERLEAVES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+impl RecoveryWriteInterleave {
+    pub(crate) async fn wait_until_selected(&self) {
+        self.state.selected.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for RecoveryWriteInterleave {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut interleaves = recovery_write_interleaves()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if interleaves
+            .get(&self.task_id)
+            .is_some_and(|registered| std::sync::Arc::ptr_eq(registered, &self.state))
+        {
+            interleaves.remove(&self.task_id);
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_recovery_write_for_test(task_id: &str) {
+    let state = recovery_write_interleaves()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(task_id);
+    if let Some(state) = state {
+        state.selected.notify_one();
+        state.release.notified().await;
+    }
+}
+
 pub struct TaskDb {
     pool: PgPool,
     schema: String,
@@ -94,6 +158,26 @@ fn record_task_db_usage() {
 }
 
 impl TaskDb {
+    #[cfg(test)]
+    pub(crate) fn install_recovery_write_interleave_for_test(
+        task_id: impl Into<String>,
+    ) -> RecoveryWriteInterleave {
+        let task_id = task_id.into();
+        let state = std::sync::Arc::new(RecoveryWriteInterleaveState {
+            selected: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let previous = recovery_write_interleaves()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.clone(), state.clone());
+        assert!(
+            previous.is_none(),
+            "recovery interleave already installed for task {task_id}"
+        );
+        RecoveryWriteInterleave { task_id, state }
+    }
+
     /// Open a Postgres-backed task database.
     ///
     /// Each unique `db_path` maps to its own Postgres schema (`h{hash_of_path}`)

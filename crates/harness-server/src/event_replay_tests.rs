@@ -670,8 +670,8 @@ async fn replay_caller_counts_and_logs_only_applied_writes() -> anyhow::Result<(
     );
     let output = captured.output();
     assert!(
-        !output.contains("applied replayed state to 2 task(s)"),
-        "replay aggregate wording must not count the superseded write: {output}"
+        output.contains("event_replay: applied replayed state to 1 task(s)"),
+        "replay aggregate wording must report exactly the one applied task: {output}"
     );
     assert!(
         output.contains("replayed state superseded by authoritative durable state"),

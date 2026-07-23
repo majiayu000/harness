@@ -289,6 +289,8 @@ impl TaskDb {
         scheduler_json: &str,
         expected_version: i32,
     ) -> anyhow::Result<TaskRecoveryWriteOutcome> {
+        #[cfg(test)]
+        super::pause_recovery_write_for_test(task_id).await;
         let resumable = TaskStatus::resumable_statuses();
         let placeholders = Self::numbered_placeholders(7, resumable.len());
         let sql = format!(
@@ -329,6 +331,8 @@ impl TaskDb {
         pr_url: &str,
         expected_version: i32,
     ) -> anyhow::Result<TaskRecoveryWriteOutcome> {
+        #[cfg(test)]
+        super::pause_recovery_write_for_test(task_id).await;
         let rows_affected = sqlx::query(
             "UPDATE tasks SET pr_url = $1, version = version + 1 \
              WHERE store_key = $2 AND id = $3 AND pr_url IS NULL AND version = $4",
@@ -358,6 +362,8 @@ impl TaskDb {
         scheduler_json: &str,
         expected_version: i32,
     ) -> anyhow::Result<TaskRecoveryWriteOutcome> {
+        #[cfg(test)]
+        super::pause_recovery_write_for_test(task_id).await;
         let rows_affected = sqlx::query(
             "UPDATE tasks SET status = 'pending', error = NULL, pr_url = $1, \
              scheduler_state = $2, updated_at = CURRENT_TIMESTAMP, \
@@ -392,6 +398,8 @@ impl TaskDb {
         scheduler_json: &str,
         expected_version: i32,
     ) -> anyhow::Result<TaskRecoveryWriteOutcome> {
+        #[cfg(test)]
+        super::pause_recovery_write_for_test(task_id).await;
         let rows_affected = sqlx::query(
             "UPDATE tasks SET status = 'pending', error = NULL, \
              scheduler_state = $1, updated_at = CURRENT_TIMESTAMP, \
@@ -422,6 +430,8 @@ impl TaskDb {
         scheduler_json: &str,
         expected_version: i32,
     ) -> anyhow::Result<TaskRecoveryWriteOutcome> {
+        #[cfg(test)]
+        super::pause_recovery_write_for_test(task_id).await;
         let rows_affected = sqlx::query(
             "UPDATE tasks SET status = 'failed', error = $1, \
              scheduler_state = $2, updated_at = CURRENT_TIMESTAMP, \
@@ -453,6 +463,8 @@ impl TaskDb {
         scheduler_json: &str,
         expected_version: i32,
     ) -> anyhow::Result<TaskRecoveryWriteOutcome> {
+        #[cfg(test)]
+        super::pause_recovery_write_for_test(task_id).await;
         let rows_affected = sqlx::query(
             "UPDATE tasks SET status = 'failed', error = $1, scheduler_state = $2, \
              updated_at = CURRENT_TIMESTAMP, version = version + 1 \

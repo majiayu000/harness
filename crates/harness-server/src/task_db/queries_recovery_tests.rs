@@ -1,5 +1,5 @@
-use super::queries_recovery::observe_recovery_outcome;
 use super::{TaskDb, TaskRecoveryConflict, TaskRecoveryWriteOutcome};
+use crate::event_replay::{replay_and_recover, TaskEvent, TaskEventLog};
 use crate::task_runner::{TaskSchedulerState, TaskState, TaskStatus};
 use harness_core::types::TaskId;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -289,6 +289,169 @@ async fn assert_applied_target(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DurableRecoveryFields {
+    status: TaskStatus,
+    pr_url: Option<String>,
+    error: Option<String>,
+    scheduler: TaskSchedulerState,
+    version: i32,
+}
+
+impl From<TaskState> for DurableRecoveryFields {
+    fn from(task: TaskState) -> Self {
+        Self {
+            status: task.status,
+            pr_url: task.pr_url,
+            error: task.error,
+            scheduler: task.scheduler,
+            version: task.version,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RealCallerCounters {
+    Replay(u32),
+    Checkpoint {
+        resumed: u32,
+        failed: u32,
+        transient_failed: u32,
+    },
+}
+
+async fn durable_recovery_fields(
+    db: &TaskDb,
+    task_id: &str,
+) -> anyhow::Result<DurableRecoveryFields> {
+    db.get(task_id)
+        .await?
+        .map(DurableRecoveryFields::from)
+        .ok_or_else(|| anyhow::anyhow!("recovery actor task {task_id} disappeared"))
+}
+
+async fn exercise_real_caller_interleave(
+    site: RecoverySite,
+    superseded: bool,
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = Arc::new(TaskDb::open(&dir.path().join("tasks.db")).await?);
+    let outcome_name = if superseded { "superseded" } else { "conflict" };
+    let task_id = format!("real-{outcome_name}-{}", site_name(site));
+    db.insert(&seed_task(site, &task_id)).await?;
+    if matches!(site, RecoverySite::ResumeWithPr) {
+        db.write_checkpoint(&task_id, None, Some("plan"), Some(PR_URL), "pr_created")
+            .await?;
+    }
+
+    let log_path = dir.path().join("task-events.jsonl");
+    if matches!(site, RecoverySite::TerminalReplay | RecoverySite::PrReplay) {
+        let log = TaskEventLog::open(&log_path)?;
+        match site {
+            RecoverySite::TerminalReplay => log.append(&TaskEvent::Completed {
+                task_id: task_id.clone(),
+                ts: 1,
+            }),
+            RecoverySite::PrReplay => log.append(&TaskEvent::PrDetected {
+                task_id: task_id.clone(),
+                ts: 1,
+                pr_url: PR_URL.to_string(),
+            }),
+            _ => unreachable!("only replay sites create events"),
+        }
+    }
+
+    let interleave = TaskDb::install_recovery_write_interleave_for_test(task_id.clone());
+    let captured = CapturedSubscriber::default();
+    let caller = async {
+        let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
+        match site {
+            RecoverySite::TerminalReplay | RecoverySite::PrReplay => {
+                replay_and_recover(&db, &log_path)
+                    .await
+                    .map(RealCallerCounters::Replay)
+            }
+            _ => db
+                .recover_in_progress()
+                .await
+                .map(|result| RealCallerCounters::Checkpoint {
+                    resumed: result.resumed,
+                    failed: result.failed,
+                    transient_failed: result.transient_failed,
+                }),
+        }
+    };
+    let actor = async {
+        interleave.wait_until_selected().await;
+        if superseded {
+            write_equivalent_result(&db, site, &task_id).await?;
+        } else {
+            bump_version(&db, &task_id).await?;
+        }
+        let durable = durable_recovery_fields(&db, &task_id).await?;
+        interleave.release();
+        anyhow::Ok(durable)
+    };
+    let (caller_result, actor_fields) = tokio::join!(caller, actor);
+    let actor_fields = actor_fields?;
+    assert_eq!(
+        durable_recovery_fields(&db, &task_id).await?,
+        actor_fields,
+        "{site:?} {outcome_name} recovery must not rewrite actor-owned durable fields"
+    );
+
+    let output = captured.output();
+    if superseded {
+        let counters = caller_result?;
+        match counters {
+            RealCallerCounters::Replay(updated) => assert_eq!(updated, 0, "{site:?}"),
+            RealCallerCounters::Checkpoint {
+                resumed,
+                failed,
+                transient_failed,
+            } => assert_eq!(
+                (resumed, failed, transient_failed),
+                (0, 0, 0),
+                "{site:?} superseded write must not enter RecoveryResult"
+            ),
+        }
+        let diagnostic = if matches!(site, RecoverySite::TerminalReplay | RecoverySite::PrReplay) {
+            "replayed state superseded by authoritative durable state"
+        } else {
+            "action superseded by authoritative durable state"
+        };
+        assert!(
+            output.contains(diagnostic),
+            "{site:?} must emit bounded superseded evidence: {output}"
+        );
+    } else {
+        let error = caller_result.expect_err("real caller must propagate recovery conflict");
+        assert!(
+            error.downcast_ref::<TaskRecoveryConflict>().is_some(),
+            "{site:?} must preserve typed conflict: {error:#}"
+        );
+    }
+    for success_wording in [
+        "applied replayed state",
+        "wrote back pr_url",
+        "resumed task",
+        "pending mid-transient-retry",
+        "marked interrupted task",
+    ] {
+        assert!(
+            !output.contains(success_wording),
+            "{site:?} {outcome_name} must exclude success wording {success_wording:?}: {output}"
+        );
+    }
+    if !superseded && matches!(site, RecoverySite::TerminalReplay) {
+        assert!(
+            !output.contains("compacted log"),
+            "terminal replay conflict must return before compaction: {output}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn write_outcomes_are_closed_and_exclusive() {
     assert!(TaskRecoveryWriteOutcome::Applied
@@ -565,47 +728,29 @@ async fn recovery_counts_and_success_logs_require_applied_write() -> anyhow::Res
         );
     }
 
-    let captured = CapturedSubscriber::default();
-    let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
-    let mut applied_count = 0;
-    for outcome in [
-        TaskRecoveryWriteOutcome::Applied,
-        TaskRecoveryWriteOutcome::Superseded,
-    ] {
-        if observe_recovery_outcome("task-count", outcome).expect("closed non-conflict outcome") {
-            applied_count += 1;
-        }
+    Ok(())
+}
+
+#[tokio::test]
+async fn all_six_superseded_interleavings_exclude_real_counts_and_logs() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
     }
-    assert_eq!(applied_count, 1);
+    let _guard = crate::test_helpers::acquire_db_state_guard().await;
+    for site in RECOVERY_SITES {
+        exercise_real_caller_interleave(site, true).await?;
+    }
+    Ok(())
+}
 
-    let error = observe_recovery_outcome(
-        "task-count",
-        TaskRecoveryWriteOutcome::Conflict {
-            action: "test recovery",
-            task_id: "task-count".to_string(),
-            expected_version: 4,
-            current_version: Some(5),
-        },
-    )
-    .expect_err("conflict must abort before aggregate success logging");
-    assert!(error.downcast_ref::<TaskRecoveryConflict>().is_some());
-
-    let output = captured.output();
-    assert!(
-        output.contains("action superseded by authoritative durable state"),
-        "superseded outcome should emit bounded non-success evidence: {output}"
-    );
-    for success_wording in [
-        "resumed task",
-        "wrote back pr_url",
-        "applied replayed state",
-        "marked interrupted task",
-        "pending mid-transient-retry",
-    ] {
-        assert!(
-            !output.contains(success_wording),
-            "non-applied outcomes must not emit success wording {success_wording:?}: {output}"
-        );
+#[tokio::test]
+async fn all_six_conflict_interleavings_fail_real_callers_without_rewrite() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+    let _guard = crate::test_helpers::acquire_db_state_guard().await;
+    for site in RECOVERY_SITES {
+        exercise_real_caller_interleave(site, false).await?;
     }
     Ok(())
 }
