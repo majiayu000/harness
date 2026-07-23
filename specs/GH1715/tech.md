@@ -63,13 +63,20 @@ Represent the state/event allowlist in one auditable decision function rather
 than distributed guards. Conditional cases may inspect existing instance
 metadata and the incoming event:
 
-- repeated PR detection requires the existing PR binding to match;
-- repeated feedback scheduling requires the same task or a `claim:`
-  placeholder;
-- placeholder-backed feedback may be reclaimed;
-- repeated merge start requires the same task/head attempt;
+- repeated `IssueScheduled`, `ImplementStarted`, and `PlanIssueDetected`
+  require compatible task identity;
+- repeated `PrDetected`, `FeedbackFound`, `FeedbackTaskScheduled`, and
+  `WorkflowDone` require every supplied existing PR binding to match;
+- feedback scheduling requires the same task or a `claim:` placeholder, and
+  placeholder-backed feedback may be reclaimed;
+- `Mergeable` and repeated `MergeStarted` require compatible PR-head,
+  task, and merge-attempt identities;
 - `ImplementStarted` in `AddressingFeedback` updates execution metadata
   without collapsing the lifecycle to `Implementing`.
+
+Update every direct `apply_event` caller, including unit tests in
+`issue_lifecycle.rs`, to consume the returned `Result` explicitly. No call may
+discard a `#[must_use]` result or suppress `unused_must_use` warnings.
 
 The allowlist implements the exact Transition Contract in `product.md`.
 Its accepted result records both the target state and a closed metadata-effect
@@ -93,6 +100,12 @@ Because validation finishes before mutation and persistence occurs only after
 the callback succeeds, an illegal event rolls back the transaction and
 preserves the prior row. Existing `SELECT ... FOR UPDATE` serialization
 remains unchanged.
+
+`claim_feedback_candidates` intentionally keeps batch-atomic fail-closed
+semantics: one illegal candidate aborts the transaction before any candidate
+is committed. It must not log-and-continue, because that would silently hide a
+corrupt lifecycle row and return partial batch success. The caller may retry
+after the offending row or event ordering is repaired.
 
 ### Compatibility Boundaries
 
@@ -137,7 +150,7 @@ No external calls or new persistence records are introduced.
 | B-006 | placeholder conditional transitions | `cargo test -p harness-workflow feedback_claim_placeholder_transitions_remain_recoverable --lib` |
 | B-007 | blocked terminal recovery rows | `cargo test -p harness-workflow blocked_issue_lifecycle_can_converge_to_terminal_state --lib` |
 | B-008 | fallible store callbacks and transaction order | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::rejected_issue_lifecycle_store_update_rolls_back -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
-| B-009 | typed error propagation from store methods and merge approval | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib`; `cargo test -p harness-workflow merge_approval_wrong_state_returns_transition_error --lib` |
+| B-009 | typed error propagation, direct callers, batch claiming, and merge approval | `cargo test -p harness-workflow issue_workflow_store_reports_illegal_transition --lib`; `cargo test -p harness-workflow feedback_claim_batch_aborts_on_illegal_transition --lib`; `cargo test -p harness-workflow merge_approval_wrong_state_returns_transition_error --lib`; `cargo check -p harness-workflow --all-targets` |
 | B-010 | serde and existing valid store behavior | `cargo test -p harness-workflow issue_lifecycle --lib`; `cargo test -p harness-workflow issue_workflow_store --lib` |
 | B-011 | row-lock race coverage | `HARNESS_DATABASE_URL=<isolated-test-db> cargo test -p harness-workflow --lib issue_workflow_store::tests::concurrent_valid_and_invalid_issue_transitions_preserve_winner -- --ignored --exact` must execute a required-DB fixture rather than the optional helper |
 | B-012 | manifest scope and workspace compatibility | `git diff --name-only origin/main...HEAD`; `cargo check -p harness-workflow --all-targets` |
@@ -190,6 +203,11 @@ No external calls or new persistence records are introduced.
       declared audit refresh, while merge approval from every other illegal
       source state returns the typed transition error and never
       `IgnoredWrongState`.
+- [ ] Prove one illegal feedback-claim candidate rolls back the complete batch
+      with an explicit error; no candidate is silently skipped or partially
+      committed.
+- [ ] Update every direct `apply_event` unit test and caller to handle the
+      returned `Result`; do not add lint suppression.
 - [ ] Add a required-DB test helper for the two new persistence tests. It reads
       `HARNESS_DATABASE_URL`, validates an isolated test database through the
       existing database-safety helpers, calls
