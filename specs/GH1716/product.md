@@ -56,8 +56,9 @@ task can remain unrecovered without an explicit error.
    recovery action, expected version, and current version when available.
 5. **B-005:** Event replay increments its applied-task count only for
    `Applied`. Any unresolved `Conflict` aborts replay before terminal event-log
-   compaction, so unapplied terminal evidence remains available for a later
-   recovery attempt.
+   compaction and propagates through task-store startup before checkpoint
+   recovery runs, so unapplied terminal evidence cannot be bypassed by a
+   success-shaped store open.
 6. **B-006:** Recovery does not blindly retry a `Conflict`. Re-running recovery
    after the competing writer has quiesced is idempotent: an equivalent result
    is `Superseded`, while an eligible unapplied row receives a new CAS attempt
@@ -88,6 +89,9 @@ task can remain unrecovered without an explicit error.
 - [ ] Recovery counters and success logs exclude superseded and conflicting
       writes.
 - [ ] A replay conflict leaves terminal JSONL evidence uncompacted.
+- [ ] A typed replay conflict fails task-store startup before checkpoint
+      recovery; non-conflict replay failures retain their explicitly documented
+      startup policy.
 - [ ] Existing checkpoint, no-checkpoint, PR writeback, terminal replay, and
       transient-retry recovery behavior remains covered.
 - [ ] No schema, workflow runtime, public HTTP API, or authorization behavior

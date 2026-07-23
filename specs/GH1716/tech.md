@@ -9,7 +9,7 @@ GH-1716
 See `specs/GH1716/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1716,"complete":true,"paths":["crates/harness-server/src/event_replay.rs","crates/harness-server/src/event_replay_tests.rs","crates/harness-server/src/task_db.rs","crates/harness-server/src/task_db/queries_recovery.rs","crates/harness-server/src/task_db/queries_recovery_tests.rs","crates/harness-server/tests/checkpoint_recovery.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010"]}
+{"issue":1716,"complete":true,"paths":["crates/harness-server/src/event_replay.rs","crates/harness-server/src/event_replay_tests.rs","crates/harness-server/src/task_db.rs","crates/harness-server/src/task_db/queries_recovery.rs","crates/harness-server/src/task_db/queries_recovery_tests.rs","crates/harness-server/src/task_runner/store/startup.rs","crates/harness-server/tests/checkpoint_recovery.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010"]}
 -->
 
 ## Current System
@@ -57,12 +57,13 @@ See `specs/GH1716/product.md`.
      contains contradictory durable evidence. Failure of the original
      eligibility predicate alone never proves supersession.
 4. Keep classification action-specific. Terminal replay checks resumable
-   status and requires the exact intended terminal state before superseding;
-   a different terminal result conflicts. PR replay requires the same PR URL;
-   a different non-null URL conflicts. Checkpoint resume checks resumable
-   status plus the exact pending/scheduler/PR target, while no-checkpoint and
-   transient recovery classify only explicit newer terminal outcomes as
-   action-obsoleting.
+   status and requires the complete intended durable result before
+   superseding: the exact terminal state plus the same PR URL whenever replay
+   supplies one. A nonmatching terminal state, missing required replay PR, or
+   different PR conflicts. PR-only replay likewise requires the same PR URL.
+   Checkpoint resume checks resumable status plus the exact
+   pending/scheduler/PR target, while no-checkpoint and transient recovery
+   classify only explicit newer terminal outcomes as action-obsoleting.
 5. Do not retry `Conflict` within the same invocation. A blind reload-and-write
    loop could overwrite a live writer and defeat optimistic locking. Return an
    error so a later startup or explicit rerun begins from a fresh snapshot.
@@ -74,7 +75,12 @@ See `specs/GH1716/product.md`.
 7. Return the replay write outcome from `apply_replayed_state`. In
    `replay_and_recover`, increment `updated` only for `Applied`, skip counting
    `Superseded`, and return before `compact_log` on `Conflict`.
-8. Preserve all existing SQL predicates, target states, checkpoint precedence,
+8. Preserve a typed replay-conflict error through `replay_and_recover`.
+   `TaskStore::from_task_db_with_startup_recovery` must propagate that conflict
+   and stop before checkpoint recovery. It may retain the current non-fatal
+   policy for explicitly non-conflict replay/compaction errors, but must not
+   erase the typed conflict through generic logging.
+9. Preserve all existing SQL predicates, target states, checkpoint precedence,
    scheduler-state mutations, and startup ordering. Do not modify workflow
    runtime stores or recovery APIs.
 
@@ -86,9 +92,10 @@ Conflict`.
 
 For `Applied`, recovery updates the matching aggregate and may emit success
 evidence. For `Superseded`, recovery emits non-success diagnostics and moves to
-the next task. For `Conflict`, recovery returns an explicit error. Event replay
+the next task. For `Conflict`, recovery returns a typed error. Event replay
 reaches terminal-log compaction only after every replayed task is either
-applied or proven superseded.
+applied or proven superseded; startup propagates the conflict before entering
+checkpoint recovery.
 
 No external API call, schema write, workflow runtime event, decision, command,
 or artifact is added.
@@ -101,7 +108,7 @@ or artifact is added.
 | B-002 | `task_db/queries_recovery.rs`, `event_replay.rs` | `cargo test -p harness-server --lib task_db::queries_recovery_tests::recovery_counts_and_success_logs_require_applied_write` captures tracing output and counters |
 | B-003 | action-specific fresh-read classifiers | `cargo test -p harness-server --lib task_db::queries_recovery_tests::lost_cas_is_superseded_only_with_authoritative_evidence` |
 | B-004 | conflict outcome and error conversion | `cargo test -p harness-server --lib task_db::queries_recovery_tests::contradictory_or_still_eligible_stale_write_is_conflict` covers a different PR URL and nonmatching terminal result |
-| B-005 | `event_replay.rs`, `event_replay_tests.rs` | `cargo test -p harness-server --lib event_replay::tests::replay_conflict_preserves_terminal_log` |
+| B-005 | `event_replay.rs`, `event_replay_tests.rs`, `task_runner/store/startup.rs` | `cargo test -p harness-server --lib event_replay::tests::replay_conflict_preserves_terminal_log`; `cargo test -p harness-server --lib task_runner::store::startup::tests::replay_conflict_fails_startup_before_checkpoint_recovery` |
 | B-006 | no in-call retry and repeat behavior | `cargo test -p harness-server --lib task_db::queries_recovery_tests::repeated_recovery_converges_without_rewrite` |
 | B-007 | existing SQL/decode propagation plus new classifier | `cargo test -p harness-server --test task_db_rounds`; existing corrupted scheduler-state tests remain green |
 | B-008 | existing recovery policy | `cargo test -p harness-server --test checkpoint_recovery` |
@@ -130,7 +137,8 @@ or artifact is added.
   inspected rather than relying only on shared classifier tests.
 - For replay, create terminal JSONL evidence, force the stale eligible row
   conflict, and assert replay returns an error before compaction; rerun after
-  applying an equivalent terminal result and assert idempotent supersession.
+  applying an equivalent complete terminal result, including the expected PR
+  URL when supplied, and assert idempotent supersession.
 
 ## Alternatives Considered
 
@@ -175,6 +183,9 @@ or artifact is added.
       row; `Superseded` and `Conflict` output must contain no success wording.
 - [ ] Assert an unresolved replay conflict leaves terminal event-log contents
       byte-for-byte unchanged.
+- [ ] Assert the typed replay conflict exits task-store startup before
+      checkpoint recovery, while a separately classified non-conflict
+      compaction failure follows the existing non-fatal policy.
 - [ ] Run `cargo test -p harness-server --lib event_replay`.
 - [ ] Run `cargo test -p harness-server --test checkpoint_recovery`.
 - [ ] Run `cargo test -p harness-server --test task_db_rounds`.
