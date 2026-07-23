@@ -382,6 +382,18 @@ mod tests {
             "instruction_bearing": false
         }))
         .expect("item defaults parse");
+        let explicit_empty_item: ContextPreviewItem = serde_json::from_value(serde_json::json!({
+            "id": "rule:none",
+            "class": "rule",
+            "content": "",
+            "est_tokens": 0,
+            "priority": "p2",
+            "relevance": 0.0,
+            "degrade": [],
+            "instruction_bearing": false
+        }))
+        .expect("explicit empty item parse");
+        assert_eq!(item, explicit_empty_item);
         assert!(item.degrade.is_empty());
         assert_eq!(
             serde_json::to_value(item).expect("serialize item defaults"),
