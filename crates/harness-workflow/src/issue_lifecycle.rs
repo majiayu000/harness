@@ -335,7 +335,8 @@ impl IssueWorkflowInstance {
                 | State::AddressingFeedback
                 | State::PrOpen,
                 Event::PrDetected,
-            ) if compatible(&self.active_task_id, &event.task_id)
+            ) if (!matches!(source, State::PrOpen)
+                || compatible(&self.active_task_id, &event.task_id))
                 && self.pr_bindings_compatible(event) =>
             {
                 TransitionDecision::new(State::PrOpen, Effect::PrDetected)
