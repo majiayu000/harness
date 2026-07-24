@@ -31,10 +31,8 @@ async fn make_trigger_with_challenger(
 ) -> QualityTrigger {
     let events = Arc::new(EventStore::new(dir).await.expect("event store"));
     let gc_config = harness_core::config::misc::GcConfig::default();
-    let signal_detector = SignalDetector::new(
-        gc_config.signal_thresholds.clone(),
-        harness_core::types::ProjectId::new(),
-    );
+    let signal_detector =
+        SignalDetector::new(Default::default(), harness_core::types::ProjectId::new());
     let draft_store = DraftStore::new(dir).expect("draft store");
     let gc_agent = Arc::new(GcAgent::new(
         gc_config,

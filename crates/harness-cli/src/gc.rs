@@ -140,10 +140,7 @@ fn make_agent_for_draft_ops(
     let project_id = project_id_from_root(project_root);
     Ok(GcAgent::new(
         GcConfig::default(),
-        SignalDetector::new(
-            harness_core::config::misc::SignalThresholdsConfig::default(),
-            project_id,
-        ),
+        SignalDetector::new(Default::default(), project_id),
         draft_store,
         project_root.to_path_buf(),
     ))

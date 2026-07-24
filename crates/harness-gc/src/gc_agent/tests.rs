@@ -4,10 +4,7 @@ use harness_core::types::{
 };
 
 fn make_test_gc_agent(dir: &std::path::Path) -> GcAgent {
-    let signal_detector = SignalDetector::new(
-        harness_core::config::misc::SignalThresholdsConfig::default(),
-        ProjectId::new(),
-    );
+    let signal_detector = SignalDetector::new(Default::default(), ProjectId::new());
     let draft_store = DraftStore::new(dir).unwrap();
     GcAgent::new(
         GcConfig::default(),
@@ -86,10 +83,7 @@ fn auto_adopt_matching_rules_only_adopts_rule_drafts_under_prefix() {
     let sandbox = tempfile::tempdir().unwrap();
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
-    let signal_detector = SignalDetector::new(
-        harness_core::config::misc::SignalThresholdsConfig::default(),
-        ProjectId::new(),
-    );
+    let signal_detector = SignalDetector::new(Default::default(), ProjectId::new());
     let draft_store = DraftStore::new(sandbox.path()).unwrap();
     let gc = GcAgent::new(
         GcConfig::default(),
@@ -185,10 +179,7 @@ fn adopt_rejects_parent_dir_traversal() {
     let sandbox = tempfile::tempdir().unwrap();
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
-    let signal_detector = SignalDetector::new(
-        harness_core::config::misc::SignalThresholdsConfig::default(),
-        ProjectId::new(),
-    );
+    let signal_detector = SignalDetector::new(Default::default(), ProjectId::new());
     let draft_store = DraftStore::new(&project_root).unwrap();
     let gc = GcAgent::new(
         GcConfig::default(),
@@ -374,10 +365,7 @@ fn auto_adopt_skips_rejected() {
     let sandbox = tempfile::tempdir().unwrap();
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
-    let signal_detector = SignalDetector::new(
-        harness_core::config::misc::SignalThresholdsConfig::default(),
-        ProjectId::new(),
-    );
+    let signal_detector = SignalDetector::new(Default::default(), ProjectId::new());
     let draft_store = DraftStore::new(sandbox.path()).unwrap();
     let gc = GcAgent::new(
         GcConfig::default(),
