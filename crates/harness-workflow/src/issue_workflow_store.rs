@@ -42,6 +42,25 @@ static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
     },
 ];
 
+#[cfg(test)]
+tokio::task_local! {
+    static FEEDBACK_CLAIM_EVENT_OVERRIDE: (String, IssueLifecycleEventKind);
+}
+
+#[cfg(test)]
+async fn with_feedback_claim_event_override<F>(
+    workflow_id: String,
+    event_kind: IssueLifecycleEventKind,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    FEEDBACK_CLAIM_EVENT_OVERRIDE
+        .scope((workflow_id, event_kind), future)
+        .await
+}
+
 mod maintenance;
 mod merge_approval;
 mod remote_facts;
@@ -221,12 +240,13 @@ impl IssueWorkflowStore {
         force_execute: bool,
     ) -> anyhow::Result<IssueWorkflowInstance> {
         self.update_issue(project_id, repo, issue_number, |workflow| {
-            workflow.labels_snapshot = labels_snapshot.to_vec();
-            workflow.force_execute = force_execute;
             workflow.apply_event(
                 IssueLifecycleEvent::new(IssueLifecycleEventKind::IssueScheduled)
                     .with_task_id(task_id.to_string()),
-            );
+            )?;
+            workflow.labels_snapshot = labels_snapshot.to_vec();
+            workflow.force_execute = force_execute;
+            Ok(())
         })
         .await
     }
@@ -239,10 +259,10 @@ impl IssueWorkflowStore {
         task_id: &str,
     ) -> anyhow::Result<IssueWorkflowInstance> {
         self.update_issue(project_id, repo, issue_number, |workflow| {
-            workflow.apply_event(
+            Ok(workflow.apply_event(
                 IssueLifecycleEvent::new(IssueLifecycleEventKind::ImplementStarted)
                     .with_task_id(task_id.to_string()),
-            );
+            )?)
         })
         .await
     }
@@ -256,11 +276,11 @@ impl IssueWorkflowStore {
         concern: &str,
     ) -> anyhow::Result<IssueWorkflowInstance> {
         self.update_issue(project_id, repo, issue_number, |workflow| {
-            workflow.apply_event(
+            Ok(workflow.apply_event(
                 IssueLifecycleEvent::new(IssueLifecycleEventKind::PlanIssueDetected)
                     .with_task_id(task_id.to_string())
                     .with_detail(concern.to_string()),
-            );
+            )?)
         })
         .await
     }
@@ -275,11 +295,11 @@ impl IssueWorkflowStore {
         pr_url: &str,
     ) -> anyhow::Result<IssueWorkflowInstance> {
         self.update_issue(project_id, repo, issue_number, |workflow| {
-            workflow.apply_event(
+            Ok(workflow.apply_event(
                 IssueLifecycleEvent::new(IssueLifecycleEventKind::PrDetected)
                     .with_task_id(task_id.to_string())
                     .with_pr(pr_number, pr_url.to_string()),
-            );
+            )?)
         })
         .await
     }
@@ -298,7 +318,7 @@ impl IssueWorkflowStore {
             if let Some(pr_url) = workflow.pr_url.clone() {
                 event = event.with_pr(pr_number, pr_url);
             }
-            workflow.apply_event(event);
+            Ok(workflow.apply_event(event)?)
         })
         .await
     }
@@ -333,7 +353,7 @@ impl IssueWorkflowStore {
         if let Some(pr_url) = workflow.pr_url.clone() {
             event = event.with_pr(pr_number, pr_url);
         }
-        workflow.apply_event(event);
+        workflow.apply_event(event)?;
         self.upsert_in_tx(&mut tx, &workflow).await?;
         debug_assert_eq!(workflow.id, wf_id);
         tx.commit().await?;
@@ -358,7 +378,7 @@ impl IssueWorkflowStore {
             if let Some(detail) = detail {
                 event = event.with_detail(detail.to_string());
             }
-            workflow.apply_event(event);
+            Ok(workflow.apply_event(event)?)
         })
         .await
     }
@@ -383,7 +403,7 @@ impl IssueWorkflowStore {
             if let Some(detail) = detail {
                 event = event.with_detail(detail.to_string());
             }
-            workflow.apply_event(event);
+            Ok(workflow.apply_event(event)?)
         })
         .await
     }
@@ -397,12 +417,11 @@ impl IssueWorkflowStore {
         fallback: ReviewFallbackSnapshot,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
         self.update_by_pr(project_id, repo, pr_number, |workflow| {
-            workflow.set_review_fallback(Some(fallback.clone()));
             let mut event = IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable);
             if let Some(detail) = detail {
                 event = event.with_detail(detail.to_string());
             }
-            workflow.apply_event(event);
+            Ok(workflow.apply_event_with_review_fallback(event, fallback.clone())?)
         })
         .await
     }
@@ -419,7 +438,7 @@ impl IssueWorkflowStore {
             if let Some(detail) = detail {
                 event = event.with_detail(detail.to_string());
             }
-            workflow.apply_event(event);
+            Ok(workflow.apply_event(event)?)
         })
         .await
     }
@@ -442,7 +461,7 @@ impl IssueWorkflowStore {
             if let Some(detail) = detail {
                 event = event.with_detail(detail.to_string());
             }
-            workflow.apply_event(event);
+            Ok(workflow.apply_event(event)?)
         })
         .await
     }
@@ -507,10 +526,20 @@ impl IssueWorkflowStore {
             };
             if let Some(pr_number) = workflow.pr_number {
                 let pr_url = workflow.pr_url.clone().unwrap_or_default();
-                workflow.apply_event(
-                    IssueLifecycleEvent::new(IssueLifecycleEventKind::FeedbackFound)
-                        .with_pr(pr_number, pr_url),
-                );
+                #[cfg(test)]
+                let event_kind = FEEDBACK_CLAIM_EVENT_OVERRIDE
+                    .try_with(|(id, kind)| {
+                        if id == &workflow_id {
+                            *kind
+                        } else {
+                            IssueLifecycleEventKind::FeedbackFound
+                        }
+                    })
+                    .unwrap_or(IssueLifecycleEventKind::FeedbackFound);
+                #[cfg(not(test))]
+                let event_kind = IssueLifecycleEventKind::FeedbackFound;
+                workflow
+                    .apply_event(IssueLifecycleEvent::new(event_kind).with_pr(pr_number, pr_url))?;
                 self.upsert_in_tx(&mut tx, &workflow).await?;
                 debug_assert_eq!(workflow.id, workflow_id);
                 claimed.push(workflow);
@@ -528,10 +557,10 @@ impl IssueWorkflowStore {
         detail: &str,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
         self.update_by_pr(project_id, repo, pr_number, |workflow| {
-            workflow.apply_event(
+            Ok(workflow.apply_event(
                 IssueLifecycleEvent::new(IssueLifecycleEventKind::NoFeedbackFound)
                     .with_detail(detail.to_string()),
-            );
+            )?)
         })
         .await
     }
@@ -544,7 +573,7 @@ impl IssueWorkflowStore {
         f: F,
     ) -> anyhow::Result<IssueWorkflowInstance>
     where
-        F: FnOnce(&mut IssueWorkflowInstance),
+        F: FnOnce(&mut IssueWorkflowInstance) -> anyhow::Result<()>,
     {
         let wf_id = workflow_id(project_id, repo, issue_number);
         let placeholder = IssueWorkflowInstance::new(
@@ -562,7 +591,7 @@ impl IssueWorkflowStore {
         if workflow.repo.is_none() {
             workflow.repo = repo.map(|r| r.to_string());
         }
-        f(&mut workflow);
+        f(&mut workflow)?;
         self.upsert_in_tx(&mut tx, &workflow).await?;
         tx.commit().await?;
         Ok(workflow)
@@ -576,14 +605,14 @@ impl IssueWorkflowStore {
         f: F,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>>
     where
-        F: FnOnce(&mut IssueWorkflowInstance),
+        F: FnOnce(&mut IssueWorkflowInstance) -> anyhow::Result<()>,
     {
         let mut tx = self.pool.begin().await?;
         let wf_id = workflow_id(project_id, repo, issue_number);
         let Some(mut workflow) = self.load_for_update_by_id(&mut tx, &wf_id).await? else {
             return Ok(None);
         };
-        f(&mut workflow);
+        f(&mut workflow)?;
         self.upsert_in_tx(&mut tx, &workflow).await?;
         tx.commit().await?;
         Ok(Some(workflow))
@@ -597,7 +626,7 @@ impl IssueWorkflowStore {
         f: F,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>>
     where
-        F: FnOnce(&mut IssueWorkflowInstance),
+        F: FnOnce(&mut IssueWorkflowInstance) -> anyhow::Result<()>,
     {
         let mut tx = self.pool.begin().await?;
         let Some((wf_id, mut workflow)) = self
@@ -606,7 +635,7 @@ impl IssueWorkflowStore {
         else {
             return Ok(None);
         };
-        f(&mut workflow);
+        f(&mut workflow)?;
         self.upsert_in_tx(&mut tx, &workflow).await?;
         debug_assert_eq!(workflow.id, wf_id);
         tx.commit().await?;

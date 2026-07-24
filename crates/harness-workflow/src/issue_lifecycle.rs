@@ -29,7 +29,7 @@ pub enum IssueLifecycleState {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueLifecycleEventKind {
     DependenciesDetected,
@@ -49,6 +49,32 @@ pub enum IssueLifecycleEventKind {
     WorkflowFailed,
     WorkflowCancelled,
     WorkflowDone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueLifecycleTransitionErrorReason {
+    TransitionNotAllowed,
+    BindingConflict,
+}
+
+impl std::fmt::Display for IssueLifecycleTransitionErrorReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TransitionNotAllowed => formatter.write_str("transition_not_allowed"),
+            Self::BindingConflict => formatter.write_str("binding_conflict"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "issue lifecycle transition rejected for {workflow_id}: state {source_state:?}, event {event_kind:?}, reason {reason}"
+)]
+pub struct IssueLifecycleTransitionError {
+    pub workflow_id: String,
+    pub source_state: IssueLifecycleState,
+    pub event_kind: IssueLifecycleEventKind,
+    pub reason: IssueLifecycleTransitionErrorReason,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,133 +255,293 @@ impl IssueWorkflowInstance {
         }
     }
 
-    pub fn apply_event(&mut self, event: IssueLifecycleEvent) {
-        match event.kind {
-            IssueLifecycleEventKind::DependenciesDetected => {
-                self.state = IssueLifecycleState::AwaitingDependencies;
+    pub fn apply_event(
+        &mut self,
+        event: IssueLifecycleEvent,
+    ) -> Result<(), IssueLifecycleTransitionError> {
+        let decision = self.transition_decision(&event)?;
+        self.apply_accepted_event(event, decision);
+        Ok(())
+    }
+
+    pub(crate) fn apply_event_with_review_fallback(
+        &mut self,
+        event: IssueLifecycleEvent,
+        fallback: ReviewFallbackSnapshot,
+    ) -> Result<(), IssueLifecycleTransitionError> {
+        let decision = self.transition_decision(&event)?;
+        if event.kind != IssueLifecycleEventKind::Mergeable
+            || self
+                .review_fallback
+                .as_ref()
+                .is_some_and(|stored| !stored.has_same_logical_identity(&fallback))
+        {
+            return Err(self.transition_error(
+                event.kind,
+                IssueLifecycleTransitionErrorReason::BindingConflict,
+            ));
+        }
+        self.apply_accepted_event(event, decision);
+        if self.review_fallback.is_none() {
+            self.review_fallback = Some(fallback);
+        }
+        Ok(())
+    }
+
+    fn transition_decision(
+        &self,
+        event: &IssueLifecycleEvent,
+    ) -> Result<TransitionDecision, IssueLifecycleTransitionError> {
+        use IssueLifecycleEventKind as Event;
+        use IssueLifecycleState as State;
+        use TransitionMetadataEffect as Effect;
+
+        let source = self.state;
+        let decision = match (source, event.kind) {
+            (State::Discovered | State::AwaitingDependencies, Event::DependenciesDetected) => {
+                TransitionDecision::new(State::AwaitingDependencies, Effect::DependenciesDetected)
+            }
+            (
+                State::Discovered | State::AwaitingDependencies | State::Scheduled,
+                Event::IssueScheduled,
+            ) if source != State::Scheduled || compatible(&self.active_task_id, &event.task_id) => {
+                TransitionDecision::new(State::Scheduled, Effect::IssueScheduled)
+            }
+            (
+                State::Discovered
+                | State::AwaitingDependencies
+                | State::Scheduled
+                | State::Implementing,
+                Event::ImplementStarted,
+            ) if !matches!(source, State::Scheduled | State::Implementing)
+                || compatible(&self.active_task_id, &event.task_id) =>
+            {
+                TransitionDecision::new(State::Implementing, Effect::ImplementStarted)
+            }
+            (State::AddressingFeedback, Event::ImplementStarted)
+                if compatible(&self.active_task_id, &event.task_id) =>
+            {
+                TransitionDecision::new(State::AddressingFeedback, Effect::ImplementStarted)
+            }
+            (State::Scheduled | State::Implementing, Event::PlanIssueDetected)
+                if compatible(&self.active_task_id, &event.task_id) =>
+            {
+                TransitionDecision::new(State::Implementing, Effect::PlanIssueDetected)
+            }
+            (
+                State::Discovered
+                | State::Scheduled
+                | State::Implementing
+                | State::AddressingFeedback
+                | State::PrOpen,
+                Event::PrDetected,
+            ) if (!matches!(source, State::PrOpen)
+                || compatible(&self.active_task_id, &event.task_id))
+                && self.pr_bindings_compatible(event) =>
+            {
+                TransitionDecision::new(State::PrOpen, Effect::PrDetected)
+            }
+            (State::PrOpen | State::AwaitingFeedback, Event::FeedbackSweepCompleted) => {
+                TransitionDecision::new(State::AwaitingFeedback, Effect::FeedbackSweepCompleted)
+            }
+            (
+                State::PrOpen | State::AwaitingFeedback | State::FeedbackClaimed,
+                Event::FeedbackFound,
+            ) if self.pr_bindings_compatible(event) => {
+                TransitionDecision::new(State::FeedbackClaimed, Effect::FeedbackFound)
+            }
+            (State::AddressingFeedback, Event::FeedbackFound)
+                if self
+                    .active_task_id
+                    .as_deref()
+                    .is_some_and(is_feedback_claim_placeholder)
+                    && self.pr_bindings_compatible(event) =>
+            {
+                TransitionDecision::new(State::FeedbackClaimed, Effect::FeedbackFound)
+            }
+            (State::PrOpen | State::FeedbackClaimed, Event::FeedbackTaskScheduled)
+                if self.pr_bindings_compatible(event) =>
+            {
+                TransitionDecision::new(State::AddressingFeedback, Effect::FeedbackTaskScheduled)
+            }
+            (State::AddressingFeedback, Event::FeedbackTaskScheduled)
+                if self.feedback_task_compatible(event) && self.pr_bindings_compatible(event) =>
+            {
+                TransitionDecision::new(State::AddressingFeedback, Effect::FeedbackTaskScheduled)
+            }
+            (State::FeedbackClaimed | State::AwaitingFeedback, Event::NoFeedbackFound) => {
+                TransitionDecision::new(State::AwaitingFeedback, Effect::NoFeedbackFound)
+            }
+            (
+                State::PrOpen
+                | State::AwaitingFeedback
+                | State::AddressingFeedback
+                | State::ReadyToMerge,
+                Event::Mergeable,
+            ) if compatible(&self.pr_head_sha, &event.pr_head_sha) => {
+                TransitionDecision::new(State::ReadyToMerge, Effect::Mergeable)
+            }
+            (State::ReadyToMerge | State::Merging, Event::MergeStarted)
+                if compatible(&self.active_task_id, &event.task_id)
+                    && compatible(&self.pr_head_sha, &event.pr_head_sha)
+                    && compatible(&self.merge_attempted_head_sha, &event.pr_head_sha) =>
+            {
+                TransitionDecision::new(State::Merging, Effect::MergeStarted)
+            }
+            (State::ReadyToMerge, Event::HumanMergeApproved) => {
+                TransitionDecision::new(State::Done, Effect::HumanMergeApproved)
+            }
+            (State::Done, Event::HumanMergeApproved) => {
+                TransitionDecision::new(State::Done, Effect::AuditOnly)
+            }
+            (_, Event::WorkflowBlocked) if source.is_nonterminal() => {
+                TransitionDecision::new(State::Blocked, Effect::WorkflowBlocked)
+            }
+            (_, Event::WorkflowFailed) if source.is_nonterminal() => {
+                TransitionDecision::new(State::Failed, Effect::WorkflowFailed)
+            }
+            (State::Failed, Event::WorkflowFailed) => {
+                TransitionDecision::new(State::Failed, Effect::AuditOnly)
+            }
+            (_, Event::WorkflowCancelled) if source.is_nonterminal() => {
+                TransitionDecision::new(State::Cancelled, Effect::WorkflowCancelled)
+            }
+            (State::Cancelled, Event::WorkflowCancelled) => {
+                TransitionDecision::new(State::Cancelled, Effect::AuditOnly)
+            }
+            (_, Event::WorkflowDone)
+                if (source.is_nonterminal() || source == State::Done)
+                    && self.pr_bindings_compatible(event) =>
+            {
+                TransitionDecision::new(State::Done, Effect::WorkflowDone)
+            }
+            _ => {
+                let reason = if self.has_binding_conflict(event) {
+                    IssueLifecycleTransitionErrorReason::BindingConflict
+                } else {
+                    IssueLifecycleTransitionErrorReason::TransitionNotAllowed
+                };
+                return Err(self.transition_error(event.kind, reason));
+            }
+        };
+        Ok(decision)
+    }
+
+    fn apply_accepted_event(&mut self, event: IssueLifecycleEvent, decision: TransitionDecision) {
+        use TransitionMetadataEffect as Effect;
+        self.state = decision.target_state;
+        match decision.metadata_effect {
+            Effect::DependenciesDetected => {
                 self.active_task_id = None;
                 self.review_fallback = None;
             }
-            IssueLifecycleEventKind::IssueScheduled => {
-                self.state = IssueLifecycleState::Scheduled;
-                self.active_task_id = event.task_id.clone();
+            Effect::IssueScheduled | Effect::ImplementStarted => {
+                fill(&mut self.active_task_id, &event.task_id);
                 self.review_fallback = None;
             }
-            IssueLifecycleEventKind::ImplementStarted => {
-                self.state = IssueLifecycleState::Implementing;
-                self.active_task_id = event.task_id.clone();
-                self.review_fallback = None;
-            }
-            IssueLifecycleEventKind::PlanIssueDetected => {
-                self.state = IssueLifecycleState::Implementing;
-                self.active_task_id = event.task_id.clone();
+            Effect::PlanIssueDetected => {
+                fill(&mut self.active_task_id, &event.task_id);
                 self.plan_concern = event.detail.clone();
                 self.review_fallback = None;
             }
-            IssueLifecycleEventKind::PrDetected => {
-                self.state = IssueLifecycleState::PrOpen;
-                self.active_task_id = event.task_id.clone();
-                self.pr_number = event.pr_number;
-                self.pr_url = event.pr_url.clone();
-                if event.pr_head_sha.is_some() {
-                    self.pr_head_sha = event.pr_head_sha.clone();
-                }
+            Effect::PrDetected => {
+                fill(&mut self.active_task_id, &event.task_id);
+                self.fill_pr_bindings(&event);
                 self.review_fallback = None;
             }
-            IssueLifecycleEventKind::FeedbackFound => {
-                self.state = IssueLifecycleState::FeedbackClaimed;
+            Effect::FeedbackFound => {
                 self.active_task_id = None;
                 self.feedback_claimed_at = Some(event.at);
-                if event.pr_number.is_some() {
-                    self.pr_number = event.pr_number;
-                }
-                if event.pr_url.is_some() {
-                    self.pr_url = event.pr_url.clone();
-                }
-                if event.pr_head_sha.is_some() {
-                    self.pr_head_sha = event.pr_head_sha.clone();
-                }
+                self.fill_pr_bindings(&event);
             }
-            IssueLifecycleEventKind::FeedbackTaskScheduled => {
-                self.state = IssueLifecycleState::AddressingFeedback;
-                self.active_task_id = event.task_id.clone();
+            Effect::FeedbackTaskScheduled => {
+                fill(&mut self.active_task_id, &event.task_id);
                 self.feedback_claimed_at = None;
                 self.review_fallback = None;
-                if event.pr_number.is_some() {
-                    self.pr_number = event.pr_number;
-                }
-                if event.pr_url.is_some() {
-                    self.pr_url = event.pr_url.clone();
-                }
+                self.fill_pr_bindings(&event);
             }
-            IssueLifecycleEventKind::FeedbackSweepCompleted
-            | IssueLifecycleEventKind::NoFeedbackFound => {
-                self.state = IssueLifecycleState::AwaitingFeedback;
+            Effect::FeedbackSweepCompleted | Effect::NoFeedbackFound => {
                 self.active_task_id = None;
                 self.feedback_claimed_at = None;
                 self.review_fallback = None;
             }
-            IssueLifecycleEventKind::Mergeable => {
-                self.state = IssueLifecycleState::ReadyToMerge;
-                self.feedback_claimed_at = None;
+            Effect::Mergeable => {
                 self.active_task_id = None;
-                if event.pr_head_sha.is_some() {
-                    self.pr_head_sha = event.pr_head_sha.clone();
-                }
-            }
-            IssueLifecycleEventKind::MergeStarted => {
-                self.state = IssueLifecycleState::Merging;
-                self.active_task_id = event.task_id.clone();
                 self.feedback_claimed_at = None;
-                if event.pr_head_sha.is_some() {
-                    self.pr_head_sha = event.pr_head_sha.clone();
-                    self.merge_attempted_head_sha = event.pr_head_sha.clone();
-                }
+                fill(&mut self.pr_head_sha, &event.pr_head_sha);
             }
-            IssueLifecycleEventKind::HumanMergeApproved => {
-                if self.state != IssueLifecycleState::ReadyToMerge {
-                    tracing::warn!(
-                        workflow_id = %self.id,
-                        state = ?self.state,
-                        "HumanMergeApproved received in unexpected state, ignoring"
-                    );
-                    return;
-                }
-                self.state = IssueLifecycleState::Done;
+            Effect::MergeStarted => {
+                fill(&mut self.active_task_id, &event.task_id);
                 self.feedback_claimed_at = None;
+                fill(&mut self.pr_head_sha, &event.pr_head_sha);
+                fill(&mut self.merge_attempted_head_sha, &event.pr_head_sha);
             }
-            IssueLifecycleEventKind::WorkflowBlocked => {
-                self.state = IssueLifecycleState::Blocked;
+            Effect::HumanMergeApproved => self.feedback_claimed_at = None,
+            Effect::WorkflowBlocked => {
                 self.active_task_id = None;
                 self.feedback_claimed_at = None;
             }
-            IssueLifecycleEventKind::WorkflowFailed => {
-                self.state = IssueLifecycleState::Failed;
+            Effect::WorkflowFailed | Effect::WorkflowCancelled => {
                 self.feedback_claimed_at = None;
             }
-            IssueLifecycleEventKind::WorkflowCancelled => {
-                self.state = IssueLifecycleState::Cancelled;
+            Effect::WorkflowDone => {
                 self.feedback_claimed_at = None;
+                self.fill_pr_bindings(&event);
             }
-            IssueLifecycleEventKind::WorkflowDone => {
-                self.state = IssueLifecycleState::Done;
-                self.feedback_claimed_at = None;
-                if event.pr_number.is_some() {
-                    self.pr_number = event.pr_number;
-                }
-                if event.pr_url.is_some() {
-                    self.pr_url = event.pr_url.clone();
-                }
-                if event.pr_head_sha.is_some() {
-                    self.pr_head_sha = event.pr_head_sha.clone();
-                }
-            }
+            Effect::AuditOnly => {}
         }
         if event.remote_fact_hash.is_some() {
             self.last_remote_fact_hash = event.remote_fact_hash.clone();
         }
         self.last_event = Some(event);
         self.updated_at = Utc::now();
+    }
+
+    fn transition_error(
+        &self,
+        event_kind: IssueLifecycleEventKind,
+        reason: IssueLifecycleTransitionErrorReason,
+    ) -> IssueLifecycleTransitionError {
+        IssueLifecycleTransitionError {
+            workflow_id: self.id.clone(),
+            source_state: self.state,
+            event_kind,
+            reason,
+        }
+    }
+
+    fn pr_bindings_compatible(&self, event: &IssueLifecycleEvent) -> bool {
+        compatible(&self.pr_number, &event.pr_number)
+            && compatible(&self.pr_url, &event.pr_url)
+            && compatible(&self.pr_head_sha, &event.pr_head_sha)
+    }
+
+    fn feedback_task_compatible(&self, event: &IssueLifecycleEvent) -> bool {
+        self.active_task_id
+            .as_deref()
+            .is_some_and(is_feedback_claim_placeholder)
+            || compatible(&self.active_task_id, &event.task_id)
+    }
+
+    fn has_binding_conflict(&self, event: &IssueLifecycleEvent) -> bool {
+        !self.pr_bindings_compatible(event)
+            || matches!(
+                event.kind,
+                IssueLifecycleEventKind::IssueScheduled
+                    | IssueLifecycleEventKind::ImplementStarted
+                    | IssueLifecycleEventKind::PlanIssueDetected
+                    | IssueLifecycleEventKind::PrDetected
+                    | IssueLifecycleEventKind::FeedbackTaskScheduled
+                    | IssueLifecycleEventKind::MergeStarted
+            ) && !compatible(&self.active_task_id, &event.task_id)
+            || event.kind == IssueLifecycleEventKind::MergeStarted
+                && !compatible(&self.merge_attempted_head_sha, &event.pr_head_sha)
+    }
+
+    fn fill_pr_bindings(&mut self, event: &IssueLifecycleEvent) {
+        fill(&mut self.pr_number, &event.pr_number);
+        fill(&mut self.pr_url, &event.pr_url);
+        fill(&mut self.pr_head_sha, &event.pr_head_sha);
     }
 
     pub fn set_review_fallback(&mut self, fallback: Option<ReviewFallbackSnapshot>) {
@@ -386,6 +572,69 @@ impl IssueWorkflowInstance {
         self.merge_policy = merge_policy;
         self.merge_method = merge_method;
         self.updated_at = Utc::now();
+    }
+}
+
+impl IssueLifecycleState {
+    fn is_nonterminal(self) -> bool {
+        !matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+}
+
+impl ReviewFallbackSnapshot {
+    fn has_same_logical_identity(&self, other: &Self) -> bool {
+        self.tier == other.tier
+            && self.trigger == other.trigger
+            && self.active_bot == other.active_bot
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransitionDecision {
+    target_state: IssueLifecycleState,
+    metadata_effect: TransitionMetadataEffect,
+}
+
+impl TransitionDecision {
+    fn new(target_state: IssueLifecycleState, metadata_effect: TransitionMetadataEffect) -> Self {
+        Self {
+            target_state,
+            metadata_effect,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TransitionMetadataEffect {
+    DependenciesDetected,
+    IssueScheduled,
+    ImplementStarted,
+    PlanIssueDetected,
+    PrDetected,
+    FeedbackSweepCompleted,
+    FeedbackFound,
+    FeedbackTaskScheduled,
+    NoFeedbackFound,
+    Mergeable,
+    MergeStarted,
+    HumanMergeApproved,
+    WorkflowBlocked,
+    WorkflowFailed,
+    WorkflowCancelled,
+    WorkflowDone,
+    AuditOnly,
+}
+
+fn compatible<T: PartialEq>(stored: &Option<T>, incoming: &Option<T>) -> bool {
+    match (stored, incoming) {
+        (Some(stored), Some(incoming)) => stored == incoming,
+        _ => true,
+    }
+}
+
+fn fill<T: Clone>(stored: &mut Option<T>, incoming: &Option<T>) {
+    if let Some(incoming) = incoming {
+        *stored = Some(incoming.clone());
     }
 }
 
@@ -421,12 +670,15 @@ mod tests {
     #[test]
     fn human_merge_approved_transitions_ready_to_done() {
         let mut wf = IssueWorkflowInstance::new("/tmp/p", Some("owner/repo".to_string()), 1);
-        wf.apply_event(IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable));
+        wf.state = IssueLifecycleState::PrOpen;
+        wf.apply_event(IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable))
+            .unwrap();
         assert_eq!(wf.state, IssueLifecycleState::ReadyToMerge);
 
         wf.apply_event(IssueLifecycleEvent::new(
             IssueLifecycleEventKind::HumanMergeApproved,
-        ));
+        ))
+        .unwrap();
         assert_eq!(wf.state, IssueLifecycleState::Done);
         assert!(wf.feedback_claimed_at.is_none());
         assert_eq!(
@@ -440,39 +692,41 @@ mod tests {
         let mut wf = IssueWorkflowInstance::new("/tmp/p", Some("owner/repo".to_string()), 2);
         wf.apply_event(
             IssueLifecycleEvent::new(IssueLifecycleEventKind::IssueScheduled).with_task_id("t1"),
-        );
+        )
+        .unwrap();
         assert_eq!(wf.state, IssueLifecycleState::Scheduled);
 
-        let last_event_before = wf.last_event.as_ref().map(|e| e.kind.clone());
+        let before = wf.clone();
         wf.apply_event(IssueLifecycleEvent::new(
             IssueLifecycleEventKind::HumanMergeApproved,
-        ));
-        assert_eq!(wf.state, IssueLifecycleState::Scheduled, "state unchanged");
-        assert_eq!(
-            wf.last_event.as_ref().map(|e| e.kind.clone()),
-            last_event_before,
-            "last_event unchanged on early return"
-        );
+        ))
+        .unwrap_err();
+        assert_eq!(wf, before);
     }
 
     #[test]
     fn human_merge_approved_double_fire_is_safe() {
         let mut wf = IssueWorkflowInstance::new("/tmp/p", Some("owner/repo".to_string()), 3);
-        wf.apply_event(IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable));
+        wf.state = IssueLifecycleState::PrOpen;
+        wf.apply_event(IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable))
+            .unwrap();
         wf.apply_event(IssueLifecycleEvent::new(
             IssueLifecycleEventKind::HumanMergeApproved,
-        ));
+        ))
+        .unwrap();
         assert_eq!(wf.state, IssueLifecycleState::Done);
 
         wf.apply_event(IssueLifecycleEvent::new(
             IssueLifecycleEventKind::HumanMergeApproved,
-        ));
-        assert_eq!(wf.state, IssueLifecycleState::Done, "second call is no-op");
+        ))
+        .unwrap();
+        assert_eq!(wf.state, IssueLifecycleState::Done);
     }
 
     #[test]
     fn mergeable_preserves_existing_review_fallback_snapshot() {
         let mut wf = IssueWorkflowInstance::new("/tmp/p", Some("owner/repo".to_string()), 4);
+        wf.state = IssueLifecycleState::PrOpen;
         let activated_at = Utc::now();
         wf.set_review_fallback(Some(ReviewFallbackSnapshot {
             tier: ReviewFallbackTier::C,
@@ -481,7 +735,8 @@ mod tests {
             activated_at,
         }));
 
-        wf.apply_event(IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable));
+        wf.apply_event(IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable))
+            .unwrap();
 
         assert_eq!(wf.state, IssueLifecycleState::ReadyToMerge);
         assert_eq!(

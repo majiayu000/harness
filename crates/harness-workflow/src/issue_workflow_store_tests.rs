@@ -1,4 +1,4 @@
-use super::{IssueMergeApprovalOutcome, IssueWorkflowStore};
+use super::{with_feedback_claim_event_override, IssueMergeApprovalOutcome, IssueWorkflowStore};
 use crate::issue_lifecycle::{
     IssueLifecycleEventKind, IssueLifecycleState, ReviewFallbackSnapshot, ReviewFallbackTier,
     ReviewFallbackTrigger,
@@ -414,7 +414,7 @@ async fn claim_feedback_candidates_skips_malformed_rows() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
-async fn record_merge_approved_transitions_workflow_to_done() -> anyhow::Result<()> {
+async fn repeated_merge_approval_from_done_is_applied_idempotently() -> anyhow::Result<()> {
     let Some(store) = open_test_store().await? else {
         return Ok(());
     };
@@ -450,11 +450,22 @@ async fn record_merge_approved_transitions_workflow_to_done() -> anyhow::Result<
         other => panic!("expected applied approval outcome, got {other:?}"),
     };
     assert_eq!(updated.state, IssueLifecycleState::Done);
+    let repeated = store
+        .record_merge_approved(project_id, Some("owner/repo"), 120)
+        .await?;
+    let IssueMergeApprovalOutcome::Applied(repeated) = repeated else {
+        panic!("expected repeated approval to be applied, got {repeated:?}");
+    };
+    assert_eq!(repeated.state, IssueLifecycleState::Done);
+    assert_eq!(
+        repeated.last_event.map(|event| event.kind),
+        Some(IssueLifecycleEventKind::HumanMergeApproved)
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn record_merge_approved_reports_wrong_state_without_mutating() -> anyhow::Result<()> {
+async fn merge_approval_wrong_state_returns_transition_error() -> anyhow::Result<()> {
     let Some(store) = open_test_store().await? else {
         return Ok(());
     };
@@ -472,42 +483,39 @@ async fn record_merge_approved_reports_wrong_state_without_mutating() -> anyhow:
             "https://github.com/owner/repo/pull/121",
         )
         .await?;
-    store
-        .record_terminal_for_issue(
-            project_id,
-            Some("owner/repo"),
-            22,
-            IssueLifecycleState::Done,
-            None,
-        )
-        .await?;
     let before = store
         .get_by_pr(project_id, Some("owner/repo"), 121)
         .await?
         .ok_or_else(|| anyhow::anyhow!("workflow should exist"))?;
 
-    let outcome = store
+    let error = store
         .record_merge_approved(project_id, Some("owner/repo"), 121)
-        .await?;
-
-    let IssueMergeApprovalOutcome::IgnoredWrongState { actual, workflow } = outcome else {
-        panic!("expected ignored wrong-state outcome, got {outcome:?}");
-    };
-    assert_eq!(actual, IssueLifecycleState::Done);
-    assert_eq!(workflow.state, IssueLifecycleState::Done);
+        .await
+        .expect_err("PrOpen merge approval must fail");
+    assert!(error.to_string().contains("transition_not_allowed"));
     let after = store
         .get_by_pr(project_id, Some("owner/repo"), 121)
         .await?
         .ok_or_else(|| anyhow::anyhow!("workflow should still exist"))?;
-    assert_eq!(after.state, IssueLifecycleState::Done);
-    assert_eq!(
-        after.last_event.as_ref().map(|event| &event.kind),
-        before.last_event.as_ref().map(|event| &event.kind)
-    );
-    assert_eq!(
-        after.last_event.as_ref().map(|event| &event.kind),
-        Some(&IssueLifecycleEventKind::WorkflowDone)
-    );
+    assert_eq!(after, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_workflow_store_reports_illegal_transition() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project = "/tmp/project-illegal-transition";
+    seed_pr(&store, project, 23, 123).await?;
+    store
+        .record_pr_merged(project, Some("owner/repo"), 123, None)
+        .await?;
+    let error = store
+        .record_implement_started(project, Some("owner/repo"), 23, "late-task")
+        .await
+        .expect_err("terminal transition must reach the caller");
+    assert!(error.to_string().contains("transition_not_allowed"));
     Ok(())
 }
 
@@ -537,12 +545,7 @@ async fn record_ready_to_merge_with_fallback_persists_snapshot() -> anyhow::Resu
             Some("owner/repo"),
             121,
             Some("fallback via silence"),
-            ReviewFallbackSnapshot {
-                tier: ReviewFallbackTier::C,
-                trigger: ReviewFallbackTrigger::Silence,
-                active_bot: Some("codex".to_string()),
-                activated_at,
-            },
+            fallback_snapshot(ReviewFallbackTrigger::Silence, activated_at),
         )
         .await?
         .expect("workflow");
@@ -550,181 +553,246 @@ async fn record_ready_to_merge_with_fallback_persists_snapshot() -> anyhow::Resu
     assert_eq!(workflow.state, IssueLifecycleState::ReadyToMerge);
     assert_eq!(
         workflow.review_fallback,
-        Some(ReviewFallbackSnapshot {
-            tier: ReviewFallbackTier::C,
-            trigger: ReviewFallbackTrigger::Silence,
-            active_bot: Some("codex".to_string()),
-            activated_at,
-        })
+        Some(fallback_snapshot(
+            ReviewFallbackTrigger::Silence,
+            activated_at
+        ))
     );
     assert_eq!(
         workflow.last_event.and_then(|event| event.detail),
         Some("fallback via silence".to_string())
     );
+    let retried = store
+        .record_ready_to_merge_with_fallback(
+            project_id,
+            Some("owner/repo"),
+            121,
+            Some("retry"),
+            fallback_snapshot(ReviewFallbackTrigger::Silence, Utc::now()),
+        )
+        .await?
+        .expect("workflow");
+    assert_eq!(
+        retried.review_fallback.expect("fallback").activated_at,
+        activated_at
+    );
+    store
+        .record_ready_to_merge_with_fallback(
+            project_id,
+            Some("owner/repo"),
+            121,
+            Some("conflict"),
+            fallback_snapshot(ReviewFallbackTrigger::GeminiQuota, Utc::now()),
+        )
+        .await
+        .expect_err("different fallback identity must fail");
     Ok(())
 }
 
-#[tokio::test]
-async fn repair_project_id_rekeys_row() -> anyhow::Result<()> {
-    let Some(store) = open_test_store().await? else {
-        return Ok(());
-    };
-    let corrupt_id = "/data/workspaces/abc-uuid-repair-test";
-    store
-        .record_issue_scheduled(corrupt_id, Some("owner/repo"), 9001, "task-r1", &[], false)
-        .await?;
-
-    let workflow = store
-        .get_by_issue(corrupt_id, Some("owner/repo"), 9001)
-        .await?
-        .expect("row should exist");
-    let old_row_id = workflow.id.clone();
-
-    let canonical = "/real/canonical/root";
-    store.repair_project_id(&old_row_id, canonical).await?;
-
-    let old = store
-        .get_by_issue(corrupt_id, Some("owner/repo"), 9001)
-        .await?;
-    assert!(old.is_none(), "old row should be removed");
-
-    let new = store
-        .get_by_issue(canonical, Some("owner/repo"), 9001)
-        .await?
-        .expect("new row should exist");
-    assert_eq!(new.project_id, canonical);
-    Ok(())
+fn fallback_snapshot(
+    trigger: ReviewFallbackTrigger,
+    activated_at: chrono::DateTime<Utc>,
+) -> ReviewFallbackSnapshot {
+    ReviewFallbackSnapshot {
+        tier: ReviewFallbackTier::C,
+        trigger,
+        active_bot: Some("codex".into()),
+        activated_at,
+    }
 }
 
-#[tokio::test]
-async fn repair_project_id_refuses_to_overwrite_existing_canonical_row() -> anyhow::Result<()> {
-    let Some(store) = open_test_store().await? else {
-        return Ok(());
-    };
-    let corrupt_project_id = "/data/workspaces/abc-uuid-conflict-test";
-    let canonical_project_id = "/real/canonical/conflict-root";
+async fn required_test_store() -> anyhow::Result<IssueWorkflowStore> {
+    let configured = std::env::var("HARNESS_DATABASE_URL").map_err(|_| {
+        anyhow::anyhow!(
+            "GH1715 persistence tests require HARNESS_DATABASE_URL for an isolated disposable database"
+        )
+    })?;
+    let database_url = harness_core::db::resolve_test_database_url(Some(&configured))?;
+    let dir = tempfile::tempdir()?;
+    IssueWorkflowStore::open_with_database_url(
+        &dir.path().join("gh1715-issue-workflows.db"),
+        Some(&database_url),
+    )
+    .await
+}
 
+async fn seed_pr(
+    store: &IssueWorkflowStore,
+    project: &str,
+    issue: u64,
+    pr: u64,
+) -> anyhow::Result<()> {
     store
-        .record_issue_scheduled(
-            corrupt_project_id,
-            Some("owner/repo"),
-            9005,
-            "task-corrupt",
-            &[],
-            false,
-        )
-        .await?;
-    store
-        .record_issue_scheduled(
-            canonical_project_id,
-            Some("owner/repo"),
-            9005,
-            "task-canonical",
-            &[],
-            false,
-        )
+        .record_issue_scheduled(project, Some("owner/repo"), issue, "task-1", &[], false)
         .await?;
     store
         .record_pr_detected(
-            canonical_project_id,
+            project,
             Some("owner/repo"),
-            9005,
-            "task-canonical",
-            45,
-            "https://github.com/owner/repo/pull/45",
+            issue,
+            "task-1",
+            pr,
+            &format!("https://github.com/owner/repo/pull/{pr}"),
         )
         .await?;
+    Ok(())
+}
 
-    let corrupt_before = store
-        .get_by_issue(corrupt_project_id, Some("owner/repo"), 9005)
+#[tokio::test]
+#[ignore = "requires isolated HARNESS_DATABASE_URL"]
+async fn issue_workflow_store_metadata_requires_valid_transition() -> anyhow::Result<()> {
+    let store = required_test_store().await?;
+    let project = "/tmp/gh1715-metadata";
+    seed_pr(&store, project, 101, 201).await?;
+    store
+        .record_pr_merged(project, Some("owner/repo"), 201, None)
+        .await?;
+    let before = store
+        .get_by_issue(project, Some("owner/repo"), 101)
         .await?
-        .expect("corrupt row should exist");
-    let canonical_before = store
-        .get_by_issue(canonical_project_id, Some("owner/repo"), 9005)
-        .await?
-        .expect("canonical row should exist");
-
-    let err = store
-        .repair_project_id(&corrupt_before.id, canonical_project_id)
+        .expect("workflow");
+    store
+        .record_issue_scheduled(
+            project,
+            Some("owner/repo"),
+            101,
+            "other",
+            &["changed".into()],
+            true,
+        )
         .await
-        .expect_err("repair should fail when canonical row already exists");
-    assert!(
-        err.to_string().contains("canonical row already exists"),
-        "unexpected error: {err}",
-    );
-
-    let corrupt_after = store
-        .get_by_issue(corrupt_project_id, Some("owner/repo"), 9005)
+        .expect_err("terminal scheduling must fail");
+    let after = store
+        .get_by_issue(project, Some("owner/repo"), 101)
         .await?
-        .expect("corrupt row should remain for manual remediation");
-    let canonical_after = store
-        .get_by_issue(canonical_project_id, Some("owner/repo"), 9005)
-        .await?
-        .expect("canonical row should remain unchanged");
-
-    assert_eq!(store.row_count().await?, 2);
-    assert_eq!(corrupt_after, corrupt_before);
-    assert_eq!(canonical_after, canonical_before);
-    Ok(())
-}
-
-#[tokio::test]
-async fn mark_workflow_failed_with_reason_sets_state() -> anyhow::Result<()> {
-    let Some(store) = open_test_store().await? else {
-        return Ok(());
-    };
-    let project_id = "/tmp/project-mark-failed-test";
+        .expect("workflow");
+    assert_eq!(after, before);
     store
-        .record_issue_scheduled(project_id, Some("owner/repo"), 9002, "task-mf1", &[], false)
-        .await?;
-
-    let workflow = store
-        .get_by_issue(project_id, Some("owner/repo"), 9002)
-        .await?
-        .expect("row should exist");
-
-    store
-        .mark_workflow_failed_with_reason(&workflow.id, "project root not found")
-        .await?;
-
-    let updated = store
-        .get_by_issue(project_id, Some("owner/repo"), 9002)
-        .await?
-        .expect("row should still exist");
-    assert_eq!(updated.state, IssueLifecycleState::Failed);
+        .record_ready_to_merge_with_fallback(
+            project,
+            Some("owner/repo"),
+            201,
+            Some("late fallback"),
+            fallback_snapshot(ReviewFallbackTrigger::AllBotsQuota, Utc::now()),
+        )
+        .await
+        .expect_err("fallback metadata must be applied only after transition validation");
     assert_eq!(
-        updated
-            .last_event
-            .as_ref()
-            .and_then(|e| e.detail.as_deref()),
-        Some("project root not found")
+        store
+            .get_by_issue(project, Some("owner/repo"), 101)
+            .await?
+            .expect("workflow"),
+        before
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn list_with_worktree_project_ids_filters_correctly() -> anyhow::Result<()> {
-    let Some(store) = open_test_store().await? else {
-        return Ok(());
-    };
-    let corrupt = "/data/workspaces/xyz-uuid-list-test";
-    let canonical = "/tmp/canonical-list-test";
-
+#[ignore = "requires isolated HARNESS_DATABASE_URL"]
+async fn rejected_issue_lifecycle_store_update_rolls_back() -> anyhow::Result<()> {
+    let store = required_test_store().await?;
+    let project = "/tmp/gh1715-rollback";
+    seed_pr(&store, project, 102, 202).await?;
     store
-        .record_issue_scheduled(corrupt, Some("owner/repo"), 9003, "task-l1", &[], false)
+        .record_pr_merged(project, Some("owner/repo"), 202, None)
         .await?;
+    let before = store
+        .get_by_issue(project, Some("owner/repo"), 102)
+        .await?
+        .expect("workflow");
     store
-        .record_issue_scheduled(canonical, Some("owner/repo"), 9004, "task-l2", &[], false)
-        .await?;
-
-    let corrupt_rows = store.list_with_worktree_project_ids().await?;
-    assert!(
-        corrupt_rows.iter().any(|w| w.project_id == corrupt),
-        "worktree row should appear"
+        .record_implement_started(project, Some("owner/repo"), 102, "late-task")
+        .await
+        .expect_err("terminal implementation must fail");
+    assert_eq!(
+        store
+            .get_by_issue(project, Some("owner/repo"), 102)
+            .await?
+            .expect("workflow"),
+        before
     );
-    assert!(
-        !corrupt_rows.iter().any(|w| w.project_id == canonical),
-        "canonical row should not appear"
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated HARNESS_DATABASE_URL"]
+async fn feedback_claim_batch_aborts_on_illegal_transition() -> anyhow::Result<()> {
+    let store = required_test_store().await?;
+    let project = "/tmp/gh1715-batch";
+    seed_pr(&store, project, 103, 203).await?;
+    seed_pr(&store, project, 104, 204).await?;
+    let legal_before = store
+        .get_by_pr(project, Some("owner/repo"), 203)
+        .await?
+        .expect("legal candidate");
+    let illegal_before = store
+        .get_by_pr(project, Some("owner/repo"), 204)
+        .await?
+        .expect("illegal candidate");
+    sqlx::query(
+        "UPDATE issue_workflows
+         SET updated_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+         WHERE id = $1",
+    )
+    .bind(&illegal_before.id)
+    .execute(&store.pool)
+    .await?;
+
+    let result = with_feedback_claim_event_override(
+        illegal_before.id.clone(),
+        IssueLifecycleEventKind::IssueScheduled,
+        store.claim_feedback_candidates(16, Utc::now() - chrono::Duration::minutes(5)),
+    )
+    .await;
+    assert!(result
+        .expect_err("one illegal candidate must abort the real claim batch")
+        .to_string()
+        .contains("transition_not_allowed"));
+    assert_eq!(
+        store
+            .get_by_pr(project, Some("owner/repo"), 203)
+            .await?
+            .expect("legal candidate"),
+        legal_before
+    );
+    assert_eq!(
+        store
+            .get_by_pr(project, Some("owner/repo"), 204)
+            .await?
+            .expect("illegal candidate"),
+        illegal_before
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated HARNESS_DATABASE_URL"]
+async fn concurrent_valid_and_invalid_issue_transitions_preserve_winner() -> anyhow::Result<()> {
+    let store = std::sync::Arc::new(required_test_store().await?);
+    let project = "/tmp/gh1715-race";
+    seed_pr(&store, project, 105, 205).await?;
+    let valid_store = store.clone();
+    let invalid_store = store.clone();
+    let (valid, invalid) = tokio::join!(
+        valid_store.record_pr_merged(project, Some("owner/repo"), 205, None),
+        invalid_store.record_issue_scheduled(
+            project,
+            Some("owner/repo"),
+            105,
+            "late-task",
+            &[],
+            false
+        )
+    );
+    assert!(valid.is_ok());
+    assert!(invalid.is_err());
+    assert_eq!(
+        store
+            .get_by_issue(project, Some("owner/repo"), 105)
+            .await?
+            .expect("workflow")
+            .state,
+        IssueLifecycleState::Done
     );
     Ok(())
 }

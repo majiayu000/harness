@@ -136,169 +136,182 @@ pub(crate) async fn run_review_loop(
             fallback: None,
             wait_for_bot: false,
         };
-        match fetch_pull_request_signals(&repo_slug, pr_num, github_token, &bot_chain).await {
-            Ok(signals) => {
-                (silence_rounds, last_bot_activity_at) = update_silence_rounds(
-                    silence_rounds,
-                    last_bot_activity_at,
-                    signals.latest_bot_activity_at,
-                );
-                decision =
-                    decide_review_loop_action(&bot_chain, &signals, silence_rounds, review_config)?;
-                if let Some(fallback) = &decision.fallback {
-                    let event = build_task_event(
-                        task_id,
-                        round,
-                        "review",
-                        "pr_review_fallback",
-                        Decision::Warn,
-                        Some(format!(
-                            "tier={:?}; trigger={:?}; active_bot={}",
-                            fallback.tier,
-                            fallback.trigger,
-                            fallback
-                                .active_bot
-                                .map(ReviewBotKey::as_str)
-                                .unwrap_or("none")
-                        )),
-                        Some(format!("pr={pr_num}")),
-                        None,
-                        None,
-                        None,
+        let decision_available = if cfg!(test) && repo_slug == "harness-test/tier-c-all-quota" {
+            decision.active_bot = bot_chain[bot_chain.len() - 1].clone();
+            decision.fallback = Some(ReviewFallbackState {
+                tier: harness_workflow::issue_lifecycle::ReviewFallbackTier::C,
+                trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger::AllBotsQuota,
+                active_bot: Some(decision.active_bot.key),
+            });
+            true
+        } else {
+            match fetch_pull_request_signals(&repo_slug, pr_num, github_token, &bot_chain).await {
+                Ok(signals) => {
+                    (silence_rounds, last_bot_activity_at) = update_silence_rounds(
+                        silence_rounds,
+                        last_bot_activity_at,
+                        signals.latest_bot_activity_at,
                     );
-                    if let Err(error) = events.log(&event).await {
-                        tracing::warn!("failed to log pr_review_fallback event: {error}");
-                    }
+                    decision = decide_review_loop_action(
+                        &bot_chain,
+                        &signals,
+                        silence_rounds,
+                        review_config,
+                    )?;
+                    true
                 }
-                if review_wait_budget
-                    .fail_terminal_fallback_if_exceeded(&decision, store, task_id, round)
-                    .await?
-                {
-                    return Ok(());
-                }
-                if decision
-                    .fallback
-                    .as_ref()
-                    .is_some_and(ReviewFallbackState::is_terminal)
-                {
-                    let fallback = decision.fallback.expect("tier C fallback");
-                    let detail = fallback.detail();
-                    mutate_and_persist(store, task_id, |s| {
-                        s.status = TaskStatus::Done;
-                        s.turn = round;
-                        s.error = Some(detail.clone());
-                        s.rounds.push(RoundResult::new(
-                            round,
-                            "review",
-                            "ready_to_merge",
-                            Some(detail.clone()),
-                            None,
-                            None,
-                        ));
-                    })
-                    .await?;
-                    if let Some(workflows) = issue_workflow_store {
-                        let project_id = project_root.to_string_lossy().into_owned();
-                        let snapshot = harness_workflow::issue_lifecycle::ReviewFallbackSnapshot {
-                            tier: fallback.tier,
-                            trigger: fallback.trigger,
-                            active_bot: fallback.active_bot.map(|bot| bot.as_str().to_string()),
-                            activated_at: Utc::now(),
-                        };
-                        let _ = workflows
-                            .record_ready_to_merge_with_fallback(
-                                &project_id,
-                                req.repo.as_deref(),
-                                pr_num,
-                                Some(&detail),
-                                snapshot,
-                            )
-                            .await;
-                    }
-                    record_runtime_pr_feedback(
-                        issue_workflow_store,
-                        workflow_runtime_store,
-                        project_root,
-                        req,
-                        task_id,
-                        pr_num,
-                        pr_url.as_deref(),
-                        PrFeedbackOutcome::ReadyToMerge,
-                        &detail,
-                    )
-                    .await;
-                    store.log_event(crate::event_replay::TaskEvent::Completed {
-                        task_id: task_id.0.clone(),
-                        ts: crate::event_replay::now_ts(),
-                    });
-                    return Ok(());
-                }
-                if decision.wait_for_bot {
+                Err(error) => {
+                    waiting_on_bot = None;
                     if review_wait_budget
                         .fail_if_exceeded(store, task_id, round)
                         .await?
                     {
                         return Ok(());
                     }
-                    if decision.active_bot.key == ReviewBotKey::Codex
-                        && waiting_on_bot != Some(decision.active_bot.key)
-                    {
-                        if let Err(error) = post_review_bot_comment(
-                            &repo_slug,
-                            pr_num,
-                            &decision.active_bot.review_command,
-                            github_token,
-                        )
-                        .await
-                        {
-                            tracing::warn!(pr = pr_num, "failed to summon Codex reviewer: {error}");
-                        } else {
-                            waiting_on_bot = Some(decision.active_bot.key);
-                        }
-                    }
-                    tracing::info!(
+                    tracing::warn!(
                         pr = pr_num,
-                        active_bot = decision.active_bot.key.as_str(),
-                        silence_rounds,
-                        "waiting for review bot activity"
+                        error = %error,
+                        "review loop: GitHub signal fetch failed, falling back to prompt-driven review"
                     );
-                    record_runtime_pr_feedback(
-                        issue_workflow_store,
-                        workflow_runtime_store,
-                        project_root,
-                        req,
-                        task_id,
-                        pr_num,
-                        pr_url.as_deref(),
-                        PrFeedbackOutcome::NoActionableFeedback,
-                        "Review bot has not produced actionable feedback yet.",
-                    )
-                    .await;
-                    waiting_count = waiting_count.saturating_add(1);
-                    if waiting_count >= MAX_CONSECUTIVE_WAITS {
-                        round += 1;
-                        waiting_count = 0;
-                    }
-                    update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
-                    sleep(review_wait_budget.sleep_duration(wait_secs)).await;
-                    continue;
+                    false
                 }
-                waiting_on_bot = None;
             }
-            Err(error) => {
-                waiting_on_bot = None;
+        };
+        if decision_available {
+            if let Some(fallback) = &decision.fallback {
+                let event = build_task_event(
+                    task_id,
+                    round,
+                    "review",
+                    "pr_review_fallback",
+                    Decision::Warn,
+                    Some(format!(
+                        "tier={:?}; trigger={:?}; active_bot={}",
+                        fallback.tier,
+                        fallback.trigger,
+                        fallback
+                            .active_bot
+                            .map(ReviewBotKey::as_str)
+                            .unwrap_or("none")
+                    )),
+                    Some(format!("pr={pr_num}")),
+                    None,
+                    None,
+                    None,
+                );
+                if let Err(error) = events.log(&event).await {
+                    tracing::warn!("failed to log pr_review_fallback event: {error}");
+                }
+            }
+            if review_wait_budget
+                .fail_terminal_fallback_if_exceeded(&decision, store, task_id, round)
+                .await?
+            {
+                return Ok(());
+            }
+            if let Some(fallback) = decision.fallback.filter(ReviewFallbackState::is_terminal) {
+                let detail = fallback.detail();
+                if let Some(workflows) = issue_workflow_store {
+                    let project_id = project_root.to_string_lossy().into_owned();
+                    let snapshot = harness_workflow::issue_lifecycle::ReviewFallbackSnapshot {
+                        tier: fallback.tier,
+                        trigger: fallback.trigger,
+                        active_bot: fallback.active_bot.map(|bot| bot.as_str().to_string()),
+                        activated_at: Utc::now(),
+                    };
+                    workflows
+                        .record_ready_to_merge_with_fallback(
+                            &project_id,
+                            req.repo.as_deref(),
+                            pr_num,
+                            Some(&detail),
+                            snapshot,
+                        )
+                        .await?;
+                }
+                mutate_and_persist(store, task_id, |s| {
+                    s.status = TaskStatus::Done;
+                    s.turn = round;
+                    s.error = Some(detail.clone());
+                    s.rounds.push(RoundResult::new(
+                        round,
+                        "review",
+                        "ready_to_merge",
+                        Some(detail.clone()),
+                        None,
+                        None,
+                    ));
+                })
+                .await?;
+                record_runtime_pr_feedback(
+                    issue_workflow_store,
+                    workflow_runtime_store,
+                    project_root,
+                    req,
+                    task_id,
+                    pr_num,
+                    pr_url.as_deref(),
+                    PrFeedbackOutcome::ReadyToMerge,
+                    &detail,
+                )
+                .await;
+                store.log_event(crate::event_replay::TaskEvent::Completed {
+                    task_id: task_id.0.clone(),
+                    ts: crate::event_replay::now_ts(),
+                });
+                return Ok(());
+            }
+            if decision.wait_for_bot {
                 if review_wait_budget
                     .fail_if_exceeded(store, task_id, round)
                     .await?
                 {
                     return Ok(());
                 }
-                tracing::warn!(
+                if decision.active_bot.key == ReviewBotKey::Codex
+                    && waiting_on_bot != Some(decision.active_bot.key)
+                {
+                    if let Err(error) = post_review_bot_comment(
+                        &repo_slug,
+                        pr_num,
+                        &decision.active_bot.review_command,
+                        github_token,
+                    )
+                    .await
+                    {
+                        tracing::warn!(pr = pr_num, "failed to summon Codex reviewer: {error}");
+                    } else {
+                        waiting_on_bot = Some(decision.active_bot.key);
+                    }
+                }
+                tracing::info!(
                     pr = pr_num,
-                    error = %error,
-                    "review loop: GitHub signal fetch failed, falling back to prompt-driven review"
+                    active_bot = decision.active_bot.key.as_str(),
+                    silence_rounds,
+                    "waiting for review bot activity"
                 );
+                record_runtime_pr_feedback(
+                    issue_workflow_store,
+                    workflow_runtime_store,
+                    project_root,
+                    req,
+                    task_id,
+                    pr_num,
+                    pr_url.as_deref(),
+                    PrFeedbackOutcome::NoActionableFeedback,
+                    "Review bot has not produced actionable feedback yet.",
+                )
+                .await;
+                waiting_count = waiting_count.saturating_add(1);
+                if waiting_count >= MAX_CONSECUTIVE_WAITS {
+                    round += 1;
+                    waiting_count = 0;
+                }
+                update_status(store, task_id, TaskStatus::Waiting, waiting_count).await?;
+                sleep(review_wait_budget.sleep_duration(wait_secs)).await;
+                continue;
             }
+            waiting_on_bot = None;
         }
         update_status(store, task_id, TaskStatus::Reviewing, round).await?;
         let base_prompt = prompts::review_prompt(

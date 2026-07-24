@@ -1,7 +1,8 @@
 use super::review_loop::run_review_loop;
 use crate::event_replay::TaskEvent;
 use crate::task_runner::{
-    CreateTaskRequest, TaskId, TaskPhase, TaskState, TaskStatus, TaskStore, TaskTerminalFailure,
+    mutate_and_persist, CreateTaskRequest, TaskId, TaskPhase, TaskState, TaskStatus, TaskStore,
+    TaskTerminalFailure,
 };
 use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::types::{Capability, TokenUsage};
@@ -286,5 +287,327 @@ async fn review_loop_round_budget_exhausted_marks_terminal_once() -> anyhow::Res
         })
         .count();
     assert_eq!(failed_events, 1);
+    Ok(())
+}
+
+struct TierCTestStores {
+    tasks: Arc<TaskStore>,
+    issue_workflows: harness_workflow::issue_lifecycle::IssueWorkflowStore,
+    runtime: harness_workflow::runtime::WorkflowRuntimeStore,
+    database_url: String,
+    task_path: std::path::PathBuf,
+    project_root: std::path::PathBuf,
+}
+
+async fn required_tier_c_stores(dir: &std::path::Path) -> anyhow::Result<TierCTestStores> {
+    let configured = std::env::var("HARNESS_DATABASE_URL").map_err(|_| {
+        anyhow::anyhow!(
+            "GH1715 Tier-C tests require HARNESS_DATABASE_URL for an isolated disposable database"
+        )
+    })?;
+    let database_url = harness_core::db::resolve_test_database_url(Some(&configured))?;
+    let task_path = dir.join("gh1715-tasks.db");
+    let project_root = dir.join("project");
+    std::fs::create_dir_all(&project_root)?;
+    Ok(TierCTestStores {
+        tasks: TaskStore::open_with_database_url(&task_path, Some(&database_url)).await?,
+        issue_workflows:
+            harness_workflow::issue_lifecycle::IssueWorkflowStore::open_with_database_url(
+                &dir.join("gh1715-issue-workflows.db"),
+                Some(&database_url),
+            )
+            .await?,
+        runtime: harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &dir.join("gh1715-runtime"),
+            Some(&database_url),
+        )
+        .await?,
+        database_url,
+        task_path,
+        project_root,
+    })
+}
+
+async fn seed_tier_c_workflows(
+    stores: &TierCTestStores,
+    task_id: &TaskId,
+    issue: u64,
+    pr: u64,
+) -> anyhow::Result<()> {
+    stores.tasks.insert(&TaskState::new(task_id.clone())).await;
+    let project = stores.project_root.to_string_lossy();
+    stores
+        .issue_workflows
+        .record_issue_scheduled(
+            project.as_ref(),
+            Some("owner/repo"),
+            issue,
+            task_id.as_str(),
+            &[],
+            false,
+        )
+        .await?;
+    stores
+        .issue_workflows
+        .record_pr_detected(
+            project.as_ref(),
+            Some("owner/repo"),
+            issue,
+            task_id.as_str(),
+            pr,
+            &format!("https://github.com/owner/repo/pull/{pr}"),
+        )
+        .await?;
+    crate::workflow_runtime_pr_feedback::record_pr_detected(
+        Some(&stores.runtime),
+        crate::workflow_runtime_pr_feedback::PrDetectedRuntimeContext {
+            project_root: &stores.project_root,
+            repo: Some("owner/repo"),
+            issue_number: issue,
+            task_id,
+            pr_number: pr,
+            pr_url: &format!("https://github.com/owner/repo/pull/{pr}"),
+        },
+    )
+    .await;
+    crate::workflow_runtime_pr_feedback::record_local_review_passed(
+        Some(&stores.runtime),
+        crate::workflow_runtime_pr_feedback::LocalReviewPassedRuntimeContext {
+            project_root: &stores.project_root,
+            repo: Some("owner/repo"),
+            issue_number: Some(issue),
+            task_id,
+            pr_number: pr,
+            pr_url: Some(&format!("https://github.com/owner/repo/pull/{pr}")),
+            summary: "Local review passed before hosted review fallback.",
+        },
+    )
+    .await;
+    Ok(())
+}
+
+async fn run_tier_c_review_loop(
+    stores: &TierCTestStores,
+    tasks: &TaskStore,
+    task_id: &TaskId,
+    issue: u64,
+    pr: u64,
+    events: &Arc<harness_observe::event_store::EventStore>,
+) -> anyhow::Result<()> {
+    let agent = StaticReviewAgent::new("must not reach prompt-driven review");
+    let review_config = harness_core::config::agents::AgentReviewConfig {
+        fallback_chain: vec!["gemini".to_string(), "codex".to_string()],
+        review_wait_budget_secs: 60,
+        ..harness_core::config::agents::AgentReviewConfig::default()
+    };
+    let request = CreateTaskRequest {
+        issue: Some(issue),
+        repo: Some("owner/repo".to_string()),
+        ..CreateTaskRequest::default()
+    };
+    let interceptors = Arc::new(Vec::new());
+    let mut turns_used = 0;
+    let mut turns_used_acc = 0;
+    let result = run_review_loop(
+        tasks,
+        task_id,
+        &agent,
+        &review_config,
+        &harness_core::config::project::ProjectConfig::default(),
+        Some(&stores.issue_workflows),
+        Some(&stores.runtime),
+        &stores.project_root,
+        &request,
+        events,
+        &interceptors,
+        &[],
+        &stores.project_root,
+        &HashMap::new(),
+        Some(format!("https://github.com/owner/repo/pull/{pr}")),
+        pr,
+        None,
+        1,
+        0,
+        1,
+        false,
+        false,
+        Duration::from_secs(5),
+        &mut turns_used,
+        &mut turns_used_acc,
+        Instant::now(),
+        Instant::now(),
+        "harness-test/tier-c-all-quota".to_string(),
+        0.9,
+        None,
+    )
+    .await;
+    assert_eq!(agent.request_count().await, 0);
+    result
+}
+
+fn completed_event_count(path: &std::path::Path, task_id: &TaskId) -> anyhow::Result<usize> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    Ok(content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<TaskEvent>(line).ok())
+        .filter(|event| {
+            matches!(
+                event,
+                TaskEvent::Completed { task_id: completed, .. } if completed == task_id.as_str()
+            )
+        })
+        .count())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated HARNESS_DATABASE_URL"]
+async fn tier_c_lifecycle_rejection_records_no_completion_evidence() -> anyhow::Result<()> {
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+    let dir = tempfile::tempdir()?;
+    let stores = required_tier_c_stores(dir.path()).await?;
+    let task_id = TaskId::from_str("gh1715-tier-c-rejection");
+    seed_tier_c_workflows(&stores, &task_id, 1715, 2715).await?;
+    stores
+        .issue_workflows
+        .record_pr_merged(
+            &stores.project_root.to_string_lossy(),
+            Some("owner/repo"),
+            2715,
+            None,
+        )
+        .await?;
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+    let error = run_tier_c_review_loop(
+        &stores,
+        stores.tasks.as_ref(),
+        &task_id,
+        1715,
+        2715,
+        &events,
+    )
+    .await
+    .expect_err("terminal lifecycle must reject Tier-C readiness");
+    assert!(error.to_string().contains("transition_not_allowed"));
+    let task = stores.tasks.get(&task_id).expect("task");
+    assert_ne!(task.status, TaskStatus::Done);
+    assert!(task.rounds.is_empty());
+    assert_eq!(
+        completed_event_count(&dir.path().join("task-events.jsonl"), &task_id)?,
+        0
+    );
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &stores.project_root.to_string_lossy(),
+        Some("owner/repo"),
+        1715,
+    );
+    assert!(stores
+        .runtime
+        .events_for(&workflow_id)
+        .await?
+        .iter()
+        .all(|event| event.event_type != "PrReadyToMerge"));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated HARNESS_DATABASE_URL"]
+async fn tier_c_task_store_failure_retry_records_completion_once() -> anyhow::Result<()> {
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+    let dir = tempfile::tempdir()?;
+    let stores = required_tier_c_stores(dir.path()).await?;
+    let task_id = TaskId::from_str("gh1715-tier-c-retry");
+    seed_tier_c_workflows(&stores, &task_id, 1716, 2716).await?;
+    let conflicting_store =
+        TaskStore::open_with_database_url(&stores.task_path, Some(&stores.database_url)).await?;
+    mutate_and_persist(&conflicting_store, &task_id, |task| {
+        task.error = Some("concurrent update".to_string());
+    })
+    .await?;
+    let events = Arc::new(harness_observe::event_store::EventStore::new(dir.path()).await?);
+    run_tier_c_review_loop(
+        &stores,
+        stores.tasks.as_ref(),
+        &task_id,
+        1716,
+        2716,
+        &events,
+    )
+    .await
+    .expect_err("stale task version must force the post-lifecycle mutation to fail");
+    assert_ne!(
+        stores.tasks.get(&task_id).expect("task").status,
+        TaskStatus::Done
+    );
+    assert_eq!(
+        completed_event_count(&dir.path().join("task-events.jsonl"), &task_id)?,
+        0
+    );
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &stores.project_root.to_string_lossy(),
+        Some("owner/repo"),
+        1716,
+    );
+    assert_eq!(
+        stores
+            .runtime
+            .events_for(&workflow_id)
+            .await?
+            .iter()
+            .filter(|event| event.event_type == "PrReadyToMerge")
+            .count(),
+        0
+    );
+    let first_activated_at = stores
+        .issue_workflows
+        .get_by_pr(
+            &stores.project_root.to_string_lossy(),
+            Some("owner/repo"),
+            2716,
+        )
+        .await?
+        .expect("workflow")
+        .review_fallback
+        .expect("first fallback")
+        .activated_at;
+
+    let retry_store =
+        TaskStore::open_with_database_url(&stores.task_path, Some(&stores.database_url)).await?;
+    run_tier_c_review_loop(&stores, retry_store.as_ref(), &task_id, 1716, 2716, &events).await?;
+    let retried = stores
+        .issue_workflows
+        .get_by_pr(
+            &stores.project_root.to_string_lossy(),
+            Some("owner/repo"),
+            2716,
+        )
+        .await?
+        .expect("workflow");
+    assert_eq!(
+        retried.review_fallback.expect("fallback").activated_at,
+        first_activated_at
+    );
+    let task = retry_store.get(&task_id).expect("task");
+    assert_eq!(task.status, TaskStatus::Done);
+    assert_eq!(
+        task.rounds
+            .iter()
+            .filter(|round| round.result == "ready_to_merge")
+            .count(),
+        1
+    );
+    assert_eq!(
+        completed_event_count(&dir.path().join("task-events.jsonl"), &task_id)?,
+        1
+    );
+    assert_eq!(
+        stores
+            .runtime
+            .events_for(&workflow_id)
+            .await?
+            .iter()
+            .filter(|event| event.event_type == "PrReadyToMerge")
+            .count(),
+        1
+    );
     Ok(())
 }
