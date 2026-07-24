@@ -8,6 +8,7 @@ pub(super) enum RuntimeDecisionCommitOutcome {
 }
 
 impl RuntimeDecisionCommitOutcome {
+    #[cfg(test)]
     fn into_result(self) -> anyhow::Result<()> {
         match self {
             Self::Accepted | Self::Rejected { .. } => Ok(()),
@@ -18,6 +19,7 @@ impl RuntimeDecisionCommitOutcome {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn persist_pr_detected(
     store: &WorkflowRuntimeStore,
     ctx: &PrDetectedRuntimeContext<'_>,
@@ -254,6 +256,7 @@ pub(super) async fn persist_pr_hygiene_repair_request(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn persist_pr_feedback(
     store: &WorkflowRuntimeStore,
     ctx: &PrFeedbackRuntimeContext<'_>,
@@ -330,6 +333,7 @@ pub(super) async fn persist_pr_feedback(
     .into_result()
 }
 
+#[cfg(test)]
 pub(super) async fn persist_local_review_passed(
     store: &WorkflowRuntimeStore,
     ctx: &LocalReviewPassedRuntimeContext<'_>,
@@ -409,6 +413,7 @@ pub(super) async fn persist_local_review_passed(
     .into_result()
 }
 
+#[cfg(test)]
 pub(super) async fn persist_pr_merged(
     store: &WorkflowRuntimeStore,
     ctx: &PrMergedRuntimeContext<'_>,

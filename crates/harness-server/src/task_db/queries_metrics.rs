@@ -86,6 +86,7 @@ impl TaskDb {
     }
 
     /// Return the current optimistic-locking version of a single task.
+    #[cfg(test)]
     pub(crate) async fn get_version_only(&self, id: &str) -> anyhow::Result<Option<i32>> {
         let row: Option<(i32,)> =
             sqlx::query_as("SELECT version FROM tasks WHERE store_key = $1 AND id = $2")
