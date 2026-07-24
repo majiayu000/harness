@@ -226,7 +226,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             execution_phase: options.execution_phase,
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
-            allowed_tools: vec![],
+            allowed_tools: None,
             context: vec![],
             timeout_secs,
             env_vars: options.env_vars.clone(),

@@ -202,7 +202,7 @@ async fn start_turn_sends_layered_static_prompt_through_system_prompt_args() -> 
 
 #[tokio::test]
 async fn start_turn_full_profile_uses_dangerously_skip_permissions() -> anyhow::Result<()> {
-    let args = captured_args_for_allowed_tools(vec![]).await?;
+    let args = captured_args_for_allowed_tools(None).await?;
     assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
     assert!(!args.contains(&"--allowedTools".to_string()));
     assert!(!args.contains(&"--permission-mode".to_string()));
@@ -212,7 +212,7 @@ async fn start_turn_full_profile_uses_dangerously_skip_permissions() -> anyhow::
 #[tokio::test]
 async fn start_turn_restricted_profile_splits_permission_flags() -> anyhow::Result<()> {
     let args =
-        captured_args_for_allowed_tools(vec!["Read".to_string(), "Bash".to_string()]).await?;
+        captured_args_for_allowed_tools(Some(vec!["Read".to_string(), "Bash".to_string()])).await?;
     assert!(
         !args.contains(&"--dangerously-skip-permissions".to_string()),
         "--allowedTools and --dangerously-skip-permissions are mutually exclusive"
@@ -226,8 +226,22 @@ async fn start_turn_restricted_profile_splits_permission_flags() -> anyhow::Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn start_turn_deny_all_profile_is_not_promoted_to_full_permissions() -> anyhow::Result<()> {
+    let args = captured_args_for_allowed_tools(Some(vec![])).await?;
+    assert!(
+        !args.contains(&"--dangerously-skip-permissions".to_string()),
+        "Some(vec![]) is deny-all and must not become full permissions"
+    );
+    assert!(args
+        .windows(2)
+        .any(|w| w == ["--permission-mode", "bypassPermissions"]));
+    assert!(args.windows(2).any(|w| w == ["--allowedTools", ""]));
+    Ok(())
+}
+
 async fn captured_args_for_allowed_tools(
-    allowed_tools: Vec<String>,
+    allowed_tools: Option<Vec<String>>,
 ) -> anyhow::Result<Vec<String>> {
     let dir = tempfile::tempdir()?;
     let args_path = dir.path().join("args.txt");
@@ -395,7 +409,7 @@ fn turn_request(prompt: &str, project_root: PathBuf) -> TurnRequest {
         execution_phase: Some(ExecutionPhase::Execution),
         sandbox_mode: None,
         approval_policy: None,
-        allowed_tools: vec![],
+        allowed_tools: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),

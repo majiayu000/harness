@@ -80,7 +80,7 @@ impl AgentAdapter for ClaudeAdapter {
         ];
         if let Some(system_prompt) = req.claude_system_prompt() {
             args.push(OsString::from("--append-system-prompt"));
-            args.push(OsString::from(AsRef::<str>::as_ref(&system_prompt)));
+            args.push(OsString::from(system_prompt));
             args.push(OsString::from("--exclude-dynamic-system-prompt-sections"));
         }
         // Hard tool enforcement at the CLI boundary (issue #514):
@@ -89,13 +89,14 @@ impl AgentAdapter for ClaudeAdapter {
         //                                             --allowedTools <comma-list>
         // The two flags are mutually exclusive in Claude CLI 2.1.70+.
         // See also: claude.rs base_args — both files must stay in sync on this split.
-        if req.allowed_tools.is_empty() {
+        if req.uses_dangerously_skip_permissions() {
             args.push(OsString::from("--dangerously-skip-permissions"));
         } else {
             args.push(OsString::from("--permission-mode"));
             args.push(OsString::from("bypassPermissions"));
             args.push(OsString::from("--allowedTools"));
-            args.push(OsString::from(req.allowed_tools.join(",")));
+            let tools = req.allowed_tools.as_deref().unwrap_or(&[]);
+            args.push(OsString::from(tools.join(",")));
         }
 
         // Narrow sandbox write paths to token scope when present.
