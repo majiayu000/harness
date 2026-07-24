@@ -32,7 +32,7 @@ async fn make_trigger_with_challenger(
     let events = Arc::new(EventStore::new(dir).await.expect("event store"));
     let gc_config = harness_core::config::misc::GcConfig::default();
     let signal_detector = SignalDetector::new(
-        gc_config.signal_thresholds.clone().into(),
+        gc_config.signal_thresholds.clone(),
         harness_core::types::ProjectId::new(),
     );
     let draft_store = DraftStore::new(dir).expect("draft store");

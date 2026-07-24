@@ -5,7 +5,7 @@ use harness_core::types::{
 
 fn make_test_gc_agent(dir: &std::path::Path) -> GcAgent {
     let signal_detector = SignalDetector::new(
-        crate::signal_detector::SignalThresholds::default(),
+        harness_core::config::misc::SignalThresholdsConfig::default(),
         ProjectId::new(),
     );
     let draft_store = DraftStore::new(dir).unwrap();
@@ -87,7 +87,7 @@ fn auto_adopt_matching_rules_only_adopts_rule_drafts_under_prefix() {
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
     let signal_detector = SignalDetector::new(
-        crate::signal_detector::SignalThresholds::default(),
+        harness_core::config::misc::SignalThresholdsConfig::default(),
         ProjectId::new(),
     );
     let draft_store = DraftStore::new(sandbox.path()).unwrap();
@@ -186,7 +186,7 @@ fn adopt_rejects_parent_dir_traversal() {
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
     let signal_detector = SignalDetector::new(
-        crate::signal_detector::SignalThresholds::default(),
+        harness_core::config::misc::SignalThresholdsConfig::default(),
         ProjectId::new(),
     );
     let draft_store = DraftStore::new(&project_root).unwrap();
@@ -375,7 +375,7 @@ fn auto_adopt_skips_rejected() {
     let project_root = sandbox.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
     let signal_detector = SignalDetector::new(
-        crate::signal_detector::SignalThresholds::default(),
+        harness_core::config::misc::SignalThresholdsConfig::default(),
         ProjectId::new(),
     );
     let draft_store = DraftStore::new(sandbox.path()).unwrap();

@@ -1251,7 +1251,6 @@ dependencies = [
  "harness-exec",
  "harness-gc",
  "harness-observe",
- "harness-protocol",
  "harness-rules",
  "harness-server",
  "harness-skills",
