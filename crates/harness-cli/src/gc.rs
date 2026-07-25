@@ -5,7 +5,6 @@ use harness_core::{
 use harness_gc::draft_store::DraftStore;
 use harness_gc::gc_agent::GcAgent;
 use harness_gc::signal_detector::SignalDetector;
-use harness_gc::signal_detector::SignalThresholds as GcThresholds;
 use harness_observe::event_store::EventStore;
 use std::sync::Arc;
 
@@ -47,12 +46,11 @@ pub async fn run_gc(
             let external_signals = event_store.query_external_signals(None)?;
             event_store.shutdown().await;
 
-            let thresholds = map_thresholds(&config.gc.signal_thresholds);
-            let signal_detector = SignalDetector::new(thresholds, project_id);
-            let gc_config = map_gc_config(&config.gc);
+            let signal_detector =
+                SignalDetector::new(config.gc.signal_thresholds.clone(), project_id);
             let draft_store = DraftStore::new(data_dir)?;
             let gc_agent = GcAgent::new(
-                gc_config,
+                config.gc.clone(),
                 signal_detector,
                 draft_store,
                 project.root.clone(),
@@ -142,7 +140,7 @@ fn make_agent_for_draft_ops(
     let project_id = project_id_from_root(project_root);
     Ok(GcAgent::new(
         GcConfig::default(),
-        SignalDetector::new(GcThresholds::default(), project_id),
+        SignalDetector::new(Default::default(), project_id),
         draft_store,
         project_root.to_path_buf(),
     ))
@@ -200,20 +198,4 @@ fn project_id_from_root(project_root: &std::path::Path) -> ProjectId {
 
 fn count_by_status(drafts: &[Draft], status: DraftStatus) -> usize {
     drafts.iter().filter(|d| d.status == status).count()
-}
-
-fn map_thresholds(t: &harness_core::config::misc::SignalThresholdsConfig) -> GcThresholds {
-    GcThresholds {
-        repeated_warn_min: t.repeated_warn_min,
-        chronic_block_min: t.chronic_block_min,
-        hot_file_edits_min: t.hot_file_edits_min,
-        slow_op_threshold_ms: t.slow_op_threshold_ms,
-        slow_op_count_min: t.slow_op_count_min,
-        escalation_ratio: t.escalation_ratio,
-        violation_min: t.violation_min,
-    }
-}
-
-fn map_gc_config(c: &harness_core::config::misc::GcConfig) -> GcConfig {
-    c.clone()
 }
