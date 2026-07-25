@@ -360,7 +360,12 @@ async fn exercise_real_caller_interleave(
             _ => unreachable!("only replay sites create events"),
         }
     }
-
+    let terminal_log_before_conflict =
+        if !superseded && matches!(site, RecoverySite::TerminalReplay) {
+            Some(std::fs::read(&log_path)?)
+        } else {
+            None
+        };
     let interleave = TaskDb::install_recovery_write_interleave_for_test(task_id.clone());
     let captured = CapturedSubscriber::default();
     let caller = async {
@@ -399,7 +404,6 @@ async fn exercise_real_caller_interleave(
         actor_fields,
         "{site:?} {outcome_name} recovery must not rewrite actor-owned durable fields"
     );
-
     let output = captured.output();
     if superseded {
         let counters = caller_result?;
@@ -443,10 +447,15 @@ async fn exercise_real_caller_interleave(
             "{site:?} {outcome_name} must exclude success wording {success_wording:?}: {output}"
         );
     }
-    if !superseded && matches!(site, RecoverySite::TerminalReplay) {
+    if let Some(expected_bytes) = terminal_log_before_conflict {
         assert!(
             !output.contains("compacted log"),
             "terminal replay conflict must return before compaction: {output}"
+        );
+        assert_eq!(
+            std::fs::read(&log_path)?,
+            expected_bytes,
+            "terminal replay conflict must preserve JSONL bytes exactly"
         );
     }
     Ok(())
@@ -561,9 +570,25 @@ async fn lost_cas_is_superseded_only_with_authoritative_evidence() -> anyhow::Re
         TaskRecoveryWriteOutcome::Superseded,
         "a replay without PR evidence must not conflict with an equivalent terminal writer that supplied a PR"
     );
+    let resume_without_pr_id = "superseded-resume-without-pr-terminal-with-pr";
+    db.insert(&seed_task(RecoverySite::ResumeWithPr, resume_without_pr_id))
+        .await?;
+    db.apply_replayed_state_outcome(resume_without_pr_id, Some(PR_URL), Some("done"))
+        .await?;
+    let scheduler = target_scheduler(RecoverySite::ResumeWithoutPr);
+    assert_eq!(
+        db.apply_checkpoint_resume_without_pr_at_version(
+            resume_without_pr_id,
+            None,
+            &scheduler,
+            &serde_json::to_string(&scheduler)?,
+            0,
+        )
+        .await?,
+        TaskRecoveryWriteOutcome::Superseded
+    );
     Ok(())
 }
-
 #[tokio::test]
 async fn contradictory_or_still_eligible_stale_write_is_conflict() -> anyhow::Result<()> {
     if !database_tests_configured() {
@@ -618,7 +643,26 @@ async fn contradictory_or_still_eligible_stale_write_is_conflict() -> anyhow::Re
             .await?,
         TaskRecoveryWriteOutcome::Conflict { .. }
     ));
-
+    let resume_different_pr_id = "conflict-resume-different-pr";
+    db.insert(&seed_task(
+        RecoverySite::ResumeWithPr,
+        resume_different_pr_id,
+    ))
+    .await?;
+    db.apply_replayed_state_outcome(resume_different_pr_id, Some(OTHER_PR_URL), Some("done"))
+        .await?;
+    let scheduler = target_scheduler(RecoverySite::ResumeWithPr);
+    assert!(matches!(
+        db.apply_checkpoint_resume_with_pr_at_version(
+            resume_different_pr_id,
+            PR_URL,
+            &scheduler,
+            &serde_json::to_string(&scheduler)?,
+            0,
+        )
+        .await?,
+        TaskRecoveryWriteOutcome::Conflict { .. }
+    ));
     let different_terminal_id = "conflict-different-terminal";
     db.insert(&seed_task(
         RecoverySite::TerminalReplay,
@@ -639,7 +683,6 @@ async fn contradictory_or_still_eligible_stale_write_is_conflict() -> anyhow::Re
     ));
     Ok(())
 }
-
 #[tokio::test]
 async fn repeated_recovery_converges_without_rewrite() -> anyhow::Result<()> {
     if !database_tests_configured() {

@@ -533,12 +533,19 @@ impl TaskDb {
             }
             RecoveryWriteIntent::PrReplay { pr_url } => snapshot.pr_url.as_deref() == Some(pr_url),
             RecoveryWriteIntent::Resume { pr_url, scheduler } => {
-                let pr_matches = snapshot.pr_url.as_deref() == pr_url;
+                let exact_pr_matches = snapshot.pr_url.as_deref() == pr_url;
                 let exact_target = current_status == TaskStatus::Pending
                     && snapshot.error.is_none()
                     && current_scheduler == *scheduler
-                    && pr_matches;
-                exact_target || (current_status.is_terminal() && pr_matches)
+                    && exact_pr_matches;
+                let terminal_pr_is_compatible = match pr_url {
+                    Some(pr_url) => snapshot.pr_url.as_deref() == Some(pr_url),
+                    None => snapshot
+                        .pr_url
+                        .as_deref()
+                        .is_none_or(|url| parse_pr_num_from_url(url).is_some()),
+                };
+                exact_target || (current_status.is_terminal() && terminal_pr_is_compatible)
             }
             RecoveryWriteIntent::Fail { error, scheduler } => {
                 let exact_target = current_status == TaskStatus::Failed

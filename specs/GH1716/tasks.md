@@ -30,8 +30,10 @@ GH-1716
 - Done when: exactly one affected row is the only applied case; more than one
   row is an invariant error; zero rows require a fresh action-specific read;
   equivalent, absent, and explicitly obsolete rows supersede; eligible or
-  contradictory rows return structured conflict context; no conflict is
-  retried within the invocation.
+  contradictory rows return structured conflict context; a resume with no
+  intended PR accepts a terminal writer's valid PR binding as obsolete, while
+  a resume with an intended PR requires an exact match; no conflict is retried
+  within the invocation.
 - Verify:
   `cargo test -p harness-server --lib task_db::queries_recovery_tests::write_outcomes_are_closed_and_exclusive`;
   `cargo test -p harness-server --lib task_db::queries_recovery_tests::lost_cas_is_superseded_only_with_authoritative_evidence`;
@@ -91,8 +93,9 @@ GH-1716
   only for applied writes.
 - Done when: all eighteen interleaving cases assert their own UPDATE outcome,
   counters and logs exclude superseded/conflicting writes, different PR and
-  nonmatching terminal evidence conflict, decode failures remain errors, and
-  replay conflict preserves terminal evidence.
+  nonmatching terminal evidence conflict, no-PR resume accepts a terminal
+  writer's valid PR binding, decode failures remain errors, and replay conflict
+  preserves terminal JSONL bytes exactly.
 - Verify: run the focused `task_db::queries_recovery_tests` matrix with an
   isolated disposable `HARNESS_DATABASE_URL`, plus
   `cargo test -p harness-server --lib event_replay` and
