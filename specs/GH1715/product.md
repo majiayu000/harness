@@ -49,9 +49,12 @@ request processing depends on.
 4. **B-004:** The valid and idempotent state/event pairs are exactly those in
    the Transition Contract below. Repetition may refresh compatible metadata
    only where the contract explicitly permits it.
-5. **B-005:** A repeated PR- or task-binding event is idempotent only when it
-   preserves the existing identity. A conflicting PR number, task identity,
-   or merge-attempt identity is an error rather than a replacement.
+5. **B-005:** Before `PrOpen`, `PrDetected` may replace the task bound to the
+   prior scheduling, implementation, or feedback stage with the task that
+   detected the PR. Once the workflow is `PrOpen`, repeated PR detection is
+   idempotent only when both task and PR bindings are compatible. Every other
+   conflicting PR number, task identity, or merge-attempt identity is an error
+   rather than a replacement.
 6. **B-006:** Feedback recovery remains valid: a stale `claim:` placeholder
    may be reclaimed, and a placeholder may be replaced by its real feedback
    task. An unrelated active feedback task may not be replaced.
@@ -63,13 +66,10 @@ request processing depends on.
    returns the error to the caller.
 9. **B-009:** Rejection is never reported as success or downgraded to an
    ignored event. Store errors propagate to existing outer callers for logging
-   or mapping according to their own contract; the Tier-C review fallback must
-   not discard a failed `record_ready_to_merge_with_fallback` call or persist
-   task completion first. The lifecycle write must succeed before the server
-   records `TaskStatus::Done`, a `ready_to_merge` round, runtime feedback, or a
-   completion event. Repeating merge approval from `Done` is an accepted
-   idempotent event; merge approval from every other non-`ReadyToMerge` state is
-   an error.
+   or mapping according to their own contract. Scheduling metadata and review
+   fallback snapshots are applied only after lifecycle validation succeeds.
+   Repeating merge approval from `Done` is an accepted idempotent event; merge
+   approval from every other non-`ReadyToMerge` state is an error.
 10. **B-010:** Existing serialized workflow rows remain readable without a
     migration, and valid existing paths retain their current wire states and
     metadata effects.
@@ -96,7 +96,7 @@ row explicitly authorizes a new stage binding.
 | `ImplementStarted` | `Discovered`, `AwaitingDependencies`, same-task `Scheduled`, same-task `Implementing` | `Implementing` | Bind the implementation task; clear review fallback. |
 | `ImplementStarted` | same-task `AddressingFeedback` | same | Retain feedback-stage state and task; clear review fallback. |
 | `PlanIssueDetected` | same-task `Scheduled`, same-task `Implementing` | `Implementing` | Bind the same task, replace `plan_concern` with the supplied detail, and clear review fallback. |
-| `PrDetected` | `Discovered`, same-task `Scheduled`, same-task `Implementing`, same-task `AddressingFeedback`, same-PR/task `PrOpen` | `PrOpen` | Bind the compatible PR number/URL/head and task; clear review fallback. `Discovered` preserves first-success recovery when PR evidence arrives before an earlier lifecycle write. |
+| `PrDetected` | `Discovered`, `Scheduled`, `Implementing`, `AddressingFeedback`, same-PR/task `PrOpen` | `PrOpen` | Bind the compatible PR number/URL/head and task; clear review fallback. Before `PrOpen`, a supplied task may replace the prior stage task. `Discovered` preserves first-success recovery when PR evidence arrives before an earlier lifecycle write. |
 | `FeedbackSweepCompleted` | `PrOpen`, `AwaitingFeedback` | `AwaitingFeedback` | Clear active task, feedback claim, and review fallback. |
 | `FeedbackFound` | `PrOpen`, `AwaitingFeedback`, `FeedbackClaimed` | `FeedbackClaimed` | Clear active task, refresh claim time, and fill only compatible PR fields. |
 | `FeedbackFound` | placeholder-backed `AddressingFeedback` | `FeedbackClaimed` | Reclaim the placeholder, clear active task, refresh claim time, and fill only compatible PR fields. |
@@ -130,18 +130,12 @@ illegal.
       audit-only terminal repetition and preservation of every unlisted field.
 - [ ] Store tests prove scheduling metadata and the Tier-C review fallback
       snapshot are applied only after their lifecycle event validates.
-- [ ] A server behavior test proves a rejected Tier-C lifecycle update leaves
-      the task non-`Done`, appends no `ready_to_merge` round, emits no runtime
-      ready-to-merge feedback, and records no completion event.
-- [ ] A server retry test proves a lifecycle-success/task-store-failure retry
-      preserves the first fallback snapshot and ultimately records exactly one
-      `ready_to_merge` round, runtime feedback result, and completion event.
 - [ ] Store tests prove rejected updates roll back without changing the
       persisted row.
 - [ ] Tests retain `Blocked -> Done`, human approval, repeated terminal event,
       feedback-claim recovery, `Scheduled -> PlanIssueDetected`,
-      first-success `Discovered -> PrDetected`, `Scheduled -> PrDetected`, and
-      `PrOpen -> FeedbackTaskScheduled`.
+      first-success `Discovered -> PrDetected`, pre-`PrOpen` stage-task handoff,
+      conflicting repeated `PrDetected`, and `PrOpen -> FeedbackTaskScheduled`.
 - [ ] No lifecycle enum, wire tag, database schema, canonical runtime file, or
       SpecRail workflow file changes.
 
@@ -164,7 +158,10 @@ illegal.
 
 - A delayed `PrDetected` arrives after the workflow is `Done`, `Failed`, or
   `Cancelled`.
-- A repeated `PrDetected` names a different PR from the durable binding.
+- A pre-`PrOpen` `PrDetected` binds a different task from the task used by the
+  prior stage.
+- A repeated `PrDetected` names a different task or PR from the durable
+  `PrOpen` binding.
 - A feedback claim is retried after a crash before the real task ID is bound.
 - A feedback-task event races with stale-claim reclamation.
 - An externally merged PR is observed while the legacy workflow is `Blocked`.

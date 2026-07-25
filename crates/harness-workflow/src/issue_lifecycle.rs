@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+#[cfg(test)]
+#[path = "issue_lifecycle_tests.rs"]
+mod lifecycle_transition_tests;
+
 /// Re-exported to preserve the `harness_workflow::issue_lifecycle::IssueWorkflowStore` path
 /// used by callers outside this crate.
 pub use crate::issue_workflow_store::{IssueMergeApprovalOutcome, IssueWorkflowStore};
