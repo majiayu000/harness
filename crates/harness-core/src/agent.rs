@@ -315,7 +315,10 @@ pub struct TurnRequest {
     pub execution_phase: Option<ExecutionPhase>,
     pub sandbox_mode: Option<SandboxMode>,
     pub approval_policy: Option<String>,
-    pub allowed_tools: Vec<String>,
+    /// `None` = full profile (no tool restriction). `Some(list)` = restricted
+    /// profile — an empty list means deny-all and must NOT be promoted to full
+    /// permissions (mirrors `AgentRequest::allowed_tools`).
+    pub allowed_tools: Option<Vec<String>>,
     pub context: Vec<ContextItem>,
     pub timeout_secs: Option<u64>,
     pub env_vars: HashMap<String, String>,
@@ -336,6 +339,13 @@ impl TurnRequest {
         self.prompt_layers
             .as_ref()
             .and_then(AgentPromptLayers::static_system_prompt_for_cache)
+    }
+
+    /// True when no tool restriction applies (full profile). Mirrors
+    /// `AgentRequest::uses_dangerously_skip_permissions`: a `Some` list — even
+    /// an empty one — is a restricted profile.
+    pub fn uses_dangerously_skip_permissions(&self) -> bool {
+        self.allowed_tools.is_none()
     }
 }
 
