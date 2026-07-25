@@ -246,21 +246,27 @@ mod tests {
         };
         let actor = async {
             interleave.wait_until_selected().await;
-            sqlx::query("UPDATE tasks SET version = version + 1 WHERE store_key = $1 AND id = $2")
+            let result = async {
+                sqlx::query(
+                    "UPDATE tasks SET version = version + 1 WHERE store_key = $1 AND id = $2",
+                )
                 .bind(&store_key)
                 .bind(task_id)
                 .execute(&pool)
                 .await?;
-            let fields: (String, Option<String>, Option<String>, String, i32) = sqlx::query_as(
-                "SELECT status, pr_url, error, scheduler_state, version \
-                 FROM tasks WHERE store_key = $1 AND id = $2",
-            )
-            .bind(&store_key)
-            .bind(task_id)
-            .fetch_one(&pool)
-            .await?;
+                let fields: (String, Option<String>, Option<String>, String, i32) = sqlx::query_as(
+                    "SELECT status, pr_url, error, scheduler_state, version \
+                     FROM tasks WHERE store_key = $1 AND id = $2",
+                )
+                .bind(&store_key)
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await?;
+                anyhow::Ok(fields)
+            }
+            .await;
             interleave.release();
-            anyhow::Ok(fields)
+            result
         };
         let (startup_result, actor_fields) = tokio::join!(startup, actor);
         let error = match startup_result {

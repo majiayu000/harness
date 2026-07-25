@@ -12,7 +12,6 @@ use tracing::{Event, Id, Metadata, Subscriber};
 const PR_URL: &str = "https://github.com/owner/repo/pull/1716";
 const OTHER_PR_URL: &str = "https://github.com/owner/repo/pull/999";
 const FAILURE_ERROR: &str = "recovered after restart";
-
 #[derive(Debug, Clone, Copy)]
 enum RecoverySite {
     TerminalReplay,
@@ -22,7 +21,6 @@ enum RecoverySite {
     NoCheckpointFailure,
     TransientFailure,
 }
-
 const RECOVERY_SITES: [RecoverySite; 6] = [
     RecoverySite::TerminalReplay,
     RecoverySite::PrReplay,
@@ -388,14 +386,17 @@ async fn exercise_real_caller_interleave(
     };
     let actor = async {
         interleave.wait_until_selected().await;
-        if superseded {
-            write_equivalent_result(&db, site, &task_id).await?;
-        } else {
-            bump_version(&db, &task_id).await?;
+        let result = async {
+            if superseded {
+                write_equivalent_result(&db, site, &task_id).await?;
+            } else {
+                bump_version(&db, &task_id).await?;
+            }
+            durable_recovery_fields(&db, &task_id).await
         }
-        let durable = durable_recovery_fields(&db, &task_id).await?;
+        .await;
         interleave.release();
-        anyhow::Ok(durable)
+        result
     };
     let (caller_result, actor_fields) = tokio::join!(caller, actor);
     let actor_fields = actor_fields?;
@@ -469,7 +470,6 @@ fn write_outcomes_are_closed_and_exclusive() {
     assert!(!TaskRecoveryWriteOutcome::Superseded
         .applied_or_error()
         .expect("superseded should succeed without counting"));
-
     let error = TaskRecoveryWriteOutcome::Conflict {
         action: "test recovery",
         task_id: "task-1".to_string(),
