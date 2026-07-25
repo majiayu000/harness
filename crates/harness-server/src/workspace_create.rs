@@ -49,16 +49,19 @@ impl WorkspaceManager {
             {
                 return Ok(WorkspaceLease {
                     workspace_path: active.workspace_path.clone(),
+                    #[cfg(test)]
                     owner_session: active.owner_session.clone(),
+                    #[cfg(test)]
                     run_generation,
+                    #[cfg(test)]
                     decision: WorkspaceAcquireDecision::ReusedTracked,
+                    #[cfg(test)]
                     project_key: active.project_key.clone(),
+                    #[cfg(test)]
                     slot_index: active.slot_index,
                 });
             }
             return Err(WorkspaceLifecycleError::LiveForeignOwner {
-                workspace_path: active.workspace_path.clone(),
-                workspace_owner: Some(active.owner_session.clone()),
                 message: format!(
                     "WorktreeCollision: workspace path {:?} already owned by another harness session; manual resolution required",
                     active.workspace_path
@@ -70,8 +73,6 @@ impl WorkspaceManager {
             Ok(permit) => permit,
             Err(err) => {
                 return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: self.config.root.clone(),
-                    workspace_owner: None,
                     message: format!(
                         "workspace pool acquisition failed for task {}: {err}",
                         task_id.0
@@ -90,16 +91,19 @@ impl WorkspaceManager {
             {
                 return Ok(WorkspaceLease {
                     workspace_path: active.workspace_path.clone(),
+                    #[cfg(test)]
                     owner_session: active.owner_session.clone(),
+                    #[cfg(test)]
                     run_generation,
+                    #[cfg(test)]
                     decision: WorkspaceAcquireDecision::ReusedTracked,
+                    #[cfg(test)]
                     project_key: active.project_key.clone(),
+                    #[cfg(test)]
                     slot_index: active.slot_index,
                 });
             }
             return Err(WorkspaceLifecycleError::LiveForeignOwner {
-                workspace_path: active.workspace_path.clone(),
-                workspace_owner: Some(active.owner_session.clone()),
                 message: format!(
                     "WorktreeCollision: workspace path {:?} already owned by another harness session; manual resolution required",
                     active.workspace_path
@@ -109,15 +113,11 @@ impl WorkspaceManager {
         // Validate inputs to prevent unexpected git behavior.
         if !is_valid_branch_name(base_branch) {
             return Err(WorkspaceLifecycleError::CreateFailed {
-                workspace_path: self.config.root.join(&workspace_project_key),
-                workspace_owner: None,
                 message: format!("invalid base_branch: {base_branch:?}"),
             });
         }
         if !is_valid_branch_name(remote) {
             return Err(WorkspaceLifecycleError::CreateFailed {
-                workspace_path: self.config.root.join(&workspace_project_key),
-                workspace_owner: None,
                 message: format!("invalid remote: {remote:?}"),
             });
         }
@@ -125,8 +125,6 @@ impl WorkspaceManager {
         let branch = format!("{}{}", options.branch_prefix, task_id.0);
         if !is_valid_branch_name(&branch) {
             return Err(WorkspaceLifecycleError::CreateFailed {
-                workspace_path: self.config.root.join(&workspace_project_key),
-                workspace_owner: None,
                 message: format!("invalid workspace branch: {branch:?}"),
             });
         }
@@ -162,8 +160,6 @@ impl WorkspaceManager {
                     }),
                     Err(err) => {
                         return Err(WorkspaceLifecycleError::CreateFailed {
-                            workspace_path: self.config.root.join(&workspace_project_key),
-                            workspace_owner: None,
                             message: format!(
                                 "failed to inspect released workspace lease for workspace key {}: {err}",
                                 owner_record_workspace_key
@@ -200,8 +196,6 @@ impl WorkspaceManager {
                     Ok(slots) => slots,
                     Err(err) => {
                         return Err(WorkspaceLifecycleError::CreateFailed {
-                            workspace_path: self.config.root.join(&workspace_project_key),
-                            workspace_owner: None,
                             message: format!(
                                 "failed to inspect persisted workspace leases for project {project_key}: {err}"
                             ),
@@ -228,8 +222,6 @@ impl WorkspaceManager {
                     continue;
                 }
                 return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: self.config.root.join(&workspace_project_key),
-                    workspace_owner: None,
                     message: format!(
                         "workspace pool exhausted for project {project_key}; no free persisted slot after acquiring permit"
                     ),
@@ -241,8 +233,6 @@ impl WorkspaceManager {
             let process_started_at = if self.lease_store.is_some() {
                 WorkspaceLeaseStore::current_process_started_at().map_err(|err| {
                     WorkspaceLifecycleError::CreateFailed {
-                        workspace_path: workspace_path.clone(),
-                        workspace_owner: Some(owner_session.clone()),
                         message: format!("failed to identify workspace lease process: {err}"),
                     }
                 })?
@@ -288,8 +278,6 @@ impl WorkspaceManager {
                 }
                 Err(err) => {
                     return Err(WorkspaceLifecycleError::CreateFailed {
-                        workspace_path,
-                        workspace_owner: Some(owner_session.clone()),
                         message: format!("failed to persist workspace lease: {err}"),
                     });
                 }
@@ -302,19 +290,12 @@ impl WorkspaceManager {
                 Entry::Occupied(occ) => {
                     let owner_task = occ.get().clone();
                     if owner_task != task_id.clone() {
-                        let (existing_path, workspace_owner) = self
+                        let existing_path = self
                             .active
                             .get(&owner_task)
-                            .map(|entry| {
-                                (
-                                    entry.workspace_path.clone(),
-                                    Some(entry.owner_session.clone()),
-                                )
-                            })
-                            .unwrap_or_else(|| (workspace_path.clone(), None));
+                            .map(|entry| entry.workspace_path.clone())
+                            .unwrap_or_else(|| workspace_path.clone());
                         Some(WorkspaceLifecycleError::LiveForeignOwner {
-                            workspace_path: existing_path.clone(),
-                            workspace_owner,
                             message: format!(
                                 "WorktreeCollision: workspace path {:?} already reserved by active task {}; manual resolution required",
                                 existing_path,
@@ -353,11 +334,8 @@ impl WorkspaceManager {
                 Entry::Occupied(occ) => {
                     let active = occ.get();
                     let active_path = active.workspace_path.clone();
-                    let active_owner = active.owner_session.clone();
                     self.release_active_path(task_id, &workspace_path);
                     Some(WorkspaceLifecycleError::LiveForeignOwner {
-                        workspace_path: active_path.clone(),
-                        workspace_owner: Some(active_owner),
                         message: format!(
                             "WorktreeCollision: workspace path {:?} already owned by another harness session; manual resolution required",
                             active_path
@@ -401,7 +379,7 @@ impl WorkspaceManager {
         drop(slot_guard);
 
         let git_ops_guard = self.git_ops.lock().await;
-        let mut decision = WorkspaceAcquireDecision::CreatedFresh;
+        let mut _decision = WorkspaceAcquireDecision::CreatedFresh;
         let workspace_path_exists = workspace_path.exists();
         let missing_path_registered_worktree = if workspace_path_exists {
             false
@@ -425,8 +403,6 @@ impl WorkspaceManager {
             Err(e) => {
                 self.release_workspace(task_id).await;
                 return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: Some(owner_session.clone()),
                     message: format!("git fetch failed for task {}: {e}", task_id.0),
                 });
             }
@@ -443,8 +419,6 @@ impl WorkspaceManager {
             if options.require_remote_head {
                 self.release_workspace(task_id).await;
                 return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: Some(owner_session.clone()),
                     message: format!(
                         "git fetch {remote} {base_branch} failed for task {}: {}",
                         task_id.0,
@@ -475,8 +449,6 @@ impl WorkspaceManager {
             {
                 self.release_workspace(task_id).await;
                 return Err(WorkspaceLifecycleError::LiveForeignOwner {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: owner_record.map(|record| record.owner_session),
                     message: format!(
                         "WorktreeCollision: workspace path {:?} is managed by another harness session; manual resolution required",
                         workspace_path
@@ -493,7 +465,7 @@ impl WorkspaceManager {
                 && (reacquired_released_task_slot || reacquired_released_path)
                 && owner_record_matches_current_workspace;
             if can_reuse_without_reset {
-                decision = WorkspaceAcquireDecision::ReusedRecovered;
+                _decision = WorkspaceAcquireDecision::ReusedRecovered;
                 tracing::info!(
                     task_id = %task_id.0,
                     path = ?workspace_path,
@@ -518,15 +490,13 @@ impl WorkspaceManager {
                         );
                     }
                     return Err(WorkspaceLifecycleError::ReconcileFailed {
-                        workspace_path: workspace_path.clone(),
-                        workspace_owner: owner_record.map(|record| record.owner_session),
                         message: format!(
                             "workspace slot reset failed for task {} at {:?}: {err}",
                             task_id.0, workspace_path
                         ),
                     });
                 }
-                decision = WorkspaceAcquireDecision::RecreatedStale;
+                _decision = WorkspaceAcquireDecision::RecreatedStale;
             }
 
             let owner_record = WorkspaceOwnerRecord {
@@ -538,24 +508,26 @@ impl WorkspaceManager {
             if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
                 self.release_workspace(task_id).await;
                 return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: Some(owner_session.clone()),
                     message: format!("failed to persist workspace owner record: {err}"),
                 });
             }
             drop(git_ops_guard);
             return Ok(WorkspaceLease {
                 workspace_path,
+                #[cfg(test)]
                 owner_session,
+                #[cfg(test)]
                 run_generation,
-                decision,
+                #[cfg(test)]
+                decision: _decision,
+                #[cfg(test)]
                 project_key,
+                #[cfg(test)]
                 slot_index,
             });
         }
 
         if workspace_path_exists || missing_path_registered_worktree {
-            let owner_record = read_owner_record(&workspace_path);
             if let Err(err) = cleanup_workspace_path_with_registration(
                 source_repo,
                 &workspace_path,
@@ -565,15 +537,13 @@ impl WorkspaceManager {
             {
                 self.release_workspace(task_id).await;
                 return Err(WorkspaceLifecycleError::ReconcileFailed {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: owner_record.map(|record| record.owner_session),
                     message: format!(
                         "workspace lifecycle reconciliation failed for task {} at {:?}: {err}",
                         task_id.0, workspace_path
                     ),
                 });
             }
-            decision = WorkspaceAcquireDecision::RecreatedStale;
+            _decision = WorkspaceAcquireDecision::RecreatedStale;
         }
 
         // Create git worktree based on remote/base_branch (latest upstream).
@@ -609,8 +579,6 @@ impl WorkspaceManager {
                     );
                 }
                 return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: Some(owner_session.clone()),
                     message: format!("git worktree add failed for task {}: {e}", task_id.0),
                 });
             }
@@ -633,8 +601,6 @@ impl WorkspaceManager {
                     );
                 }
                 return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: Some(owner_session.clone()),
                     message: format!(
                         "git worktree add from {remote_ref} failed for task {}: {}",
                         task_id.0, stderr
@@ -672,8 +638,6 @@ impl WorkspaceManager {
                         );
                     }
                     return Err(WorkspaceLifecycleError::CreateFailed {
-                        workspace_path: workspace_path.clone(),
-                        workspace_owner: Some(owner_session.clone()),
                         message: format!(
                             "git worktree add fallback failed for task {}: {e}",
                             task_id.0
@@ -698,8 +662,6 @@ impl WorkspaceManager {
                     );
                 }
                 return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path: workspace_path.clone(),
-                    workspace_owner: Some(owner_session.clone()),
                     message: format!("git worktree add failed for task {}: {}", task_id.0, stderr),
                 });
             }
@@ -721,8 +683,6 @@ impl WorkspaceManager {
                 );
             }
             return Err(WorkspaceLifecycleError::CreateFailed {
-                workspace_path: workspace_path.clone(),
-                workspace_owner: Some(owner_session.clone()),
                 message: format!("failed to persist workspace owner record: {err}"),
             });
         }
@@ -758,20 +718,21 @@ impl WorkspaceManager {
                     );
                 }
                 self.release_workspace(task_id).await;
-                return Err(WorkspaceLifecycleError::CreateFailed {
-                    workspace_path,
-                    workspace_owner: Some(owner_session),
-                    message: err_msg,
-                });
+                return Err(WorkspaceLifecycleError::CreateFailed { message: err_msg });
             }
         }
 
         Ok(WorkspaceLease {
             workspace_path,
+            #[cfg(test)]
             owner_session,
+            #[cfg(test)]
             run_generation,
-            decision,
+            #[cfg(test)]
+            decision: _decision,
+            #[cfg(test)]
             project_key,
+            #[cfg(test)]
             slot_index,
         })
     }

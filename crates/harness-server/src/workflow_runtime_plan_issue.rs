@@ -415,7 +415,12 @@ Workflow policy
         )
         .await;
 
-        assert!(matches!(action, PlanIssueRuntimeAction::Block { .. }));
+        match action {
+            PlanIssueRuntimeAction::Block { error } => {
+                assert!(error.contains("PLAN_ISSUE persisted after replan"));
+            }
+            _ => panic!("expected PlanIssueRuntimeAction::Block"),
+        }
     }
 
     #[tokio::test]

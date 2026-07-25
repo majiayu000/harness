@@ -197,7 +197,7 @@ async fn make_state_inner(
             .await?,
     );
     let signal_detector = harness_gc::signal_detector::SignalDetector::new(
-        server.config.gc.signal_thresholds.clone().into(),
+        server.config.gc.signal_thresholds.clone(),
         harness_core::types::ProjectId::new(),
     );
     let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;

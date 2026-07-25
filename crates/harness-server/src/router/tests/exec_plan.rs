@@ -15,7 +15,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
     .await?;
     let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
     let signal_detector = harness_gc::signal_detector::SignalDetector::new(
-        server.config.gc.signal_thresholds.clone().into(),
+        server.config.gc.signal_thresholds.clone(),
         harness_core::types::ProjectId::new(),
     );
     let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;

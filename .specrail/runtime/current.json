@@ -1,0 +1,207 @@
+{
+  "checkpoint_version": 3,
+  "updated_at": "2026-07-23T18:01:49Z",
+  "status": "blocked",
+  "overall_objective": "Use implx auto to drain all actionable issues and PRs for majiayu000/harness: GH1716, GH1715, and GH1717.",
+  "queue_mode": "full_queue_drain",
+  "auth_mode": "auto",
+  "goal": {
+    "goal_id": "019f8e3a-4762-72a3-a6ec-5c82cedc6d8e",
+    "status": "blocked",
+    "objective": "Drain the full actionable GH1715-GH1717 queue using the runtime checkpoint plus fresh remote truth."
+  },
+  "budget": {
+    "basis": "item_cap",
+    "item_cap": 3,
+    "compaction_budget": 1,
+    "observed_compaction_count": 1,
+    "telemetry_source": "unavailable",
+    "max_wall_clock_minutes": 120,
+    "max_tool_calls": 250,
+    "max_review_correction_rounds": 2,
+    "max_full_test_runs_per_head": 1,
+    "observed_tool_calls": 84,
+    "observed_review_correction_rounds": 2,
+    "observed_full_test_runs_per_head": 0
+  },
+  "tranche_id": "implx-auto-20260723-01",
+  "tranche_started_at": "2026-07-23T10:45:00Z",
+  "spec_coverage": {
+    "complete": [1715, 1716, 1717],
+    "needs_tasks": [],
+    "needs_spec": [],
+    "umbrella_covered": [],
+    "exception_allowed": []
+  },
+  "current_tranche": {
+    "issues": [1715, 1716, 1717],
+    "phase": "human_decision_gate",
+    "item_cap": 3
+  },
+  "completed_items": [
+    {
+      "issue": 1715,
+      "pr": 1721,
+      "head_sha": "6fda547ad9b81d629c44aee2285ad081b6923a91",
+      "status": "needs_human_repeat_rejection_and_scope_expansion",
+      "pr_kind": "mixed_impl",
+      "pr_tier": "heavy"
+    },
+    {
+      "issue": 1716,
+      "pr": 1722,
+      "head_sha": "bde9ffdfdc364346c7596962dc38c9b3059135cd",
+      "status": "needs_human_repeat_rejection",
+      "pr_kind": "mixed_impl",
+      "pr_tier": "heavy"
+    },
+    {
+      "issue": 1717,
+      "pr": 1723,
+      "head_sha": "8c408d4e33d874483b76be9d331d9b85e16150c9",
+      "status": "merged_and_issue_closed",
+      "pr_kind": "mixed_impl",
+      "pr_tier": "heavy"
+    }
+  ],
+  "remaining_queue": [
+    {
+      "issue": 1715,
+      "spec_status": "complete",
+      "existing_prs": [1718, 1721],
+      "blocker": "repeat_rejection on PrOpen repeated-PrDetected mutation evidence; registry migration fixture fix would expand approved planned paths.",
+      "next_action": "Human decides whether to authorize another evidence correction and the test-only registry fixture path expansion."
+    },
+    {
+      "issue": 1716,
+      "spec_status": "complete",
+      "existing_prs": [1719, 1722],
+      "blocker": "repeat_rejection after two correction rounds: no Superseded checkpoint case reaches TaskStore startup aggregate branches.",
+      "next_action": "Human decides whether the missing TaskStore-level Superseded evidence is required or waives the repeated review rejection."
+    }
+  ],
+  "tranche_mix": {
+    "spec_pr_count": 0,
+    "impl_pr_count": 0,
+    "consecutive_spec_only": 0
+  },
+  "duplicate_work_evidence": {
+    "source": "manual_live_equivalent",
+    "open_prs": [1721, 1722],
+    "merged_spec_prs": [1718, 1719, 1720],
+    "remote_spec_branch_contents_match_main": true,
+    "implementation_branch_conflicts": []
+  },
+  "capability_gaps": [
+    "Repository pack does not include checks/github_duplicate_evidence.py.",
+    "Repository pack does not include checks/runtime_ledger_gate.py."
+  ],
+  "gates": {
+    "route_gate": {
+      "1715": "allowed",
+      "1716": "allowed",
+      "1717": "allowed"
+    },
+    "spec_check": {
+      "1715": "passed",
+      "1716": "passed",
+      "1717": "passed"
+    },
+    "pr_gate": {
+      "1721": "blocked_repeat_rejection_and_scope_expansion",
+      "1722": "blocked_repeat_rejection",
+      "1723": "merged_external_by_user"
+    },
+    "review_threads": {
+      "1721": "pending",
+      "1722": "pending",
+      "1723": "clean_zero_unresolved_before_merge"
+    },
+    "merge_authorization": "implx auto invocation"
+  },
+  "thread_dispatch_gate": {
+    "explicit_thread_request": false,
+    "native_subagents": true,
+    "spawn_requirement": "required",
+    "fallback_mode": null,
+    "planned_native_threads": [
+      "GH1715 writable worker with exclusive lifecycle/store/server-review paths",
+      "GH1716 writable worker with exclusive task recovery/event replay paths",
+      "GH1717 writable worker with exclusive protocol/context handler paths"
+    ],
+    "native_thread_evidence": {
+      "spawned_agents": [
+        {
+          "lane_id": "gh1716_worker",
+          "agent_id_or_thread_id": "/root/gh1716_worker",
+          "role": "worker",
+          "status": "completed_with_repeat_rejection",
+          "result_collected": true
+        },
+        {
+          "lane_id": "gh1715_worker",
+          "agent_id_or_thread_id": "/root/gh1715_worker",
+          "role": "worker",
+          "status": "completed_with_repeat_rejection",
+          "result_collected": true
+        },
+        {
+          "lane_id": "gh1717_planner",
+          "agent_id_or_thread_id": "/root/gh1717_planner",
+          "role": "planner",
+          "status": "completed_with_reviews",
+          "wait_evidence": "bounded_wait_returned",
+          "result_collected": true
+        }
+      ]
+    },
+    "no_spawn_reason": null
+  },
+  "human_decisions": [
+    {
+      "issue": 1716,
+      "pr": 1722,
+      "reason": "repeat_rejection after the maximum two review correction rounds",
+      "decision_needed": "Require a TaskStore-startup Superseded aggregate test or waive that final evidence gap."
+    },
+    {
+      "issue": 1715,
+      "pr": 1721,
+      "reason": "repeat_rejection on required PrOpen repeated-PrDetected mutation evidence. Current CI also proves the stale registry migration fixture fails at Scheduled + PrDetected with binding_conflict; the smallest fix adds crates/harness-server/src/http/builders/registry_migration.rs outside approved planned paths.",
+      "decision_needed": "Authorize another review correction and the test-only planned-path expansion, waive the remaining evidence, or keep PR #1721 blocked."
+    }
+  ],
+  "closure_evidence": {
+    "1717": {
+      "issue_state": "closed",
+      "issue_state_reason": "completed",
+      "issue_closed_at": "2026-07-23T17:57:16Z",
+      "pr": 1723,
+      "pr_state": "merged",
+      "head_sha": "8c408d4e33d874483b76be9d331d9b85e16150c9",
+      "merge_commit_sha": "05b95428de95b54b168064d2611a724978d5cd78",
+      "merged_at": "2026-07-23T17:57:15Z",
+      "merged_by": "majiayu000"
+    }
+  },
+  "artifacts": {
+    "1723_current_head_ci": "/tmp/harness-pr1723-checks-head-8c408d4e.log",
+    "1723_current_head_evidence": "/tmp/harness-pr1723-evidence-current.json",
+    "1723_current_head_pr_gate": "/tmp/harness-pr1723-pr-gate-current.json"
+  },
+  "remote_refresh": {
+    "checked_at": "2026-07-23T18:01:49Z",
+    "origin_main_sha": "05b95428de95b54b168064d2611a724978d5cd78",
+    "local_main_sha": "05b95428de95b54b168064d2611a724978d5cd78",
+    "open_impl_prs": [1721, 1722],
+    "open_issues": [1715, 1716],
+    "truth_level": "A"
+  },
+  "blocked_audit": {
+    "consecutive_goal_turns": 3,
+    "condition": "Only the same two human decisions remain for repeat-rejected PRs #1721 and #1722.",
+    "verified_at": "2026-07-23T18:01:49Z"
+  },
+  "stop_reason": "only_human_decisions_remain",
+  "resume_prompt": "Use implx auto; resume from .specrail/runtime/current.json and fresh remote truth. PR #1723 is merged and issue #1717 is closed. Do not retry PR #1721 or #1722 until the user explicitly authorizes the focused evidence corrections recorded in human_decisions."
+}

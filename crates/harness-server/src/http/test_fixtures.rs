@@ -165,7 +165,7 @@ async fn make_read_only_route_test_state_with_project_root(
     let review_task_queue = Arc::new(crate::task_queue::TaskQueue::new(&review_queue_config));
 
     let signal_detector = harness_gc::signal_detector::SignalDetector::new(
-        server.config.gc.signal_thresholds.clone().into(),
+        server.config.gc.signal_thresholds.clone(),
         harness_core::types::ProjectId::new(),
     );
     let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;

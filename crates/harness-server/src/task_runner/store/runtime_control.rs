@@ -2,6 +2,7 @@ use super::*;
 
 impl TaskStore {
     /// Register a broadcast channel for a task's stream. Call once before task execution starts.
+    #[cfg(test)]
     pub(crate) fn register_task_stream(&self, id: &TaskId) {
         let (tx, _rx) = broadcast::channel(TASK_STREAM_CAPACITY);
         self.stream_txs.insert(id.clone(), tx);
@@ -17,6 +18,7 @@ impl TaskStore {
     /// No-op when no stream is registered. Dropping the send result is intentional:
     /// `SendError` only occurs when there are no active receivers, which is normal
     /// when no SSE client is connected (backpressure: oldest events dropped on lag).
+    #[cfg(test)]
     pub(crate) fn publish_stream_item(&self, id: &TaskId, item: StreamItem) {
         if let Some(tx) = self.stream_txs.get(id) {
             if let Err(e) = tx.send(item) {
@@ -26,18 +28,9 @@ impl TaskStore {
     }
 
     /// Remove the task's stream channel after execution completes.
+    #[cfg(test)]
     pub(crate) fn close_task_stream(&self, id: &TaskId) {
         self.stream_txs.remove(id);
-    }
-
-    /// Store the abort handle for a running task so it can be cancelled later.
-    pub(crate) fn store_abort_handle(&self, id: &TaskId, handle: tokio::task::AbortHandle) {
-        self.abort_handles.insert(id.clone(), handle);
-    }
-
-    /// Remove and discard the abort handle when the task finishes normally.
-    pub(crate) fn remove_abort_handle(&self, id: &TaskId) {
-        self.abort_handles.remove(id);
     }
 
     /// Abort the running task's Tokio future, if one is registered.

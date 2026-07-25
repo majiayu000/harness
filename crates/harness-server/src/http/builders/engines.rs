@@ -192,7 +192,7 @@ pub(crate) async fn build_engines(
 
     // ── GC agent ─────────────────────────────────────────────────────────────
     let signal_detector = harness_gc::signal_detector::SignalDetector::new(
-        server.config.gc.signal_thresholds.clone().into(),
+        server.config.gc.signal_thresholds.clone(),
         harness_core::types::ProjectId::from_str(
             project_root
                 .file_name()

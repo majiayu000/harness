@@ -84,7 +84,7 @@ fn turn_request_uses_same_claude_layer_split() {
         execution_phase: None,
         sandbox_mode: None,
         approval_policy: None,
-        allowed_tools: vec![],
+        allowed_tools: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),

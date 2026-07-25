@@ -6,10 +6,10 @@
 
 #[cfg(test)]
 use harness_agents::compress_model::build_observation_compressor;
-use harness_agents::compress_model::build_seeded_observation_compressor;
 use harness_core::compress::{
     CompressError, CompressHint, NapStatus, ObsSource, ObservationCompressor,
 };
+#[cfg(test)]
 use harness_core::config::compression::CompressionConfig;
 use std::sync::Arc;
 
@@ -32,24 +32,6 @@ impl TaskObservationCompressionSession {
     }
 }
 
-pub(crate) fn start_task_observation_session(
-    config: &CompressionConfig,
-    task_id: &TaskId,
-) -> Option<Arc<TaskObservationCompressionSession>> {
-    build_task_observation_compressor(config, task_id)
-        .map(|compressor| Arc::new(TaskObservationCompressionSession { compressor }))
-}
-
-pub(crate) async fn scope_completion_observation_session<F>(
-    session: Arc<TaskObservationCompressionSession>,
-    future: F,
-) -> F::Output
-where
-    F: std::future::Future,
-{
-    COMPLETION_OBSERVATION_SESSION.scope(session, future).await
-}
-
 pub(crate) fn completion_observation_session() -> Option<Arc<TaskObservationCompressionSession>> {
     COMPLETION_OBSERVATION_SESSION.try_with(Arc::clone).ok()
 }
@@ -70,19 +52,6 @@ pub(crate) trait RawObservationSink: Send + Sync {
         artifact_type: &str,
         raw: &str,
     ) -> anyhow::Result<()>;
-}
-
-/// Build one compressor for the full task lifecycle so sampling and breaker
-/// state accumulate across prompt-injection seams and transient retries.
-///
-/// GH-1574 still needs separate wiring for triage-to-plan, workflow-runtime,
-/// and composer seams. Plan-to-implement and live-task cross-review share this
-/// task-scoped handle.
-pub(crate) fn build_task_observation_compressor(
-    config: &CompressionConfig,
-    task_id: &TaskId,
-) -> Option<TaskObservationCompressor> {
-    build_seeded_observation_compressor(config, task_id.as_str())
 }
 
 /// Compress a prior agent's output before injecting it into the next
@@ -158,29 +127,10 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use harness_core::compress::{
-        ActionSketch, CompressModel, CompressModelError, CompressModelOutput, Compressed,
-        CompressorCallUsage, CompressorUsage, PromptCompressor,
+        ActionSketch, CompressModel, CompressModelError, CompressModelOutput, CompressorCallUsage,
+        PromptCompressor,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct StaticCompressor(&'static str);
-
-    #[async_trait]
-    impl ObservationCompressor for StaticCompressor {
-        async fn compress(
-            &self,
-            obs: &str,
-            _hint: &CompressHint,
-        ) -> Result<Compressed, CompressError> {
-            Ok(Compressed {
-                text: self.0.to_string(),
-                original_tokens: obs.len() as u32,
-                compressed_tokens: 1,
-                compressor_usage: CompressorUsage::default(),
-                nap: NapStatus::SkippedSample,
-            })
-        }
-    }
 
     #[tokio::test]
     async fn missing_compressor_returns_raw_unchanged() {
@@ -270,52 +220,5 @@ mod tests {
         assert_eq!(compressor.nap_checked(), 5);
         assert_eq!(compressor.nap_failed(), 5);
         assert_eq!(summaries.load(Ordering::Relaxed), 5);
-    }
-
-    #[tokio::test]
-    async fn completion_scope_exposes_only_the_exact_session() {
-        let old = test_task_observation_session(Arc::new(StaticCompressor("old")));
-        let new = test_task_observation_session(Arc::new(StaticCompressor("new")));
-
-        assert!(completion_observation_session().is_none());
-        scope_completion_observation_session(Arc::clone(&old), async {
-            assert!(Arc::ptr_eq(
-                &old,
-                &completion_observation_session().unwrap()
-            ));
-            scope_completion_observation_session(Arc::clone(&new), async {
-                assert!(Arc::ptr_eq(
-                    &new,
-                    &completion_observation_session().unwrap()
-                ));
-            })
-            .await;
-            assert!(Arc::ptr_eq(
-                &old,
-                &completion_observation_session().unwrap()
-            ));
-        })
-        .await;
-        assert!(completion_observation_session().is_none());
-    }
-
-    #[tokio::test]
-    async fn concurrent_completion_scopes_do_not_cross_sessions() {
-        let first = test_task_observation_session(Arc::new(StaticCompressor("first")));
-        let second = test_task_observation_session(Arc::new(StaticCompressor("second")));
-
-        let first_scope = scope_completion_observation_session(Arc::clone(&first), async {
-            tokio::task::yield_now().await;
-            Arc::ptr_eq(&first, &completion_observation_session().unwrap())
-        });
-        let second_scope = scope_completion_observation_session(Arc::clone(&second), async {
-            tokio::task::yield_now().await;
-            Arc::ptr_eq(&second, &completion_observation_session().unwrap())
-        });
-
-        let (first_isolated, second_isolated) = tokio::join!(first_scope, second_scope);
-        assert!(first_isolated);
-        assert!(second_isolated);
-        assert!(completion_observation_session().is_none());
     }
 }
