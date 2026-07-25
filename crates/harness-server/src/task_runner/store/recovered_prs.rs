@@ -120,7 +120,7 @@ pub(super) fn recovered_pr_candidate(task: &TaskState) -> Option<RecoveredPrCand
         return None;
     }
     let pr_url = task.pr_url.as_ref()?.clone();
-    if super::super::spawn::parse_pr_url(&pr_url).is_none() {
+    if parse_pr_url(&pr_url).is_none() {
         tracing::warn!(
             task_id = %task.id.0,
             pr_url,
@@ -139,7 +139,7 @@ async fn check_recovered_pr_state(
     github_token: Option<&str>,
 ) -> Option<RecoveredPrStatusUpdate> {
     let RecoveredPrCandidate { task_id, pr_url } = candidate;
-    let Some((owner, repo, pr_number)) = super::super::spawn::parse_pr_url(&pr_url) else {
+    let Some((owner, repo, pr_number)) = parse_pr_url(&pr_url) else {
         tracing::warn!(
             task_id = %task_id.0,
             pr_url,
@@ -232,4 +232,19 @@ async fn check_recovered_pr_state(
         );
         None
     }
+}
+
+fn parse_pr_url(pr_url: &str) -> Option<(String, String, u64)> {
+    // Strip fragment (e.g. #discussion_r...)
+    let url = pr_url.split('#').next().unwrap_or(pr_url);
+    let parts: Vec<&str> = url.trim_end_matches('/').split('/').collect();
+    // Expected: ["https:", "", "github.com", owner, repo, "pull", number]
+    let pull_idx = parts.iter().rposition(|&p| p == "pull")?;
+    if pull_idx + 1 >= parts.len() || pull_idx < 2 {
+        return None;
+    }
+    let number: u64 = parts[pull_idx + 1].parse().ok()?;
+    let repo = parts[pull_idx - 1].to_string();
+    let owner = parts[pull_idx - 2].to_string();
+    Some((owner, repo, number))
 }

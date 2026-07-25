@@ -187,6 +187,7 @@ pub struct PersistedRequestSettings {
 }
 
 impl PersistedRequestSettings {
+    #[cfg(test)]
     pub(crate) fn from_req(req: &CreateTaskRequest) -> Self {
         Self {
             definition_id: req.definition_id.clone(),
@@ -292,6 +293,7 @@ impl Default for CreateTaskRequest {
     }
 }
 
+#[cfg(test)]
 pub fn summarize_request_description(req: &CreateTaskRequest) -> Option<String> {
     let task_kind = req.task_kind();
     // Only persist structured safe labels — never raw prompt text, which may contain

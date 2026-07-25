@@ -1,23 +1,6 @@
 use super::*;
 
 impl TaskStore {
-    /// Persist an artifact captured from agent output during task execution.
-    pub(crate) async fn insert_artifact(
-        &self,
-        task_id: &TaskId,
-        turn: u32,
-        artifact_type: &str,
-        content: &str,
-    ) {
-        if let Err(e) = self
-            .db
-            .insert_artifact(&task_id.0, turn, artifact_type, content)
-            .await
-        {
-            tracing::warn!(task_id = %task_id.0, artifact_type, "failed to insert task artifact: {e}");
-        }
-    }
-
     /// Return all artifacts for a task ordered by insertion time.
     pub async fn list_artifacts(
         &self,
@@ -25,19 +8,6 @@ impl TaskStore {
     ) -> anyhow::Result<Vec<crate::task_db::TaskArtifact>> {
         record_task_runner_usage();
         self.db.list_artifacts(&task_id.0).await
-    }
-
-    /// Persist a redacted agent prompt for a task turn (fire-and-forget wrapper).
-    pub(crate) async fn save_prompt(
-        &self,
-        task_id: &TaskId,
-        turn: u32,
-        phase: &str,
-        prompt: &str,
-    ) -> anyhow::Result<()> {
-        self.db
-            .save_task_prompt(&task_id.0, turn, phase, prompt)
-            .await
     }
 
     /// Return all persisted prompts for a task ordered by turn.
@@ -56,6 +26,7 @@ impl TaskStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn insert(&self, state: &TaskState) {
         let mut state = state.clone();
         state.reconcile_scheduler_with_status();
@@ -72,40 +43,12 @@ impl TaskStore {
         });
     }
 
-    /// Write a phase checkpoint for `task_id`. Checkpoint writes are non-fatal:
-    /// callers should log the error rather than failing the task.
-    pub(crate) async fn write_checkpoint(
-        &self,
-        task_id: &TaskId,
-        triage_output: Option<&str>,
-        plan_output: Option<&str>,
-        pr_url: Option<&str>,
-        last_phase: &str,
-    ) -> anyhow::Result<()> {
-        self.db
-            .write_checkpoint(
-                task_id.as_str(),
-                triage_output,
-                plan_output,
-                pr_url,
-                last_phase,
-            )
-            .await
-    }
-
-    /// Load the checkpoint for `task_id`, or `None` if no checkpoint exists.
-    pub(crate) async fn load_checkpoint(
-        &self,
-        task_id: &TaskId,
-    ) -> anyhow::Result<Option<crate::task_db::TaskCheckpoint>> {
-        self.db.load_checkpoint(task_id.as_str()).await
-    }
-
     /// Overwrite `external_id` on an auto-fix task, even if one is already set.
     ///
     /// Used during streaming to implement "last sentinel wins" — the agent may
     /// emit multiple `CREATED_ISSUE=` lines as it self-corrects.  Updates both
     /// the DB and the in-memory cache so dedup reads are immediately consistent.
+    #[cfg(test)]
     pub(crate) async fn overwrite_external_id_auto_fix(
         &self,
         id: &TaskId,

@@ -9,18 +9,16 @@ pub enum UsageProbeSurface {
     TurnRpc,
     ThreadManager,
     TaskDb,
-    TaskExecutor,
     TaskRunner,
     HarnessEval,
 }
 
 impl UsageProbeSurface {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::ThreadRpc,
         Self::TurnRpc,
         Self::ThreadManager,
         Self::TaskDb,
-        Self::TaskExecutor,
         Self::TaskRunner,
         Self::HarnessEval,
     ];
@@ -31,7 +29,6 @@ impl UsageProbeSurface {
             Self::TurnRpc => "turn_rpc",
             Self::ThreadManager => "thread_manager",
             Self::TaskDb => "task_db",
-            Self::TaskExecutor => "task_executor",
             Self::TaskRunner => "task_runner",
             Self::HarnessEval => "harness_eval",
         }
@@ -43,7 +40,6 @@ impl UsageProbeSurface {
             Self::TurnRpc => &TURN_RPC_COUNT,
             Self::ThreadManager => &THREAD_MANAGER_COUNT,
             Self::TaskDb => &TASK_DB_COUNT,
-            Self::TaskExecutor => &TASK_EXECUTOR_COUNT,
             Self::TaskRunner => &TASK_RUNNER_COUNT,
             Self::HarnessEval => &HARNESS_EVAL_COUNT,
         }
@@ -60,7 +56,6 @@ static THREAD_RPC_COUNT: AtomicU64 = AtomicU64::new(0);
 static TURN_RPC_COUNT: AtomicU64 = AtomicU64::new(0);
 static THREAD_MANAGER_COUNT: AtomicU64 = AtomicU64::new(0);
 static TASK_DB_COUNT: AtomicU64 = AtomicU64::new(0);
-static TASK_EXECUTOR_COUNT: AtomicU64 = AtomicU64::new(0);
 static TASK_RUNNER_COUNT: AtomicU64 = AtomicU64::new(0);
 static HARNESS_EVAL_COUNT: AtomicU64 = AtomicU64::new(0);
 

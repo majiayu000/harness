@@ -1,7 +1,6 @@
 mod artifacts;
 mod metrics;
 mod request;
-pub(super) mod spawn;
 mod state;
 mod store;
 mod types;
@@ -21,13 +20,6 @@ pub use request::{
     fill_missing_repo_from_project, CreateTaskRequest, PersistedRequestSettings, SystemTaskInput,
     MAX_TASK_PRIORITY,
 };
-use spawn::{
-    check_awaiting_deps as check_awaiting_deps_impl,
-    register_pending_task as register_pending_task_impl,
-    spawn_preregistered_task as spawn_preregistered_task_impl, spawn_task as spawn_task_impl,
-    spawn_task_awaiting_deps as spawn_task_awaiting_deps_impl,
-};
-pub use spawn::{effective_turn_timeout, prompt_requires_plan, resolve_canonical_project};
 pub use state::{
     RecentFailureTask, RoundResult, SchedulerAuthorityState, SchedulerOwner, SchedulerOwnerKind,
     TaskSchedulerState, TaskState, TaskSummary, TaskWorkflowSummary,
@@ -46,100 +38,6 @@ fn record_task_runner_usage() {
     harness_core::usage_probe::record_usage(
         harness_core::usage_probe::UsageProbeSurface::TaskRunner,
     );
-}
-
-pub async fn spawn_task(
-    store: Arc<TaskStore>,
-    agent: Arc<dyn harness_core::agent::CodeAgent>,
-    reviewer: Option<Arc<dyn harness_core::agent::CodeAgent>>,
-    server_config: Arc<harness_core::config::HarnessConfig>,
-    skills: Arc<tokio::sync::RwLock<harness_skills::store::SkillStore>>,
-    events: Arc<harness_observe::event_store::EventStore>,
-    interceptors: impl Into<crate::task_executor::SharedTurnInterceptors>,
-    req: CreateTaskRequest,
-    workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
-    permit: crate::task_queue::TaskPermit,
-    completion_callback: Option<CompletionCallback>,
-    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
-    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
-    allowed_project_roots: Vec<std::path::PathBuf>,
-) -> TaskId {
-    record_task_runner_usage();
-    spawn_task_impl(
-        store,
-        agent,
-        reviewer,
-        server_config,
-        skills,
-        events,
-        interceptors,
-        req,
-        workspace_mgr,
-        permit,
-        completion_callback,
-        issue_workflow_store,
-        workflow_runtime_store,
-        allowed_project_roots,
-    )
-    .await
-}
-
-pub async fn register_pending_task(store: Arc<TaskStore>, req: &CreateTaskRequest) -> TaskId {
-    record_task_runner_usage();
-    register_pending_task_impl(store, req).await
-}
-
-pub async fn spawn_preregistered_task(
-    task_id: TaskId,
-    store: Arc<TaskStore>,
-    agent: Arc<dyn harness_core::agent::CodeAgent>,
-    reviewer: Option<Arc<dyn harness_core::agent::CodeAgent>>,
-    server_config: Arc<harness_core::config::HarnessConfig>,
-    skills: Arc<tokio::sync::RwLock<harness_skills::store::SkillStore>>,
-    events: Arc<harness_observe::event_store::EventStore>,
-    interceptors: impl Into<crate::task_executor::SharedTurnInterceptors>,
-    req: CreateTaskRequest,
-    workspace_mgr: Option<Arc<crate::workspace::WorkspaceManager>>,
-    permit: crate::task_queue::TaskPermit,
-    completion_callback: Option<CompletionCallback>,
-    issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
-    workflow_runtime_store: Option<Arc<harness_workflow::runtime::WorkflowRuntimeStore>>,
-    allowed_project_roots: Vec<std::path::PathBuf>,
-    group_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) {
-    record_task_runner_usage();
-    spawn_preregistered_task_impl(
-        task_id,
-        store,
-        agent,
-        reviewer,
-        server_config,
-        skills,
-        events,
-        interceptors,
-        req,
-        workspace_mgr,
-        permit,
-        completion_callback,
-        issue_workflow_store,
-        workflow_runtime_store,
-        allowed_project_roots,
-        group_permit,
-    )
-    .await;
-}
-
-pub async fn spawn_task_awaiting_deps(
-    store: Arc<TaskStore>,
-    req: CreateTaskRequest,
-) -> anyhow::Result<TaskId> {
-    record_task_runner_usage();
-    spawn_task_awaiting_deps_impl(store, req).await
-}
-
-pub async fn check_awaiting_deps(store: &TaskStore) -> (Vec<TaskId>, Vec<TaskId>) {
-    record_task_runner_usage();
-    check_awaiting_deps_impl(store).await
 }
 
 pub async fn update_status(
