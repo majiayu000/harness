@@ -88,26 +88,6 @@ impl TaskStore {
         self.db.exists_by_id(id.0.as_str()).await
     }
 
-    /// Return the status of a dependency task with a single DB lookup.
-    ///
-    /// Checks the in-memory cache first; falls back to a lightweight
-    /// `SELECT status` query (no `rounds` JSON decode) for terminal tasks
-    /// evicted from the startup cache.  Returns `None` when the task is
-    /// unknown in both cache and DB, or when the DB call fails.
-    pub(crate) async fn dep_status(&self, id: &TaskId) -> Option<TaskStatus> {
-        if let Some(task) = self.cache.get(id) {
-            return Some(task.status.clone());
-        }
-        match self.db.get_status_only(id.0.as_str()).await {
-            Ok(Some(s)) => s.parse::<TaskStatus>().ok(),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(task_id = %id.0, "DB error fetching dep status: {e}; treating as absent");
-                None
-            }
-        }
-    }
-
     /// Return tasks that are in an active status and have not been updated for
     /// at least `stale_threshold`.  Delegates to [`TaskDb::list_stalled_tasks`].
     pub async fn list_stalled_tasks(

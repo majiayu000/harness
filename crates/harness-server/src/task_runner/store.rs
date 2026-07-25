@@ -24,6 +24,7 @@ mod transitions;
 
 /// Broadcast channel capacity for per-task stream events.
 /// When the buffer is full, the oldest events are dropped for lagging receivers.
+#[cfg(test)]
 const TASK_STREAM_CAPACITY: usize = 512;
 
 fn record_task_runner_usage() {

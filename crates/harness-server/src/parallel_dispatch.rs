@@ -50,13 +50,6 @@ pub(crate) fn parallel_subtask_id(task_id: &TaskId, index: usize) -> TaskId {
     TaskId::from_str(&format!("{}-p{index}", task_id.as_str()))
 }
 
-pub(crate) fn synthetic_subtask_ids(task_id: &TaskId) -> Vec<TaskId> {
-    let mut ids = Vec::with_capacity(MAX_PARALLEL + 1);
-    ids.push(sequential_subtask_id(task_id));
-    ids.extend((0..MAX_PARALLEL).map(|index| parallel_subtask_id(task_id, index)));
-    ids
-}
-
 /// Build the `allowed_write_paths` list for a capability token.
 ///
 /// The sandbox policy suppresses the blanket `/tmp` grant whenever token paths

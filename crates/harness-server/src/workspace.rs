@@ -147,6 +147,7 @@ struct WorkspaceOwnerRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceAcquireDecision {
     CreatedFresh,
+    #[cfg(test)]
     ReusedTracked,
     ReusedRecovered,
     RecreatedStale,
@@ -155,54 +156,23 @@ pub(crate) enum WorkspaceAcquireDecision {
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceLease {
     pub(crate) workspace_path: PathBuf,
+    #[cfg(test)]
     pub(crate) owner_session: String,
+    #[cfg(test)]
     pub(crate) run_generation: u32,
+    #[cfg(test)]
     pub(crate) decision: WorkspaceAcquireDecision,
+    #[cfg(test)]
     pub(crate) project_key: String,
+    #[cfg(test)]
     pub(crate) slot_index: u32,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum WorkspaceLifecycleError {
-    LiveForeignOwner {
-        workspace_path: PathBuf,
-        workspace_owner: Option<String>,
-        message: String,
-    },
-    ReconcileFailed {
-        workspace_path: PathBuf,
-        workspace_owner: Option<String>,
-        message: String,
-    },
-    CreateFailed {
-        workspace_path: PathBuf,
-        workspace_owner: Option<String>,
-        message: String,
-    },
-}
-
-impl WorkspaceLifecycleError {
-    pub(crate) fn workspace_path(&self) -> &Path {
-        match self {
-            Self::LiveForeignOwner { workspace_path, .. }
-            | Self::ReconcileFailed { workspace_path, .. }
-            | Self::CreateFailed { workspace_path, .. } => workspace_path.as_path(),
-        }
-    }
-
-    pub(crate) fn workspace_owner(&self) -> Option<&str> {
-        match self {
-            Self::LiveForeignOwner {
-                workspace_owner, ..
-            }
-            | Self::ReconcileFailed {
-                workspace_owner, ..
-            }
-            | Self::CreateFailed {
-                workspace_owner, ..
-            } => workspace_owner.as_deref(),
-        }
-    }
+    LiveForeignOwner { message: String },
+    ReconcileFailed { message: String },
+    CreateFailed { message: String },
 }
 
 impl std::fmt::Display for WorkspaceLifecycleError {
@@ -427,30 +397,6 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    pub(crate) async fn remove_workspace_family(&self, task_id: &TaskId) -> anyhow::Result<()> {
-        let mut first_error = None;
-        if let Err(error) = self.remove_workspace(task_id).await {
-            first_error = Some(error);
-        }
-        for subtask_id in crate::parallel_dispatch::synthetic_subtask_ids(task_id) {
-            if let Err(error) = self.remove_workspace(&subtask_id).await {
-                tracing::warn!(
-                    task_id = %task_id.0,
-                    subtask_id = %subtask_id.0,
-                    "failed to remove synthetic subtask workspace: {error}"
-                );
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        if let Some(error) = first_error {
-            Err(error)
-        } else {
-            Ok(())
-        }
-    }
-
     /// Release the in-memory lease without deleting the workspace on disk.
     ///
     /// Used when `auto_cleanup=false` so a later task with the same deterministic
@@ -470,13 +416,6 @@ impl WorkspaceManager {
                     "failed to release persisted workspace lease for inactive task: {error}"
                 );
             }
-        }
-    }
-
-    pub(crate) async fn release_workspace_family(&self, task_id: &TaskId) {
-        self.release_workspace(task_id).await;
-        for subtask_id in crate::parallel_dispatch::synthetic_subtask_ids(task_id) {
-            self.release_workspace(&subtask_id).await;
         }
     }
 

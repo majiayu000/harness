@@ -230,6 +230,7 @@ pub(super) fn required_u64_field(data: &serde_json::Value, field: &str) -> anyho
         .ok_or_else(|| anyhow::anyhow!("runtime issue workflow is missing {field}"))
 }
 
+#[cfg(test)]
 pub(super) fn event_type(outcome: PrFeedbackOutcome) -> &'static str {
     match outcome {
         PrFeedbackOutcome::BlockingFeedback => "FeedbackFound",
@@ -238,6 +239,7 @@ pub(super) fn event_type(outcome: PrFeedbackOutcome) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(super) fn outcome_label(outcome: PrFeedbackOutcome) -> &'static str {
     match outcome {
         PrFeedbackOutcome::BlockingFeedback => "blocking_feedback",

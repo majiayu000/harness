@@ -1,3 +1,4 @@
+use crate::context::{ContextPreviewItem, ContextPreviewRequest};
 use harness_core::types::{
     DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId,
 };
@@ -151,9 +152,9 @@ pub enum Method {
 
     // === Context composer ===
     ContextPreview {
-        request: harness_context::ComposeRequest,
+        request: ContextPreviewRequest,
         #[serde(default)]
-        supplied_items: Vec<harness_context::ContextItem>,
+        supplied_items: Vec<ContextPreviewItem>,
     },
 }
 

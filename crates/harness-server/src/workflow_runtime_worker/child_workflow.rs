@@ -123,7 +123,19 @@ pub(super) async fn execute_start_child_workflow(
         .unwrap_or(false)
     {
         let labels = string_vec(command, "labels");
-        let force_execute = force_execute_from_project_policy(project_id, &labels);
+        let force_execute = {
+            // load_workflow_config does synchronous disk IO; keep it off the
+            // async executor thread.
+            let project_id = project_id.to_string();
+            let labels = labels.clone();
+            tokio::task::spawn_blocking(move || {
+                force_execute_from_project_policy(&project_id, &labels)
+            })
+            .await
+            .map_err(|join_error| {
+                anyhow::anyhow!("force-execute policy load task failed: {join_error}")
+            })??
+        };
         let task_id = issue_task_id_from_command(command, job, repo, issue_number);
         let issue_task_prefix = issue_task_prefix_from_task_id(&task_id, issue_number);
         if !issue_submission_recorded(store, &child, &task_id).await? {

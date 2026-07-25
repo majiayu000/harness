@@ -1,15 +1,18 @@
 use crate::workflow_runtime_submission::TaskId;
+#[cfg(test)]
 use harness_workflow::runtime::{
-    build_local_review_completed_decision, build_local_review_request_decision,
-    build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_sweep_decision,
-    build_pr_hygiene_repair_decision, DecisionValidator, LocalReviewCompletedInput,
-    LocalReviewDecisionInput, LocalReviewOutcome, PrDetectedDecisionInput, PrFeedbackDecisionInput,
-    PrFeedbackOutcome, PrFeedbackSweepDecisionInput, PrHygieneRepairDecisionInput,
-    ValidationContext, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
-    WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
-    WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY,
+    build_local_review_completed_decision, build_pr_detected_decision, build_pr_feedback_decision,
+    LocalReviewCompletedInput, LocalReviewOutcome, PrDetectedDecisionInput,
+    PrFeedbackDecisionInput, PrFeedbackOutcome, WorkflowCommand, WorkflowCommandType,
+};
+use harness_workflow::runtime::{
+    build_local_review_request_decision, build_pr_feedback_sweep_decision,
+    build_pr_hygiene_repair_decision, DecisionValidator, LocalReviewDecisionInput,
+    PrFeedbackSweepDecisionInput, PrHygieneRepairDecisionInput, ValidationContext,
+    WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition,
+    WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -19,11 +22,13 @@ const DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS: u64 = 24 * 60 * 60;
 mod command_state;
 mod persistence;
 pub(crate) mod pr_detection;
+#[cfg(test)]
 mod pr_lifecycle_persist;
 mod targets;
 
 use command_state::*;
 use persistence::*;
+#[cfg(test)]
 use pr_lifecycle_persist::{
     issue_workflow_id, persist_pr_lifecycle_with_retry, pr_lifecycle_workflow_id,
 };
@@ -33,6 +38,7 @@ use pr_lifecycle_persist::{
 };
 use targets::*;
 
+#[cfg(test)]
 pub(crate) struct PrDetectedRuntimeContext<'a> {
     pub project_root: &'a Path,
     pub repo: Option<&'a str>,
@@ -42,6 +48,7 @@ pub(crate) struct PrDetectedRuntimeContext<'a> {
     pub pr_url: &'a str,
 }
 
+#[cfg(test)]
 pub(crate) struct PrFeedbackRuntimeContext<'a> {
     pub project_root: &'a Path,
     pub repo: Option<&'a str>,
@@ -53,6 +60,7 @@ pub(crate) struct PrFeedbackRuntimeContext<'a> {
     pub summary: &'a str,
 }
 
+#[cfg(test)]
 pub(crate) struct LocalReviewPassedRuntimeContext<'a> {
     pub project_root: &'a Path,
     pub repo: Option<&'a str>,
@@ -63,6 +71,7 @@ pub(crate) struct LocalReviewPassedRuntimeContext<'a> {
     pub summary: &'a str,
 }
 
+#[cfg(test)]
 pub(crate) struct PrMergedRuntimeContext<'a> {
     pub project_root: &'a Path,
     pub repo: Option<&'a str>,
@@ -134,6 +143,7 @@ fn runtime_task_id_from_instance(instance: &WorkflowInstance) -> String {
         .unwrap_or_else(|| format!("runtime:{}", instance.id))
 }
 
+#[cfg(test)]
 fn pr_lifecycle_failure_instance(
     project_root: &Path,
     repo: Option<&str>,
@@ -196,6 +206,7 @@ pub(crate) enum RuntimeMergeApprovalOutcome {
     },
 }
 
+#[cfg(test)]
 pub(crate) async fn record_pr_detected(
     store: Option<&WorkflowRuntimeStore>,
     ctx: PrDetectedRuntimeContext<'_>,
@@ -247,6 +258,7 @@ pub(crate) async fn record_pr_detected(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn record_pr_feedback(
     store: Option<&WorkflowRuntimeStore>,
     ctx: PrFeedbackRuntimeContext<'_>,
@@ -301,6 +313,7 @@ pub(crate) async fn record_pr_feedback(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn record_local_review_passed(
     store: Option<&WorkflowRuntimeStore>,
     ctx: LocalReviewPassedRuntimeContext<'_>,
@@ -317,6 +330,7 @@ pub(crate) async fn record_local_review_passed(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn record_pr_merged(
     store: Option<&WorkflowRuntimeStore>,
     ctx: PrMergedRuntimeContext<'_>,

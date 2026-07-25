@@ -59,7 +59,7 @@ pub mod services;
 pub mod skill_governor;
 pub mod stdio;
 pub mod task_db;
-pub mod task_executor;
+#[cfg(test)]
 pub(crate) mod workflow_runtime_plan_issue;
 pub(crate) mod workflow_runtime_policy;
 pub(crate) mod workflow_runtime_pr_feedback;
