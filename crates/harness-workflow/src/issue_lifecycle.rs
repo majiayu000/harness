@@ -259,6 +259,7 @@ impl IssueWorkflowInstance {
         }
     }
 
+    #[must_use = "state transitions can fail and the resulting error must be handled"]
     pub fn apply_event(
         &mut self,
         event: IssueLifecycleEvent,
@@ -268,6 +269,7 @@ impl IssueWorkflowInstance {
         Ok(())
     }
 
+    #[must_use = "state transitions can fail and the resulting error must be handled"]
     pub(crate) fn apply_event_with_review_fallback(
         &mut self,
         event: IssueLifecycleEvent,

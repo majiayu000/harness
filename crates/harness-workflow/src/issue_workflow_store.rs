@@ -421,7 +421,7 @@ impl IssueWorkflowStore {
             if let Some(detail) = detail {
                 event = event.with_detail(detail.to_string());
             }
-            Ok(workflow.apply_event_with_review_fallback(event, fallback.clone())?)
+            Ok(workflow.apply_event_with_review_fallback(event, fallback)?)
         })
         .await
     }
