@@ -1,3 +1,4 @@
+use anyhow::Context;
 use dashmap::DashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -37,8 +38,16 @@ pub(crate) async fn build_registry(
     tasks: &Arc<crate::task_runner::TaskStore>,
 ) -> anyhow::Result<RegistryBundle> {
     let configured_database_url = server.config.server.database_url.as_deref();
-    let workflow_config =
-        harness_core::config::workflow::load_workflow_config(project_root).unwrap_or_default();
+    // Fail closed: a malformed WORKFLOW.md must abort startup rather than
+    // silently booting with the default schema namespace and default policy.
+    // A missing WORKFLOW.md still yields the base/default config (Ok).
+    let workflow_config = harness_core::config::workflow::load_workflow_config(project_root)
+        .with_context(|| {
+            format!(
+                "failed to load workflow config for {}",
+                project_root.display()
+            )
+        })?;
     let workflow_ns = workflow_config.storage.schema_namespace;
     let mut startup_results = Vec::new();
     let plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>> = Arc::new(DashMap::new());

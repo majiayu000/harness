@@ -149,12 +149,17 @@ fn issue_task_id_from_dedupe_key(dedupe_key: &str, issue_number: u64) -> Option<
     Some(dedupe_key[..marker_end].to_string()).filter(|task_id| !task_id.is_empty())
 }
 
-pub(super) fn force_execute_from_project_policy(project_id: &str, labels: &[String]) -> bool {
+pub(super) fn force_execute_from_project_policy(
+    project_id: &str,
+    labels: &[String],
+) -> anyhow::Result<bool> {
+    // Fail closed: a malformed WORKFLOW.md must surface as a job error rather
+    // than silently falling back to the default force-execute label.
     let workflow_cfg = harness_core::config::workflow::load_workflow_config(Path::new(project_id))
-        .unwrap_or_default();
-    labels
+        .with_context(|| format!("failed to load workflow config for {project_id}"))?;
+    Ok(labels
         .iter()
-        .any(|label| label == &workflow_cfg.issue_workflow.force_execute_label)
+        .any(|label| label == &workflow_cfg.issue_workflow.force_execute_label))
 }
 
 pub(super) fn optional_data_u64(workflow: &WorkflowInstance, field: &str) -> Option<u64> {
@@ -558,6 +563,49 @@ mod tests {
         let task_id = issue_task_id_from_command(&command, &job, Some("owner/repo"), 42);
 
         assert_eq!(task_id.as_str(), "explicit-task");
+    }
+
+    #[test]
+    fn force_execute_policy_fails_closed_on_malformed_workflow_md() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            "---\nissue_workflow: [not, a, map\n---\nbody\n",
+        )
+        .expect("write malformed WORKFLOW.md");
+
+        let result = force_execute_from_project_policy(
+            dir.path().to_str().expect("utf8 path"),
+            &["force-execute".to_string()],
+        );
+
+        let error = result.expect_err("malformed WORKFLOW.md must error, not fall back");
+        assert!(
+            error.to_string().contains("failed to load workflow config"),
+            "error must name the config load failure, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn force_execute_policy_matches_default_label_without_workflow_md() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let default_label = harness_core::config::workflow::WorkflowConfig::default()
+            .issue_workflow
+            .force_execute_label;
+
+        let matched = force_execute_from_project_policy(
+            dir.path().to_str().expect("utf8 path"),
+            &[default_label],
+        )
+        .expect("missing WORKFLOW.md must fall back to defaults without error");
+        assert!(matched);
+
+        let unmatched = force_execute_from_project_policy(
+            dir.path().to_str().expect("utf8 path"),
+            &["unrelated-label".to_string()],
+        )
+        .expect("missing WORKFLOW.md must fall back to defaults without error");
+        assert!(!unmatched);
     }
 
     #[test]
