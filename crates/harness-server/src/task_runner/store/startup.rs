@@ -302,4 +302,89 @@ mod tests {
         }
         Ok(())
     }
+
+    #[tokio::test]
+    async fn invalid_task_pr_terminal_writer_supersedes_startup_resume() -> anyhow::Result<()> {
+        if std::env::var("HARNESS_DATABASE_URL").is_err() {
+            return Ok(());
+        }
+        let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("tasks.db");
+        let db = TaskDb::open(&db_path).await?;
+        let task_id = "startup-invalid-task-pr-superseded";
+        let mut task = TaskState::new(TaskId(task_id.to_string()));
+        task.status = TaskStatus::Implementing;
+        task.pr_url = Some("not-a-pr-url".to_string());
+        let mut terminal_scheduler = task.scheduler.clone();
+        terminal_scheduler.mark_terminal(&TaskStatus::Done);
+        let terminal_scheduler_json = serde_json::to_string(&terminal_scheduler)?;
+        db.insert(&task).await?;
+        db.write_checkpoint(task_id, None, Some("plan"), None, "planned")
+            .await?;
+
+        let interleave = TaskDb::install_recovery_write_interleave_for_test(task_id);
+        let pool = db.postgres_pool();
+        let store_key = db.store_key().to_string();
+        let captured = CapturedStartupLogs::default();
+        let startup = async {
+            let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
+            TaskStore::open(&db_path).await
+        };
+        let actor = async {
+            interleave.wait_until_selected().await;
+            let result = async {
+                sqlx::query(
+                    "UPDATE tasks SET status = 'done', pr_url = $1, scheduler_state = $2, \
+                     version = version + 1 WHERE store_key = $3 AND id = $4",
+                )
+                .bind("https://github.com/owner/repo/pull/1716")
+                .bind(&terminal_scheduler_json)
+                .bind(&store_key)
+                .bind(task_id)
+                .execute(&pool)
+                .await?;
+                let fields: (String, Option<String>, Option<String>, String, i32) = sqlx::query_as(
+                    "SELECT status, pr_url, error, scheduler_state, version \
+                     FROM tasks WHERE store_key = $1 AND id = $2",
+                )
+                .bind(&store_key)
+                .bind(task_id)
+                .fetch_one(&pool)
+                .await?;
+                anyhow::Ok(fields)
+            }
+            .await;
+            interleave.release();
+            result
+        };
+        let (startup_result, actor_fields) = tokio::join!(startup, actor);
+        let _store = startup_result?;
+        let actor_fields = actor_fields?;
+        let durable_fields: (String, Option<String>, Option<String>, String, i32) = sqlx::query_as(
+            "SELECT status, pr_url, error, scheduler_state, version \
+             FROM tasks WHERE store_key = $1 AND id = $2",
+        )
+        .bind(&store_key)
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            durable_fields, actor_fields,
+            "superseded startup recovery must not rewrite terminal actor fields"
+        );
+        let output = captured.output();
+        assert!(output.contains("action superseded by authoritative durable state"));
+        for success_wording in [
+            "startup recovery: resumed task",
+            "wrote back pr_url",
+            "resumed 1 task(s) from checkpoint",
+        ] {
+            assert!(
+                !output.contains(success_wording),
+                "superseded startup recovery must exclude success wording {success_wording:?}: {output}"
+            );
+        }
+        Ok(())
+    }
 }

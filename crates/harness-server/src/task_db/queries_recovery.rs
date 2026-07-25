@@ -193,7 +193,7 @@ impl TaskDb {
                 } else {
                     self.apply_checkpoint_resume_without_pr_at_version(
                         &row.id,
-                        row.task_pr_url.as_deref(),
+                        effective_pr_url,
                         &scheduler,
                         &scheduler_json,
                         row.version,
