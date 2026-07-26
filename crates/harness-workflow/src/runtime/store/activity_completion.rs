@@ -77,7 +77,7 @@ impl WorkflowRuntimeStore {
         result: &ActivityResult,
         transcript: Option<&PendingRuntimeTranscript>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
-        self.commit_runtime_activity_completion_inner(
+        self.commit_runtime_activity_completion_retrying(
             runtime_job_id,
             owner,
             lease_expires_at,
@@ -96,7 +96,7 @@ impl WorkflowRuntimeStore {
         lease_generation: Option<u64>,
         result: &ActivityResult,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
-        self.commit_runtime_activity_completion_inner(
+        self.commit_runtime_activity_completion_retrying(
             runtime_job_id,
             owner,
             lease_expires_at,
@@ -116,7 +116,7 @@ impl WorkflowRuntimeStore {
         result: &ActivityResult,
         transcript: Option<&PendingRuntimeTranscript>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
-        self.commit_runtime_activity_completion_inner(
+        self.commit_runtime_activity_completion_retrying(
             runtime_job_id,
             owner,
             lease_expires_at,
@@ -124,6 +124,35 @@ impl WorkflowRuntimeStore {
             result,
             transcript,
         )
+        .await
+    }
+
+    /// Runs the completion transaction, re-running it when PostgreSQL aborts
+    /// it to break a lock cycle. Retrying is safe: an aborted transaction
+    /// applied nothing, so the attempt starts from the same committed state.
+    ///
+    /// The lock order fix below makes this abort rare rather than routine —
+    /// this exists so a residual conflict costs a retry instead of failing the
+    /// runtime job.
+    async fn commit_runtime_activity_completion_retrying(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        lease_expires_at: DateTime<Utc>,
+        lease_generation: Option<u64>,
+        result: &ActivityResult,
+        transcript: Option<&PendingRuntimeTranscript>,
+    ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
+        lock_order::retry_on_transaction_abort("commit_runtime_activity_completion", || {
+            self.commit_runtime_activity_completion_inner(
+                runtime_job_id,
+                owner,
+                lease_expires_at,
+                lease_generation,
+                result,
+                transcript,
+            )
+        })
         .await
     }
 
@@ -136,15 +165,36 @@ impl WorkflowRuntimeStore {
         result: &ActivityResult,
         transcript: Option<&PendingRuntimeTranscript>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
-        let mut tx = self.pool.begin().await?;
+        // Resolve the keys of the rows this transaction will lock BEFORE it
+        // opens, with plain reads that take no row locks. `command_id` and
+        // `workflow_id` are immutable for the life of a job/command, so an
+        // unlocked read of them cannot go stale in a way that matters — and it
+        // lets the transaction below take its locks parent-first. See
+        // `lock_order` for the canonical order.
         let command_id_row: Option<(String,)> =
             sqlx::query_as("SELECT command_id FROM runtime_jobs WHERE id = $1")
                 .bind(runtime_job_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&self.pool)
                 .await?;
         let Some((command_id,)) = command_id_row else {
             return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
+        let workflow_id_row: Option<(String,)> =
+            sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                .bind(&command_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        let mut tx = self.pool.begin().await?;
+        // Lock order 1/3: the workflow instance. `apply_runtime_completion_decision_tx`
+        // needs this lock at the end of the transaction; taking it here instead
+        // keeps this path from inverting the order used by command dispatch.
+        // A missing instance is fine — the `workflow_exists` check below owns
+        // that case, and locking an absent row is a no-op.
+        if let Some((workflow_id,)) = workflow_id_row.as_ref() {
+            transaction_helpers::select_instance_for_update_tx(&mut tx, workflow_id).await?;
+        }
+        // Lock order 2/3: the command.
         let command_row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
                     dispatch_lease_expires_at, dispatch_not_before,
@@ -157,6 +207,7 @@ impl WorkflowRuntimeStore {
         .bind(&command_id)
         .fetch_optional(&mut *tx)
         .await?;
+        // Lock order 3/3: the runtime job.
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
                 .bind(runtime_job_id)
