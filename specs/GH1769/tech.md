@@ -21,8 +21,9 @@ GH-1769
   RPC). The live runtime packet builder
   (`crates/harness-server/src/workflow_runtime_worker/prompt_packet.rs`) has
   no skills section; grep for `SkillsProvider` /
-  `build_matched_skills_section` / `trigger_patterns` under
-  `harness-server/src` matches only `handlers/context.rs`. Skill governance
+  `build_matched_skills_section` under `harness-server/src` matches only
+  `handlers/context.rs`, and `trigger_patterns` has zero hits there at all.
+  Skill governance
   (`crates/harness-skills/src/store.rs:14` `SkillGovernanceStatus`,
   `store.rs:43` `canary_ratio`) therefore governs an injection path that does
   not exist at runtime.
