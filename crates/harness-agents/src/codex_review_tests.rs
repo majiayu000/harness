@@ -98,11 +98,17 @@ fn spawn_args(spawn: &crate::spawn_contract::PreparedAgentSpawn) -> Vec<String> 
         .collect()
 }
 
+fn mark_standard_git_repository(root: &std::path::Path) -> anyhow::Result<()> {
+    fs::create_dir(root.join(".git"))?;
+    Ok(())
+}
+
 /// GH-1785: `execute_review` used to call `wrap_command` directly, so review
 /// runs got neither container isolation nor operator-secret env filtering.
 #[test]
 fn review_spawn_uses_container_isolation() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    mark_standard_git_repository(dir.path())?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
     let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
@@ -134,6 +140,7 @@ fn review_spawn_uses_container_isolation() -> anyhow::Result<()> {
 #[test]
 fn container_review_uses_configured_image_and_proxy() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    mark_standard_git_repository(dir.path())?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
     let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
@@ -169,6 +176,7 @@ fn container_review_uses_configured_image_and_proxy() -> anyhow::Result<()> {
 #[test]
 fn review_spawn_filters_operator_secrets() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    mark_standard_git_repository(dir.path())?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
     let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
@@ -198,6 +206,7 @@ fn review_spawn_filters_operator_secrets() -> anyhow::Result<()> {
 #[test]
 fn review_spawn_keeps_container_stdin_open_for_piped_prompt() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    mark_standard_git_repository(dir.path())?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
     let (piped, _) =
@@ -210,6 +219,92 @@ fn review_spawn_keeps_container_stdin_open_for_piped_prompt() -> anyhow::Result<
 
     assert!(spawn_args(&piped).contains(&"--interactive".to_string()));
     assert!(!spawn_args(&not_piped).contains(&"--interactive".to_string()));
+    Ok(())
+}
+
+#[test]
+fn container_review_maps_repository_subdirectory() -> anyhow::Result<()> {
+    let repo = tempfile::tempdir()?;
+    mark_standard_git_repository(repo.path())?;
+    let project = repo.path().join("crates/example");
+    fs::create_dir_all(&project)?;
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+
+    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
+        &project,
+        Some("origin/main"),
+        vec![],
+    ))?;
+
+    let args = spawn_args(&spawn);
+    assert_eq!(
+        spawn.child_workspace,
+        PathBuf::from("/workspace/crates/example")
+    );
+    assert!(args.contains(&format!(
+        "type=bind,src={},dst=/workspace,readonly",
+        std::fs::canonicalize(repo.path())?.display()
+    )));
+    assert!(args
+        .windows(2)
+        .any(|window| window == ["--workdir", "/workspace/crates/example"]));
+    Ok(())
+}
+
+#[test]
+fn container_review_mounts_linked_worktree_git_metadata_read_only() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let common_git = root.path().join("common.git");
+    let worktree_git = common_git.join("worktrees/feature");
+    let worktree = root.path().join("feature");
+    fs::create_dir_all(&worktree_git)?;
+    fs::create_dir_all(&worktree)?;
+    fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", worktree_git.display()),
+    )?;
+    fs::write(worktree_git.join("commondir"), "../..\n")?;
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+
+    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
+        &worktree,
+        Some("origin/main"),
+        vec![],
+    ))?;
+
+    let args = spawn_args(&spawn);
+    assert!(args.contains(&format!(
+        "type=bind,src={},dst=/git/worktree,readonly",
+        std::fs::canonicalize(&worktree_git)?.display()
+    )));
+    assert!(args.contains(&format!(
+        "type=bind,src={},dst=/git/common,readonly",
+        std::fs::canonicalize(&common_git)?.display()
+    )));
+    assert!(args.contains(&"GIT_DIR=/git/worktree".to_string()));
+    assert!(args.contains(&"GIT_COMMON_DIR=/git/common".to_string()));
+    assert!(args.contains(&"GIT_WORK_TREE=/workspace".to_string()));
+    Ok(())
+}
+
+#[test]
+fn container_review_fails_closed_without_git_topology() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+
+    let error = agent
+        .prepare_review_spawn(&container_review_request(
+            project.path(),
+            Some("origin/main"),
+            vec![],
+        ))
+        .expect_err("container review must reject a workspace without Git metadata");
+
+    assert!(matches!(
+        error,
+        harness_core::error::HarnessError::Unsupported(message)
+            if message.starts_with("container_review_git_repository_not_found:")
+    ));
     Ok(())
 }
 

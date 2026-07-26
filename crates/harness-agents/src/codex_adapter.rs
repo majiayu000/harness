@@ -11,10 +11,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::ChildStdout;
 use tokio::sync::{mpsc, Mutex};
-
 type StdoutLines = Lines<BufReader<ChildStdout>>;
 const MAX_PROTOCOL_LINE_PREVIEW: usize = 240;
-
 fn prepare_app_server_spawn(
     cli_path: &std::path::Path,
     req: &TurnRequest,
@@ -41,7 +39,6 @@ fn prepare_app_server_spawn(
         forward_stdin: true,
     })
 }
-
 pub struct CodexAdapter {
     cli_path: PathBuf,
     default_model: String,
@@ -50,7 +47,6 @@ pub struct CodexAdapter {
     sandbox_mode: SandboxMode,
     state: Arc<Mutex<AdapterState>>,
 }
-
 struct AdapterState {
     child: Option<tokio::process::Child>,
     stdin: Option<tokio::process::ChildStdin>,
@@ -58,8 +54,8 @@ struct AdapterState {
     next_id: u64,
     thread_id: Option<String>,
     active_turn_id: Option<String>,
+    child_workspace: Option<PathBuf>,
 }
-
 impl AdapterState {
     fn new() -> Self {
         Self {
@@ -69,19 +65,17 @@ impl AdapterState {
             next_id: 1,
             thread_id: None,
             active_turn_id: None,
+            child_workspace: None,
         }
     }
-
     fn next_request_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         id
     }
-
     fn child_ready(&self) -> bool {
         self.child.is_some() && self.stdin.is_some() && self.stdout_lines.is_some()
     }
-
     async fn reset_child(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
@@ -91,9 +85,9 @@ impl AdapterState {
         self.stdout_lines = None;
         self.thread_id = None;
         self.active_turn_id = None;
+        self.child_workspace = None;
     }
 }
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedCodexMessage {
     Event(AgentEvent),
@@ -102,7 +96,6 @@ pub enum ParsedCodexMessage {
     Response { id: Value, result: Value },
     Ignore,
 }
-
 impl CodexAdapter {
     pub fn new(cli_path: PathBuf) -> Self {
         let config = CodexAgentConfig {
@@ -292,6 +285,7 @@ impl CodexAdapter {
         state.stdin = child.stdin.take();
         state.stdout_lines = Some(BufReader::new(stdout).lines());
         state.child = Some(child);
+        state.child_workspace = Some(prepared_spawn.child_workspace.clone());
 
         let init_id = Self::send_request(
             state,
@@ -337,8 +331,12 @@ impl CodexAdapter {
 
         Self::send_notification(state, "initialized", Value::Null).await?;
 
-        let thread_id_request =
-            Self::send_request(state, "thread/start", thread_start_params(req)).await?;
+        let thread_id_request = Self::send_request(
+            state,
+            "thread/start",
+            thread_start_params(req, &prepared_spawn.child_workspace),
+        )
+        .await?;
 
         loop {
             match Self::read_next_message(&mut lines).await? {
@@ -400,11 +398,16 @@ impl AgentAdapter for CodexAdapter {
                 "codex thread/start did not yield a thread id".into(),
             )
         })?;
+        let child_workspace = state.child_workspace.clone().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(
+                "codex child workspace unavailable".into(),
+            )
+        })?;
 
         Self::send_request(
             &mut state,
             "turn/start",
-            turn_start_params(&req, &thread_id),
+            turn_start_params(&req, &thread_id, &child_workspace),
         )
         .await?;
 
@@ -587,9 +590,9 @@ fn sandbox_policy_value(mode: Option<SandboxMode>, project_root: &PathBuf) -> Op
     })
 }
 
-fn thread_start_params(req: &TurnRequest) -> Value {
+fn thread_start_params(req: &TurnRequest, child_workspace: &PathBuf) -> Value {
     json!({
-        "cwd": req.project_root,
+        "cwd": child_workspace,
         "model": req.model,
         "sandbox": sandbox_mode_value(req.sandbox_mode),
         "approvalPolicy": req.approval_policy,
@@ -597,13 +600,13 @@ fn thread_start_params(req: &TurnRequest) -> Value {
     })
 }
 
-fn turn_start_params(req: &TurnRequest, thread_id: &str) -> Value {
+fn turn_start_params(req: &TurnRequest, thread_id: &str, child_workspace: &PathBuf) -> Value {
     json!({
         "threadId": thread_id,
-        "cwd": req.project_root,
+        "cwd": child_workspace,
         "model": req.model,
         "effort": req.reasoning_effort,
-        "sandboxPolicy": sandbox_policy_value(req.sandbox_mode, &req.project_root),
+        "sandboxPolicy": sandbox_policy_value(req.sandbox_mode, child_workspace),
         "approvalPolicy": req.approval_policy,
         "input": [
             {
