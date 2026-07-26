@@ -1,16 +1,36 @@
 use harness_agents::claude::ClaudeCodeAgent;
 use harness_agents::codex::{CodexAgent, CodexReviewRequest};
 use harness_core::{
-    agent::AgentRequest,
-    agent::CodeAgent,
+    agent::{AgentRequest, CodeAgent, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV},
     config::{agents::SandboxMode, HarnessConfig},
     prompts,
     review::{parse_review_report, ReviewDecision, ReviewProviderKind},
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 
 const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
+
+fn codex_review_spawn_env(config: &HarnessConfig) -> HashMap<String, String> {
+    let mut env_vars = HashMap::from([(
+        AGENT_ISOLATION_TIER_ENV.to_string(),
+        config.isolation.default_tier.as_str().to_string(),
+    )]);
+    let allowlist = config
+        .isolation
+        .network_allowlist
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !allowlist.is_empty() {
+        env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
+    }
+    env_vars
+}
 
 fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
     ClaudeCodeAgent::new(
@@ -141,7 +161,7 @@ pub async fn review(
             reasoning_effort: Some(review_config.reasoning_effort),
             sandbox_mode: SandboxMode::ReadOnlyWithNetwork,
             approval_policy: Some("never".to_string()),
-            env_vars: Default::default(),
+            env_vars: codex_review_spawn_env(config),
         }),
     )
     .await
@@ -299,6 +319,34 @@ async fn run_review_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::{
+        agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV},
+        config::isolation::IsolationTier,
+    };
+
+    #[test]
+    fn codex_review_spawn_env_uses_configured_isolation() {
+        let mut config = HarnessConfig::default();
+        config.isolation.default_tier = IsolationTier::Container;
+        config.isolation.network_allowlist = vec![
+            "github.com".to_string(),
+            " api.openai.com ".to_string(),
+            String::new(),
+        ];
+
+        let env_vars = codex_review_spawn_env(&config);
+
+        assert_eq!(
+            env_vars.get(AGENT_ISOLATION_TIER_ENV).map(String::as_str),
+            Some("container")
+        );
+        assert_eq!(
+            env_vars
+                .get(AGENT_NETWORK_ALLOWLIST_ENV)
+                .map(String::as_str),
+            Some("github.com,api.openai.com")
+        );
+    }
 
     #[tokio::test]
     async fn resolve_repo_slug_with_url_does_not_call_gh() -> anyhow::Result<()> {

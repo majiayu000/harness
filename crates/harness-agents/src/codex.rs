@@ -144,8 +144,6 @@ impl CodexAgent {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let mut args = vec![
-            OsString::from("-C"),
-            req.project_root.as_os_str().to_os_string(),
             OsString::from("-m"),
             OsString::from(model),
             OsString::from("-c"),

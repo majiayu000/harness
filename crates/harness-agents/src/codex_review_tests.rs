@@ -15,7 +15,7 @@ fn review_request(base_ref: Option<&str>) -> CodexReviewRequest {
 }
 
 #[test]
-fn review_args_use_native_review_subcommand_with_base_without_stdin_prompt() {
+fn review_args_use_spawn_working_directory_with_base_without_stdin_prompt() {
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
     let request = review_request(Some("origin/main"));
 
@@ -26,9 +26,8 @@ fn review_args_use_native_review_subcommand_with_base_without_stdin_prompt() {
         .collect();
 
     assert!(!args.iter().any(|arg| arg == "exec"));
-    assert!(args
-        .windows(2)
-        .any(|window| window == ["-C", "/tmp/project"]));
+    assert!(!args.iter().any(|arg| arg == "-C"));
+    assert!(!args.iter().any(|arg| arg == "/tmp/project"));
     assert!(args.windows(2).any(|window| window == ["-m", "gpt-test"]));
     assert!(args
         .windows(2)
@@ -117,6 +116,10 @@ fn review_spawn_uses_container_isolation() -> anyhow::Result<()> {
     assert!(spawn.clear_inherited_env);
     assert_eq!(spawn.current_dir, std::fs::canonicalize(dir.path())?);
     assert!(args.contains(&"--mount".to_string()));
+    assert!(args
+        .windows(2)
+        .any(|window| window == ["--workdir", "/workspace"]));
+    assert!(!args.iter().any(|arg| arg == "-C"));
     assert!(args.contains(&"review".to_string()));
     Ok(())
 }
