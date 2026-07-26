@@ -9,235 +9,194 @@ GH-1731
 - Product: `specs/GH1731/product.md`
 - Tech: `specs/GH1731/tech.md`
 
+## Delivery Context
+
+PR #1810 merged the initial inventory implementation as `f55eea8b`. Tasks
+SP1731-T1 through SP1731-T5 belong to that historical delivery and are not
+reopened or repeated here. This plan continues with stable IDs SP1731-T6
+through SP1731-T10 for the post-merge remediation of six current-head review
+findings.
+
 ## Implementation Tasks
 
-- [ ] `SP1731-T1` — Owner: implementation agent; Done when: the audited dependency and public inventory contract are wired; Verify: `cargo check -p harness-core --all-targets`.
-- [ ] `SP1731-T2` — Owner: implementation agent; Done when: the closed typed discovery table emits valid ordered ASC-001 components; Verify: `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector`.
-- [ ] `SP1731-T3` — Owner: implementation agent; Done when: capability-relative traversal enforces containment and every resource bound; Verify: `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target`.
-- [ ] `SP1731-T4` — Owner: implementation agent; Done when: exhaustive positive and negative inventory fixtures pass; Verify: `cargo test -p harness-core stack::inventory_tests`.
-- [ ] `SP1731-T5` — Owner: verification owner; Done when: additive scope and all final gates pass on the exact head; Verify: `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1731`.
+- [ ] `SP1731-T6` — Owner: implementation agent; Done when: the merged rule model and review fixtures are moved into private `rules.rs` and `review_tests.rs` modules without public API, dependency, or behavior changes, and all existing inventory tests pass; Verify: `cargo test -p harness-core stack::inventory_tests`.
+- [ ] `SP1731-T7` — Owner: implementation agent; Done when: configured-rule merging preserves the strictest exact-file constraint independently of field order and drive-relative Windows sources fail typed, with deterministic regressions; Verify: `cargo test -p harness-core stack::inventory::review_tests::derived_exact_file_constraint_wins_over_flexible_source` and `cargo test -p harness-core stack::inventory::review_tests::drive_relative_configured_source_fails_typed`.
+- [ ] `SP1731-T8` — Owner: implementation agent; Done when: recursive depth is measured from repository depth 0 and recursive symlink open failures recheck capability-relative path evidence before classification, with deterministic regressions; Verify: `cargo test -p harness-core stack::inventory::review_tests::nested_allowlist_root_preserves_repository_relative_depth` and `cargo test -p harness-core stack::inventory::review_tests::recursive_symlink_open_failure_rechecks_broken_link`.
+- [ ] `SP1731-T9` — Owner: implementation agent; Done when: bounded native listings are sorted before fallible recursive/suffix classification and an injected reader failure always traverses the actual bounded-read path, with order-reversal and privileged-user-safe regressions; Verify: `cargo test -p harness-core stack::inventory::review_tests::fallible_recursive_classification_is_order_independent` and `cargo test -p harness-core stack::inventory::review_tests::injected_reader_failure_exercises_bounded_read_path`.
+- [ ] `SP1731-T10` — Owner: verification owner; Done when: every six-finding acceptance test, the full `harness-core` suite, formatting, check, workspace clippy, SpecRail checks, four-path scope audit, exact-head CI, and independent review gates pass; Verify: the commands under SP1731-T10 below.
 
-### SP1731-T1 — Establish the dependency and public inventory contract
+### SP1731-T6 — Split Private Rules and Review Fixtures
 
 - Owner: implementation agent
-- Files: `Cargo.toml`, `Cargo.lock`, `crates/harness-core/Cargo.toml`,
-  `crates/harness-core/src/stack/mod.rs`,
-  `crates/harness-core/src/stack/inventory.rs`
-- Dependencies: ASC-001 / GH-1730 merged
-- Covers: B-001, B-002, B-010, B-012
+- Dependencies: merged PR #1810 (`f55eea8b`)
+- Files:
+  - `crates/harness-core/src/stack/inventory.rs`
+  - `crates/harness-core/src/stack/inventory/rules.rs`
+  - `crates/harness-core/src/stack/inventory_tests.rs`
+  - `crates/harness-core/src/stack/inventory/review_tests.rs`
+- Covers: B-001, B-002, B-003, B-004, B-005, B-006, B-008, B-009,
+  B-010, B-012
 - Done when:
-  - A baseline `cargo audit` result is recorded before any manifest or lockfile
-    edit.
-  - The audited `cap-std` dependency is added without downgrading another
-    dependency.
-  - The already-locked `libc` crate is promoted to a workspace dependency and
-    used by `harness-core` only for Unix `O_NONBLOCK`; no additional syscall
-    wrapper is added.
-  - The public options, result, entry, entry-class, and typed error-category
-    APIs match `tech.md`, keep invariant-bearing fields private, and expose
-    read-only accessors.
-  - Invalid limits fail before the repository root is opened.
-  - Options expose exact non-zero regular-file, opened-directory,
-    aggregate-encountered-entry, depth, entries-per-directory, per-file byte,
-    and aggregate-byte limits with the defaults and integer types in `tech.md`.
-  - The result contains ordered entries and makes no ambient canonical-root
-    claim.
+  - `inventory/rules.rs` privately owns `StaticRule`, matcher and target types,
+    selector constants, `STATIC_RULES`, minimal config shapes,
+    configured-source normalization, and rule merge helpers.
+  - `inventory/review_tests.rs` privately owns white-box fixtures and
+    deterministic seams; black-box public-contract fixtures remain in
+    `inventory_tests.rs`.
+  - `stack::inventory` remains the only exposed inventory module.
+  - No public type, signature, default, serialized value, dependency,
+    allowlist row, or component-kind mapping changes.
+  - Production and test files remain below the repository 800-line ceiling.
+  - The move is behavior-neutral and existing inventory tests pass before the
+    six fixes are layered on top.
 - Verify:
-  - `cargo audit`
   - `cargo check -p harness-core --all-targets`
-  - `cargo test -p harness-core stack::inventory_tests::invalid_limits_fail_before_root_open`
+  - `cargo test -p harness-core stack::inventory_tests`
+  - `git diff --check`
 
-### SP1731-T2 — Implement the closed typed discovery table
+### SP1731-T7 — Preserve Rule Constraints and Validate Sources
 
 - Owner: implementation agent
-- Files: `crates/harness-core/src/stack/inventory.rs`,
-  `crates/harness-core/src/stack/inventory/rules.rs`
-- Dependencies: SP1731-T1
-- Covers: B-002, B-003, B-004, B-005, B-006, B-007, B-011
+- Dependencies: SP1731-T6
+- Files:
+  - `crates/harness-core/src/stack/inventory/rules.rs`
+  - `crates/harness-core/src/stack/inventory/review_tests.rs`
+- Covers: B-002, B-003, B-004, B-006, B-009, B-011
 - Done when:
-  - One immutable typed rule table represents every B-003 exact path,
-    root-only suffix, selector-filtered recursive directory, and
-    directory-presence predicate.
-  - Every directory row uses the closed surface-specific selector in
-    `tech.md`; general skill roots select direct `*.md` and nested `SKILL.md`,
-    while `.harness/skills` selects direct `*.md` only.
-  - Hook selection is limited to direct `.harness/guards/*.sh` and the closed
-    direct `.githooks` lifecycle basename vocabulary; generic hook directories,
-    README, helper, and fixture files emit no component.
-  - `.vibeguard/run-guards.sh` is one exact `validation` entry independent of
-    the declarative `.vibeguard` extension selector.
-  - Bounded `harness.toml` bytes are parsed once for the four rule-source fields
-    in `tech.md`; repository-relative file/directory sources derive typed
-    `policy` rules, identical `(locator, component_kind)` bindings deduplicate,
-    distinct roles for one locator are preserved, and absolute sources remain
-    out of scope.
-  - Harness-native roots have their specific component kinds and no recursive
-    catch-all `.harness` rule exists.
-  - Missing exact entries are omitted only after a non-following
-    `symlink_metadata` lookup returns `NotFound`.
-  - Every selected regular file and the root `spec` predicate construct valid
-    ASC-001 components through the merged public API and classify the direct
-    current observation as `fresh`.
-  - `.usage.json`, skill package references, and other unmatched support files
-    do not emit independent stack components.
-  - Native basename/extension selection excludes an unmatched non-UTF-8
-    ordinary file before portable locator normalization.
-  - Output order is the lexicographic order of lossless portable locators.
+  - A derived exact-file target wins over a flexible file-or-directory target
+    for the same normalized locator and component kind, independently of
+    configured field order.
+  - A static target and selector remain authoritative when a configured source
+    overlaps them, while configured presence still makes the binding required.
+  - Equivalent flexible bindings traverse once, and one locator with distinct
+    component kinds retains separate entries backed by one file observation.
+  - `C:policy.toml` and equivalent drive-relative forms fail with
+    `configured_source_invalid` on every host.
+  - Truly absolute configured sources remain out of repository scope, and
+    existing invalid portable relative forms still fail typed.
 - Verify:
-  - `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector`
-  - `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders`
-  - `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`
-  - `cargo test -p harness-core stack::inventory_tests::only_lifecycle_bound_hook_entrypoints_are_inventoried`
-  - `cargo test -p harness-core stack::inventory_tests::vibeguard_runner_is_inventoried_as_validation`
+  - `cargo test -p harness-core stack::inventory::review_tests::derived_exact_file_constraint_wins_over_flexible_source`
+  - `cargo test -p harness-core stack::inventory::review_tests::derived_rule_merge_is_field_order_independent`
+  - `cargo test -p harness-core stack::inventory::review_tests::drive_relative_configured_source_fails_typed`
   - `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once`
   - `cargo test -p harness-core stack::inventory_tests::same_locator_with_distinct_kinds_is_preserved`
-  - `cargo test -p harness-core stack::inventory_tests::invalid_configured_rule_sources_fail_typed`
-  - `cargo test -p harness-core stack::inventory_tests::unsupported_non_utf8_entries_are_filtered_before_locator_normalization`
-  - `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule`
-  - `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh`
-  - `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory`
-  - `cargo test -p harness-core stack::inventory::review_tests::equivalent_static_and_configured_rules_share_one_traversal`
-  - `cargo test -p harness-core stack::inventory::review_tests::exact_rules_require_native_component_casing`
 
-### SP1731-T3 — Implement capability-relative bounded traversal
+### SP1731-T8 — Preserve Root-Relative Depth and Race Evidence
 
 - Owner: implementation agent
-- Files: `crates/harness-core/src/stack/inventory.rs`,
-  `crates/harness-core/src/stack/inventory/rules.rs`
-- Dependencies: SP1731-T1, SP1731-T2
-- Covers: B-001, B-004, B-008, B-009, B-010, B-011, B-012
+- Dependencies: SP1731-T6
+- Files:
+  - `crates/harness-core/src/stack/inventory.rs`
+  - `crates/harness-core/src/stack/inventory/review_tests.rs`
+- Covers: B-001, B-008, B-009, B-010, B-011
 - Done when:
-  - The caller-supplied root is opened once and all descendant operations stay
-    relative to that directory capability.
-  - Broken symlinks, escaping targets, non-regular entries, unreadable data,
-    non-UTF-8 locators, ancestor cycles, and entries that disappear after
-    `read_dir` return their specified typed error kinds without leaking ambient
-    target paths.
-  - A valid in-root symlink swap may select either valid target, and the digest
-    covers exactly the bytes from the opened regular-file handle without
-    reporting `entry_raced`.
-  - In-root directory symlinks are resolved through the capability and
-    traversed before file selection; recursive symlink identities still return
-    `cycle_detected`.
-  - An exact-file rule whose symlink target is a directory returns
-    `non_regular_entry`; only directory or configured file-or-directory rules
-    may descend.
-  - Depth uses the repository root as depth 0; directory enumeration
-    reads at most the checked N+1 sentinel; every yielded item charges the
-    aggregate encountered-entry budget; each opened directory including the
-    repository root charges the directory budget; regular-file and byte
-    budgets are charged before another read or descent.
-  - Traversal performs no repository write, process launch, network operation,
-    hook invocation, or MCP connection.
-  - Unix selected-file opens use `O_NONBLOCK` and validate opened-handle type
-    before reading, so a path raced to a FIFO returns `non_regular_entry`
-    without waiting for a writer.
+  - The repository root remains depth 0 and an initial allowlist or configured
+    directory starts traversal at its normalized root-relative component count.
+  - Exact-case listing reuse cannot reset or bypass depth enforcement.
+  - A nested allowlist root fails before descent when its physical depth
+    already exceeds `max_depth`.
+  - Recursive `open_dir` `NotFound` rechecks non-following metadata through the
+    same root capability.
+  - A still-present dangling symlink returns `broken_symlink`; a vanished or
+    replaced non-symlink returns `entry_raced`.
+  - Safe locators remain complete when losslessly representable and otherwise
+    stop at the nearest lossless ancestor.
 - Verify:
-  - `cargo test -p harness-core stack::inventory_tests::inventory_stays_bound_to_the_opened_root_handle`
-  - `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target`
-  - `cargo test -p harness-core stack::inventory_tests::in_root_directory_symlinks_are_traversed_and_cycles_fail`
-  - `cargo test -p harness-core stack::inventory_tests::file_rules_reject_directory_symlink_targets`
-  - `cargo test -p harness-core stack::inventory_tests::selected_fifo_targets_fail_without_blocking`
-  - `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators`
-  - `cargo test -p harness-core stack::inventory_tests::reads_never_exceed_remaining_aggregate_or_per_file_budget`
+  - `cargo test -p harness-core stack::inventory::review_tests::nested_allowlist_root_preserves_repository_relative_depth`
+  - `cargo test -p harness-core stack::inventory::review_tests::configured_directory_preserves_repository_relative_depth`
+  - `cargo test -p harness-core stack::inventory::review_tests::recursive_symlink_open_failure_rechecks_broken_link`
+  - `cargo test -p harness-core stack::inventory::review_tests::recursive_directory_disappearance_remains_entry_raced`
   - `cargo test -p harness-core stack::inventory_tests::every_traversal_limit_has_an_exact_boundary_fixture`
-  - `cargo test -p harness-core stack::inventory::review_tests::coordinated_selected_open_race_stays_root_confined`
-  - `cargo test -p harness-core stack::inventory::review_tests::selected_open_and_entry_metadata_races_are_classified`
-  - `cargo test -p harness-core stack::inventory::review_tests::injected_reader_failure_exercises_bounded_read_path`
 
-### SP1731-T4 — Add exhaustive inventory contract tests
+### SP1731-T9 — Make Failure Ordering and Read Coverage Deterministic
 
 - Owner: implementation agent
-- Files: `crates/harness-core/src/stack/inventory_tests.rs`,
-  `crates/harness-core/src/stack/inventory/review_tests.rs`
-- Dependencies: SP1731-T1, SP1731-T2, SP1731-T3
-- Covers: B-001, B-002, B-003, B-004, B-005, B-006, B-007, B-008,
-  B-009, B-010, B-011, B-012
+- Dependencies: SP1731-T6, SP1731-T8
+- Files:
+  - `crates/harness-core/src/stack/inventory.rs`
+  - `crates/harness-core/src/stack/inventory/review_tests.rs`
+  - `crates/harness-core/src/stack/inventory_tests.rs`
+- Covers: B-005, B-007, B-009, B-010, B-011, B-012
 - Done when:
-  - Table-driven fixtures cover every allowlisted surface, every ASC-001
-    mapping including `fresh` current observations, unrelated-file exclusion,
-    each directory selector, exact root suffix matching, and the non-recursive
-    `spec` predicate.
-  - Skill fixtures prove direct Markdown and nested `SKILL.md` definitions are
-    discovered while usage sidecars, package references, and support files are
-    excluded.
-  - Hook fixtures prove exact lifecycle selectors exclude README, helpers, and
-    nested fixtures; Unix FIFO fixtures prove selected opens cannot block before
-    handle type validation.
-  - Configuration fixtures cover valid, duplicate, absolute, escaping, missing,
-    exact-file, recursive-directory, and same-locator/different-kind rule
-    sources without serializing out-of-scope absolute paths.
-  - Negative fixtures cover missing versus broken symlinks, root replacement,
-    escaping and in-root symlink swaps, cycles, special files, unreadable
-    files, non-UTF-8 paths, post-`read_dir` disappearance, invalid limits, and
-    every exact resource boundary including aggregate entries and opened
-    directories.
-  - Unix executable-bit changes alter entry evidence without changing the
-    content digest; non-Unix reports executable state as unobserved.
-  - A deterministic injected read failure covers platforms where permission
-    changes cannot reliably produce an unreadable file.
-  - Review-hardening fixtures prove exact native casing, one physical
-    traversal for equivalent static/configured rules, final-open race
-    classification with safe child locators, and coordinated lookup/open
-    symlink replacements for both in-root A-to-B and in-root-to-outside cases.
-  - Exact-casing fixtures use tight entry/directory budgets to prove cached
-    native listings are not re-enumerated once per exact rule.
+  - Each bounded native listing is collected and charged once, then sorted
+    before symlink resolution, lossless locator conversion, target-class
+    checks, or selected-file opens.
+  - Recursive and root-suffix paths use the same sort-before-fallible-work
+    boundary.
+  - Reversing injected enumeration order produces the same first typed error
+    and safe locator for multiple invalid selected candidates.
+  - A private test seam injects failure during the bounded read of an
+    already-opened selected regular file.
+  - The injected failure always asserts `read_failed` and the selected locator;
+    no privilege or permission probe can skip the only end-to-end assertion.
+  - Production bounded reads retain the per-file and aggregate `+ 1` sentinel
+    behavior.
 - Verify:
-  - `cargo test -p harness-core stack::inventory_tests`
-  - `cargo test -p harness-core`
+  - `cargo test -p harness-core stack::inventory::review_tests::fallible_recursive_classification_is_order_independent`
+  - `cargo test -p harness-core stack::inventory::review_tests::fallible_suffix_classification_is_order_independent`
+  - `cargo test -p harness-core stack::inventory::review_tests::injected_reader_failure_exercises_bounded_read_path`
+  - `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators`
+  - `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory`
 
-### SP1731-T5 — Verify additive scope and hand off the final slice
+### SP1731-T10 — Verify and Hand Off the Remediation
 
 - Owner: verification owner
-- Files: all eight implementation paths in the planned-changes manifest
-- Dependencies: SP1731-T1, SP1731-T2, SP1731-T3, SP1731-T4
+- Dependencies: SP1731-T7, SP1731-T8, SP1731-T9
+- Files: exactly the four paths in the `specrail-planned-changes` manifest
 - Covers: B-001, B-002, B-003, B-004, B-005, B-006, B-007, B-008,
   B-009, B-010, B-011, B-012
 - Done when:
-  - The implementation changes only the eight authorized paths and does not add
-    a CLI command, persistence migration, runtime consumer, or prompt-loader
-    behavior.
-  - The post-dependency `cargo audit` passes and no dependency is downgraded.
-  - The implementation PR uses `Fixes #1731`; this spec PR uses only
-    `Refs #1731` and leaves the issue open.
-  - Exact-head CI, independent local review, review threads, and the SpecRail
-    PR gate are all green before merge.
+  - All six final #1810 findings map to changed production logic and at least
+    one deterministic acceptance test named in `tech.md`.
+  - The implementation diff contains exactly the four authorized paths.
+  - The public API, manifests, lockfile, allowlist semantics, and callers are
+    unchanged.
+  - Focused tests, the complete `harness-core` suite, formatting, check,
+    warning-sensitive workspace clippy, and both SpecRail checks pass on the
+    exact implementation head.
+  - Exact-head CI is green and an independent reviewer confirms no unresolved
+    actionable review threads before the follow-up PR closes GH-1731.
 - Verify:
-  - `git diff --name-only origin/main...HEAD`
-  - `cargo audit`
+  - `cargo test -p harness-core stack::inventory::review_tests`
+  - `cargo test -p harness-core stack::inventory_tests`
+  - `cargo test -p harness-core`
+  - `cargo check -p harness-core --all-targets`
   - `cargo fmt --all`
   - `cargo fmt --all -- --check`
-  - `cargo check -p harness-core --all-targets`
-  - `cargo test -p harness-core`
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `python3 checks/check_workflow.py --repo .`
   - `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1731`
+  - `git diff --name-only <base>...HEAD`
 
-## Parallelization
+## Dependency and Parallelization
 
-The implementation is serial. SP1731-T1 through SP1731-T3 share
-`inventory.rs` and `inventory/rules.rs`; SP1731-T4 owns both test modules and
-verifies that exact contract, and SP1731-T5 owns shared verification. A
-read-only reviewer lane may inspect the exact diff after SP1731-T5; no two
-writable lanes may edit these paths concurrently.
+The implementation is serial:
 
-## Verification
+1. SP1731-T6 establishes the private module boundary.
+2. SP1731-T7 and SP1731-T8 may be implemented only after that split, but both
+   share `review_tests.rs`, so they remain one writable lane.
+3. SP1731-T9 depends on the traversal seam from SP1731-T8.
+4. SP1731-T10 is the sole full-verification owner.
 
-- [ ] Product invariant set is exactly B-001 through B-012.
-- [ ] The task coverage union is exactly B-001 through B-012.
-- [ ] The baseline security audit runs before dependency edits.
-- [ ] The post-change security audit and every command under SP1731-T5 pass on
-      the exact implementation head.
+A separate read-only reviewer may inspect the final exact head. No two writable
+lanes may edit the four planned paths concurrently.
+
+## Completion Checklist
+
+- [ ] Product invariant set remains exactly B-001 through B-012.
+- [ ] The union of task `Covers:` fields is exactly B-001 through B-012.
+- [ ] Every final current-head #1810 finding has one named deterministic
+      acceptance test.
+- [ ] The planned-change manifest contains exactly four implementation paths.
+- [ ] No public API, dependency, caller, or product-spec path changes.
+- [ ] The follow-up implementation PR references the reopened GH-1731 and
+      closes it only after exact-head CI and review gates pass.
 
 ## Handoff Notes
 
-- PR #1761 is the heavy spec-only slice. It must merge without closing GH-1731.
-- The implementation stays library-only. ASC-026 owns public CLI exposure, so
-  GH-1731 verification targets `harness-core`.
-- `cap_std::fs::Dir::canonicalize` returns a capability-relative path; the
-  inventory therefore exposes no ambient canonical root.
-- In-root symlink swaps are non-atomic but root-confined. The opened file handle
-  is the observation authority and its returned bytes determine the digest.
-- The planned-change manifest is exhaustive. Review hardening amended it from
-  six to eight entries; any further implementation path requires another spec
-  revision before code changes.
+- PR #1810 is merged historical implementation, not pending work.
+- PR #1812 is a post-merge remediation amendment and uses `Refs #1731`; it does
+  not itself close the issue.
+- The follow-up implementation should use `Fixes #1731` only after completing
+  SP1731-T6 through SP1731-T10.
+- No merge or review-thread resolution is authorized by this spec-only task.
