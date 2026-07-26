@@ -354,10 +354,19 @@ pub(super) fn classify_open_failure(kind: std::io::ErrorKind) -> AgentStackInven
 }
 
 #[rustfmt::skip]
+fn observed_non_regular(root: &Dir, path: &str) -> bool {
+    match root.symlink_metadata(path) {
+        Ok(meta) if meta.is_symlink() => root.metadata(path).ok().is_some_and(|target| !target.is_file()),
+        Ok(meta) => !meta.is_file(), Err(_) => false,
+    }
+}
+
+#[rustfmt::skip]
 pub(super) fn classify_selected_open_failure(
     root: &Dir, path: &str, kind: std::io::ErrorKind,
 ) -> AgentStackInventoryErrorKind {
-    if kind == std::io::ErrorKind::NotFound { classify_resolution_failure(root, path, kind) } else { classify_open_failure(kind) }
+    if kind == std::io::ErrorKind::NotFound { classify_resolution_failure(root, path, kind) }
+    else if observed_non_regular(root, path) { EK::NonRegularEntry } else { classify_open_failure(kind) }
 }
 
 #[rustfmt::skip]
@@ -434,7 +443,6 @@ pub(crate) fn inventory_with_root(
         if let Some(rule) = exact_rules.iter_mut()
             .find(|rule| rule.0 == locator && rule.2.as_str() == kind.as_str())
         {
-            rule.1 = target;
             rule.3 = true;
         } else {
             exact_rules.push((locator, target, kind, true));
@@ -522,9 +530,11 @@ impl Scan<'_> {
     #[rustfmt::skip]
     fn has_exact_case(&mut self, root: &Dir, path: &str) -> Result<bool, IErr> {
         let mut parent = String::new();
+        let components = path.split('/').count();
         for (depth, segment) in path.split('/').enumerate() {
             if !self.listings.contains_key(&parent) {
                 if parent.is_empty() { self.enumerate(root, "")?; } else {
+                    if root.symlink_metadata(&parent).ok().is_some_and(|meta| meta.is_symlink()) && root.metadata(&parent).ok().is_some_and(|meta| !meta.is_dir()) { return Ok(false); }
                     if depth > self.opts.max_depth { return Err(err(EK::LimitExceeded, &parent)); }
                     charge(&mut self.dirs_opened, self.opts.max_directories, &parent)?;
                     let dir = root.open_dir(&parent).map_err(|error| {
@@ -536,9 +546,10 @@ impl Scan<'_> {
                     self.enumerate(&dir, &parent)?;
                 }
             }
-            let exact = self.listings.get(&parent)
-                .is_some_and(|listing| listing.iter().any(|(name, _)| name == OsStr::new(segment)));
-            if !exact { return Ok(false); }
+            let exact = self.listings.get(&parent).and_then(|listing| listing.iter()
+                .find(|(name, _)| name == OsStr::new(segment)).map(|(_, kind)| (kind.is_dir(), kind.is_symlink())));
+            let Some((is_dir, is_symlink)) = exact else { return Ok(false); };
+            if depth + 1 < components && !is_dir && !is_symlink { return Ok(false); }
             parent = if parent.is_empty() { segment.to_owned() } else { format!("{parent}/{segment}") };
         }
         Ok(true)
@@ -626,9 +637,6 @@ impl Scan<'_> {
         Ok(listing)
     }
 
-    /// Recursive selector-filtered traversal; `depth` counts directory opens
-    /// below the repository root (the root itself is depth 0). All opens and
-    /// symlink resolutions stay relative to the one root capability.
     #[rustfmt::skip]
     fn traverse(
         &mut self, root: &Dir, prefix: String,
@@ -659,8 +667,6 @@ impl Scan<'_> {
     ) -> Result<(), IErr> {
         let direct_level = depth == 1;
         let listing = self.enumerate(dir, prefix)?;
-        // Every symlink is resolved through the root capability before any
-        // file selector applies; broken or escaping targets fail typed.
         let mut candidates: Vec<(bool, String)> = Vec::new();
         for (name, file_type) in &listing {
             let is_dir = if file_type.is_symlink() {
@@ -698,9 +704,6 @@ impl Scan<'_> {
         Ok(())
     }
 
-    /// Open one selected candidate capability-relatively (nonblocking on
-    /// Unix), validate the opened handle type, read within remaining budgets,
-    /// and emit its component; `None` means the binding was deduplicated.
     #[rustfmt::skip]
     fn read_selected(
         &mut self, root: &Dir, locator: String, kind: Kind,
@@ -740,7 +743,6 @@ impl Scan<'_> {
         #[cfg(not(unix))]
         let unix_executable: Option<bool> = None;
         let remaining = self.opts.max_total_bytes - self.bytes_used;
-        // Sentinels are safe: validation keeps byte limits below `u64::MAX`.
         let limit = (self.opts.max_file_bytes + 1).min(remaining + 1);
         let mut bytes = Vec::new();
         file.take(limit)
@@ -760,7 +762,6 @@ impl Scan<'_> {
         Ok(Some(bytes))
     }
 
-    /// Build and validate one ASC-001 component and record its typed entry.
     #[rustfmt::skip]
     fn emit(
         &mut self, kind: Kind, locator: String,

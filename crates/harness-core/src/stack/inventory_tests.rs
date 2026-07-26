@@ -83,8 +83,6 @@ fn entry_digest(entry: &AgentStackInventoryEntry) -> String {
         .to_owned()
 }
 
-// ── B-001 ────────────────────────────────────────────────────────────────────
-
 #[test]
 #[rustfmt::skip]
 fn invalid_limits_fail_before_root_open() {
@@ -141,8 +139,6 @@ fn inventory_stays_bound_to_the_opened_root_handle() {
     assert!(pairs(&inventory).iter().all(|(l, _)| !l.starts_with('/')));
 }
 
-// ── B-002 ────────────────────────────────────────────────────────────────────
-
 #[test]
 #[rustfmt::skip]
 fn inventory_never_reads_user_global_or_sibling_paths() {
@@ -157,8 +153,6 @@ fn inventory_never_reads_user_global_or_sibling_paths() {
     assert_eq!(listed, vec![("AGENTS.md".to_owned(), "instructions")]);
     assert!(listed.iter().all(|(l, _)| !l.starts_with('/') && !l.contains("..")));
 }
-
-// ── B-003 ────────────────────────────────────────────────────────────────────
 
 #[test]
 #[rustfmt::skip]
@@ -256,7 +250,7 @@ fn configured_repository_rule_sources_are_inventoried_once() {
     let dir = tmp();
     let root = dir.path();
     write_file(root, "harness.toml", br#"[rules]
-discovery_paths = ["rules", "rules", "./rules", "/absolute/outside"]
+discovery_paths = ["rules", "rules", "./rules", ".vibeguard", "/absolute/outside"]
 builtin_path = "builtin.toml"
 exec_policy_paths = ["exec.policy.toml"]
 requirements_path = "reqs.toml"
@@ -264,16 +258,21 @@ requirements_path = "reqs.toml"
     write_file(root, "rules/p.md", b"p");
     write_file(root, "rules/p.toml", b"q = 1");
     write_file(root, "rules/skip.txt", b"not selected");
+    write_file(root, ".vibeguard/rule.json", b"{}");
     write_file(root, "builtin.toml", b"b = 1");
     write_file(root, "exec.policy.toml", b"e = 1");
     write_file(root, "reqs.toml", b"r = 1");
-    let options = opts(root).with_max_directories(2).expect("root plus rules");
+    let options = opts(root).with_max_directories(3).expect("root plus two rule directories");
     let listed = pairs(&inventory_repository_stack(&options).expect("merged static and derived rules"));
-    let expected = ["builtin.toml", "exec.policy.toml", "reqs.toml", "rules/p.md", "rules/p.toml"];
+    let expected = [".vibeguard/rule.json", "builtin.toml", "exec.policy.toml", "reqs.toml", "rules/p.md", "rules/p.toml"];
     assert_eq!(of_kind(&listed, "policy"), expected, "each binding is inventoried once");
     assert!(listed.contains(&("harness.toml".to_owned(), "validation")));
     assert!(!listed.iter().any(|(l, _)| l.contains("absolute") || l.contains("outside")));
-    assert!(!listed.iter().any(|(l, _)| l == "policies/skip.txt"));
+    assert!(!listed.iter().any(|(l, _)| l == "rules/skip.txt"));
+    let mismatch = tmp();
+    write_file(mismatch.path(), "harness.toml", b"[rules]\ndiscovery_paths = [\"requirements.toml\"]\n");
+    fs::create_dir(mismatch.path().join("requirements.toml")).expect("mkdir");
+    assert_fail(mismatch.path(), EK::NonRegularEntry);
 }
 
 #[test]
@@ -293,8 +292,6 @@ fn same_locator_with_distinct_kinds_is_preserved() {
     }
 }
 
-// ── B-004 ────────────────────────────────────────────────────────────────────
-
 #[test]
 fn missing_allowlisted_entries_emit_no_placeholders() {
     let dir = tmp();
@@ -305,9 +302,17 @@ fn missing_allowlisted_entries_emit_no_placeholders() {
     let wrong_case = tmp();
     write_file(wrong_case.path(), "agents.md", b"wrong case");
     assert!(run_ok(wrong_case.path()).entries().is_empty());
+    let file_ancestor = tmp();
+    write_file(file_ancestor.path(), "src", b"not a directory");
+    assert!(run_ok(file_ancestor.path()).entries().is_empty());
+    #[cfg(unix)]
+    {
+        let linked = tmp();
+        write_file(linked.path(), "target", b"not a directory");
+        symlink("target", linked.path().join("src")).expect("symlink");
+        assert!(run_ok(linked.path()).entries().is_empty());
+    }
 }
-
-// ── B-005 ────────────────────────────────────────────────────────────────────
 
 #[test]
 #[rustfmt::skip]
@@ -367,8 +372,6 @@ fn current_observations_are_fresh() {
         assert_eq!(entry.component().freshness(), AgentStackFreshness::Fresh);
     }
 }
-
-// ── B-006 ────────────────────────────────────────────────────────────────────
 
 #[test]
 #[rustfmt::skip]
@@ -432,8 +435,6 @@ fn component_kind_comes_from_matching_rule() {
     assert!(listed.contains(&(".mcp.json".to_owned(), "mcp_server")));
 }
 
-// ── B-007 ────────────────────────────────────────────────────────────────────
-
 #[cfg(unix)]
 #[test]
 #[rustfmt::skip]
@@ -493,8 +494,6 @@ fn filesystem_enumeration_order_does_not_change_inventory() {
     assert_eq!(listed, sorted, "output is sorted by normalized locator");
     assert_eq!(first, second, "enumeration order cannot change output");
 }
-
-// ── B-008 ────────────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
 #[test]
@@ -592,8 +591,6 @@ fn file_rules_reject_directory_symlink_targets() {
     assert_fail(dir.path(), EK::NonRegularEntry);
 }
 
-// ── B-009 ────────────────────────────────────────────────────────────────────
-
 #[cfg(unix)]
 #[test]
 #[rustfmt::skip]
@@ -646,8 +643,6 @@ fn invalid_configured_rule_sources_fail_typed() {
     fs::create_dir(dir_target.path().join("adir")).expect("mkdir");
     assert_fail(dir_target.path(), EK::NonRegularEntry);
 }
-
-// ── B-010 ────────────────────────────────────────────────────────────────────
 
 #[test]
 #[rustfmt::skip]
@@ -735,6 +730,10 @@ fn selected_fifo_targets_fail_without_blocking() {
         .expect("inventory must not block on a writer-less FIFO");
     let error = result.expect_err("fifo is a non-regular entry");
     assert_eq!((error.kind(), error.locator()), (EK::NonRegularEntry, Some("Makefile")));
+    let socket = tmp();
+    let _listener = std::os::unix::net::UnixListener::bind(socket.path().join("Makefile"))
+        .expect("bind socket");
+    assert_fail(socket.path(), EK::NonRegularEntry);
 }
 
 #[cfg(not(unix))]
@@ -742,8 +741,6 @@ fn selected_fifo_targets_fail_without_blocking() {
 fn selected_fifo_targets_fail_without_blocking() {
     assert_eq!(EK::NonRegularEntry.as_str(), "non_regular_entry");
 }
-
-// ── B-011 ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn unchanged_repository_inventory_is_repeatable() {
@@ -758,8 +755,6 @@ fn unchanged_repository_inventory_is_repeatable() {
     assert_eq!(first, second, "unchanged bytes produce identical output");
     assert_eq!(first.entries().len(), 4);
 }
-
-// ── B-012 ────────────────────────────────────────────────────────────────────
 
 fn snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     fn walk(dir: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
