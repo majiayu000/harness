@@ -23,7 +23,18 @@ pub struct QualityDimensions {
 pub struct QualityGrader;
 
 impl QualityGrader {
-    pub fn grade(events: &[Event], violation_count: usize) -> QualityReport {
+    /// Grade an observation window, or `None` when the window holds no
+    /// evidence at all.
+    ///
+    /// Every dimension below is a ratio over observed events. With zero events
+    /// and zero violations each ratio degenerates to its perfect value and the
+    /// window scores 100/A — a fabricated verdict indistinguishable from a
+    /// genuinely clean window, which then drives GC cadence and dashboards. No
+    /// data is not good news, so it gets no grade.
+    pub fn grade(events: &[Event], violation_count: usize) -> Option<QualityReport> {
+        if events.is_empty() && violation_count == 0 {
+            return None;
+        }
         let total = events.len().max(1) as f64;
 
         // Security: ratio of security-related blocks to total events
@@ -58,7 +69,7 @@ impl QualityGrader {
         let score = security * 0.4 + stability * 0.3 + coverage * 0.2 + performance * 0.1;
         let grade = Grade::from_score(score);
 
-        QualityReport {
+        Some(QualityReport {
             score,
             grade,
             dimensions: QualityDimensions {
@@ -69,7 +80,7 @@ impl QualityGrader {
             },
             recommended_gc_interval: grade.recommended_gc_interval(),
             semantic_verdict: None,
-        }
+        })
     }
 }
 
@@ -89,7 +100,7 @@ mod tests {
     #[test]
     fn grade_perfect_events_no_violations() {
         let events: Vec<Event> = (0..10).map(|_| pass_event()).collect();
-        let report = QualityGrader::grade(&events, 0);
+        let report = QualityGrader::grade(&events, 0).expect("a non-empty window is gradable");
         assert_eq!(report.grade, Grade::A);
         assert!(report.score >= 90.0);
     }
@@ -97,7 +108,7 @@ mod tests {
     #[test]
     fn grade_degrades_with_violations() {
         let events: Vec<Event> = (0..10).map(|_| pass_event()).collect();
-        let report = QualityGrader::grade(&events, 50);
+        let report = QualityGrader::grade(&events, 50).expect("a non-empty window is gradable");
         assert!(report.score < 100.0);
         assert!(report.dimensions.coverage < 100.0);
     }
@@ -105,19 +116,34 @@ mod tests {
     #[test]
     fn grade_degrades_with_many_blocks() {
         let events: Vec<Event> = (0..10).map(|_| block_event("security_check")).collect();
-        let report = QualityGrader::grade(&events, 0);
+        let report = QualityGrader::grade(&events, 0).expect("a non-empty window is gradable");
         assert!(report.dimensions.stability < 100.0);
     }
 
     #[test]
-    fn grade_empty_events_returns_report() {
-        let report = QualityGrader::grade(&[], 0);
-        assert!(report.score >= 0.0);
+    fn empty_window_has_no_verdict() {
+        assert!(QualityGrader::grade(&[], 0).is_none());
+    }
+
+    #[test]
+    fn violations_without_events_are_still_graded() {
+        let report =
+            QualityGrader::grade(&[], 5).expect("violations are evidence even without events");
+        assert!(report.dimensions.coverage < 100.0);
+    }
+
+    #[test]
+    fn a_clean_non_empty_window_still_scores_perfectly() {
+        let events: Vec<Event> = (0..3).map(|_| pass_event()).collect();
+        let report = QualityGrader::grade(&events, 0).expect("a non-empty window is gradable");
+        assert_eq!(report.grade, Grade::A);
+        assert_eq!(report.score, 100.0);
     }
 
     #[test]
     fn recommended_gc_interval_matches_grade() {
-        let report = QualityGrader::grade(&[], 0);
+        let events: Vec<Event> = (0..10).map(|_| pass_event()).collect();
+        let report = QualityGrader::grade(&events, 0).expect("a non-empty window is gradable");
         assert_eq!(
             report.recommended_gc_interval,
             report.grade.recommended_gc_interval()

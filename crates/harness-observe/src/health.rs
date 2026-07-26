@@ -30,7 +30,9 @@ pub struct EventSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthReport {
-    pub quality: QualityReport,
+    /// `None` when the window held no events and no violations: an empty
+    /// window has no quality verdict to report.
+    pub quality: Option<QualityReport>,
     pub violation_summary: Vec<ViolationSummary>,
     pub signal_summary: Vec<SignalSummary>,
     pub event_summary: EventSummary,
@@ -42,7 +44,13 @@ pub fn generate_health_report(events: &[Event], violations: &[Violation]) -> Hea
     let signal_summary = derive_signals(events);
     let event_summary = count_events(events);
     let quality = QualityGrader::grade(events, violations.len());
-    let recommendations = build_recommendations(&quality, &violation_summary, &event_summary);
+    let recommendations = match quality.as_ref() {
+        Some(quality) => build_recommendations(quality, &violation_summary, &event_summary),
+        None => vec![
+            "No events observed in this window; run a task before reading a quality verdict."
+                .to_string(),
+        ],
+    };
 
     HealthReport {
         quality,
@@ -193,14 +201,14 @@ mod tests {
     }
 
     #[test]
-    fn zero_events_zero_violations_grade_a() {
+    fn zero_events_zero_violations_has_no_quality_verdict() {
         let report = generate_health_report(&[], &[]);
-        assert_eq!(report.quality.grade, Grade::A);
+        assert!(report.quality.is_none());
         assert!(report.violation_summary.is_empty());
         assert!(report.signal_summary.is_empty());
         assert_eq!(report.event_summary.total, 0);
         assert_eq!(report.recommendations.len(), 1);
-        assert!(report.recommendations[0].contains("good"));
+        assert!(report.recommendations[0].contains("No events observed"));
     }
 
     #[test]
@@ -257,6 +265,9 @@ mod tests {
             .map(|_| make_violation("SEC-01", Severity::High))
             .collect();
         let report = generate_health_report(&[], &violations);
-        assert!(report.quality.dimensions.coverage < 100.0);
+        let quality = report
+            .quality
+            .expect("violations are evidence enough to grade");
+        assert!(quality.dimensions.coverage < 100.0);
     }
 }
