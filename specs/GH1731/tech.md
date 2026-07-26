@@ -135,7 +135,8 @@ quiescent checkout.
 Each file becomes an ASC-001 component:
 
 - `schema_version`: ASC-001 constant;
-- component ID: `repository:<normalized locator>`;
+- component ID from the ASC-001 helper:
+  `repository:<component kind>:<normalized locator>`;
 - source scope: `repository`;
 - source locator: normalized locator;
 - kind: rule kind;
