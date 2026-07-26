@@ -222,6 +222,9 @@ report_binary_freshness() {
   local live_pid="${1:-}"
   local assessed="" exe="" state=""
   if [[ -n "$live_pid" ]]; then
+    # ps comm output can be truncated or relative on some platforms; when it
+    # does not resolve to a repository-local binary we fall back to the
+    # default candidate below and always print which binary was assessed.
     exe="$(ps -p "$live_pid" -o comm= 2>/dev/null | tail -1 || true)"
     case "$exe" in
       "$PWD"/target/*|./target/*|target/*)

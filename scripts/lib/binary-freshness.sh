@@ -36,9 +36,11 @@ _harness_bf_mtime() {
 # POSIX treats repeated slashes as one separator; squeeze them so textual
 # prefix matching cannot be defeated by "dir//file" spellings in dep-info.
 _harness_bf_squeeze_slashes() {
-    local path="$1"
+    # Named pattern/replacement variables: literal backslash-escaped slashes
+    # in ${var//pattern/replacement} misparse under macOS stock bash 3.2.
+    local path="$1" double_slash='//' single_slash='/'
     while case "$path" in *//*) true ;; *) false ;; esac; do
-        path="${path//\/\//\/}"
+        path="${path//$double_slash/$single_slash}"
     done
     printf '%s\n' "$path"
 }
