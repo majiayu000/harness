@@ -649,6 +649,7 @@ async fn replay_caller_counts_and_logs_only_applied_writes() -> anyhow::Result<(
 
     let captured = ReplayCapturedSubscriber::default();
     let updated = {
+        crate::test_helpers::install_tracing_interest_keeper();
         let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
         replay_and_recover(&db, &log_path).await?
     };
@@ -711,6 +712,7 @@ async fn replay_conflict_preserves_terminal_log() -> anyhow::Result<()> {
 
     let captured = ReplayCapturedSubscriber::default();
     let error = {
+        crate::test_helpers::install_tracing_interest_keeper();
         let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
         replay_and_recover(&db, &log_path)
             .await

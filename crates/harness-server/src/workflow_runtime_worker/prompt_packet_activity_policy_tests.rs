@@ -186,7 +186,17 @@ fn runtime_prompt_packet_omits_duplicated_additional_prompt() {
         "additional_prompt": "Inspect the existing pull request.",
         "issue_number": 42
     }));
-    let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+    let mut runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+    runtime_profile.timeout_secs = Some(3600);
+    let resolved_settings =
+        crate::workflow_runtime_worker::runtime_profile::resolve_runtime_settings(
+            &runtime_profile,
+            runtime_profile.kind,
+            None,
+            &harness_core::config::agents::AgentsConfig::default(),
+            &harness_core::config::concurrency::ConcurrencyConfig::default(),
+        )
+        .unwrap_or_else(|error| panic!("test runtime settings should resolve: {error}"));
 
     let packet = build_runtime_prompt_packet(
         &job,
@@ -194,8 +204,10 @@ fn runtime_prompt_packet_omits_duplicated_additional_prompt() {
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings,
         &WorkflowDocument::default(),
         &[],
+        None,
     )
     .expect("prompt packet should build");
 

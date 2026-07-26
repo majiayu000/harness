@@ -20,6 +20,31 @@ pub struct WorkflowDocument {
     pub prompt_template: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
+    /// Ordered configured sources (central base first, repository override
+    /// second) observed while loading this document. Observation-only runtime
+    /// evidence: never serialized with the document.
+    #[serde(skip)]
+    pub sources: Vec<WorkflowSourceObservation>,
+}
+
+/// Which configured `WORKFLOW.md` file contributed to the effective document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowSourceRole {
+    /// The central base `WORKFLOW.md` registered next to the server config.
+    CentralBase,
+    /// The repository `{project_root}/WORKFLOW.md` override.
+    RepositoryOverride,
+}
+
+/// Observation-only fact about one configured workflow source file that was
+/// actually read while loading the effective document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowSourceObservation {
+    pub role: WorkflowSourceRole,
+    /// Path of the file read, canonicalized when resolvable.
+    pub path: PathBuf,
+    /// Lowercase hex SHA-256 of the exact bytes read from the file.
+    pub content_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,14 +546,24 @@ fn workflow_base_path() -> Option<&'static Path> {
     WORKFLOW_BASE_PATH.get().map(PathBuf::as_path)
 }
 
+/// One parsed `WORKFLOW.md` file plus the digest of the exact bytes read.
+struct LoadedWorkflowFile {
+    front_matter: serde_yaml::Value,
+    body: String,
+    content_sha256: String,
+}
+
 /// Parse a single `WORKFLOW.md` into its front-matter YAML value and prompt body.
 /// Returns `Ok(None)` when the file does not exist.
-fn read_workflow_file(path: &Path) -> anyhow::Result<Option<(serde_yaml::Value, String)>> {
+fn read_workflow_file(path: &Path) -> anyhow::Result<Option<LoadedWorkflowFile>> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    let content_sha256 = crate::stack::Sha256Digest::from_bytes(contents.as_bytes())
+        .as_str()
+        .to_owned();
     let (front_matter, body) = split_front_matter_and_body(&contents);
     let value = match front_matter {
         None => serde_yaml::Value::Null,
@@ -540,7 +575,11 @@ fn read_workflow_file(path: &Path) -> anyhow::Result<Option<(serde_yaml::Value, 
             )
         })?,
     };
-    Ok(Some((value, body.trim().to_string())))
+    Ok(Some(LoadedWorkflowFile {
+        front_matter: value,
+        body: body.trim().to_string(),
+        content_sha256,
+    }))
 }
 
 /// Recursively merge `over` onto `base`, except for an atomic root-level
@@ -606,20 +645,40 @@ fn load_workflow_document_with_base(
         _ => None,
     };
 
+    let mut sources = Vec::new();
+    if let Some((base_path, base_file)) = &base {
+        sources.push(WorkflowSourceObservation {
+            role: WorkflowSourceRole::CentralBase,
+            path: workflow_path_identity(base_path),
+            content_sha256: base_file.content_sha256.clone(),
+        });
+    }
+    if let Some(repo_file) = &repo {
+        sources.push(WorkflowSourceObservation {
+            role: WorkflowSourceRole::RepositoryOverride,
+            path: workflow_path_identity(&repo_path),
+            content_sha256: repo_file.content_sha256.clone(),
+        });
+    }
+
     let (merged_value, prompt_template, source_path) = match (base, repo) {
         (None, None) => return Ok(WorkflowDocument::default()),
-        (Some((base_path, (base_value, base_body))), None) => {
-            (base_value, base_body, base_path.display().to_string())
-        }
-        (None, Some((repo_value, repo_body))) => {
-            (repo_value, repo_body, repo_path.display().to_string())
-        }
-        (Some((base_path, (base_value, base_body))), Some((repo_value, repo_body))) => {
-            let merged = deep_merge_yaml(base_value, repo_value);
-            let body = if repo_body.is_empty() {
-                base_body
+        (Some((base_path, base_file)), None) => (
+            base_file.front_matter,
+            base_file.body,
+            base_path.display().to_string(),
+        ),
+        (None, Some(repo_file)) => (
+            repo_file.front_matter,
+            repo_file.body,
+            repo_path.display().to_string(),
+        ),
+        (Some((base_path, base_file)), Some(repo_file)) => {
+            let merged = deep_merge_yaml(base_file.front_matter, repo_file.front_matter);
+            let body = if repo_file.body.is_empty() {
+                base_file.body
             } else {
-                repo_body
+                repo_file.body
             };
             let source = format!("{} + {}", base_path.display(), repo_path.display());
             (merged, body, source)
@@ -659,6 +718,7 @@ fn load_workflow_document_with_base(
         config,
         prompt_template,
         source_path: Some(source_path),
+        sources,
     })
 }
 
