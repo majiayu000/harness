@@ -35,7 +35,6 @@ fn run_ok(root: &Path) -> AgentStackInventory {
     run(root).expect("inventory must succeed")
 }
 
-/// Assert the scan fails with `kind` and return the error for locator checks.
 fn assert_fail(root: &Path, kind: EK) -> AgentStackInventoryError {
     let error = run(root).expect_err("inventory must fail");
     assert_eq!(error.kind(), kind);
@@ -86,8 +85,6 @@ fn entry_digest(entry: &AgentStackInventoryEntry) -> String {
 #[test]
 #[rustfmt::skip]
 fn invalid_limits_fail_before_root_open() {
-    // Invalid limits are rejected at construction, before any root open, even
-    // when the root itself does not exist.
     let missing = PathBuf::from("/nonexistent/harness-gh1731");
     let base = || AgentStackInventoryOptions::new(missing.clone());
     for result in [
@@ -101,7 +98,6 @@ fn invalid_limits_fail_before_root_open() {
         assert_eq!(error.kind(), EK::InvalidOptions);
         assert_eq!(error.locator(), None);
     }
-    // A missing, unreadable, or non-directory root fails as `root_open`.
     assert_eq!(run(&missing).expect_err("missing root").kind(), EK::RootOpen);
     let dir = tmp();
     write_file(dir.path(), "not-a-directory", b"x");
@@ -113,8 +109,6 @@ fn invalid_limits_fail_before_root_open() {
 #[test]
 #[rustfmt::skip]
 fn inventory_stays_bound_to_the_opened_root_handle() {
-    // Replace the root path after opening the handle: traversal must keep
-    // observing the originally opened directory, not the new path occupant.
     let outer = tmp();
     let root = outer.path().join("repo");
     fs::create_dir(&root).expect("mkdir root");
@@ -131,8 +125,6 @@ fn inventory_stays_bound_to_the_opened_root_handle() {
 #[cfg(not(unix))]
 #[test]
 fn inventory_stays_bound_to_the_opened_root_handle() {
-    // Handle replacement cannot be raced portably here; assert the service
-    // only reports repository-relative locators.
     let dir = tmp();
     write_file(dir.path(), "AGENTS.md", b"original");
     let inventory = run_ok(dir.path());
@@ -179,7 +171,6 @@ fn inventory_discovers_every_stack_and_language_validation_selector() {
         ".eslintrc.json", ".eslintrc.yaml", ".eslintrc.yml", "eslint.config.js",
         "eslint.config.mjs", "eslint.config.cjs", "biome.json", ".rubocop.yml",
         "App.csproj", "App.sln", ".csproj", ".sln", "Makefile", "justfile",
-        // Unrelated files that must stay excluded.
         "README.md", "src/main.rs", "docs/notes.md", ".vibeguard/helper.sh",
         ".harness/local/run.log", "hooks/x.sh", ".claude/hooks/y.sh",
         "spec/models/user_spec.rb",
@@ -187,7 +178,6 @@ fn inventory_discovers_every_stack_and_language_validation_selector() {
     for rel in files {
         write_file(root, rel, rel.as_bytes());
     }
-    // Keep `harness.toml` valid TOML so configured-rule parsing succeeds.
     write_file(root, "harness.toml", b"# empty harness config\n");
     let expected: &[(&str, &str)] = &[
         ("AGENTS.md", "instructions"), ("AGENTS.override.md", "instructions"),
@@ -273,6 +263,11 @@ requirements_path = "reqs.toml"
     write_file(mismatch.path(), "harness.toml", b"[rules]\ndiscovery_paths = [\"requirements.toml\"]\n");
     fs::create_dir(mismatch.path().join("requirements.toml")).expect("mkdir");
     assert_fail(mismatch.path(), EK::NonRegularEntry);
+    let derived = tmp();
+    write_file(derived.path(), "harness.toml",
+        b"[rules]\ndiscovery_paths = [\"shared\"]\nrequirements_path = \"shared\"\n");
+    fs::create_dir(derived.path().join("shared")).expect("mkdir");
+    assert_fail(derived.path(), EK::NonRegularEntry);
 }
 
 #[test]
@@ -423,7 +418,6 @@ fn only_lifecycle_bound_hook_entrypoints_are_inventoried() {
 fn component_kind_comes_from_matching_rule() {
     let dir = tmp();
     let root = dir.path();
-    // Identical bytes everywhere: the kind must come from the matched rule.
     for rel in ["skills/same.md", "rules/same.md", "MEMORY.md", "WORKFLOW.md", ".mcp.json"] {
         write_file(root, rel, b"identical contents");
     }
@@ -452,7 +446,6 @@ fn unsupported_non_utf8_entries_are_filtered_before_locator_normalization() {
         return;
     }
     assert_eq!(pairs(&run_ok(root)), vec![("skills/ok.md".to_owned(), "skill")]);
-    // A selected non-UTF-8 name fails typed with the representable ancestor.
     let selected = root.join("skills").join(OsStr::from_bytes(b"bad-\xFF.md"));
     fs::write(&selected, b"selected").expect("write non-utf8 md");
     let error = assert_fail(root, EK::NonUtf8Locator);
@@ -482,7 +475,6 @@ fn unsupported_non_utf8_entries_are_filtered_before_locator_normalization() {
 fn filesystem_enumeration_order_does_not_change_inventory() {
     let dir = tmp();
     let root = dir.path();
-    // Create in deliberately non-sorted order.
     for rel in ["skills/zz.md", "skills/aa.md", "skills/mm.md", "rules/z.toml", "rules/a.md"] {
         write_file(root, rel, rel.as_bytes());
     }
@@ -521,6 +513,7 @@ fn symlink_swaps_remain_root_confined_and_hash_the_opened_target() {
     assert_eq!(classify_resolution_failure(&cap, "CLAUDE.md", std::io::ErrorKind::NotFound), EK::EntryRaced);
     symlink("gone.txt", root.join("CLAUDE.md")).expect("broken link");
     assert_eq!(classify_selected_open_failure(&cap, "CLAUDE.md", std::io::ErrorKind::NotFound), EK::BrokenSymlink);
+    assert_eq!(classify_traversal_open_failure(&cap, "CLAUDE.md", std::io::ErrorKind::NotFound), EK::BrokenSymlink);
     assert_fail(&root, EK::BrokenSymlink);
 }
 
@@ -543,11 +536,15 @@ fn in_root_directory_symlinks_are_traversed_and_cycles_fail() {
     write_file(root, "rules-src/a.md", b"a");
     symlink("rules-src", root.join("rules")).expect("dir symlink");
     assert!(pairs(&run_ok(root)).contains(&("rules/a.md".to_owned(), "policy")));
-    // A directory identity already on the active ancestor stack is a cycle.
     let cyclic = tmp();
     write_file(cyclic.path(), ".vibeguard/sub/rule.md", b"r");
     symlink("../../.vibeguard", cyclic.path().join(".vibeguard/sub/loop")).expect("cycle link");
     assert_fail(cyclic.path(), EK::CycleDetected);
+    let ordered = tmp();
+    fs::create_dir(ordered.path().join("rules")).expect("mkdir");
+    symlink("missing", ordered.path().join("rules/z.md")).expect("symlink");
+    symlink("missing", ordered.path().join("rules/a.md")).expect("symlink");
+    assert_eq!(assert_fail(ordered.path(), EK::BrokenSymlink).locator(), Some("rules/a.md"));
 }
 
 #[cfg(not(unix))]
@@ -584,8 +581,6 @@ fn file_rules_reject_directory_symlink_targets() {
 #[cfg(not(unix))]
 #[test]
 fn file_rules_reject_directory_symlink_targets() {
-    // Without symlinks, assert the same rejection for a plain directory that
-    // occupies an exact-file rule path.
     let dir = tmp();
     fs::create_dir(dir.path().join("CLAUDE.md")).expect("mkdir");
     assert_fail(dir.path(), EK::NonRegularEntry);
@@ -600,11 +595,11 @@ fn unreadable_and_non_utf8_entries_fail_without_lossy_locators() {
     write_file(root, "CLAUDE.md", b"secret");
     let path = root.join("CLAUDE.md");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod 000");
-    if fs::File::open(&path).is_err() {
-        let error = assert_fail(root, EK::ReadFailed);
-        assert_eq!(error.locator(), Some("CLAUDE.md"));
-        assert!(!error.locator().unwrap_or_default().contains('\u{FFFD}'), "no lossy locator");
-    }
+    let options = if fs::File::open(&path).is_err() { opts(root) }
+        else { opts(root).with_injected_read_failure("CLAUDE.md") };
+    let error = inventory_repository_stack(&options).expect_err("unreadable selected file");
+    assert_eq!((error.kind(), error.locator()), (EK::ReadFailed, Some("CLAUDE.md")));
+    assert!(!error.locator().unwrap_or_default().contains('\u{FFFD}'), "no lossy locator");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod back");
     assert_eq!(classify_open_failure(std::io::ErrorKind::PermissionDenied), EK::ReadFailed);
     assert_eq!(classify_open_failure(std::io::ErrorKind::NotFound), EK::EntryRaced);
@@ -615,10 +610,15 @@ fn unreadable_and_non_utf8_entries_fail_without_lossy_locators() {
 #[cfg(not(unix))]
 #[test]
 fn unreadable_and_non_utf8_entries_fail_without_lossy_locators() {
-    let denied = classify_open_failure(std::io::ErrorKind::PermissionDenied);
-    assert_eq!(denied, EK::ReadFailed);
-    let raced = classify_open_failure(std::io::ErrorKind::NotFound);
-    assert_eq!(raced, EK::EntryRaced);
+    let dir = tmp();
+    write_file(dir.path(), "CLAUDE.md", b"secret");
+    let options = opts(dir.path()).with_injected_read_failure("CLAUDE.md");
+    assert_eq!(
+        inventory_repository_stack(&options)
+            .expect_err("injected read")
+            .kind(),
+        EK::ReadFailed
+    );
 }
 
 #[test]
@@ -631,6 +631,9 @@ fn invalid_configured_rule_sources_fail_typed() {
     let empty = tmp();
     write_file(empty.path(), "harness.toml", b"[rules]\nexec_policy_paths = [\"\"]\n");
     assert_fail(empty.path(), EK::ConfiguredSourceInvalid);
+    let drive_relative = tmp();
+    write_file(drive_relative.path(), "harness.toml", b"[rules]\ndiscovery_paths = [\"C:policy.toml\"]\n");
+    assert_fail(drive_relative.path(), EK::ConfiguredSourceInvalid);
     let missing = tmp();
     write_file(missing.path(), "harness.toml", b"[rules]\nrequirements_path = \"nope.toml\"\n");
     let error = assert_fail(missing.path(), EK::ConfiguredSourceMissing);
@@ -654,19 +657,15 @@ fn every_traversal_limit_has_an_exact_boundary_fixture() {
     let files = tmp();
     write_file(files.path(), "AGENTS.md", b"aaaa");
     write_file(files.path(), "CLAUDE.md", b"bbbb");
-    // max_files: two regular files fit exactly; one fails on the second read.
     assert!(run_with(base(files.path()).with_max_files(2)).is_ok());
     let error = run_with(base(files.path()).with_max_files(1)).expect_err("file budget");
     assert_eq!((error.kind(), error.locator()), (EK::LimitExceeded, Some("CLAUDE.md")));
     assert!(run_with(base(files.path()).with_max_file_bytes(4)).is_ok());
     let error = run_with(base(files.path()).with_max_file_bytes(3)).expect_err("per-file bytes");
     assert_eq!(error.kind(), EK::LimitExceeded);
-    // max_total_bytes: 4 + 4 bytes pass at 8 and fail at 7.
     assert!(run_with(base(files.path()).with_max_total_bytes(8)).is_ok());
     let error = run_with(base(files.path()).with_max_total_bytes(7)).expect_err("total bytes");
     assert_eq!((error.kind(), error.locator()), (EK::LimitExceeded, Some("CLAUDE.md")));
-    // Depth and opened-directory budgets: skills/a/SKILL.md needs depth 2 and
-    // three opened directories (root, skills, skills/a).
     let deep = tmp();
     write_file(deep.path(), "skills/a/SKILL.md", b"s");
     assert!(run_with(base(deep.path()).with_max_depth(2)).is_ok());
@@ -675,7 +674,10 @@ fn every_traversal_limit_has_an_exact_boundary_fixture() {
     assert!(run_with(base(deep.path()).with_max_directories(3)).is_ok());
     let error = run_with(base(deep.path()).with_max_directories(2)).expect_err("dir budget");
     assert_eq!(error.kind(), EK::LimitExceeded);
-    // max_entries_per_directory: three children fit exactly at 3, fail at 2.
+    let nested = tmp();
+    write_file(nested.path(), ".harness/rules/a.md", b"a");
+    let error = run_with(base(nested.path()).with_max_depth(1)).expect_err("root-relative depth");
+    assert_eq!((error.kind(), error.locator()), (EK::LimitExceeded, Some(".harness/rules")));
     let wide = tmp();
     for rel in ["skills/a.md", "skills/b.md", "skills/c.md"] {
         write_file(wide.path(), rel, b"x");
@@ -684,7 +686,6 @@ fn every_traversal_limit_has_an_exact_boundary_fixture() {
     let error = run_with(base(wide.path()).with_max_entries_per_directory(2))
         .expect_err("per-directory entries");
     assert_eq!(error.kind(), EK::LimitExceeded);
-    // suffix enumeration yields 1 (the `skills` directory itself): 4 exactly.
     assert!(run_with(base(wide.path()).with_max_total_entries(4)).is_ok());
     let error = run_with(base(wide.path()).with_max_total_entries(3)).expect_err("entries");
     assert_eq!((error.kind(), error.locator()), (EK::LimitExceeded, Some("skills")));
