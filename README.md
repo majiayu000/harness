@@ -91,9 +91,10 @@ sandbox modes are `read-only`, `read-only-with-network`, `workspace-write`, and
 ## Level up: the fleet control plane
 
 For parallel agents, task queues, cross-agent review, and the web dashboard,
-start the server (needs Postgres 14+, an API bearer token, and Docker for the
-bundled database). The copy-paste token generation below also needs the OpenSSL
-CLI. The Codex-safe launcher additionally requires `curl` and `lsof`.
+start the server (needs Postgres 14+, an API bearer token, and Docker Engine
+with the Docker Compose v2.1+ plugin for the bundled database). The copy-paste
+token generation below also needs the OpenSSL CLI. The Codex-safe launcher
+additionally requires `curl` and `lsof`.
 
 In a normal standalone terminal, start Postgres and the foreground server:
 
@@ -102,6 +103,8 @@ In a normal standalone terminal, start Postgres and the foreground server:
 HARNESS_API_TOKEN="$(openssl rand -hex 32)" &&
   test -n "$HARNESS_API_TOKEN" &&
   export HARNESS_API_TOKEN &&
+  printf '\nCopy this command into every client terminal:\n  export HARNESS_API_TOKEN=%s\n\n' \
+    "$HARNESS_API_TOKEN" &&
   bash scripts/dev-db.sh &&
   ./start-server.sh
 ```
@@ -115,6 +118,8 @@ settings reach the server even when another tmux server already exists:
 HARNESS_API_TOKEN="$(openssl rand -hex 32)" &&
   test -n "$HARNESS_API_TOKEN" &&
   export HARNESS_API_TOKEN &&
+  printf '\nCopy this command into every client terminal:\n  export HARNESS_API_TOKEN=%s\n\n' \
+    "$HARNESS_API_TOKEN" &&
   bash scripts/dev-db.sh &&
   export HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness &&
   export HARNESS_DATABASE_POOL_MAX_CONNECTIONS=16 &&
@@ -123,12 +128,23 @@ HARNESS_API_TOKEN="$(openssl rand -hex 32)" &&
 ```
 
 For the standalone path, `start-server.sh` remains in the foreground, so check
-it from a second terminal:
+it from a second terminal. First paste the exact
+`export HARNESS_API_TOKEN=...` command printed by Terminal 1, then verify both
+the unauthenticated health endpoint and an authenticated API endpoint:
 
 ```bash
 # Terminal 2
+# Paste the export command printed by Terminal 1 before running these commands.
 curl http://127.0.0.1:9800/health
+curl http://127.0.0.1:9800/api/dashboard \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 ```
+
+Open `http://127.0.0.1:9800/` and enter the same token when the dashboard
+prompts for it. The token grants API access; treat the printed command as a
+secret and do not commit or share it. Shell environments are not shared between
+terminals or persisted across restarts; after restarting, use the newly printed
+export command.
 
 Full server setup, configuration, and workflows are covered in
 [Quick Start](#quick-start) below.
@@ -184,7 +200,8 @@ server and development setup.
 - Bun 1.1+ for release builds that embed the web dashboard. If `web/dist` is
   already built, release builds can reuse it.
 - Postgres 14+. For local development, `scripts/dev-db.sh` starts the bundled
-  Docker Compose Postgres service.
+  Postgres service and requires Docker Engine with the Docker Compose v2.1+
+  plugin (`docker compose`, not legacy `docker-compose` v1).
 - A GitHub token for issue/PR automation. Use `gh auth login`, `GITHUB_TOKEN`,
   `GH_TOKEN`, or `server.github_token`.
 
@@ -331,9 +348,13 @@ cargo run -p harness-cli -- exec "Fix the failing test in src/lib.rs"
 
 ### Common Workflows
 
+The protected HTTP examples assume `HARNESS_API_TOKEN` is exported in the
+client shell as shown in the server quickstart above.
+
 ```bash
 # Workflow-runtime submission
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Add input validation to the API handler"}'
 
@@ -465,11 +486,15 @@ max_turns = 20
 
 ## HTTP REST API
 
+Except for `/health`, the examples below assume `HARNESS_API_TOKEN` is exported
+in the client shell and send it as a bearer token.
+
 ### Workflow Runtime Submissions
 
 ```bash
 # Submit work by prompt
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Add input validation to the API handler",
@@ -478,6 +503,7 @@ curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 
 # Submit work by GitHub issue number
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -487,6 +513,7 @@ curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 
 # Submit an issue but bypass triage/plan and go straight to implementation
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -496,6 +523,7 @@ curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 
 # Submit a PR for review/fix
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -505,28 +533,34 @@ curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 # Submit multiple issues (one durable submission per request)
 for issue in 10 11 12; do
   curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+    -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
     -H "Content-Type: application/json" \
     -d "{\"project\":\"/path/to/project\",\"issue\":$issue}"
 done
 
 # Get submission status
-curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id} \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 
 # List submissions
-curl http://127.0.0.1:9800/api/workflows/runtime/submissions
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 
 # Stream submission output (SSE)
-curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}/stream
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}/stream \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 ```
 
 ### Project Management
 
 ```bash
 # List registered projects
-curl http://127.0.0.1:9800/projects
+curl http://127.0.0.1:9800/projects \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 
 # Register a new project at runtime
 curl -X POST http://127.0.0.1:9800/projects \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "id": "my-project",
@@ -535,14 +569,16 @@ curl -X POST http://127.0.0.1:9800/projects \
   }'
 
 # Remove a project
-curl -X DELETE http://127.0.0.1:9800/projects/my-project
+curl -X DELETE http://127.0.0.1:9800/projects/my-project \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 ```
 
 ### Dashboard
 
 ```bash
 # Get aggregated status across all projects
-curl http://127.0.0.1:9800/api/dashboard
+curl http://127.0.0.1:9800/api/dashboard \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 
 # Response:
 # {
