@@ -110,7 +110,7 @@ repository root, not that an agent selected, loaded, or executed it.
 | Empty / missing input | Covered by B-001 and B-004. |
 | Error and failure paths | Covered by B-001, B-008, B-009, and B-010. |
 | Authorization / permission | Covered by B-001, B-002, and B-012; the caller selects one readable root and inventory gains no external authority. |
-| Concurrency / race / ordering | Covered by B-007 and B-011. Inventory is a point-in-time read; concurrent file mutation may produce a read error but never a fabricated stable result. |
+| Concurrency / race / ordering | Covered by B-007 and B-011. Inventory is a point-in-time read of a caller-controlled repository. Detected path or metadata changes fail the run; resistance to an adversary concurrently mutating the filesystem requires the isolated runtime-host work in ASC-021 through ASC-024. |
 | Retry / repetition / idempotency | Covered by B-011 and B-012. |
 | Illegal state transitions | N/A. Inventory is a stateless read operation. |
 | Compatibility / migration | Covered by B-003, B-005, and B-012; no existing persisted representation changes. |

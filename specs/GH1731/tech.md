@@ -75,15 +75,22 @@ adding a rule cannot reorder unrelated existing components.
 Canonicalize the requested root and require directory metadata. For each rule:
 
 1. inspect with `symlink_metadata`;
-2. treat `NotFound` as absence;
-3. return a typed error for other metadata failures;
-4. canonicalize existing entries and verify `starts_with(canonical_root)`;
+2. treat `NotFound` from that initial metadata lookup as absence;
+3. return a typed error for every other metadata failure;
+4. canonicalize existing entries, treat every canonicalization failure
+   (including `NotFound` for a broken symlink) as a typed error, and verify
+   `starts_with(canonical_root)`;
 5. visit directories with `std::fs::read_dir`, collect entries, normalize, and
    sort before recursion;
-6. track canonical directory identities in a set to reject cycles;
+6. track canonical directory identities in the active ancestor stack to reject
+   cycles while permitting non-cyclic duplicate paths to the same directory;
 7. accept only regular files or safe symlinks resolving to regular files;
-8. read through `File::take(max_file_bytes + 1)` and reject overflow;
-9. calculate SHA-256 from the exact bytes read.
+8. open and read using the canonical path verified in step 4 rather than the
+   unresolved repository locator;
+9. read through `File::take(max_file_bytes + 1)` and reject overflow;
+10. recanonicalize the repository locator after the read, abort if it no longer
+    resolves to the verified path, and calculate SHA-256 from the exact bytes
+    read only after that stability check.
 
 Safe in-root symlinks retain their link locator as component identity while
 hashing target bytes. Duplicate target content may therefore produce multiple
@@ -93,6 +100,12 @@ multiple declared stack entry points.
 Errors carry a stable category and sanitized repository-relative locator.
 They do not include file bytes, resolved out-of-root locations, or arbitrary OS
 error strings in serialized evidence.
+
+These checks detect ordinary concurrent changes but are not a security
+boundary against an adversary that can race filesystem mutations during the
+scan. Such repositories require the isolated, no-secret runtime-host profile
+planned by ASC-021 through ASC-024. This issue does not claim descriptor-based
+or kernel-enforced traversal confinement.
 
 ### Component Construction
 
@@ -163,8 +176,11 @@ occurs.
 ## Risks
 
 - Security: path escape and symlink races could read outside the requested
-  root. Canonical containment is checked for every existing entry immediately
-  before opening.
+  root. Canonical containment is checked before any file read, files are opened
+  through the verified canonical path, and the locator is revalidated after
+  reading. Hostile concurrent mutation remains outside this issue's trust
+  boundary and requires the isolated runtime-host controls in ASC-021 through
+  ASC-024.
 - Logic: an incomplete allowlist omits behavior-affecting sources. The product
   contract and table test enumerate the exact v0.1 surface.
 - Compatibility: broadening the table changes observed output; later changes
