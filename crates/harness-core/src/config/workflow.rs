@@ -266,6 +266,10 @@ pub struct RuntimeWorkerPolicy {
     pub concurrency: u32,
     #[serde(default = "default_runtime_worker_lease_ttl_secs")]
     pub lease_ttl_secs: u64,
+    /// Enforce the declared completion-evidence contract on built-in workflow
+    /// transitions. Kill switch for one release; enforcement is the default.
+    #[serde(default = "default_true")]
+    pub completion_evidence_enforced: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -447,6 +451,7 @@ impl Default for RuntimeWorkerPolicy {
             interval_secs: default_runtime_worker_interval_secs(),
             concurrency: default_runtime_worker_concurrency(),
             lease_ttl_secs: default_runtime_worker_lease_ttl_secs(),
+            completion_evidence_enforced: true,
         }
     }
 }
