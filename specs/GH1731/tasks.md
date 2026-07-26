@@ -50,7 +50,8 @@ GH-1731
 ### SP1731-T2 — Implement the closed typed discovery table
 
 - Owner: implementation agent
-- Files: `crates/harness-core/src/stack/inventory.rs`
+- Files: `crates/harness-core/src/stack/inventory.rs`,
+  `crates/harness-core/src/stack/inventory/rules.rs`
 - Dependencies: SP1731-T1
 - Covers: B-002, B-003, B-004, B-005, B-006, B-007, B-011
 - Done when:
@@ -95,11 +96,14 @@ GH-1731
   - `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule`
   - `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh`
   - `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory`
+  - `cargo test -p harness-core stack::inventory::review_tests::equivalent_static_and_configured_rules_share_one_traversal`
+  - `cargo test -p harness-core stack::inventory::review_tests::exact_rules_require_native_component_casing`
 
 ### SP1731-T3 — Implement capability-relative bounded traversal
 
 - Owner: implementation agent
-- Files: `crates/harness-core/src/stack/inventory.rs`
+- Files: `crates/harness-core/src/stack/inventory.rs`,
+  `crates/harness-core/src/stack/inventory/rules.rs`
 - Dependencies: SP1731-T1, SP1731-T2
 - Covers: B-001, B-004, B-008, B-009, B-010, B-011, B-012
 - Done when:
@@ -137,11 +141,15 @@ GH-1731
   - `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators`
   - `cargo test -p harness-core stack::inventory_tests::reads_never_exceed_remaining_aggregate_or_per_file_budget`
   - `cargo test -p harness-core stack::inventory_tests::every_traversal_limit_has_an_exact_boundary_fixture`
+  - `cargo test -p harness-core stack::inventory::review_tests::coordinated_selected_open_race_stays_root_confined`
+  - `cargo test -p harness-core stack::inventory::review_tests::selected_open_and_entry_metadata_races_are_classified`
+  - `cargo test -p harness-core stack::inventory::review_tests::injected_reader_failure_exercises_bounded_read_path`
 
 ### SP1731-T4 — Add exhaustive inventory contract tests
 
 - Owner: implementation agent
-- Files: `crates/harness-core/src/stack/inventory_tests.rs`
+- Files: `crates/harness-core/src/stack/inventory_tests.rs`,
+  `crates/harness-core/src/stack/inventory/review_tests.rs`
 - Dependencies: SP1731-T1, SP1731-T2, SP1731-T3
 - Covers: B-001, B-002, B-003, B-004, B-005, B-006, B-007, B-008,
   B-009, B-010, B-011, B-012
@@ -168,6 +176,12 @@ GH-1731
     content digest; non-Unix reports executable state as unobserved.
   - A deterministic injected read failure covers platforms where permission
     changes cannot reliably produce an unreadable file.
+  - Review-hardening fixtures prove exact native casing, one physical
+    traversal for equivalent static/configured rules, final-open race
+    classification with safe child locators, and coordinated lookup/open
+    symlink replacements for both in-root A-to-B and in-root-to-outside cases.
+  - Exact-casing fixtures use tight entry/directory budgets to prove cached
+    native listings are not re-enumerated once per exact rule.
 - Verify:
   - `cargo test -p harness-core stack::inventory_tests`
   - `cargo test -p harness-core`
@@ -175,12 +189,12 @@ GH-1731
 ### SP1731-T5 — Verify additive scope and hand off the final slice
 
 - Owner: verification owner
-- Files: all six implementation paths in the planned-changes manifest
+- Files: all eight implementation paths in the planned-changes manifest
 - Dependencies: SP1731-T1, SP1731-T2, SP1731-T3, SP1731-T4
 - Covers: B-001, B-002, B-003, B-004, B-005, B-006, B-007, B-008,
   B-009, B-010, B-011, B-012
 - Done when:
-  - The implementation changes only the six authorized paths and does not add
+  - The implementation changes only the eight authorized paths and does not add
     a CLI command, persistence migration, runtime consumer, or prompt-loader
     behavior.
   - The post-dependency `cargo audit` passes and no dependency is downgraded.
@@ -202,9 +216,10 @@ GH-1731
 ## Parallelization
 
 The implementation is serial. SP1731-T1 through SP1731-T3 share
-`inventory.rs`, SP1731-T4 verifies that exact contract, and SP1731-T5 owns
-shared verification. A read-only reviewer lane may inspect the exact diff
-after SP1731-T5; no two writable lanes may edit these paths concurrently.
+`inventory.rs` and `inventory/rules.rs`; SP1731-T4 owns both test modules and
+verifies that exact contract, and SP1731-T5 owns shared verification. A
+read-only reviewer lane may inspect the exact diff after SP1731-T5; no two
+writable lanes may edit these paths concurrently.
 
 ## Verification
 
@@ -223,5 +238,6 @@ after SP1731-T5; no two writable lanes may edit these paths concurrently.
   inventory therefore exposes no ambient canonical root.
 - In-root symlink swaps are non-atomic but root-confined. The opened file handle
   is the observation authority and its returned bytes determine the digest.
-- The planned-change manifest is exhaustive. Any implementation path outside
-  its six entries requires a spec revision before code changes.
+- The planned-change manifest is exhaustive. Review hardening amended it from
+  six to eight entries; any further implementation path requires another spec
+  revision before code changes.

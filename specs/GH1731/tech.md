@@ -9,7 +9,7 @@ GH-1731
 See `specs/GH1731/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1731,"complete":true,"paths":["Cargo.lock","Cargo.toml","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/inventory.rs","crates/harness-core/src/stack/inventory_tests.rs","crates/harness-core/src/stack/mod.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012"]}
+{"issue":1731,"complete":true,"paths":["Cargo.lock","Cargo.toml","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/inventory.rs","crates/harness-core/src/stack/inventory/rules.rs","crates/harness-core/src/stack/inventory/review_tests.rs","crates/harness-core/src/stack/inventory_tests.rs","crates/harness-core/src/stack/mod.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012"]}
 -->
 
 ## Current System
@@ -55,6 +55,37 @@ Add `stack::inventory` with:
 
 `stack/mod.rs` exposes the service and its public option/result/error types. It
 does not expose traversal helpers or mutable rule tables.
+
+### Review-Hardening Amendment (2026-07-27)
+
+Current-head review of implementation PR #1810 found four valid cross-platform
+and race-classification defects plus two deterministic-fixture gaps. The three
+original stack source files are already at 795, 800, and 798 lines, so adding
+the required fixes in place would violate the repository's 800-line hard
+ceiling. The implementation therefore extracts the closed rule model and
+configured-rule merge logic into `inventory/rules.rs`, while
+`inventory/review_tests.rs` owns the review-driven race, exact-casing,
+deduplication, and injected-reader fixtures. Neither module is public.
+
+The amended implementation must:
+
+- recheck a selected path capability-relatively when final open reports
+  `NotFound`, distinguishing a still-present broken symlink from a vanished or
+  replaced entry;
+- classify `DirEntry::file_type()` `NotFound` as `entry_raced`, reporting the
+  complete safe child locator for a UTF-8 basename and only the nearest
+  representable ancestor for a non-UTF-8 basename;
+- merge equivalent static and configured rules before traversal charges
+  directory or encountered-entry budgets;
+- validate every component of an exact path against native `OsStr` casing,
+  including parent directories on case-insensitive filesystems; cache and
+  reuse each native directory listing so casing checks neither enumerate once
+  per rule nor evade the existing entry/directory budgets;
+- coordinate one deterministic lookup/open seam for both an in-root A-to-B
+  symlink swap, whose digest must match the handle actually opened, and an
+  in-root-to-outside replacement, whose external bytes must never be read; and
+- inject a deterministic reader failure through the bounded-read path instead
+  of treating a direct error-enum assertion as read-path evidence.
 
 `AgentStackInventoryOptions` has private fields and a constructor accepting a
 `PathBuf` root. Its byte limits are `u64`; its regular-file, opened-directory,
@@ -315,24 +346,25 @@ inventory error; the service never skips an invalid component.
 
 ### Test Layout
 
-Keep production traversal in `inventory.rs` and table-driven fixtures in
-`inventory_tests.rs`. Tests use tempfile and explicit permissions where the
-platform supports unreadable-file assertions. Platform-specific inability to
-create an unreadable file must use a deterministic injected reader failure
-fixture rather than silently skip the behavior. Unix-only non-UTF-8 fixtures
-assert that unmatched native names are excluded before normalization and that a
-selected name or traversed directory returns a typed locator error; other
-platforms assert the same validator directly. Exact hook fixtures include valid
-lifecycle basenames plus README, helpers, and nested fixtures. A Unix FIFO
-fixture uses a bounded test timeout and proves `O_NONBLOCK` reaches handle-type
-rejection without a writer. A coordinated escaping-symlink fixture proves that
-a raced path cannot escape the opened root capability. An in-root swap fixture
-accepts either valid opened target and proves the digest matches that handle. A
-directory-symlink fixture proves recursive discovery and cycle rejection. A
-root-path replacement fixture proves traversal remains bound to the originally
-opened handle without claiming an ambient canonical root. Unix fixtures toggle
-a hook's executable bits while holding bytes constant; non-Unix tests assert
-the explicit unobserved state.
+Keep production traversal in `inventory.rs`, the closed rule model in
+`inventory/rules.rs`, broad table-driven fixtures in `inventory_tests.rs`, and
+review-driven white-box fixtures in `inventory/review_tests.rs`. Tests use
+tempfile and explicit permissions where the platform supports unreadable-file
+assertions. Platform-specific inability to create an unreadable file must use a
+deterministic injected reader failure fixture rather than silently skip the
+behavior. Unix-only non-UTF-8 fixtures assert that unmatched native names are
+excluded before normalization and that a selected name or traversed directory
+returns a typed locator error; other platforms assert the same validator
+directly. Exact hook fixtures include valid lifecycle basenames plus README,
+helpers, and nested fixtures. A Unix FIFO fixture uses a bounded test timeout
+and proves `O_NONBLOCK` reaches handle-type rejection without a writer. A
+coordinated escaping-symlink fixture proves that a raced path cannot escape the
+opened root capability. An in-root swap fixture accepts either valid opened
+target and proves the digest matches that handle. A directory-symlink fixture
+proves recursive discovery and cycle rejection. A root-path replacement fixture
+proves traversal remains bound to the originally opened handle without claiming
+an ambient canonical root. Unix fixtures toggle a hook's executable bits while
+holding bytes constant; non-Unix tests assert the explicit unobserved state.
 
 ## Data Flow
 
@@ -353,16 +385,16 @@ subprocess, network, persistence, or repository write occurs.
 | --- | --- | --- |
 | B-001 | root-handle-first preflight with no ambient-root claim | `cargo test -p harness-core stack::inventory_tests::inventory_stays_bound_to_the_opened_root_handle` |
 | B-002 | root-only rule table | `cargo test -p harness-core stack::inventory_tests::inventory_never_reads_user_global_or_sibling_paths` |
-| B-003 | static `InventoryRule` table plus bounded configured rule derivation | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector`; `cargo test -p harness-core stack::inventory_tests::vibeguard_runner_is_inventoried_as_validation`; `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once`; `cargo test -p harness-core stack::inventory_tests::same_locator_with_distinct_kinds_is_preserved` |
+| B-003 | static `InventoryRule` table plus bounded configured rule derivation | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector`; `cargo test -p harness-core stack::inventory_tests::vibeguard_runner_is_inventoried_as_validation`; `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once`; `cargo test -p harness-core stack::inventory_tests::same_locator_with_distinct_kinds_is_preserved`; `cargo test -p harness-core stack::inventory::review_tests::equivalent_static_and_configured_rules_share_one_traversal` |
 | B-004 | non-following initial lookup and missing-entry handling | `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders` |
 | B-005 | entry/component construction, hashing, executable mode, directory presence, and current-observation freshness | `cargo test -p harness-core stack::inventory_tests::entries_bind_content_mode_and_directory_presence_to_valid_components`; `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh` |
 | B-006 | surface-specific static and configured selector classification | `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`; `cargo test -p harness-core stack::inventory_tests::only_lifecycle_bound_hook_entrypoints_are_inventoried`; `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once`; `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
-| B-007 | native prefilter plus sorted selected traversal/output | `cargo test -p harness-core stack::inventory_tests::unsupported_non_utf8_entries_are_filtered_before_locator_normalization`; `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory` |
-| B-008 | capability-relative file/directory symlink traversal and opened-handle observation | `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target`; `cargo test -p harness-core stack::inventory_tests::in_root_directory_symlinks_are_traversed_and_cycles_fail`; `cargo test -p harness-core stack::inventory_tests::file_rules_reject_directory_symlink_targets` |
-| B-009 | typed read/path/config errors | `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators`; `cargo test -p harness-core stack::inventory_tests::invalid_configured_rule_sources_fail_typed` |
+| B-007 | native prefilter plus sorted selected traversal/output | `cargo test -p harness-core stack::inventory_tests::unsupported_non_utf8_entries_are_filtered_before_locator_normalization`; `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory`; `cargo test -p harness-core stack::inventory::review_tests::exact_rules_require_native_component_casing` |
+| B-008 | capability-relative file/directory symlink traversal and opened-handle observation | `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target`; `cargo test -p harness-core stack::inventory_tests::in_root_directory_symlinks_are_traversed_and_cycles_fail`; `cargo test -p harness-core stack::inventory_tests::file_rules_reject_directory_symlink_targets`; `cargo test -p harness-core stack::inventory::review_tests::coordinated_selected_open_race_stays_root_confined` |
+| B-009 | typed read/path/config errors | `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators`; `cargo test -p harness-core stack::inventory_tests::invalid_configured_rule_sources_fail_typed`; `cargo test -p harness-core stack::inventory::review_tests::selected_open_and_entry_metadata_races_are_classified`; `cargo test -p harness-core stack::inventory::review_tests::injected_reader_failure_exercises_bounded_read_path` |
 | B-010 | checked file/directory/entry/depth/byte limits and nonblocking handle validation | `cargo test -p harness-core stack::inventory_tests::every_traversal_limit_has_an_exact_boundary_fixture`; `cargo test -p harness-core stack::inventory_tests::selected_fifo_targets_fail_without_blocking` |
 | B-011 | repeated full-entry fixture comparison | `cargo test -p harness-core stack::inventory_tests::unchanged_repository_inventory_is_repeatable` |
-| B-012 | read-only API surface and side-effect fixture | `cargo test -p harness-core stack::inventory_tests::inventory_is_read_only_and_invokes_no_external_behavior`; `rg -n "Command::new|TcpStream|UdpSocket|reqwest|std::fs::(write|remove|rename|create_dir)" crates/harness-core/src/stack/inventory.rs` (expect no matches); `cargo test -p harness-core agents_md` |
+| B-012 | read-only API surface and side-effect fixture | `cargo test -p harness-core stack::inventory_tests::inventory_is_read_only_and_invokes_no_external_behavior`; `rg -n "Command::new|TcpStream|UdpSocket|reqwest|std::fs::(write|remove|rename|create_dir)" crates/harness-core/src/stack/inventory.rs crates/harness-core/src/stack/inventory/rules.rs` (expect no matches); `cargo test -p harness-core agents_md` |
 
 ## Alternatives Considered
 
@@ -436,7 +468,7 @@ subprocess, network, persistence, or repository write occurs.
       updating `Cargo.lock`.
 - [ ] Run
       `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1731`.
-- [ ] Confirm the implementation diff contains only the six paths in the
+- [ ] Confirm the implementation diff contains only the eight paths in the
       planned-changes manifest.
 
 ## Rollback Plan
