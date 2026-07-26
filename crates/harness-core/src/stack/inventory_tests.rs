@@ -609,6 +609,7 @@ fn unreadable_and_non_utf8_entries_fail_without_lossy_locators() {
     // where permission bits cannot produce an unreadable file.
     assert_eq!(classify_open_failure(std::io::ErrorKind::PermissionDenied), EK::ReadFailed);
     assert_eq!(classify_open_failure(std::io::ErrorKind::NotFound), EK::EntryRaced);
+    assert_eq!(classify_directory_open_failure(std::io::ErrorKind::NotADirectory), EK::EntryRaced);
 }
 
 #[cfg(not(unix))]
@@ -687,11 +688,10 @@ fn every_traversal_limit_has_an_exact_boundary_fixture() {
     let error = run_with(base(wide.path()).with_max_entries_per_directory(2))
         .expect_err("per-directory entries");
     assert_eq!(error.kind(), EK::LimitExceeded);
-    // max_total_entries: the skills traversal yields 3 entries and the root
     // suffix enumeration yields 1 (the `skills` directory itself): 4 exactly.
     assert!(run_with(base(wide.path()).with_max_total_entries(4)).is_ok());
     let error = run_with(base(wide.path()).with_max_total_entries(3)).expect_err("entries");
-    assert_eq!(error.kind(), EK::LimitExceeded);
+    assert_eq!((error.kind(), error.locator()), (EK::LimitExceeded, None));
 }
 
 #[test]

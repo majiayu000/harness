@@ -171,7 +171,7 @@ impl std::error::Error for AgentStackInventoryError {}
 type IErr = AgentStackInventoryError;
 
 fn err(kind: AgentStackInventoryErrorKind, locator: &str) -> IErr {
-    IErr::new(kind, Some(locator.to_owned()))
+    IErr::new(kind, (!locator.is_empty()).then(|| locator.to_owned()))
 }
 
 /// Closed per-directory entry selector: pure rule-table data, never content
@@ -392,6 +392,11 @@ pub(super) fn classify_resolution_failure(
 #[rustfmt::skip]
 pub(super) fn classify_open_failure(kind: std::io::ErrorKind) -> AgentStackInventoryErrorKind {
     if kind == std::io::ErrorKind::NotFound { EK::EntryRaced } else { EK::ReadFailed }
+}
+
+#[rustfmt::skip]
+pub(super) fn classify_directory_open_failure(kind: std::io::ErrorKind) -> AgentStackInventoryErrorKind {
+    match kind { std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => EK::EntryRaced, std::io::ErrorKind::PermissionDenied => EK::RootEscape, _ => EK::EntryMetadata }
 }
 
 type DerivedRule = (String, RuleTarget, AgentStackComponentKind);
@@ -635,11 +640,7 @@ impl Scan<'_> {
         }
         charge(&mut self.dirs_opened, self.opts.max_directories, &prefix)?;
         let dir = root.open_dir(&prefix).map_err(|error| {
-            let kind = match error.kind() {
-                std::io::ErrorKind::NotFound => EK::EntryRaced,
-                std::io::ErrorKind::PermissionDenied => EK::RootEscape,
-                _ => EK::EntryMetadata,
-            };
+            let kind = classify_directory_open_failure(error.kind());
             err(kind, &prefix)
         })?;
         let identity = directory_identity(&dir, &prefix)?;
