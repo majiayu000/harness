@@ -89,8 +89,8 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
                             .count()
                     })
                     .unwrap_or(0);
-                let report = QualityGrader::grade(&events, violation_count);
-                serde_json::to_value(report.grade).ok()
+                QualityGrader::grade(&events, violation_count)
+                    .and_then(|report| serde_json::to_value(report.grade).ok())
             }
         }
         Err(e) => {

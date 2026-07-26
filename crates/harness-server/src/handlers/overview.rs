@@ -579,7 +579,9 @@ fn compute_grade(events: &[Event]) -> (Option<f64>, Option<Value>) {
                 .count()
         })
         .unwrap_or(0);
-    let report = QualityGrader::grade(events, violation_count);
+    let Some(report) = QualityGrader::grade(events, violation_count) else {
+        return (None, None);
+    };
     let letter = serde_json::to_value(report.grade).ok();
     (Some(report.score), letter)
 }
