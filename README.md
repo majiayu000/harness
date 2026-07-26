@@ -41,23 +41,35 @@ cargo build --release -p harness-cli
 # binary at ./target/release/harness
 ```
 
-Requires Rust 1.88+. That's all for the CLI — Postgres, Bun, and a GitHub
-token are only needed for the server / fleet features below.
+Requires Rust 1.88+. A fresh release build also requires Bun 1.1+ because it
+embeds the web dashboard; if `web/dist` is already built, the release build can
+reuse it without Bun. Postgres and a GitHub token are only needed for the server
+/ fleet features below.
 
 ## Quickstart: run one agent task
 
-The only prerequisite is one local agent runtime on your `PATH` —
-[`claude`](https://docs.anthropic.com/en/docs/claude-code) (default) or
-[`codex`](https://github.com/openai/codex) — or an `ANTHROPIC_API_KEY` for the
-direct API adapter.
+Install one local coding runtime on your `PATH`: either
+[`codex`](https://github.com/openai/codex) or
+[`claude`](https://docs.anthropic.com/en/docs/claude-code). Run Harness as an
+unprivileged OS user: `--drop-sudo` defaults to `true`, so `harness exec`
+rejects root and sudo environments. Only pass `--drop-sudo=false` when elevated
+execution is deliberate.
 
 ```bash
-./target/release/harness exec "Fix the failing test in src/lib.rs"
+# With Codex CLI
+./target/release/harness exec --agent codex "Fix the failing test in src/lib.rs"
+
+# Or with Claude Code CLI
+./target/release/harness exec --agent claude "Fix the failing test in src/lib.rs"
 ```
 
-Harness picks the first available agent, runs it against the current directory
-with a `workspace-write` sandbox hint, and prints the agent's final response to
+Harness runs the explicitly selected coding agent against the current directory
+with a `workspace-write` sandbox hint and prints the agent's final response to
 stdout.
+
+The `anthropic-api` adapter is for text generation: it sends the prompt without
+repository context or tools, so it cannot inspect or modify the project in this
+coding example.
 
 Useful flags: `--project <dir>`, `--agent claude|codex|anthropic-api`,
 `--model <id>`, `--sandbox-mode read-only`, `--output-file result.md`.
