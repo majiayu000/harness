@@ -10,6 +10,7 @@ mod candidate_promotion;
 mod candidate_selection;
 mod candidate_terminal;
 mod command_record;
+pub mod completion_evidence;
 pub mod declarative;
 mod declarative_interpreter;
 mod declarative_pinning;

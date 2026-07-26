@@ -5,7 +5,21 @@ use super::validator::{
 };
 use std::collections::BTreeSet;
 
+/// Rule metadata plus required evidence, in one call. `DecisionValidator`
+/// runs the two halves separately so command-structure errors surface before
+/// evidence errors; this combined form exists for tests that exercise the
+/// declarative metadata contract directly.
+#[cfg(test)]
 pub(super) fn validate_declarative_transition_metadata(
+    rule: &TransitionRule,
+    decision: &WorkflowDecision,
+    context: &ValidationContext,
+) -> Result<(), WorkflowDecisionRejection> {
+    validate_declarative_transition_rule_metadata(rule, decision, context)?;
+    validate_required_evidence(rule, decision)
+}
+
+pub(super) fn validate_declarative_transition_rule_metadata(
     rule: &TransitionRule,
     decision: &WorkflowDecision,
     context: &ValidationContext,
@@ -35,6 +49,15 @@ pub(super) fn validate_declarative_transition_metadata(
             ));
         }
     }
+    Ok(())
+}
+
+/// Required-evidence enforcement (GH-1766). Same-state activity retries are
+/// exempt: evidence requirements bind fact-minting transitions, not retries.
+pub(super) fn validate_required_evidence(
+    rule: &TransitionRule,
+    decision: &WorkflowDecision,
+) -> Result<(), WorkflowDecisionRejection> {
     let is_activity_retry = decision.decision == "retry_failed_runtime_activity"
         && decision.observed_state == decision.next_state
         && decision.commands.len() == 1

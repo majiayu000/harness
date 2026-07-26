@@ -10,6 +10,8 @@ mod github_issue_pr_validation;
 mod prompt_task_validation;
 #[path = "validator_context.rs"]
 mod validation_context;
+#[path = "validator_defaults.rs"]
+mod validator_defaults;
 
 #[cfg(test)]
 #[path = "validator_tests.rs"]
@@ -114,227 +116,6 @@ impl TransitionAllowlist {
                 .as_deref()
                 .is_none_or(|rule_from| rule_from == from_state)
         })
-    }
-
-    pub fn github_issue_pr_defaults() -> Self {
-        use WorkflowCommandType::{
-            BindPr, EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
-            RecordPlanConcern, RequestOperatorAttention, StartChildWorkflow, Wait,
-        };
-
-        Self::default()
-            .allow("discovered", "awaiting_dependencies", [Wait])
-            .allow("failed", "awaiting_dependencies", [Wait])
-            .allow("cancelled", "awaiting_dependencies", [Wait])
-            .allow("awaiting_dependencies", "awaiting_dependencies", [Wait])
-            .allow(
-                "awaiting_dependencies",
-                "scheduled",
-                [EnqueueActivity, Wait],
-            )
-            .allow("awaiting_dependencies", "planning", [EnqueueActivity, Wait])
-            .allow(
-                "awaiting_dependencies",
-                "implementing",
-                [EnqueueActivity, Wait],
-            )
-            .allow("discovered", "scheduled", [EnqueueActivity, Wait])
-            .allow("discovered", "planning", [EnqueueActivity, Wait])
-            .allow("discovered", "implementing", [EnqueueActivity, Wait])
-            .allow("scheduled", "scheduled", [EnqueueActivity, Wait])
-            .allow("failed", "scheduled", [EnqueueActivity, Wait])
-            .allow("failed", "planning", [EnqueueActivity, Wait])
-            .allow("failed", "implementing", [EnqueueActivity, Wait])
-            .allow("failed", "replanning", [EnqueueActivity, Wait])
-            .allow("failed", "local_review_gate", [EnqueueActivity, Wait])
-            .allow(
-                "failed",
-                "awaiting_feedback",
-                [EnqueueActivity, StartChildWorkflow, Wait],
-            )
-            .allow(
-                "failed",
-                "addressing_feedback",
-                [EnqueueActivity, StartChildWorkflow, Wait],
-            )
-            .allow("failed", "merging", [EnqueueActivity])
-            .allow("blocked", "implementing", [EnqueueActivity, Wait])
-            .allow("blocked", "replanning", [EnqueueActivity, Wait])
-            .allow("blocked", "local_review_gate", [EnqueueActivity, Wait])
-            .allow(
-                "blocked",
-                "awaiting_feedback",
-                [EnqueueActivity, StartChildWorkflow, Wait],
-            )
-            .allow(
-                "blocked",
-                "addressing_feedback",
-                [EnqueueActivity, StartChildWorkflow, Wait],
-            )
-            .allow("blocked", "merging", [EnqueueActivity])
-            .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
-            .allow("cancelled", "planning", [EnqueueActivity, Wait])
-            .allow("cancelled", "implementing", [EnqueueActivity, Wait])
-            .allow("scheduled", "planning", [EnqueueActivity, Wait])
-            .allow(
-                "scheduled",
-                "implementing",
-                [EnqueueActivity, RecordPlanConcern, Wait],
-            )
-            .allow(
-                "scheduled",
-                "replanning",
-                [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
-            )
-            .allow("planning", "implementing", [EnqueueActivity, MarkBlocked])
-            .allow("planning", "planning", [EnqueueActivity, Wait])
-            .allow(
-                "implementing",
-                "implementing",
-                [EnqueueActivity, RecordPlanConcern, Wait],
-            )
-            .allow(
-                "implementing",
-                "replanning",
-                [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
-            )
-            .allow(
-                "replanning",
-                "implementing",
-                [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
-            )
-            .allow(
-                "implementing",
-                "pr_open",
-                [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
-            )
-            .allow("implementing", "done", [MarkDone])
-            .allow(
-                "scheduled",
-                "pr_open",
-                [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
-            )
-            .allow("pr_open", "pr_open", [BindPr, Wait])
-            .allow("pr_open", "local_review_gate", [EnqueueActivity, Wait])
-            .allow("pr_open", "awaiting_feedback", [Wait])
-            .allow(
-                "local_review_gate",
-                "local_review_gate",
-                [EnqueueActivity, Wait],
-            )
-            .allow("local_review_gate", "awaiting_feedback", [Wait])
-            .allow(
-                "local_review_gate",
-                "addressing_feedback",
-                [EnqueueActivity, MarkBlocked, Wait],
-            )
-            .allow("pr_open", "done", [MarkDone])
-            .allow(
-                "awaiting_feedback",
-                "awaiting_feedback",
-                [EnqueueActivity, StartChildWorkflow, Wait],
-            )
-            .allow(
-                "awaiting_feedback",
-                "addressing_feedback",
-                [EnqueueActivity, StartChildWorkflow, MarkBlocked, Wait],
-            )
-            .allow(
-                "addressing_feedback",
-                "addressing_feedback",
-                [EnqueueActivity, StartChildWorkflow, MarkBlocked, Wait],
-            )
-            .allow(
-                "addressing_feedback",
-                "local_review_gate",
-                [EnqueueActivity, StartChildWorkflow, Wait],
-            )
-            .allow(
-                "awaiting_feedback",
-                "quality_gate_pending",
-                [StartChildWorkflow, Wait],
-            )
-            .allow(
-                "quality_gate_pending",
-                "ready_to_merge",
-                std::iter::empty::<WorkflowCommandType>(),
-            )
-            .allow("awaiting_feedback", "done", [MarkDone])
-            .allow("addressing_feedback", "done", [MarkDone])
-            .allow("quality_gate_pending", "done", [MarkDone])
-            .allow("quality_gate_pending", "quality_gate_pending", [Wait])
-            .allow("ready_to_merge", "ready_to_merge", [Wait])
-            .allow("ready_to_merge", "merging", [EnqueueActivity])
-            .allow("merging", "done", [MarkDone])
-            .allow("ready_to_merge", "done", [MarkDone])
-            .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
-            .allow_from_any("failed", [MarkFailed])
-            .allow_from_any("cancelled", [MarkCancelled])
-    }
-
-    pub fn quality_gate_defaults() -> Self {
-        use WorkflowCommandType::{
-            EnqueueActivity, MarkBlocked, MarkCancelled, MarkFailed, RequestOperatorAttention, Wait,
-        };
-
-        Self::default()
-            .allow("pending", "checking", [EnqueueActivity, Wait])
-            .allow("checking", "checking", [EnqueueActivity, Wait])
-            .allow(
-                "checking",
-                "passed",
-                std::iter::empty::<WorkflowCommandType>(),
-            )
-            .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
-            .allow_from_any("failed", [MarkFailed])
-            .allow_from_any("cancelled", [MarkCancelled])
-    }
-
-    pub fn pr_feedback_defaults() -> Self {
-        use WorkflowCommandType::{
-            EnqueueActivity, MarkBlocked, MarkCancelled, MarkFailed, RequestOperatorAttention, Wait,
-        };
-
-        Self::default()
-            .allow("pending", "inspecting", [EnqueueActivity, Wait])
-            .allow("inspecting", "inspecting", [EnqueueActivity, Wait])
-            .allow("inspecting", "feedback_found", std::iter::empty())
-            .allow("inspecting", "no_actionable_feedback", std::iter::empty())
-            .allow("inspecting", "ready_to_merge", std::iter::empty())
-            .allow("feedback_found", "done", [Wait])
-            .allow("no_actionable_feedback", "done", [Wait])
-            .allow("ready_to_merge", "done", [Wait])
-            .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
-            .allow_from_any("failed", [MarkFailed])
-            .allow_from_any("cancelled", [MarkCancelled])
-    }
-
-    pub fn prompt_task_defaults() -> Self {
-        use WorkflowCommandType::{
-            EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
-            RequestOperatorAttention, Wait,
-        };
-
-        Self::default()
-            .allow("submitted", "awaiting_dependencies", [Wait])
-            .allow("failed", "awaiting_dependencies", [Wait])
-            .allow("cancelled", "awaiting_dependencies", [Wait])
-            .allow("awaiting_dependencies", "awaiting_dependencies", [Wait])
-            .allow(
-                "awaiting_dependencies",
-                "implementing",
-                [EnqueueActivity, Wait],
-            )
-            .allow("submitted", "implementing", [EnqueueActivity, Wait])
-            .allow("failed", "implementing", [EnqueueActivity, Wait])
-            .allow("cancelled", "implementing", [EnqueueActivity, Wait])
-            .allow("implementing", "implementing", [EnqueueActivity])
-            .allow("blocked", "awaiting_dependencies", [Wait])
-            .allow("blocked", "implementing", [EnqueueActivity, Wait])
-            .allow("implementing", "done", [MarkDone])
-            .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
-            .allow_from_any("failed", [MarkFailed])
-            .allow_from_any("cancelled", [MarkCancelled])
     }
 }
 
@@ -527,7 +308,7 @@ impl DecisionValidator {
             ));
         };
 
-        validator_progress::validate_declarative_transition_metadata(rule, decision, context)?;
+        validator_progress::validate_declarative_transition_rule_metadata(rule, decision, context)?;
 
         if self.kind == DecisionValidatorKind::PromptTask
             && decision.observed_state == "implementing"
@@ -536,6 +317,10 @@ impl DecisionValidator {
             prompt_task_validation::validate_decision(decision)?;
         }
         self.validate_commands(rule, decision, context)?;
+        // Evidence is checked after command structure so a decision that is
+        // both malformed and unproven reports the actionable structural
+        // error first; either way it is rejected.
+        validator_progress::validate_required_evidence(rule, decision)?;
         validator_progress::validate_target_progress_contract_with_override(
             instance,
             decision,

@@ -114,8 +114,8 @@ impl Scheduler {
         state.observability.events.log(&probe_report).await?;
         let report = generate_health_report(&events, &violations);
         tracing::info!(
-            grade = ?report.quality.grade,
-            score = report.quality.score,
+            grade = ?report.quality.as_ref().map(|quality| quality.grade),
+            score = ?report.quality.as_ref().map(|quality| quality.score),
             violations = report.violation_summary.len(),
             "scheduler: periodic health report"
         );

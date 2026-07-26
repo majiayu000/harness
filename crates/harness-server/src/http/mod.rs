@@ -236,7 +236,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     .count()
             })
             .unwrap_or(0);
-        harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
+        // An empty startup window has an unknown grade; keep the least
+        // aggressive GC cadence until real observations arrive (GH-1766).
+        harness_observe::quality::QualityGrader::grade(&events, violation_count)
+            .map(|report| report.grade)
+            .unwrap_or(harness_core::types::Grade::A)
     };
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
     // Pass the pre-built GitHub pollers from AppState to the orchestrator so

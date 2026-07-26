@@ -4,7 +4,8 @@ use super::support::{
 };
 use super::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::model::{
-    ActivityResult, ValidationRecord, WorkflowDecision, WorkflowEvent, WorkflowInstance,
+    ActivityResult, ValidationRecord, WorkflowDecision, WorkflowEvent, WorkflowEvidence,
+    WorkflowInstance,
 };
 use crate::runtime::pr_feedback::{
     build_local_review_completed_decision, build_pr_feedback_decision, LocalReviewCompletedInput,
@@ -193,11 +194,26 @@ pub(super) fn pr_feedback_child_decision_from_activity_result(
         ),
     };
 
-    Some(
+    let mut decision =
         WorkflowDecision::new(&instance.id, &instance.state, decision, next_state, reason)
-            .with_evidence(runtime_completion_evidence(event, result))
-            .high_confidence(),
-    )
+            .with_evidence(runtime_completion_evidence(event, result));
+    if outcome == PrFeedbackOutcome::ReadyToMerge {
+        // GH-1766: `inspecting -> ready_to_merge` requires server_pr_snapshot
+        // evidence. The readiness contract above already proved the snapshot;
+        // record the evidence class the transition rule demands.
+        if ready_snapshot_proves_pr_ready(instance, result) {
+            decision = decision.with_evidence(WorkflowEvidence::new(
+                crate::runtime::completion_evidence::EVIDENCE_SERVER_PR_SNAPSHOT,
+                "server_github_graphql snapshot proves the PR is ready to merge",
+            ));
+        } else if !crate::runtime::completion_evidence::completion_evidence_enforced(result) {
+            decision = decision.with_evidence(WorkflowEvidence::new(
+                crate::runtime::completion_evidence::EVIDENCE_SERVER_PR_SNAPSHOT,
+                crate::runtime::completion_evidence::WAIVER_SUMMARY,
+            ));
+        }
+    }
+    Some(decision.high_confidence())
 }
 
 fn pr_feedback_outcome_from_signals(result: &ActivityResult) -> Option<PrFeedbackOutcome> {

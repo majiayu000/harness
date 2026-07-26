@@ -5,6 +5,11 @@ use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
     ISSUE_STATE_ARTIFACT, SCOPE_TOO_LARGE_SIGNAL,
 };
+use crate::runtime::completion_evidence::{
+    completion_evidence_enforced, pr_binding_verification_failure, verified_pr_binding_artifact,
+    EVIDENCE_GITHUB_TERMINAL, EVIDENCE_VERIFIED_PR_BINDING, REASON_PR_BINDING_VERIFICATION_FAILED,
+    WAIVER_SUMMARY,
+};
 use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
     WorkflowEvidence, WorkflowInstance,
@@ -156,6 +161,10 @@ pub(super) fn github_issue_closed_decision(
                 "closed_issue_evidence": closed_issue.payload,
             }),
         ))
+        .with_evidence(WorkflowEvidence::new(
+            EVIDENCE_GITHUB_TERMINAL,
+            format!("closed_issue: {}", closed_issue.summary),
+        ))
         .with_evidence(WorkflowEvidence::new("closed_issue", closed_issue.summary))
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
@@ -191,6 +200,14 @@ pub(super) fn bind_pr_from_activity_result(
         return None;
     }
     let (pr_number, pr_url) = pull_request_artifact(result)?;
+    let binding_evidence = match verified_pr_binding_evidence(result, pr_number) {
+        Ok(evidence) => evidence,
+        Err(reason) => {
+            return Some(pr_binding_verification_blocked_decision(
+                instance, event, result, &reason,
+            ));
+        }
+    };
     Some(
         WorkflowDecision::new(
             &instance.id,
@@ -205,9 +222,88 @@ pub(super) fn bind_pr_from_activity_result(
             format!("runtime-completion:{}:bind-pr:{pr_number}", event.id),
         ))
         .with_evidence(WorkflowEvidence::new("pull_request", pr_url))
+        .with_evidence(binding_evidence)
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
     )
+}
+
+/// The `verified_pr_binding` decision evidence for a claimed PR binding
+/// (GH-1766, B-005/B-006): the server-attached verification artifact, or a
+/// recorded waiver when enforcement is disabled. A server-recorded
+/// verification failure, a PR-number mismatch, or a missing verification
+/// while enforcement is active all fail closed.
+pub(crate) fn verified_pr_binding_evidence(
+    result: &ActivityResult,
+    claimed_pr_number: u64,
+) -> Result<WorkflowEvidence, String> {
+    if let Some(failure) = pr_binding_verification_failure(result) {
+        return Err(format!(
+            "server verification of the claimed pull request failed: {failure}"
+        ));
+    }
+    if let Some(verified) = verified_pr_binding_artifact(result) {
+        let verified_number = verified.get("pr_number").and_then(Value::as_u64);
+        if verified_number != Some(claimed_pr_number) {
+            return Err(format!(
+                "server verified pull request {verified_number:?} but the activity claimed {claimed_pr_number}"
+            ));
+        }
+        return Ok(WorkflowEvidence::new(
+            EVIDENCE_VERIFIED_PR_BINDING,
+            verified.to_string(),
+        ));
+    }
+    if !completion_evidence_enforced(result) {
+        return Ok(WorkflowEvidence::new(
+            EVIDENCE_VERIFIED_PR_BINDING,
+            WAIVER_SUMMARY,
+        ));
+    }
+    Err(
+        "the activity claimed a pull request but the server recorded no binding verification"
+            .to_string(),
+    )
+}
+
+pub(crate) fn pr_binding_verification_blocked_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    detail: &str,
+) -> WorkflowDecision {
+    let reason = format!("{REASON_PR_BINDING_VERIFICATION_FAILED}: {detail}");
+    WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        REASON_PR_BINDING_VERIFICATION_FAILED,
+        "blocked",
+        &reason,
+    )
+    .with_command(runtime_blocked_command(
+        &reason,
+        Some(STOP_REASON_INVALID_AGENT_OUTPUT),
+        format!(
+            "runtime-completion:{}:pr-binding-verification:block",
+            event.id
+        ),
+        event,
+        result,
+    ))
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::RequestOperatorAttention,
+        format!(
+            "runtime-completion:{}:pr-binding-verification:operator",
+            event.id
+        ),
+        json!({
+            "reason": reason,
+            "activity": result.activity,
+            "runtime_job_id": event_field_string(event, "runtime_job_id"),
+        }),
+    ))
+    .with_evidence(runtime_completion_evidence(event, result))
+    .high_confidence()
 }
 
 pub(super) fn merged_pr_from_activity_result(
@@ -249,6 +345,15 @@ pub(super) fn merged_pr_from_activity_result(
                 "head_sha": merged.head_sha,
                 "pull_request_evidence": merged.payload,
             }),
+        ))
+        .with_evidence(WorkflowEvidence::new(
+            EVIDENCE_GITHUB_TERMINAL,
+            format!(
+                "merged_pull_request: pr={} head={} merge_commit={}",
+                merged.pr_number,
+                merged.head_sha.as_deref().unwrap_or("unknown"),
+                merged.merge_commit_sha.as_deref().unwrap_or("unknown"),
+            ),
         ))
         .with_evidence(WorkflowEvidence::new(
             "github_pr_merged",

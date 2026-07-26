@@ -1,11 +1,18 @@
 use super::support::{
     invalid_agent_output_blocked_decision, runtime_completion_evidence, signal_count,
 };
-use crate::runtime::model::{ActivityResult, WorkflowDecision, WorkflowEvent, WorkflowInstance};
+use crate::runtime::completion_evidence::{
+    completion_evidence_enforced, server_validation_digest_artifact,
+    server_validation_digest_passed, EVIDENCE_SERVER_VALIDATION_DIGEST, WAIVER_SUMMARY,
+};
+use crate::runtime::model::{
+    ActivityResult, WorkflowDecision, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
+};
 use crate::runtime::quality_gate::{
     QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
     QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
 };
+use serde_json::Value;
 
 pub(super) fn quality_gate_success_decision(
     instance: &WorkflowInstance,
@@ -25,6 +32,7 @@ pub(super) fn quality_gate_success_decision(
                 "passed",
                 "quality gate activity completed successfully with passing evidence",
             )
+            .with_evidence(server_validation_digest_evidence(result))
             .with_evidence(runtime_completion_evidence(event, result))
             .high_confidence(),
         );
@@ -100,8 +108,36 @@ pub(super) fn quality_gate_success_contract_error(result: &ActivityResult) -> Op
         Some("run_quality_gate succeeded with ambiguous quality status signals")
     } else if !quality_gate_has_validation_evidence(result) {
         Some("run_quality_gate succeeded without validation evidence")
+    } else if completion_evidence_enforced(result)
+        && server_validation_digest_artifact(result).is_none()
+    {
+        // GH-1766 B-003: an agent QualityPassed claim without a server-side
+        // validation re-run does not satisfy the gate.
+        Some("run_quality_gate succeeded without a server validation digest; the server must re-execute the validation commands itself")
+    } else if completion_evidence_enforced(result) && !server_validation_digest_passed(result) {
+        Some("run_quality_gate claimed QualityPassed but the server validation digest records failing or unstarted commands")
     } else {
         None
+    }
+}
+
+/// Decision evidence for the required `server_validation_digest` class:
+/// either a summary of the server-authored digest or a recorded waiver when
+/// the operator kill switch is active.
+fn server_validation_digest_evidence(result: &ActivityResult) -> WorkflowEvidence {
+    match server_validation_digest_artifact(result) {
+        Some(digest) => {
+            let commands = digest
+                .get("commands")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            WorkflowEvidence::new(
+                EVIDENCE_SERVER_VALIDATION_DIGEST,
+                format!("server executed {commands} validation command(s), all exit 0"),
+            )
+        }
+        None => WorkflowEvidence::new(EVIDENCE_SERVER_VALIDATION_DIGEST, WAIVER_SUMMARY),
     }
 }
 

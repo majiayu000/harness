@@ -268,6 +268,32 @@ pub struct RuntimeWorkerPolicy {
     pub lease_ttl_secs: u64,
 }
 
+/// Server-verified completion evidence policy (GH-1766).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeCompletionPolicy {
+    /// Operator kill switch for completion-evidence enforcement. Defaults to
+    /// enabled; disabling records waiver evidence instead of blocking and is
+    /// intended for one transition release only.
+    #[serde(default = "default_true")]
+    pub evidence_enforced: bool,
+    /// Timeout for the server-side quality-gate validation re-run.
+    #[serde(default = "default_quality_gate_validation_timeout_secs")]
+    pub quality_gate_validation_timeout_secs: u64,
+}
+
+impl Default for RuntimeCompletionPolicy {
+    fn default() -> Self {
+        Self {
+            evidence_enforced: true,
+            quality_gate_validation_timeout_secs: default_quality_gate_validation_timeout_secs(),
+        }
+    }
+}
+
+fn default_quality_gate_validation_timeout_secs() -> u64 {
+    900
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeRetryPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +355,8 @@ pub struct WorkflowConfig {
     pub runtime_dispatch: RuntimeDispatchPolicy,
     #[serde(default)]
     pub runtime_worker: RuntimeWorkerPolicy,
+    #[serde(default)]
+    pub runtime_completion: RuntimeCompletionPolicy,
     #[serde(default)]
     pub runtime_retry_policy: RuntimeRetryPolicy,
     #[serde(default)]

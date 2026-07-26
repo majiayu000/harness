@@ -1,4 +1,8 @@
 use super::support::{runtime_blocked_command, runtime_completion_evidence};
+use crate::runtime::completion_evidence::{
+    completion_evidence_enforced, prompt_completion_alternative, EVIDENCE_PROMPT_COMPLETION,
+    REASON_PROMPT_COMPLETION_EVIDENCE_MISSING, WAIVER_SUMMARY,
+};
 use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
     WorkflowEvidence, WorkflowInstance,
@@ -27,7 +31,21 @@ pub(super) fn prompt_task_success_decision(
 ) -> Option<WorkflowDecision> {
     let continuation = match prompt_continuation_state_from_data(&instance.data) {
         Ok(Some(continuation)) => continuation,
-        Ok(None) => return Some(single_shot_done_decision(instance, event, result)),
+        Ok(None) => {
+            return Some(match prompt_completion_evidence_for_done(result) {
+                Ok(evidence) => {
+                    single_shot_done_decision(instance, event, result).with_evidence(evidence)
+                }
+                Err(reason) => blocked_decision(
+                    instance,
+                    event,
+                    result,
+                    REASON_PROMPT_COMPLETION_EVIDENCE_MISSING,
+                    &reason,
+                    None,
+                ),
+            });
+        }
         Err(reason) => {
             return Some(blocked_decision(
                 instance,
@@ -67,9 +85,18 @@ pub(super) fn prompt_task_success_decision(
     };
     let observed = observed_state(&continuation, result, &signal);
     if !continuation.policy.active_states.contains(&signal.state) {
-        return Some(settled_done_decision(
-            instance, event, result, &signal, &observed,
-        ));
+        return Some(match prompt_completion_evidence_for_done(result) {
+            Ok(evidence) => settled_done_decision(instance, event, result, &signal, &observed)
+                .with_evidence(evidence),
+            Err(reason) => blocked_decision(
+                instance,
+                event,
+                result,
+                REASON_PROMPT_COMPLETION_EVIDENCE_MISSING,
+                &reason,
+                Some((&signal, &observed)),
+            ),
+        });
     }
     if continuation.attempt >= continuation.policy.max_attempts {
         let reason = format!(
@@ -161,6 +188,33 @@ fn scope_too_large_decision(
     .with_evidence(runtime_completion_evidence(event, result))
     .with_evidence(WorkflowEvidence::new("scope_too_large", scope.to_string()))
     .high_confidence()
+}
+
+/// The umbrella completion evidence for a prompt-task done decision
+/// (GH-1766, B-007): a `validation_report` alternative, a
+/// `no_change_rationale` alternative, or a recorded waiver when the operator
+/// kill switch is active. Absent all three, the done decision is replaced by
+/// a blocked decision with a precise, retryable reason.
+fn prompt_completion_evidence_for_done(
+    result: &ActivityResult,
+) -> Result<WorkflowEvidence, String> {
+    if let Some(alternative) = prompt_completion_alternative(result) {
+        return Ok(WorkflowEvidence::new(
+            EVIDENCE_PROMPT_COMPLETION,
+            format!("satisfied_by={alternative}"),
+        ));
+    }
+    if !completion_evidence_enforced(result) {
+        return Ok(WorkflowEvidence::new(
+            EVIDENCE_PROMPT_COMPLETION,
+            WAIVER_SUMMARY,
+        ));
+    }
+    Err(
+        "prompt task completion requires a validation_report (structured validation \
+         records) or an explicit no_change_rationale artifact; the result carried neither"
+            .to_string(),
+    )
 }
 
 fn single_shot_done_decision(
