@@ -93,6 +93,11 @@ compatibility and adds `resolved_runtime_settings`. Provenance hashes canonical
 JSON of only the resolved value. No launch field is recomputed after the
 packet is recorded.
 
+The resolver rejects `timeout_secs = 0` with a typed error before packet
+construction. Positive values pass unchanged to both provenance and
+`TurnLifecycleOptions`; the lifecycle's defensive minimum no longer changes a
+value accepted from this path.
+
 ### Workflow Source Preservation
 
 Extend `WorkflowDocument` with an observation-only, serde-skipped ordered
@@ -117,12 +122,13 @@ from whether the display path can be normalized relative to the project.
 `prompt_packet.rs` calls the module once after creating the base packet fields
 and before activity policy or final hashing:
 
-1. build provenance from `runtime_profile`, `workflow_document`, selected
+1. change newly produced packet schema to `harness.runtime.prompt_packet.v2`;
+2. build provenance from `runtime_profile`, `workflow_document`, selected
    `repo_memory`, resolved runtime settings, and the already constructed packet
    sections;
-2. serialize it through `serde_json::to_value` with contextual error handling;
-3. assign `packet["context_provenance"]`;
-4. continue existing activity-policy and continuation processing.
+3. serialize it through `serde_json::to_value` with contextual error handling;
+4. assign `packet["context_provenance"]`;
+5. continue existing activity-policy and continuation processing.
 
 Any validation or serialization error propagates from
 `build_runtime_prompt_packet`. The caller therefore does not hash, record, or
@@ -166,7 +172,7 @@ Repo memory:
   estimated token count stored in the provenance entry's typed metadata
   extension defined by this module, not in the ASC-001 component;
 - reason `repo_memory_selected`;
-- observation/trust `runtime_observed`;
+- observation `runtime_observed`, trust `self_declared`;
 - selection `loaded`;
 - order immediately after the final workflow entry, preserving memory selection
   order.
@@ -246,10 +252,10 @@ event and agent execution.
 
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
-| B-001 | provenance envelope/schema insertion | `cargo test -p harness-server context_provenance_tests::runtime_packet_contains_exactly_one_versioned_provenance_manifest --lib` |
+| B-001 | v2 packet/provenance schema insertion | `cargo test -p harness-server context_provenance_tests::v2_packet_requires_one_versioned_provenance_manifest_and_v1_remains_historical --lib` |
 | B-002 | constructor inputs and no inventory fallback | `cargo test -p harness-server context_provenance_tests::provenance_contains_only_runtime_selected_sources --lib` |
 | B-003 | ASC-001 component construction and ordered entry wrapper | `cargo test -p harness-server context_provenance_tests::all_provenance_entries_validate_against_stack_component_contract --lib` |
-| B-004 | single resolved-settings construction/use | `cargo test -p harness-server context_provenance_tests::provenance_and_agent_launch_share_resolved_runtime_settings --lib` |
+| B-004 | single resolved-settings construction/use | `cargo test -p harness-server context_provenance_tests::provenance_and_agent_launch_share_resolved_runtime_settings_and_reject_zero_timeout --lib` |
 | B-005 | retained source list and workflow builders | `cargo test -p harness-server context_provenance_tests::central_repository_merged_and_default_workflows_have_truthful_provenance --lib` |
 | B-006 | repo-memory source builder | `cargo test -p harness-server context_provenance_tests::selected_memory_order_and_safe_metadata_are_preserved --lib` |
 | B-007 | empty memory input and existing degradation boundary | `cargo test -p harness-server context_provenance_tests::missing_memory_records_are_not_fabricated --lib`; `cargo test -p harness-server repo_memory_prompt --lib` |
@@ -283,7 +289,8 @@ event and agent execution.
 - Logic: omitting a selected source creates incomplete audit evidence. The
   constructor takes the same runtime inputs as packet construction.
 - Compatibility: historical packets lack provenance. Readers must treat them
-  as lower-evidence records, not invalid stored runtime events.
+  as lower-evidence v1 records, not invalid stored runtime events. Newly
+  produced packets use v2 so missing required provenance is distinguishable.
 - Integrity: fallback-resolved settings or durable prompt text could escape the
   packet digest. One resolved value feeds both launch and provenance, and the
   packet binds prompt text before `RuntimePromptPrepared`.
@@ -303,6 +310,8 @@ event and agent execution.
 - [ ] Add central-only, repository-only, merged, and defaults workflow-source
       fixtures.
 - [ ] Add same-reference/different-prompt-text packet digest fixtures.
+- [ ] Add packet v1 historical compatibility, v2 required provenance, repo
+      memory `self_declared` trust, and zero-timeout rejection fixtures.
 - [ ] Add redaction and external-context coverage assertions.
 - [ ] Add stable ordering and source/packet digest sensitivity assertions.
 - [ ] Prove invalid required provenance returns before event recording and
@@ -325,9 +334,8 @@ event and agent execution.
 
 ## Rollback Plan
 
-Revert the implementation commit. Newly recorded prompt packets containing the
-additive provenance field remain valid JSON and retain their existing packet
-digest. Reversion stops adding provenance to future packets and requires no
-database rollback. Evidence consumers must continue treating historical or
-post-rollback packets without provenance as lower-evidence records rather than
- fabricating source claims.
+Revert the implementation commit. Already recorded v2 packets remain valid JSON
+and retain their existing packet digest. Reversion resumes v1 packet emission
+and requires no database rollback. Evidence consumers continue requiring
+provenance for v2 while treating v1 as lower-evidence history rather than
+fabricating source claims.

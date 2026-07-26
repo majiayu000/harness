@@ -44,10 +44,12 @@ does not prove it was selected or loaded for a runtime activity.
 
 ## User-Visible Behavior
 
-1. **B-001:** Every workflow-runtime prompt packet contains exactly one
+1. **B-001:** Every newly produced workflow-runtime prompt packet declares
+   packet schema `harness.runtime.prompt_packet.v2` and contains exactly one
    `context_provenance` object with schema
-   `harness.runtime.context_provenance.v1`. Missing, blank, or unsupported
-   provenance schema is invalid for newly produced packets.
+   `harness.runtime.context_provenance.v1`. A v2 packet with missing, blank, or
+   unsupported provenance is invalid. Historical v1 packets remain valid
+   lower-evidence records and are never interpreted as v2.
 2. **B-002:** Provenance records only inputs selected by Harness while building
    that packet. Repository discovery alone never produces a selected, loaded,
    or runtime-observed provenance entry.
@@ -72,7 +74,9 @@ does not prove it was selected or loaded for a runtime activity.
    memory entry in the same order. It records durable record identity,
    evidence reference when present, estimated token count, and a digest of the
    exact redacted packet representation, but does not duplicate raw payload
-   content in the provenance object.
+   content in the provenance object. Observation is `runtime_observed` because
+   Harness selected it, while trust remains `self_declared` because selection
+   does not validate the memory claim.
 7. **B-007:** When memory is enabled but retrieval fails, existing degradation
    evidence remains authoritative and provenance records no fabricated memory
    entry. The packet cannot claim selected memory that was not returned.
@@ -102,8 +106,8 @@ does not prove it was selected or loaded for a runtime activity.
     without a second partially committed record.
 14. **B-014:** Existing prompt semantics, repo-memory selection, runtime
     profile selection, activity policy, activity-result status, and workflow
-    state transitions remain unchanged except for adding redacted provenance
-    metadata to the packet.
+    state transitions remain unchanged. The intentional wire change is the
+    prompt-packet schema bump from v1 to v2 plus redacted provenance metadata.
 
 ## Acceptance Criteria
 
@@ -163,8 +167,8 @@ does not prove it was selected or loaded for a runtime activity.
 
 ## Rollout Notes
 
-This adds a field to newly generated version-1 prompt packets without changing
-the existing packet schema identifier. Consumers already treat the packet as a
-JSON object and must ignore the additive field if they do not inspect it.
-Evidence readers that require provenance must check its nested schema and must
-not infer provenance for historical packets lacking the field.
+This emits version-2 prompt packets and leaves stored version-1 packets
+unchanged. Consumers that only render the packet continue to treat it as a JSON
+object. Evidence readers require provenance only for v2, treat v1 as
+lower-evidence history, and never infer provenance for a packet lacking the
+field.
