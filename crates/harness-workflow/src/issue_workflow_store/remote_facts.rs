@@ -17,7 +17,7 @@ impl IssueWorkflowStore {
             if let Some(detail) = detail {
                 event = event.with_detail(detail.to_string());
             }
-            workflow.apply_event(event);
+            Ok(workflow.apply_event(event)?)
         })
         .await
     }
@@ -37,6 +37,7 @@ impl IssueWorkflowStore {
             }
             workflow.labels_snapshot = labels_snapshot.to_vec();
             workflow.set_remote_fact_hash(Some(fact_hash.to_string()));
+            Ok(())
         })
         .await
     }
@@ -54,6 +55,7 @@ impl IssueWorkflowStore {
                 workflow.set_pr_head_sha(Some(pr_head_sha.to_string()));
             }
             workflow.set_remote_fact_hash(Some(fact_hash.to_string()));
+            Ok(())
         })
         .await
     }
@@ -68,6 +70,7 @@ impl IssueWorkflowStore {
     ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
         self.update_existing_issue(project_id, repo, issue_number, |workflow| {
             workflow.set_merge_policy(merge_policy, merge_method);
+            Ok(())
         })
         .await
     }
@@ -88,7 +91,7 @@ impl IssueWorkflowStore {
             if let Some(fact_hash) = fact_hash {
                 event = event.with_remote_fact_hash(fact_hash.to_string());
             }
-            workflow.apply_event(event);
+            Ok(workflow.apply_event(event)?)
         })
         .await
     }

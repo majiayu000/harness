@@ -29,14 +29,9 @@ impl IssueWorkflowStore {
             return Ok(IssueMergeApprovalOutcome::NotFound);
         };
 
-        if workflow.state != IssueLifecycleState::ReadyToMerge {
-            let actual = workflow.state;
-            return Ok(IssueMergeApprovalOutcome::IgnoredWrongState { actual, workflow });
-        }
-
         workflow.apply_event(IssueLifecycleEvent::new(
             IssueLifecycleEventKind::HumanMergeApproved,
-        ));
+        ))?;
         self.upsert_in_tx(&mut tx, &workflow).await?;
         debug_assert_eq!(workflow.id, wf_id);
         tx.commit().await?;

@@ -104,9 +104,143 @@ impl IssueWorkflowStore {
         workflow.apply_event(
             IssueLifecycleEvent::new(IssueLifecycleEventKind::WorkflowFailed)
                 .with_detail(reason.to_string()),
-        );
+        )?;
         self.upsert_in_tx(&mut tx, &workflow).await?;
         tx.commit().await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IssueWorkflowStore;
+    use crate::issue_lifecycle::IssueLifecycleState;
+
+    async fn open_test_store() -> anyhow::Result<Option<IssueWorkflowStore>> {
+        if std::env::var("DATABASE_URL").is_err() {
+            return Ok(None);
+        }
+        let dir = tempfile::tempdir()?;
+        match IssueWorkflowStore::open(&dir.path().join("issue_workflows.db")).await {
+            Ok(store) => Ok(Some(store)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_project_id_rekeys_row() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let corrupt = "/data/workspaces/abc-uuid-repair-test";
+        store
+            .record_issue_scheduled(corrupt, Some("owner/repo"), 9001, "task-r1", &[], false)
+            .await?;
+        let old = store
+            .get_by_issue(corrupt, Some("owner/repo"), 9001)
+            .await?
+            .expect("row");
+        store
+            .repair_project_id(&old.id, "/real/canonical/root")
+            .await?;
+        assert!(store
+            .get_by_issue(corrupt, Some("owner/repo"), 9001)
+            .await?
+            .is_none());
+        assert_eq!(
+            store
+                .get_by_issue("/real/canonical/root", Some("owner/repo"), 9001)
+                .await?
+                .expect("canonical row")
+                .project_id,
+            "/real/canonical/root"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_project_id_refuses_to_overwrite_existing_canonical_row() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let corrupt = "/data/workspaces/abc-uuid-conflict-test";
+        let canonical = "/real/canonical/conflict-root";
+        store
+            .record_issue_scheduled(corrupt, Some("owner/repo"), 9005, "corrupt", &[], false)
+            .await?;
+        store
+            .record_issue_scheduled(canonical, Some("owner/repo"), 9005, "canonical", &[], false)
+            .await?;
+        let corrupt_before = store
+            .get_by_issue(corrupt, Some("owner/repo"), 9005)
+            .await?
+            .expect("corrupt row");
+        let canonical_before = store
+            .get_by_issue(canonical, Some("owner/repo"), 9005)
+            .await?
+            .expect("canonical row");
+        let error = store
+            .repair_project_id(&corrupt_before.id, canonical)
+            .await
+            .expect_err("conflict");
+        assert!(error.to_string().contains("canonical row already exists"));
+        assert_eq!(
+            store
+                .get_by_issue(corrupt, Some("owner/repo"), 9005)
+                .await?
+                .expect("corrupt row"),
+            corrupt_before
+        );
+        assert_eq!(
+            store
+                .get_by_issue(canonical, Some("owner/repo"), 9005)
+                .await?
+                .expect("canonical row"),
+            canonical_before
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_workflow_failed_with_reason_sets_state() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project = "/tmp/project-mark-failed-test";
+        let workflow = store
+            .record_issue_scheduled(project, Some("owner/repo"), 9002, "task", &[], false)
+            .await?;
+        store
+            .mark_workflow_failed_with_reason(&workflow.id, "project root not found")
+            .await?;
+        let updated = store
+            .get_by_issue(project, Some("owner/repo"), 9002)
+            .await?
+            .expect("row");
+        assert_eq!(updated.state, IssueLifecycleState::Failed);
+        assert_eq!(
+            updated.last_event.and_then(|event| event.detail).as_deref(),
+            Some("project root not found")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_with_worktree_project_ids_filters_correctly() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let corrupt = "/data/workspaces/xyz-uuid-list-test";
+        let canonical = "/tmp/canonical-list-test";
+        store
+            .record_issue_scheduled(corrupt, Some("owner/repo"), 9003, "t1", &[], false)
+            .await?;
+        store
+            .record_issue_scheduled(canonical, Some("owner/repo"), 9004, "t2", &[], false)
+            .await?;
+        let rows = store.list_with_worktree_project_ids().await?;
+        assert!(rows.iter().any(|workflow| workflow.project_id == corrupt));
+        assert!(!rows.iter().any(|workflow| workflow.project_id == canonical));
         Ok(())
     }
 }
