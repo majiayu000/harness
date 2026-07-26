@@ -17,6 +17,12 @@ retrieved memory, dynamic task input, or context that Harness cannot observe.
 Repository inventory also cannot solve this problem because discovering a file
 does not prove it was selected or loaded for a runtime activity.
 
+The first implementation exposed three compatibility gaps after merge: valid
+profile names could make provenance construction fail, the model-facing packet
+still advertised the durable v2 schema, and omitted approval policy was
+misclassified for runtimes that do not support that setting. The remediation
+must correct those claims without weakening durable v2 evidence.
+
 ## Goals
 
 - Record a redacted provenance manifest for sources the workflow runtime
@@ -27,6 +33,12 @@ does not prove it was selected or loaded for a runtime activity.
   class, and coverage limitations.
 - Make missing or unserializable required provenance a visible error.
 - Avoid persisting raw memory payloads, secrets, or hidden model reasoning.
+- Accept every profile name already accepted by runtime configuration while
+  keeping provenance locators valid and deterministic.
+- Keep durable packets on v2 while preserving the model-facing v1 packet
+  contract for unchanged inputs.
+- Distinguish an unobserved Codex default from a setting that is not applicable
+  to the selected runtime.
 
 ## Non-Goals
 
@@ -64,9 +76,11 @@ does not prove it was selected or loaded for a runtime activity.
    reasoning effort, sandbox, and approval policy after their
    profile/workflow/server fallbacks. This includes Claude's phase-sensitive
    model and effort selection when the profile omits explicit values. A setting
-   whose effective value is resolved outside Harness — such as a Codex approval
-   policy the profile omits — is recorded as explicitly unobserved rather than
-   given a fabricated final value. The final launch settings are computed once
+   whose effective value is resolved outside Harness — specifically a Codex
+   approval policy the profile omits — is recorded as explicitly unobserved
+   rather than given a fabricated final value. A setting unsupported by the
+   selected runtime is recorded as not applicable, not unobserved. The final
+   launch settings are computed once
    before packet construction and shared by packet construction and agent
    launch. The source is runtime-scoped, observation and trust are
    `runtime_observed`, selection state is `loaded`, and changing any recorded
@@ -113,12 +127,26 @@ does not prove it was selected or loaded for a runtime activity.
     without a second partially committed record. The activity artifact carries
     that same digest and the same packet-schema constant.
 14. **B-014:** Existing prompt semantics, repo-memory selection, runtime
-    profile selection, activity policy, activity-result status, and workflow
-    state transitions remain unchanged. The intentional wire change is the
-    prompt-packet schema bump from v1 to v2 plus redacted provenance metadata.
-    Audit-only packet fields are stripped from the model-facing prompt
-    rendering, so the agent-visible prompt bytes for unchanged inputs are
-    identical to the v1 rendering.
+   profile selection, activity policy, activity-result status, and workflow
+   state transitions remain unchanged. Durable packets and their activity
+   artifacts retain schema `harness.runtime.prompt_packet.v2` and all required
+   audit metadata. Before rendering for the agent, the model-facing clone
+   removes audit-only fields and restores schema
+   `harness.runtime.prompt_packet.v1`; for unchanged inputs its serialized
+   packet section and complete prompt bytes are identical to the pre-v2
+   rendering.
+15. **B-015:** Every profile name accepted by `RuntimeProfile`, including names
+   with spaces, slashes, Unicode, or UUID-shaped text, produces a valid,
+   deterministic runtime provenance locator derived from the lowercase SHA-256
+   of the exact UTF-8 profile-name bytes. The unhashed profile name remains
+   unchanged in `resolved_runtime_settings.profile_name`; the locator does not
+   expose or normalize it. Equal names produce equal locators, and unequal test
+   names produce unequal locators.
+16. **B-016:** Omitted approval policy resolves by runtime capability. Codex
+   runtimes record `unobserved_agent_default`; Claude Code and Anthropic API
+   record `not_applicable`; explicit approval policy remains rejected for every
+   non-Codex runtime. `not_applicable` never implies that an agent-side default
+   influenced launch.
 
 ## Acceptance Criteria
 
@@ -144,6 +172,16 @@ does not prove it was selected or loaded for a runtime activity.
       construction fails.
 - [ ] Existing prompt, memory, activity-policy, and activity-result tests
       remain green without weakening assertions.
+- [ ] Named test
+      `arbitrary_profile_names_use_stable_hashed_locators_and_preserve_profile_name`
+      proves B-015 for spaces, slashes, Unicode, and UUID-shaped names.
+- [ ] Named test
+      `model_facing_prompt_uses_v1_schema_while_durable_packet_remains_v2`
+      proves the exact B-014 durable/model schema split and v1 prompt bytes.
+- [ ] Named test
+      `non_codex_omitted_approval_policy_is_not_applicable` proves B-016 for
+      Claude Code and Anthropic API while the existing Codex case remains
+      `unobserved_agent_default`.
 - [ ] No database migration, new runtime event type, or external dependency is
       introduced.
 
@@ -151,15 +189,15 @@ does not prove it was selected or loaded for a runtime activity.
 
 | Boundary | Verdict |
 | --- | --- |
-| Empty / missing input | Covered by B-001, B-005, B-007, and B-009. |
+| Empty / missing input | Covered by B-001, B-005, B-007, B-009, and B-016. |
 | Error and failure paths | Covered by B-007 and B-012. |
-| Authorization / permission | Covered by B-009 and B-010; provenance observes no new authority and exposes no credentials. |
+| Authorization / permission | Covered by B-009, B-010, and B-016; provenance observes no new authority, distinguishes unsupported policy, and exposes no credentials. |
 | Concurrency / race / ordering | Covered by B-006, B-011, and B-013; provenance is built from the same immutable inputs before the existing event write. |
 | Retry / repetition / idempotency | Covered by B-011 and B-013. |
 | Illegal state transitions | N/A. Provenance does not change workflow state; ASC-001 validation rejects illegal evidence combinations. |
-| Compatibility / migration | Covered by B-001, B-013, and B-014. |
+| Compatibility / migration | Covered by B-001, B-013, B-014, B-015, and B-016. |
 | Degradation / fallback | Covered by B-007, B-009, and B-012; missing evidence is never success-shaped. |
-| Evidence and audit integrity | Covered by B-002 through B-13. |
+| Evidence and audit integrity | Covered by B-002 through B-013, B-015, and B-016. |
 | Cancellation / interruption / partial completion | Covered by B-012 and B-013; failure precedes agent execution and the existing event records packet plus provenance atomically. |
 
 ## Edge Cases
@@ -173,6 +211,8 @@ does not prove it was selected or loaded for a runtime activity.
 - An adapter independently reads repository instructions after Harness creates
   the packet.
 - A runtime profile has absent optional fields.
+- A runtime profile name contains spaces, slashes, Unicode, or is a UUID.
+- Claude Code or Anthropic API omits the unsupported approval-policy field.
 - Server defaults resolve two otherwise identical runtime profiles to
   different effective model or sandbox settings.
 - One durable prompt reference resolves to changed task text.
@@ -185,4 +225,6 @@ This emits version-2 prompt packets and leaves stored version-1 packets
 unchanged. Consumers that only render the packet continue to treat it as a JSON
 object. Evidence readers require provenance only for v2, treat v1 as
 lower-evidence history, and never infer provenance for a packet lacking the
-field.
+field. Agent prompt rendering continues to receive a v1-schema compatibility
+clone; the v2 schema and evidence remain confined to the durable packet and
+activity artifact.
