@@ -82,7 +82,7 @@ GH-1731
   - A valid in-root symlink swap may select either valid target, and the digest
     covers exactly the bytes from the opened regular-file handle without
     reporting `entry_raced`.
-  - Depth uses the allowlisted directory as depth 0; directory enumeration
+  - Depth uses the repository root as depth 0; directory enumeration
     reads at most the checked N+1 sentinel; every yielded item charges the
     aggregate encountered-entry budget; each opened directory including the
     repository root charges the directory budget; regular-file and byte
