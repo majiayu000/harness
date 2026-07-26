@@ -67,8 +67,9 @@ GH-1731
     the declarative `.vibeguard` extension selector.
   - Bounded `harness.toml` bytes are parsed once for the four rule-source fields
     in `tech.md`; repository-relative file/directory sources derive typed
-    `policy` rules, duplicates deduplicate, and absolute sources remain out of
-    scope.
+    `policy` rules, identical `(locator, component_kind)` bindings deduplicate,
+    distinct roles for one locator are preserved, and absolute sources remain
+    out of scope.
   - Harness-native roots have their specific component kinds and no recursive
     catch-all `.harness` rule exists.
   - Missing exact entries are omitted only after a non-following
@@ -88,6 +89,7 @@ GH-1731
   - `cargo test -p harness-core stack::inventory_tests::only_lifecycle_bound_hook_entrypoints_are_inventoried`
   - `cargo test -p harness-core stack::inventory_tests::vibeguard_runner_is_inventoried_as_validation`
   - `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once`
+  - `cargo test -p harness-core stack::inventory_tests::same_locator_with_distinct_kinds_is_preserved`
   - `cargo test -p harness-core stack::inventory_tests::invalid_configured_rule_sources_fail_typed`
   - `cargo test -p harness-core stack::inventory_tests::unsupported_non_utf8_entries_are_filtered_before_locator_normalization`
   - `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule`
@@ -155,8 +157,8 @@ GH-1731
     nested fixtures; Unix FIFO fixtures prove selected opens cannot block before
     handle type validation.
   - Configuration fixtures cover valid, duplicate, absolute, escaping, missing,
-    exact-file, and recursive-directory rule sources without serializing
-    out-of-scope absolute paths.
+    exact-file, recursive-directory, and same-locator/different-kind rule
+    sources without serializing out-of-scope absolute paths.
   - Negative fixtures cover missing versus broken symlinks, root replacement,
     escaping and in-root symlink swaps, cycles, special files, unreadable
     files, non-UTF-8 paths, post-`read_dir` disappearance, invalid limits, and

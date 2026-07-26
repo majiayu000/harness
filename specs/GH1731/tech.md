@@ -152,7 +152,8 @@ parent traversal, and derive a typed `policy` rule:
 - `discovery_paths` and `builtin_path` accept either one exact file or a
   directory recursively selecting extensions `md` and `toml`;
 - `exec_policy_paths` and `requirements_path` require one exact file;
-- duplicate normalized locators are inventoried once;
+- duplicate `(normalized locator, component kind)` bindings are inventoried
+  once; a locator selected under different kinds emits one component per kind;
 - an absolute configured source is outside B-002 and produces no target
   component or serialized path;
 - an invalid, escaping, or missing relative source fails typed.
@@ -352,7 +353,7 @@ subprocess, network, persistence, or repository write occurs.
 | --- | --- | --- |
 | B-001 | root-handle-first preflight with no ambient-root claim | `cargo test -p harness-core stack::inventory_tests::inventory_stays_bound_to_the_opened_root_handle` |
 | B-002 | root-only rule table | `cargo test -p harness-core stack::inventory_tests::inventory_never_reads_user_global_or_sibling_paths` |
-| B-003 | static `InventoryRule` table plus bounded configured rule derivation | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector`; `cargo test -p harness-core stack::inventory_tests::vibeguard_runner_is_inventoried_as_validation`; `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once` |
+| B-003 | static `InventoryRule` table plus bounded configured rule derivation | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector`; `cargo test -p harness-core stack::inventory_tests::vibeguard_runner_is_inventoried_as_validation`; `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once`; `cargo test -p harness-core stack::inventory_tests::same_locator_with_distinct_kinds_is_preserved` |
 | B-004 | non-following initial lookup and missing-entry handling | `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders` |
 | B-005 | entry/component construction, hashing, executable mode, directory presence, and current-observation freshness | `cargo test -p harness-core stack::inventory_tests::entries_bind_content_mode_and_directory_presence_to_valid_components`; `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh` |
 | B-006 | surface-specific static and configured selector classification | `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`; `cargo test -p harness-core stack::inventory_tests::only_lifecycle_bound_hook_entrypoints_are_inventoried`; `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once`; `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
@@ -410,8 +411,9 @@ subprocess, network, persistence, or repository write occurs.
 - [ ] Prove `.vibeguard/run-guards.sh` is a `validation` entry and unrelated
       `.vibeguard` shell helpers remain excluded.
 - [ ] Prove configured repository-relative rule files and directories are
-      inventoried once; invalid, escaping, and missing relative sources fail
-      typed; absolute sources remain out of scope and are never serialized.
+      inventoried once per `(locator, kind)` binding; distinct typed roles for
+      one locator are preserved; invalid, escaping, and missing relative sources
+      fail typed; absolute sources remain out of scope and are never serialized.
 - [ ] Prove unmatched non-UTF-8 ordinary files are excluded before locator
       normalization, while selected files and traversed directories fail typed.
 - [ ] Prove in-root directory symlinks recurse, escaping targets fail, cycles

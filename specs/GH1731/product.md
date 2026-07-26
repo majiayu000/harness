@@ -153,9 +153,11 @@ repository root, not that an agent selected, loaded, or executed it.
 - [ ] Hook fixtures prove only `.harness/guards/*.sh` and documented direct Git
       hook basenames become `hook` components; README, helper, and nested
       fixture files are excluded.
-- [ ] Config fixtures prove every repository-relative rule source loaded from
-      `harness.toml` is inventoried once, absolute sources remain out of scope,
-      and invalid or missing relative sources fail typed.
+- [ ] Config fixtures prove every unique repository-relative
+      `(locator, component_kind)` binding loaded from `harness.toml` is
+      inventoried once, the same locator retains distinct typed roles, absolute
+      sources remain out of scope, and invalid or missing relative sources fail
+      typed.
 - [ ] Every output validates under the ASC-001 component contract.
 - [ ] Tests prove path normalization, stable ordering, content hashing,
       missing-entry behavior, root-handle containment across path replacement,
