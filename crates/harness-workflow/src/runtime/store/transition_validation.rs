@@ -3,9 +3,9 @@
 //! `DecisionValidator` enforces the transition allowlist, terminal-reopen
 //! denial, lease ownership, and required commands/evidence. Historically only
 //! the runtime-completion and operator-recovery paths consulted it, so the
-//! remaining transition writers could persist a caller-supplied instance that
-//! the definition never allowed (GH-1784). Every state-changing write goes
-//! through `validate_transition` instead of calling the validator ad hoc.
+//! `apply_decision_transition` could persist a caller-supplied instance that
+//! the definition never allowed (GH-1784). That path now goes through
+//! `validate_transition` instead of calling the validator ad hoc.
 
 use chrono::{DateTime, Utc};
 
@@ -30,12 +30,12 @@ pub(super) enum TransitionValidation {
 pub(super) fn validate_transition(
     current: &WorkflowInstance,
     decision: &WorkflowDecision,
-    source: &str,
+    actor: &str,
     now: DateTime<Utc>,
 ) -> TransitionValidation {
     match validator_for_instance(current) {
         Ok(Some(validator)) => {
-            match validator.validate(current, decision, &ValidationContext::new(source, now)) {
+            match validator.validate(current, decision, &ValidationContext::new(actor, now)) {
                 Ok(()) => TransitionValidation::Accepted,
                 Err(error) => TransitionValidation::Rejected(error.to_string()),
             }

@@ -172,7 +172,7 @@ async fn durable_store_apply_decision_transition_can_create_initial_instance() -
             decision: &decision,
             final_instance: &final_instance,
             command_status: WorkflowCommandStatus::Pending,
-        })
+        }, "workflow-runtime-test")
         .await?
         .expect("missing initial instance should be created inside the transition");
 
@@ -249,7 +249,7 @@ async fn durable_store_apply_decision_transition_does_not_rewind_existing_instan
             decision: &decision,
             final_instance: &final_instance,
             command_status: WorkflowCommandStatus::Pending,
-        })
+        }, "workflow-runtime-test")
         .await?;
 
     assert!(record.is_none());

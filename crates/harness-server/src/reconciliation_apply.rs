@@ -8,13 +8,31 @@ pub(super) async fn apply_runtime_workflow_transition(
     target_state: &str,
     reason: &str,
 ) -> anyhow::Result<bool> {
-    let Some(mut instance) = runtime_store.get_instance(&candidate.workflow_id).await? else {
+    let Some(instance) = runtime_store.get_instance(&candidate.workflow_id).await? else {
         return Ok(false);
     };
     if instance.is_terminal() || instance.state != candidate.state {
         return Ok(false);
     }
+    apply_loaded_runtime_workflow_transition(
+        runtime_store,
+        issue_workflows,
+        candidate,
+        instance,
+        target_state,
+        reason,
+    )
+    .await
+}
 
+pub(super) async fn apply_loaded_runtime_workflow_transition(
+    runtime_store: &WorkflowRuntimeStore,
+    issue_workflows: Option<&IssueWorkflowStore>,
+    candidate: &RuntimeWorkflowCandidate,
+    mut instance: WorkflowInstance,
+    target_state: &str,
+    reason: &str,
+) -> anyhow::Result<bool> {
     let is_pr_target = candidate.pr_number.is_some();
     let event_type = match (target_state, is_pr_target) {
         ("done", true) => "PrMerged",
@@ -90,22 +108,32 @@ pub(super) async fn apply_runtime_workflow_transition(
         reason,
         candidate,
     );
-    let Some(_record) = runtime_store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: candidate.state.as_str(),
-            create_if_missing: None,
-            event_type,
-            source: "reconciliation",
-            payload: event_payload,
-            decision: &decision,
-            final_instance: &instance,
-            command_status: WorkflowCommandStatus::Completed,
-        })
-        .await?
-    else {
+    let record = runtime_store
+        .apply_decision_transition(
+            WorkflowDecisionTransition {
+                expected_state: candidate.state.as_str(),
+                create_if_missing: None,
+                event_type,
+                source: "reconciliation",
+                payload: event_payload,
+                decision: &decision,
+                final_instance: &instance,
+                command_status: WorkflowCommandStatus::Completed,
+            },
+            "reconciliation",
+        )
+        .await?;
+    if !complete_runtime_workflow_transition(
+        record,
+        issue_workflows,
+        candidate,
+        target_state,
+        reason,
+    )
+    .await
+    {
         return Ok(false);
-    };
-    record_runtime_issue_side_effects(issue_workflows, candidate, target_state, reason).await;
+    }
     tracing::info!(
         workflow_id = %candidate.workflow_id,
         from = %candidate.state,
@@ -116,6 +144,28 @@ pub(super) async fn apply_runtime_workflow_transition(
         "workflow runtime reconciliation: applying transition"
     );
     Ok(true)
+}
+
+pub(super) async fn complete_runtime_workflow_transition(
+    record: Option<harness_workflow::runtime::WorkflowDecisionRecord>,
+    issue_workflows: Option<&IssueWorkflowStore>,
+    candidate: &RuntimeWorkflowCandidate,
+    target_state: &str,
+    reason: &str,
+) -> bool {
+    let Some(record) = record else {
+        return false;
+    };
+    if !record.accepted {
+        tracing::warn!(
+            workflow_id = %candidate.workflow_id,
+            reason = record.rejection_reason.as_deref().unwrap_or("unspecified validator rejection"),
+            "workflow runtime reconciliation transition rejected during atomic validation"
+        );
+        return false;
+    }
+    record_runtime_issue_side_effects(issue_workflows, candidate, target_state, reason).await;
+    true
 }
 
 fn remote_payload(
