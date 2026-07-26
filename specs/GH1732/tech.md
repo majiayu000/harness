@@ -139,8 +139,9 @@ execute an incomplete packet.
 Resolved runtime settings:
 
 - kind `agent_runtime`;
-- ID `runtime-profile:<profile name>`;
-- runtime-scoped locator using the profile name;
+- runtime-scoped locator `runtime-profile/<profile name>`;
+- ID from the ASC-001 helper:
+  `runtime:agent_runtime:runtime-profile/<profile name>`;
 - digest of canonical serde JSON for `ResolvedRuntimeSettings`;
 - reason `workflow_runtime_profile_selected`;
 - observation/trust `runtime_observed`;
@@ -165,7 +166,8 @@ Workflow sources and effective document:
 Repo memory:
 
 - kind `memory`;
-- ID and runtime locator derived from the durable memory record ID;
+- runtime locator derived from the durable memory record ID and ID derived by
+  the ASC-001 helper from kind and source;
 - digest of the exact redacted JSON representation returned by
   `repo_memory_prompt_value`, scoped to that record;
 - safe metadata fields for durable ID, optional evidence reference, and
