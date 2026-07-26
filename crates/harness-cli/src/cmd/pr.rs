@@ -13,18 +13,15 @@ use tokio::time::{sleep, Duration};
 const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
 
 fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
-    ClaudeCodeAgent::new(
-        config.agents.claude.cli_path.clone(),
-        config.agents.claude.default_model.clone(),
+    // This path needs the Claude backend alone, not a registry — but it takes
+    // it from the same builder, so it cannot drift from the entry points.
+    harness_agents::builder::claude_agent_from_config(
+        &config.agents,
         config.agents.sandbox_mode,
-    )
-    .with_no_session_persistence_probe()
-    .with_provider_backpressure_gate(
         harness_agents::provider_backpressure::ProviderBackpressureGate::from_claude_config(
             &config.agents.claude.provider_backpressure,
         ),
     )
-    .with_stream_timeout(config.agents.stream_timeout_secs)
 }
 
 pub async fn fix(

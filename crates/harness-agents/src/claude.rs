@@ -48,13 +48,6 @@ impl ClaudeCodeAgent {
         }
     }
 
-    /// Previously probed and enabled `--no-session-persistence`. Now a no-op:
-    /// session persistence is required for token-usage tracking and learn
-    /// system observability. Retained for API compatibility.
-    pub fn with_no_session_persistence_probe(self) -> Self {
-        self
-    }
-
     /// Attach a ReasoningBudget for per-phase model selection.
     pub fn with_reasoning_budget(mut self, budget: ReasoningBudget) -> Self {
         self.reasoning_budget = Some(budget);

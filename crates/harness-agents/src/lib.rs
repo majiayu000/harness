@@ -1,4 +1,5 @@
 pub mod anthropic_api;
+pub mod builder;
 pub mod claude;
 pub mod claude_adapter;
 mod claude_stream;

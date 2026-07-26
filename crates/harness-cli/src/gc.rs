@@ -6,7 +6,6 @@ use harness_gc::draft_store::DraftStore;
 use harness_gc::gc_agent::GcAgent;
 use harness_gc::signal_detector::SignalDetector;
 use harness_observe::event_store::EventStore;
-use std::sync::Arc;
 
 use crate::commands::GcCommand;
 
@@ -56,7 +55,7 @@ pub async fn run_gc(
                 project.root.clone(),
             );
 
-            let agent_registry = build_agent_registry(config);
+            let agent_registry = build_agent_registry(config)?;
             let agent = agent_registry.default_agent().ok_or_else(|| {
                 anyhow::anyhow!(
                     "no default agent registered; available agents: {}",
@@ -148,43 +147,8 @@ fn make_agent_for_draft_ops(
 
 fn build_agent_registry(
     config: &harness_core::config::HarnessConfig,
-) -> harness_agents::registry::AgentRegistry {
-    let mut registry = harness_agents::registry::AgentRegistry::new(&config.agents.default_agent);
-    registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
-    registry.register(
-        "claude",
-        Arc::new(
-            harness_agents::claude::ClaudeCodeAgent::new(
-                config.agents.claude.cli_path.clone(),
-                config.agents.claude.default_model.clone(),
-                config.agents.sandbox_mode,
-            )
-            .with_no_session_persistence_probe()
-            .with_stream_timeout(config.agents.stream_timeout_secs),
-        ),
-    );
-    registry.register(
-        "codex",
-        Arc::new(
-            harness_agents::codex::CodexAgent::from_config(
-                config.agents.codex.clone(),
-                config.agents.sandbox_mode,
-            )
-            .with_stream_timeout(config.agents.stream_timeout_secs),
-        ),
-    );
-    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-        registry.register(
-            "anthropic-api",
-            Arc::new(
-                harness_agents::anthropic_api::AnthropicApiAgent::from_config(
-                    api_key,
-                    &config.agents.anthropic_api,
-                ),
-            ),
-        );
-    }
-    registry
+) -> anyhow::Result<harness_agents::registry::AgentRegistry> {
+    harness_agents::builder::registry_from_config(&config.agents, config.agents.sandbox_mode)
 }
 
 fn project_id_from_root(project_root: &std::path::Path) -> ProjectId {
