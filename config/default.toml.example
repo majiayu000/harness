@@ -50,6 +50,13 @@ max_turns = 20
 # wall-clock turn timeout.
 # stall_timeout_secs = 600
 
+[workflow]
+# Temporary one-release emergency kill switch for server-verified completion
+# evidence. Defaults to true; keep enabled unless a controlled rollback is
+# required. Disabling it accepts agent-claimed terminal results without
+# server-verified evidence for every project in this Harness deployment.
+completion_evidence_enforced = true
+
 [workflow.circuit_breaker]
 # Pause dispatch for a runtime profile after repeated same-class failures.
 enabled = true

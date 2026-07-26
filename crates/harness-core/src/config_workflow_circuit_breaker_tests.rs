@@ -93,6 +93,22 @@ fn harness_config_rejects_unknown_completion_evidence_key() {
 }
 
 #[test]
+fn harness_config_rejects_completion_evidence_key_inside_circuit_breaker() {
+    let toml_str = workflow_breaker_harness_config_toml(
+        r#"
+        [workflow.circuit_breaker]
+        completion_evidence_enforced = false
+        "#,
+    );
+
+    let error = toml::from_str::<HarnessConfig>(&toml_str)
+        .expect_err("a kill switch nested under the circuit breaker must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+}
+
+#[test]
 fn harness_config_rejects_legacy_root_completion_evidence_key() {
     let toml_str = format!(
         "runtime_completion_evidence_enforced = false\n{}",

@@ -21,6 +21,7 @@ impl Default for WorkflowRuntimeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeCircuitBreakerPolicy {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
