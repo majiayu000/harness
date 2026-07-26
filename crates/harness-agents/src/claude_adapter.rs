@@ -130,7 +130,6 @@ impl AgentAdapter for ClaudeAdapter {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
 
         let provider_permit =
             acquire_provider_permit_with_event_heartbeat(&self.provider_gate, &req, &tx).await?;

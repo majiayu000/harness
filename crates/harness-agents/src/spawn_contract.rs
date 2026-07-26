@@ -11,6 +11,21 @@ use crate::scoped_token::{
     CONTAINER_GH_TOKEN_ENV, CONTAINER_GITHUB_TOKEN_ENV, SCOPED_GITHUB_TOKEN_ENV,
 };
 
+/// Env keys Claude Code uses to detect that it is running nested inside
+/// another Claude Code session; leaking any of them into a spawned agent
+/// causes SIGTRAP. Only these markers are stripped — legitimate `CLAUDE_*`
+/// configuration such as `CLAUDE_CONFIG_DIR` must pass through.
+///
+/// Keep in sync with the wrapper-variable classification in
+/// `scripts/start-harness-codex-safe.sh`.
+pub(crate) const NESTED_SESSION_ENV_KEYS: [&str; 5] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+];
+
 const DEFAULT_AGENT_CONTAINER_IMAGE: &str = "harness-agent:latest";
 const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
 const AGENT_EGRESS_PROXY_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY";
@@ -137,6 +152,22 @@ pub(crate) fn apply_process_env(cmd: &mut tokio::process::Command, spawn: &Prepa
         cmd.env_clear();
     }
     cmd.envs(spawn.process_env.iter());
+    strip_nested_session_env(cmd);
+}
+
+/// Remove nested-session markers from the command's *effective* environment.
+///
+/// `env_remove` overrides both inherited parent env and explicitly set vars,
+/// so this works regardless of where the marker came from. Must be applied
+/// after all `env`/`envs` calls that could introduce the keys.
+pub(crate) fn strip_nested_session_env(cmd: &mut tokio::process::Command) {
+    for key in NESTED_SESSION_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+}
+
+fn is_nested_session_env(key: &str) -> bool {
+    NESTED_SESSION_ENV_KEYS.contains(&key)
 }
 
 fn isolation_tier(env_vars: &HashMap<String, String>) -> Result<IsolationTier, HarnessError> {
@@ -166,6 +197,7 @@ fn host_process_env(env_vars: &HashMap<String, String>) -> BTreeMap<String, Stri
     env_vars
         .iter()
         .filter(|(key, _)| !is_spawn_control_env(key))
+        .filter(|(key, _)| !is_nested_session_env(key))
         .filter(|(key, _)| key.as_str() != SCOPED_GITHUB_TOKEN_ENV)
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
@@ -175,6 +207,7 @@ fn container_env_vars(env_vars: &HashMap<String, String>) -> BTreeMap<String, St
     let mut env = env_vars
         .iter()
         .filter(|(key, _)| !is_spawn_control_env(key))
+        .filter(|(key, _)| !is_nested_session_env(key))
         .filter(|(key, _)| key.as_str() != SCOPED_GITHUB_TOKEN_ENV)
         .filter(|(key, _)| !is_operator_secret_env(key))
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -456,6 +489,68 @@ mod container_spawn_tests {
         assert!(!args.iter().any(|arg| arg.contains("operator-token")));
         assert!(!args.iter().any(|arg| arg.contains("operator-key")));
         assert!(!spawn.process_env.contains_key("GITHUB_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn host_spawn_filters_injected_nested_session_markers() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut env_vars = HashMap::new();
+        for key in NESTED_SESSION_ENV_KEYS {
+            env_vars.insert(key.to_string(), "1".to_string());
+        }
+        env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), "/cfg".to_string());
+        let sandbox_spec = SandboxSpec::new(SandboxMode::DangerFullAccess, root.path());
+
+        let spawn = prepare_agent_spawn(input(
+            Path::new("claude"),
+            &[],
+            root.path(),
+            &sandbox_spec,
+            &env_vars,
+        ))?;
+
+        for key in NESTED_SESSION_ENV_KEYS {
+            assert!(
+                !spawn.process_env.contains_key(key),
+                "{key} must be stripped from the host process env"
+            );
+        }
+        // Legitimate CLAUDE_* configuration must pass through.
+        assert_eq!(
+            spawn.process_env.get("CLAUDE_CONFIG_DIR"),
+            Some(&"/cfg".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn container_spawn_filters_injected_nested_session_markers() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            AGENT_ISOLATION_TIER_ENV.to_string(),
+            "container".to_string(),
+        );
+        env_vars.insert("CLAUDECODE".to_string(), "1".to_string());
+        env_vars.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), "cli".to_string());
+        env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), "/cfg".to_string());
+        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
+
+        let spawn = ContainerSpawn.prepare(input(
+            Path::new("claude"),
+            &[],
+            root.path(),
+            &sandbox_spec,
+            &env_vars,
+        ))?;
+
+        let args = string_args(&spawn);
+        assert!(!args.iter().any(|arg| arg.starts_with("CLAUDECODE=")));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("CLAUDE_CODE_ENTRYPOINT=")));
+        assert!(args.contains(&"CLAUDE_CONFIG_DIR=/cfg".to_string()));
         Ok(())
     }
 

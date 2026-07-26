@@ -207,9 +207,9 @@ impl CodexAgent {
             .kill_on_drop(true);
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
-        crate::strip_claude_env(&mut cmd);
         cmd.envs(&req.env_vars);
         crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
+        crate::spawn_contract::strip_nested_session_env(&mut cmd);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -416,7 +416,6 @@ impl CodeAgent for CodexAgent {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -544,7 +543,6 @@ impl CodeAgent for CodexAgent {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {

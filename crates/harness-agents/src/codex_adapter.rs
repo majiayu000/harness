@@ -252,7 +252,6 @@ impl CodexAdapter {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
         crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {

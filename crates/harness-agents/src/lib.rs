@@ -17,18 +17,6 @@ use harness_core::run_registry::{append_binding_nonblocking, BindingRecord};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Remove all `CLAUDE`-prefixed environment variables from a command to prevent
-/// nested Claude Code detection (SIGTRAP).
-pub(crate) fn strip_claude_env(cmd: &mut tokio::process::Command) {
-    let claude_keys: Vec<String> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("CLAUDE"))
-        .map(|(k, _)| k)
-        .collect();
-    for key in &claude_keys {
-        cmd.env_remove(key);
-    }
-}
-
 pub(crate) fn resolve_agent_run_identity(env_vars: &HashMap<String, String>) -> RunIdentity {
     match RunIdentity::from_env_vars(env_vars) {
         Ok(Some(identity)) => identity,
