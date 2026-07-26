@@ -63,6 +63,12 @@ GH-1731
   - Hook selection is limited to direct `.harness/guards/*.sh` and the closed
     direct `.githooks` lifecycle basename vocabulary; generic hook directories,
     README, helper, and fixture files emit no component.
+  - `.vibeguard/run-guards.sh` is one exact `validation` entry independent of
+    the declarative `.vibeguard` extension selector.
+  - Bounded `harness.toml` bytes are parsed once for the four rule-source fields
+    in `tech.md`; repository-relative file/directory sources derive typed
+    `policy` rules, duplicates deduplicate, and absolute sources remain out of
+    scope.
   - Harness-native roots have their specific component kinds and no recursive
     catch-all `.harness` rule exists.
   - Missing exact entries are omitted only after a non-following
@@ -80,6 +86,9 @@ GH-1731
   - `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders`
   - `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`
   - `cargo test -p harness-core stack::inventory_tests::only_lifecycle_bound_hook_entrypoints_are_inventoried`
+  - `cargo test -p harness-core stack::inventory_tests::vibeguard_runner_is_inventoried_as_validation`
+  - `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once`
+  - `cargo test -p harness-core stack::inventory_tests::invalid_configured_rule_sources_fail_typed`
   - `cargo test -p harness-core stack::inventory_tests::unsupported_non_utf8_entries_are_filtered_before_locator_normalization`
   - `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule`
   - `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh`
@@ -104,6 +113,9 @@ GH-1731
   - In-root directory symlinks are resolved through the capability and
     traversed before file selection; recursive symlink identities still return
     `cycle_detected`.
+  - An exact-file rule whose symlink target is a directory returns
+    `non_regular_entry`; only directory or configured file-or-directory rules
+    may descend.
   - Depth uses the repository root as depth 0; directory enumeration
     reads at most the checked N+1 sentinel; every yielded item charges the
     aggregate encountered-entry budget; each opened directory including the
@@ -118,6 +130,7 @@ GH-1731
   - `cargo test -p harness-core stack::inventory_tests::inventory_stays_bound_to_the_opened_root_handle`
   - `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target`
   - `cargo test -p harness-core stack::inventory_tests::in_root_directory_symlinks_are_traversed_and_cycles_fail`
+  - `cargo test -p harness-core stack::inventory_tests::file_rules_reject_directory_symlink_targets`
   - `cargo test -p harness-core stack::inventory_tests::selected_fifo_targets_fail_without_blocking`
   - `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators`
   - `cargo test -p harness-core stack::inventory_tests::reads_never_exceed_remaining_aggregate_or_per_file_budget`
@@ -141,6 +154,9 @@ GH-1731
   - Hook fixtures prove exact lifecycle selectors exclude README, helpers, and
     nested fixtures; Unix FIFO fixtures prove selected opens cannot block before
     handle type validation.
+  - Configuration fixtures cover valid, duplicate, absolute, escaping, missing,
+    exact-file, and recursive-directory rule sources without serializing
+    out-of-scope absolute paths.
   - Negative fixtures cover missing versus broken symlinks, root replacement,
     escaping and in-root symlink swaps, cycles, special files, unreadable
     files, non-UTF-8 paths, post-`read_dir` disappearance, invalid limits, and

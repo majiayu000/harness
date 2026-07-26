@@ -83,23 +83,27 @@ fact.
 optional sanitized repository-relative locator. The closed initial categories
 are `invalid_options`, `root_open`, `entry_metadata`, `broken_symlink`,
 `root_escape`, `non_regular_entry`, `non_utf8_locator`, `read_failed`,
-`entry_raced`, `cycle_detected`, `limit_exceeded`, and
-`component_validation`. `entry_raced` means an entry already returned by
+`entry_raced`, `cycle_detected`, `config_parse`,
+`configured_source_invalid`, `configured_source_missing`, `limit_exceeded`,
+and `component_validation`. `entry_raced` means an entry already returned by
 `read_dir` disappeared or could no longer be opened/represented under the
 observed locator; a symlink swapped to another valid in-root regular file is
 not an error and follows B-008. `cycle_detected` is used only when an opened
-directory identity is already present in the active ancestor stack. Error
-evidence never serializes file bytes, ambient target paths, or arbitrary OS
-error strings. This issue does not add an aggregate digest or snapshot
-identity.
+directory identity is already present in the active ancestor stack.
+`config_parse` covers invalid UTF-8 or TOML in present `harness.toml`;
+`configured_source_invalid` covers an empty, parent-traversing, or otherwise
+invalid repository-relative rule source, and `configured_source_missing` means
+that such a declared relative source is absent. Error evidence never serializes
+file bytes, ambient target paths, configured absolute paths, or arbitrary OS
+error strings. This issue does not add an aggregate digest or snapshot identity.
 
 ### Closed Discovery Table
 
 Define the B-003 allowlist as one constant typed table. Every row has:
 
 - repository-relative matcher (exact path or root-only suffix);
-- expected entry class (`file`, selector-filtered recursive `directory`, or
-  non-recursive `directory_presence`);
+- expected entry class (`file`, selector-filtered recursive `directory`,
+  configured `file_or_directory`, or non-recursive `directory_presence`);
 - a closed entry selector for directory rows;
 - `AgentStackComponentKind`.
 
@@ -122,7 +126,9 @@ emit components. `.github/workflows` uses direct extensions `yml` and `yaml`;
 extensions `yml` and `yaml`; and `.cursor/rules` uses recursive extensions
 `md` and `mdc`. `.vibeguard` uses recursive extensions `md`, `toml`, `yaml`,
 `yml`, `json`, and `json5`; `.remem` uses recursive extensions `toml`, `yaml`,
-`yml`, and `json`, so databases and runtime state are excluded.
+`yml`, and `json`, so databases and runtime state are excluded. The exact
+`.vibeguard/run-guards.sh` row is independently typed `validation`; other shell
+helpers beneath `.vibeguard` are not selected.
 
 `.githooks` uses direct basenames from this closed Git lifecycle vocabulary:
 `applypatch-msg`, `pre-applypatch`, `post-applypatch`, `pre-commit`,
@@ -136,11 +142,32 @@ extensions `yml` and `yaml`; and `.cursor/rules` uses recursive extensions
 without an explicit lifecycle binding, their README, helpers, and fixtures
 cannot satisfy the ASC-001 `hook` kind.
 
+If root `harness.toml` is present, parse its already-bounded opened bytes into a
+private minimal config shape containing only `rules.discovery_paths`,
+`rules.builtin_path`, `rules.exec_policy_paths`, and
+`rules.requirements_path`. Do not deserialize unrelated Harness settings or
+reopen the config. Normalize each non-empty relative path lexically, reject any
+parent traversal, and derive a typed `policy` rule:
+
+- `discovery_paths` and `builtin_path` accept either one exact file or a
+  directory recursively selecting extensions `md` and `toml`;
+- `exec_policy_paths` and `requirements_path` require one exact file;
+- duplicate normalized locators are inventoried once;
+- an absolute configured source is outside B-002 and produces no target
+  component or serialized path;
+- an invalid, escaping, or missing relative source fails typed.
+
+Derived rules use the same capability root, path normalization, selectors,
+symlink handling, resource budgets, ordering, and error redaction as static
+rules. The `harness.toml` bytes count and hash once even though they also produce
+derived rules.
+
 Root instruction names map to `instructions`, workflow files and
 `.github/workflows` map to `workflow`, skill roots map to `skill`, selected hook
 entrypoints map to `hook`, MCP files map to `mcp_server`, memory/remem surfaces
 map to `memory`, policy/rule surfaces map to `policy`, Harness configuration
-maps to `validation`, and package/toolchain files map to `validation`.
+maps to `validation`, the exact `.vibeguard/run-guards.sh` maps to `validation`,
+and package/toolchain files map to `validation`.
 
 Harness-native rows are exact and independently typed:
 `.harness/config.toml` maps to `validation`, `.harness/skills` to `skill`,
@@ -185,11 +212,15 @@ an ambient path or uses `std::fs` free functions.
 
 Validate every numeric limit before traversal. `max_file_bytes` must permit a
 checked `+ 1` sentinel read; zero limits and arithmetic overflow return a typed
-configuration error. For each rule:
+configuration error. Then read and emit `harness.toml` at most once through the
+same bounded handle-first path, parse only the rule-source fields above, and
+merge their derived rules with the static table before traversing other entries.
+For each expanded rule:
 
-1. inspect every exact allowlist path with capability-relative,
+1. inspect every exact static or derived path with capability-relative,
    non-following `symlink_metadata`;
-2. treat `NotFound` only from that initial non-following lookup as absence; an
+2. treat `NotFound` from an initial static optional lookup as absence, but map it
+   to `configured_source_missing` for a repository-relative derived rule. An
    entry already yielded by `read_dir` followed by `NotFound` is a race error;
 3. visit directories through capability-relative handles, collect at most
    `max_entries_per_directory + 1` entries with checked arithmetic, fail on the
@@ -202,9 +233,11 @@ configuration error. For each rule:
    must have a lossless portable locator before descent;
 5. for a symlink, resolve target metadata through the directory capability
    before applying a file selector. Classify `NotFound` as `broken_symlink`,
-   reject escape or other resolution failure, descend through an in-root
-   directory target, and apply the native basename/extension selector only when
-   the resolved target is not a directory;
+   reject escape or other resolution failure, and descend through an in-root
+   directory target only when the rule expects `directory` or
+   `file_or_directory`. A `file` rule whose symlink target is a directory
+   returns `non_regular_entry`. Apply the native basename/extension selector
+   only when the resolved target is not a directory;
 6. normalize every selected file and recursively visited directory losslessly,
    sort those candidates by portable locator, and then process them. A non-UTF-8
    unmatched ordinary file is ignored, while a non-UTF-8 selected file or
@@ -302,9 +335,10 @@ the explicit unobserved state.
 
 ## Data Flow
 
-Explicit root/options → validated limits → one ambient root-handle open → fixed
-rule lookup → native selector filtering → safe, sorted capability-relative
-traversal → nonblocking candidate open and handle-type validation →
+Explicit root/options → validated limits → one ambient root-handle open →
+bounded `harness.toml` read and configured-rule derivation → static/derived rule
+merge → native selector filtering → safe, sorted capability-relative traversal
+→ nonblocking candidate open and handle-type validation →
 remaining-budget-capped byte read → SHA-256 and file metadata → validated
 ASC-001 component → typed entry → ordered `AgentStackInventory`.
 
@@ -318,13 +352,13 @@ subprocess, network, persistence, or repository write occurs.
 | --- | --- | --- |
 | B-001 | root-handle-first preflight with no ambient-root claim | `cargo test -p harness-core stack::inventory_tests::inventory_stays_bound_to_the_opened_root_handle` |
 | B-002 | root-only rule table | `cargo test -p harness-core stack::inventory_tests::inventory_never_reads_user_global_or_sibling_paths` |
-| B-003 | `InventoryRule` constant | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector` |
+| B-003 | static `InventoryRule` table plus bounded configured rule derivation | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector`; `cargo test -p harness-core stack::inventory_tests::vibeguard_runner_is_inventoried_as_validation`; `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once` |
 | B-004 | non-following initial lookup and missing-entry handling | `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders` |
 | B-005 | entry/component construction, hashing, executable mode, directory presence, and current-observation freshness | `cargo test -p harness-core stack::inventory_tests::entries_bind_content_mode_and_directory_presence_to_valid_components`; `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh` |
-| B-006 | surface-specific typed selector classification | `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`; `cargo test -p harness-core stack::inventory_tests::only_lifecycle_bound_hook_entrypoints_are_inventoried`; `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
+| B-006 | surface-specific static and configured selector classification | `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`; `cargo test -p harness-core stack::inventory_tests::only_lifecycle_bound_hook_entrypoints_are_inventoried`; `cargo test -p harness-core stack::inventory_tests::configured_repository_rule_sources_are_inventoried_once`; `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
 | B-007 | native prefilter plus sorted selected traversal/output | `cargo test -p harness-core stack::inventory_tests::unsupported_non_utf8_entries_are_filtered_before_locator_normalization`; `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory` |
-| B-008 | capability-relative file/directory symlink traversal and opened-handle observation | `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target`; `cargo test -p harness-core stack::inventory_tests::in_root_directory_symlinks_are_traversed_and_cycles_fail` |
-| B-009 | typed read/path errors | `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators` |
+| B-008 | capability-relative file/directory symlink traversal and opened-handle observation | `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target`; `cargo test -p harness-core stack::inventory_tests::in_root_directory_symlinks_are_traversed_and_cycles_fail`; `cargo test -p harness-core stack::inventory_tests::file_rules_reject_directory_symlink_targets` |
+| B-009 | typed read/path/config errors | `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators`; `cargo test -p harness-core stack::inventory_tests::invalid_configured_rule_sources_fail_typed` |
 | B-010 | checked file/directory/entry/depth/byte limits and nonblocking handle validation | `cargo test -p harness-core stack::inventory_tests::every_traversal_limit_has_an_exact_boundary_fixture`; `cargo test -p harness-core stack::inventory_tests::selected_fifo_targets_fail_without_blocking` |
 | B-011 | repeated full-entry fixture comparison | `cargo test -p harness-core stack::inventory_tests::unchanged_repository_inventory_is_repeatable` |
 | B-012 | read-only API surface and side-effect fixture | `cargo test -p harness-core stack::inventory_tests::inventory_is_read_only_and_invokes_no_external_behavior`; `rg -n "Command::new|TcpStream|UdpSocket|reqwest|std::fs::(write|remove|rename|create_dir)" crates/harness-core/src/stack/inventory.rs` (expect no matches); `cargo test -p harness-core agents_md` |
@@ -373,10 +407,16 @@ subprocess, network, persistence, or repository write occurs.
       registered definition entrypoints, while `.usage.json`, package
       references, and unrelated support files emit no component.
 - [ ] Prove closed hook selectors exclude README, helpers, and nested fixtures.
+- [ ] Prove `.vibeguard/run-guards.sh` is a `validation` entry and unrelated
+      `.vibeguard` shell helpers remain excluded.
+- [ ] Prove configured repository-relative rule files and directories are
+      inventoried once; invalid, escaping, and missing relative sources fail
+      typed; absolute sources remain out of scope and are never serialized.
 - [ ] Prove unmatched non-UTF-8 ordinary files are excluded before locator
       normalization, while selected files and traversed directories fail typed.
 - [ ] Prove in-root directory symlinks recurse, escaping targets fail, cycles
-      fail, and selected Unix FIFO targets return without blocking.
+      fail, file rules reject directory targets, and selected Unix FIFO targets
+      return without blocking.
 - [ ] Prove every successful file read and `spec` directory probe classifies
       freshness as `fresh`.
 - [ ] Add Unix executable-bit change and non-Unix unobserved-mode fixtures, plus

@@ -66,8 +66,12 @@ repository root, not that an agent selected, loaded, or executed it.
    `.harness/skills/*.usage.json`, package references, and other sidecar files
    are not independent stack units. Generic `.claude/hooks` and `hooks`
    directories are not inventoried because directory membership alone does not
-   prove lifecycle binding. Toolchain and validation selectors include
-   `Cargo.toml`, `go.mod`, `package.json`,
+   prove lifecycle binding. When repository-root `harness.toml` exists,
+   repository-relative `rules.discovery_paths`, `rules.builtin_path`,
+   `rules.exec_policy_paths`, and `rules.requirements_path` entries extend the
+   policy inventory through the same root capability; absolute sources remain
+   outside the repository-scoped result. Toolchain and validation selectors
+   include `Cargo.toml`, `go.mod`, `package.json`,
    `pyproject.toml`, `setup.py`, `requirements.txt`, `build.gradle`,
    `build.gradle.kts`, `pom.xml`, root `*.csproj` and `*.sln` files, `Gemfile`,
    `yarn.lock`, `pnpm-lock.yaml`, `.eslintrc`, `.eslintrc.js`,
@@ -96,7 +100,10 @@ repository root, not that an agent selected, loaded, or executed it.
    entrypoints inherit that rule's kind. A skill usage sidecar, package support
    file, or other unsupported descendant does not become a component merely
    because it is beneath a typed directory; unsupported files outside every
-   selector are not inventoried.
+   selector are not inventoried. Repository-relative rule sources derived from
+   `harness.toml` are typed `policy`; directory sources select recursive `*.md`
+   and `*.toml` definitions, while configured file sources select that exact
+   file.
 7. **B-007:** Discovery order and output order are deterministic: allowlist
    rule order is stable, selected files and directories required for recursive
    discovery are sorted by normalized relative locator, and filesystem
@@ -109,13 +116,18 @@ repository root, not that an agent selected, loaded, or executed it.
    an explicit error. A symlink swapped between valid in-root regular-file
    targets may resolve to either target; the opened file handle is the
    observation authority, the component retains the repository link locator,
-   and its digest covers exactly the bytes returned by that handle.
+   and its digest covers exactly the bytes returned by that handle. A rule that
+   expects a file rejects a symlink resolving to a directory; only recursive or
+   configured file-or-directory rules may descend through directory symlinks.
 9. **B-009:** A selected allowlisted entry that exists but cannot be opened,
    read, resolved, classified, or represented as a lossless UTF-8 portable
    locator returns an error with a failure category and, when representable,
    its safe relative locator; a non-UTF-8 name reports only the nearest
    representable ancestor. Harness does not use lossy path conversion, silently
-   omit a selected entry, or report a complete successful inventory.
+   omit a selected entry, or report a complete successful inventory. A present
+   `harness.toml` with invalid TOML or an invalid, escaping, or missing
+   repository-relative rule source fails with a stable typed category rather
+   than silently dropping configured policy.
 10. **B-010:** Directory traversal is bounded by configured regular-file,
     opened-directory, aggregate-encountered-entry, aggregate-byte, depth,
     entries-per-directory, and per-file byte limits. Selected non-regular
@@ -141,6 +153,9 @@ repository root, not that an agent selected, loaded, or executed it.
 - [ ] Hook fixtures prove only `.harness/guards/*.sh` and documented direct Git
       hook basenames become `hook` components; README, helper, and nested
       fixture files are excluded.
+- [ ] Config fixtures prove every repository-relative rule source loaded from
+      `harness.toml` is inventoried once, absolute sources remain out of scope,
+      and invalid or missing relative sources fail typed.
 - [ ] Every output validates under the ASC-001 component contract.
 - [ ] Tests prove path normalization, stable ordering, content hashing,
       missing-entry behavior, root-handle containment across path replacement,
@@ -184,6 +199,9 @@ repository root, not that an agent selected, loaded, or executed it.
 - A generic hook directory contains README, helper, and fixture files with no
   lifecycle binding.
 - A selected regular file is replaced by a FIFO immediately before open.
+- `harness.toml` declares duplicate, absolute, escaping, missing, file, and
+  directory rule sources.
+- An exact-file rule resolves through a symlink to a directory.
 - `Makefile` exists while `makefile` does not; matching remains exact.
 - The repository has no allowlisted surfaces.
 
