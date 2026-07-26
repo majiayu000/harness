@@ -5,6 +5,7 @@ use harness_core::types::TaskId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
+use tracing::instrument::WithSubscriber;
 use tracing::span::{Attributes, Record};
 use tracing::subscriber::Interest;
 use tracing::{Event, Id, Metadata, Subscriber};
@@ -367,7 +368,6 @@ async fn exercise_real_caller_interleave(
     let interleave = TaskDb::install_recovery_write_interleave_for_test(task_id.clone());
     let captured = CapturedSubscriber::default();
     let caller = async {
-        let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
         match site {
             RecoverySite::TerminalReplay | RecoverySite::PrReplay => {
                 replay_and_recover(&db, &log_path)
@@ -383,7 +383,8 @@ async fn exercise_real_caller_interleave(
                     transient_failed: result.transient_failed,
                 }),
         }
-    };
+    }
+    .with_subscriber(captured.clone());
     let actor = async {
         interleave.wait_until_selected().await;
         let result = async {
@@ -752,10 +753,10 @@ async fn recovery_counts_and_success_logs_require_applied_write() -> anyhow::Res
     .await?;
 
     let applied_output = CapturedSubscriber::default();
-    let recovery = {
-        let _subscriber_guard = tracing::subscriber::set_default(applied_output.clone());
-        db.recover_in_progress().await?
-    };
+    let recovery = db
+        .recover_in_progress()
+        .with_subscriber(applied_output.clone())
+        .await?;
     assert_eq!(recovery.resumed, 2);
     assert_eq!(recovery.failed, 1);
     assert_eq!(recovery.transient_failed, 1);

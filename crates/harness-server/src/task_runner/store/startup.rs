@@ -163,6 +163,7 @@ mod tests {
     use harness_core::types::TaskId;
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
+    use tracing::instrument::WithSubscriber;
     use tracing::span::{Attributes, Record};
     use tracing::subscriber::Interest;
     use tracing::{Event, Id, Metadata, Subscriber};
@@ -240,10 +241,7 @@ mod tests {
         let pool = db.postgres_pool();
         let store_key = db.store_key().to_string();
         let captured = CapturedStartupLogs::default();
-        let startup = async {
-            let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
-            TaskStore::open(&db_path).await
-        };
+        let startup = TaskStore::open(&db_path).with_subscriber(captured.clone());
         let actor = async {
             interleave.wait_until_selected().await;
             let result = async {
@@ -327,10 +325,7 @@ mod tests {
         let pool = db.postgres_pool();
         let store_key = db.store_key().to_string();
         let captured = CapturedStartupLogs::default();
-        let startup = async {
-            let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
-            TaskStore::open(&db_path).await
-        };
+        let startup = TaskStore::open(&db_path).with_subscriber(captured.clone());
         let actor = async {
             interleave.wait_until_selected().await;
             let result = async {

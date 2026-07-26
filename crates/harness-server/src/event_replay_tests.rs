@@ -3,6 +3,7 @@ use harness_core::types::TaskId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
+use tracing::instrument::WithSubscriber;
 use tracing::span::{Attributes, Record};
 use tracing::subscriber::Interest;
 use tracing::{Event, Id, Metadata, Subscriber};
@@ -648,10 +649,9 @@ async fn replay_caller_counts_and_logs_only_applied_writes() -> anyhow::Result<(
     drop(log);
 
     let captured = ReplayCapturedSubscriber::default();
-    let updated = {
-        let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
-        replay_and_recover(&db, &log_path).await?
-    };
+    let updated = replay_and_recover(&db, &log_path)
+        .with_subscriber(captured.clone())
+        .await?;
     assert_eq!(updated, 1, "only the durable replay write is counted");
     assert_eq!(
         db.get("replay-applied")
@@ -710,12 +710,10 @@ async fn replay_conflict_preserves_terminal_log() -> anyhow::Result<()> {
     let before = std::fs::read(&log_path)?;
 
     let captured = ReplayCapturedSubscriber::default();
-    let error = {
-        let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
-        replay_and_recover(&db, &log_path)
-            .await
-            .expect_err("contradictory terminal replay must fail closed")
-    };
+    let error = replay_and_recover(&db, &log_path)
+        .with_subscriber(captured.clone())
+        .await
+        .expect_err("contradictory terminal replay must fail closed");
     assert!(
         error
             .downcast_ref::<crate::task_db::TaskRecoveryConflict>()
