@@ -42,8 +42,10 @@ repository root, not that an agent selected, loaded, or executed it.
 ## User-Visible Behavior
 
 1. **B-001:** Inventory requires an explicit existing repository root. Harness
-   canonicalizes it once before discovery; missing, unreadable, or non-directory
-   roots return an error and produce no successful inventory.
+   opens that root once, verifies and derives its canonical observation path
+   from the same opened directory handle, and uses that handle for all later
+   access. Missing, unreadable, or non-directory roots return an error and
+   produce no successful inventory.
 2. **B-002:** Default discovery is limited to the repository root. User-global,
    system, sibling, plugin-cache, and executable PATH locations are excluded
    unless a later contract explicitly adds a separately labeled scope.
@@ -56,17 +58,28 @@ repository root, not that an agent selected, loaded, or executed it.
    and `mcp.json`; policy/validation roots `.vibeguard`, `rules`,
    `requirements.toml`, `.remem`, `remem.toml`, `.harness/config.toml`,
    `.harness/skills`, `.harness/rules`, `.harness/guards`, `.harness/sg`,
-   `harness.toml`, `.github/workflows`, and `.cursor/rules`; and toolchain files
-   `Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`, and `justfile`.
-   Operational `.harness` paths such as `local`, `drafts`, `generated`, and
-   `gc-checkpoint.json` are excluded.
+   `harness.toml`, `.github/workflows`, and `.cursor/rules`. Toolchain and
+   validation selectors include `Cargo.toml`, `go.mod`, `package.json`,
+   `pyproject.toml`, `setup.py`, `requirements.txt`, `build.gradle`,
+   `build.gradle.kts`, `pom.xml`, root `*.csproj` and `*.sln` files, `Gemfile`,
+   `yarn.lock`, `pnpm-lock.yaml`, `.eslintrc`, `.eslintrc.js`,
+   `.eslintrc.cjs`, `.eslintrc.json`, `.eslintrc.yaml`, `.eslintrc.yml`,
+   `eslint.config.js`, `eslint.config.mjs`, `eslint.config.cjs`, `biome.json`,
+   `.rubocop.yml`, the root `spec` directory-presence predicate, `Makefile`,
+   and `justfile`. Operational `.harness` paths such as `local`, `drafts`,
+   `generated`, and `gc-checkpoint.json` are excluded.
 4. **B-004:** A missing allowlisted file or directory means no component for
    that location. Harness does not emit placeholder components, fabricated
    digests, aliases, or warning-only fallback content.
-5. **B-005:** Every discovered regular file produces one ASC-001 component
-   with a normalized repository-relative `/`-separated locator, lowercase
-   SHA-256 content digest, `repository_observed` observation and trust, and
-   selection state `discovered`.
+5. **B-005:** Every discovered regular file produces one inventory entry with
+   a valid ASC-001 component, a normalized repository-relative
+   `/`-separated locator, lowercase SHA-256 content digest,
+   `repository_observed` observation and trust, and selection state
+   `discovered`. The entry records the opened file's Unix executable bit as
+   `true` or `false` on Unix and explicitly marks it unobserved elsewhere, so
+   disabling a hook changes evidence even when its bytes do not. The root
+   `spec` predicate emits one typed directory-presence entry with absent
+   integrity and does not recursively inventory test content.
 6. **B-006:** Component kind comes from the matched allowlist rule, not from
    file contents. Files beneath a typed directory inherit that rule's kind;
    unsupported files outside every allowlist rule are not inventoried.
@@ -89,9 +102,10 @@ repository root, not that an agent selected, loaded, or executed it.
     aggregate-byte, depth, entries-per-directory, and per-file byte limits.
     Non-regular special files, recursive symlink cycles, invalid limit values,
     and every exceeded limit fail visibly rather than being skipped.
-11. **B-011:** Repeating inventory against unchanged repository bytes produces
-    the same ordered components and digests regardless of current time or
-    filesystem enumeration order.
+11. **B-011:** Repeating inventory against unchanged repository bytes,
+    executable metadata, and directory-presence predicates produces the same
+    ordered entries and digests regardless of current time or filesystem
+    enumeration order.
 12. **B-012:** Inventory performs no writes, subprocess execution, network
     calls, hook invocation, MCP connection, package resolution, or modification
     of current prompt-loading behavior.
@@ -107,6 +121,10 @@ repository root, not that an agent selected, loaded, or executed it.
       missing-entry behavior, root escape and symlink-race rejection, cycles,
       non-UTF-8 paths, special files, unreadable files, and every resource
       limit.
+- [ ] Tests prove all `lang_detect.rs` selectors are inventoried, root suffix
+      rules stay root-scoped, the `spec` predicate does not recurse, and
+      executable-bit changes alter hook evidence without changing content
+      digests.
 - [ ] Capability-scoped filesystem traversal is introduced as one audited,
       narrowly owned dependency; existing workspace SHA-256 support is reused.
 - [ ] The implementation exposes a library service for later CLI and runtime

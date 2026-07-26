@@ -44,6 +44,8 @@ Add `stack::inventory` with:
 - `AgentStackInventoryOptions { root, max_file_bytes, max_total_bytes,
   max_files, max_depth, max_entries_per_directory }`;
 - `AgentStackInventory`;
+- `AgentStackInventoryEntry`;
+- `AgentStackEntryClass`;
 - `AgentStackInventoryError`;
 - a private `InventoryRule` table;
 - `inventory_repository_stack(options) -> Result<AgentStackInventory, ...>`.
@@ -51,16 +53,19 @@ Add `stack::inventory` with:
 `stack/mod.rs` exposes the service and its public option/result/error types. It
 does not expose traversal helpers or mutable rule tables.
 
-The result contains the canonical root and ordered ASC-001 components. The root
-is observation metadata and is not represented as a component. This issue does
-not add an aggregate digest or snapshot identity.
+The result contains the canonical root derived from the opened root handle and
+ordered inventory entries. Each entry contains one ASC-001 component plus its
+typed file or directory-presence observation. The root is observation metadata
+and is not represented as a component. This issue does not add an aggregate
+digest or snapshot identity.
 
 ### Closed Discovery Table
 
 Define the B-003 allowlist as one constant typed table. Every row has:
 
-- exact repository-relative path;
-- expected entry class (`file` or recursively scanned `directory`);
+- repository-relative matcher (exact path or root-only suffix);
+- expected entry class (`file`, recursively scanned `directory`, or
+  non-recursive `directory_presence`);
 - `AgentStackComponentKind`.
 
 Root instruction names map to `instructions`, workflow files and
@@ -81,16 +86,32 @@ The instruction rows include `AGENTS.md`, `AGENTS.override.md`, and
 the paths that `load_agents_md` may load. These are exact file rows, not
 recursive scans of those code directories.
 
+The validation rows exhaustively mirror every repository predicate consumed by
+`lang_detect.rs`: exact files `Cargo.toml`, `go.mod`, `package.json`,
+`pyproject.toml`, `setup.py`, `requirements.txt`, `build.gradle`,
+`build.gradle.kts`, `pom.xml`, `Gemfile`, `yarn.lock`, `pnpm-lock.yaml`,
+`.eslintrc`, `.eslintrc.js`, `.eslintrc.cjs`, `.eslintrc.json`,
+`.eslintrc.yaml`, `.eslintrc.yml`, `eslint.config.js`, `eslint.config.mjs`,
+`eslint.config.cjs`, `biome.json`, and `.rubocop.yml`; root-only suffix rows
+for `*.csproj` and `*.sln`; and a `directory_presence` row for root `spec`.
+`Cargo.toml` and `package.json` content digests bind the workspace and test-
+script predicates respectively. `spec` emits only a presence component and is
+not recursively scanned. `Makefile` and `justfile` remain additional exact
+toolchain rows.
+
 The table order is stable but final output is sorted by normalized locator, so
 adding a rule cannot reorder unrelated existing components.
 
 ### Safe Traversal
 
-Add audited `cap-std` workspace and `harness-core` dependencies. Open the
-explicit root once with ambient authority, then perform all discovery,
-metadata, directory iteration, and file opens relative to that
-`cap_std::fs::Dir`. No descendant operation converts back to an ambient path or
-uses `std::fs` free functions.
+Add audited `cap-std` workspace and `harness-core` dependencies. Call
+`Dir::open_ambient_dir` exactly once for the caller-supplied root, then verify
+the directory and derive the reported canonical root with handle-relative
+metadata and `Dir::canonicalize(".")` on that same handle. Do not call
+`std::fs::canonicalize` before opening and then reopen by pathname. Perform all
+discovery, metadata, directory iteration, and file opens relative to the
+resulting `cap_std::fs::Dir`; no descendant operation converts back to an
+ambient path or uses `std::fs` free functions.
 
 Validate every numeric limit before traversal. `max_file_bytes` must permit a
 checked `+ 1` sentinel read; zero limits and arithmetic overflow return a typed
@@ -105,14 +126,17 @@ configuration error. For each rule:
    recursion;
 5. track opened directory identities in the active ancestor stack to reject
    cycles while permitting non-cyclic duplicate paths to the same directory;
-6. increment checked depth, file-count, and aggregate-byte budgets before
-   descending or reading and fail before a configured limit can be exceeded;
+6. increment checked depth and file-count budgets before descending or reading
+   and fail before a configured limit can be exceeded;
 7. reject sockets, FIFOs, devices, and every other non-regular special entry;
 8. open each file through its containing directory capability and validate
    regular-file metadata from the opened handle;
-9. read through `File::take(checked_max_file_bytes_plus_one)` and reject
-   per-file or aggregate overflow;
-10. calculate SHA-256 from the exact bytes returned by that opened handle.
+9. compute checked per-file and remaining-aggregate `+ 1` sentinels, read in
+   bounded chunks through `File::take(min(per_file_sentinel,
+   remaining_total_sentinel))`, account each chunk before the next read, and
+   reject immediately when either byte limit would be exceeded;
+10. calculate SHA-256 and Unix executable metadata from the exact opened file
+    handle.
 
 Safe in-root symlinks retain their link locator as component identity while
 hashing target bytes. Duplicate target content may therefore produce multiple
@@ -132,7 +156,8 @@ quiescent checkout.
 
 ### Component Construction
 
-Each file becomes an ASC-001 component:
+Each regular file becomes an `AgentStackInventoryEntry` containing an ASC-001
+component:
 
 - `schema_version`: ASC-001 constant;
 - component ID from the ASC-001 helper:
@@ -146,6 +171,14 @@ Each file becomes an ASC-001 component:
 - freshness: `unknown`;
 - capabilities: empty.
 
+`AgentStackEntryClass::RegularFile` additionally carries
+`unix_executable: Some(bool)` from the opened handle's `mode & 0o111` on Unix,
+or `None` on platforms where that metadata is not observed. The
+`DirectoryPresence` class is used only for root `spec`; its ASC-001 integrity
+is absent, its kind is `validation`, and all other observation fields match a
+discovered repository component. Aggregate snapshot and diff consumers must
+compare the full entry rather than only the content digest.
+
 Construction calls ASC-001 validation. Any validation failure becomes an
 inventory error; the service never skips an invalid component.
 
@@ -158,12 +191,16 @@ create an unreadable file must use a deterministic injected reader failure
 fixture rather than silently skip the behavior. Unix-only non-UTF-8 fixtures
 assert a typed locator error; other platforms assert the same validator
 directly. A coordinated symlink-swap fixture proves that a raced path cannot
-escape the opened root capability.
+escape the opened root capability. A root-swap fixture proves the canonical
+observation path is derived from the opened handle rather than a pathname
+canonicalized before open. Unix fixtures toggle a hook's executable bits while
+holding bytes constant; non-Unix tests assert the explicit unobserved state.
 
 ## Data Flow
 
-Explicit root/options → canonical root validation → fixed rule lookup → safe,
-sorted traversal → bounded byte read → SHA-256 → validated ASC-001 component →
+Explicit root/options → one ambient root-handle open → handle-derived canonical
+root → fixed rule lookup → safe, sorted traversal → remaining-budget-capped byte
+read → SHA-256 and file metadata → validated ASC-001 component → typed entry →
 ordered `AgentStackInventory`.
 
 Any existing-entry failure aborts the operation. Missing allowlisted entries
@@ -174,17 +211,17 @@ occurs.
 
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
-| B-001 | options/root preflight | `cargo test -p harness-core stack::inventory_tests::inventory_rejects_missing_file_and_unreadable_roots` |
+| B-001 | root-handle-first preflight | `cargo test -p harness-core stack::inventory_tests::inventory_derives_canonical_root_from_the_opened_handle` |
 | B-002 | root-only rule table | `cargo test -p harness-core stack::inventory_tests::inventory_never_reads_user_global_or_sibling_paths` |
-| B-003 | `InventoryRule` constant | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_typed_harness_native_and_loaded_instruction_surfaces_only` |
+| B-003 | `InventoryRule` constant | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector` |
 | B-004 | NotFound handling | `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders` |
-| B-005 | component construction and hashing | `cargo test -p harness-core stack::inventory_tests::discovered_files_emit_valid_repository_observed_components` |
+| B-005 | entry/component construction, hashing, executable mode, and directory presence | `cargo test -p harness-core stack::inventory_tests::entries_bind_content_mode_and_directory_presence_to_valid_components` |
 | B-006 | typed rule classification | `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
 | B-007 | sorted traversal/output | `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory` |
 | B-008 | capability-relative traversal/open | `cargo test -p harness-core stack::inventory_tests::raced_or_escaping_symlinks_cannot_escape_root_capability` |
 | B-009 | typed read/path errors | `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators` |
-| B-010 | checked aggregate/per-entry limits | `cargo test -p harness-core stack::inventory_tests::inventory_rejects_special_entries_and_every_resource_limit` |
-| B-011 | repeated fixture comparison | `cargo test -p harness-core stack::inventory_tests::unchanged_repository_inventory_is_repeatable` |
+| B-010 | checked streaming aggregate/per-entry limits | `cargo test -p harness-core stack::inventory_tests::reads_never_exceed_remaining_aggregate_or_per_file_budget` |
+| B-011 | repeated full-entry fixture comparison | `cargo test -p harness-core stack::inventory_tests::unchanged_repository_inventory_is_repeatable` |
 | B-012 | read-only API surface and side-effect fixture | `cargo test -p harness-core stack::inventory_tests::inventory_is_read_only_and_invokes_no_external_behavior`; `rg -n "Command::new|TcpStream|UdpSocket|reqwest|std::fs::(write|remove|rename|create_dir)" crates/harness-core/src/stack/inventory.rs` (expect no matches); `cargo test -p harness-core agents_md` |
 
 ## Alternatives Considered
@@ -207,7 +244,8 @@ occurs.
   race symlink replacement against handle-relative opens. Run `cargo audit`
   when introducing the security-sensitive dependency.
 - Logic: an incomplete allowlist omits behavior-affecting sources. The product
-  contract and table test enumerate the exact v0.1 surface.
+  contract and table test enumerate the exact v0.1 surface, including every
+  current `lang_detect.rs` predicate.
 - Compatibility: broadening the table changes observed output; later changes
   require explicit review.
 - Performance: checked file-count, aggregate-byte, depth,
@@ -217,10 +255,14 @@ occurs.
 ## Test Plan
 
 - [ ] Build one fixture containing every allowlisted file/directory class.
+- [ ] Assert exact coverage of every language, package-manager, linter, and
+      test-directory selector consumed by `lang_detect.rs`.
 - [ ] Add missing, unrelated, nested ordering, in-root symlink, escaping
-      symlink, symlink-race, cycle, special-file, non-UTF-8, per-file,
-      aggregate-byte, file-count, depth, entries-per-directory, overflow, and
-      read-failure fixtures.
+      symlink, root-swap, symlink-race, cycle, special-file, non-UTF-8,
+      per-file, remaining-aggregate-byte, file-count, depth,
+      entries-per-directory, overflow, and read-failure fixtures.
+- [ ] Add Unix executable-bit change and non-Unix unobserved-mode fixtures, plus
+      a non-recursive root `spec` directory-presence fixture.
 - [ ] Validate every emitted component with the ASC-001 API.
 - [ ] Run `cargo check -p harness-core --all-targets`.
 - [ ] Run `cargo test -p harness-core stack::inventory_tests`.
