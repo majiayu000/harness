@@ -54,9 +54,12 @@ repository root, not that an agent selected, loaded, or executed it.
    roots `.claude/skills`, `.codex/skills`, `.agents/skills`, and `skills`;
    hook roots `.claude/hooks`, `hooks`, and `.githooks`; MCP files `.mcp.json`
    and `mcp.json`; policy/validation roots `.vibeguard`, `rules`,
-   `requirements.toml`, `.remem`, `remem.toml`, `.harness`, `harness.toml`,
-   `.github/workflows`, and `.cursor/rules`; and toolchain files `Cargo.toml`,
-   `package.json`, `pyproject.toml`, `Makefile`, and `justfile`.
+   `requirements.toml`, `.remem`, `remem.toml`, `.harness/config.toml`,
+   `.harness/skills`, `.harness/rules`, `.harness/guards`, `.harness/sg`,
+   `harness.toml`, `.github/workflows`, and `.cursor/rules`; and toolchain files
+   `Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`, and `justfile`.
+   Operational `.harness` paths such as `local`, `drafts`, `generated`, and
+   `gc-checkpoint.json` are excluded.
 4. **B-004:** A missing allowlisted file or directory means no component for
    that location. Harness does not emit placeholder components, fabricated
    digests, aliases, or warning-only fallback content.

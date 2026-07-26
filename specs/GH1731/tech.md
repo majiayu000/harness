@@ -69,6 +69,13 @@ map to `hook`, MCP files map to `mcp_server`, memory/remem surfaces map to
 `memory`, policy/rule surfaces map to `policy`, Harness configuration maps to
 `validation`, and package/toolchain files map to `validation`.
 
+Harness-native rows are exact and independently typed:
+`.harness/config.toml` maps to `validation`, `.harness/skills` to `skill`,
+`.harness/rules` and `.harness/sg` to `policy`, and `.harness/guards` to
+`hook`. There is no recursive `.harness` row. Consequently runtime logs/PIDs
+under `.harness/local`, GC drafts/checkpoints, and generated adoption artifacts
+cannot enter inventory output or consume scan budgets.
+
 The instruction rows include `AGENTS.md`, `AGENTS.override.md`, and
 `CLAUDE.md` directly beneath each of `src`, `crates`, `lib`, and `pkg`, matching
 the paths that `load_agents_md` may load. These are exact file rows, not
@@ -168,7 +175,7 @@ occurs.
 | --- | --- | --- |
 | B-001 | options/root preflight | `cargo test -p harness-core stack::inventory_tests::inventory_rejects_missing_file_and_unreadable_roots` |
 | B-002 | root-only rule table | `cargo test -p harness-core stack::inventory_tests::inventory_never_reads_user_global_or_sibling_paths` |
-| B-003 | `InventoryRule` constant | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_v0_1_allowlisted_surface_including_loaded_subdirectory_instructions` |
+| B-003 | `InventoryRule` constant | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_typed_harness_native_and_loaded_instruction_surfaces_only` |
 | B-004 | NotFound handling | `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders` |
 | B-005 | component construction and hashing | `cargo test -p harness-core stack::inventory_tests::discovered_files_emit_valid_repository_observed_components` |
 | B-006 | typed rule classification | `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
