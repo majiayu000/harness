@@ -9,7 +9,7 @@ GH-1732
 See `specs/GH1732/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1732,"complete":true,"paths":["crates/harness-core/src/config/workflow.rs","crates/harness-server/src/workflow_runtime_worker/executor.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet_activity_policy_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet_tests.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014"]}
+{"issue":1732,"complete":true,"paths":["crates/harness-core/src/config/workflow.rs","crates/harness-server/src/http/tests/runtime_worker_tests.rs","crates/harness-server/src/workflow_runtime_worker/executor.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet_activity_policy_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet_tests.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014"]}
 -->
 
 ## Current System
@@ -34,6 +34,12 @@ See `specs/GH1732/product.md`.
   separately from the `RuntimeProfile` serialized into the packet. It also
   resolves durable prompt-task text before packet construction but appends
   that text only after the packet has already been hashed and recorded.
+- `crates/harness-agents/src/claude.rs:75-83` resolves an omitted request model
+  from execution phase and `ReasoningBudget`, but `executor.rs` currently
+  derives execution phase only after recording the packet.
+- `crates/harness-server/src/http/tests/runtime_worker_tests.rs:103-107`
+  asserts the durable prompt packet's current v1 schema and must move with the
+  intentional packet-schema bump.
 - `crates/harness-server/src/workflow_runtime_worker/repo_memory_prompt.rs:16-68`
   returns either selected records or explicit retrieval-degradation evidence;
   it does not fabricate records on failure.
@@ -79,14 +85,28 @@ external consumer contract.
 ### Shared Resolved Runtime Settings
 
 Add private `ResolvedRuntimeSettings` in `runtime_profile.rs`. One resolver
-accepts the already timeout-adjusted `RuntimeProfile`, `RuntimeKind`, and server
-agent configuration and returns the final profile name, kind, model, reasoning
-effort, sandbox, approval policy, max-turns, and timeout. `executor.rs` creates
-this value once, passes it to packet/provenance construction, and uses the same
-launch fields for `TurnLifecycleOptions` and agent request construction.
+accepts the already timeout-adjusted `RuntimeProfile`, `RuntimeKind`, derived
+`ExecutionPhase`, and complete server agent configuration and returns the final
+profile name, kind, execution phase, model, reasoning effort, sandbox, approval
+policy, max-turns, and timeout. `executor.rs` derives activity and execution
+phase before packet construction, creates this value once, passes it to
+packet/provenance construction, and uses the same launch fields for
+`TurnLifecycleOptions` and agent request construction.
 `max_turns` is copied from the effective profile already enforced by the
 workflow runtime; it is evidence, not a second enforcement point. Existing
 validation helpers become implementation details of this single resolver.
+
+Model resolution is exact: explicit profile model wins; otherwise Codex uses
+`agents.codex.default_model`, Claude uses
+`agents.claude.reasoning_budget.model_for_phase(execution_phase)` when both
+values exist and falls back to `agents.claude.default_model`, and Anthropic API
+uses `agents.anthropic_api.default_model`. Reasoning effort is the explicit
+profile value when supported; otherwise Codex uses its configured default,
+Claude uses `execution_phase.effort_level()` when a phase exists, and Anthropic
+API records no unsupported effort value. Passing the resolved model and effort
+explicitly to `TurnLifecycleOptions` makes the existing agent implementations
+take those values before any internal default or phase fallback, so provenance
+and launch cannot diverge.
 
 The packet retains the declared/effective `runtime_profile` section for
 compatibility and adds `resolved_runtime_settings`. Provenance hashes canonical
@@ -122,7 +142,9 @@ from whether the display path can be normalized relative to the project.
 `prompt_packet.rs` calls the module once after creating the base packet fields
 and before activity policy or final hashing:
 
-1. change newly produced packet schema to `harness.runtime.prompt_packet.v2`;
+1. define one `RUNTIME_PROMPT_PACKET_SCHEMA` constant with value
+   `harness.runtime.prompt_packet.v2`, and use it for both the newly produced
+   packet and `workflow_prompt_artifact`;
 2. build provenance from `runtime_profile`, `workflow_document`, selected
    `repo_memory`, resolved runtime settings, and the already constructed packet
    sections;
@@ -150,6 +172,18 @@ Resolved runtime settings:
 
 Workflow sources and effective document:
 
+- all four entry forms have kind `workflow` and derive their IDs through the
+  ASC-001 helper;
+- a central source uses runtime locator
+  `workflow-source/central/<canonical-path-sha256>` and therefore ID
+  `runtime:workflow:workflow-source/central/<canonical-path-sha256>`;
+- a repository source uses repository locator `WORKFLOW.md` and ID
+  `repository:workflow:WORKFLOW.md`;
+- the normalized effective document uses runtime locator
+  `workflow-document/effective` and ID
+  `runtime:workflow:workflow-document/effective`;
+- defaults use runtime locator `workflow-document/defaults` and ID
+  `runtime:workflow:workflow-document/defaults`;
 - central and repository source entries use the ordered source facts retained
   by `WorkflowDocument`;
 - source digests cover exact bytes read, while the effective-document digest
@@ -166,8 +200,8 @@ Workflow sources and effective document:
 Repo memory:
 
 - kind `memory`;
-- runtime locator derived from the durable memory record ID and ID derived by
-  the ASC-001 helper from kind and source;
+- runtime locator `repo-memory/<durable record ID>` and canonical ID
+  `runtime:memory:repo-memory/<durable record ID>`;
 - digest of the exact redacted JSON representation returned by
   `repo_memory_prompt_value`, scoped to that record;
 - safe metadata fields for durable ID, optional evidence reference, and
@@ -254,10 +288,10 @@ event and agent execution.
 
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
-| B-001 | v2 packet/provenance schema insertion | `cargo test -p harness-server context_provenance_tests::v2_packet_requires_one_versioned_provenance_manifest_and_v1_remains_historical --lib` |
+| B-001 | shared v2 packet/artifact schema plus provenance insertion | `cargo test -p harness-server context_provenance_tests::v2_packet_and_artifact_share_schema_and_v1_remains_historical --lib`; `cargo test -p harness-server runtime_job_worker_tick_runs_registered_agent_and_completes_job --lib` |
 | B-002 | constructor inputs and no inventory fallback | `cargo test -p harness-server context_provenance_tests::provenance_contains_only_runtime_selected_sources --lib` |
 | B-003 | ASC-001 component construction and ordered entry wrapper | `cargo test -p harness-server context_provenance_tests::all_provenance_entries_validate_against_stack_component_contract --lib` |
-| B-004 | single resolved-settings construction/use | `cargo test -p harness-server context_provenance_tests::provenance_and_agent_launch_share_resolved_runtime_settings_and_reject_zero_timeout --lib` |
+| B-004 | phase-first single resolved-settings construction/use | `cargo test -p harness-server context_provenance_tests::claude_phase_defaults_and_explicit_overrides_match_agent_launch_provenance --lib`; `cargo test -p harness-server context_provenance_tests::provenance_and_agent_launch_share_resolved_runtime_settings_and_reject_zero_timeout --lib` |
 | B-005 | retained source list and workflow builders | `cargo test -p harness-server context_provenance_tests::central_repository_merged_and_default_workflows_have_truthful_provenance --lib` |
 | B-006 | repo-memory source builder | `cargo test -p harness-server context_provenance_tests::selected_memory_order_and_safe_metadata_are_preserved --lib` |
 | B-007 | empty memory input and existing degradation boundary | `cargo test -p harness-server context_provenance_tests::missing_memory_records_are_not_fabricated --lib`; `cargo test -p harness-server repo_memory_prompt --lib` |
@@ -266,7 +300,7 @@ event and agent execution.
 | B-010 | redacted entry serialization | `cargo test -p harness-server context_provenance_tests::provenance_does_not_duplicate_memory_payload_or_secret_values --lib` |
 | B-011 | ordering and digest fixtures | `cargo test -p harness-server context_provenance_tests::provenance_and_packet_digests_are_repeatable_and_order_sensitive --lib` |
 | B-012 | fallible builder boundary | `cargo test -p harness-server context_provenance_tests::invalid_required_provenance_aborts_packet_construction --lib` |
-| B-013 | existing RuntimePromptPrepared persistence path | `cargo test -p harness-server prompt_packet_pinning_tests --lib` |
+| B-013 | RuntimePromptPrepared and activity-artifact persistence path | `cargo test -p harness-server runtime_job_worker_tick_runs_registered_agent_and_completes_job --lib` |
 | B-014 | existing behavior and workspace suites | `cargo test --workspace`; `git diff --name-only origin/main...HEAD` |
 
 ## Alternatives Considered
@@ -309,11 +343,15 @@ event and agent execution.
 - [ ] Add profile, workflow-file, workflow-default, one-memory, multi-memory,
       and no-memory provenance fixtures.
 - [ ] Add resolved server-default/profile-override parity fixtures.
+- [ ] Add Claude phase-derived model/effort and explicit-override fixtures that
+      assert the same values in provenance and the captured agent request.
 - [ ] Add central-only, repository-only, merged, and defaults workflow-source
       fixtures.
 - [ ] Add same-reference/different-prompt-text packet digest fixtures.
 - [ ] Add packet v1 historical compatibility, v2 required provenance, repo
       memory `self_declared` trust, and zero-timeout rejection fixtures.
+- [ ] Update the runtime-worker integration assertion to v2 and assert the
+      activity artifact carries the same schema constant and packet digest.
 - [ ] Add redaction and external-context coverage assertions.
 - [ ] Add stable ordering and source/packet digest sensitivity assertions.
 - [ ] Prove invalid required provenance returns before event recording and
@@ -331,7 +369,7 @@ event and agent execution.
       `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Run
       `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1732`.
-- [ ] Confirm the implementation diff contains only the eight paths in the
+- [ ] Confirm the implementation diff contains only the nine paths in the
       planned-changes manifest.
 
 ## Rollback Plan

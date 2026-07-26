@@ -48,8 +48,10 @@ does not prove it was selected or loaded for a runtime activity.
    packet schema `harness.runtime.prompt_packet.v2` and contains exactly one
    `context_provenance` object with schema
    `harness.runtime.context_provenance.v1`. A v2 packet with missing, blank, or
-   unsupported provenance is invalid. Historical v1 packets remain valid
-   lower-evidence records and are never interpreted as v2.
+   unsupported provenance is invalid. The associated `runtime_prompt_packet`
+   activity artifact declares the same packet-schema value from one shared
+   constant. Historical v1 packets and artifacts remain valid lower-evidence
+   records and are never interpreted as v2.
 2. **B-002:** Provenance records only inputs selected by Harness while building
    that packet. Repository discovery alone never produces a selected, loaded,
    or runtime-observed provenance entry.
@@ -57,11 +59,13 @@ does not prove it was selected or loaded for a runtime activity.
    source scope/locator, lowercase SHA-256 digest, selection reason,
    zero-based order, observation class, selection state, and trust level using
    the ASC-001 model.
-4. **B-004:** Runtime provenance records runtime kind, profile name, effective
-   max-turns and timeout, plus final model, reasoning effort, sandbox, and
-   approval policy after their profile/workflow/server fallbacks. The final
-   launch settings are computed once and shared by packet construction and
-   agent launch. The source is runtime-scoped, observation and trust are
+4. **B-004:** Runtime provenance records runtime kind, profile name, execution
+   phase, effective max-turns and timeout, plus final model, reasoning effort,
+   sandbox, and approval policy after their profile/workflow/server fallbacks.
+   This includes Claude's phase-sensitive model and effort selection when the
+   profile omits explicit values. The final launch settings are computed once
+   before packet construction and shared by packet construction and agent
+   launch. The source is runtime-scoped, observation and trust are
    `runtime_observed`, selection state is `loaded`, and changing any recorded
    setting changes its digest.
 5. **B-005:** Workflow provenance distinguishes the ordered central-base and
@@ -103,7 +107,8 @@ does not prove it was selected or loaded for a runtime activity.
 13. **B-013:** `RuntimePromptPrepared` continues to persist the prompt packet
     and existing packet digest. Because provenance is nested in the packet,
     the event atomically links the runtime job, provenance entries, and digest
-    without a second partially committed record.
+    without a second partially committed record. The activity artifact carries
+    that same digest and the same packet-schema constant.
 14. **B-014:** Existing prompt semantics, repo-memory selection, runtime
     profile selection, activity policy, activity-result status, and workflow
     state transitions remain unchanged. The intentional wire change is the
@@ -114,8 +119,11 @@ does not prove it was selected or loaded for a runtime activity.
 - [ ] Runtime profile, workflow document/defaults, and each selected repo-memory
       record produce validated ASC-001 provenance entries.
 - [ ] Agent launch and provenance consume the same resolved model, reasoning,
-      sandbox, approval, and timeout values; provenance also records the
-      effective max-turns already enforced by the workflow runtime.
+      execution phase, sandbox, approval, and timeout values; provenance also
+      records the effective max-turns already enforced by the workflow runtime.
+- [ ] Claude fixtures prove explicit profile values take precedence and omitted
+      model/effort values resolve from the same phase and server configuration
+      used by agent launch.
 - [ ] Central, repository, merged, and default workflow cases retain truthful
       source identities and content/effective digests without leaking unsafe
       absolute paths.
