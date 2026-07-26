@@ -260,7 +260,8 @@ impl CodeAgent for ClaudeCodeAgent {
         }
         let mut child = crate::ManagedChild::new(child, "claude execute");
 
-        let output = child.wait_with_output().await.map_err(|e| {
+        let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
+        let output = child.wait_with_output(&limits).await.map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to wait for claude: {e}"
             ))
