@@ -12,9 +12,11 @@ gates, and a 176 GB `target/` directory that made every build
 filesystem-bound. Most of that has since been remediated (manifest lints,
 `line-tables-only` debuginfo, staged-scope pre-commit, target cleanup to
 ~18 GB), but the fixes are unguarded: lint policy is still duplicated in four
-call sites, nothing prevents `target/` bloat from regrowing, the parallel
-target-directory scheme is convention-only, and no automated check stops a
-future PR from silently reintroducing the two-universe split.
+call sites; the existing target GC script (`scripts/gc-target.sh`) is
+manual-only, destructive by default, and blind to unsanctioned target
+universes; the parallel target-directory scheme is convention-only; and no
+automated check stops a future PR from silently reintroducing the
+two-universe split.
 
 Operators and agents need the build-performance posture to be owned by
 configuration and enforced by automation, not by institutional memory.
@@ -23,8 +25,9 @@ configuration and enforced by automation, not by institutional memory.
 
 - Make the manifest lint table the single authority for warning policy;
   remove the duplicated `-D warnings` invocation arguments.
-- Bound `target/` growth with an automated, age-gated garbage-collection
-  sweep over an explicit list of sanctioned target-directory universes.
+- Extend the existing `scripts/gc-target.sh` into a bounded, automated,
+  age-gated sweep over an explicit list of sanctioned target-directory
+  universes.
 - Add a CI regression guard that fails when the unified-universe posture is
   violated (reintroduced `RUSTFLAGS`, missing manifest lints, missing
   per-crate `[lints]` table, altered dev-profile debuginfo).
@@ -53,11 +56,15 @@ configuration and enforced by automation, not by institutional memory.
 3. **B-003:** The sanctioned target-directory universes are explicitly
    enumerated in repository documentation. Local tooling that isolates
    concurrent cargo commands uses only sanctioned names.
-4. **B-004:** A garbage-collection sweep removes artifacts in unsanctioned
-   target universes and artifacts older than a configured age threshold, and
+4. **B-004:** The garbage-collection sweep (the extended
+   `scripts/gc-target.sh`) removes artifacts in unsanctioned target
+   universes and artifacts older than a configured age threshold, and
    reports what it removed. It never deletes outside `target/`.
-5. **B-005:** The sweep supports a dry-run mode that reports candidates
-   without deleting, and dry-run is the default when invoked manually.
+5. **B-005:** The sweep's default flips from destructive to dry-run — an
+   explicit behavior change to the existing `scripts/gc-target.sh`. A
+   flag-less invocation reports candidates and deletes nothing; destructive
+   mode requires an explicit `--delete`. The existing `--dry-run` flag
+   remains accepted as a no-op alias.
 6. **B-006:** CI includes a guard step that fails when any of the following
    holds: `RUSTFLAGS` appears in `.githooks/`, workflow files, or `Makefile`;
    the workspace manifest lacks the lint table; any workspace crate manifest
@@ -77,12 +84,13 @@ configuration and enforced by automation, not by institutional memory.
       `Makefile`) carry no trailing lint arguments.
 - [ ] A deliberately introduced warning fails pre-commit clippy, pre-push
       clippy, and the CI clippy job, proving B-002.
-- [ ] The GC sweep, run in dry-run mode against a fixture target layout
-      containing one sanctioned and one unsanctioned universe plus stale
-      artifacts, reports exactly the unsanctioned universe and stale
-      artifacts as candidates and deletes nothing.
-- [ ] The GC sweep in destructive mode removes exactly the reported
-      candidates and leaves sanctioned, fresh artifacts intact.
+- [ ] The extended `scripts/gc-target.sh`, invoked with no flags against a
+      fixture target layout containing one sanctioned and one unsanctioned
+      universe plus stale artifacts, reports exactly the unsanctioned
+      universe and stale artifacts as candidates and deletes nothing
+      (covered in `scripts/test_gc_target.py`).
+- [ ] The sweep with `--delete` removes exactly the reported candidates and
+      leaves sanctioned, fresh artifacts intact.
 - [ ] The CI guard fails on each seeded violation class from B-006 (one test
       per class) and passes on the clean tree.
 - [ ] Documentation lists the sanctioned target-directory names and the GC
@@ -122,6 +130,11 @@ configuration and enforced by automation, not by institutional memory.
 
 No migration or feature flag required. The lint-argument removal and the CI
 guard land together so the guard immediately protects the consolidated
-state. The GC sweep ships with dry-run default; destructive mode is enabled
-after one observed clean dry-run cycle. Reverting the change restores the
-duplicated flags and removes the guard, with no data impact.
+state. Note that flipping `scripts/gc-target.sh` to dry-run-by-default
+(B-005) is a behavior change for existing callers — `make gc-target` and
+any operator habit of flag-less destructive runs stop deleting until
+`--delete` is passed; this is the intended safe direction, and the
+`make gc-target` recipe is updated in the same change. Scheduled
+destructive invocation is enabled only after one observed clean dry-run
+cycle. Reverting the change restores the duplicated flags, the destructive
+default, and removes the guard, with no data impact.

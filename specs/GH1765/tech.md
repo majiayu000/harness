@@ -14,7 +14,7 @@ GH-1765
 | `RUSTFLAGS` universes | Eliminated | zero matches for `RUSTFLAGS` under `.githooks/`, `.github/workflows/`, `Makefile`, `scripts/` |
 | Dev debuginfo | Landed | `Cargo.toml:113-117`: `[profile.dev] debug = "line-tables-only"`; `[profile.dev.package."*"] debug = false` |
 | Pre-commit scope | Landed | `.githooks/pre-commit` derives `-p` package scope from staged files; docs/specs-only commits skip clippy; no tests in pre-commit |
-| `target/` bloat | Reduced, unguarded | ~18 GB total (was 176 GB); six historical universes still present: `cargo-check` 866 MB, `cargo-build-main` 141 MB, `cargo-build` 138 MB, `cargo-test` 15 MB, `cargo-check-warnings` 9.7 MB, `cargo-test-local-fresh` 7.5 MB |
+| `target/` bloat | Reduced; manual GC tooling exists | ~18 GB total (was 176 GB); six historical universes still present: `cargo-check` 866 MB, `cargo-build-main` 141 MB, `cargo-build` 138 MB, `cargo-test` 15 MB, `cargo-check-warnings` 9.7 MB, `cargo-test-local-fresh` 7.5 MB. `scripts/gc-target.sh` (PR #1545): age-based cleanup (`--days`, default 14), `--dry-run` opt-in, prefers `cargo sweep`, sweeps `target/` + all `target/cargo-*`, exposed as `make gc-target` (`Makefile:17-18`), tested by `scripts/test_gc_target.py` |
 
 ### Remaining defects this spec addresses
 
@@ -26,8 +26,12 @@ GH-1765
    - `Makefile:12` — same invocation
    Trailing lint args affect only primary packages, so dependency
    fingerprints no longer flip; the cost is policy drift, not rebuilds.
-2. **No target GC.** Nothing bounds `target/` size or removes dead
-   universes; the 176 GB state can silently regrow.
+2. **Target GC is manual and incomplete.** `scripts/gc-target.sh` covers
+   age-based stale-artifact cleanup, but it is manual-only, destructive by
+   default (`--dry-run` is opt-in), removes no unsanctioned universe
+   wholesale, has no sanctioned-universe list, does not skip universes with
+   an active cargo build, and has no scheduled invocation — so the 176 GB
+   state can silently regrow between manual runs.
 3. **No regression guard.** No automated check protects the manifest-lints /
    profile / no-RUSTFLAGS posture.
 4. **Universe list is convention-only.** `CLAUDE.md` sanctions
@@ -53,34 +57,56 @@ added later under `[workspace.lints.clippy]` without touching call sites.
 No behavioral change: a warning in any workspace crate already fails
 compilation under the manifest table.
 
-### D2 — Target GC sweep
+### D2 — Extend `scripts/gc-target.sh`
 
-New script `scripts/target-gc.sh` (bash, no new dependencies), invoked
-manually and optionally from a scheduled maintenance entry point:
+The existing script stays the single GC entry point (no new script). It
+already provides: `--days N` age windows (default 14), `--dry-run`,
+`cargo sweep` preference with mtime fallback, enumeration of `target/` plus
+every `target/cargo-*` universe, `make gc-target`, and Python tests
+(`scripts/test_gc_target.py`). The residual delta to implement in place:
 
 - **Sanctioned universe list** — a shell array at the top of the script,
   mirrored in `CLAUDE.md`: `debug`, `release`, `cargo-check`, `cargo-test`,
   `cargo-clippy`, `package`, `tmp`.
 - **Unsanctioned universes** — any other first-level directory under
-  `target/` is a removal candidate in full.
-- **Stale artifacts** — within sanctioned universes, files with mtime older
-  than `TARGET_GC_MAX_AGE_DAYS` (default 30) are candidates.
-- **Active-build safety** — a universe containing a live cargo lock
-  (`.cargo-lock` held; detected via a non-blocking `flock` probe, or
-  skipped wholesale if `flock` is unavailable on the platform) is skipped
-  and reported as skipped.
-- **Modes** — default is dry-run: print candidate paths and aggregate size,
-  delete nothing. `--delete` performs removal and prints a summary of
-  reclaimed bytes. Exit code 0 in both modes unless an I/O error occurs.
-- **Scope guard** — the script refuses to operate unless
-  `$(git rev-parse --show-toplevel)/target` is the resolved target root;
-  it never follows symlinks out of it.
+  `target/` becomes a removal candidate in full (today such universes are
+  only swept for stale files, never retired).
+- **Dry-run by default** — flip the current destructive default: with no
+  flags the script prints candidates and deletes nothing; destructive mode
+  requires an explicit `--delete`. `--dry-run` is retained as a no-op alias
+  for compatibility. This is a deliberate behavior change (product B-005).
+- **Active-build safety** — a universe holding a live cargo build lock
+  (non-blocking `flock` probe on its lock file; skip the universe wholesale
+  if `flock` is unavailable on the platform) is skipped and reported as
+  skipped, replacing the current "do not run during builds" doc-comment
+  honor system.
+- **Scheduled invocation** — a maintenance entry point (launchd/cron
+  wrapper alongside the existing `scripts/gc-scheduled.sh` pattern) runs
+  the script with `--delete` after the rollout gate in product Rollout
+  Notes is met.
+- **Scope guard** — the script keeps refusing to operate outside the
+  resolved repo `target/` root and never follows symlinks out of it.
+- **Tests** — extend `scripts/test_gc_target.py` to cover the new
+  candidate classes, the flipped default, and lock-skip behavior.
 
 ### D3 — CI regression guard
 
-New job step in `.github/workflows/ci.yml` (in the existing lint job, before
-clippy; runs on every PR, exempt from path filtering) executing
-`scripts/check-build-posture.sh`:
+New **standalone job** `build-posture` in `.github/workflows/ci.yml`. It must
+be unconditional: no `if:` change-detection expression and no `needs:` on
+`changed` or `web-build`, because the existing clippy job is path-filtered
+(`if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci ==
+'true'`, `ci.yml:109`) and a PR touching only `.githooks/` or `Makefile` —
+exactly the regression class B-006 targets — would skip a step placed there.
+The job is a single checkout + `scripts/check-build-posture.sh` run
+(seconds of runtime, so unconditional execution is cheap).
+
+Aggregation into the required check: the `CI Result` job (`ci.yml:233`,
+`if: always()`) adds `build-posture` to its `needs:` list and its
+`results=(...)` array, so a posture violation fails `CI Result` — the
+branch-protection-required status — even though `build-posture` itself is
+not individually required.
+
+The script asserts:
 
 ```
 1. ! grep -rn "RUSTFLAGS" .githooks .github/workflows Makefile scripts
@@ -100,7 +126,7 @@ documentation files; implement with an explicit exclude list.
 
 `CLAUDE.md` "Local Cargo Concurrency" section updated with: the sanctioned
 universe list (single source shared with D2 via comment cross-reference),
-the GC thresholds, and a pointer to `scripts/target-gc.sh`.
+the GC thresholds, and a pointer to `scripts/gc-target.sh`.
 
 ## Migration Order
 
@@ -109,6 +135,26 @@ the GC thresholds, and a pointer to `scripts/target-gc.sh`.
 2. Land D2 + D4 in a follow-up PR; run one dry-run cycle on the primary dev
    machine; then enable `--delete` in the maintenance entry point.
 
+## Product-to-Test Mapping
+
+| Behavior | Validation step |
+| --- | --- |
+| B-001 | Grep assertions over the four call sites + guard check 5; manifest lint table grep |
+| B-002 | Seeded-warning run fails pre-commit clippy, pre-push clippy, and CI clippy without trailing lint args |
+| B-003 | Sanctioned list present in script array and `CLAUDE.md`; unsanctioned fixture universe classified as removal candidate |
+| B-004 | `test_gc_target.py` fixture: destructive run removes exactly reported candidates, nothing outside `target/` |
+| B-005 | `test_gc_target.py`: flag-less invocation deletes nothing; `--delete` required for removal |
+| B-006 | One seeded-violation CI/guard-script test per invariant class |
+| B-007 | Guard output asserts `posture violation: <invariant> in <file>` format |
+| B-008 | Clean-tree runs of pre-commit, pre-push, `make lint`, and full CI pass unchanged |
+
+## Rollback
+
+Revert the implementing PR(s): call sites regain the redundant lint args,
+`gc-target.sh` returns to destructive-default, and the `build-posture` job
+disappears from `CI Result` aggregation. No data, schema, or state
+migration is involved in either direction.
+
 ## Validation
 
 - `bash scripts/check-build-posture.sh` → exit 0 on clean tree.
@@ -116,8 +162,9 @@ the GC thresholds, and a pointer to `scripts/target-gc.sh`.
   pre-commit; drop `[lints]` from one crate; drop the profile line; re-add
   `-- -D warnings`) → guard exits 1 naming the invariant, one class per run.
 - `touch -t` fixture artifacts under a scratch `target/` layout →
-  `scripts/target-gc.sh` dry-run lists exactly the stale + unsanctioned
-  candidates; `--delete` removes exactly them.
+  flag-less `scripts/gc-target.sh` lists exactly the stale + unsanctioned
+  candidates and deletes nothing; `--delete` removes exactly them
+  (extended `scripts/test_gc_target.py`).
 - `cargo clippy --workspace --all-targets` with a seeded
   `let unused = 1;` fails, proving manifest-only enforcement (B-002).
 - Standard gates: `cargo fmt --all -- --check`; full CI on the PR.
@@ -129,8 +176,10 @@ the GC thresholds, and a pointer to `scripts/target-gc.sh`.
 - **R2:** GC deletes something a developer wanted. Mitigation: dry-run
   default, age gating, sanctioned-list skip, active-lock skip, and printed
   candidate list before `--delete`.
-- **Alt considered:** adopting `cargo-sweep`/`cargo-cache` for D2. Rejected
-  for now — adds a tool dependency for what a 60-line script covers; the
+- **Alt considered:** replacing `scripts/gc-target.sh` with a new script or
+  a `cargo-cache` dependency. Rejected — the existing script already
+  integrates `cargo sweep` opportunistically and has tests; extending it
+  preserves the entry point (`make gc-target`) and its test suite. The
   guard (D3) is the part with durable value.
 - **Alt considered:** removing per-universe target dirs entirely now that
   the flag universes are unified. Rejected — concurrent local cargo

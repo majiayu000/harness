@@ -2,7 +2,7 @@
 
 > Linked issue: GH-1765
 > Original diagnosis: 2026-07-04 (read-only inspection + live measurement, M2 12-core / 96 GB, rustc 1.94)
-> State re-verified: 2026-07-26 against the current tree
+> State partially re-verified: 2026-07-26 (spot checks of the items in §4; not a full re-measurement)
 > Scope: why agent-driven iteration on this repository was slow, what has been
 > remediated since, what remains, and how to keep it from regressing.
 
@@ -68,7 +68,7 @@ Much of the original recommendation set has already landed:
 | R1 — unify the compile universe (manifest lints, no `RUSTFLAGS`) | **Done** | `Cargo.toml:26` `[workspace.lints.rust] warnings = "deny"`; all 13 crates carry `[lints] workspace = true`; `grep -r RUSTFLAGS .githooks .github/workflows Makefile scripts` → zero matches |
 | R2 — cut debuginfo | **Done** | `Cargo.toml:113-117`: `[profile.dev] debug = "line-tables-only"`, `[profile.dev.package."*"] debug = false` |
 | R3 — slim pre-commit | **Done** | `.githooks/pre-commit` now derives a staged-file package scope, skips clippy entirely for docs/specs-only commits, and no longer runs tests |
-| R4 — GC `target/` | **Largely done, unautomated** | `target/` now ~18 GB total (`debug` 16 GB, `cargo-check` 866 MB, `release` 619 MB, remainder < 300 MB each); fingerprints fresh (2026-07-23). No recurring GC mechanism exists — the 176 GB state can regrow |
+| R4 — GC `target/` | **Largely done; tooling exists, gaps remain** | `target/` now ~18 GB total (`debug` 16 GB, `cargo-check` 866 MB, `release` 619 MB, remainder < 300 MB each); fingerprints fresh (2026-07-23). `scripts/gc-target.sh` (merged 2026-07-05, PR #1545) provides age-based cleanup (`--days`, default 14) with `--dry-run`, prefers `cargo sweep`, sweeps `target/` plus all `target/cargo-*` universes, is exposed as `make gc-target`, and has Python tests (`scripts/test_gc_target.py`). Remaining gaps: manual-only invocation, destructive by default, no sanctioned-universe list, no removal of unsanctioned universes, no active-build lock skip |
 | File splits | **Mostly done** | Files ≥ 1000 lines: 23 → **8** (largest now `harness-cli/src/commands.rs` at 1651) |
 | R5 — residual PG schema cleanup | **Improved, backlog remains** | Orphan-schema reaper wired (historic ~538k → ~17k schemas at last measurement); backlog cleanup is a runtime-performance item tracked separately |
 
@@ -82,10 +82,15 @@ Much of the original recommendation set has already landed:
    longer flipped — but the flags are now dead policy duplicated in four
    places, and any future edit to one site reintroduces drift between "what
    the manifest enforces" and "what hooks enforce".
-2. **No target-directory GC policy.** The 176 GB state accumulated silently
-   over months and taxed every build (I3). Nothing prevents recurrence: no
-   size bound, no age-based sweep of the parallel `CARGO_TARGET_DIR`
-   universes, no CI/ops surfacing of target size.
+2. **Target GC is manual and incomplete.** `scripts/gc-target.sh` already
+   handles age-based cleanup of `target/` and every `target/cargo-*`
+   universe, but it must be invoked by hand, deletes by default (dry-run is
+   opt-in), has no notion of a sanctioned universe list (an unsanctioned
+   universe is swept for stale files, never removed wholesale), does not
+   skip universes with an active cargo build, and is not wired into any
+   scheduled maintenance. The 176 GB state accumulated silently over months
+   and taxed every build (I3); a manual opt-in script does not prevent
+   recurrence.
 3. **Parallel target-dir scheme is convention-only.** `CLAUDE.md` sanctions
    per-command target dirs (`target/cargo-check`, `target/cargo-test`,
    `target/cargo-clippy`), but historical drift produced six universes with
@@ -117,16 +122,19 @@ lint set is enforced, from one place.
   policy that the manifest already owns is exactly the drift pattern that
   produced the original two-universe split.
 
-### R-B — Bounded, automated target GC
+### R-B — Extend `scripts/gc-target.sh` into a bounded, automated sweep
 
-Adopt a size/age budget for `target/` (e.g. warn > 40 GB, sweep artifacts
-untouched > 30 days) and enumerate the sanctioned universe list; anything
-outside the list is subject to removal by the sweep. Surface current size in
-the existing ops/health tooling rather than a new system.
+Keep the existing script as the single GC entry point and close the residual
+delta: enumerate the sanctioned universe list (anything outside it is
+removed wholesale, not just swept for stale files), flip the default to
+dry-run with an explicit `--delete` for destructive mode, skip universes
+holding an active cargo build lock, and wire a scheduled invocation so
+hygiene is not manual-only. Surface current size in the existing ops/health
+tooling rather than a new system.
 
 - Risk: an over-eager sweep forces a cold rebuild. Mitigate with age gating
-  and a dry-run mode.
-- Alternative: manual periodic cleanup. Rejected — the 176 GB state is
+  and the dry-run default.
+- Alternative: leave the script manual-only. Rejected — the 176 GB state is
   evidence that unowned manual hygiene does not happen.
 
 ### R-C — Regression guard in CI
