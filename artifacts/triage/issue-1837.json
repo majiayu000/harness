@@ -1,0 +1,24 @@
+{
+  "issue": 1837,
+  "route": "triage_issue",
+  "state": "new_issue",
+  "classification": "documentation",
+  "security_private": false,
+  "duplicate": false,
+  "related_work": [
+    "GH-930",
+    "GH-1360",
+    "GH-832",
+    "GH-1416",
+    "PR-1821"
+  ],
+  "search_summary": "No active issue or pull request other than PR-1821 covers the complete fresh-clone README onboarding and server startup contract.",
+  "proposed_labels": [
+    "bug",
+    "area_docs",
+    "agent_generated",
+    "ready_to_implement"
+  ],
+  "decision": "allowed",
+  "human_gate_evidence": "Readiness was not granted or applied by the agent; maintainer review remains required."
+}

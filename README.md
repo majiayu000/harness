@@ -43,8 +43,9 @@ cargo build --release -p harness-cli
 
 Requires Rust 1.88+. A fresh release build also requires Bun 1.1+ because it
 embeds the web dashboard; if `web/dist` is already built, the release build can
-reuse it without Bun. Postgres and a GitHub token are only needed for the server
-/ fleet features below.
+reuse it without Bun. Postgres and an API authentication token are only needed
+for the server / fleet features below; a GitHub token is additionally needed
+for GitHub integration.
 
 ## Quickstart: run one agent task
 
@@ -90,27 +91,39 @@ sandbox modes are `read-only`, `read-only-with-network`, `workspace-write`, and
 ## Level up: the fleet control plane
 
 For parallel agents, task queues, cross-agent review, and the web dashboard,
-start the server (needs Postgres 14+; Docker for the bundled one):
+start the server (needs Postgres 14+, an API bearer token, and Docker for the
+bundled database). The copy-paste token generation below also needs the OpenSSL
+CLI. The Codex-safe launcher additionally requires `curl` and `lsof`.
 
 In a normal standalone terminal, start Postgres and the foreground server:
 
 ```bash
 # Terminal 1
-bash scripts/dev-db.sh
-./start-server.sh
+HARNESS_API_TOKEN="$(openssl rand -hex 32)" &&
+  test -n "$HARNESS_API_TOKEN" &&
+  export HARNESS_API_TOKEN &&
+  bash scripts/dev-db.sh &&
+  ./start-server.sh
 ```
 
 From a Codex-owned session, use the sanitized launcher instead; it removes
-wrapper variables that can confuse child Codex agents and starts detached by
-default:
+wrapper variables that can confuse child Codex agents. This environment-based
+quickstart selects its background `nohup` path so the database and authentication
+settings reach the server even when another tmux server already exists:
 
 ```bash
-bash scripts/dev-db.sh
-bash scripts/start-harness-codex-safe.sh
+HARNESS_API_TOKEN="$(openssl rand -hex 32)" &&
+  test -n "$HARNESS_API_TOKEN" &&
+  export HARNESS_API_TOKEN &&
+  bash scripts/dev-db.sh &&
+  export HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness &&
+  export HARNESS_DATABASE_POOL_MAX_CONNECTIONS=16 &&
+  export HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS=60 &&
+  HARNESS_STARTER_NO_TMUX=1 bash scripts/start-harness-codex-safe.sh
 ```
 
-Because `start-server.sh` remains in the foreground, check it from a second
-terminal:
+For the standalone path, `start-server.sh` remains in the foreground, so check
+it from a second terminal:
 
 ```bash
 # Terminal 2
