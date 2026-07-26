@@ -17,11 +17,13 @@ retrieved memory, dynamic task input, or context that Harness cannot observe.
 Repository inventory also cannot solve this problem because discovering a file
 does not prove it was selected or loaded for a runtime activity.
 
-The first implementation exposed three compatibility gaps after merge: valid
-profile names could make provenance construction fail, the model-facing packet
-still advertised the durable v2 schema, and omitted approval policy was
-misclassified for runtimes that do not support that setting. The remediation
-must correct those claims without weakening durable v2 evidence.
+The first implementation exposed compatibility and validation gaps after merge:
+profile names accepted by runtime configuration could make provenance
+construction fail, hashing every name would migrate already-valid audit
+identities, the model-facing packet still advertised the durable v2 schema, and
+approval policy was misclassified or silently discarded for runtimes that do
+not support that setting. The remediation must correct those claims without
+weakening durable v2 evidence.
 
 ## Goals
 
@@ -34,11 +36,14 @@ must correct those claims without weakening durable v2 evidence.
 - Make missing or unserializable required provenance a visible error.
 - Avoid persisting raw memory payloads, secrets, or hidden model reasoning.
 - Accept every profile name already accepted by runtime configuration while
-  keeping provenance locators valid and deterministic.
+  preserving existing valid provenance identities and providing a
+  collision-disjoint deterministic fallback for other names.
 - Keep durable packets on v2 while preserving the model-facing v1 packet
-  contract for unchanged inputs.
+  contract, including historical prompt-template handling, for unchanged
+  inputs.
 - Distinguish an unobserved Codex default from a setting that is not applicable
-  to the selected runtime.
+  to the selected runtime, and reject rather than discard an explicitly
+  unsupported policy.
 
 ## Non-Goals
 
@@ -131,22 +136,32 @@ must correct those claims without weakening durable v2 evidence.
    state transitions remain unchanged. Durable packets and their activity
    artifacts retain schema `harness.runtime.prompt_packet.v2` and all required
    audit metadata. Before rendering for the agent, the model-facing clone
-   removes audit-only fields and restores schema
-   `harness.runtime.prompt_packet.v1`; for unchanged inputs its serialized
-   packet section and complete prompt bytes are identical to the pre-v2
+   removes audit-only fields, removes `workflow_file.prompt_template` from the
+   packet JSON, and restores schema `harness.runtime.prompt_packet.v1`. A
+   non-empty prompt template is appended exactly once through the historical
+   template section. For unchanged inputs, the serialized packet section and
+   complete prompt bytes are identical to an independently frozen pre-v2
    rendering.
-15. **B-015:** Every profile name accepted by `RuntimeProfile`, including names
-   with spaces, slashes, Unicode, or UUID-shaped text, produces a valid,
-   deterministic runtime provenance locator derived from the lowercase SHA-256
-   of the exact UTF-8 profile-name bytes. The unhashed profile name remains
-   unchanged in `resolved_runtime_settings.profile_name`; the locator does not
-   expose or normalize it. Equal names produce equal locators, and unequal test
-   names produce unequal locators.
-16. **B-016:** Omitted approval policy resolves by runtime capability. Codex
-   runtimes record `unobserved_agent_default`; Claude Code and Anthropic API
-   record `not_applicable`; explicit approval policy remains rejected for every
-   non-Codex runtime. `not_applicable` never implies that an agent-side default
-   influenced launch.
+15. **B-015:** Every profile name accepted by `RuntimeProfile` produces a valid,
+   deterministic runtime provenance locator without migrating existing valid
+   identities. Harness first attempts the historical
+   `runtime_profile/<exact-name>` locator. If it validates, the locator and
+   component ID remain unchanged, including multi-segment names such as
+   `team/codex`. Only names that fail that validation use the disjoint
+   `runtime_profile_name_sha256/<lowercase SHA-256 of exact UTF-8 name bytes>`
+   namespace. The unhashed profile name remains byte-for-byte unchanged in
+   `resolved_runtime_settings.profile_name`; neither path trims, case-folds, or
+   Unicode-normalizes it. Equal invalid byte sequences produce equal fallbacks;
+   the enumerated byte-distinct acceptance vectors must produce different
+   fallbacks.
+16. **B-016:** Approval policy resolves by runtime capability. Omitted policy
+   records `unobserved_agent_default` for both Codex runtime kinds and
+   `not_applicable` for Claude Code and Anthropic API. Remote Host remains
+   rejected by local runtime-settings resolution. An explicit approval policy
+   declared for Claude Code, Anthropic API, or Remote Host is rejected both by
+   dispatch-policy resolution and direct runtime-settings resolution; it is
+   never silently discarded. Switching from Codex to a non-Codex runtime
+   without an explicit policy does not inherit the Codex-only value.
 
 ## Acceptance Criteria
 
@@ -173,15 +188,26 @@ must correct those claims without weakening durable v2 evidence.
 - [ ] Existing prompt, memory, activity-policy, and activity-result tests
       remain green without weakening assertions.
 - [ ] Named test
-      `arbitrary_profile_names_use_stable_hashed_locators_and_preserve_profile_name`
-      proves B-015 for spaces, slashes, Unicode, and UUID-shaped names.
+      `profile_locator_preserves_valid_identity_and_hashes_invalid_exact_bytes`
+      proves B-015 with frozen component IDs for valid names and known SHA-256
+      vectors for empty, whitespace-distinct, case-distinct, slash-invalid,
+      UUID-shaped, and NFC/NFD Unicode names.
 - [ ] Named test
-      `model_facing_prompt_uses_v1_schema_while_durable_packet_remains_v2`
-      proves the exact B-014 durable/model schema split and v1 prompt bytes.
+      `model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2`
+      proves the exact B-014 durable/model schema split, non-empty
+      prompt-template handling, and complete pre-v2 prompt bytes without
+      deriving the expected value from the current v2 packet.
 - [ ] Named test
-      `non_codex_omitted_approval_policy_is_not_applicable` proves B-016 for
-      Claude Code and Anthropic API while the existing Codex case remains
-      `unobserved_agent_default`.
+      `approval_policy_resolution_matches_runtime_capability_matrix` proves
+      omitted-policy behavior for Codex Exec, Codex JSON-RPC, Claude Code,
+      Anthropic API, and the Remote Host rejection boundary.
+- [ ] Explicit-policy dispatch and direct-resolution matrix tests reject Claude
+      Code, Anthropic API, and Remote Host rather than dropping the value.
+- [ ] Named test
+      `provenance_failure_prevents_prompt_event_and_agent_start` proves B-012
+      through the real worker boundary: the job fails, no
+      `RuntimePromptPrepared` event is recorded, and the registered agent
+      receives no prompt.
 - [ ] No database migration, new runtime event type, or external dependency is
       introduced.
 
@@ -211,8 +237,17 @@ must correct those claims without weakening durable v2 evidence.
 - An adapter independently reads repository instructions after Harness creates
   the packet.
 - A runtime profile has absent optional fields.
-- A runtime profile name contains spaces, slashes, Unicode, or is a UUID.
+- A valid runtime profile name such as `codex-default` or `team/codex` retains
+  its historical locator and component ID.
+- An accepted profile name is empty or contains whitespace, an invalid slash
+  shape, Unicode, or UUID-shaped text and therefore uses the hashed fallback.
+- Two invalid names differ only by leading/trailing whitespace, case, or
+  NFC/NFD Unicode bytes.
 - Claude Code or Anthropic API omits the unsupported approval-policy field.
+- A dispatch policy explicitly declares approval policy for Claude Code,
+  Anthropic API, or Remote Host.
+- A dispatch override switches from Codex to a non-Codex runtime without
+  explicitly declaring approval policy.
 - Server defaults resolve two otherwise identical runtime profiles to
   different effective model or sandbox settings.
 - One durable prompt reference resolves to changed task text.
@@ -227,4 +262,6 @@ object. Evidence readers require provenance only for v2, treat v1 as
 lower-evidence history, and never infer provenance for a packet lacking the
 field. Agent prompt rendering continues to receive a v1-schema compatibility
 clone; the v2 schema and evidence remain confined to the durable packet and
-activity artifact.
+activity artifact. Existing valid runtime-profile component IDs remain stable;
+the disjoint hashed namespace is used only for names that previously could not
+produce provenance.
