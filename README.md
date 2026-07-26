@@ -55,33 +55,65 @@ unprivileged OS user: `--drop-sudo` defaults to `true`, so `harness exec`
 rejects root and sudo environments. Only pass `--drop-sudo=false` when elevated
 execution is deliberate.
 
+On Linux, the default `workspace-write` sandbox also requires
+`harness-landlock` or [`bwrap`](https://github.com/containers/bubblewrap) on
+`PATH`; install your distribution's Bubblewrap package if you do not have the
+Landlock helper. Harness fails closed when neither helper is available.
+
 ```bash
-# With Codex CLI
+# With Codex CLI (Linux or macOS)
 ./target/release/harness exec --agent codex "Fix the failing test in src/lib.rs"
 
-# Or with Claude Code CLI
+# Or with Claude Code CLI on Linux
 ./target/release/harness exec --agent claude "Fix the failing test in src/lib.rs"
+
+# Claude Code on macOS cannot run under the Seatbelt workspace-write sandbox
+./target/release/harness exec --agent claude --sandbox-mode danger-full-access \
+  "Fix the failing test in src/lib.rs"
 ```
 
 Harness runs the explicitly selected coding agent against the current directory
-with a `workspace-write` sandbox hint and prints the agent's final response to
-stdout.
+and prints the agent's final response to stdout. The default is
+`workspace-write`. The macOS Claude exception grants the agent unrestricted
+filesystem and process access; use it only in a trusted repository and review
+the resulting changes.
 
 The `anthropic-api` adapter is for text generation: it sends the prompt without
 repository context or tools, so it cannot inspect or modify the project in this
 coding example.
 
 Useful flags: `--project <dir>`, `--agent claude|codex|anthropic-api`,
-`--model <id>`, `--sandbox-mode read-only`, `--output-file result.md`.
+`--model <id>`, `--sandbox-mode <mode>`, `--output-file result.md`. Supported
+sandbox modes are `read-only`, `read-only-with-network`, `workspace-write`, and
+`danger-full-access`.
 
 ## Level up: the fleet control plane
 
 For parallel agents, task queues, cross-agent review, and the web dashboard,
 start the server (needs Postgres 14+; Docker for the bundled one):
 
+In a normal standalone terminal, start Postgres and the foreground server:
+
 ```bash
-bash scripts/dev-db.sh      # start local Postgres via Docker Compose
-./start-server.sh           # build (if needed) and start the server
+# Terminal 1
+bash scripts/dev-db.sh
+./start-server.sh
+```
+
+From a Codex-owned session, use the sanitized launcher instead; it removes
+wrapper variables that can confuse child Codex agents and starts detached by
+default:
+
+```bash
+bash scripts/dev-db.sh
+bash scripts/start-harness-codex-safe.sh
+```
+
+Because `start-server.sh` remains in the foreground, check it from a second
+terminal:
+
+```bash
+# Terminal 2
 curl http://127.0.0.1:9800/health
 ```
 
