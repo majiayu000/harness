@@ -4,7 +4,7 @@
 
 GH-1732
 
-complexity: medium
+complexity: high
 
 ## User Problem
 
@@ -55,15 +55,19 @@ does not prove it was selected or loaded for a runtime activity.
    source scope/locator, lowercase SHA-256 digest, selection reason,
    zero-based order, observation class, selection state, and trust level using
    the ASC-001 model.
-4. **B-004:** The selected runtime profile is represented once using its
-   normalized serialized behavior fields. Its source is runtime-scoped,
-   observation and trust are `runtime_observed`, selection state is `loaded`,
-   and its digest changes when any serialized profile behavior changes.
-5. **B-005:** A configured workflow document is represented once using its
-   source path and a digest of the normalized effective config plus prompt
-   template. If no workflow file exists and Harness uses defaults, provenance
-   records an explicit runtime default source rather than inventing a
-   repository file.
+4. **B-004:** Runtime provenance records runtime kind, profile name, effective
+   max-turns and timeout, plus final model, reasoning effort, sandbox, and
+   approval policy after their profile/workflow/server fallbacks. The final
+   launch settings are computed once and shared by packet construction and
+   agent launch. The source is runtime-scoped, observation and trust are
+   `runtime_observed`, selection state is `loaded`, and changing any recorded
+   setting changes its digest.
+5. **B-005:** Workflow provenance distinguishes the ordered central-base and
+   repository `WORKFLOW.md` sources from the normalized effective document.
+   Configured sources retain content digests and safe typed locators even when
+   the effective document is merged; unsafe absolute paths are redacted, not
+   misclassified as defaults. If neither source exists, an explicit runtime
+   default entry is emitted instead of inventing a repository file.
 6. **B-006:** Every repo-memory record selected into the packet produces one
    memory entry in the same order. It records durable record identity,
    evidence reference when present, estimated token count, and a digest of the
@@ -74,8 +78,10 @@ does not prove it was selected or loaded for a runtime activity.
    entry. The packet cannot claim selected memory that was not returned.
 8. **B-008:** Dynamic workflow instance and command input remain visibly
    identified as per-invocation payload sections, not reusable context
-   dependencies. Their inclusion is covered by the enclosing prompt packet
-   digest and does not misclassify external user content as trusted context.
+   dependencies. For prompt tasks, the packet also records the durable prompt
+   reference and SHA-256 of the exact task text before packet hashing; raw task
+   text is not duplicated in provenance. These inputs are covered by the
+   enclosing packet digest and are not misclassified as trusted context.
 9. **B-009:** Provenance declares its coverage limitations. Context loaded
    independently by an agent CLI, MCP host, user-global configuration, or
    model provider is marked `not_observed_by_harness`; absence from the
@@ -103,6 +109,14 @@ does not prove it was selected or loaded for a runtime activity.
 
 - [ ] Runtime profile, workflow document/defaults, and each selected repo-memory
       record produce validated ASC-001 provenance entries.
+- [ ] Agent launch and provenance consume the same resolved model, reasoning,
+      sandbox, approval, and timeout values; provenance also records the
+      effective max-turns already enforced by the workflow runtime.
+- [ ] Central, repository, merged, and default workflow cases retain truthful
+      source identities and content/effective digests without leaking unsafe
+      absolute paths.
+- [ ] Prompt-task fixtures prove that changing durable task text under the same
+      reference changes the packet digest while raw text is not duplicated.
 - [ ] The packet contains coverage declarations for independently loaded
       context that Harness cannot observe.
 - [ ] Provenance omits raw secret values and duplicate memory payload content.
@@ -133,13 +147,17 @@ does not prove it was selected or loaded for a runtime activity.
 ## Edge Cases
 
 - Workflow defaults are active because no `WORKFLOW.md` exists.
-- Workflow configuration exists but its source path is unavailable.
+- A central workflow base is active outside the repository.
+- Central and repository workflow sources are merged.
 - Memory is enabled with zero selected records.
 - Two selected memory records contain equivalent redacted content but different
   durable identities.
 - An adapter independently reads repository instructions after Harness creates
   the packet.
 - A runtime profile has absent optional fields.
+- Server defaults resolve two otherwise identical runtime profiles to
+  different effective model or sandbox settings.
+- One durable prompt reference resolves to changed task text.
 - Provenance serialization fails before `RuntimePromptPrepared`.
 - A retry builds the same logical packet after a previous interrupted attempt.
 

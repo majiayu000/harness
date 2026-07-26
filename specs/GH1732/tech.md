@@ -9,7 +9,7 @@ GH-1732
 See `specs/GH1732/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1732,"complete":true,"paths":["crates/harness-server/src/workflow_runtime_worker/prompt_packet.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014"]}
+{"issue":1732,"complete":true,"paths":["crates/harness-core/src/config/workflow.rs","crates/harness-server/src/workflow_runtime_worker/executor.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet_activity_policy_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet_tests.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014"]}
 -->
 
 ## Current System
@@ -30,15 +30,22 @@ See `specs/GH1732/product.md`.
   preparation, and only then constructs and executes the agent prompt.
 - `executor.rs:298-317` persists `RuntimePromptPrepared` with the packet digest
   and complete packet in one runtime event.
+- `executor.rs:99-147` resolves sandbox, model, reasoning effort, and approval
+  separately from the `RuntimeProfile` serialized into the packet. It also
+  resolves durable prompt-task text before packet construction but appends
+  that text only after the packet has already been hashed and recorded.
 - `crates/harness-server/src/workflow_runtime_worker/repo_memory_prompt.rs:16-68`
   returns either selected records or explicit retrieval-degradation evidence;
   it does not fabricate records on failure.
 - `crates/harness-workflow/src/runtime/memory_retrieval.rs:26-30` gives selected
   memory its durable record and estimated token count.
-- `crates/harness-workflow/src/runtime/model.rs:468-484` defines the serialized
-  runtime-profile behavior fields.
+- `crates/harness-workflow/src/runtime/model.rs:469-484` defines declared
+  runtime-profile fields, some of which may be absent and resolved from server
+  or workflow defaults at launch.
 - `crates/harness-core/src/config/workflow.rs:15-23` defines effective workflow
-  config, prompt template, and optional source path.
+  config, prompt template, and one display-oriented `source_path`. The loader
+  can combine central and repository files into a string, so this field cannot
+  truthfully preserve each source by itself.
 - `prompt_packet.rs` is currently 794 lines, so new provenance logic cannot be
   added inline without violating the repository's 800-line ceiling.
 
@@ -52,6 +59,7 @@ from `prompt_packet.rs`. The module owns:
 - `CONTEXT_PROVENANCE_SCHEMA`;
 - construction of `ContextProvenance`;
 - normalized digest helpers for runtime profile, workflow document, and memory;
+- prompt-task reference/text binding without raw-text duplication;
 - safe source-locator normalization;
 - coverage declarations for context not observed by Harness.
 
@@ -68,11 +76,50 @@ would weaken that contract. `build_runtime_prompt_packet` continues to return
 its existing private `serde_json::Value`; this issue adds no response DTO or
 external consumer contract.
 
+### Shared Resolved Runtime Settings
+
+Add private `ResolvedRuntimeSettings` in `runtime_profile.rs`. One resolver
+accepts the already timeout-adjusted `RuntimeProfile`, `RuntimeKind`, and server
+agent configuration and returns the final profile name, kind, model, reasoning
+effort, sandbox, approval policy, max-turns, and timeout. `executor.rs` creates
+this value once, passes it to packet/provenance construction, and uses the same
+launch fields for `TurnLifecycleOptions` and agent request construction.
+`max_turns` is copied from the effective profile already enforced by the
+workflow runtime; it is evidence, not a second enforcement point. Existing
+validation helpers become implementation details of this single resolver.
+
+The packet retains the declared/effective `runtime_profile` section for
+compatibility and adds `resolved_runtime_settings`. Provenance hashes canonical
+JSON of only the resolved value. No launch field is recomputed after the
+packet is recorded.
+
+### Workflow Source Preservation
+
+Extend `WorkflowDocument` with an observation-only, serde-skipped ordered
+source list. Each source records whether it is the central base or repository
+override, its original path for in-process classification, and SHA-256 of the
+exact file bytes read. `load_workflow_document_with_base` retains central then
+repository order while preserving the existing merged config, prompt template,
+and compatibility `source_path`.
+
+The provenance builder emits:
+
+- one runtime-scoped central-source entry whose locator contains a digest of
+  the canonical path rather than the absolute path;
+- one repository-scoped `WORKFLOW.md` entry when the repository file exists;
+- one runtime-scoped effective-document entry whose digest covers normalized
+  merged config and prompt template; or
+- one runtime-scoped defaults entry when no configured source exists.
+
+Configured-versus-default classification comes from the source list, never
+from whether the display path can be normalized relative to the project.
+
 `prompt_packet.rs` calls the module once after creating the base packet fields
 and before activity policy or final hashing:
 
 1. build provenance from `runtime_profile`, `workflow_document`, selected
-   `repo_memory`, and the already constructed packet sections;
+   `repo_memory`, resolved runtime settings, and the already constructed packet
+   sections;
 2. serialize it through `serde_json::to_value` with contextual error handling;
 3. assign `packet["context_provenance"]`;
 4. continue existing activity-policy and continuation processing.
@@ -83,29 +130,31 @@ execute an incomplete packet.
 
 ### Source Entries
 
-Runtime profile:
+Resolved runtime settings:
 
 - kind `agent_runtime`;
 - ID `runtime-profile:<profile name>`;
 - runtime-scoped locator using the profile name;
-- digest of canonical serde JSON for the complete `RuntimeProfile`;
+- digest of canonical serde JSON for `ResolvedRuntimeSettings`;
 - reason `workflow_runtime_profile_selected`;
 - observation/trust `runtime_observed`;
 - selection `loaded`;
 - order 0.
 
-Workflow document:
+Workflow sources and effective document:
 
-- kind `workflow`;
-- repository-scoped normalized source locator when `source_path` is present
-  and safely relative to the project source root;
-- otherwise runtime-scoped `workflow-defaults`;
-- digest of canonical JSON containing effective `config` and
-  `prompt_template`, excluding the source locator;
-- reason `workflow_document_selected` or `workflow_defaults_selected`;
-- observation/trust `runtime_observed`;
-- selection `loaded`;
-- order 1.
+- central and repository source entries use the ordered source facts retained
+  by `WorkflowDocument`;
+- source digests cover exact bytes read, while the effective-document digest
+  covers canonical JSON containing merged `config` and `prompt_template`;
+- central absolute paths are represented only by a runtime-scoped path digest;
+- the repository source uses the normalized `WORKFLOW.md` locator;
+- reasons distinguish `workflow_base_selected`,
+  `workflow_repository_selected`, `workflow_document_effective`, and
+  `workflow_defaults_selected`;
+- observation/trust are `runtime_observed`, selection is `loaded`, and orders
+  follow the runtime entry then central source, repository source, effective
+  document, and memory records.
 
 Repo memory:
 
@@ -119,7 +168,8 @@ Repo memory:
 - reason `repo_memory_selected`;
 - observation/trust `runtime_observed`;
 - selection `loaded`;
-- order 2 onward, preserving selection order.
+- order immediately after the final workflow entry, preserving memory selection
+  order.
 
 The module never copies raw memory payload into provenance. The payload remains
 only in the existing packet memory section. On retrieval failure, the input
@@ -129,8 +179,17 @@ artifact remains the failure evidence.
 ### Dynamic Payload and Coverage
 
 Do not create reusable context components for workflow instance, command input,
-activity result schema, or continuation payload. They are per-invocation
-packet sections and remain covered by the enclosing packet digest.
+prompt-task request, activity result schema, or continuation payload. They are
+per-invocation packet sections and remain covered by the enclosing packet
+digest.
+
+Pass `prompt_task_request.prompt_text()` into `build_runtime_prompt_packet`.
+When present, add a redacted `prompt_task_request` packet section containing
+the existing non-empty `prompt_ref` and lowercase SHA-256 of the exact UTF-8
+task text. Do not place raw task text in the packet or provenance. The existing
+`build_runtime_job_prompt` appends that same text after packet rendering, so
+prompt semantics remain unchanged while the recorded packet digest becomes
+sensitive to the text actually executed.
 
 Add closed coverage markers for:
 
@@ -167,12 +226,18 @@ Tests construct real `RuntimeProfile`, `WorkflowDocument`, and
 absence of duplicated payloads, coverage markers, stable ordering, source
 digest sensitivity, and packet digest sensitivity.
 
+Keep `prompt_packet.rs` at or below the repository's 800-line hard ceiling by
+placing construction, hashing, and prompt-task binding helpers in the focused
+submodule; the parent module contains only the minimal call sites and wiring.
+
 ## Data Flow
 
-Selected runtime profile + effective workflow document + selected repo-memory
-records → validated ordered provenance → nested packet field → existing
-activity policy/continuation enrichment → existing packet SHA-256 →
-`RuntimePromptPrepared { prompt_packet_digest, prompt_packet }` → agent prompt.
+Resolved runtime settings + ordered workflow source facts/effective document +
+selected repo-memory records → validated ordered provenance → prompt-task
+reference/text digest binding → nested packet fields → existing activity
+policy/continuation enrichment → existing packet SHA-256 →
+`RuntimePromptPrepared { prompt_packet_digest, prompt_packet }` → agent prompt
+using the same resolved settings and prompt-task text.
 
 Failure before packet completion returns an error and prevents the runtime
 event and agent execution.
@@ -184,17 +249,17 @@ event and agent execution.
 | B-001 | provenance envelope/schema insertion | `cargo test -p harness-server context_provenance_tests::runtime_packet_contains_exactly_one_versioned_provenance_manifest --lib` |
 | B-002 | constructor inputs and no inventory fallback | `cargo test -p harness-server context_provenance_tests::provenance_contains_only_runtime_selected_sources --lib` |
 | B-003 | ASC-001 component construction and ordered entry wrapper | `cargo test -p harness-server context_provenance_tests::all_provenance_entries_validate_against_stack_component_contract --lib` |
-| B-004 | runtime-profile source builder | `cargo test -p harness-server context_provenance_tests::runtime_profile_behavior_changes_its_source_digest --lib` |
-| B-005 | workflow document/default source builder | `cargo test -p harness-server context_provenance_tests::workflow_file_and_runtime_defaults_have_distinct_provenance --lib` |
+| B-004 | single resolved-settings construction/use | `cargo test -p harness-server context_provenance_tests::provenance_and_agent_launch_share_resolved_runtime_settings --lib` |
+| B-005 | retained source list and workflow builders | `cargo test -p harness-server context_provenance_tests::central_repository_merged_and_default_workflows_have_truthful_provenance --lib` |
 | B-006 | repo-memory source builder | `cargo test -p harness-server context_provenance_tests::selected_memory_order_and_safe_metadata_are_preserved --lib` |
 | B-007 | empty memory input and existing degradation boundary | `cargo test -p harness-server context_provenance_tests::missing_memory_records_are_not_fabricated --lib`; `cargo test -p harness-server repo_memory_prompt --lib` |
-| B-008 | dynamic-payload exclusion | `cargo test -p harness-server context_provenance_tests::command_and_workflow_payloads_are_not_reusable_context_components --lib` |
+| B-008 | dynamic-payload and prompt-task binding | `cargo test -p harness-server context_provenance_tests::prompt_task_text_is_digest_bound_without_becoming_context --lib` |
 | B-009 | closed coverage markers | `cargo test -p harness-server context_provenance_tests::manifest_declares_unobserved_external_context --lib` |
 | B-010 | redacted entry serialization | `cargo test -p harness-server context_provenance_tests::provenance_does_not_duplicate_memory_payload_or_secret_values --lib` |
 | B-011 | ordering and digest fixtures | `cargo test -p harness-server context_provenance_tests::provenance_and_packet_digests_are_repeatable_and_order_sensitive --lib` |
 | B-012 | fallible builder boundary | `cargo test -p harness-server context_provenance_tests::invalid_required_provenance_aborts_packet_construction --lib` |
 | B-013 | existing RuntimePromptPrepared persistence path | `cargo test -p harness-server prompt_packet_pinning_tests --lib` |
-| B-014 | existing behavior suites and diff scope | `cargo test -p harness-server prompt_packet --lib`; `cargo test -p harness-server repo_memory_prompt --lib`; `git diff --name-only origin/main...HEAD` |
+| B-014 | existing behavior and workspace suites | `cargo test --workspace`; `git diff --name-only origin/main...HEAD` |
 
 ## Alternatives Considered
 
@@ -219,6 +284,12 @@ event and agent execution.
   constructor takes the same runtime inputs as packet construction.
 - Compatibility: historical packets lack provenance. Readers must treat them
   as lower-evidence records, not invalid stored runtime events.
+- Integrity: fallback-resolved settings or durable prompt text could escape the
+  packet digest. One resolved value feeds both launch and provenance, and the
+  packet binds prompt text before `RuntimePromptPrepared`.
+- Provenance: one display-oriented workflow source string can collapse or
+  misclassify central/repository inputs. The loader retains ordered typed source
+  facts and exact content digests separately.
 - Performance: hashing selected profile/workflow/memory representations is
   linear in packet input already being serialized and bounded by memory budget.
 - Maintenance: adding a new behavior-affecting packet source must update both
@@ -228,20 +299,28 @@ event and agent execution.
 
 - [ ] Add profile, workflow-file, workflow-default, one-memory, multi-memory,
       and no-memory provenance fixtures.
+- [ ] Add resolved server-default/profile-override parity fixtures.
+- [ ] Add central-only, repository-only, merged, and defaults workflow-source
+      fixtures.
+- [ ] Add same-reference/different-prompt-text packet digest fixtures.
 - [ ] Add redaction and external-context coverage assertions.
 - [ ] Add stable ordering and source/packet digest sensitivity assertions.
 - [ ] Prove invalid required provenance returns before event recording and
       agent execution using the existing executor boundary test.
-- [ ] Run `cargo check -p harness-server --all-targets`.
+- [ ] Run `cargo check --workspace --all-targets`.
 - [ ] Run `cargo test -p harness-server context_provenance --lib`.
 - [ ] Run `cargo test -p harness-server prompt_packet --lib`.
 - [ ] Run `cargo test -p harness-server repo_memory_prompt --lib`.
+- [ ] With an isolated disposable PostgreSQL database, run
+      `HARNESS_DATABASE_URL=<isolated-db-url> cargo test --workspace`; without
+      one, run the repository pre-push DB-less suite and record the deferred DB
+      suites for CI.
 - [ ] Run `cargo fmt --all` and `cargo fmt --all -- --check`.
 - [ ] Before push, run
       `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Run
       `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1732`.
-- [ ] Confirm the implementation diff contains only the three paths in the
+- [ ] Confirm the implementation diff contains only the eight paths in the
       planned-changes manifest.
 
 ## Rollback Plan
