@@ -48,21 +48,31 @@ changes.
 `stack/mod.rs` defines:
 
 - `AGENT_STACK_COMPONENT_SCHEMA_VERSION`;
+- `AgentStackComponentId`;
 - `AgentStackComponentKind`;
 - `AgentStackSourceScope`;
+- `AgentStackSourceLocator`;
+- `AgentStackUserGlobalRoot`;
 - `AgentStackObservationClass`;
 - `AgentStackSelectionState`;
 - `AgentStackCapability`;
 - `AgentStackTrustLevel`;
 - `AgentStackFreshness`;
+- `Sha256Digest`;
 - `AgentStackSource`;
 - `AgentStackComponent`;
-- `AgentStackComponentError`.
+- `AgentStackComponentError`;
+- `AgentStackComponentParseError`.
 
 Every enum derives serde with `rename_all = "snake_case"` and has no catch-all
-variant. The component and nested source structs use `deny_unknown_fields`.
-Required strings remain `String` in the serialized shape but construction and
-`validate()` reject blank values.
+variant. `AgentStackComponentId`, `AgentStackSourceLocator`, and `Sha256Digest`
+are public validated newtypes with private inner strings. The component and
+nested source structs use `deny_unknown_fields`; invariant-bearing fields are
+private and exposed through read-only accessors. `AgentStackComponentError`
+owns typed construction and validation failures.
+`AgentStackComponentParseError` is the public syntax-versus-validation wrapper.
+Private `VersionEnvelope` and v0.1 wire structs are implementation details and
+never appear in the public API.
 
 The exact v0.1 wire object has these fields in this struct declaration order:
 
@@ -93,9 +103,12 @@ explicit JSON `null` is rejected rather than being accepted as absence.
 Deserialization rejects a missing required field rather than inventing a
 default.
 
-`AgentStackSourceScope` contains explicit `repository`, `user_global`,
-`runtime`, and `runner` values. Repository locators use `/`-separated portable
-paths relative to the repository root. User-global locators use
+`AgentStackSourceScope` contains explicit `repository`, `user_global`, `admin`,
+`system`, `runtime`, and `runner` values.
+
+Repository locators use `/`-separated portable paths relative to the repository
+root. Admin locators use the same path grammar relative to `/etc/harness`.
+Neither scope serializes its absolute root. User-global locators use
 `<root_namespace>/<portable_relative_path>`, with this closed root namespace:
 
 | Root namespace | Exact logical root |
@@ -103,37 +116,110 @@ paths relative to the repository root. User-global locators use
 | `home_harness` | `$HOME/.harness` |
 | `xdg_config_harness` | `$XDG_CONFIG_HOME/harness` when XDG_CONFIG_HOME is absolute; otherwise `$HOME/.config/harness` |
 | `platform_config_harness` | macOS `$HOME/Library/Application Support/harness` or Windows `%APPDATA%/harness` |
+| `configured_user` | A user-owned configured root with a persisted snake_case configuration key as the first relative segment |
 
-The namespace is chosen from the discovery root that produced the component,
-not by relativizing against an arbitrary common ancestor. An unknown root
-namespace is invalid. If the required environment root is absent, relative, or
-does not apply to the current platform, that namespace cannot be emitted.
-Platform-neutral path validation rejects leading `/`, backslashes, Windows
-drive prefixes such as `C:`, NUL bytes, and empty, `.`, or `..` segments before
-accepting either portable relative path; it does not use platform-specific
-`std::path::Component` semantics or access the filesystem.
+The model exposes a pure user-global root selector. Producers pass expanded,
+lexically normalized absolute candidate roots plus the unnormalized source
+path; the helper performs no environment reads or filesystem I/O. v0.1 accepts
+zero or one `configured_user` candidate. Supplying more than one returns
+`AgentStackComponentError::AmbiguousConfiguredUserRoot` before path matching,
+including equal or nested configured roots. If a source path matches more than
+one remaining root, the selector chooses the first match in this exact
+precedence: `home_harness`, `xdg_config_harness`,
+`platform_config_harness`, then the single `configured_user`. Equal default
+roots collapse to the higher-precedence namespace, so XDG wins over the
+platform root in the macOS/Windows collision cases and matches `config::dirs`
+discovery order. A collision exists only when normalized root segment sequences
+are lexically equal. The root-match key canonicalizes only Windows disk-prefix
+letters to uppercase; every other path component remains case-sensitive. Thus
+`C:\root` and `c:\root` are equivalent roots, while `C:\Root` and `C:\root`
+remain distinct logical sources in v0.1. The selector does not query
+filesystem-specific case-sensitivity. Producers must pass consistently
+expanded candidate roots. Focused tests separately prove drive-letter
+equivalence and directory-segment case distinction through the same
+platform-neutral root-match helper used by the selector. Containment is
+segment-aware, not string-prefix based. Root comparison does not resolve
+symlinks; differently configured symlink roots are distinct logical sources in
+v0.1. An absent or relative environment root is a producer discovery error, not
+a wire-parse error.
 
-Runtime and runner locators use the exact form
-`<namespace>/<stable_key>`. Both segments use lowercase snake_case ASCII
-tokens (`[a-z0-9]+(?:_[a-z0-9]+)*`). The namespace identifies a versioned
-producer configuration domain. Validation rejects UUID-shaped values,
-including canonical hyphenated UUIDs and 32-hex compact UUIDs, and rejects
-values outside the token grammar, such as whitespace-bearing display labels.
-It also rejects the exact reserved missing-evidence spellings `unknown`,
-`unknown-component`, `unknown_component`, `none`, `null`, and `missing` for
-every scope before component-ID derivation. For runtime and runner locators,
-this reserved-spelling check applies independently to `namespace` and
-`stable_key`, so values such as `unknown/codex` and `codex/unknown` are both
-invalid.
+System locators use `builtin/<namespace>/<stable_path>` for embedded
+components. Runtime and runner locators use
+`<namespace>/<stable_path>`. `namespace` uses lowercase snake_case ASCII
+(`[a-z0-9]+(?:_[a-z0-9]+)*`). `stable_path` contains one or more
+`/`-separated portable identity segments; each segment starts with ASCII
+alphanumeric and continues with ASCII alphanumeric, `_`, `-`, or `.` while
+preserving case exactly. This preserves identities such as `exec-plan`,
+`golden-principles.md`, `codex-default`, `getUser`, and `DATA_EXPORT_v2`
+without aliases; `getUser` and `getuser` are distinct identities. Validation
+rejects UUID-shaped segments case-insensitively, including canonical
+hyphenated UUIDs and 32-hex compact UUIDs, whitespace-bearing display labels,
+empty segments, `.`, and `..`. It also rejects the reserved missing-evidence
+spellings `unknown`, `unknown-component`, `unknown_component`, `none`, `null`,
+and `missing` case-insensitively and independently in every logical-path
+segment before component-ID derivation.
+
+All filesystem-derived locators require lossless UTF-8. The path adapter
+decomposes the root and source with `Path::components()` and performs an
+explicit segment-aware prefix comparison with the root-match key above, without
+filesystem canonicalization. A Windows `Disk` or `VerbatimDisk` prefix is
+represented by an internal typed prefix whose ASCII drive letter is uppercase;
+other prefixes and roots are rejected for portable locators. After the matched
+root, the adapter rejects `Prefix`, `RootDir`, and `ParentDir`, and discards
+redundant `CurDir` components, so `root/a/./b` derives the same locator as
+`root/a/b`, while `root/a/../b` fails. Every accepted `OsStr` segment uses
+`to_str()` independently; failure returns
+`AgentStackComponentError::NonUtf8SourceLocator`.
+
+The path adapter delegates output to a platform-neutral
+`encode_portable_segments` helper that accepts explicit UTF-8 segments,
+validates each segment, and joins them with literal `/`. Contract tests exercise
+this helper on every CI platform without claiming to execute Windows-native
+`Path` semantics on Ubuntu. The wire parser separately rejects leading `/`,
+backslashes, Windows drive prefixes such as `C:`, NUL bytes, empty segments,
+`.`, and `..`. `to_string_lossy()` and filesystem I/O are prohibited.
 
 The wire validator deliberately does not claim to prove how an otherwise-valid
-stable key was obtained: `codex/12345` is syntactically valid even if a faulty
-producer derived it from a process ID. Producers have the separate contract to
-read the key from persisted, versioned configuration identity and never derive
-it from display names, process IDs, timestamps, or other per-scan data. Given
-only one component there is no second observation against which to verify
-continuity. ASC-005 owns cross-snapshot comparison and reports a changed key
-for an otherwise unchanged configured source as an identity discontinuity.
+stable path was obtained. Producers have the separate contract to use persisted
+configuration identity rather than display names, process IDs, timestamps, or
+other per-scan data. ASC-002 owns repository inventory mapping. ASC-003 owns
+runtime prompt-provenance mappings in
+`crates/harness-server/src/workflow_runtime_worker/prompt_packet/`; it preserves
+the source scope and locator for repository/user sources observed at runtime and
+uses `runtime` scope only for runtime-owned generated/configuration components.
+ASC-004 owns runtime and MCP fingerprint mappings in `harness-agents` and
+`harness-core`; it chooses scope from actual component ownership and uses
+`runner_observed` only as observation class when a runner performs the probe.
+Their producer tests must prove stable-path provenance and stable component ID
+across stronger observations. ASC-005 compares snapshots and reports an
+otherwise-unexplained path change as an identity discontinuity.
+
+### Source Mapping Contract Examples
+
+| Source class | v0.1 contract example |
+| --- | --- |
+| Repository files | `repository` plus repository-relative portable path |
+| `$HOME/.harness` instructions, skills, and rules | `user_global` plus `home_harness/<relative_path>` |
+| XDG/default user config | `user_global` plus `xdg_config_harness/<relative_path>` |
+| macOS/Windows platform config | `user_global` plus `platform_config_harness/<relative_path>` after precedence collapse |
+| Typed user-owned persist root | `user_global` plus `configured_user/<stable_config_key>/<relative_path>` |
+| `/etc/harness` skills and rules | `admin` plus `/etc/harness`-relative portable path |
+| Embedded/built-in skills or rules | `system` plus `builtin/<namespace>/<stable_path>` |
+| Runtime-owned prompt settings or synthesized documents | `runtime`; producer implementation belongs to ASC-003 |
+| Repository/user component loaded by runtime | Original source scope and locator, plus `runtime_observed` observation |
+| Runner-owned executable/probe component | `runner`; producer implementation belongs to ASC-004 |
+| Repository/user runtime or MCP component probed by runner | Original source scope and locator, plus `runner_observed` observation |
+
+`HARNESS_DATA_DIR` is persistence configuration, not a component source by
+itself. Arbitrary `SkillStore` or `RuleEngine` discovery paths without typed
+ownership and a persisted configuration key cannot emit v0.1 components; a
+future producer must first classify them as repository, user, admin, or system
+input. This fails closed instead of guessing from an absolute path. This issue
+implements contract examples only, not integrations with those stores.
+ASC-002, ASC-003, and ASC-004 own the repository, runtime-prompt, and
+runtime/MCP producers respectively. User/admin/system inventory outside those
+issues remains intentionally unallocated and requires a new linked spec before
+integration.
 
 `AgentStackComponentId::from_source(kind, source)` is the only component-ID
 derivation. Its exact wire spelling is
@@ -163,8 +249,8 @@ snake_case wire spelling:
 `AgentStackComponent::validate()` returns the first typed invariant violation:
 
 1. exact schema version;
-2. valid scope-specific source locator, including NUL, reserved-sentinel,
-   UUID-shape, and runtime/runner token-grammar rejection;
+2. valid scope-specific source locator, including root namespace, lossless
+   UTF-8, NUL, reserved-sentinel, UUID-shape, and logical-path grammar;
 3. component ID exactly matching the canonical kind/source derivation;
 4. valid optional digest;
 5. observation/selection compatibility;
@@ -202,6 +288,19 @@ misreported as a v0.1 unknown-field syntax failure. Normal Rust construction
 uses `AgentStackComponent::new(...)` and validated setters/builders; struct
 fields that participate in invariants are not publicly mutable.
 
+Wire parsing is platform- and environment-independent. It validates the closed
+scope/root vocabulary and locator syntax but never reads `HOME`,
+`XDG_CONFIG_HOME`, `APPDATA`, the current platform, or the filesystem. Producer
+constructors own environment applicability, root precedence, path conversion,
+and typed discovery errors. Therefore evidence produced on macOS parses
+identically on Linux.
+
+Source scope and observation class are orthogonal. Parsing or constructing a
+stronger observation never rewrites `source` or `component_id`. A repository
+skill discovered by ASC-002 and later loaded by ASC-003 therefore retains the
+same `repository:skill:<locator>` identity while its observation class and
+selection state advance.
+
 ### Test Layout
 
 Keep focused unit tests in `stack/tests.rs` via `#[cfg(test)] mod tests;`.
@@ -230,7 +329,7 @@ or persistence occurs.
 | --- | --- | --- |
 | B-001 | schema constant and version-envelope-first parsing | `cargo test -p harness-core stack::tests::schema_version_is_required_and_exact`; `cargo test -p harness-core stack::tests::unsupported_version_precedes_strict_v01_shape_validation` |
 | B-002 | `AgentStackComponentKind` | `cargo test -p harness-core stack::tests::component_kind_wire_vocabulary_is_closed` |
-| B-003 | canonical component ID plus scope-specific stable locator validation | `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable`; `cargo test -p harness-core stack::tests::user_global_locator_requires_canonical_root_namespace`; `cargo test -p harness-core stack::tests::runtime_and_runner_locators_require_stable_config_keys` |
+| B-003 | source-mapping contract examples, canonical root selection, lossless locator encoding, and component-ID derivation | `cargo test -p harness-core stack::tests::source_mapping_contract_examples_are_canonical`; `cargo test -p harness-core stack::tests::component_identity_is_stable_across_observation_classes`; `cargo test -p harness-core stack::tests::user_global_root_selection_collapses_overlaps_by_precedence`; `cargo test -p harness-core stack::tests::multiple_configured_user_roots_fail_as_ambiguous`; `cargo test -p harness-core stack::tests::wire_parser_is_environment_independent`; `cargo test -p harness-core stack::tests::path_locator_rejects_non_utf8_without_lossy_conversion`; `cargo test -p harness-core stack::tests::portable_segment_encoder_uses_forward_slashes`; `cargo test -p harness-core stack::tests::path_adapter_canonicalizes_curdir_and_rejects_parentdir`; `cargo test -p harness-core stack::tests::windows_drive_letter_casing_is_canonical_equivalent`; `cargo test -p harness-core stack::tests::windows_directory_segment_casing_remains_distinct`; `cargo test -p harness-core stack::tests::logical_path_grammar_covers_system_runtime_and_runner`; `cargo test -p harness-core stack::tests::logical_path_preserves_case_distinct_tool_names` |
 | B-004 | `AgentStackObservationClass` | `cargo test -p harness-core stack::tests::observation_class_round_trips_without_implied_trust` |
 | B-005 | observation/selection validation matrix | `cargo test -p harness-core stack::tests::selection_state_requires_supporting_observation` |
 | B-006 | `Sha256Digest` newtype | `cargo test -p harness-core stack::tests::sha256_digest_rejects_blank_malformed_and_mixed_case_values` |
@@ -262,6 +361,8 @@ or persistence occurs.
   schema version changes.
 - Logic: an incorrect observation/trust ordering could permit evidence
   escalation; exhaustive matrices cover the cross-product.
+- Logic: overlapping user roots could fork stable IDs; the pure selector and
+  synthetic cross-platform collision fixtures enforce one precedence.
 - Performance: validation is bounded by a small capability list and performs
   no I/O.
 - Maintenance: later issues must extend this module rather than copy its
@@ -278,9 +379,26 @@ or persistence occurs.
       display-label locator, duplicate and canonically ordered capability, and
       explicit-null integrity tests.
 - [ ] Prove user-global producers using the same root namespace derive the same
-      locator and reject unknown root namespaces.
-- [ ] Prove reserved runtime/runner spellings are rejected independently in
-      both locator segments, including `codex/unknown`.
+      locator, reject unknown root namespaces, and collapse equal or overlapping
+      XDG/platform roots by the fixed precedence.
+- [ ] Prove multiple equal or nested configured-user roots fail as ambiguous.
+- [ ] Prove system, runtime, and runner logical-path grammar in one
+      table-driven suite, including system's fixed `builtin/` prefix and
+      per-segment UUID, sentinel, and display-label rejection.
+- [ ] Cover every row in the source-mapping contract-example table and prove
+      untyped custom discovery roots fail closed without claiming integration
+      coverage for producers outside this issue.
+- [ ] Prove the wire parser is independent of platform/environment and
+      filesystem path constructors reject non-UTF-8 without lossy conversion.
+- [ ] Prove the path adapter discards `CurDir`, rejects `ParentDir`, and cannot
+      escape the matched root.
+- [ ] Prove the platform-neutral explicit-segment encoder uses `/`, rejects
+      explicit `.` and `..` segments, and preserves existing
+      hyphenated/dotted and case-distinct stable identities.
+- [ ] Prove the platform-neutral root-match helper makes Windows drive-letter
+      casing canonical-equivalent while preserving directory-segment casing.
+- [ ] Prove stronger runtime/runner observation preserves the original source
+      scope, locator, and component ID.
 - [ ] Prove a future-version fixture with v0.1-unknown fields returns the typed
       unsupported-version error before strict v0.1 shape validation.
 - [ ] Add separate typed assertions for JSON syntax/shape failures and domain

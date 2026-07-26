@@ -49,20 +49,27 @@ runtime use or local observation with trusted attestation.
    aliases, and case variants are rejected.
 3. **B-003:** Every component has one canonical stable component ID derived
    exactly as `<source_scope>:<component_kind>:<source_locator>`, one typed
-   source scope, and one non-empty source locator. IDs cannot use UUIDs,
-   mutable display labels, per-scan values, or producer-specific aliases.
-   Repository locators are portable paths relative to the repository root.
-   User-global locators use
-   `<root_namespace>/<portable_relative_path>`, where the closed root namespace
-   identifies the exact Harness user-global discovery root. Neither path form
-   can be absolute or escape with `..`. Runtime and runner locators use
-   `<namespace>/<stable_key>` and reject reserved sentinel, UUID, and
-   display-label wire shapes independently in both segments. Producers must
-   derive `stable_key` from a persisted, versioned configuration identity
-   rather than presentation or per-scan data. The single-component parser
-   validates the wire contract but does not attest that provenance; ASC-005
-   compares snapshots to detect an unauthorized key change for an otherwise
-   unchanged configured source.
+   source scope from `repository`, `user_global`, `admin`, `system`, `runtime`,
+   or `runner`, and one non-empty source locator. IDs cannot use UUIDs, mutable
+   display labels, per-scan values, lossy path conversions, or
+   producer-specific aliases. Repository and admin locators are lossless UTF-8
+   portable paths relative to their fixed roots. User-global locators use
+   `<root_namespace>/<portable_relative_path>` and select one root by the
+   contract's fixed precedence when roots overlap under its lexical comparison.
+   Windows drive-letter casing is canonical-equivalent; other case-varied path
+   segments and symlink aliases remain distinct logical sources. v0.1 accepts at
+   most one configured-user root and rejects ambiguous configuration.
+   System, runtime, and runner locators use a snake_case namespace followed by
+   a stable, case-preserving logical path that losslessly preserves identifiers
+   containing `_`, `-`, and `.`. They reject reserved sentinel, UUID, and
+   display-label wire shapes in every segment. Source scope identifies where a
+   component originates; observation class separately identifies who observed
+   it, so stronger observation never rewrites component identity. Producers
+   must derive logical keys from persisted, versioned configuration identity
+   rather than presentation or per-scan data. The environment-independent wire
+   parser validates syntax but does not attest producer provenance; later
+   producers prove their mapping, and ASC-005 detects unauthorized
+   cross-snapshot identity changes.
 4. **B-004:** Observation class is a closed vocabulary identifying the
    observer boundary: `repository_observed`, `runtime_observed`, or
    `runner_observed`. The class constrains the strongest admissible trust claim
@@ -117,10 +124,12 @@ runtime use or local observation with trusted attestation.
       version, noncanonical component identity, invalid source locator, invalid
       digest, illegal observation/selection combinations, and trust escalation.
 - [ ] Positive fixtures round-trip every component kind, observation class,
-      selection state, trust level, freshness value, and capability.
+      source scope, user-global root, selection state, trust level, freshness
+      value, and capability.
 - [ ] Negative fixtures prove unknown fields, aliases, malformed digests,
       traversal and NUL-containing locators, explicit `null` integrity, missing
-      required values, and impossible evidence combinations fail.
+      required values, non-UTF-8 path inputs, and impossible evidence
+      combinations fail.
 - [ ] Existing `Capability`, `ContextItem`, `CapabilityToken`, and
       `RuntimeKind` types and behavior remain unchanged.
 - [ ] The implementation adds no external dependency and no persistence
@@ -153,6 +162,12 @@ runtime use or local observation with trusted attestation.
   sentinel, or newly generated per-scan value as its source locator.
 - Two user-global producers observe the same root but choose different base
   directories instead of using its canonical root namespace.
+- XDG and platform configuration roots expand to the same or overlapping path.
+- A producer discovers a non-UTF-8 path or an untyped custom discovery root.
+- An admin or built-in component is mislabeled as user-global or repository
+  evidence.
+- A repository component is observed at runtime and incorrectly receives a new
+  runtime-scoped component ID.
 - Capabilities are present but no declared/granted/observed evidence class has
   yet been attached by the later capability-evidence contract.
 

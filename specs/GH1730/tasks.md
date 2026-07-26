@@ -27,6 +27,8 @@ GH-1730
 - Done when:
   - `harness_core::stack` exposes the schema version and every closed enum
     named by the product spec.
+  - Public validated component ID, source locator, digest, component, and parse
+    error types expose read-only accessors without public invariant mutation.
   - Serde uses the exact snake_case wire spellings and rejects unknown enum
     values without aliases or catch-all variants.
   - Observation, selection, trust, and freshness combinations fail closed
@@ -49,14 +51,30 @@ GH-1730
   - Component IDs are derived only from the validated source scope, component
     kind, and source locator.
   - Repository locators are relative to the repository root; user-global
-    locators begin with the closed canonical root namespace for the exact
-    Harness discovery root. Both reject absolute, drive-prefixed, backslash,
-    NUL, empty, dot, and traversal path segments without filesystem access.
-  - Runtime and runner locators enforce the `<namespace>/<stable_key>` wire
-    grammar and reject reserved missing-evidence sentinels, UUIDs, and
-    display-label shapes. Reserved sentinels are rejected independently in
-    both segments. The parser does not claim to verify whether an
-    otherwise-valid key came from persisted configuration.
+    locators use the closed canonical root namespace selected by the pure
+    precedence helper; admin locators are relative to `/etc/harness`; system
+    locators use the built-in logical namespace.
+  - Equal or overlapping user-global roots collapse in the exact order
+    `home_harness`, `xdg_config_harness`, `platform_config_harness`,
+    `configured_user`; more than one configured-user candidate fails as
+    ambiguous.
+  - Filesystem-derived locators reject non-UTF-8, absolute, drive-prefixed,
+    backslash, NUL, empty, and traversal inputs without filesystem access or
+    lossy conversion. Redundant `.` canonicalizes away; `..` fails.
+    Platform-neutral segment encoding joins valid components with `/`.
+  - System, runtime, and runner locators enforce the stable logical-path wire
+    grammar, preserve existing hyphenated/dotted stable identities, and reject
+    reserved missing-evidence sentinels, UUIDs, and display-label shapes.
+    Reserved sentinels are rejected independently in every segment. The parser
+    does not claim to verify whether an otherwise-valid path came from persisted
+    configuration.
+  - Repository, user, admin, and system contract examples map deterministically;
+    untyped custom discovery paths fail closed. Tests do not claim integration
+    coverage for producers outside this issue.
+  - Component source scope and locator remain unchanged when observation class
+    strengthens from repository to runtime or runner observation.
+  - Wire parsing is independent of platform, environment variables, and the
+    filesystem; producer constructors own environment/root applicability.
   - Source locators are validated before their canonical component IDs are
     derived and compared.
   - Integrity accepts only non-zero lowercase SHA-256 values; omission remains
@@ -65,9 +83,19 @@ GH-1730
     invariant failures without an untyped public escape hatch, and checks a
     minimal version envelope before strict v0.1 shape decoding.
 - Verify:
-  - `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable`
-  - `cargo test -p harness-core stack::tests::user_global_locator_requires_canonical_root_namespace`
-  - `cargo test -p harness-core stack::tests::runtime_and_runner_locators_require_stable_config_keys`
+  - `cargo test -p harness-core stack::tests::source_mapping_contract_examples_are_canonical`
+  - `cargo test -p harness-core stack::tests::component_identity_is_stable_across_observation_classes`
+  - `cargo test -p harness-core stack::tests::user_global_root_selection_collapses_overlaps_by_precedence`
+  - `cargo test -p harness-core stack::tests::multiple_configured_user_roots_fail_as_ambiguous`
+  - `cargo test -p harness-core stack::tests::wire_parser_is_environment_independent`
+  - `cargo test -p harness-core stack::tests::path_locator_rejects_non_utf8_without_lossy_conversion`
+  - `cargo test -p harness-core stack::tests::portable_segment_encoder_uses_forward_slashes`
+  - `cargo test -p harness-core stack::tests::path_adapter_canonicalizes_curdir_and_rejects_parentdir`
+  - `cargo test -p harness-core stack::tests::windows_drive_letter_casing_is_canonical_equivalent`
+  - `cargo test -p harness-core stack::tests::windows_directory_segment_casing_remains_distinct`
+  - `cargo test -p harness-core stack::tests::logical_path_grammar_covers_system_runtime_and_runner`
+  - `cargo test -p harness-core stack::tests::logical_path_preserves_case_distinct_tool_names`
+  - `cargo test -p harness-core stack::tests::untyped_custom_discovery_source_fails_closed`
   - `cargo test -p harness-core stack::tests::source_locator_rejects_reserved_sentinels`
   - `cargo test -p harness-core stack::tests::runtime_locator_rejects_reserved_segments`
   - `cargo test -p harness-core stack::tests::portable_path_locator_rejects_nul`
@@ -105,6 +133,10 @@ GH-1730
     illegal observation/selection/trust cross-product.
   - Exact-shape fixtures prove canonical identity, capability ordering,
     optional-integrity behavior, and unknown-field rejection.
+  - Source contract fixtures cover repository, user, admin, system, runtime,
+    and runner examples plus overlapping-root, non-UTF-8, portable-segment,
+    path-adapter, Windows root-casing, logical-identity casing, and
+    observation-stability cases.
   - Negative fixtures separately prove JSON syntax/shape failures and typed
     domain validation failures.
 - Verify:
