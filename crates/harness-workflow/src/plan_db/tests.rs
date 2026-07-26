@@ -269,7 +269,8 @@ async fn legacy_plan_db_migration_backfills_once() -> anyhow::Result<()> {
 
     let result = std::panic::AssertUnwindSafe(async {
         let mut legacy_plan = ExecPlan::from_spec("# Legacy plan", &target_data_dir)?;
-        legacy_plan.purpose = "legacy plan".to_string();
+        let escaped_literal = format!("legacy {}u0000 plan", '\\');
+        legacy_plan.purpose = escaped_literal.clone();
         legacy_db.upsert(&legacy_plan).await?;
 
         let copied =
@@ -284,7 +285,7 @@ async fn legacy_plan_db_migration_backfills_once() -> anyhow::Result<()> {
             .get(&legacy_plan.id)
             .await?
             .expect("legacy plan should be present in the shared schema");
-        assert_eq!(loaded.purpose, "legacy plan");
+        assert_eq!(loaded.purpose, escaped_literal);
         assert!(
             other_db.get(&legacy_plan.id).await?.is_none(),
             "other data_dir scopes must not hydrate legacy plans"
@@ -418,5 +419,113 @@ async fn migration_contract_text_to_jsonb_gin() -> anyhow::Result<()> {
     let parsed: serde_json::Value = serde_json::from_str(&data)?;
     assert_eq!(parsed["status"], serde_json::json!("draft"));
 
+    Ok(())
+}
+
+#[test]
+fn text_to_jsonb_migration_does_not_blindly_rewrite_serialized_json() {
+    let Some(migration) = PLAN_MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 3)
+    else {
+        panic!("plan database migration v3 must exist");
+    };
+
+    assert!(
+        !migration.sql.contains("replace("),
+        "migration v3 must fail closed instead of textually rewriting serialized JSON"
+    );
+}
+
+#[test]
+fn legacy_backfill_copies_jsonb_without_a_textual_round_trip() -> anyhow::Result<()> {
+    let sql = legacy_plan_backfill_sql("h1234", "jsonb")?;
+
+    assert!(!sql.contains("replace("));
+    assert!(!sql.contains("data::text"));
+    assert!(
+        sql.contains("SELECT $1, id, data, created_at, updated_at"),
+        "legacy JSONB must be copied directly: {sql}"
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_backfill_casts_text_without_rewriting_serialized_json() -> anyhow::Result<()> {
+    let sql = legacy_plan_backfill_sql("h1234", "text")?;
+
+    assert!(!sql.contains("replace("));
+    assert!(
+        sql.contains("SELECT $1, id, data::jsonb, created_at, updated_at"),
+        "legacy TEXT must use a fail-closed JSONB cast: {sql}"
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_backfill_rejects_unknown_data_types() {
+    let error = match legacy_plan_backfill_sql("h1234", "bytea") {
+        Ok(sql) => panic!("unsupported source type produced SQL: {sql}"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("unsupported"));
+}
+
+#[tokio::test]
+async fn text_to_jsonb_migration_rejects_nul_without_rewriting_source() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let _permit = db_gate().acquire().await?;
+    let schema = unique_test_schema("plan_db_nul_migration_test");
+    let setup = pg_open_pool(&database_url).await?;
+    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
+        .execute(&setup)
+        .await?;
+    let pool = pg_open_pool_schematized(&database_url, &schema).await?;
+
+    PgMigrator::new(&pool, &PLAN_MIGRATIONS[..2]).run().await?;
+    let source = serde_json::to_string(&serde_json::json!({
+        "id": "nul-migration",
+        "purpose": "a\0b"
+    }))?;
+    sqlx::query("INSERT INTO exec_plans (id, data) VALUES ($1, $2)")
+        .bind("nul-migration")
+        .bind(&source)
+        .execute(&pool)
+        .await?;
+
+    let migration_error = match PgMigrator::new(&pool, PLAN_MIGRATIONS).run().await {
+        Ok(()) => panic!("migration must fail instead of silently rewriting a NUL escape"),
+        Err(error) => error,
+    };
+    assert!(
+        migration_error.to_string().contains("migration v3"),
+        "migration failure must identify the rejected step: {migration_error}"
+    );
+
+    let column_type: String = sqlx::query_scalar(
+        "SELECT data_type
+         FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'exec_plans'
+           AND column_name = 'data'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(column_type, "text", "failed migration must roll back DDL");
+
+    let stored: String = sqlx::query_scalar("SELECT data FROM exec_plans WHERE id = $1")
+        .bind("nul-migration")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(stored, source, "failed migration must preserve source data");
+
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(&setup)
+        .await?;
+    setup.close().await;
     Ok(())
 }

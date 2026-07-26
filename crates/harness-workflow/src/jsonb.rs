@@ -14,34 +14,58 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-static NUL_SANITIZATIONS: AtomicU64 = AtomicU64::new(0);
+static NUL_CHARACTERS_REMOVED: AtomicU64 = AtomicU64::new(0);
 
-/// Total number of values sanitized since process start.
-pub(crate) fn nul_sanitizations_total() -> u64 {
-    NUL_SANITIZATIONS.load(Ordering::Relaxed)
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SanitizationStats {
+    nul_characters_removed: u64,
+    affected_nodes: u64,
+}
+
+impl SanitizationStats {
+    fn record_node(&mut self, nul_characters_removed: u64) {
+        self.nul_characters_removed = self
+            .nul_characters_removed
+            .saturating_add(nul_characters_removed);
+        self.affected_nodes = self.affected_nodes.saturating_add(1);
+    }
+}
+
+/// Total number of NUL characters removed since process start.
+#[cfg(test)]
+pub(crate) fn nul_characters_removed_total() -> u64 {
+    NUL_CHARACTERS_REMOVED.load(Ordering::Relaxed)
+}
+
+fn record_nul_characters_removed(count: u64) -> u64 {
+    match NUL_CHARACTERS_REMOVED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(count))
+    }) {
+        Ok(previous) => previous.saturating_add(count),
+        Err(current) => current,
+    }
 }
 
 /// Serialize `value` as a JSON string safe to bind to a Postgres `jsonb` column.
 ///
 /// NUL characters are removed from string contents and object keys. Removal is
-/// data loss, so it is counted and logged at error level with the serialized
-/// type and the JSON pointers that were affected — never the values themselves,
-/// which may carry secrets.
+/// data loss, so it is counted and logged at error level. Logs contain only the
+/// serialized type and scalar counts, never values, object keys, or paths.
 pub(crate) fn to_jsonb_string<T>(value: &T) -> anyhow::Result<String>
 where
     T: Serialize + ?Sized,
 {
     let mut json = serde_json::to_value(value)?;
-    let mut affected = Vec::new();
-    strip_nul(&mut json, &mut String::new(), &mut affected);
+    let stats = strip_nul(&mut json)?;
 
-    if !affected.is_empty() {
-        NUL_SANITIZATIONS.fetch_add(affected.len() as u64, Ordering::Relaxed);
+    if stats.nul_characters_removed > 0 {
+        let total_nul_characters_removed =
+            record_nul_characters_removed(stats.nul_characters_removed);
         tracing::error!(
             entity_type = std::any::type_name::<T>(),
-            removals = affected.len(),
-            pointers = ?affected,
-            total_sanitizations = nul_sanitizations_total(),
+            nul_characters_removed = stats.nul_characters_removed,
+            affected_nodes = stats.affected_nodes,
+            total_nul_characters_removed,
             "stripped NUL characters before jsonb write; stored value differs from the input"
         );
     }
@@ -49,57 +73,53 @@ where
     Ok(serde_json::to_string(&json)?)
 }
 
-/// Remove NUL characters in place, recording an RFC 6901 pointer per affected node.
-fn strip_nul(value: &mut Value, path: &mut String, affected: &mut Vec<String>) {
+/// Remove NUL characters in place and return bounded scalar statistics.
+fn strip_nul(value: &mut Value) -> anyhow::Result<SanitizationStats> {
+    let mut stats = SanitizationStats::default();
+    strip_nul_into(value, &mut stats)?;
+    Ok(stats)
+}
+
+fn strip_nul_into(value: &mut Value, stats: &mut SanitizationStats) -> anyhow::Result<()> {
     match value {
         Value::String(text) => {
-            if text.contains('\0') {
+            let removed = text.chars().filter(|ch| *ch == '\0').count() as u64;
+            if removed > 0 {
                 text.retain(|ch| ch != '\0');
-                affected.push(path.clone());
+                stats.record_node(removed);
             }
         }
         Value::Array(items) => {
-            for (index, item) in items.iter_mut().enumerate() {
-                let restore = path.len();
-                path.push('/');
-                path.push_str(&index.to_string());
-                strip_nul(item, path, affected);
-                path.truncate(restore);
+            for item in items {
+                strip_nul_into(item, stats)?;
             }
         }
         Value::Object(entries) => {
             if entries.keys().any(|key| key.contains('\0')) {
                 let mut rekeyed = Map::with_capacity(entries.len());
                 for (key, item) in std::mem::take(entries) {
-                    if key.contains('\0') {
-                        let restore = path.len();
-                        path.push('/');
-                        path.push_str(&escape_token(&key));
-                        affected.push(path.clone());
-                        path.truncate(restore);
+                    let sanitized_key = key.replace('\0', "");
+                    if rekeyed.contains_key(&sanitized_key) {
+                        anyhow::bail!(
+                            "refusing jsonb sanitization because object keys would collide"
+                        );
                     }
-                    // A rekey can collide with an existing key; last write wins,
-                    // matching the previous textual behavior.
-                    rekeyed.insert(key.replace('\0', ""), item);
+                    let removed = key.chars().filter(|ch| *ch == '\0').count() as u64;
+                    if removed > 0 {
+                        stats.record_node(removed);
+                    }
+                    rekeyed.insert(sanitized_key, item);
                 }
                 *entries = rekeyed;
             }
 
-            for (key, item) in entries.iter_mut() {
-                let restore = path.len();
-                path.push('/');
-                path.push_str(&escape_token(key));
-                strip_nul(item, path, affected);
-                path.truncate(restore);
+            for item in entries.values_mut() {
+                strip_nul_into(item, stats)?;
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
-}
-
-/// RFC 6901 reference-token escaping.
-fn escape_token(key: &str) -> String {
-    key.replace('~', "~0").replace('/', "~1")
+    Ok(())
 }
 
 #[cfg(test)]
@@ -160,6 +180,16 @@ mod tests {
     }
 
     #[test]
+    fn every_removed_nul_is_counted() {
+        let stats = sanitization_stats(serde_json::json!({
+            "summary": "a\0b\0c"
+        }));
+
+        assert_eq!(stats.nul_characters_removed, 2);
+        assert_eq!(stats.affected_nodes, 1);
+    }
+
+    #[test]
     fn real_nul_is_stripped_from_nested_values_and_keys() {
         let value = serde_json::json!({
             "outer": { "in\0ner": ["ok", "x\0y"] }
@@ -174,41 +204,63 @@ mod tests {
         );
     }
 
-    fn affected_pointers(mut value: Value) -> Vec<String> {
-        let mut affected = Vec::new();
-        strip_nul(&mut value, &mut String::new(), &mut affected);
-        affected
+    #[test]
+    fn colliding_sanitized_keys_fail_closed() {
+        let value = serde_json::json!({
+            "ab": "original",
+            "a\0b": "would overwrite"
+        });
+
+        let error = to_jsonb_string(&value)
+            .expect_err("sanitizing colliding object keys must not discard either value");
+
+        assert!(
+            error.to_string().contains("collide"),
+            "collision error must explain the failure without revealing keys: {error}"
+        );
+        assert!(
+            !error.to_string().contains("would overwrite"),
+            "collision error must not reveal values: {error}"
+        );
+    }
+
+    fn sanitization_stats(mut value: Value) -> SanitizationStats {
+        match strip_nul(&mut value) {
+            Ok(stats) => stats,
+            Err(error) => panic!("test fixture must not contain colliding keys: {error}"),
+        }
     }
 
     #[test]
-    fn every_affected_node_is_reported_by_pointer() {
-        let affected = affected_pointers(serde_json::json!({
+    fn characters_and_affected_nodes_are_counted_separately() {
+        let stats = sanitization_stats(serde_json::json!({
             "a": "x\0y",
-            "b": ["ok", "z\0"],
+            "b": ["ok", "z\0\0"],
             "c": { "k\0": "clean" }
         }));
 
-        assert_eq!(affected, vec!["/a", "/b/1", "/c/k\0"]);
+        assert_eq!(stats.nul_characters_removed, 4);
+        assert_eq!(stats.affected_nodes, 3);
     }
 
     #[test]
     fn clean_values_report_nothing() {
-        let affected = affected_pointers(serde_json::json!({
+        let stats = sanitization_stats(serde_json::json!({
             "a": "xy",
             "b": content_with_escaped_literal()
         }));
 
-        assert!(affected.is_empty(), "unexpected reports: {affected:?}");
+        assert_eq!(stats, SanitizationStats::default());
     }
 
     /// The process-wide counter is monotonic; other tests share it, so this
     /// only asserts that a sanitization advances it.
     #[test]
-    fn sanitization_advances_the_counter() {
-        let before = nul_sanitizations_total();
+    fn sanitization_advances_the_character_counter() {
+        let before = nul_characters_removed_total();
 
         to_jsonb_string(&serde_json::json!({ "a": "x\0y", "b": "z\0" })).unwrap();
 
-        assert!(nul_sanitizations_total() >= before + 2);
+        assert!(nul_characters_removed_total() >= before + 2);
     }
 }
