@@ -51,7 +51,7 @@ harness_binary_freshness() {
     local bin="$1"
     local root="$2"
     local depinfo="${bin}.d"
-    local bin_mtime="" dep_mtime="" line="" deps="" dep=""
+    local bin_mtime="" dep_mtime="" line="" deps="" dep="" relative_dep=""
     local checked=0 had_noglob=0
 
     root="$(_harness_bf_squeeze_slashes "$root")"
@@ -90,9 +90,18 @@ harness_binary_freshness() {
     for dep in $deps; do
         dep="${dep//$'\x1f'/ }"
         [ -n "$dep" ] || continue
+        case "$dep" in
+            /*) ;;
+            *) dep="$root/$dep" ;;
+        esac
         dep="$(_harness_bf_squeeze_slashes "$dep")"
         case "$dep" in
-            "$root"/*) ;;
+            "$root"/*)
+                relative_dep="${dep#"$root"/}"
+                case "/$relative_dep/" in
+                    */../*) continue ;;
+                esac
+                ;;
             *) continue ;;
         esac
         if [ ! -e "$dep" ]; then

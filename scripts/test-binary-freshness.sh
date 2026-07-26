@@ -71,6 +71,27 @@ expect_state() {
 fix="$(new_fixture fresh)"
 expect_state "fresh binary" fresh "$fix"
 
+fix="$(new_fixture relative-depinfo-fresh)"
+printf 'target/release/harness: src/main.rs\n' \
+    > "$fix/target/release/harness.d"
+touch -t "$OLD_TS" "$fix/target/release/harness.d"
+expect_state "relative dep-info input (fresh)" fresh "$fix"
+
+fix="$(new_fixture relative-depinfo-stale)"
+printf 'target/release/harness: src/main.rs\n' \
+    > "$fix/target/release/harness.d"
+touch -t "$OLD_TS" "$fix/target/release/harness.d"
+touch "$fix/src/main.rs"
+expect_state "relative dep-info input (stale)" stale "$fix"
+
+fix="$(new_fixture relative-depinfo-parent-escape)"
+printf 'outside build input\n' > "$FIXTURE_ROOT/outside.rs"
+printf 'target/release/harness: src/main.rs ../outside.rs\n' \
+    > "$fix/target/release/harness.d"
+touch -t "$OLD_TS" "$fix/src/main.rs" "$fix/target/release/harness.d"
+touch "$FIXTURE_ROOT/outside.rs"
+expect_state "relative dep-info parent escape is ignored" fresh "$fix"
+
 fix="$(new_fixture stale-newer-input)"
 touch "$fix/src/main.rs"
 expect_state "build input newer than binary" stale "$fix"
@@ -114,6 +135,30 @@ expect_state "missing root manifest" unverifiable "$fix"
 # --- start-harness-codex-safe.sh integration cases -----------------------
 
 STARTER="$REPO_ROOT/scripts/start-harness-codex-safe.sh"
+
+if [ -e "/proc/$$/exe" ] && command -v sleep > /dev/null 2>&1; then
+    fix="$(new_fixture starter-live-proc-executable)"
+    mkdir -p "$fix/target/debug" "$fix/.harness/local"
+    cp "$(command -v sleep)" "$fix/target/debug/harness"
+    printf '%s/target/debug/harness: %s/src/main.rs\n' "$fix" "$fix" \
+        > "$fix/target/debug/harness.d"
+    touch -t "$OLD_TS" "$fix/target/debug/harness.d"
+    "$fix/target/debug/harness" 30 &
+    live_pid=$!
+    printf '%s\n' "$live_pid" > "$fix/.harness/local/harness-39410.pid"
+    set +e
+    output="$(cd "$fix" && "$STARTER" --port 39410 2>&1)"
+    status=$?
+    set -e
+    kill "$live_pid" 2>/dev/null || true
+    wait "$live_pid" 2>/dev/null || true
+    if [ "$status" -eq 0 ] &&
+        printf '%s' "$output" | grep -q "binary=$fix/target/debug/harness"; then
+        pass "starter reports exact Linux procfs live executable"
+    else
+        fail "starter procfs executable report: exit=$status output=$output"
+    fi
+fi
 
 if ! command -v lsof > /dev/null 2>&1; then
     echo "SKIP: lsof unavailable; starter integration cases not run" >&2

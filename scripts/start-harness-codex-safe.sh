@@ -218,14 +218,23 @@ listener_pid_for_port() {
 # Reports binary freshness separately from process health. Prefers the
 # executable of the given live PID when it is a repository-local binary,
 # otherwise falls back to the selected or default repository binary.
+live_executable_for_pid() {
+  local live_pid="$1"
+  if [[ -e "/proc/$live_pid/exe" ]]; then
+    readlink "/proc/$live_pid/exe" 2>/dev/null || true
+    return 0
+  fi
+  ps -p "$live_pid" -o comm= 2>/dev/null | tail -1 || true
+}
+
 report_binary_freshness() {
   local live_pid="${1:-}"
   local assessed="" exe="" state=""
   if [[ -n "$live_pid" ]]; then
-    # ps comm output can be truncated or relative on some platforms; when it
-    # does not resolve to a repository-local binary we fall back to the
-    # default candidate below and always print which binary was assessed.
-    exe="$(ps -p "$live_pid" -o comm= 2>/dev/null | tail -1 || true)"
+    # Linux ps comm output is only a process name, so prefer the exact procfs
+    # executable link. Other platforms use ps comm and fall back below when it
+    # does not identify a repository-local binary.
+    exe="$(live_executable_for_pid "$live_pid")"
     case "$exe" in
       "$PWD"/target/*|./target/*|target/*)
         assessed="$exe"
