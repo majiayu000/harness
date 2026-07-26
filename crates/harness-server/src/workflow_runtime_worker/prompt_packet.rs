@@ -563,7 +563,7 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
             "on_succeeded": {
                 "reducer_next_state": "done",
-                "success_requires": "A succeeded implement_prompt result MUST include validation evidence via validation records or a validation_report artifact.",
+                "success_requires": "A succeeded implement_prompt result MUST carry either a validation_report artifact — a non-empty array of {command, exit_code} entries — or a no_change_rationale string artifact explaining why no change was made. Free-text validation records do not satisfy this; completion is rejected without one of the two artifacts. Reporting a non-zero exit_code is allowed: report truthfully rather than omitting a failing command.",
                 "required_summary": "Include changed files, validation commands, and remaining blockers."
             },
             "on_failed": {

@@ -1,7 +1,8 @@
+use super::prompt_completion_evidence::{prompt_completion_evidence, PromptCompletionEvidence};
 use super::support::{runtime_blocked_command, runtime_completion_evidence};
 use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
-    WorkflowEvidence, WorkflowInstance, EVIDENCE_PROMPT_COMPLETION,
+    WorkflowEvidence, WorkflowInstance,
 };
 use crate::runtime::prompt_task::{
     parse_external_state_signal, prompt_continuation_state_from_data, ExternalStateSignal,
@@ -163,105 +164,26 @@ fn scope_too_large_decision(
     .high_confidence()
 }
 
-/// The artifact carrying the commands a prompt task ran, as
-/// `[{ "command": ..., "exit_code": ... }]`.
-pub const PROMPT_VALIDATION_REPORT_ARTIFACT: &str = "validation_report";
-
-/// The artifact carrying a prompt task's structured explanation for producing
-/// no change.
-pub const PROMPT_NO_CHANGE_RATIONALE_ARTIFACT: &str = "no_change_rationale";
-
-/// Which alternative satisfied the completion contract, or why neither did.
-enum PromptCompletionEvidence {
-    ValidationReport { commands: usize, failures: usize },
-    NoChangeRationale,
-}
-
-impl PromptCompletionEvidence {
-    fn evidence(&self) -> WorkflowEvidence {
-        match self {
-            Self::ValidationReport { commands, failures } => WorkflowEvidence::new(
-                EVIDENCE_PROMPT_COMPLETION,
-                format!(
-                    "validation_report: {commands} command(s) reported, {failures} non-zero exit(s)"
-                ),
-            ),
-            Self::NoChangeRationale => WorkflowEvidence::new(
-                EVIDENCE_PROMPT_COMPLETION,
-                "no_change_rationale: the task reported no change with a stated reason",
-            ),
-        }
+/// Attach the completion evidence when the contract is enforced. With the kill
+/// switch off there is nothing to attach and the transition table has no
+/// matching requirement.
+fn with_completion_evidence(
+    decision: WorkflowDecision,
+    completion: Option<PromptCompletionEvidence>,
+) -> WorkflowDecision {
+    match completion {
+        Some(completion) => decision.with_evidence(completion.evidence()),
+        None => decision,
     }
 }
 
-/// Resolve the disjunctive completion contract: a prompt task may claim Done
-/// only if it presented a validation report or an explicit no-change rationale.
+/// Block with a reason precise enough to act on.
 ///
-/// `TransitionRule::required_evidence` is a conjunctive set, so the OR is
-/// resolved here and a single umbrella evidence kind is minted. The transition
-/// table then requires only that kind, and a done-decision that bypasses this
-/// check still fails validation.
-fn prompt_completion_evidence(result: &ActivityResult) -> Result<PromptCompletionEvidence, String> {
-    if let Some(artifact) = find_artifact(result, PROMPT_VALIDATION_REPORT_ARTIFACT) {
-        let entries = artifact.as_array().ok_or_else(|| {
-            format!("`{PROMPT_VALIDATION_REPORT_ARTIFACT}` must be an array of {{command, exit_code}} entries")
-        })?;
-        if entries.is_empty() {
-            return Err(format!(
-                "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` is empty; report the commands you ran or supply `{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}`"
-            ));
-        }
-        let mut failures = 0usize;
-        for entry in entries {
-            let command = entry.get("command").and_then(Value::as_str);
-            let exit_code = entry.get("exit_code").and_then(Value::as_i64);
-            match (command, exit_code) {
-                (Some(command), Some(exit_code)) => {
-                    if command.trim().is_empty() {
-                        return Err(format!(
-                            "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` entry has an empty `command`"
-                        ));
-                    }
-                    if exit_code != 0 {
-                        failures += 1;
-                    }
-                }
-                _ => {
-                    return Err(format!(
-                        "each `{PROMPT_VALIDATION_REPORT_ARTIFACT}` entry needs a string `command` and an integer `exit_code`"
-                    ));
-                }
-            }
-        }
-        return Ok(PromptCompletionEvidence::ValidationReport {
-            commands: entries.len(),
-            failures,
-        });
-    }
-    if let Some(artifact) = find_artifact(result, PROMPT_NO_CHANGE_RATIONALE_ARTIFACT) {
-        let rationale = artifact.as_str().ok_or_else(|| {
-            format!("`{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}` must be a string explaining why no change was made")
-        })?;
-        if rationale.trim().is_empty() {
-            return Err(format!(
-                "`{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}` is empty; state why no change was made"
-            ));
-        }
-        return Ok(PromptCompletionEvidence::NoChangeRationale);
-    }
-    Err(format!(
-        "completion requires a `{PROMPT_VALIDATION_REPORT_ARTIFACT}` artifact ([{{command, exit_code}}]) or a `{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}` string artifact"
-    ))
-}
-
-fn find_artifact<'a>(result: &'a ActivityResult, artifact_type: &str) -> Option<&'a Value> {
-    result
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.artifact_type == artifact_type)
-        .map(|artifact| &artifact.artifact)
-}
-
+/// Like its sibling prompt-task blocks (exhausted, no-progress, scope-too-large)
+/// this classifies as a terminal stop, not a transient one: the auto-recovery
+/// scheduler must not silently re-run an agent that just failed to produce
+/// evidence, since nothing in a bare retry tells it what was missing. Recovery
+/// is the operator unblock path, which carries the detail below.
 fn missing_completion_evidence_decision(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
@@ -289,7 +211,7 @@ fn single_shot_done_decision(
             return missing_completion_evidence_decision(instance, event, result, &detail)
         }
     };
-    WorkflowDecision::new(
+    let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
         "finish_prompt_task",
@@ -297,9 +219,8 @@ fn single_shot_done_decision(
         "prompt implementation activity completed successfully",
     )
     .with_command(mark_done_command(instance, result, None))
-    .with_evidence(runtime_completion_evidence(event, result))
-    .with_evidence(completion.evidence())
-    .high_confidence()
+    .with_evidence(runtime_completion_evidence(event, result));
+    with_completion_evidence(decision, completion).high_confidence()
 }
 
 fn settled_done_decision(
@@ -315,7 +236,7 @@ fn settled_done_decision(
             return missing_completion_evidence_decision(instance, event, result, &detail)
         }
     };
-    WorkflowDecision::new(
+    let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
         "finish_prompt_task_external_settled",
@@ -327,9 +248,8 @@ fn settled_done_decision(
     )
     .with_command(mark_done_command(instance, result, Some(continuation)))
     .with_evidence(runtime_completion_evidence(event, result))
-    .with_evidence(signal.evidence())
-    .with_evidence(completion.evidence())
-    .high_confidence()
+    .with_evidence(signal.evidence());
+    with_completion_evidence(decision, completion).high_confidence()
 }
 
 fn continue_decision(
@@ -516,9 +436,13 @@ fn external_state_evidence_summary(result: &ActivityResult) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::prompt_completion_evidence::{
+        PROMPT_NO_CHANGE_RATIONALE_ARTIFACT, PROMPT_VALIDATION_REPORT_ARTIFACT,
+    };
     use super::*;
     use crate::runtime::model::{
         ActivityArtifact, ActivitySignal, ValidationRecord, WorkflowSubject,
+        EVIDENCE_PROMPT_COMPLETION,
     };
     use crate::runtime::prompt_task::PromptContinuationPolicy;
     use std::collections::BTreeSet;

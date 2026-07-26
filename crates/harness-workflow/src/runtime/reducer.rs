@@ -2,6 +2,7 @@ pub(crate) mod declarative_completion;
 mod github_issue_completion;
 mod plan_issue_completion;
 mod pr_feedback_completion;
+mod prompt_completion_evidence;
 mod prompt_task_completion;
 mod quality_gate_completion;
 mod runtime_failure;
@@ -520,6 +521,11 @@ fn prompt_task_activity_matches(instance: &WorkflowInstance, result: &ActivityRe
     )
 }
 
+/// The outer structured-output gate. It fires before the prompt-task reducer,
+/// so its message must name the same two artifacts the reducer demands —
+/// otherwise a result with no evidence at all would be told only that
+/// "validation evidence" was missing, while a result carrying agent prose would
+/// get the precise reason.
 fn prompt_task_success_contract_error(
     instance: &WorkflowInstance,
     result: &ActivityResult,
@@ -527,13 +533,14 @@ fn prompt_task_success_contract_error(
     if prompt_task_has_validation_evidence(result) {
         return None;
     }
+    const MISSING: &str = "implement_prompt succeeded without completion evidence: attach a validation_report artifact ([{command, exit_code}]) or a no_change_rationale string artifact";
     match prompt_continuation_state_from_data(&instance.data) {
         Ok(Some(continuation)) => match parse_external_state_signal(result) {
             Ok(signal) if continuation.policy.active_states.contains(&signal.state) => None,
             Err(_) => None,
-            _ => Some("implement_prompt succeeded without validation evidence"),
+            _ => Some(MISSING),
         },
-        Ok(None) => Some("implement_prompt succeeded without validation evidence"),
+        Ok(None) => Some(MISSING),
         Err(_) => None,
     }
 }

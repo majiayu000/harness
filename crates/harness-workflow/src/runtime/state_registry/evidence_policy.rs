@@ -20,7 +20,45 @@ pub fn apply_builtin_evidence_enforcement(enforced: bool) -> anyhow::Result<()> 
         .apply_builtin_evidence_enforcement(enforced)
 }
 
+/// Whether the registered definition still demands `evidence_kind` for this
+/// transition.
+///
+/// Reducers refuse to build a claim-only terminal decision in the first place,
+/// so that the agent gets a precise reason instead of a bare rejection. They
+/// ask this rather than tracking enforcement separately: the transition table
+/// is the single authority, so the kill switch that strips a requirement lifts
+/// the reducer gate with it, and the two layers cannot drift apart.
+pub fn transition_requires_evidence(
+    definition_id: &str,
+    from_state: &str,
+    to_state: &str,
+    evidence_kind: &str,
+) -> bool {
+    registry()
+        .read()
+        .expect("workflow definition registry lock poisoned")
+        .transition_requires_evidence(definition_id, from_state, to_state, evidence_kind)
+}
+
 impl WorkflowDefinitionRegistry {
+    /// Whether `definition_id`'s rule for this transition declares
+    /// `evidence_kind`. Unknown definitions and unknown transitions declare
+    /// nothing.
+    pub fn transition_requires_evidence(
+        &self,
+        definition_id: &str,
+        from_state: &str,
+        to_state: &str,
+        evidence_kind: &str,
+    ) -> bool {
+        self.definition(definition_id).is_some_and(|definition| {
+            definition
+                .allowlist
+                .rule_for(from_state, to_state)
+                .is_some_and(|rule| rule.required_evidence.contains(evidence_kind))
+        })
+    }
+
     /// Re-register the built-in definitions under the given completion-evidence
     /// policy. Disabling enforcement strips the declared evidence requirements
     /// while leaving every other transition rule intact.
@@ -97,6 +135,49 @@ mod tests {
             let expected = builtin.allowlist.rules().count();
             assert_eq!(registered.allowlist.rules().count(), expected);
         }
+    }
+
+    #[test]
+    fn the_kill_switch_lifts_the_reducer_gate_with_the_transition_requirement() {
+        // Reducers ask `transition_requires_evidence` rather than tracking
+        // enforcement separately, so stripping the requirement must make that
+        // query answer false — otherwise an operator who disabled the contract
+        // would still be blocked by the reducer.
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        assert!(registry.transition_requires_evidence(
+            crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+            "done",
+            crate::runtime::model::EVIDENCE_PROMPT_COMPLETION,
+        ));
+
+        registry
+            .apply_builtin_evidence_enforcement(false)
+            .expect("kill switch applies to a registry holding the built-ins");
+
+        assert!(!registry.transition_requires_evidence(
+            crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+            "done",
+            crate::runtime::model::EVIDENCE_PROMPT_COMPLETION,
+        ));
+    }
+
+    #[test]
+    fn unknown_definitions_and_transitions_declare_nothing() {
+        let registry = WorkflowDefinitionRegistry::with_builtins();
+        assert!(!registry.transition_requires_evidence(
+            "no_such_definition",
+            "implementing",
+            "done",
+            crate::runtime::model::EVIDENCE_PROMPT_COMPLETION,
+        ));
+        assert!(!registry.transition_requires_evidence(
+            crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+            "no_such_state",
+            crate::runtime::model::EVIDENCE_PROMPT_COMPLETION,
+        ));
     }
 
     #[test]

@@ -52,10 +52,6 @@ fn prompt_task_without_policy_ignores_forged_structured_continuation() {
                 "Completed the single-shot prompt task.",
             )
             .with_validation(ValidationRecord::new("cargo test", "passed"))
-    .with_artifact(ActivityArtifact::new(
-        "validation_report",
-        json!([{ "command": "cargo test", "exit_code": 0 }]),
-    ))
             .with_artifact(ActivityArtifact::new(
                 "validation_report",
                 json!([{ "command": "cargo test", "exit_code": 0 }]),
