@@ -64,17 +64,46 @@ variant. The component and nested source structs use `deny_unknown_fields`.
 Required strings remain `String` in the serialized shape but construction and
 `validate()` reject blank values.
 
+The exact v0.1 wire object has these fields in this struct declaration order:
+
+```json
+{
+  "schema_version": "agent-stack-component/v0.1",
+  "component_id": "repository:skills/example/SKILL.md",
+  "kind": "skill",
+  "source": {
+    "scope": "repository",
+    "locator": "skills/example/SKILL.md"
+  },
+  "observation_class": "repository_observed",
+  "selection_state": "discovered",
+  "integrity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "capabilities": [],
+  "trust_level": "repository_observed",
+  "freshness": "unknown"
+}
+```
+
+All fields except `integrity` are required. `source` contains exactly `scope`
+and `locator`; neither the top-level object nor `source` accepts unknown
+fields. `integrity` uses
+`#[serde(skip_serializing_if = "Option::is_none")]`, so absence is omission,
+not JSON `null`. Deserialization rejects a missing required field rather than
+inventing a default.
+
 `AgentStackSourceScope` contains explicit `repository`, `user_global`,
 `runtime`, and `runner` values. Repository locators use `/`-separated
 repository-relative strings. Platform-neutral validation rejects leading `/`,
-backslashes, and empty, `.`, or `..` segments before accepting the locator; it
-does not use platform-specific `std::path::Component` semantics or access the
-filesystem. Other scopes require a non-empty opaque locator and are never
-rewritten into repository paths.
+backslashes, Windows drive prefixes such as `C:`, and empty, `.`, or `..`
+segments before accepting the locator; it does not use platform-specific
+`std::path::Component` semantics or access the filesystem. Other scopes
+require a non-empty opaque locator and are never rewritten into repository
+paths.
 
 Integrity is represented by `Option<Sha256Digest>`, where `Sha256Digest` is a
 validated newtype around the 64-character lowercase hexadecimal wire value.
-This issue validates supplied digests but does not hash content. Digest
+The all-zero value is rejected as the missing-integrity sentinel prohibited by
+B-010. This issue validates supplied digests but does not hash content. Digest
 calculation belongs to inventory and snapshot producers.
 
 Capabilities use the sensitivity vocabulary required by B-007. They are kept
@@ -99,10 +128,10 @@ can reject duplicates instead of silently deduplicating untrusted evidence.
 Validation canonicalizes their order only after uniqueness has been proven.
 
 Repository observations permit only `discovered`, `eligible`, or `selected`.
-Runtime observations permit through `loaded`; runner observations permit every
-state. A repository-level `selected` claim does not prove runtime loading or
-use. `observed` requires runtime or runner observation. Trust may be equal to
-or weaker than the observation source but never stronger. `self_declared` is
+Runtime and runner observations permit every selection state. A
+repository-level `selected` claim does not prove runtime loading or use.
+`observed` requires runtime or runner observation. Trust may be equal to or
+weaker than the observation source but never stronger. `self_declared` is
 accepted for every observation source.
 
 Deserialization performs validation through a private wire representation and
@@ -115,8 +144,10 @@ not publicly mutable.
 
 Keep focused unit tests in `stack/tests.rs` via `#[cfg(test)] mod tests;`.
 Table-driven tests enumerate every enum wire value and legal
-observation/selection/trust combination. Negative JSON fixtures remain
-schema-shaped so they test invariant rejection rather than JSON syntax.
+observation/selection/trust combination. Exact-shape fixtures verify required
+field names, nested source fields, declaration-order serialization, omission
+of absent integrity, and rejection of unknown fields. Negative JSON fixtures
+remain schema-shaped so they test invariant rejection rather than JSON syntax.
 
 ## Data Flow
 
