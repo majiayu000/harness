@@ -2,7 +2,7 @@
 
 # Harness
 
-**Run fleets of parallel coding agents with governance — orchestrate, police, review, and observe Claude Code / Codex at scale.**
+**Ship code with a fleet of AI agents you can actually trust — orchestrated, policed, reviewed, and observable.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](Cargo.toml)
@@ -29,6 +29,52 @@
 AI development is no longer one agent in one terminal — it is fleets of agents working in parallel across issues, branches, and repositories. The hard problems move up a level: who assigns the work, what each agent is allowed to do, who reviews the output, and what happens when a run goes wrong at 3 a.m.
 
 Harness is a Rust-native control plane for that fleet. It wraps AI coding agents (Claude Code, Codex, Anthropic API) with structured lifecycle management, policy enforcement, and continuous feedback loops. Instead of replacing agents, it standardizes how they run, what they're allowed to do, and how their output is reviewed.
+
+## Install
+
+Build from source (no prebuilt binaries or Homebrew formula yet):
+
+```bash
+git clone https://github.com/majiayu000/harness.git
+cd harness
+cargo build --release -p harness-cli
+# binary at ./target/release/harness
+```
+
+Requires Rust 1.88+. That's all for the CLI — Postgres, Bun, and a GitHub
+token are only needed for the server / fleet features below.
+
+## Quickstart: run one agent task
+
+The only prerequisite is one local agent runtime on your `PATH` —
+[`claude`](https://docs.anthropic.com/en/docs/claude-code) (default) or
+[`codex`](https://github.com/openai/codex) — or an `ANTHROPIC_API_KEY` for the
+direct API adapter.
+
+```bash
+./target/release/harness exec "Fix the failing test in src/lib.rs"
+```
+
+Harness picks the first available agent, runs it against the current directory
+with a `workspace-write` sandbox hint, and prints the agent's final response to
+stdout.
+
+Useful flags: `--project <dir>`, `--agent claude|codex|anthropic-api`,
+`--model <id>`, `--sandbox-mode read-only`, `--output-file result.md`.
+
+## Level up: the fleet control plane
+
+For parallel agents, task queues, cross-agent review, and the web dashboard,
+start the server (needs Postgres 14+; Docker for the bundled one):
+
+```bash
+bash scripts/dev-db.sh      # start local Postgres via Docker Compose
+./start-server.sh           # build (if needed) and start the server
+curl http://127.0.0.1:9800/health
+```
+
+Full server setup, configuration, and workflows are covered in
+[Quick Start](#quick-start) below.
 
 ## Key Features
 
@@ -72,31 +118,18 @@ Harness is a Rust-native control plane for that fleet. It wraps AI coding agents
 
 ## Quick Start
 
-### Prerequisites
+CLI install and one-shot execution are covered in [Install](#install) and
+[Quickstart](#quickstart-run-one-agent-task) above. This section covers the
+server and development setup.
 
-- Rust 1.88+
+### Server prerequisites
+
 - Bun 1.1+ for release builds that embed the web dashboard. If `web/dist` is
   already built, release builds can reuse it.
 - Postgres 14+. For local development, `scripts/dev-db.sh` starts the bundled
   Docker Compose Postgres service.
 - A GitHub token for issue/PR automation. Use `gh auth login`, `GITHUB_TOKEN`,
   `GH_TOKEN`, or `server.github_token`.
-- At least one agent runtime for autonomous execution:
-  - [`codex`](https://github.com/openai/codex) CLI
-  - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI
-  - Anthropic API key (for direct API adapter)
-
-### Build
-
-```bash
-git clone https://github.com/majiayu000/harness.git
-cd harness
-cargo build --release -p harness-cli
-```
-
-`./start-server.sh` also builds the release CLI automatically when
-`./target/release/harness` is missing, but running the build yourself keeps the
-startup prerequisite explicit.
 
 ### Rust API Facade
 
