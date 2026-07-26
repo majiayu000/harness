@@ -80,10 +80,8 @@ every `target/cargo-*` universe, `make gc-target`, and Python tests
   if `flock` is unavailable on the platform) is skipped and reported as
   skipped, replacing the current "do not run during builds" doc-comment
   honor system.
-- **Scheduled invocation** — a maintenance entry point (launchd/cron
-  wrapper alongside the existing `scripts/gc-scheduled.sh` pattern) runs
-  the script with `--delete` after the rollout gate in product Rollout
-  Notes is met.
+- **Scheduled invocation** — a new launchd/cron wrapper runs the script
+  with `--delete` after the rollout gate in product Rollout Notes is met.
 - **Scope guard** — the script keeps refusing to operate outside the
   resolved repo `target/` root and never follows symlinks out of it.
 - **Tests** — extend `scripts/test_gc_target.py` to cover the new
