@@ -1,4 +1,4 @@
-use super::HarnessConfig;
+use super::{workflow::load_workflow_config, HarnessConfig};
 
 fn workflow_breaker_harness_config_toml(workflow_section: &str) -> String {
     format!(
@@ -51,6 +51,7 @@ fn workflow_breaker_harness_config_toml(workflow_section: &str) -> String {
 #[test]
 fn workflow_circuit_breaker_config_defaults() {
     let config = HarnessConfig::default();
+    assert!(config.workflow.completion_evidence_enforced);
     let breaker = &config.workflow.circuit_breaker;
 
     assert!(breaker.enabled);
@@ -60,6 +61,88 @@ fn workflow_circuit_breaker_config_defaults() {
     assert_eq!(breaker.cooldown_secs, 600);
     assert_eq!(breaker.backoff_factor, 2.0);
     assert_eq!(breaker.max_cooldown_secs, 7200);
+}
+
+#[test]
+fn harness_config_deserializes_completion_evidence_kill_switch() {
+    let toml_str = workflow_breaker_harness_config_toml(
+        r#"
+        [workflow]
+        completion_evidence_enforced = false
+        "#,
+    );
+
+    let config: HarnessConfig = toml::from_str(&toml_str).unwrap();
+    assert!(!config.workflow.completion_evidence_enforced);
+}
+
+#[test]
+fn harness_config_rejects_unknown_completion_evidence_key() {
+    let toml_str = workflow_breaker_harness_config_toml(
+        r#"
+        [workflow]
+        runtime_completion_evidence_enforced = false
+        "#,
+    );
+
+    let error = toml::from_str::<HarnessConfig>(&toml_str)
+        .expect_err("an unknown kill-switch key must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `runtime_completion_evidence_enforced`"));
+}
+
+#[test]
+fn harness_config_rejects_legacy_root_completion_evidence_key() {
+    let toml_str = format!(
+        "runtime_completion_evidence_enforced = false\n{}",
+        workflow_breaker_harness_config_toml("")
+    );
+
+    let error = toml::from_str::<HarnessConfig>(&toml_str)
+        .expect_err("a legacy root kill-switch key must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `runtime_completion_evidence_enforced`"));
+}
+
+#[test]
+fn project_workflow_rejects_deployment_completion_evidence_key() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+runtime_worker:
+  completion_evidence_enforced: false
+---
+"#,
+    )?;
+
+    let error = load_workflow_config(dir.path())
+        .expect_err("the deployment-global switch must not be accepted in project config");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+    Ok(())
+}
+
+#[test]
+fn project_workflow_rejects_legacy_root_completion_evidence_key() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+runtime_completion_evidence_enforced: false
+---
+"#,
+    )?;
+
+    let error = load_workflow_config(dir.path())
+        .expect_err("the legacy project kill-switch key must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `runtime_completion_evidence_enforced`"));
+    Ok(())
 }
 
 #[test]

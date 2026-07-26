@@ -186,6 +186,7 @@ impl<'de> Deserialize<'de> for HarnessConfig {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct HarnessConfigInput {
             server: ServerConfig,
             agents: AgentsConfig,

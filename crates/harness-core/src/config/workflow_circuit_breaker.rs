@@ -1,9 +1,23 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct WorkflowRuntimeConfig {
+    /// Enforce the declared completion-evidence contract on built-in workflow
+    /// transitions for this Harness deployment. Kill switch for one release;
+    /// enforcement is the default.
+    pub completion_evidence_enforced: bool,
     #[serde(default)]
     pub circuit_breaker: RuntimeCircuitBreakerPolicy,
+}
+
+impl Default for WorkflowRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            completion_evidence_enforced: true,
+            circuit_breaker: RuntimeCircuitBreakerPolicy::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

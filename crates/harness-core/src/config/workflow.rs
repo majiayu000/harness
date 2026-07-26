@@ -282,6 +282,7 @@ pub struct RuntimeDispatchProfileOverride {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerPolicy {
     #[serde(default)]
     pub enabled: bool,
@@ -291,10 +292,6 @@ pub struct RuntimeWorkerPolicy {
     pub concurrency: u32,
     #[serde(default = "default_runtime_worker_lease_ttl_secs")]
     pub lease_ttl_secs: u64,
-    /// Enforce the declared completion-evidence contract on built-in workflow
-    /// transitions. Kill switch for one release; enforcement is the default.
-    #[serde(default = "default_true")]
-    pub completion_evidence_enforced: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -335,6 +332,7 @@ pub struct WorkflowMemoryPolicy {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<WorkflowDefinitionPolicy>,
@@ -476,7 +474,6 @@ impl Default for RuntimeWorkerPolicy {
             interval_secs: default_runtime_worker_interval_secs(),
             concurrency: default_runtime_worker_concurrency(),
             lease_ttl_secs: default_runtime_worker_lease_ttl_secs(),
-            completion_evidence_enforced: true,
         }
     }
 }
