@@ -51,9 +51,12 @@ runtime use or local observation with trusted attestation.
    source scope, and one non-empty source locator. Repository-relative
    locators cannot be absolute or escape with `..`; non-repository sources must
    use their declared scope instead of pretending to be repository files.
-4. **B-004:** Observation class is closed and ordered by meaning, not implied
-   trust: `repository_observed`, `runtime_observed`, or `runner_observed`.
-   Repository observation never means that a component was selected or used.
+4. **B-004:** Observation class is a closed vocabulary identifying the
+   observer boundary: `repository_observed`, `runtime_observed`, or
+   `runner_observed`. The class constrains the strongest admissible trust claim
+   but does not by itself prove selection, loading, or execution. Repository
+   observation may report repository-level selection, but never proves that a
+   runtime loaded or used the component.
 5. **B-005:** Selection state is exactly one of `discovered`, `eligible`,
    `selected`, `loaded`, or `observed`. A component may report only a state
    supported by its observation: repository-only evidence cannot report

@@ -66,8 +66,9 @@ Required strings remain `String` in the serialized shape but construction and
 
 `AgentStackSourceScope` contains explicit `repository`, `user_global`,
 `runtime`, and `runner` values. Repository locators use `/`-separated
-repository-relative strings. Validation uses `std::path::Component` to reject
-absolute, parent, root, and platform-prefix components without accessing the
+repository-relative strings. Platform-neutral validation rejects leading `/`,
+backslashes, and empty, `.`, or `..` segments before accepting the locator; it
+does not use platform-specific `std::path::Component` semantics or access the
 filesystem. Other scopes require a non-empty opaque locator and are never
 rewritten into repository paths.
 
@@ -93,9 +94,14 @@ these identifiers in declared/granted/observed evidence without changing them.
 6. observation/trust compatibility;
 7. no duplicate capability values.
 
+Capabilities remain a sequence in the wire representation so deserialization
+can reject duplicates instead of silently deduplicating untrusted evidence.
+Validation canonicalizes their order only after uniqueness has been proven.
+
 Repository observations permit only `discovered`, `eligible`, or `selected`.
 Runtime observations permit through `loaded`; runner observations permit every
-state. `observed` requires runtime or runner observation. Trust may be equal to
+state. A repository-level `selected` claim does not prove runtime loading or
+use. `observed` requires runtime or runner observation. Trust may be equal to
 or weaker than the observation source but never stronger. `self_declared` is
 accepted for every observation source.
 
