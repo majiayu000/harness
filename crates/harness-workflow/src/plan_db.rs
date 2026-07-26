@@ -165,14 +165,9 @@ impl PlanDb {
     }
 
     pub async fn upsert(&self, plan: &ExecPlan) -> anyhow::Result<()> {
-        let data = serde_json::to_string(plan)?;
-        // PostgreSQL JSONB rejects \u0000; serde_json encodes NUL as the
-        // 6-char escape sequence, so strip that form (not the literal byte).
-        let data = if data.contains("\\u0000") {
-            data.replace("\\u0000", "")
-        } else {
-            data
-        };
+        // PostgreSQL JSONB rejects NUL; stripping happens at the JSON value
+        // level so escaped literals are not corrupted (see crate::jsonb).
+        let data = crate::jsonb::to_jsonb_string(plan)?;
         sqlx::query(
             "INSERT INTO exec_plans (store_key, id, data) VALUES ($1, $2, $3::jsonb)
              ON CONFLICT(store_key, id) DO UPDATE SET data = EXCLUDED.data,
