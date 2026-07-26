@@ -1,4 +1,6 @@
-use crate::claude_adapter::{parse_stream_json_line, parse_stream_json_usage};
+use crate::claude_adapter::{
+    parse_stream_json_events, parse_stream_json_result_failure, parse_stream_json_usage,
+};
 use crate::streaming::send_stream_item;
 use harness_core::{
     agent::{AgentEvent, StreamItem},
@@ -15,6 +17,9 @@ pub(crate) struct ParsedClaudeStreamOutput {
     pub(crate) raw_stdout: String,
     pub(crate) output: String,
     pub(crate) token_usage: TokenUsage,
+    /// Terminal `result` failure reported by the CLI (emitted with exit code
+    /// 0), so success cannot be inferred from the process status alone.
+    pub(crate) failure: Option<String>,
     completed: bool,
 }
 
@@ -53,8 +58,8 @@ fn apply_claude_stream_line(
     }
 
     let usage = parse_stream_json_usage(line);
-    let event = parse_stream_json_line(line);
-    if usage.is_none() && event.is_none() && !is_json_line(line) {
+    let events = parse_stream_json_events(line);
+    if usage.is_none() && events.is_empty() && !is_json_line(line) {
         push_plaintext_line(line, parsed, emitted_items);
         return;
     }
@@ -64,30 +69,49 @@ fn apply_claude_stream_line(
         emitted_items.push(StreamItem::TokenUsage { usage });
     }
 
+    if let Some(failure) = parse_stream_json_result_failure(line) {
+        // Do not also emit a StreamItem::Error here: the failure is reported
+        // exactly once, through the Err path of the execution call, so the
+        // turn lifecycle does not persist the same error twice.
+        parsed.failure = Some(failure);
+        parsed.completed = true;
+        return;
+    }
+
+    for event in events {
+        apply_claude_stream_event(event, parsed, emitted_items);
+    }
+}
+
+fn apply_claude_stream_event(
+    event: AgentEvent,
+    parsed: &mut ParsedClaudeStreamOutput,
+    emitted_items: &mut Vec<StreamItem>,
+) {
     match event {
-        Some(AgentEvent::MessageDelta { text }) => {
+        AgentEvent::MessageDelta { text } => {
             parsed.output.push_str(&text);
             emitted_items.push(StreamItem::MessageDelta { text });
         }
-        Some(AgentEvent::ToolOutputDelta { item_id, text }) => {
+        AgentEvent::ToolOutputDelta { item_id, text } => {
             emitted_items.push(StreamItem::ToolOutputDelta { item_id, text });
         }
-        Some(AgentEvent::ItemStartedPayload { item }) => {
+        AgentEvent::ItemStartedPayload { item } => {
             emitted_items.push(StreamItem::ItemStarted { item });
         }
-        Some(AgentEvent::ItemCompletedPayload { item }) => {
+        AgentEvent::ItemCompletedPayload { item } => {
             emitted_items.push(StreamItem::ItemCompleted { item });
         }
-        Some(AgentEvent::ApprovalRequest { id, command }) => {
+        AgentEvent::ApprovalRequest { id, command } => {
             emitted_items.push(StreamItem::ApprovalRequest { id, command });
         }
-        Some(AgentEvent::Warning { message }) => {
+        AgentEvent::Warning { message } => {
             emitted_items.push(StreamItem::Warning { message });
         }
-        Some(AgentEvent::Error { message }) => {
+        AgentEvent::Error { message } => {
             emitted_items.push(StreamItem::Error { message });
         }
-        Some(AgentEvent::TurnCompleted { output }) => {
+        AgentEvent::TurnCompleted { output } => {
             if !output.is_empty() {
                 if parsed.output.is_empty() {
                     emitted_items.push(StreamItem::MessageDelta {
@@ -103,7 +127,7 @@ fn apply_claude_stream_line(
             });
             parsed.completed = true;
         }
-        Some(AgentEvent::ToolCall { name, input }) => {
+        AgentEvent::ToolCall { name, input } => {
             emitted_items.push(StreamItem::ItemCompleted {
                 item: Item::ToolCall {
                     name,
@@ -112,13 +136,10 @@ fn apply_claude_stream_line(
                 },
             });
         }
-        Some(
-            AgentEvent::TurnStarted
-            | AgentEvent::ItemStarted { .. }
-            | AgentEvent::ItemCompleted
-            | AgentEvent::TokenUsage { .. },
-        )
-        | None => {}
+        AgentEvent::TurnStarted
+        | AgentEvent::ItemStarted { .. }
+        | AgentEvent::ItemCompleted
+        | AgentEvent::TokenUsage { .. } => {}
     }
 }
 
@@ -211,6 +232,10 @@ pub(crate) async fn stream_claude_code_output(
         } else {
             format!("claude exited with {status}: stdout_tail=[{stdout_tail}]")
         }));
+    }
+
+    if let Some(failure) = &parsed.failure {
+        return Err(HarnessError::AgentExecution(failure.clone()));
     }
 
     if !parsed.completed {
