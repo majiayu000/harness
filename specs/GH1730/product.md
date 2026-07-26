@@ -47,8 +47,10 @@ runtime use or local observation with trusted attestation.
    `instructions`, `skill`, `mcp_server`, `mcp_tool`, `hook`, `memory`,
    `policy`, `workflow`, `validation`, and `agent_runtime`. Unknown spellings,
    aliases, and case variants are rejected.
-3. **B-003:** Every component has one non-empty stable component ID, one typed
-   source scope, and one non-empty source locator. Repository-relative
+3. **B-003:** Every component has one canonical stable component ID derived
+   exactly as `<source_scope>:<component_kind>:<source_locator>`, one typed
+   source scope, and one non-empty source locator. IDs cannot use UUIDs,
+   mutable display labels, or producer-specific aliases. Repository-relative
    locators cannot be absolute or escape with `..`; non-repository sources must
    use their declared scope instead of pretending to be repository files.
 4. **B-004:** Observation class is a closed vocabulary identifying the
@@ -95,14 +97,15 @@ runtime use or local observation with trusted attestation.
 - [ ] Public Rust types represent every field and closed vocabulary in
       B-001 through B-010 without `serde_json::Value` or `Any`-like public
       escape hatches.
-- [ ] A typed validation error distinguishes unsupported version, blank
-      identity, invalid source locator, invalid digest, illegal
-      observation/selection combinations, and trust escalation.
+- [ ] The public JSON parser preserves whether input failed JSON syntax or a
+      typed validation invariant; validation errors distinguish unsupported
+      version, invalid or unstable identity, invalid source locator, invalid
+      digest, illegal observation/selection combinations, and trust escalation.
 - [ ] Positive fixtures round-trip every component kind, observation class,
       selection state, trust level, freshness value, and capability.
 - [ ] Negative fixtures prove unknown fields, aliases, malformed digests,
-      traversal locators, missing required values, and impossible evidence
-      combinations fail.
+      traversal locators, explicit `null` integrity, missing required values,
+      and impossible evidence combinations fail.
 - [ ] Existing `Capability`, `ContextItem`, `CapabilityToken`, and
       `RuntimeKind` types and behavior remain unchanged.
 - [ ] The implementation adds no external dependency and no persistence

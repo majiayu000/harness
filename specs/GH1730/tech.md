@@ -69,7 +69,7 @@ The exact v0.1 wire object has these fields in this struct declaration order:
 ```json
 {
   "schema_version": "agent-stack-component/v0.1",
-  "component_id": "repository:skills/example/SKILL.md",
+  "component_id": "repository:skill:skills/example/SKILL.md",
   "kind": "skill",
   "source": {
     "scope": "repository",
@@ -86,10 +86,12 @@ The exact v0.1 wire object has these fields in this struct declaration order:
 
 All fields except `integrity` are required. `source` contains exactly `scope`
 and `locator`; neither the top-level object nor `source` accepts unknown
-fields. `integrity` uses
-`#[serde(skip_serializing_if = "Option::is_none")]`, so absence is omission,
-not JSON `null`. Deserialization rejects a missing required field rather than
-inventing a default.
+fields. `integrity` uses a custom `deserialize_with` function plus a missing
+field default, and `#[serde(skip_serializing_if = "Option::is_none")]` for
+output. A missing field becomes `None`, serialization omits `None`, and an
+explicit JSON `null` is rejected rather than being accepted as absence.
+Deserialization rejects a missing required field rather than inventing a
+default.
 
 `AgentStackSourceScope` contains explicit `repository`, `user_global`,
 `runtime`, and `runner` values. Repository locators use `/`-separated
@@ -99,6 +101,14 @@ segments before accepting the locator; it does not use platform-specific
 `std::path::Component` semantics or access the filesystem. Other scopes
 require a non-empty opaque locator and are never rewritten into repository
 paths.
+
+`AgentStackComponentId::from_source(kind, source)` is the only component-ID
+derivation. Its exact wire spelling is
+`<source_scope>:<component_kind>:<source_locator>` using the closed snake_case
+enum spellings and the validated locator. Construction and parsing recompute
+that value and reject any supplied ID that differs, so UUIDs, mutable labels,
+and producer-specific aliases cannot create parallel identities for the same
+source.
 
 Integrity is represented by `Option<Sha256Digest>`, where `Sha256Digest` is a
 validated newtype around the 64-character lowercase hexadecimal wire value.
@@ -110,14 +120,17 @@ Capabilities use the sensitivity vocabulary required by B-007. They are kept
 distinct from `types::Capability`, which describes broad adapter support, and
 from `CapabilityToken`, which grants scoped write authority. ASC-008 will wrap
 these identifiers in declared/granted/observed evidence without changing them.
+Canonical serialization sorts capabilities lexicographically by their exact
+snake_case wire spelling:
+`destructive`, `file_write`, `network`, `privileged`, `production_write`,
+`secret_read`, `shell`.
 
 ### Validation Invariants
 
 `AgentStackComponent::validate()` returns the first typed invariant violation:
 
 1. exact schema version;
-2. non-empty component ID that is not a reserved missing-evidence sentinel
-   such as `unknown-component`;
+2. component ID exactly matching the canonical kind/source derivation;
 3. valid source scope and locator;
 4. valid optional digest;
 5. observation/selection compatibility;
@@ -126,7 +139,8 @@ these identifiers in declared/granted/observed evidence without changing them.
 
 Capabilities remain a sequence in the wire representation so deserialization
 can reject duplicates instead of silently deduplicating untrusted evidence.
-Validation canonicalizes their order only after uniqueness has been proven.
+Validation sorts by the exact wire spelling above only after uniqueness has
+been proven.
 
 Repository observations permit only `discovered`, `eligible`, or `selected`.
 Runtime and runner observations permit every selection state. A
@@ -135,29 +149,37 @@ repository-level `selected` claim does not prove runtime loading or use.
 weaker than the observation source but never stronger. `self_declared` is
 accepted for every observation source.
 
-Deserialization performs validation through a private wire representation and
-`TryFrom`, so invalid external JSON cannot create a public component that only
-fails later. Normal Rust construction uses `AgentStackComponent::new(...)` and
-validated setters/builders; struct fields that participate in invariants are
-not publicly mutable.
+`AgentStackComponent` implements deterministic `Serialize` but does not expose
+raw untyped `Deserialize`. Public `AgentStackComponent::from_json(&str)` first
+parses a private wire representation and then applies `TryFrom`, returning
+`AgentStackComponentParseError::Syntax` for JSON syntax/shape failures or
+`AgentStackComponentParseError::Validation(AgentStackComponentError)` for
+domain-invariant failures. This preserves the typed validation cause instead
+of flattening it into `serde_json::Error`. Normal Rust construction uses
+`AgentStackComponent::new(...)` and validated setters/builders; struct fields
+that participate in invariants are not publicly mutable.
 
 ### Test Layout
 
 Keep focused unit tests in `stack/tests.rs` via `#[cfg(test)] mod tests;`.
 Table-driven tests enumerate every enum wire value and legal
 observation/selection/trust combination. Exact-shape fixtures verify required
-field names, nested source fields, declaration-order serialization, omission
-of absent integrity, and rejection of unknown fields. Negative JSON fixtures
-remain schema-shaped so they test invariant rejection rather than JSON syntax.
+field names, nested source fields, canonical component identity, declaration-
+order serialization, exact capability ordering, omission of absent integrity,
+rejection of explicit `null`, and rejection of unknown fields. Negative JSON
+fixtures remain schema-shaped so they test typed invariant rejection separately
+from malformed-JSON syntax failures.
 
 ## Data Flow
 
-Producer input → typed component constructor or serde wire representation →
-ordered invariant validation → immutable `AgentStackComponent` → deterministic
-serde output.
+Producer input → typed component constructor or typed JSON parser → ordered
+invariant validation and canonicalization → immutable `AgentStackComponent` →
+deterministic serde output.
 
-Failure returns `AgentStackComponentError`; no default component, alias,
-warning-only fallback, filesystem mutation, or persistence occurs.
+Constructor failure returns `AgentStackComponentError`; JSON input failure
+returns `AgentStackComponentParseError` while retaining any nested validation
+cause. No default component, alias, warning-only fallback, filesystem mutation,
+or persistence occurs.
 
 ## Product-to-Test Mapping
 
@@ -165,7 +187,7 @@ warning-only fallback, filesystem mutation, or persistence occurs.
 | --- | --- | --- |
 | B-001 | schema constant and deserialization validation | `cargo test -p harness-core stack::tests::schema_version_is_required_and_exact` |
 | B-002 | `AgentStackComponentKind` | `cargo test -p harness-core stack::tests::component_kind_wire_vocabulary_is_closed` |
-| B-003 | source scope and locator validation | `cargo test -p harness-core stack::tests::repository_source_rejects_absolute_and_parent_paths` |
+| B-003 | canonical component ID plus source scope and locator validation | `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable` |
 | B-004 | `AgentStackObservationClass` | `cargo test -p harness-core stack::tests::observation_class_round_trips_without_implied_trust` |
 | B-005 | observation/selection validation matrix | `cargo test -p harness-core stack::tests::selection_state_requires_supporting_observation` |
 | B-006 | `Sha256Digest` newtype | `cargo test -p harness-core stack::tests::sha256_digest_rejects_blank_malformed_and_mixed_case_values` |
@@ -173,7 +195,7 @@ warning-only fallback, filesystem mutation, or persistence occurs.
 | B-008 | observation/trust validation matrix | `cargo test -p harness-core stack::tests::trust_cannot_exceed_observation_source` |
 | B-009 | `AgentStackFreshness` | `cargo test -p harness-core stack::tests::missing_freshness_is_explicitly_unknown` |
 | B-010 | constructors and optional-field validation | `cargo test -p harness-core stack::tests::missing_optional_facts_are_not_fabricated` |
-| B-011 | serde attributes and round-trip table | `cargo test -p harness-core stack::tests::all_component_values_round_trip_deterministically` |
+| B-011 | serde attributes, canonical capability order, and round-trip table | `cargo test -p harness-core stack::tests::all_component_values_round_trip_in_canonical_wire_order` |
 | B-012 | manifest scope and existing core tests | `git diff --name-only origin/main...HEAD`; `cargo test -p harness-core` |
 
 ## Alternatives Considered
@@ -208,8 +230,11 @@ warning-only fallback, filesystem mutation, or persistence occurs.
       every kind.
 - [ ] Add exhaustive observation × selection and observation × trust tables.
 - [ ] Add schema-valid negative fixtures for unknown fields and aliases.
-- [ ] Add digest, blank/reserved identity, drive-prefixed and traversal locator,
-      and duplicate capability tests.
+- [ ] Add digest, canonical identity, drive-prefixed and traversal locator,
+      duplicate and canonically ordered capability, and explicit-null integrity
+      tests.
+- [ ] Add separate typed assertions for JSON syntax/shape failures and domain
+      validation failures.
 - [ ] Run `cargo check -p harness-core --all-targets`.
 - [ ] Run `cargo test -p harness-core stack`.
 - [ ] Run `cargo test -p harness-core`.
