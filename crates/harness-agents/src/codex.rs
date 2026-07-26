@@ -192,6 +192,10 @@ impl CodexAgent {
         let sandbox_spec = SandboxSpec::new(req.sandbox_mode, &req.project_root);
 
         let mut spawn_env_vars = req.env_vars.clone();
+        spawn_env_vars.insert(
+            crate::spawn_contract::REVIEW_GIT_SAFE_WORKSPACE_ENV.to_string(),
+            "1".to_string(),
+        );
         let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
         run_identity.write_env_vars(&mut spawn_env_vars);
         if self.cloud.enabled {

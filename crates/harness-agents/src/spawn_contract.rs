@@ -31,6 +31,7 @@ const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
 const AGENT_EGRESS_PROXY_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY";
 const CONTAINER_EGRESS_ALLOWLIST_ENV: &str = "HARNESS_AGENT_EGRESS_ALLOWLIST";
 const CONTAINER_WORKSPACE: &str = "/workspace";
+pub(crate) const REVIEW_GIT_SAFE_WORKSPACE_ENV: &str = "HARNESS_AGENT_REVIEW_GIT_SAFE_WORKSPACE";
 
 pub(crate) struct AgentSpawnInput<'a> {
     pub(crate) program: &'a Path,
@@ -99,10 +100,18 @@ impl AgentSpawnContract for ContainerSpawn {
         args.push(OsString::from("--workdir"));
         args.push(OsString::from(CONTAINER_WORKSPACE));
         args.push(OsString::from("--mount"));
-        args.push(OsString::from(format!(
+        let mut workspace_mount = format!(
             "type=bind,src={},dst={CONTAINER_WORKSPACE}",
             workspace.display()
-        )));
+        );
+        if matches!(
+            input.sandbox_spec.mode,
+            harness_core::config::agents::SandboxMode::ReadOnly
+                | harness_core::config::agents::SandboxMode::ReadOnlyWithNetwork
+        ) {
+            workspace_mount.push_str(",readonly");
+        }
+        args.push(OsString::from(workspace_mount));
         args.push(OsString::from("--network"));
         args.push(OsString::from(container_network_mode(
             input.env_vars,
@@ -126,6 +135,16 @@ impl AgentSpawnContract for ContainerSpawn {
             }
             args.push(OsString::from("--env"));
             args.push(OsString::from("NO_PROXY=localhost,127.0.0.1"));
+        }
+        if review_git_safe_workspace(input.env_vars) {
+            for (key, value) in [
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "safe.directory"),
+                ("GIT_CONFIG_VALUE_0", CONTAINER_WORKSPACE),
+            ] {
+                args.push(OsString::from("--env"));
+                args.push(OsString::from(format!("{key}={value}")));
+            }
         }
         args.push(OsString::from(image));
         args.push(container_program(input.program));
@@ -250,7 +269,14 @@ fn is_spawn_control_env(key: &str) -> bool {
             | AGENT_CONTAINER_IMAGE_ENV
             | AGENT_EGRESS_PROXY_ENV
             | SCOPED_GITHUB_TOKEN_ENV
+            | REVIEW_GIT_SAFE_WORKSPACE_ENV
     )
+}
+
+fn review_git_safe_workspace(env_vars: &HashMap<String, String>) -> bool {
+    env_vars
+        .get(REVIEW_GIT_SAFE_WORKSPACE_ENV)
+        .is_some_and(|value| value == "1")
 }
 
 fn is_operator_secret_env(key: &str) -> bool {
@@ -379,6 +405,9 @@ mod container_spawn_tests {
             "type=bind,src={},dst={CONTAINER_WORKSPACE}",
             std::fs::canonicalize(root.path())?.display()
         )));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("type=bind,") && arg.ends_with(",readonly")));
         assert!(!args
             .iter()
             .any(|arg| arg.contains("/Users/") && arg.contains("home")));

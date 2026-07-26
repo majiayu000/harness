@@ -84,7 +84,7 @@ fn container_review_request(
         base_ref: base_ref.map(str::to_string),
         model: Some("gpt-test".to_string()),
         reasoning_effort: Some("high".to_string()),
-        sandbox_mode: SandboxMode::WorkspaceWrite,
+        sandbox_mode: SandboxMode::ReadOnlyWithNetwork,
         approval_policy: Some("never".to_string()),
         env_vars: env,
     }
@@ -119,8 +119,50 @@ fn review_spawn_uses_container_isolation() -> anyhow::Result<()> {
     assert!(args
         .windows(2)
         .any(|window| window == ["--workdir", "/workspace"]));
+    let Some(mount) = args.iter().find(|arg| arg.starts_with("type=bind,")) else {
+        panic!("container workspace mount is missing");
+    };
+    assert!(mount.ends_with(",readonly"));
+    assert!(args.contains(&"GIT_CONFIG_COUNT=1".to_string()));
+    assert!(args.contains(&"GIT_CONFIG_KEY_0=safe.directory".to_string()));
+    assert!(args.contains(&"GIT_CONFIG_VALUE_0=/workspace".to_string()));
     assert!(!args.iter().any(|arg| arg == "-C"));
     assert!(args.contains(&"review".to_string()));
+    Ok(())
+}
+
+#[test]
+fn container_review_uses_configured_image_and_proxy() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+
+    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
+        dir.path(),
+        Some("origin/main"),
+        vec![
+            (
+                "HARNESS_AGENT_CONTAINER_IMAGE",
+                "example/reviewer:sha256-test",
+            ),
+            (
+                "HARNESS_AGENT_EGRESS_PROXY",
+                "http://review-proxy.local:8080",
+            ),
+            (
+                "HARNESS_AGENT_NETWORK_ALLOWLIST",
+                "api.openai.com,github.com",
+            ),
+            ("OPERATOR_API_KEY", "operator-secret"),
+        ],
+    ))?;
+
+    let args = spawn_args(&spawn);
+    assert!(args.contains(&"example/reviewer:sha256-test".to_string()));
+    assert!(args
+        .windows(2)
+        .any(|window| window == ["--network", "bridge"]));
+    assert!(args.contains(&"HTTPS_PROXY=http://review-proxy.local:8080".to_string()));
+    assert!(!args.iter().any(|arg| arg.contains("operator-secret")));
     Ok(())
 }
 

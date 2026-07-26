@@ -11,8 +11,19 @@ use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 
 const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
+const CODEX_REVIEW_PROCESS_SPAWN_CONTROL_ENV: [&str; 2] = [
+    "HARNESS_AGENT_CONTAINER_IMAGE",
+    "HARNESS_AGENT_EGRESS_PROXY",
+];
 
 fn codex_review_spawn_env(config: &HarnessConfig) -> HashMap<String, String> {
+    codex_review_spawn_env_with(config, |key| std::env::var(key).ok())
+}
+
+fn codex_review_spawn_env_with(
+    config: &HarnessConfig,
+    mut read_process_env: impl FnMut(&str) -> Option<String>,
+) -> HashMap<String, String> {
     let mut env_vars = HashMap::from([(
         AGENT_ISOLATION_TIER_ENV.to_string(),
         config.isolation.default_tier.as_str().to_string(),
@@ -28,6 +39,11 @@ fn codex_review_spawn_env(config: &HarnessConfig) -> HashMap<String, String> {
         .join(",");
     if !allowlist.is_empty() {
         env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
+    }
+    for key in CODEX_REVIEW_PROCESS_SPAWN_CONTROL_ENV {
+        if let Some(value) = read_process_env(key).filter(|value| !value.trim().is_empty()) {
+            env_vars.insert(key.to_string(), value);
+        }
     }
     env_vars
 }
@@ -325,7 +341,7 @@ mod tests {
     };
 
     #[test]
-    fn codex_review_spawn_env_uses_configured_isolation() {
+    fn codex_review_spawn_env_uses_only_configured_spawn_controls() {
         let mut config = HarnessConfig::default();
         config.isolation.default_tier = IsolationTier::Container;
         config.isolation.network_allowlist = vec![
@@ -333,8 +349,22 @@ mod tests {
             " api.openai.com ".to_string(),
             String::new(),
         ];
+        let process_env = HashMap::from([
+            (
+                "HARNESS_AGENT_CONTAINER_IMAGE".to_string(),
+                "example/reviewer:sha256-test".to_string(),
+            ),
+            (
+                "HARNESS_AGENT_EGRESS_PROXY".to_string(),
+                "http://review-proxy.local:8080".to_string(),
+            ),
+            (
+                "OPERATOR_API_KEY".to_string(),
+                "operator-secret".to_string(),
+            ),
+        ]);
 
-        let env_vars = codex_review_spawn_env(&config);
+        let env_vars = codex_review_spawn_env_with(&config, |key| process_env.get(key).cloned());
 
         assert_eq!(
             env_vars.get(AGENT_ISOLATION_TIER_ENV).map(String::as_str),
@@ -346,6 +376,20 @@ mod tests {
                 .map(String::as_str),
             Some("github.com,api.openai.com")
         );
+        assert_eq!(
+            env_vars
+                .get("HARNESS_AGENT_CONTAINER_IMAGE")
+                .map(String::as_str),
+            Some("example/reviewer:sha256-test")
+        );
+        assert_eq!(
+            env_vars
+                .get("HARNESS_AGENT_EGRESS_PROXY")
+                .map(String::as_str),
+            Some("http://review-proxy.local:8080")
+        );
+        assert!(!env_vars.contains_key("OPERATOR_API_KEY"));
+        assert!(!env_vars.values().any(|value| value == "operator-secret"));
     }
 
     #[tokio::test]
