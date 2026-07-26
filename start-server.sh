@@ -3,6 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# shellcheck source=scripts/lib/binary-freshness.sh
+. "scripts/lib/binary-freshness.sh"
+
 CONFIG_PATH="${HARNESS_CONFIG:-}"
 CONFIG_ARGS=()
 HARNESS_BIN="${HARNESS_BIN:-./target/release/harness}"
@@ -271,29 +274,56 @@ ensure_bind_port_available() {
 ensure_bind_port_available
 
 ensure_harness_binary() {
+    local freshness rebuild_reason=""
+
     if [ -e "$HARNESS_BIN" ] && [ ! -x "$HARNESS_BIN" ]; then
         echo "ERROR: Harness binary exists but is not executable: $HARNESS_BIN" >&2
         echo "Remove it or rebuild with: cargo build --release -p harness-cli" >&2
         exit 1
     fi
 
-    if [ -x "$HARNESS_BIN" ]; then
-        return 0
-    fi
-
     if [ "$HARNESS_BIN" != "./target/release/harness" ]; then
+        if [ -x "$HARNESS_BIN" ]; then
+            # Explicit HARNESS_BIN is operator-owned: report freshness but do
+            # not enforce it.
+            harness_binary_freshness "$HARNESS_BIN" "$PWD" > /dev/null
+            freshness="$HARNESS_BINARY_FRESHNESS_STATE"
+            if [ "$freshness" != "fresh" ]; then
+                echo "WARNING: operator-selected Harness binary is ${freshness}: $HARNESS_BIN" >&2
+                echo "WARNING: reason: ${HARNESS_BINARY_FRESHNESS_DETAIL}" >&2
+            fi
+            return 0
+        fi
         echo "ERROR: configured Harness binary not found or not executable: $HARNESS_BIN" >&2
         echo "Set HARNESS_BIN to an executable harness binary or build the default release binary." >&2
         exit 1
     fi
 
+    if [ -x "$HARNESS_BIN" ]; then
+        harness_binary_freshness "$HARNESS_BIN" "$PWD" > /dev/null
+        freshness="$HARNESS_BINARY_FRESHNESS_STATE"
+        if [ "$freshness" = "fresh" ]; then
+            return 0
+        fi
+        rebuild_reason="default release binary is ${freshness}: ${HARNESS_BINARY_FRESHNESS_DETAIL}"
+    fi
+
     if ! command -v cargo >/dev/null 2>&1; then
+        if [ -n "$rebuild_reason" ]; then
+            echo "ERROR: $rebuild_reason" >&2
+            echo "ERROR: cargo is not available to rebuild it; rebuild elsewhere with: cargo build --release -p harness-cli" >&2
+            echo "Or set HARNESS_BIN to an operator-owned binary to bypass freshness enforcement." >&2
+            exit 1
+        fi
         echo "ERROR: $HARNESS_BIN is missing and cargo is not available to build it." >&2
         echo "Install Rust or build the release binary in another environment, then rerun ./start-server.sh." >&2
         exit 1
     fi
 
-    echo "Release Harness binary not found; building it with cargo build --release -p harness-cli..." >&2
+    if [ -n "$rebuild_reason" ]; then
+        echo "Rebuilding Harness because $rebuild_reason" >&2
+    fi
+    echo "Building release Harness binary with cargo build --release -p harness-cli..." >&2
     if ! cargo build --release -p harness-cli; then
         echo "ERROR: failed to build $HARNESS_BIN." >&2
         echo "Install the build prerequisites, then rerun: cargo build --release -p harness-cli" >&2
