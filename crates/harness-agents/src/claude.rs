@@ -285,6 +285,12 @@ impl CodeAgent for ClaudeCodeAgent {
             )));
         }
 
+        // The CLI reports terminal failures via a `result` event while still
+        // exiting 0, so the exit-status check above is not sufficient.
+        if let Some(failure) = parsed.failure {
+            return Err(harness_core::error::HarnessError::AgentExecution(failure));
+        }
+
         Ok(AgentResponse {
             output: parsed.output,
             stderr,

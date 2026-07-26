@@ -201,10 +201,10 @@ impl AgentAdapter for ClaudeAdapter {
                 continue;
             }
 
-            let event = match parse_stream_json_line(&line) {
-                Some(ev) => ev,
-                None => continue,
-            };
+            let events = parse_stream_json_events(&line);
+            if events.is_empty() {
+                continue;
+            }
 
             if let Some(usage) = parse_stream_json_usage(&line) {
                 if tx.send(AgentEvent::TokenUsage { usage }).await.is_err() {
@@ -212,12 +212,19 @@ impl AgentAdapter for ClaudeAdapter {
                 }
             }
 
-            // Accumulate output text for TurnCompleted
-            if let AgentEvent::MessageDelta { ref text } = event {
-                output_buf.push_str(text);
-            }
+            let mut channel_closed = false;
+            for event in events {
+                // Accumulate output text for TurnCompleted
+                if let AgentEvent::MessageDelta { ref text } = event {
+                    output_buf.push_str(text);
+                }
 
-            if tx.send(event).await.is_err() {
+                if tx.send(event).await.is_err() {
+                    channel_closed = true;
+                    break;
+                }
+            }
+            if channel_closed {
                 break;
             }
         }
@@ -365,61 +372,147 @@ fn provider_wait_message(phase: ProviderPhase) -> String {
 
 /// Parse a single line of Claude Code `--output-format stream-json` output.
 ///
-/// Returns `None` for unrecognized event types (forward compatibility).
+/// Returns the first event on the line; use [`parse_stream_json_events`] when a
+/// line can carry several (e.g. an assistant message mixing text and tool_use
+/// content blocks).
 pub fn parse_stream_json_line(line: &str) -> Option<AgentEvent> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    let event_type = v.get("type")?.as_str()?;
+    parse_stream_json_events(line).into_iter().next()
+}
+
+/// Parse a single line of Claude Code `--output-format stream-json` output into
+/// every event it carries, in content-block order.
+///
+/// Returns an empty vec for unrecognized event types (forward compatibility).
+pub fn parse_stream_json_events(line: &str) -> Vec<AgentEvent> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let Some(event_type) = v.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
 
     match event_type {
-        "assistant" => {
-            let text = parse_assistant_text(v.get("message")?)?;
-            Some(AgentEvent::MessageDelta { text })
-        }
+        "assistant" => v
+            .get("message")
+            .map(parse_assistant_events)
+            .unwrap_or_default(),
         "tool_use" => {
-            let name = v.get("name")?.as_str()?.to_string();
+            let Some(name) = v.get("name").and_then(Value::as_str) else {
+                return Vec::new();
+            };
             let input = v.get("input").cloned().unwrap_or(serde_json::Value::Null);
-            Some(AgentEvent::ToolCall { name, input })
+            vec![AgentEvent::ToolCall {
+                name: name.to_string(),
+                input,
+            }]
         }
-        "tool_result" => Some(AgentEvent::ItemCompleted),
-        "result" => {
-            let output = v
-                .get("result")
-                .and_then(|r| r.as_str())
-                .unwrap_or("")
-                .to_string();
-            Some(AgentEvent::TurnCompleted { output })
-        }
+        "tool_result" => vec![AgentEvent::ItemCompleted],
+        "result" => match parse_result_failure_value(&v) {
+            Some(message) => vec![AgentEvent::Error { message }],
+            None => {
+                let output = v
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                vec![AgentEvent::TurnCompleted { output }]
+            }
+        },
         "error" => {
             let message = v
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
-            Some(AgentEvent::Error { message })
+            vec![AgentEvent::Error { message }]
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
-fn parse_assistant_text(message: &Value) -> Option<String> {
-    if let Some(text) = message.as_str() {
-        return Some(text.to_string());
+/// Detect a terminal `result` event that reports failure (`is_error` or an
+/// `error*` subtype). The Claude CLI emits these with exit code 0, so callers
+/// must not rely on the process status to notice the failure.
+pub(crate) fn parse_stream_json_result_failure(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("result") {
+        return None;
+    }
+    parse_result_failure_value(&v)
+}
+
+fn parse_result_failure_value(v: &Value) -> Option<String> {
+    let subtype = v.get("subtype").and_then(Value::as_str).unwrap_or("");
+    let is_error =
+        v.get("is_error").and_then(Value::as_bool) == Some(true) || subtype.starts_with("error");
+    if !is_error {
+        return None;
     }
 
-    let content = message.get("content")?.as_array()?;
-    let text = content
-        .iter()
-        .filter_map(|block| {
-            if block.get("type").and_then(Value::as_str) == Some("text") {
-                block.get("text").and_then(Value::as_str)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let detail = v
+        .get("result")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            v.get("error")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        });
+    let subtype_label = if subtype.is_empty() {
+        "unknown"
+    } else {
+        subtype
+    };
+    Some(match detail {
+        Some(detail) => format!("claude result reported failure ({subtype_label}): {detail}"),
+        None => format!("claude result reported failure ({subtype_label})"),
+    })
+}
 
-    (!text.is_empty()).then_some(text)
+fn parse_assistant_events(message: &Value) -> Vec<AgentEvent> {
+    if let Some(text) = message.as_str() {
+        return vec![AgentEvent::MessageDelta {
+            text: text.to_string(),
+        }];
+    }
+
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut events = Vec::new();
+    let mut text_buf = String::new();
+    for block in content {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    text_buf.push_str(text);
+                }
+            }
+            Some("tool_use") => {
+                if let Some(name) = block.get("name").and_then(Value::as_str) {
+                    if !text_buf.is_empty() {
+                        events.push(AgentEvent::MessageDelta {
+                            text: std::mem::take(&mut text_buf),
+                        });
+                    }
+                    let input = block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    events.push(AgentEvent::ToolCall {
+                        name: name.to_string(),
+                        input,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    if !text_buf.is_empty() {
+        events.push(AgentEvent::MessageDelta { text: text_buf });
+    }
+    events
 }
 
 pub fn parse_stream_json_usage(line: &str) -> Option<TokenUsage> {
