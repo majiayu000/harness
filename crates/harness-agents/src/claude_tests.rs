@@ -821,6 +821,35 @@ printf '{"type":"result","result":"CLAUDECODE=%s ENTRYPOINT=%s CONFIG_DIR=%s"}\n
 }
 
 #[tokio::test]
+async fn execute_times_out_on_hung_agent() {
+    let (dir, script) = write_executable_script("sleep 30");
+    let agent = ClaudeCodeAgent::new(
+        script,
+        "test-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    )
+    .with_stream_timeout(Some(1));
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+
+    let started = std::time::Instant::now();
+    let error = match timeout(Duration::from_secs(10), agent.execute(request)).await {
+        Ok(Ok(response)) => panic!("hung agent must not report success: {response:?}"),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => panic!("execute must fail at the configured timeout, not hang"),
+    };
+    assert!(error.contains("idle timeout"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
 async fn execute_returns_token_usage_from_stream_json_result() {
     let (dir, script) = write_executable_script(
         r#"
