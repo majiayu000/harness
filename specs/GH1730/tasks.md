@@ -73,6 +73,9 @@ GH-1730
     `home_harness`, `xdg_config_harness`, `platform_config_harness`,
     `configured_user`; more than one configured-user candidate fails as
     ambiguous.
+  - The configured-user key segment preserves valid lowercase snake_case and
+    rejects aliases, case variants, UUIDs, reserved sentinels, and display
+    labels before the remaining portable path is accepted.
   - A pure resolver uses absolute XDG when available, otherwise falls back from
     absent or relative XDG to absolute HOME, and returns a typed discovery error
     only when neither root is usable. Its lexically normalized output becomes
@@ -108,6 +111,8 @@ GH-1730
   - `cargo test -p harness-core stack::tests::component_identity_is_stable_across_observation_classes`
   - `cargo test -p harness-core stack::tests::user_global_root_selection_collapses_overlaps_by_precedence`
   - `cargo test -p harness-core stack::tests::multiple_configured_user_roots_fail_as_ambiguous`
+  - `cargo test -p harness-core stack::tests::configured_user_key_uses_strict_snake_case`
+  - `cargo test -p harness-core stack::tests::configured_user_key_rejects_display_uuid_and_reserved_segments`
   - `cargo test -p harness-core stack::tests::xdg_root_falls_back_to_absolute_home_when_xdg_is_missing_or_relative`
   - `cargo test -p harness-core stack::tests::xdg_root_fails_when_xdg_and_home_are_unusable`
   - `cargo test -p harness-core stack::tests::wire_parser_is_environment_independent`
@@ -163,8 +168,8 @@ GH-1730
     separation without a test-only artifact classifier.
   - Source contract fixtures cover repository, user, admin, system, runtime,
     and runner examples plus overlapping-root, non-UTF-8, portable-segment,
-    path-adapter, Windows root-casing, XDG fallback, logical-identity casing,
-    and observation-stability cases.
+    path-adapter, Windows root-casing, configured-user key, XDG fallback,
+    logical-identity casing, and observation-stability cases.
   - Digest fixtures distinguish exact byte encodings and optional-field
     behavior; freshness fixtures exercise the production typed evidence helper
     and exact deadline boundary.

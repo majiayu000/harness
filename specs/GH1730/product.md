@@ -66,7 +66,10 @@ runtime use or local observation with trusted attestation.
    neither input can produce an absolute root.
    Windows drive-letter casing is canonical-equivalent; other case-varied path
    segments and symlink aliases remain distinct logical sources. v0.1 accepts at
-   most one configured-user root and rejects ambiguous configuration.
+   most one configured-user root and rejects ambiguous configuration. A
+   `configured_user` locator's first relative segment is a persisted lowercase
+   snake_case configuration key; display labels, aliases, UUIDs, and reserved
+   missing-evidence spellings are invalid in that position.
    System, runtime, and runner locators use a snake_case namespace followed by
    a stable, case-preserving logical path that losslessly preserves identifiers
    containing `_`, `-`, and `.`. They reject reserved sentinel, UUID, and
@@ -172,8 +175,8 @@ runtime use or local observation with trusted attestation.
       skill usage freshness.
 - [ ] Negative fixtures prove unknown fields, aliases, malformed digests,
       traversal and NUL-containing locators, explicit `null` integrity, missing
-      required values, non-UTF-8 path inputs, and impossible evidence
-      combinations fail.
+      required values, invalid configured-user keys, non-UTF-8 path inputs, and
+      impossible evidence combinations fail.
 - [ ] Existing `Capability`, `ContextItem`, `CapabilityToken`, and
       `RuntimeKind` types and behavior remain unchanged.
 - [ ] The implementation adds no external dependency and no persistence
