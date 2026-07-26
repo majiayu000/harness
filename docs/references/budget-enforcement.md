@@ -38,10 +38,13 @@ So the plumbing for per-request budgets is done and durable.
 Enforcement, however, is delegated entirely to the agent CLI:
 `crates/harness-agents/src/claude.rs:148-150` appends
 `--max-budget-usd <value>` to the Claude CLI invocation when the field
-is set. Harness itself never compares accumulated spend against the
-budget. If the CLI ignores the flag, miscounts, or the adapter is Codex
-or the direct Anthropic API (neither of which receives an equivalent
-cap), the budget is advisory fiction.
+is set — and only on the batch path. The streaming adapter
+(`crates/harness-agents/src/claude_adapter.rs`), which is the runtime's
+live spawn path, never passes the flag at all, and neither the Codex
+nor the direct Anthropic API adapter receives an equivalent cap.
+Harness itself never compares accumulated spend against the budget. So
+even for the one field that exists, coverage is one adapter out of
+four, and honesty depends on that CLI: the budget is advisory fiction.
 
 ### 2. The only subsystem that sets a budget: GC
 
@@ -58,11 +61,17 @@ with `max_budget_usd: None`.
 
 `crates/harness-core/src/config/concurrency.rs:39-40,90` defines
 `max_turns` with a default of 20 (asserted at `concurrency.rs:191`).
-The task path treats the budget as global across the full task
-lifecycle rather than per retry (`task_runner/run_task.rs:68-69`
-records this as the fix for a budget-reset-on-retry bug). Exhaustion
-surfaces as explicit outcomes (`turn_budget_exhausted`,
-`ROUND_BUDGET_EXHAUSTED_REASON`). Candidate fan-out splits the turn
+The now-deleted legacy task layer (removed from main in PR #1725)
+documented in code that the turn budget must be global across the full
+task lifecycle rather than reset per retry — a fix for an actual
+budget-reset-on-retry bug; that precedent is historical, but the bug
+class it names is exactly what B-002 of the companion spec guards
+against for USD ledgers. In surviving code, exhaustion surfaces as
+explicit outcomes: `turn_budget_exhausted`
+(`crates/harness-server/src/workflow_runtime_plan_issue.rs:28,267`) and
+`ROUND_BUDGET_EXHAUSTED_REASON`
+(`crates/harness-server/src/workflow_runtime_submission/runtime_models.rs:8`).
+Candidate fan-out splits the turn
 budget across candidates
 (`runtime/dispatcher.rs:423 apply_candidate_runtime_budget`, keyed on
 `candidate.budget.max_turns_per_candidate`).
@@ -74,9 +83,10 @@ not per-item turns, was the runaway dimension.
 
 ### 4. Usage telemetry: rich, observation-only
 
-`crates/harness-observe/src/usage.rs` defines `UsageMetrics` (input /
-output / cache-read / cache-creation tokens plus
-`reported_total_tokens`) and parses adapter result payloads. The server
+`crates/harness-observe/src/usage.rs` defines `UsageMetrics`
+(`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
+`cache_creation_input_tokens`, plus `reported_total_tokens`) and parses
+adapter result payloads. The server
 exposes nine usage-monitor handler modules
 (`handlers/usage_monitor*.rs`: active, aggregate, candidate,
 local_usage, process, records, plus `token_usage.rs`), and the web

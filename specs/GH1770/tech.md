@@ -11,8 +11,10 @@ GH-1770
 - `crates/harness-core/src/agent.rs:52,126` — `AgentRequest::max_budget_usd:
   Option<f64>`, default `None` (unlimited).
 - `crates/harness-agents/src/claude.rs:148-150` — when set, appended as
-  `--max-budget-usd`; enforcement delegated to the Claude CLI. The Codex
-  and direct Anthropic API adapters receive no equivalent cap.
+  `--max-budget-usd`; enforcement delegated to the Claude CLI. The
+  streaming path `crates/harness-agents/src/claude_adapter.rs` never
+  passes the flag at all today, and the Codex and direct Anthropic API
+  adapters receive no equivalent cap.
 - `crates/harness-server/src/workflow_runtime_submission/runtime_request.rs:53,159,202,245,278`
   — the field survives submission, storage, redispatch, and recovery,
   defaulting to `None`.
@@ -38,7 +40,7 @@ GH-1770
 ### Telemetry without control
 
 - `crates/harness-observe/src/usage.rs` — `UsageMetrics` {input_tokens,
-  output_tokens, cache_read_tokens, cache_creation_tokens,
+  output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
   reported_total_tokens} parsed from adapter result payloads.
 - `crates/harness-server/src/handlers/usage_monitor*.rs` (active,
   aggregate, candidate, local_usage, process, records) +
@@ -137,15 +139,24 @@ the activity share across candidates, mirroring the existing
    (dispatch only when no under-threshold work is claimable). Reasons
    extend the existing `dispatch_barrier.rs` enum and surface through
    the same status paths.
-2. **Adapter flag** (`claude.rs`): populate `max_budget_usd` from the
-   activity share when unset. Codex/direct-API adapters skip the flag;
-   server-side enforcement covers them.
+2. **Adapter flag** (`claude.rs` AND `claude_adapter.rs`): populate
+   `max_budget_usd` from the activity share when unset. Today only the
+   batch path (`claude.rs:148-150`) forwards the flag; the streaming
+   adapter must gain the same argument, and per the project CLI-arg
+   rule any arg-construction change applies to both files, verified by
+   `cargo test --package harness-agents`. Codex/direct-API adapters
+   skip the flag; server-side enforcement covers them.
 3. **Turn-stream watchdog** (`workflow_runtime_worker`): accumulate
    `CostSample`s from streamed usage events; when the activity share is
    crossed mid-turn, request turn interruption via the adapter's
    existing interrupt path (Codex `interrupt`; process termination for
    batch CLIs) and record outcome
-   `ActivityErrorKind::BudgetExhausted`-equivalent (see §5).
+   `ActivityErrorKind::BudgetExhausted`-equivalent (see §5). This is a
+   deliberate departure from
+   `docs/cost-monitoring-dashboard-spec.md`'s "gate new dispatch only"
+   posture: hard per-activity ceilings terminate in-flight turns,
+   because an activity that has already blown its share is precisely
+   the case dispatch-time gating cannot catch.
 4. **Hard workflow ceiling** (reducer): when a completed activity's
    ledger commit crosses `budget_usd`, the reducer emits
    `RequestOperatorAttention` with reason `budget_exhausted` instead of
@@ -196,8 +207,9 @@ remain (harmless).
 - `cargo test -p harness-workflow` — ledger commit atomicity with
   activity completion; dispatcher gate defers with typed reasons;
   reducer operator-attention on ceiling; no ledger reset across
-  retry/redispatch/recovery (regression guard mirroring the
-  budget-reset-on-retry fix noted in `task_runner/run_task.rs:68`).
+  retry/redispatch/recovery (regression guard for the
+  budget-reset-on-retry bug class documented in the legacy task layer
+  before its removal in PR #1725).
 - `cargo test -p harness-server` — shadow vs enforce behavior, monitor
   payload fields, daily rollover.
 - `cargo test -p harness-agents` — flag derivation (both adapter files
