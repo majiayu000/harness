@@ -53,11 +53,12 @@ runtime use or local observation with trusted attestation.
    mutable display labels, per-scan values, or producer-specific aliases.
    Repository and user-global locators are portable paths relative to their
    declared scope root and cannot be absolute or escape with `..`. Runtime and
-   runner locators use `<namespace>/<stable_key>` derived from a persisted,
-   versioned configuration identity; they cannot be UUID-shaped or be derived
-   from presentation text. Changing the key while the configured source
-   identity is unchanged is a producer contract violation; a changed key is
-   valid only when it identifies a genuinely different configured source.
+   runner locators use `<namespace>/<stable_key>` and reject reserved sentinel,
+   UUID, and display-label wire shapes. Producers must derive `stable_key` from
+   a persisted, versioned configuration identity rather than presentation or
+   per-scan data. The single-component parser validates the wire contract but
+   does not attest that provenance; ASC-005 compares snapshots to detect an
+   unauthorized key change for an otherwise unchanged configured source.
 4. **B-004:** Observation class is a closed vocabulary identifying the
    observer boundary: `repository_observed`, `runtime_observed`, or
    `runner_observed`. The class constrains the strongest admissible trust claim
@@ -79,9 +80,12 @@ runtime use or local observation with trusted attestation.
    granted, or exercised.
 8. **B-008:** Trust level is exactly one of `self_declared`,
    `repository_observed`, `runtime_observed`, or `runner_observed`. A component
-   cannot claim a trust level stronger than its observation source supports.
-   Stronger attestation and human-approval claims remain out of scope for this
-   schema version.
+   uses the exact linear trust order `self_declared` <
+   `repository_observed` < `runtime_observed` < `runner_observed` and cannot
+   claim a level stronger than its observation source supports. Repository
+   observation accepts the first two levels, runtime observation accepts the
+   first three, and runner observation accepts all four. Stronger attestation
+   and human-approval claims remain out of scope for this schema version.
 9. **B-009:** Freshness is exactly one of `unknown`, `fresh`, `stale`, or
    `expired`. When no supported freshness fact exists, the value is `unknown`;
    callers do not infer freshness from file names, enumeration order, or the
@@ -106,13 +110,13 @@ runtime use or local observation with trusted attestation.
       escape hatches.
 - [ ] The public JSON parser preserves whether input failed JSON syntax or a
       typed validation invariant; validation errors distinguish unsupported
-      version, invalid or unstable identity, invalid source locator, invalid
+      version, noncanonical component identity, invalid source locator, invalid
       digest, illegal observation/selection combinations, and trust escalation.
 - [ ] Positive fixtures round-trip every component kind, observation class,
       selection state, trust level, freshness value, and capability.
 - [ ] Negative fixtures prove unknown fields, aliases, malformed digests,
-      traversal locators, explicit `null` integrity, missing required values,
-      and impossible evidence combinations fail.
+      traversal and NUL-containing locators, explicit `null` integrity, missing
+      required values, and impossible evidence combinations fail.
 - [ ] Existing `Capability`, `ContextItem`, `CapabilityToken`, and
       `RuntimeKind` types and behavior remain unchanged.
 - [ ] The implementation adds no external dependency and no persistence

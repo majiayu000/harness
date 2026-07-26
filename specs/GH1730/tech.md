@@ -97,34 +97,36 @@ default.
 `runtime`, and `runner` values. Repository and user-global locators use
 `/`-separated portable paths relative to the canonical root for their declared
 scope. Platform-neutral validation rejects leading `/`, backslashes, Windows
-drive prefixes such as `C:`, and empty, `.`, or `..` segments before accepting
-the locator; it does not use platform-specific `std::path::Component`
-semantics or access the filesystem.
+drive prefixes such as `C:`, NUL bytes, and empty, `.`, or `..` segments before
+accepting the locator; it does not use platform-specific
+`std::path::Component` semantics or access the filesystem.
 
 Runtime and runner locators use the exact form
 `<namespace>/<stable_key>`. Both segments use lowercase snake_case ASCII
 tokens (`[a-z0-9]+(?:_[a-z0-9]+)*`). The namespace identifies a versioned
-producer configuration domain, and the stable key is read from that domain's
-persisted configuration identity. It is never generated during a scan and is
-never derived from a display name, process ID, timestamp, or other mutable
-presentation or execution data. Validation rejects UUID-shaped values,
-including canonical hyphenated UUIDs and 32-hex compact UUIDs, in either
-segment. It also rejects the exact reserved missing-evidence spellings
-`unknown`, `unknown-component`, `unknown_component`, `none`, `null`, and
-`missing` for every scope before component-ID derivation. These rules make
-obvious unstable inputs invalid at the component boundary. A producer that
-substitutes a different otherwise-valid stable key is asserting a different
-source identity; detecting an unauthorized cross-scan identity change requires
-the prior snapshot and belongs to ASC-005 rather than this immutable
-single-component validator.
+producer configuration domain. Validation rejects UUID-shaped values,
+including canonical hyphenated UUIDs and 32-hex compact UUIDs, and rejects
+values outside the token grammar, such as whitespace-bearing display labels.
+It also rejects the exact reserved missing-evidence spellings `unknown`,
+`unknown-component`, `unknown_component`, `none`, `null`, and `missing` for
+every scope before component-ID derivation.
+
+The wire validator deliberately does not claim to prove how an otherwise-valid
+stable key was obtained: `codex/12345` is syntactically valid even if a faulty
+producer derived it from a process ID. Producers have the separate contract to
+read the key from persisted, versioned configuration identity and never derive
+it from display names, process IDs, timestamps, or other per-scan data. Given
+only one component there is no second observation against which to verify
+continuity. ASC-005 owns cross-snapshot comparison and reports a changed key
+for an otherwise unchanged configured source as an identity discontinuity.
 
 `AgentStackComponentId::from_source(kind, source)` is the only component-ID
 derivation. Its exact wire spelling is
 `<source_scope>:<component_kind>:<source_locator>` using the closed snake_case
 enum spellings and the validated locator. Construction and parsing recompute
-that value and reject any supplied ID that differs, so UUIDs, mutable labels,
-and producer-specific aliases cannot create parallel identities for the same
-source.
+that value and reject any supplied ID that differs. This guarantees that the
+ID agrees with the validated source fields; it does not independently attest
+the producer's cross-scan stable-key provenance.
 
 Integrity is represented by `Option<Sha256Digest>`, where `Sha256Digest` is a
 validated newtype around the 64-character lowercase hexadecimal wire value.
@@ -146,9 +148,9 @@ snake_case wire spelling:
 `AgentStackComponent::validate()` returns the first typed invariant violation:
 
 1. exact schema version;
-2. component ID exactly matching the canonical kind/source derivation;
-3. valid scope-specific source locator, including reserved-sentinel, UUID, and
-   runtime/runner stable-key rejection;
+2. valid scope-specific source locator, including NUL, reserved-sentinel,
+   UUID-shape, and runtime/runner token-grammar rejection;
+3. component ID exactly matching the canonical kind/source derivation;
 4. valid optional digest;
 5. observation/selection compatibility;
 6. observation/trust compatibility;
@@ -162,19 +164,28 @@ been proven.
 Repository observations permit only `discovered`, `eligible`, or `selected`.
 Runtime and runner observations permit every selection state. A
 repository-level `selected` claim does not prove runtime loading or use.
-`observed` requires runtime or runner observation. Trust may be equal to or
-weaker than the observation source but never stronger. `self_declared` is
-accepted for every observation source.
+`observed` requires runtime or runner observation. The exact trust matrix is:
+
+| Observation class | Allowed trust levels |
+| --- | --- |
+| `repository_observed` | `self_declared`, `repository_observed` |
+| `runtime_observed` | `self_declared`, `repository_observed`, `runtime_observed` |
+| `runner_observed` | `self_declared`, `repository_observed`, `runtime_observed`, `runner_observed` |
 
 `AgentStackComponent` implements deterministic `Serialize` but does not expose
 raw untyped `Deserialize`. Public `AgentStackComponent::from_json(&str)` first
-parses a private wire representation and then applies `TryFrom`, returning
-`AgentStackComponentParseError::Syntax` for JSON syntax/shape failures or
-`AgentStackComponentParseError::Validation(AgentStackComponentError)` for
-domain-invariant failures. This preserves the typed validation cause instead
-of flattening it into `serde_json::Error`. Normal Rust construction uses
-`AgentStackComponent::new(...)` and validated setters/builders; struct fields
-that participate in invariants are not publicly mutable.
+parses a private minimal version envelope that reads only `schema_version` and
+does not reject additional fields. A missing, blank, or non-v0.1 version
+returns the typed unsupported-version validation error before shape decoding.
+Only an exact v0.1 envelope is then parsed into the strict private v0.1 wire
+representation with `deny_unknown_fields` and converted through `TryFrom`.
+Malformed JSON or an invalid v0.1 shape returns
+`AgentStackComponentParseError::Syntax`; domain-invariant failures return
+`AgentStackComponentParseError::Validation(AgentStackComponentError)`. Thus a
+future v0.2 object with new fields is classified by version rather than being
+misreported as a v0.1 unknown-field syntax failure. Normal Rust construction
+uses `AgentStackComponent::new(...)` and validated setters/builders; struct
+fields that participate in invariants are not publicly mutable.
 
 ### Test Layout
 
@@ -202,7 +213,7 @@ or persistence occurs.
 
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
-| B-001 | schema constant and deserialization validation | `cargo test -p harness-core stack::tests::schema_version_is_required_and_exact` |
+| B-001 | schema constant and version-envelope-first parsing | `cargo test -p harness-core stack::tests::schema_version_is_required_and_exact`; `cargo test -p harness-core stack::tests::unsupported_version_precedes_strict_v01_shape_validation` |
 | B-002 | `AgentStackComponentKind` | `cargo test -p harness-core stack::tests::component_kind_wire_vocabulary_is_closed` |
 | B-003 | canonical component ID plus scope-specific stable locator validation | `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable`; `cargo test -p harness-core stack::tests::runtime_and_runner_locators_require_stable_config_keys` |
 | B-004 | `AgentStackObservationClass` | `cargo test -p harness-core stack::tests::observation_class_round_trips_without_implied_trust` |
@@ -248,9 +259,11 @@ or persistence occurs.
 - [ ] Add exhaustive observation × selection and observation × trust tables.
 - [ ] Add schema-valid negative fixtures for unknown fields and aliases.
 - [ ] Add digest, canonical identity, drive-prefixed and traversal locator,
-      reserved-sentinel locator, runtime/runner UUID and display-label locator,
-      duplicate and canonically ordered capability, and explicit-null integrity
-      tests.
+      NUL locator, reserved-sentinel locator, runtime/runner UUID and
+      display-label locator, duplicate and canonically ordered capability, and
+      explicit-null integrity tests.
+- [ ] Prove a future-version fixture with v0.1-unknown fields returns the typed
+      unsupported-version error before strict v0.1 shape validation.
 - [ ] Add separate typed assertions for JSON syntax/shape failures and domain
       validation failures.
 - [ ] Run `cargo check -p harness-core --all-targets`.

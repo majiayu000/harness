@@ -31,6 +31,8 @@ GH-1730
     values without aliases or catch-all variants.
   - Observation, selection, trust, and freshness combinations fail closed
     according to the product invariants.
+  - Observation-to-trust validation uses the complete matrix from B-008 rather
+    than inferring an implementation-specific observer relationship.
 - Verify:
   - `cargo check -p harness-core --all-targets`
   - `cargo test -p harness-core stack::tests::component_kind_wire_vocabulary_is_closed`
@@ -47,18 +49,26 @@ GH-1730
   - Component IDs are derived only from the validated source scope, component
     kind, and source locator.
   - Repository and user-global locators reject absolute, drive-prefixed,
-    backslash, empty, dot, and traversal segments without filesystem access.
-  - Runtime and runner locators use persisted
-    `<namespace>/<stable_key>` identities and reject reserved missing-evidence
-    sentinels, UUIDs, display-label shapes, and per-scan execution values.
+    backslash, NUL, empty, dot, and traversal segments without filesystem
+    access.
+  - Runtime and runner locators enforce the `<namespace>/<stable_key>` wire
+    grammar and reject reserved missing-evidence sentinels, UUIDs, and
+    display-label shapes. The parser does not claim to verify whether an
+    otherwise-valid key came from persisted configuration.
+  - Source locators are validated before their canonical component IDs are
+    derived and compared.
   - Integrity accepts only non-zero lowercase SHA-256 values; omission remains
     distinct from explicit JSON `null`.
   - The public JSON entry point distinguishes syntax/shape failures from typed
-    invariant failures without an untyped public escape hatch.
+    invariant failures without an untyped public escape hatch, and checks a
+    minimal version envelope before strict v0.1 shape decoding.
 - Verify:
   - `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable`
   - `cargo test -p harness-core stack::tests::runtime_and_runner_locators_require_stable_config_keys`
   - `cargo test -p harness-core stack::tests::source_locator_rejects_reserved_sentinels`
+  - `cargo test -p harness-core stack::tests::portable_path_locator_rejects_nul`
+  - `cargo test -p harness-core stack::tests::source_locator_validation_precedes_component_id_derivation`
+  - `cargo test -p harness-core stack::tests::unsupported_version_precedes_strict_v01_shape_validation`
   - `cargo test -p harness-core stack::tests::sha256_digest_rejects_blank_malformed_and_mixed_case_values`
   - `cargo test -p harness-core stack::tests::missing_optional_facts_are_not_fabricated`
 
