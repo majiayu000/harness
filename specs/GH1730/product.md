@@ -86,7 +86,9 @@ runtime use or local observation with trusted attestation.
     not substitute for missing evidence.
 11. **B-011:** Components serialize deterministically with snake_case field
     names, reject unknown public fields, and round-trip without changing their
-    semantic values. Collection ordering and aggregate canonicalization remain
+    semantic values. Within one component, capabilities are canonicalized in
+    lexicographic order by their exact snake_case wire spelling. Ordering
+    multiple components and canonicalizing aggregate snapshots remain
     responsibilities of the later snapshot contract.
 12. **B-012:** Introducing the model does not change existing agent execution,
     prompt construction, skill injection, capability enforcement, persisted
