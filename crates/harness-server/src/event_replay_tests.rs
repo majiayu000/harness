@@ -1,5 +1,72 @@
 use super::*;
 use harness_core::types::TaskId;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Record};
+use tracing::subscriber::Interest;
+use tracing::{Event, Id, Metadata, Subscriber};
+
+#[derive(Clone, Default)]
+struct ReplayCapturedSubscriber {
+    output: Arc<Mutex<Vec<String>>>,
+    next_span_id: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct ReplayEventVisitor(String);
+
+impl Visit for ReplayEventVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        self.0.push_str(field.name());
+        self.0.push('=');
+        self.0.push_str(&format!("{value:?}"));
+    }
+}
+
+impl Subscriber for ReplayCapturedSubscriber {
+    fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+        Interest::always()
+    }
+
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+        Id::from_u64(self.next_span_id.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut visitor = ReplayEventVisitor::default();
+        event.record(&mut visitor);
+        match self.output.lock() {
+            Ok(mut output) => output.push(visitor.0),
+            Err(poisoned) => poisoned.into_inner().push(visitor.0),
+        }
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+impl ReplayCapturedSubscriber {
+    fn output(&self) -> String {
+        let events = match self.output.lock() {
+            Ok(output) => output.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        events.join("\n")
+    }
+}
 
 fn ts() -> u64 {
     0
@@ -7,6 +74,10 @@ fn ts() -> u64 {
 
 fn make_event_log(dir: &std::path::Path) -> TaskEventLog {
     TaskEventLog::open(&dir.join("task-events.jsonl")).unwrap()
+}
+
+fn postgres_tests_configured() -> bool {
+    std::env::var("HARNESS_DATABASE_URL").is_ok_and(|url| !url.trim().is_empty())
 }
 
 // ── apply_event tests ─────────────────────────────────────────────────────
@@ -544,6 +615,123 @@ async fn replay_terminal_failed_overrides_implementing() -> anyhow::Result<()> {
     let t = tasks.iter().find(|t| t.id.0 == "t-term").unwrap();
     assert!(matches!(t.status, TaskStatus::Failed));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_caller_counts_and_logs_only_applied_writes() -> anyhow::Result<()> {
+    if !postgres_tests_configured() {
+        return Ok(());
+    }
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    let mut applied = crate::task_runner::TaskState::new(TaskId("replay-applied".into()));
+    applied.status = TaskStatus::Implementing;
+    db.insert(&applied).await?;
+
+    let mut superseded = crate::task_runner::TaskState::new(TaskId("replay-superseded".into()));
+    superseded.status = TaskStatus::Done;
+    superseded.scheduler.mark_terminal(&TaskStatus::Done);
+    db.insert(&superseded).await?;
+
+    let log_path = dir.path().join("task-events.jsonl");
+    let log = TaskEventLog::open(&log_path)?;
+    for task_id in ["replay-applied", "replay-superseded"] {
+        log.append(&TaskEvent::Completed {
+            task_id: task_id.into(),
+            ts: 1,
+        });
+    }
+    drop(log);
+
+    let captured = ReplayCapturedSubscriber::default();
+    let updated = {
+        let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
+        replay_and_recover(&db, &log_path).await?
+    };
+    assert_eq!(updated, 1, "only the durable replay write is counted");
+    assert_eq!(
+        db.get("replay-applied")
+            .await?
+            .expect("applied task")
+            .status,
+        TaskStatus::Done
+    );
+    assert_eq!(
+        db.get("replay-superseded")
+            .await?
+            .expect("superseded task")
+            .version,
+        0,
+        "superseded replay must not rewrite the task"
+    );
+    let output = captured.output();
+    assert!(
+        output.contains("event_replay: applied replayed state to 1 task(s)"),
+        "replay aggregate wording must report exactly the one applied task: {output}"
+    );
+    assert!(
+        output.contains("replayed state superseded by authoritative durable state"),
+        "superseded replay must emit non-success diagnostic wording: {output}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_conflict_preserves_terminal_log() -> anyhow::Result<()> {
+    if !postgres_tests_configured() {
+        return Ok(());
+    }
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    let mut state = crate::task_runner::TaskState::new(TaskId("replay-conflict".into()));
+    state.status = TaskStatus::Failed;
+    state.pr_url = Some("https://github.com/o/r/pull/999".to_string());
+    db.insert(&state).await?;
+
+    let log_path = dir.path().join("task-events.jsonl");
+    let log = TaskEventLog::open(&log_path)?;
+    log.append(&TaskEvent::PrDetected {
+        task_id: "replay-conflict".into(),
+        ts: 1,
+        pr_url: "https://github.com/o/r/pull/1716".into(),
+    });
+    log.append(&TaskEvent::Completed {
+        task_id: "replay-conflict".into(),
+        ts: 2,
+    });
+    drop(log);
+    let before = std::fs::read(&log_path)?;
+
+    let captured = ReplayCapturedSubscriber::default();
+    let error = {
+        let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
+        replay_and_recover(&db, &log_path)
+            .await
+            .expect_err("contradictory terminal replay must fail closed")
+    };
+    assert!(
+        error
+            .downcast_ref::<crate::task_db::TaskRecoveryConflict>()
+            .is_some(),
+        "replay conflict should retain its typed error: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read(&log_path)?,
+        before,
+        "terminal replay evidence must remain byte-for-byte unchanged"
+    );
+    let output = captured.output();
+    assert!(
+        !output.contains("applied replayed state") && !output.contains("compacted log"),
+        "conflicting replay must emit no aggregate success wording: {output}"
+    );
     Ok(())
 }
 

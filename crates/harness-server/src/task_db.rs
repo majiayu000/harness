@@ -2,6 +2,8 @@ mod migrations;
 mod queries_aux;
 mod queries_metrics;
 mod queries_recovery;
+#[cfg(test)]
+mod queries_recovery_tests;
 mod queries_retention;
 mod queries_tasks;
 mod raw_column_test_overrides;
@@ -17,8 +19,73 @@ use harness_core::store_backend::{PostgresBackend, StoreLocation};
 use migrations::TASK_MIGRATIONS;
 use sqlx::postgres::PgPool;
 use std::path::Path;
+use std::{error::Error, fmt};
 
 pub const TASK_DB_SCHEMA: &str = "task_db";
+
+#[cfg(test)]
+struct RecoveryWriteInterleaveState {
+    selected: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RecoveryWriteInterleave {
+    task_id: String,
+    state: std::sync::Arc<RecoveryWriteInterleaveState>,
+}
+
+#[cfg(test)]
+fn recovery_write_interleaves() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<RecoveryWriteInterleaveState>>,
+> {
+    static INTERLEAVES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<RecoveryWriteInterleaveState>>,
+        >,
+    > = std::sync::OnceLock::new();
+    INTERLEAVES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+impl RecoveryWriteInterleave {
+    pub(crate) async fn wait_until_selected(&self) {
+        self.state.selected.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for RecoveryWriteInterleave {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut interleaves = recovery_write_interleaves()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if interleaves
+            .get(&self.task_id)
+            .is_some_and(|registered| std::sync::Arc::ptr_eq(registered, &self.state))
+        {
+            interleaves.remove(&self.task_id);
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_recovery_write_for_test(task_id: &str) {
+    let state = recovery_write_interleaves()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(task_id);
+    if let Some(state) = state {
+        state.selected.notify_one();
+        state.release.notified().await;
+    }
+}
 
 pub struct TaskDb {
     pool: PgPool,
@@ -26,11 +93,91 @@ pub struct TaskDb {
     store_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TaskRecoveryWriteOutcome {
+    Applied,
+    Superseded,
+    Conflict {
+        action: &'static str,
+        task_id: String,
+        expected_version: i32,
+        current_version: Option<i32>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskRecoveryConflict {
+    pub(crate) action: &'static str,
+    pub(crate) task_id: String,
+    pub(crate) expected_version: i32,
+    pub(crate) current_version: Option<i32>,
+}
+
+impl fmt::Display for TaskRecoveryConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.current_version {
+            Some(current_version) => write!(
+                formatter,
+                "task recovery conflict: task {}, action {}, expected version {}, current version {}",
+                self.task_id, self.action, self.expected_version, current_version
+            ),
+            None => write!(
+                formatter,
+                "task recovery conflict: task {}, action {}, expected version {}, current version unavailable",
+                self.task_id, self.action, self.expected_version
+            ),
+        }
+    }
+}
+
+impl Error for TaskRecoveryConflict {}
+
+impl TaskRecoveryWriteOutcome {
+    pub(crate) fn applied_or_error(self) -> anyhow::Result<bool> {
+        match self {
+            Self::Applied => Ok(true),
+            Self::Superseded => Ok(false),
+            Self::Conflict {
+                action,
+                task_id,
+                expected_version,
+                current_version,
+            } => Err(TaskRecoveryConflict {
+                action,
+                task_id,
+                expected_version,
+                current_version,
+            }
+            .into()),
+        }
+    }
+}
+
 fn record_task_db_usage() {
     harness_core::usage_probe::record_usage(harness_core::usage_probe::UsageProbeSurface::TaskDb);
 }
 
 impl TaskDb {
+    #[cfg(test)]
+    pub(crate) fn install_recovery_write_interleave_for_test(
+        task_id: impl Into<String>,
+    ) -> RecoveryWriteInterleave {
+        let task_id = task_id.into();
+        let state = std::sync::Arc::new(RecoveryWriteInterleaveState {
+            selected: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let previous = recovery_write_interleaves()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.clone(), state.clone());
+        assert!(
+            previous.is_none(),
+            "recovery interleave already installed for task {task_id}"
+        );
+        RecoveryWriteInterleave { task_id, state }
+    }
+
     /// Open a Postgres-backed task database.
     ///
     /// Each unique `db_path` maps to its own Postgres schema (`h{hash_of_path}`)

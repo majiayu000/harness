@@ -722,14 +722,21 @@ pub async fn replay_and_recover(db: &TaskDb, log_path: &Path) -> anyhow::Result<
             None
         };
 
-        db.apply_replayed_state(
-            task_id_str,
-            replayed.pr_url.as_deref(),
-            terminal_status.as_deref(),
-        )
-        .await?;
-
-        updated += 1;
+        let outcome = db
+            .apply_replayed_state_outcome(
+                task_id_str,
+                replayed.pr_url.as_deref(),
+                terminal_status.as_deref(),
+            )
+            .await?;
+        if outcome.applied_or_error()? {
+            updated += 1;
+        } else {
+            tracing::debug!(
+                task_id = task_id_str,
+                "event_replay: replayed state superseded by authoritative durable state"
+            );
+        }
     }
 
     if updated > 0 {

@@ -7,6 +7,7 @@
 //! tasks with checkpoints are resumed while tasks without are failed.
 
 use harness_core::types::TaskId as CoreTaskId;
+use harness_server::event_replay::{TaskEvent, TaskEventLog};
 use harness_server::task_db::TaskDb;
 use harness_server::task_runner::{TaskKind, TaskPhase, TaskState, TaskStatus, TaskStore};
 
@@ -586,5 +587,98 @@ async fn restart_marks_resumed_task_as_recovering_in_scheduler_state() -> anyhow
         Some("startup-recovery")
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_conflict_fails_startup_before_checkpoint_recovery() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+
+    let mut replay_conflict = make_task("startup-replay-conflict", TaskStatus::Failed);
+    replay_conflict.pr_url = Some("https://github.com/o/r/pull/999".to_string());
+    db.insert(&replay_conflict).await?;
+    db.insert(&make_task(
+        "checkpoint-must-not-run",
+        TaskStatus::Implementing,
+    ))
+    .await?;
+    drop(db);
+
+    let event_log_path = tmp.path().join("task-events.jsonl");
+    let event_log = TaskEventLog::open(&event_log_path)?;
+    event_log.append(&TaskEvent::PrDetected {
+        task_id: "startup-replay-conflict".into(),
+        ts: 1,
+        pr_url: "https://github.com/o/r/pull/1716".into(),
+    });
+    event_log.append(&TaskEvent::Completed {
+        task_id: "startup-replay-conflict".into(),
+        ts: 2,
+    });
+    drop(event_log);
+
+    let error = match TaskStore::open(&db_path).await {
+        Ok(_) => anyhow::bail!("typed replay conflict must fail task-store startup"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("task recovery conflict")
+            && error.to_string().contains("startup-replay-conflict"),
+        "startup should preserve recovery conflict context: {error:#}"
+    );
+
+    let db = TaskDb::open(&db_path).await?;
+    let untouched = db
+        .get("checkpoint-must-not-run")
+        .await?
+        .expect("checkpoint task should still exist");
+    assert_eq!(
+        untouched.status,
+        TaskStatus::Implementing,
+        "checkpoint recovery must not run after a replay conflict"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_conflict_replay_failure_remains_non_fatal_at_startup() -> anyhow::Result<()> {
+    if !database_tests_configured() {
+        return Ok(());
+    }
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join("tasks.db");
+    let db = TaskDb::open(&db_path).await?;
+    db.insert(&make_task(
+        "checkpoint-after-replay-error",
+        TaskStatus::Implementing,
+    ))
+    .await?;
+    db.write_checkpoint(
+        "checkpoint-after-replay-error",
+        None,
+        Some("plan text"),
+        None,
+        "plan_done",
+    )
+    .await?;
+    drop(db);
+
+    std::fs::create_dir(tmp.path().join("task-events.jsonl"))?;
+    let store = TaskStore::open(&db_path)
+        .await
+        .expect("a non-conflict replay I/O error remains non-fatal");
+    let recovered = store
+        .get_with_db_fallback(&CoreTaskId("checkpoint-after-replay-error".into()))
+        .await?
+        .expect("checkpoint recovery must still run after a non-conflict replay error");
+    assert_eq!(recovered.status, TaskStatus::Pending);
+    assert_eq!(recovered.scheduler.recovery_generation, 1);
     Ok(())
 }
