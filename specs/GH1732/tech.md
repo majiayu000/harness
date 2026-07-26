@@ -61,6 +61,13 @@ Provenance has a private serializable envelope containing the schema,
 ordered validated `AgentStackComponent` entries, and a closed list of coverage
 limitations.
 
+This is an internal domain boundary, not a `harness-protocol` response
+contract. `harness_core::stack` is intentionally the canonical cross-crate
+Agent Stack model established by ASC-001, so protocol-local duplicate newtypes
+would weaken that contract. `build_runtime_prompt_packet` continues to return
+its existing private `serde_json::Value`; this issue adds no response DTO or
+external consumer contract.
+
 `prompt_packet.rs` calls the module once after creating the base packet fields
 and before activity policy or final hashing:
 

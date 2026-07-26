@@ -38,6 +38,9 @@ does not prove it was selected or loaded for a runtime activity.
   activity-result artifact.
 - Recording tool execution or capability use; that belongs to ASC-010.
 - Producing aggregate stack snapshots, promotion policy, or attestations.
+- Adding a public protocol response DTO or changing an external API wire
+  contract; provenance is an additive field in the private runtime prompt
+  packet representation.
 
 ## User-Visible Behavior
 
