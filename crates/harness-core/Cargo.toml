@@ -24,6 +24,10 @@ anyhow = { workspace = true }
 sqlx = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+cap-std = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
