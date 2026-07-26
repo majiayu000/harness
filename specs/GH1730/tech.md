@@ -94,13 +94,29 @@ Deserialization rejects a missing required field rather than inventing a
 default.
 
 `AgentStackSourceScope` contains explicit `repository`, `user_global`,
-`runtime`, and `runner` values. Repository locators use `/`-separated
-repository-relative strings. Platform-neutral validation rejects leading `/`,
-backslashes, Windows drive prefixes such as `C:`, and empty, `.`, or `..`
-segments before accepting the locator; it does not use platform-specific
-`std::path::Component` semantics or access the filesystem. Other scopes
-require a non-empty opaque locator and are never rewritten into repository
-paths.
+`runtime`, and `runner` values. Repository and user-global locators use
+`/`-separated portable paths relative to the canonical root for their declared
+scope. Platform-neutral validation rejects leading `/`, backslashes, Windows
+drive prefixes such as `C:`, and empty, `.`, or `..` segments before accepting
+the locator; it does not use platform-specific `std::path::Component`
+semantics or access the filesystem.
+
+Runtime and runner locators use the exact form
+`<namespace>/<stable_key>`. Both segments use lowercase snake_case ASCII
+tokens (`[a-z0-9]+(?:_[a-z0-9]+)*`). The namespace identifies a versioned
+producer configuration domain, and the stable key is read from that domain's
+persisted configuration identity. It is never generated during a scan and is
+never derived from a display name, process ID, timestamp, or other mutable
+presentation or execution data. Validation rejects UUID-shaped values,
+including canonical hyphenated UUIDs and 32-hex compact UUIDs, in either
+segment. It also rejects the exact reserved missing-evidence spellings
+`unknown`, `unknown-component`, `unknown_component`, `none`, `null`, and
+`missing` for every scope before component-ID derivation. These rules make
+obvious unstable inputs invalid at the component boundary. A producer that
+substitutes a different otherwise-valid stable key is asserting a different
+source identity; detecting an unauthorized cross-scan identity change requires
+the prior snapshot and belongs to ASC-005 rather than this immutable
+single-component validator.
 
 `AgentStackComponentId::from_source(kind, source)` is the only component-ID
 derivation. Its exact wire spelling is
@@ -131,7 +147,8 @@ snake_case wire spelling:
 
 1. exact schema version;
 2. component ID exactly matching the canonical kind/source derivation;
-3. valid source scope and locator;
+3. valid scope-specific source locator, including reserved-sentinel, UUID, and
+   runtime/runner stable-key rejection;
 4. valid optional digest;
 5. observation/selection compatibility;
 6. observation/trust compatibility;
@@ -187,14 +204,14 @@ or persistence occurs.
 | --- | --- | --- |
 | B-001 | schema constant and deserialization validation | `cargo test -p harness-core stack::tests::schema_version_is_required_and_exact` |
 | B-002 | `AgentStackComponentKind` | `cargo test -p harness-core stack::tests::component_kind_wire_vocabulary_is_closed` |
-| B-003 | canonical component ID plus source scope and locator validation | `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable` |
+| B-003 | canonical component ID plus scope-specific stable locator validation | `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable`; `cargo test -p harness-core stack::tests::runtime_and_runner_locators_require_stable_config_keys` |
 | B-004 | `AgentStackObservationClass` | `cargo test -p harness-core stack::tests::observation_class_round_trips_without_implied_trust` |
 | B-005 | observation/selection validation matrix | `cargo test -p harness-core stack::tests::selection_state_requires_supporting_observation` |
 | B-006 | `Sha256Digest` newtype | `cargo test -p harness-core stack::tests::sha256_digest_rejects_blank_malformed_and_mixed_case_values` |
 | B-007 | `AgentStackCapability` | `cargo test -p harness-core stack::tests::capability_wire_vocabulary_is_closed` |
 | B-008 | observation/trust validation matrix | `cargo test -p harness-core stack::tests::trust_cannot_exceed_observation_source` |
 | B-009 | `AgentStackFreshness` | `cargo test -p harness-core stack::tests::missing_freshness_is_explicitly_unknown` |
-| B-010 | constructors and optional-field validation | `cargo test -p harness-core stack::tests::missing_optional_facts_are_not_fabricated` |
+| B-010 | constructors, reserved locator rejection, and optional-field validation | `cargo test -p harness-core stack::tests::source_locator_rejects_reserved_sentinels`; `cargo test -p harness-core stack::tests::missing_optional_facts_are_not_fabricated` |
 | B-011 | serde attributes, canonical capability order, and round-trip table | `cargo test -p harness-core stack::tests::all_component_values_round_trip_in_canonical_wire_order` |
 | B-012 | manifest scope and existing core tests | `git diff --name-only origin/main...HEAD`; `cargo test -p harness-core` |
 
@@ -231,6 +248,7 @@ or persistence occurs.
 - [ ] Add exhaustive observation × selection and observation × trust tables.
 - [ ] Add schema-valid negative fixtures for unknown fields and aliases.
 - [ ] Add digest, canonical identity, drive-prefixed and traversal locator,
+      reserved-sentinel locator, runtime/runner UUID and display-label locator,
       duplicate and canonically ordered capability, and explicit-null integrity
       tests.
 - [ ] Add separate typed assertions for JSON syntax/shape failures and domain

@@ -46,14 +46,19 @@ GH-1730
 - Done when:
   - Component IDs are derived only from the validated source scope, component
     kind, and source locator.
-  - Repository locators reject absolute, drive-prefixed, backslash, empty,
-    dot, and traversal segments without filesystem access.
+  - Repository and user-global locators reject absolute, drive-prefixed,
+    backslash, empty, dot, and traversal segments without filesystem access.
+  - Runtime and runner locators use persisted
+    `<namespace>/<stable_key>` identities and reject reserved missing-evidence
+    sentinels, UUIDs, display-label shapes, and per-scan execution values.
   - Integrity accepts only non-zero lowercase SHA-256 values; omission remains
     distinct from explicit JSON `null`.
   - The public JSON entry point distinguishes syntax/shape failures from typed
     invariant failures without an untyped public escape hatch.
 - Verify:
   - `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable`
+  - `cargo test -p harness-core stack::tests::runtime_and_runner_locators_require_stable_config_keys`
+  - `cargo test -p harness-core stack::tests::source_locator_rejects_reserved_sentinels`
   - `cargo test -p harness-core stack::tests::sha256_digest_rejects_blank_malformed_and_mixed_case_values`
   - `cargo test -p harness-core stack::tests::missing_optional_facts_are_not_fabricated`
 

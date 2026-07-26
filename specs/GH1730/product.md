@@ -50,9 +50,14 @@ runtime use or local observation with trusted attestation.
 3. **B-003:** Every component has one canonical stable component ID derived
    exactly as `<source_scope>:<component_kind>:<source_locator>`, one typed
    source scope, and one non-empty source locator. IDs cannot use UUIDs,
-   mutable display labels, or producer-specific aliases. Repository-relative
-   locators cannot be absolute or escape with `..`; non-repository sources must
-   use their declared scope instead of pretending to be repository files.
+   mutable display labels, per-scan values, or producer-specific aliases.
+   Repository and user-global locators are portable paths relative to their
+   declared scope root and cannot be absolute or escape with `..`. Runtime and
+   runner locators use `<namespace>/<stable_key>` derived from a persisted,
+   versioned configuration identity; they cannot be UUID-shaped or be derived
+   from presentation text. Changing the key while the configured source
+   identity is unchanged is a producer contract violation; a changed key is
+   valid only when it identifies a genuinely different configured source.
 4. **B-004:** Observation class is a closed vocabulary identifying the
    observer boundary: `repository_observed`, `runtime_observed`, or
    `runner_observed`. The class constrains the strongest admissible trust claim
@@ -136,6 +141,8 @@ runtime use or local observation with trusted attestation.
 - A runtime observation claims `runner_observed` trust.
 - A future producer emits a new component kind to a v0.1 reader.
 - A component has no freshness evidence.
+- A non-repository producer supplies a UUID, display label, reserved missing
+  sentinel, or newly generated per-scan value as its source locator.
 - Capabilities are present but no declared/granted/observed evidence class has
   yet been attached by the later capability-evidence contract.
 
