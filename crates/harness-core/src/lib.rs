@@ -20,6 +20,7 @@ pub mod review;
 pub mod run_id;
 pub mod run_registry;
 pub mod shell_safety;
+pub mod stack;
 pub mod store_backend;
 #[cfg(test)]
 mod test_support;
