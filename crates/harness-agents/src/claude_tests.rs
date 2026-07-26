@@ -770,16 +770,15 @@ exit 0
     };
     assert!(error.contains("error_max_turns"), "{error}");
 
-    let mut saw_error_item = false;
+    // The failure is reported exactly once — via the Err return. A duplicate
+    // StreamItem::Error would make the turn lifecycle persist the same
+    // failure twice.
     while let Ok(Some(item)) = timeout(Duration::from_secs(2), rx.recv()).await {
-        if matches!(item, StreamItem::Error { .. }) {
-            saw_error_item = true;
-        }
+        assert!(
+            !matches!(item, StreamItem::Error { .. }),
+            "terminal failure must not also be emitted as a stream Error item"
+        );
     }
-    assert!(
-        saw_error_item,
-        "failure should surface as a stream Error item"
-    );
 }
 
 #[tokio::test]

@@ -195,12 +195,16 @@ impl AgentAdapter for ClaudeAdapter {
         let reader = tokio::io::BufReader::new(stdout);
         let mut lines = reader.lines();
         let mut output_buf = String::new();
+        let mut turn_failed = false;
 
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
                 continue;
             }
 
+            if parse_stream_json_result_failure(&line).is_some() {
+                turn_failed = true;
+            }
             let events = parse_stream_json_events(&line);
             if events.is_empty() {
                 continue;
@@ -277,11 +281,15 @@ impl AgentAdapter for ClaudeAdapter {
             }
         }
 
-        if let Err(e) = tx
-            .send(AgentEvent::TurnCompleted { output: output_buf })
-            .await
-        {
-            tracing::debug!("claude: event channel closed before turn completed: {e}");
+        // A terminal result failure already surfaced as AgentEvent::Error; a
+        // trailing TurnCompleted would contradict it, so skip it in that case.
+        if !turn_failed {
+            if let Err(e) = tx
+                .send(AgentEvent::TurnCompleted { output: output_buf })
+                .await
+            {
+                tracing::debug!("claude: event channel closed before turn completed: {e}");
+            }
         }
 
         // Clean up child handle

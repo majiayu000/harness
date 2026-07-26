@@ -70,9 +70,9 @@ fn apply_claude_stream_line(
     }
 
     if let Some(failure) = parse_stream_json_result_failure(line) {
-        emitted_items.push(StreamItem::Error {
-            message: failure.clone(),
-        });
+        // Do not also emit a StreamItem::Error here: the failure is reported
+        // exactly once, through the Err path of the execution call, so the
+        // turn lifecycle does not persist the same error twice.
         parsed.failure = Some(failure);
         parsed.completed = true;
         return;
