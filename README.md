@@ -63,14 +63,16 @@ Landlock helper. Harness fails closed when neither helper is available.
 
 ```bash
 # With Codex CLI (Linux or macOS)
-./target/release/harness exec --agent codex "Fix the failing test in src/lib.rs"
+./target/release/harness exec --agent codex \
+  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
 
 # Or with Claude Code CLI on Linux
-./target/release/harness exec --agent claude "Fix the failing test in src/lib.rs"
+./target/release/harness exec --agent claude \
+  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
 
 # Claude Code on macOS cannot run under the Seatbelt workspace-write sandbox
 ./target/release/harness exec --agent claude --sandbox-mode danger-full-access \
-  "Fix the failing test in src/lib.rs"
+  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
 ```
 
 Harness runs the explicitly selected coding agent against the current directory
@@ -343,7 +345,8 @@ cargo run -p harness-cli -- serve --transport stdio
 **One-shot execution:**
 
 ```bash
-cargo run -p harness-cli -- exec "Fix the failing test in src/lib.rs"
+cargo run -p harness-cli -- exec \
+  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
 ```
 
 ### Common Workflows
