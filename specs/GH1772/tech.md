@@ -11,9 +11,12 @@ All citations verified on `main` (81c78255).
 ### Dual lease systems
 
 - Runtime job leases: `runtime_jobs` rows carry `WorkflowLease { owner,
-  expires_at }` and `lease_generation`; owner-scoped operations live in
-  `crates/harness-workflow/src/runtime/store/runtime_job_leases.rs`,
-  `runtime/lease_state.rs`, `runtime/job_claim.rs`. TTL from
+  expires_at }` and `lease_generation`; owner-scoped operations are
+  `claim_next_runtime_job`
+  (`crates/harness-workflow/src/runtime/store/runtime_jobs.rs:251`),
+  `defer_runtime_job_claim_if_owned` (`store/runtime_job_state.rs:48`), and
+  `commit_runtime_activity_completion_with_transcript_if_owned`
+  (`store/activity_completion.rs:72`). TTL from
   `WORKFLOW.md:53` (`lease_ttl_secs: 600`) applied at
   `crates/harness-server/src/http/background/runtime_workers.rs:6-7`.
 - Workspace leases: `workspace_leases` keyed `(store_key, project_key,
@@ -145,16 +148,18 @@ B-005).
   `config_degraded_since`; beyond `config_failure_grace_secs` (default 300)
   they defer claims with reason code `config_degraded` (reusing the existing
   dispatch-barrier defer mechanism). Running activities are unaffected.
-- Leader-election forward note: supervisor registration takes a
-  `singleton: bool`; singleton loops acquire a Postgres advisory lock keyed
-  by loop name before ticking. In a single-process deployment this is a
-  no-op cost; a second process becomes safe by construction. No further
-  multi-instance work in this spec.
+- Leader-election forward-compatibility note (**non-normative**, per product
+  Non-Goals): a future multi-instance deployment could have the supervisor
+  take `singleton: bool` at registration and acquire a Postgres advisory lock
+  keyed by loop name before each singleton tick, making a second process safe
+  by construction. This spec neither requires nor tests that behavior; it
+  only asks that the supervisor API not preclude it.
 
 ## Affected Files (expected)
 
 - `crates/harness-workflow/src/runtime/worker.rs` — dead-letter branch.
-- `crates/harness-workflow/src/runtime/store/runtime_job_leases.rs`,
+- `crates/harness-workflow/src/runtime/store/{runtime_jobs.rs,
+  runtime_job_state.rs, activity_completion.rs}`,
   `store/transaction_helpers.rs`, `store/instances.rs`,
   `store_migrations.rs` — epoch exposure, dead-letter table, version
   predicate.

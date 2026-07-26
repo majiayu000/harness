@@ -34,11 +34,12 @@ different liveness models, and no atomic relationship:
 - **Runtime job leases** — `runtime_jobs` rows carry
   `WorkflowLease { owner, expires_at }` plus a `lease_generation` counter.
   Claim, defer, and completion are owner-scoped:
-  `claim_next_runtime_job_excluding_runtime_kind`,
-  `defer_runtime_job_claim_if_owned`, and
+  `claim_next_runtime_job`
+  (`crates/harness-workflow/src/runtime/store/runtime_jobs.rs:251`),
+  `defer_runtime_job_claim_if_owned`
+  (`store/runtime_job_state.rs:48`), and
   `commit_runtime_activity_completion_with_transcript_if_owned`
-  (`crates/harness-workflow/src/runtime/store/runtime_job_leases.rs`,
-  `runtime/lease_state.rs`, `runtime/job_claim.rs`). TTL is
+  (`store/activity_completion.rs:72`). TTL is
   `runtime_worker.lease_ttl_secs: 600` (`WORKFLOW.md:53`, applied at
   `crates/harness-server/src/http/background/runtime_workers.rs:6-7`).
 - **Workspace leases** — `workspace_leases` rows keyed
@@ -126,8 +127,10 @@ crates/harness-workflow/src/runtime/store/transaction_helpers.rs:93
 ```
 
 with `WorkflowDecisionTransition { expected_state, .. }` supplying the
-precondition. A grep for `version` in a `WHERE` clause across
-`runtime/store/` returns nothing.
+precondition. No UPDATE or SELECT on `workflow_instances` uses `version` as a
+predicate. (The pattern does exist in the codebase — `store/definitions.rs:46`
+guards `workflow_definitions` with `WHERE id = $1 AND version = $2` — which
+makes its absence on the instances table a choice, not a style gap.)
 
 ### Why this matters
 
