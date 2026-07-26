@@ -48,12 +48,14 @@ GH-1730
 - Done when:
   - Component IDs are derived only from the validated source scope, component
     kind, and source locator.
-  - Repository and user-global locators reject absolute, drive-prefixed,
-    backslash, NUL, empty, dot, and traversal segments without filesystem
-    access.
+  - Repository locators are relative to the repository root; user-global
+    locators begin with the closed canonical root namespace for the exact
+    Harness discovery root. Both reject absolute, drive-prefixed, backslash,
+    NUL, empty, dot, and traversal path segments without filesystem access.
   - Runtime and runner locators enforce the `<namespace>/<stable_key>` wire
     grammar and reject reserved missing-evidence sentinels, UUIDs, and
-    display-label shapes. The parser does not claim to verify whether an
+    display-label shapes. Reserved sentinels are rejected independently in
+    both segments. The parser does not claim to verify whether an
     otherwise-valid key came from persisted configuration.
   - Source locators are validated before their canonical component IDs are
     derived and compared.
@@ -64,8 +66,10 @@ GH-1730
     minimal version envelope before strict v0.1 shape decoding.
 - Verify:
   - `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable`
+  - `cargo test -p harness-core stack::tests::user_global_locator_requires_canonical_root_namespace`
   - `cargo test -p harness-core stack::tests::runtime_and_runner_locators_require_stable_config_keys`
   - `cargo test -p harness-core stack::tests::source_locator_rejects_reserved_sentinels`
+  - `cargo test -p harness-core stack::tests::runtime_locator_rejects_reserved_segments`
   - `cargo test -p harness-core stack::tests::portable_path_locator_rejects_nul`
   - `cargo test -p harness-core stack::tests::source_locator_validation_precedes_component_id_derivation`
   - `cargo test -p harness-core stack::tests::unsupported_version_precedes_strict_v01_shape_validation`

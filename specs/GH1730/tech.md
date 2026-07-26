@@ -94,11 +94,23 @@ Deserialization rejects a missing required field rather than inventing a
 default.
 
 `AgentStackSourceScope` contains explicit `repository`, `user_global`,
-`runtime`, and `runner` values. Repository and user-global locators use
-`/`-separated portable paths relative to the canonical root for their declared
-scope. Platform-neutral validation rejects leading `/`, backslashes, Windows
+`runtime`, and `runner` values. Repository locators use `/`-separated portable
+paths relative to the repository root. User-global locators use
+`<root_namespace>/<portable_relative_path>`, with this closed root namespace:
+
+| Root namespace | Exact logical root |
+| --- | --- |
+| `home_harness` | `$HOME/.harness` |
+| `xdg_config_harness` | `$XDG_CONFIG_HOME/harness` when XDG_CONFIG_HOME is absolute; otherwise `$HOME/.config/harness` |
+| `platform_config_harness` | macOS `$HOME/Library/Application Support/harness` or Windows `%APPDATA%/harness` |
+
+The namespace is chosen from the discovery root that produced the component,
+not by relativizing against an arbitrary common ancestor. An unknown root
+namespace is invalid. If the required environment root is absent, relative, or
+does not apply to the current platform, that namespace cannot be emitted.
+Platform-neutral path validation rejects leading `/`, backslashes, Windows
 drive prefixes such as `C:`, NUL bytes, and empty, `.`, or `..` segments before
-accepting the locator; it does not use platform-specific
+accepting either portable relative path; it does not use platform-specific
 `std::path::Component` semantics or access the filesystem.
 
 Runtime and runner locators use the exact form
@@ -109,7 +121,10 @@ including canonical hyphenated UUIDs and 32-hex compact UUIDs, and rejects
 values outside the token grammar, such as whitespace-bearing display labels.
 It also rejects the exact reserved missing-evidence spellings `unknown`,
 `unknown-component`, `unknown_component`, `none`, `null`, and `missing` for
-every scope before component-ID derivation.
+every scope before component-ID derivation. For runtime and runner locators,
+this reserved-spelling check applies independently to `namespace` and
+`stable_key`, so values such as `unknown/codex` and `codex/unknown` are both
+invalid.
 
 The wire validator deliberately does not claim to prove how an otherwise-valid
 stable key was obtained: `codex/12345` is syntactically valid even if a faulty
@@ -215,7 +230,7 @@ or persistence occurs.
 | --- | --- | --- |
 | B-001 | schema constant and version-envelope-first parsing | `cargo test -p harness-core stack::tests::schema_version_is_required_and_exact`; `cargo test -p harness-core stack::tests::unsupported_version_precedes_strict_v01_shape_validation` |
 | B-002 | `AgentStackComponentKind` | `cargo test -p harness-core stack::tests::component_kind_wire_vocabulary_is_closed` |
-| B-003 | canonical component ID plus scope-specific stable locator validation | `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable`; `cargo test -p harness-core stack::tests::runtime_and_runner_locators_require_stable_config_keys` |
+| B-003 | canonical component ID plus scope-specific stable locator validation | `cargo test -p harness-core stack::tests::component_id_is_canonical_kind_source_derivation_and_locator_is_portable`; `cargo test -p harness-core stack::tests::user_global_locator_requires_canonical_root_namespace`; `cargo test -p harness-core stack::tests::runtime_and_runner_locators_require_stable_config_keys` |
 | B-004 | `AgentStackObservationClass` | `cargo test -p harness-core stack::tests::observation_class_round_trips_without_implied_trust` |
 | B-005 | observation/selection validation matrix | `cargo test -p harness-core stack::tests::selection_state_requires_supporting_observation` |
 | B-006 | `Sha256Digest` newtype | `cargo test -p harness-core stack::tests::sha256_digest_rejects_blank_malformed_and_mixed_case_values` |
@@ -262,6 +277,10 @@ or persistence occurs.
       NUL locator, reserved-sentinel locator, runtime/runner UUID and
       display-label locator, duplicate and canonically ordered capability, and
       explicit-null integrity tests.
+- [ ] Prove user-global producers using the same root namespace derive the same
+      locator and reject unknown root namespaces.
+- [ ] Prove reserved runtime/runner spellings are rejected independently in
+      both locator segments, including `codex/unknown`.
 - [ ] Prove a future-version fixture with v0.1-unknown fields returns the typed
       unsupported-version error before strict v0.1 shape validation.
 - [ ] Add separate typed assertions for JSON syntax/shape failures and domain

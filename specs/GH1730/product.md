@@ -51,14 +51,18 @@ runtime use or local observation with trusted attestation.
    exactly as `<source_scope>:<component_kind>:<source_locator>`, one typed
    source scope, and one non-empty source locator. IDs cannot use UUIDs,
    mutable display labels, per-scan values, or producer-specific aliases.
-   Repository and user-global locators are portable paths relative to their
-   declared scope root and cannot be absolute or escape with `..`. Runtime and
-   runner locators use `<namespace>/<stable_key>` and reject reserved sentinel,
-   UUID, and display-label wire shapes. Producers must derive `stable_key` from
-   a persisted, versioned configuration identity rather than presentation or
-   per-scan data. The single-component parser validates the wire contract but
-   does not attest that provenance; ASC-005 compares snapshots to detect an
-   unauthorized key change for an otherwise unchanged configured source.
+   Repository locators are portable paths relative to the repository root.
+   User-global locators use
+   `<root_namespace>/<portable_relative_path>`, where the closed root namespace
+   identifies the exact Harness user-global discovery root. Neither path form
+   can be absolute or escape with `..`. Runtime and runner locators use
+   `<namespace>/<stable_key>` and reject reserved sentinel, UUID, and
+   display-label wire shapes independently in both segments. Producers must
+   derive `stable_key` from a persisted, versioned configuration identity
+   rather than presentation or per-scan data. The single-component parser
+   validates the wire contract but does not attest that provenance; ASC-005
+   compares snapshots to detect an unauthorized key change for an otherwise
+   unchanged configured source.
 4. **B-004:** Observation class is a closed vocabulary identifying the
    observer boundary: `repository_observed`, `runtime_observed`, or
    `runner_observed`. The class constrains the strongest admissible trust claim
@@ -147,6 +151,8 @@ runtime use or local observation with trusted attestation.
 - A component has no freshness evidence.
 - A non-repository producer supplies a UUID, display label, reserved missing
   sentinel, or newly generated per-scan value as its source locator.
+- Two user-global producers observe the same root but choose different base
+  directories instead of using its canonical root namespace.
 - Capabilities are present but no declared/granted/observed evidence class has
   yet been attached by the later capability-evidence contract.
 
