@@ -44,9 +44,20 @@ GH-1771
   the streaming adapter; `claude_adapter.rs:316-320` documents
   auto-approval. Repo rule: both files must change together.
 - `workflow_runtime_worker/runtime_profile.rs:27-38` — runtime profiles can
-  already declare `sandbox: "read-only-with-network"`, honored by the codex
-  paths (`codex.rs:667-676`, `codex_adapter.rs:566-580`); the Claude spawn
-  paths take no sandbox mode, and no per-activity tool profile exists.
+  already declare `sandbox: "read-only-with-network"`. The resolved mode
+  flows agent-agnostically: `workflow_runtime_worker/executor.rs:99-101`
+  computes it via `runtime_profile_sandbox_mode()` (falling back to the
+  `agents.sandbox_mode` config default) and passes it through
+  `TurnLifecycleOptions` (`executor.rs:197`;
+  `turn_engine/turn_lifecycle.rs:227`, `:243`) into the `AgentRequest` for
+  any agent. Claude spawns honor it as a real OS filesystem sandbox —
+  `claude_adapter.rs:104-109` and `claude.rs:85`, `:184-189`, `:313-318`
+  build `SandboxSpec`s enforced by harness-sandbox Seatbelt/Landlock; codex
+  paths translate it to CLI sandbox config (`codex.rs:667-676`,
+  `codex_adapter.rs:566-580`). What is missing is narrower: the Claude
+  *tool-permission flag surface* is sandbox-unaware
+  (`--dangerously-skip-permissions` under the full profile), and no
+  per-activity tool profile exists.
 
 ### Egress
 
