@@ -38,6 +38,10 @@ pub(crate) struct AgentSpawnInput<'a> {
     pub(crate) project_root: &'a Path,
     pub(crate) sandbox_spec: &'a SandboxSpec,
     pub(crate) env_vars: &'a HashMap<String, String>,
+    /// The caller pipes the prompt through the child's stdin. The container
+    /// tier must keep stdin open (`docker run -i`) or the prompt is silently
+    /// dropped; the host tier inherits stdin either way.
+    pub(crate) forward_stdin: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +93,9 @@ impl AgentSpawnContract for ContainerSpawn {
         let allowlist = network_allowlist(input.env_vars);
         let image = container_image(input.env_vars);
         let mut args = vec![OsString::from("run"), OsString::from("--rm")];
+        if input.forward_stdin {
+            args.push(OsString::from("--interactive"));
+        }
         args.push(OsString::from("--workdir"));
         args.push(OsString::from(CONTAINER_WORKSPACE));
         args.push(OsString::from("--mount"));
@@ -328,6 +335,7 @@ mod container_spawn_tests {
             project_root,
             sandbox_spec,
             env_vars,
+            forward_stdin: false,
         }
     }
 

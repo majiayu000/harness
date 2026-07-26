@@ -37,6 +37,8 @@ fn prepare_app_server_spawn(
         project_root: &req.project_root,
         sandbox_spec: &sandbox_spec,
         env_vars: &req.env_vars,
+        // The app-server protocol is driven over the child's stdin.
+        forward_stdin: true,
     })
 }
 

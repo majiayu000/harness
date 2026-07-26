@@ -198,6 +198,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                forward_stdin: false,
             })?;
 
         tracing::debug!(
@@ -333,6 +334,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                forward_stdin: false,
             })?;
 
         // Dump full args (truncate each to 120 chars) so we can diagnose

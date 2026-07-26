@@ -66,6 +66,108 @@ fn review_args_use_stdin_prompt_without_base() {
     assert_eq!(args.last().map(String::as_str), Some("-"));
 }
 
+fn container_review_request(
+    root: &std::path::Path,
+    base_ref: Option<&str>,
+    env_vars: Vec<(&str, &str)>,
+) -> CodexReviewRequest {
+    let mut env: std::collections::HashMap<String, String> = env_vars
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    env.insert(
+        "HARNESS_AGENT_ISOLATION_TIER".to_string(),
+        "container".to_string(),
+    );
+    CodexReviewRequest {
+        project_root: root.to_path_buf(),
+        instructions: Some("structured review instructions".to_string()),
+        base_ref: base_ref.map(str::to_string),
+        model: Some("gpt-test".to_string()),
+        reasoning_effort: Some("high".to_string()),
+        sandbox_mode: SandboxMode::WorkspaceWrite,
+        approval_policy: Some("never".to_string()),
+        env_vars: env,
+    }
+}
+
+fn spawn_args(spawn: &crate::spawn_contract::PreparedAgentSpawn) -> Vec<String> {
+    spawn
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// GH-1785: `execute_review` used to call `wrap_command` directly, so review
+/// runs got neither container isolation nor operator-secret env filtering.
+#[test]
+fn review_spawn_uses_container_isolation() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+
+    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
+        dir.path(),
+        Some("origin/main"),
+        vec![],
+    ))?;
+
+    let args = spawn_args(&spawn);
+    assert_eq!(spawn.program, PathBuf::from("docker"));
+    assert!(spawn.clear_inherited_env);
+    assert_eq!(spawn.current_dir, std::fs::canonicalize(dir.path())?);
+    assert!(args.contains(&"--mount".to_string()));
+    assert!(args.contains(&"review".to_string()));
+    Ok(())
+}
+
+#[test]
+fn review_spawn_filters_operator_secrets() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+
+    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
+        dir.path(),
+        Some("origin/main"),
+        vec![
+            ("GITHUB_TOKEN", "operator-token"),
+            ("ANTHROPIC_API_KEY", "operator-key"),
+            ("HARNESS_SCOPED_GITHUB_TOKEN", "scoped-token"),
+        ],
+    ))?;
+
+    let args = spawn_args(&spawn);
+    assert!(!args.iter().any(|arg| arg.contains("operator-token")));
+    assert!(!args.iter().any(|arg| arg.contains("operator-key")));
+    assert!(!spawn.process_env.contains_key("GITHUB_TOKEN"));
+    assert!(!spawn.process_env.contains_key("ANTHROPIC_API_KEY"));
+    // The scoped token is the only credential the container receives.
+    assert!(args.contains(&"GITHUB_TOKEN=scoped-token".to_string()));
+    assert!(!args
+        .iter()
+        .any(|arg| arg.starts_with("HARNESS_SCOPED_GITHUB_TOKEN=")));
+    Ok(())
+}
+
+/// A piped prompt is lost unless the container keeps stdin open.
+#[test]
+fn review_spawn_keeps_container_stdin_open_for_piped_prompt() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+
+    let (piped, _) =
+        agent.prepare_review_spawn(&container_review_request(dir.path(), None, vec![]))?;
+    let (not_piped, _) = agent.prepare_review_spawn(&container_review_request(
+        dir.path(),
+        Some("origin/main"),
+        vec![],
+    ))?;
+
+    assert!(spawn_args(&piped).contains(&"--interactive".to_string()));
+    assert!(!spawn_args(&not_piped).contains(&"--interactive".to_string()));
+    Ok(())
+}
+
 #[tokio::test]
 async fn execute_review_omits_stdin_when_base_ref_is_set() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
