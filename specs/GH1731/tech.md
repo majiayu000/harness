@@ -98,9 +98,31 @@ identity.
 Define the B-003 allowlist as one constant typed table. Every row has:
 
 - repository-relative matcher (exact path or root-only suffix);
-- expected entry class (`file`, recursively scanned `directory`, or
+- expected entry class (`file`, selector-filtered recursive `directory`, or
   non-recursive `directory_presence`);
+- a closed entry selector for directory rows;
 - `AgentStackComponentKind`.
+
+The private directory selector vocabulary is:
+
+- `all_regular_descendants` for documented roots where each descendant is a
+  declaration source;
+- `direct_extension` for definitions registered only as direct children;
+- `recursive_extension` for recursive extension-governed sources;
+- `recursive_basename` for package entrypoints with one exact basename.
+
+Selectors are data in the typed rule table, not content sniffing or ad hoc
+conditionals in traversal. The four general skill roots `.claude/skills`,
+`.codex/skills`, `.agents/skills`, and `skills` use the union of direct
+extension `md` and recursive basename `SKILL.md`. `.harness/skills` uses only
+direct extension `md`, matching `SkillStore::load_from_dir`; in particular,
+`*.usage.json`, nested package references, and arbitrary support files do not
+emit components. `.github/workflows` uses direct extensions `yml` and `yaml`;
+`.harness/rules` and `rules` use recursive extensions `md` and `toml`;
+`.harness/guards` uses direct extension `sh`; `.harness/sg` uses recursive
+extensions `yml` and `yaml`; and `.cursor/rules` uses recursive extensions
+`md` and `mdc`. The remaining documented directory roots use
+`all_regular_descendants`.
 
 Root instruction names map to `instructions`, workflow files and
 `.github/workflows` map to `workflow`, skill roots map to `skill`, hook roots
@@ -167,15 +189,21 @@ configuration error. For each rule:
    the same directory;
 6. increment checked depth, opened-directory, and file-count budgets before
    descending or reading and fail before a configured limit can be exceeded;
-7. reject sockets, FIFOs, devices, and every other non-regular special entry;
-8. open each file through its containing directory capability and validate
-   regular-file metadata from the opened handle, which becomes the authority
-   for the observed type, bytes, and executable mode;
-9. compute checked per-file and remaining-aggregate `+ 1` sentinels, read in
+7. apply the matched rule's entry selector to the normalized locator before
+   file metadata or open; an unmatched regular, symlink, or special descendant
+   is excluded without becoming a component or failure, while directories
+   required to find recursive matches remain subject to traversal budgets and
+   cycle checks;
+8. reject sockets, FIFOs, devices, and every other non-regular entry selected as
+   a definition source;
+9. open each selected file through its containing directory capability and
+   validate regular-file metadata from the opened handle, which becomes the
+   authority for the observed type, bytes, and executable mode;
+10. compute checked per-file and remaining-aggregate `+ 1` sentinels, read in
    bounded chunks through `File::take(min(per_file_sentinel,
    remaining_total_sentinel))`, account each chunk before the next read, and
    reject immediately when either byte limit would be exceeded;
-10. calculate SHA-256 and Unix executable metadata from the exact opened file
+11. calculate SHA-256 and Unix executable metadata from the exact opened file
     handle.
 
 Safe in-root symlinks retain their link locator as component identity while
@@ -208,7 +236,8 @@ component constructed through the merged public API:
 - `AgentStackComponent::new(rule.kind, source,
   AgentStackObservationClass::RepositoryObserved,
   AgentStackSelectionState::Discovered,
-  AgentStackTrustLevel::RepositoryObserved, AgentStackFreshness::Unknown)`;
+  AgentStackTrustLevel::RepositoryObserved,
+  AgentStackFreshnessEvidence::new(false, None, None, true, false).classify())`;
 - `.with_integrity(Some(digest))` for regular files;
 - the constructor-derived component ID
   `repository:<component kind>:<normalized locator>`;
@@ -219,8 +248,10 @@ component constructed through the merged public API:
 or `None` on platforms where that metadata is not observed. The
 `DirectoryPresence` class is used only for root `spec`; its ASC-001 integrity
 is absent, its kind is `validation`, and all other observation fields match a
-discovered repository component. Aggregate snapshot and diff consumers must
-compare the full entry rather than only the content digest.
+discovered repository component. Both regular-file reads and the successful
+`spec` directory probe classify as `fresh`; `unknown` is not valid for a
+successful current inventory observation. Aggregate snapshot and diff consumers
+must compare the full entry rather than only the content digest.
 
 Construction calls ASC-001 validation. Any validation failure becomes an
 inventory error; the service never skips an invalid component.
@@ -260,8 +291,8 @@ occurs.
 | B-002 | root-only rule table | `cargo test -p harness-core stack::inventory_tests::inventory_never_reads_user_global_or_sibling_paths` |
 | B-003 | `InventoryRule` constant | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector` |
 | B-004 | non-following initial lookup and missing-entry handling | `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders` |
-| B-005 | entry/component construction, hashing, executable mode, and directory presence | `cargo test -p harness-core stack::inventory_tests::entries_bind_content_mode_and_directory_presence_to_valid_components` |
-| B-006 | typed rule classification | `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
+| B-005 | entry/component construction, hashing, executable mode, directory presence, and current-observation freshness | `cargo test -p harness-core stack::inventory_tests::entries_bind_content_mode_and_directory_presence_to_valid_components`; `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh` |
+| B-006 | surface-specific typed selector classification | `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`; `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
 | B-007 | sorted traversal/output | `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory` |
 | B-008 | capability-relative traversal/open and opened-handle observation | `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target` |
 | B-009 | typed read/path errors | `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators` |
@@ -308,6 +339,11 @@ occurs.
       per-file, remaining-aggregate-byte, file-count, opened-directory,
       aggregate-encountered-entry, depth, entries-per-directory, overflow, and
       read-failure fixtures.
+- [ ] Prove direct Markdown and nested `SKILL.md` skill selectors include only
+      registered definition entrypoints, while `.usage.json`, package
+      references, and unrelated support files emit no component.
+- [ ] Prove every successful file read and `spec` directory probe classifies
+      freshness as `fresh`.
 - [ ] Add Unix executable-bit change and non-Unix unobserved-mode fixtures, plus
       a non-recursive root `spec` directory-presence fixture.
 - [ ] Validate every emitted component with the ASC-001 API.

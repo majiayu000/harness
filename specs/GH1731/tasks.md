@@ -52,18 +52,27 @@ GH-1731
 - Covers: B-002, B-003, B-004, B-005, B-006, B-007, B-011
 - Done when:
   - One immutable typed rule table represents every B-003 exact path,
-    root-only suffix, recursive directory, and directory-presence predicate.
+    root-only suffix, selector-filtered recursive directory, and
+    directory-presence predicate.
+  - Every directory row uses the closed surface-specific selector in
+    `tech.md`; general skill roots select direct `*.md` and nested `SKILL.md`,
+    while `.harness/skills` selects direct `*.md` only.
   - Harness-native roots have their specific component kinds and no recursive
     catch-all `.harness` rule exists.
   - Missing exact entries are omitted only after a non-following
     `symlink_metadata` lookup returns `NotFound`.
-  - Every regular file and the root `spec` predicate construct valid ASC-001
-    components through the merged public API.
+  - Every selected regular file and the root `spec` predicate construct valid
+    ASC-001 components through the merged public API and classify the direct
+    current observation as `fresh`.
+  - `.usage.json`, skill package references, and other unmatched support files
+    do not emit independent stack components.
   - Output order is the lexicographic order of lossless portable locators.
 - Verify:
   - `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector`
   - `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders`
+  - `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`
   - `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule`
+  - `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh`
   - `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory`
 
 ### SP1731-T3 — Implement capability-relative bounded traversal
@@ -105,8 +114,12 @@ GH-1731
   B-009, B-010, B-011, B-012
 - Done when:
   - Table-driven fixtures cover every allowlisted surface, every ASC-001
-    mapping, unrelated-file exclusion, exact root suffix matching, and the
-    non-recursive `spec` predicate.
+    mapping including `fresh` current observations, unrelated-file exclusion,
+    each directory selector, exact root suffix matching, and the non-recursive
+    `spec` predicate.
+  - Skill fixtures prove direct Markdown and nested `SKILL.md` definitions are
+    discovered while usage sidecars, package references, and support files are
+    excluded.
   - Negative fixtures cover missing versus broken symlinks, root replacement,
     escaping and in-root symlink swaps, cycles, special files, unreadable
     files, non-UTF-8 paths, post-`read_dir` disappearance, invalid limits, and

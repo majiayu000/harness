@@ -59,8 +59,12 @@ repository root, not that an agent selected, loaded, or executed it.
    and `mcp.json`; policy/validation roots `.vibeguard`, `rules`,
    `requirements.toml`, `.remem`, `remem.toml`, `.harness/config.toml`,
    `.harness/skills`, `.harness/rules`, `.harness/guards`, `.harness/sg`,
-   `harness.toml`, `.github/workflows`, and `.cursor/rules`. Toolchain and
-   validation selectors include `Cargo.toml`, `go.mod`, `package.json`,
+   `harness.toml`, `.github/workflows`, and `.cursor/rules`. Skill discovery
+   emits direct `*.md` definitions from every skill root and recursively emits
+   exact `SKILL.md` package entrypoints from non-Harness skill roots;
+   `.harness/skills/*.usage.json`, package references, and other sidecar files
+   are not independent stack units. Toolchain and validation selectors include
+   `Cargo.toml`, `go.mod`, `package.json`,
    `pyproject.toml`, `setup.py`, `requirements.txt`, `build.gradle`,
    `build.gradle.kts`, `pom.xml`, root `*.csproj` and `*.sln` files, `Gemfile`,
    `yarn.lock`, `pnpm-lock.yaml`, `.eslintrc`, `.eslintrc.js`,
@@ -75,15 +79,21 @@ repository root, not that an agent selected, loaded, or executed it.
 5. **B-005:** Every discovered regular file produces one inventory entry with
    a valid ASC-001 component, a normalized repository-relative
    `/`-separated locator, lowercase SHA-256 content digest,
-   `repository_observed` observation and trust, and selection state
-   `discovered`. The entry records the opened file's Unix executable bit as
-   `true` or `false` on Unix and explicitly marks it unobserved elsewhere, so
+   `repository_observed` observation and trust, selection state `discovered`,
+   and freshness `fresh` because inventory directly read the source in the
+   current observation. The entry records the opened file's Unix executable bit
+   as `true` or `false` on Unix and explicitly marks it unobserved elsewhere, so
    disabling a hook changes evidence even when its bytes do not. The root
    `spec` predicate emits one typed directory-presence entry with absent
-   integrity and does not recursively inventory test content.
+   integrity and freshness `fresh` because the current observation directly
+   probed it; inventory does not recursively inspect test content.
 6. **B-006:** Component kind comes from the matched allowlist rule, not from
-   file contents. Files beneath a typed directory inherit that rule's kind;
-   unsupported files outside every allowlist rule are not inventoried.
+   file contents or directory ancestry alone. Every recursive directory rule
+   has a closed surface-specific entry selector, and only matched definition
+   entrypoints inherit that rule's kind. A skill usage sidecar, package support
+   file, or other unsupported descendant does not become a component merely
+   because it is beneath a typed directory; unsupported files outside every
+   selector are not inventoried.
 7. **B-007:** Discovery order and output order are deterministic: allowlist
    rule order is stable, directory entries are sorted by normalized relative
    locator, and filesystem enumeration order cannot change output.
@@ -95,17 +105,17 @@ repository root, not that an agent selected, loaded, or executed it.
    targets may resolve to either target; the opened file handle is the
    observation authority, the component retains the repository link locator,
    and its digest covers exactly the bytes returned by that handle.
-9. **B-009:** An allowlisted entry that exists but cannot be opened, read,
-   resolved, classified, or represented as a lossless UTF-8 portable locator
-   returns an error with a failure category and, when representable, its safe
-   relative locator; a non-UTF-8 name reports only the nearest representable
-   ancestor. Harness does not use lossy path conversion, silently omit the
-   entry, or report a complete successful inventory.
+9. **B-009:** A selected allowlisted entry that exists but cannot be opened,
+   read, resolved, classified, or represented as a lossless UTF-8 portable
+   locator returns an error with a failure category and, when representable,
+   its safe relative locator; a non-UTF-8 name reports only the nearest
+   representable ancestor. Harness does not use lossy path conversion, silently
+   omit a selected entry, or report a complete successful inventory.
 10. **B-010:** Directory traversal is bounded by configured regular-file,
     opened-directory, aggregate-encountered-entry, aggregate-byte, depth,
-    entries-per-directory, and per-file byte limits. Non-regular special files,
-    recursive symlink cycles, invalid limit values, and every exceeded limit
-    fail visibly rather than being skipped.
+    entries-per-directory, and per-file byte limits. Selected non-regular
+    special files, recursive symlink cycles, invalid limit values, and every
+    exceeded limit fail visibly rather than being skipped.
 11. **B-011:** Repeating inventory against unchanged repository bytes,
     executable metadata, and directory-presence predicates produces the same
     ordered entries and digests regardless of current time or filesystem
@@ -157,7 +167,8 @@ repository root, not that an agent selected, loaded, or executed it.
 - Two safe in-root symlinks target the same file.
 - A file is removed or modified between metadata inspection and reading.
 - An allowlisted path exists as a directory where a file is expected.
-- A skill directory contains binary or special files.
+- A skill directory contains usage sidecars, package references, binary files,
+  or special files that are not selected definition entrypoints.
 - `Makefile` exists while `makefile` does not; matching remains exact.
 - The repository has no allowlisted surfaces.
 
