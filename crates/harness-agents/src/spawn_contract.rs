@@ -15,7 +15,16 @@ use crate::scoped_token::{
 /// another Claude Code session; leaking any of them into a spawned agent
 /// causes SIGTRAP. Only these markers are stripped — legitimate `CLAUDE_*`
 /// configuration such as `CLAUDE_CONFIG_DIR` must pass through.
-pub(crate) const NESTED_SESSION_ENV_KEYS: [&str; 2] = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"];
+///
+/// Keep in sync with the wrapper-variable classification in
+/// `scripts/start-harness-codex-safe.sh`.
+pub(crate) const NESTED_SESSION_ENV_KEYS: [&str; 5] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+];
 
 const DEFAULT_AGENT_CONTAINER_IMAGE: &str = "harness-agent:latest";
 const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
@@ -487,8 +496,9 @@ mod container_spawn_tests {
     fn host_spawn_filters_injected_nested_session_markers() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut env_vars = HashMap::new();
-        env_vars.insert("CLAUDECODE".to_string(), "1".to_string());
-        env_vars.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), "cli".to_string());
+        for key in NESTED_SESSION_ENV_KEYS {
+            env_vars.insert(key.to_string(), "1".to_string());
+        }
         env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), "/cfg".to_string());
         let sandbox_spec = SandboxSpec::new(SandboxMode::DangerFullAccess, root.path());
 
@@ -500,8 +510,12 @@ mod container_spawn_tests {
             &env_vars,
         ))?;
 
-        assert!(!spawn.process_env.contains_key("CLAUDECODE"));
-        assert!(!spawn.process_env.contains_key("CLAUDE_CODE_ENTRYPOINT"));
+        for key in NESTED_SESSION_ENV_KEYS {
+            assert!(
+                !spawn.process_env.contains_key(key),
+                "{key} must be stripped from the host process env"
+            );
+        }
         // Legitimate CLAUDE_* configuration must pass through.
         assert_eq!(
             spawn.process_env.get("CLAUDE_CONFIG_DIR"),
