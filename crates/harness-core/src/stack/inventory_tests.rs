@@ -184,7 +184,7 @@ fn inventory_discovers_every_stack_and_language_validation_selector() {
         "yarn.lock", "pnpm-lock.yaml", ".eslintrc", ".eslintrc.js", ".eslintrc.cjs",
         ".eslintrc.json", ".eslintrc.yaml", ".eslintrc.yml", "eslint.config.js",
         "eslint.config.mjs", "eslint.config.cjs", "biome.json", ".rubocop.yml",
-        "App.csproj", "App.sln", "Makefile", "justfile",
+        "App.csproj", "App.sln", ".csproj", ".sln", "Makefile", "justfile",
         // Unrelated files that must stay excluded.
         "README.md", "src/main.rs", "docs/notes.md", ".vibeguard/helper.sh",
         ".harness/local/run.log", "hooks/x.sh", ".claude/hooks/y.sh",
@@ -228,6 +228,7 @@ fn inventory_discovers_every_stack_and_language_validation_selector() {
         ("eslint.config.cjs", "validation"), ("biome.json", "validation"),
         (".rubocop.yml", "validation"),
         ("App.csproj", "validation"), ("App.sln", "validation"),
+        (".csproj", "validation"), (".sln", "validation"),
         ("spec", "validation"), ("Makefile", "validation"), ("justfile", "validation"),
     ];
     let mut expected: Vec<(String, &'static str)> =
@@ -278,14 +279,17 @@ requirements_path = "reqs.toml"
 #[rustfmt::skip]
 fn same_locator_with_distinct_kinds_is_preserved() {
     let dir = tmp();
-    write_file(dir.path(), "harness.toml", b"[rules]\ndiscovery_paths = [\"Cargo.toml\"]\n");
+    write_file(dir.path(), "harness.toml",
+        b"[rules]\ndiscovery_paths = [\"Cargo.toml\", \"harness.toml\"]\n");
     write_file(dir.path(), "Cargo.toml", b"[package]\nname = \"fixture\"\n");
-    let listed = pairs(&run_ok(dir.path()));
-    let kinds: Vec<&str> = listed.iter()
-        .filter(|(l, _)| l == "Cargo.toml")
-        .map(|(_, k)| *k)
-        .collect();
-    assert_eq!(kinds, ["policy", "validation"], "one component per kind");
+    let options = opts(dir.path()).with_max_files(2).expect("two physical files");
+    let inventory = inventory_repository_stack(&options).expect("reuse observations by locator");
+    for locator in ["Cargo.toml", "harness.toml"] {
+        let entries: Vec<_> = inventory.entries().iter()
+            .filter(|entry| entry.component().source().locator().as_str() == locator).collect();
+        assert_eq!(entries.len(), 2, "one component per kind");
+        assert_eq!(entry_digest(entries[0]), entry_digest(entries[1]), "one opened observation");
+    }
 }
 
 // ── B-004 ────────────────────────────────────────────────────────────────────
@@ -435,8 +439,6 @@ fn unsupported_non_utf8_entries_are_filtered_before_locator_normalization() {
     let dir = tmp();
     let root = dir.path();
     write_file(root, "skills/ok.md", b"ok");
-    // Unmatched non-UTF-8 basename (no selector extension): excluded before
-    // portable locator normalization, without failing the scan.
     let unmatched = root.join("skills").join(OsStr::from_bytes(b"raw-\xFF-bytes.bin"));
     if fs::write(&unmatched, b"binary").is_err() {
         // This filesystem (for example APFS) rejects non-UTF-8 names, so the
@@ -452,16 +454,22 @@ fn unsupported_non_utf8_entries_are_filtered_before_locator_normalization() {
     assert_eq!(error.locator(), Some("skills"), "only the representable ancestor is reported");
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 #[test]
 fn unsupported_non_utf8_entries_are_filtered_before_locator_normalization() {
-    // Non-UTF-8 basenames cannot be constructed portably here; assert the
-    // typed category directly and that ordinary discovery is unaffected.
-    assert_eq!(EK::NonUtf8Locator.as_str(), "non_utf8_locator");
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
     let dir = tmp();
-    write_file(dir.path(), "skills/ok.md", b"ok");
-    let listed = pairs(&run_ok(dir.path()));
-    assert_eq!(listed, vec![("skills/ok.md".to_owned(), "skill")]);
+    fs::create_dir(dir.path().join("skills")).expect("mkdir");
+    let name = OsString::from_wide(&[0xD800, b'.' as u16, b'm' as u16, b'd' as u16]);
+    fs::write(dir.path().join("skills").join(name), b"selected").expect("write invalid UTF-16");
+    assert_fail(dir.path(), EK::NonUtf8Locator);
+}
+
+#[cfg(all(not(unix), not(windows)))]
+#[test]
+fn unsupported_non_utf8_entries_are_filtered_before_locator_normalization() {
+    assert_eq!(EK::NonUtf8Locator.as_str(), "non_utf8_locator");
 }
 
 #[test]
@@ -542,7 +550,15 @@ fn in_root_directory_symlinks_are_traversed_and_cycles_fail() {
 #[cfg(not(unix))]
 #[test]
 fn in_root_directory_symlinks_are_traversed_and_cycles_fail() {
-    // Cycle fixtures require symlinks; assert the typed category directly.
+    let dir = tmp();
+    let first = cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority())
+        .expect("first handle");
+    let second = cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority())
+        .expect("second handle");
+    assert!(
+        directory_identity(&first, "").expect("identity")
+            == directory_identity(&second, "").expect("identity")
+    );
     assert_eq!(EK::CycleDetected.as_str(), "cycle_detected");
 }
 
@@ -555,6 +571,11 @@ fn file_rules_reject_directory_symlink_targets() {
     symlink("somewhere", root.join("CLAUDE.md")).expect("symlink");
     let error = assert_fail(root, EK::NonRegularEntry);
     assert_eq!(error.locator(), Some("CLAUDE.md"));
+    let suffix = tmp();
+    fs::create_dir(suffix.path().join("target")).expect("mkdir");
+    symlink("target", suffix.path().join("App.csproj")).expect("suffix symlink");
+    let error = assert_fail(suffix.path(), EK::NonRegularEntry);
+    assert_eq!(error.locator(), Some("App.csproj"));
 }
 
 #[cfg(not(unix))]

@@ -25,6 +25,7 @@ sqlx = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 cap-std = { workspace = true }
+same-file = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

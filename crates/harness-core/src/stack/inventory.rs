@@ -12,11 +12,12 @@ use super::{
 };
 use cap_std::fs::{Dir, FileType, OpenOptions};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Validated inventory options: one explicit repository root plus non-zero
 /// resource budgets that all permit a checked `+ 1` sentinel.
@@ -234,9 +235,9 @@ impl DirSelector {
     }
 
     /// Match against a native basename before any locator normalization.
-    fn matches(&self, name: &[u8], direct_level: bool) -> bool {
-        let ext_match = |ext: &&str| has_extension(name, ext.as_bytes());
-        let base_match = |base: &&str| name == base.as_bytes();
+    fn matches(&self, name: &OsStr, direct_level: bool) -> bool {
+        let ext_match = |ext: &&str| has_extension(name, ext);
+        let base_match = |base: &&str| name == OsStr::new(base);
         self.recursive_extensions.iter().any(ext_match)
             || self.recursive_basenames.iter().any(base_match)
             || (direct_level
@@ -245,9 +246,10 @@ impl DirSelector {
     }
 }
 
-fn has_extension(name: &[u8], ext: &[u8]) -> bool {
-    name.len() > ext.len() + 1 && name.ends_with(ext) && name[name.len() - ext.len() - 1] == b'.'
-}
+#[rustfmt::skip]
+fn has_extension(name: &OsStr, ext: &str) -> bool { Path::new(name).extension() == Some(OsStr::new(ext)) }
+#[rustfmt::skip]
+fn has_suffix(name: &OsStr, suffix: &str) -> bool { name.as_encoded_bytes().ends_with(suffix.as_bytes()) }
 
 /// Expected entry class for a rule target.
 #[derive(Debug, Clone, Copy)]
@@ -386,26 +388,23 @@ pub(super) fn classify_open_failure(kind: std::io::ErrorKind) -> AgentStackInven
     if kind == std::io::ErrorKind::NotFound { EK::EntryRaced } else { EK::ReadFailed }
 }
 
-#[cfg(unix)]
-#[rustfmt::skip]
-fn os_bytes(name: &OsStr) -> Option<&[u8]> {
-    use std::os::unix::ffi::OsStrExt;
-    Some(name.as_bytes())
-}
-#[cfg(not(unix))]
-#[rustfmt::skip]
-fn os_bytes(name: &OsStr) -> Option<&[u8]> { name.to_str().map(str::as_bytes) }
-
 type DerivedRule = (String, RuleTarget, AgentStackComponentKind);
 type Listing = Vec<(OsString, FileType)>;
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct DirectoryIdentity(Arc<same_file::Handle>);
+#[derive(Clone)]
+#[rustfmt::skip]
+struct FileObservation { bytes: Vec<u8>, digest: Sha256Digest, class: AgentStackEntryClass }
 
 #[rustfmt::skip]
 struct Scan<'a> {
     opts: &'a AgentStackInventoryOptions,
     files_used: usize, dirs_opened: usize, entries_seen: usize, bytes_used: u64,
     entries: BTreeMap<(String, &'static str), AgentStackInventoryEntry>,
+    file_observations: BTreeMap<String, FileObservation>,
     root_listing: Option<Listing>,
-    #[cfg(unix)] ancestors: Vec<(u64, u64)>,
+    ancestors: Vec<DirectoryIdentity>,
 }
 
 /// Checked budget increment: fail before a configured limit can be exceeded.
@@ -441,18 +440,10 @@ pub(crate) fn inventory_with_root(
         entries_seen: 0,
         bytes_used: 0,
         entries: BTreeMap::new(),
+        file_observations: BTreeMap::new(),
         root_listing: None,
-        #[cfg(unix)]
-        ancestors: Vec::new(),
+        ancestors: vec![directory_identity(root, "")?],
     };
-    #[cfg(unix)]
-    {
-        use cap_std::fs::MetadataExt;
-        let meta = root
-            .dir_metadata()
-            .map_err(|_| IErr::new(EK::RootOpen, None))?;
-        scan.ancestors.push((meta.dev(), meta.ino()));
-    }
     let derived = scan.load_config(root)?;
     for static_rule in STATIC_RULES {
         match static_rule.matcher {
@@ -489,7 +480,7 @@ impl Scan<'_> {
             return Ok(Vec::new());
         };
         let mut derived: Vec<DerivedRule> = Vec::new();
-        let mut seen: Vec<(String, bool)> = Vec::new();
+        let mut seen: HashSet<(String, bool)> = HashSet::new();
         let sources = rules
             .discovery_paths
             .iter()
@@ -504,10 +495,9 @@ impl Scan<'_> {
                 continue; // Absolute sources are outside the repository scope.
             };
             let key = (locator.clone(), exact_file);
-            if seen.contains(&key) {
+            if !seen.insert(key) {
                 continue;
             }
-            seen.push(key);
             let target = if exact_file {
                 RuleTarget::File
             } else {
@@ -577,24 +567,24 @@ impl Scan<'_> {
         let listing = self.root_listing.clone().unwrap_or_default();
         let mut selected = Vec::new();
         for (name, file_type) in listing {
-            let matched = os_bytes(&name).is_some_and(|bytes| {
-                bytes.len() > suffix.len() && bytes.ends_with(suffix.as_bytes())
-            });
-            if !matched || file_type.is_dir() {
+            if !has_suffix(&name, suffix) {
                 continue;
             }
+            let locator = name
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| IErr::new(EK::NonUtf8Locator, None))?;
+            if file_type.is_dir() {
+                return Err(err(EK::NonRegularEntry, &locator));
+            }
             if file_type.is_symlink() {
-                let hint = name.to_str().unwrap_or("");
                 let resolved = root
                     .metadata(&name)
-                    .map_err(|error| err(classify_resolution_failure(error.kind()), hint))?;
+                    .map_err(|error| err(classify_resolution_failure(error.kind()), &locator))?;
                 if resolved.is_dir() {
-                    continue;
+                    return Err(err(EK::NonRegularEntry, &locator));
                 }
             }
-            let Some(locator) = name.to_str().map(str::to_owned) else {
-                return Err(IErr::new(EK::NonUtf8Locator, None));
-            };
             selected.push(locator);
         }
         selected.sort();
@@ -643,18 +633,12 @@ impl Scan<'_> {
             };
             err(kind, &prefix)
         })?;
-        #[cfg(unix)]
-        {
-            use cap_std::fs::MetadataExt;
-            let meta = dir.dir_metadata().map_err(|_| err(EK::EntryMetadata, &prefix))?;
-            let identity = (meta.dev(), meta.ino());
-            if self.ancestors.contains(&identity) {
-                return Err(err(EK::CycleDetected, &prefix));
-            }
-            self.ancestors.push(identity);
+        let identity = directory_identity(&dir, &prefix)?;
+        if self.ancestors.contains(&identity) {
+            return Err(err(EK::CycleDetected, &prefix));
         }
+        self.ancestors.push(identity);
         let result = self.traverse_entries(root, &dir, &prefix, selector, kind, depth);
-        #[cfg(unix)]
         self.ancestors.pop();
         result
     }
@@ -685,7 +669,7 @@ impl Scan<'_> {
             let selected = if is_dir {
                 selector.is_recursive()
             } else {
-                os_bytes(name).is_some_and(|bytes| selector.matches(bytes, direct_level))
+                selector.matches(name, direct_level)
             };
             if selected {
                 let name = name.to_str().ok_or_else(|| err(EK::NonUtf8Locator, prefix))?;
@@ -713,6 +697,10 @@ impl Scan<'_> {
     ) -> Result<Option<Vec<u8>>, IErr> {
         if self.entries.contains_key(&(locator.clone(), kind.as_str())) {
             return Ok(None);
+        }
+        if let Some(observation) = self.file_observations.get(&locator).cloned() {
+            self.emit(kind, locator, Some(observation.digest), observation.class)?;
+            return Ok(Some(observation.bytes));
         }
         charge(&mut self.files_used, self.opts.max_files, &locator)?;
         let mut open_options = OpenOptions::new();
@@ -750,6 +738,9 @@ impl Scan<'_> {
         self.bytes_used += read;
         let digest = Sha256Digest::from_bytes(&bytes);
         let class = AgentStackEntryClass::RegularFile { unix_executable };
+        self.file_observations.insert(locator.clone(), FileObservation {
+            bytes: bytes.clone(), digest: digest.clone(), class: class.clone(),
+        });
         self.emit(kind, locator, Some(digest), class)?;
         Ok(Some(bytes))
     }
@@ -782,4 +773,12 @@ impl Scan<'_> {
         self.entries.insert(key, AgentStackInventoryEntry { component, entry_class });
         Ok(())
     }
+}
+
+#[rustfmt::skip]
+pub(super) fn directory_identity(directory: &Dir, locator: &str) -> Result<DirectoryIdentity, IErr> {
+    let file = directory.try_clone().map(Dir::into_std_file)
+        .map_err(|_| err(EK::EntryMetadata, locator))?;
+    same_file::Handle::from_file(file).map(|handle| DirectoryIdentity(Arc::new(handle)))
+        .map_err(|_| err(EK::EntryMetadata, locator))
 }

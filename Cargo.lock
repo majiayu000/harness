@@ -1341,6 +1341,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "libc",
+ "same-file",
  "serde",
  "serde_json",
  "serde_yaml",
