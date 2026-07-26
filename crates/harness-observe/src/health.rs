@@ -30,7 +30,9 @@ pub struct EventSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthReport {
-    pub quality: QualityReport,
+    /// `None` when the graded window carried no signal at all. Consumers must
+    /// render this as "no data" rather than substituting a passing grade.
+    pub quality: Option<QualityReport>,
     pub violation_summary: Vec<ViolationSummary>,
     pub signal_summary: Vec<SignalSummary>,
     pub event_summary: EventSummary,
@@ -42,7 +44,8 @@ pub fn generate_health_report(events: &[Event], violations: &[Violation]) -> Hea
     let signal_summary = derive_signals(events);
     let event_summary = count_events(events);
     let quality = QualityGrader::grade(events, violations.len());
-    let recommendations = build_recommendations(&quality, &violation_summary, &event_summary);
+    let recommendations =
+        build_recommendations(quality.as_ref(), &violation_summary, &event_summary);
 
     HealthReport {
         quality,
@@ -124,18 +127,18 @@ fn count_events(events: &[Event]) -> EventSummary {
 }
 
 fn build_recommendations(
-    quality: &QualityReport,
+    quality: Option<&QualityReport>,
     violations: &[ViolationSummary],
     summary: &EventSummary,
 ) -> Vec<String> {
     let mut recs = Vec::new();
 
-    if quality.dimensions.security < 90.0 {
+    if quality.is_some_and(|q| q.dimensions.security < 90.0) {
         recs.push(
             "Review and fix security-related violations to improve security score.".to_string(),
         );
     }
-    if quality.dimensions.stability < 80.0 {
+    if quality.is_some_and(|q| q.dimensions.stability < 80.0) {
         recs.push("Reduce block rate to improve stability score.".to_string());
     }
     if summary.escalate_count > 0 {
@@ -150,7 +153,7 @@ fn build_recommendations(
             top.rule_id, top.count
         ));
     }
-    if quality.grade == Grade::D {
+    if quality.is_some_and(|q| q.grade == Grade::D) {
         recs.push(
             "Consider running garbage collection immediately to clean up accumulated issues."
                 .to_string(),
@@ -158,7 +161,12 @@ fn build_recommendations(
     }
 
     if recs.is_empty() {
-        recs.push("System health is good. Maintain current practices.".to_string());
+        // Only claim good health when there was something to grade; an empty
+        // window means "nothing observed", not "everything fine".
+        recs.push(match quality {
+            Some(_) => "System health is good. Maintain current practices.".to_string(),
+            None => "No observability data in this window; health could not be graded.".to_string(),
+        });
     }
 
     recs
@@ -193,13 +201,25 @@ mod tests {
     }
 
     #[test]
-    fn zero_events_zero_violations_grade_a() {
+    fn zero_events_zero_violations_has_no_quality_verdict() {
         let report = generate_health_report(&[], &[]);
-        assert_eq!(report.quality.grade, Grade::A);
+        assert!(
+            report.quality.is_none(),
+            "an empty window must not report a passing grade"
+        );
         assert!(report.violation_summary.is_empty());
         assert!(report.signal_summary.is_empty());
         assert_eq!(report.event_summary.total, 0);
         assert_eq!(report.recommendations.len(), 1);
+        assert!(report.recommendations[0].contains("No observability data"));
+    }
+
+    #[test]
+    fn clean_non_empty_window_still_grades_a() {
+        let events = vec![pass_event(), pass_event()];
+        let report = generate_health_report(&events, &[]);
+        let quality = report.quality.expect("non-empty window is gradeable");
+        assert_eq!(quality.grade, Grade::A);
         assert!(report.recommendations[0].contains("good"));
     }
 
@@ -257,6 +277,7 @@ mod tests {
             .map(|_| make_violation("SEC-01", Severity::High))
             .collect();
         let report = generate_health_report(&[], &violations);
-        assert!(report.quality.dimensions.coverage < 100.0);
+        let quality = report.quality.expect("violations are gradeable signal");
+        assert!(quality.dimensions.coverage < 100.0);
     }
 }

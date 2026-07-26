@@ -236,7 +236,8 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     .count()
             })
             .unwrap_or(0);
-        harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
+        harness_observe::quality::QualityGrader::grade(&events, violation_count)
+            .map(|report| report.grade)
     };
     crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
     // Pass the pre-built GitHub pollers from AppState to the orchestrator so

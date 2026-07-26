@@ -293,6 +293,35 @@ async fn check_logs_quality_grade_event() {
         .starts_with("grade="));
 }
 
+#[tokio::test]
+async fn empty_window_logs_no_grade_and_leaves_cadence_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    // Grade::A is in auto_gc_grades, so a fabricated A on an empty window would
+    // both log a grade event and arm the GC trigger.
+    let trigger = make_trigger(dir.path(), vec![Grade::A], 0).await;
+    let before = trigger.last_triggered.load(Ordering::Relaxed);
+
+    trigger.check_and_maybe_trigger(None).await;
+
+    let events = trigger
+        .events
+        .query(&harness_core::types::EventFilters {
+            hook: Some("quality_grade".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        events.is_empty(),
+        "an empty window must not log a quality grade"
+    );
+    assert_eq!(
+        trigger.last_triggered.load(Ordering::Relaxed),
+        before,
+        "an empty window must not change GC cadence"
+    );
+}
+
 // --- challenger cross-review tests ---
 
 // Scenario 1: challenger=None, task_ctx=None → existing behavior, one quality_grade event

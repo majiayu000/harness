@@ -162,7 +162,16 @@ impl QualityTrigger {
             .next_back()
             .unwrap_or(0);
 
-        let mut report = QualityGrader::grade(&window_events, violation_count);
+        // An empty window carries no verdict. Treat it as "no change": do not
+        // log a fabricated grade, do not run cross-review, and leave the GC
+        // cadence exactly where it was.
+        let Some(mut report) = QualityGrader::grade(&window_events, violation_count) else {
+            tracing::debug!(
+                window_hours = QUALITY_WINDOW_HOURS,
+                "quality_trigger: no events or violations in window; skipping quality check"
+            );
+            return;
+        };
 
         // Cross-review gate: skip if no challenger, no task context, or grade=A.
         if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {

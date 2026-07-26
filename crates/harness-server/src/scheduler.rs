@@ -13,10 +13,19 @@ pub struct Scheduler {
     pub workspace_gc_interval: Duration,
 }
 
+/// GC cadence used when startup has no gradeable observability data yet. The
+/// least aggressive cadence is correct here: an ungraded window is not evidence
+/// of decay, and `QualityTrigger` takes over once real events exist.
+const UNGRADED_GC_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
+
 impl Scheduler {
-    pub fn from_grade(grade: Grade) -> Self {
+    /// `grade` is `None` when the startup event window carried no signal to
+    /// grade; see [`UNGRADED_GC_INTERVAL`].
+    pub fn from_grade(grade: Option<Grade>) -> Self {
         Self {
-            gc_interval: grade.recommended_gc_interval(),
+            gc_interval: grade
+                .map(|g| g.recommended_gc_interval())
+                .unwrap_or(UNGRADED_GC_INTERVAL),
             health_interval: Duration::from_secs(24 * 3600),
             self_evolution_interval: Duration::from_secs(24 * 3600),
             workspace_gc_interval: Duration::from_secs(3600),
@@ -114,8 +123,8 @@ impl Scheduler {
         state.observability.events.log(&probe_report).await?;
         let report = generate_health_report(&events, &violations);
         tracing::info!(
-            grade = ?report.quality.grade,
-            score = report.quality.score,
+            grade = ?report.quality.as_ref().map(|q| q.grade),
+            score = ?report.quality.as_ref().map(|q| q.score),
             violations = report.violation_summary.len(),
             "scheduler: periodic health report"
         );
@@ -148,7 +157,7 @@ mod tests {
 
     #[test]
     fn from_grade_d_returns_1h_gc_interval() {
-        let s = Scheduler::from_grade(Grade::D);
+        let s = Scheduler::from_grade(Some(Grade::D));
         assert_eq!(s.gc_interval, Duration::from_secs(3600));
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
         assert_eq!(s.self_evolution_interval, Duration::from_secs(24 * 3600));
@@ -156,8 +165,15 @@ mod tests {
     }
 
     #[test]
+    fn from_grade_none_uses_ungraded_interval() {
+        let s = Scheduler::from_grade(None);
+        assert_eq!(s.gc_interval, UNGRADED_GC_INTERVAL);
+        assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
     fn from_grade_a_returns_7d_gc_interval() {
-        let s = Scheduler::from_grade(Grade::A);
+        let s = Scheduler::from_grade(Some(Grade::A));
         assert_eq!(s.gc_interval, Duration::from_secs(7 * 24 * 3600));
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
         assert_eq!(s.self_evolution_interval, Duration::from_secs(24 * 3600));
@@ -166,13 +182,13 @@ mod tests {
 
     #[test]
     fn from_grade_b_returns_3d_gc_interval() {
-        let s = Scheduler::from_grade(Grade::B);
+        let s = Scheduler::from_grade(Some(Grade::B));
         assert_eq!(s.gc_interval, Duration::from_secs(3 * 24 * 3600));
     }
 
     #[test]
     fn from_grade_c_returns_1d_gc_interval() {
-        let s = Scheduler::from_grade(Grade::C);
+        let s = Scheduler::from_grade(Some(Grade::C));
         assert_eq!(s.gc_interval, Duration::from_secs(24 * 3600));
     }
 
