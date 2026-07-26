@@ -39,8 +39,9 @@ traversal engine, public-contract fixtures, and review-driven white-box
 fixtures in two monolithic files. Adding the required remediation in place
 would exceed the repository's 800-line hard ceiling.
 
-Final current-head review comments arrived after #1810 merged. GH-1731 was
-reopened because six P2 findings remain applicable to the merged code:
+Six final current-head P2 comments were posted before #1810 merged and remained
+unresolved when the merge completed. GH-1731 was subsequently reopened because
+all six findings still apply to the merged code:
 
 1. a flexible configured source can erase a later exact-file requirement for
    the same locator;
@@ -60,9 +61,9 @@ reopened because six P2 findings remain applicable to the merged code:
 The original implementation encoded the broad product invariants, but three
 internal boundaries remained underspecified:
 
-- rule merging recorded only "already present" and did not define how
-  constraints compose when two configured fields describe the same policy
-  locator;
+- rule merging recorded only "already present" and did not define how target,
+  selector, and required-presence constraints compose across static and
+  configured bindings for the same policy locator;
 - traversal helpers accepted a local depth and a path-free open-error
   classifier, losing repository-relative position and stable post-race path
   evidence; and
@@ -98,12 +99,18 @@ change.
 ### 1. Preserve the Strictest Derived Constraint
 
 Normalize configured sources before merging them. For one normalized locator
-and component kind:
+and component kind, compose target shape, directory selector, and
+required-presence as separate constraints:
 
-- a static rule keeps its original target and selector;
-- `RuleTarget::File` is stricter than
-  `RuleTarget::FileOrDirectory(selector)` and wins regardless of configured
-  field order;
+- `RuleTarget::File` is stricter than any directory-capable target and wins
+  regardless of whether it comes from a static rule, `exec_policy_paths`,
+  `requirements_path`, or their field order;
+- therefore an exact configured source tightens an equivalent static recursive
+  or file-or-directory rule to `File`;
+- when no exact-file binding exists, a static directory target retains its
+  closed selector instead of being replaced by the configured `md`/`toml`
+  selector; the static selector remains recorded but is inapplicable while an
+  exact-file constraint is active;
 - equivalent flexible targets merge without another traversal;
 - the binding is required when any configured source declares it; and
 - the same locator under distinct component kinds still emits one component
@@ -111,11 +118,17 @@ and component kind:
 
 Consequently, a locator listed in both `rules.discovery_paths` and
 `rules.exec_policy_paths` must reject a directory with
-`non_regular_entry`. Reversing those fields must not change behavior.
+`non_regular_entry`. The same is true when an exact configured source overlaps
+a static recursive rule, such as `rules.requirements_path = "rules"`.
+Reversing configured field order must not change behavior. This preserves
+B-006: configured file sources select the exact file, while static selectors
+continue to govern bindings that remain directory-capable.
 
-Acceptance test:
+Acceptance tests:
 
 - `derived_exact_file_constraint_wins_over_flexible_source`
+- `exact_configured_source_tightens_static_recursive_rule`
+- `derived_rule_merge_is_field_order_independent`
 
 ### 2. Measure Depth from the Repository Root
 
@@ -137,20 +150,31 @@ Acceptance tests:
 ### 3. Reclassify Recursive Symlink Open Races
 
 When a recursive candidate resolves as a directory but capability-relative
-`open_dir` later returns `NotFound`, recheck the candidate with non-following
-metadata through the same root capability:
+`open_dir` later returns `NotFound`, first recheck the candidate with
+non-following metadata through the same root capability. A still-present
+symlink is not sufficient evidence that its target is broken. Resolve and
+reopen that target capability-relatively once before classifying:
 
-- a still-present symlink is `broken_symlink`;
-- a vanished or replaced non-symlink candidate is `entry_raced`; and
-- a recheck failure other than `NotFound` remains a typed metadata or
-  containment failure.
+- if the current symlink resolves to and opens a valid in-root directory,
+  continue traversal from that reopened handle as a valid replacement target;
+  the retry belongs to the original directory-open attempt and does not charge
+  a second directory or depth unit;
+- if the symlink itself remains present and capability-relative target
+  resolution returns `NotFound`, return `broken_symlink`;
+- if the candidate vanished, became a non-symlink, resolves to a non-directory,
+  or changes again before the single reopen completes, return `entry_raced`;
+  and
+- resolution or reopen failures that prove containment, permission, or metadata
+  faults retain their existing typed category.
 
 The error locator is the complete lossless repository-relative candidate when
 representable, or its nearest lossless ancestor otherwise. No ambient target
-path or raw OS error string is serialized.
+path or raw OS error string is serialized. The retry is bounded to one
+re-resolution/reopen so repeated replacement cannot loop or evade budgets.
 
 Acceptance tests:
 
+- `recursive_symlink_open_failure_accepts_valid_replacement`
 - `recursive_symlink_open_failure_rechecks_broken_link`
 - `recursive_directory_disappearance_remains_entry_raced`
 
