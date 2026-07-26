@@ -217,7 +217,6 @@ impl CodeAgent for ClaudeCodeAgent {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
 
         let _provider_permit = self
             .provider_gate
@@ -376,7 +375,6 @@ impl CodeAgent for ClaudeCodeAgent {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
 
         // ETXTBSY (error 26) occurs on Linux when a security scanner or indexer
         // briefly opens the executable for writing after it is written. Retry once.

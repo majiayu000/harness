@@ -782,6 +782,45 @@ exit 0
 }
 
 #[tokio::test]
+async fn execute_strips_injected_nested_session_markers_but_keeps_claude_config() {
+    let (dir, script) = write_executable_script(
+        r#"
+printf '{"type":"result","result":"CLAUDECODE=%s ENTRYPOINT=%s CONFIG_DIR=%s"}\n' \
+    "${CLAUDECODE:-unset}" "${CLAUDE_CODE_ENTRYPOINT:-unset}" "${CLAUDE_CONFIG_DIR:-unset}"
+"#,
+    );
+    let agent = ClaudeCodeAgent::new(
+        script,
+        "test-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    );
+    let mut env_vars = std::collections::HashMap::new();
+    // Injected via the request rather than inherited from the parent env —
+    // the historical bug only stripped keys present in the parent env.
+    env_vars.insert("CLAUDECODE".to_string(), "1".to_string());
+    env_vars.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), "cli".to_string());
+    env_vars.insert(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        "/tmp/claude-cfg".to_string(),
+    );
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        env_vars,
+        ..AgentRequest::default()
+    };
+
+    let response = match agent.execute(request).await {
+        Ok(response) => response,
+        Err(error) => panic!("execution should succeed, got: {error}"),
+    };
+    assert_eq!(
+        response.output,
+        "CLAUDECODE=unset ENTRYPOINT=unset CONFIG_DIR=/tmp/claude-cfg"
+    );
+}
+
+#[tokio::test]
 async fn execute_returns_token_usage_from_stream_json_result() {
     let (dir, script) = write_executable_script(
         r#"
