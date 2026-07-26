@@ -4,6 +4,10 @@
 
 GH-1768
 
+## Product Spec
+
+`specs/GH1768/product.md`
+
 ## Context
 
 All building blocks exist in `crates/harness-workflow/src/runtime/eval/`:
@@ -20,6 +24,10 @@ All building blocks exist in `crates/harness-workflow/src/runtime/eval/`:
   usage snapshots.
 - `report.rs` — `EvalRunReport`, `EvalRunMetrics { pass_at_1, pass_to_k }`,
   `diff_eval_run_reports` with `pass_at_1_delta` / `pass_to_k_delta`.
+- `harness eval diff` already exists on the CLI
+  (`harness-cli/src/commands/eval.rs::diff_eval_reports`): takes
+  `--baseline`/`--candidate`, validates suite and k compatibility, and emits
+  the diff — but always exits 0, with no regression threshold.
 
 The gap is orchestration: `harness-cli/src/commands/eval.rs:82` bails on live
 execution; nothing collects evidence in-process; no CI job or baseline exists;
@@ -61,12 +69,18 @@ pub struct EvalExecuteConfig {
 }
 
 pub async fn execute_manifest(
-    store: &dyn WorkflowRuntimeStore,
-    observe: &dyn EventSink,
+    store: &WorkflowRuntimeStore,
+    runtime_profile: RuntimeProfile,
+    observe: &EventStore,
     manifest: &EvalBenchmarkManifest,
     cfg: EvalExecuteConfig,
 ) -> Result<EvalRunReport, EvalExecuteError>;
 ```
+
+`store` and `runtime_profile` match the existing concrete signature of
+`dispatch_eval_case_workflow(&WorkflowRuntimeStore, RuntimeProfile, ...)`
+(`run.rs:207`); `observe` is the concrete `harness_observe::EventStore` — no
+new trait abstraction is introduced by this spec.
 
 - Per case: `dispatch_eval_case_workflow` → poll instance until a terminal
   state or `case_timeout` → build `EvalCaseEvidence`.
@@ -104,11 +118,13 @@ pub async fn execute_manifest(
   (extend the existing exclusivity check at `eval.rs:67`).
 - `--execute` requires a configured runtime store (same resolution as
   `serve`); absence is a hard error naming the missing configuration.
-- Add `eval diff` subcommand flags: `--baseline`, `--candidate`,
+- Extend the **existing** `eval diff` subcommand (`diff_eval_reports`,
+  already accepting `--baseline`/`--candidate` and always exiting 0) with
   `--max-pass-drop <float>` (applies to both `pass_at_1_delta` and
-  `pass_to_k_delta`), `--fail-on-new-f-gate` (default true). Wraps
-  `diff_eval_run_reports`; nonzero exit on breach; output lists each
-  regressing case with the failed gate names.
+  `pass_to_k_delta`) and `--fail-on-new-f-gate` (default true), adding
+  nonzero-exit semantics on breach. Output lists each regressing case with
+  the failed gate names. Without the new flags, current exit-0 behavior is
+  preserved.
 
 ### 4. Observe events — `harness-observe`
 
@@ -179,9 +195,42 @@ out of scope here; this spec only guarantees the events exist and are durable.
 - Fixture round-trip: executed-run report diffs cleanly against a committed
   baseline fixture.
 
+## Product-to-Test Mapping
+
+| Product behavior | Test(s) in Test Plan |
+| --- | --- |
+| B-001 end-to-end `--execute` | DB-backed integration test |
+| B-002 mode compatibility | CLI flag-exclusivity matrix; formatter fixture byte-for-byte check |
+| B-003 evaluator-collected evidence | Integration test asserting evidence provenance + digests |
+| B-004 terminal statuses fail-closed | Terminal-status mapping table tests |
+| B-005 report contents | Fixture round-trip test |
+| B-006 regression gate | `eval diff` exit-code tests (pass drop, new F-gate, clean) |
+| B-007 committed baselines | Fixture round-trip against committed baseline fixture |
+| B-008 CI behavior | Workflow file review + phase-1 report-only dry runs |
+| B-009 observe events | Event emission + sink-failure abort tests |
+| B-010 usage ceiling | Ceiling-breach ordering test |
+| B-011 isolation | Existing `BranchSafety`/`NoUnrelatedPrCreation` gate tests (unchanged) |
+| B-012 run-id idempotency | Run-id refusal unit test |
+
 ## Rollout / Revert
 
 Additive only. Phase 1: land executor + CLI + events, run nightly in
 report-only mode. Phase 2: seed baseline via reviewed PR, enable the diff
 gate. Revert = delete workflow file and `--execute`/`diff` flags; evidence
 formatter mode is untouched throughout.
+
+## Rollback Plan
+
+Every component is independently revertible with no data migration:
+
+1. **CI gate misfires** — set the diff step back to `continue-on-error: true`
+   (phase-1 posture) without touching code.
+2. **Executor defects** — remove `--execute` wiring; `--evidence`/`--dry-run`
+   formatter paths are untouched and remain the fallback.
+3. **Observe event issues** — the two event kinds are additive; consumers do
+   not exist yet, so dropping emission has no downstream effect.
+4. **Baseline corruption** — baselines are reviewed in-repo files; revert the
+   baseline commit.
+
+No persisted schema changes anywhere; rollback is `git revert` plus CI
+workflow deletion at worst.

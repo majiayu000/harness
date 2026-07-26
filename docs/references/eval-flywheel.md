@@ -90,12 +90,17 @@ isolation model that `docs/parallel-pr-repair-bakeoff-spec.md` asks for.
 `EvalRunMetrics { pass_at_1, pass_to_k, ... }` (`report.rs:24-25`),
 per-case transitions, and `diff_eval_run_reports` producing
 `pass_at_1_delta` / `pass_to_k_delta` against a baseline report
-(`report.rs:230-231`). The regression-diff primitive already exists.
+(`report.rs:230-231`). The regression-diff primitive already exists, and it is
+already exposed on the CLI: `harness eval diff --baseline --candidate`
+(`commands/eval.rs::diff_eval_reports`, ~line 89) validates suite/k
+compatibility and emits the diff — but always exits 0; there is no threshold
+gate and no failing exit code on regression.
 
 ### 1.5 Evidence model — `eval/evidence.rs` (610 lines), `eval/model.rs`
 
-Typed `EvalCaseEvidence` with status, confidence (`Confidence` enum —
-estimated vs confirmed), usage snapshots, and remote-fact capture.
+Typed `EvalCaseEvidence` with status, confidence (`Confidence` enum:
+`Exact`, `Estimated`, `Observed`, `Unknown` — `model.rs:137`), usage
+snapshots, and remote-fact capture.
 
 ## 2. The Disconnection (verified)
 
