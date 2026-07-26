@@ -4,7 +4,11 @@
 
 GH-1771
 
-## Current State
+## Product Spec
+
+`specs/GH1771/product.md`
+
+## Current System
 
 ### Untrusted-content handling
 
@@ -15,29 +19,34 @@ GH-1771
 - `crates/harness-server/src/workflow_runtime_worker/prompt_packet.rs:24` —
   `REPO_MEMORY_PROMPT_PREAMBLE` frames retrieved repo memory as untrusted
   background evidence.
-- `prompt_packet.rs:35-45` — packet construction clones the entire
-  `workflow.data` object into the packet `workflow` value next to
-  server-owned identity fields; `prompt_packet.rs:73` injects raw
-  `command_input` (`job.input`); `prompt_packet.rs:68-71` injects
-  `workflow_file.config` and `prompt_template` from the repository;
-  `prompt_packet.rs:111-112` lifts `workflow.data.continuation` into the
-  packet. None of these carry trust framing.
-- `prompt_packet.rs:213-215` — system framing instructs the agent to treat
-  the workflow database as the source of orchestration state.
-- `specs/GH1732/` (packet schema `harness.runtime.prompt_packet.v2`) —
-  records a provenance manifest for packet *sources* with per-entry trust
-  levels. Observational; rendering is unchanged by it.
+- `prompt_packet.rs:35-48` — packet construction clones the entire
+  `workflow.data` object (`data` clone at `:36`) into the packet `workflow`
+  value next to server-owned identity fields; `:73` injects raw
+  `command_input` (`job.input`); `:68-71` injects `workflow_file.config`
+  and `prompt_template` from the repository; `:111-112` lifts
+  `workflow.data.continuation` into the packet. None of these carry trust
+  framing.
+- `prompt_packet.rs:215` — system framing instructs the agent to treat the
+  workflow database as the source of orchestration state.
+- `specs/GH1732/` (merged) — packet schema
+  `harness.runtime.prompt_packet.v2`: every newly produced packet must
+  declare v2 and carry a `context_provenance` manifest with per-entry trust
+  levels. Observational — it records what was selected; rendering is
+  unchanged by it.
 
 ### Agent profiles
 
 - `crates/harness-agents/src/claude.rs:115-131` — `base_args`: full profile
-  (`allowed_tools = None`) → `--dangerously-skip-permissions`; scoped
-  profile → `--allowedTools`. The flags are mutually exclusive.
+  (`allowed_tools = None`) → `--dangerously-skip-permissions` (pushed at
+  `:131`); scoped profile → `--allowedTools`. The flags are mutually
+  exclusive.
 - `crates/harness-agents/src/claude_adapter.rs:87-93` — same contract for
-  the streaming adapter; `claude_adapter.rs:316-320` documents auto-approval.
-- Both spawn paths must change together (repo rule: adapter arg
-  construction is duplicated across `claude.rs` and `claude_adapter.rs`).
-- The workflow runtime does not select a profile per activity today.
+  the streaming adapter; `claude_adapter.rs:316-320` documents
+  auto-approval. Repo rule: both files must change together.
+- `workflow_runtime_worker/runtime_profile.rs:27-38` — runtime profiles can
+  already declare `sandbox: "read-only-with-network"`, honored by the codex
+  paths (`codex.rs:667-676`, `codex_adapter.rs:566-580`); the Claude spawn
+  paths take no sandbox mode, and no per-activity tool profile exists.
 
 ### Egress
 
@@ -50,11 +59,13 @@ GH-1771
   external proxy; proxy URL exported as `HTTP_PROXY`/`HTTPS_PROXY`/
   `ALL_PROXY`. No proxy is bundled in `docker/`; nothing verifies the proxy
   filters anything. Host tier has no network control.
-- `crates/harness-sandbox/src/lib.rs` — Seatbelt/Landlock/bwrap generation
-  exists and already carries per-spec network toggles (`--network` handling
-  for bwrap at `lib.rs:220`), giving a host-tier enforcement seam.
+- `crates/harness-sandbox/src/lib.rs` — Seatbelt policy generation emits
+  `(allow network-outbound)` at `lib.rs:154` and protected-path
+  `(deny file-write* ...)` rules at `lib.rs:184-188`
+  (`PROTECTED_RELATIVE_PATHS` at `lib.rs:11`), giving a host-tier
+  enforcement seam.
 
-## Design
+## Proposed Design
 
 ### 1. `workflow.data` provenance sidecar
 
@@ -63,15 +74,20 @@ New module `crates/harness-workflow/src/runtime/data_provenance.rs`:
 ```rust
 pub enum DataProvenance { Server, Agent, External }
 
-pub struct ProvenanceMap(BTreeMap<String /* JSON pointer */, DataProvenance>);
+pub struct ProvenanceMap {
+    entries: BTreeMap<String /* JSON pointer */, DataProvenance>,
+    /// When classification began for this instance — the grandfathering
+    /// boundary for fields written before the sidecar existed.
+    migrated_at: DateTime<Utc>,
+}
 ```
 
 - Stored in `workflow_instances` as a sibling JSONB column
-  `data_provenance` (migration in `runtime/store_migrations.rs`), written in
-  the same transaction as every `data` mutation
-  (`runtime/store/transaction_helpers.rs` gains a
-  `write_data_with_provenance` helper; existing helpers delegate with an
-  explicit class).
+  `data_provenance` (migration in `runtime/store_migrations.rs`), written
+  in the same transaction as every `data` mutation
+  (`runtime/store/transaction_helpers.rs` gains
+  `write_data_with_provenance`; existing helpers delegate with an explicit
+  class).
 - Writer classification:
   - reducers writing snapshot-derived facts (`github_pr_snapshot`
     consumers, reconciliation, binding metadata) → `Server`;
@@ -79,30 +95,33 @@ pub struct ProvenanceMap(BTreeMap<String /* JSON pointer */, DataProvenance>);
     (`workflow_runtime_worker/activity_result.rs` consumers, continuation
     writes, `summary`, `last_external_state`) → `Agent`;
   - webhook/issue/comment text stored by intake → `External`.
-- Unclassified legacy fields: a backfill pass is **not** attempted.
-  Instead, packet-v2 construction treats missing provenance as an error
-  (B-004); v1 packets ignore the sidecar entirely. Recovery for stuck v2
-  workflows: an operator recovery action may stamp a field `Agent`
-  (conservative), never `Server`.
+- No backfill. Fields with no entry are grandfathered by `migrated_at`:
+  they render fenced-as-untrusted with a degradation artifact (product
+  B-004). A missing entry for a field written *after* `migrated_at` is a
+  writer defect → typed construction error. Operator recovery may stamp a
+  field `Agent` (conservative), never `Server`.
 
-### 2. Fenced rendering in packet construction
+### 2. Packet schema v3: fenced rendering
 
-`prompt_packet.rs`:
+GH1732 makes v2 mandatory for every newly produced packet, so fencing
+obligations attach to a `harness.runtime.prompt_packet.v3` bump (one
+shared schema constant, superset of v2):
 
-- `build_prompt_packet` gains the provenance map (loaded with the instance;
-  one query, same row).
-- For v2+ schemas, the packet `workflow.data` is split at render time:
-  - `Server` fields render in place (byte-identical to today);
-  - `Agent`/`External` fields move to a `workflow.untrusted_data` object
-    rendered under a preamble with the same contract text family as
-    `REPO_MEMORY_PROMPT_PREAMBLE`; string leaves additionally pass through
-    `wrap_external_data`.
+- `build_prompt_packet` loads the provenance map with the instance (same
+  row, one query).
+- v3 rendering splits `workflow.data`:
+  - `Server` fields render in place, byte-identical to v2;
+  - `Agent`/`External`/grandfathered fields move to a
+    `workflow.untrusted_data` object under a preamble in the
+    `REPO_MEMORY_PROMPT_PREAMBLE` contract family; string leaves pass
+    through `wrap_external_data`;
   - `continuation_context` always renders in the untrusted section.
-- Typed error `PromptPacketError::UnclassifiedField { pointer }` fails
-  packet construction (surfaces as a Configuration-kind activity failure,
-  retryable after operator stamping).
+- Typed error `PromptPacketError::UnclassifiedField { pointer }` for
+  post-sidecar unclassified fields (surfaces as a Configuration-kind
+  activity failure, retryable after operator stamping).
 - The GH1732 provenance manifest gains one entry kind for the untrusted
-  section so packet evidence and rendering agree.
+  section so packet evidence and rendering agree; historical v1/v2 packets
+  are never reinterpreted.
 
 ### 3. Scoped default profile
 
@@ -118,58 +137,116 @@ dangerously_skip_permissions = true   # explicit opt-up only
 ```
 
 - `workflow_runtime_worker` activity policy maps activity → profile name;
-  spawn paths receive a resolved `allowed_tools` and never infer full from
-  `None` in runtime context (a new `SpawnPermissionMode` enum replaces the
-  `Option` sentinel at the runtime call sites; `claude.rs` and
-  `claude_adapter.rs` change together, verified by
-  `cargo test --package harness-agents`).
-- Effective profile recorded into the packet evidence and OTel span
+  runtime call sites pass a new `SpawnPermissionMode` enum instead of the
+  `Option<Vec<String>>` sentinel, so full permissions can never be
+  inferred from absence. `claude.rs` and `claude_adapter.rs` change
+  together.
+- Effective profile recorded into packet evidence and OTel span
   attributes.
 
 ### 4. Egress floor
 
-- Host tier: `SandboxSpec` gains `egress: EgressPolicy { mode: Deny |
-  Allowlist(Vec<HostPattern>) | Open }`. macOS Seatbelt generation emits
-  network deny/allow rules alongside the existing file rules; Linux uses
-  bwrap netns (`--unshare-net`) plus a slirp/proxy helper when an
-  allowlist is configured. Platforms that cannot honor a configured policy
-  return a typed dispatch error (B-007).
+- Host tier: `SandboxSpec` gains
+  `egress: EgressPolicy { Deny | Allowlist(Vec<HostPattern>) | Open }`.
+  macOS Seatbelt generation replaces the unconditional
+  `(allow network-outbound)` with policy-derived rules; Linux uses bwrap
+  netns (`--unshare-net`) plus a slirp/proxy helper when an allowlist is
+  configured. A configured policy the platform cannot honor is a typed
+  dispatch error (product B-007).
 - Container tier: `docker/egress-proxy/` bundles a minimal filtering proxy
   image; `spawn_contract.rs` gains a pre-dispatch canary — one allowlisted
   request must succeed and one non-allowlisted request must be refused —
-  before the agent container starts (B-008). Existing `none` fallback
-  preserved verbatim.
+  before the agent container starts (product B-008). The `none` fallback
+  is preserved verbatim.
 
-## Migration Order
+## Data Flow
 
-1. Provenance sidecar: migration + writer classification + tests (dark;
-   no rendering change).
-2. Packet v2 fenced rendering behind the schema version; regression test
-   for the two-turn replay attack.
-3. Profile resolution + spawn changes (`claude.rs` +
-   `claude_adapter.rs` together); config default flips with release notes.
-4. Egress: container canary + bundled proxy first, host-tier Seatbelt
-   rules second, Linux netns last.
+1. Intake/webhook stores external text → `write_data_with_provenance`
+   stamps `External`.
+2. Reducer consumes an activity result → agent-derived fields stamped
+   `Agent`; snapshot-derived facts stamped `Server` — same transaction as
+   the `data` mutation.
+3. Worker claims a job → `build_prompt_packet` loads instance + provenance
+   map → v3 renderer partitions fields (server in place; agent/external/
+   grandfathered into fenced `workflow.untrusted_data`; continuation always
+   fenced) → unclassified post-sidecar field aborts with
+   `UnclassifiedField`.
+4. Activity policy resolves the tool profile → spawn contract emits
+   `--allowedTools` (or opted-up skip-permissions) plus the egress policy
+   → container canary / host sandbox rules applied → agent starts.
+5. Effective profile, egress mode, fencing counts, and degradation
+   artifacts land in runtime evidence and OTel attributes.
 
-Each step is independently revertible; step 2 reverts by pinning
-definitions back to v1 packets.
+## Product-to-Test Mapping
 
-## Validation
+| Behavior | Test surface |
+| --- | --- |
+| B-001 provenance recorded per writer | `harness-workflow` `runtime::data_provenance` unit tests + reducer tests per write path (snapshot→Server, activity-result→Agent, intake→External) |
+| B-002 v3 fencing, server byte-identical, historical packets untouched | `harness-server` `workflow_runtime_worker::prompt_packet` snapshot tests: v2 vs v3 fixture diff; v1/v2 fixture readback |
+| B-003 continuation always fenced | prompt_packet test with continuation present/absent |
+| B-004 grandfather vs writer-defect split | prompt_packet tests: pre-`migrated_at` field → fenced + degradation artifact; post-`migrated_at` unclassified → `UnclassifiedField` error |
+| B-005 / B-006 scoped default, explicit opt-up, flag exclusivity | `cargo test --package harness-agents` spawn-arg tests for both adapters; config resolution tests for `SpawnPermissionMode` |
+| B-007 host egress deny-by-default + typed platform error | `harness-sandbox` policy-generation tests (Seatbelt/Landlock rule sets per `EgressPolicy`); dispatch error test |
+| B-008 container canary + preserved `none` fallback | `spawn_contract` tests: canary pass/fail gating; `container_network_mode` regression |
+| B-009 evidence completeness | runtime evidence tests asserting profile, egress mode, fencing counts per job |
+| B-010 compatibility | end-to-end runtime test: in-flight v2 workflow retried post-ship produces v3 packet, unblocked, degradation artifacts recorded |
 
-- `cargo test --package harness-workflow runtime::data_provenance`
-- `cargo test --package harness-server workflow_runtime_worker::prompt_packet`
-- `cargo test --package harness-agents` (spawn arg contracts, both adapters)
-- `cargo test --package harness-sandbox` (policy generation)
-- `cargo clippy --workspace --all-targets -- -D warnings` and
-  `cargo fmt --all -- --check` before push.
+## Alternatives Considered
+
+- **Per-definition fencing flag independent of schema version** — rejected:
+  declared schema and rendering behavior could diverge, breaking GH1732's
+  discipline that the packet schema states which obligations apply, and
+  evidence consumers would need a second signal to interpret a packet.
+- **Timestamp-only grandfathering without a fail-closed tier** — rejected:
+  a post-sidecar writer bug would silently render new agent-written fields
+  as trusted; the two-tier split keeps legacy data flowing while making
+  new classification gaps loud.
+- **Inline provenance annotations inside `workflow.data`** — rejected:
+  mutates shapes existing consumers read; the sidecar keeps `data`
+  byte-compatible.
+- **Backfilling provenance for existing rows** — rejected: classification
+  requires writer context that no longer exists; conservative fencing of
+  legacy fields is safe and self-corrects as fields are rewritten.
+- **Treating repo-sourced `prompt_template` as untrusted** — out of scope
+  by product Non-Goals: it is instruction-bearing by design; control is
+  repo write access plus provenance visibility.
 
 ## Risks
 
-- Fencing changes prompt shape for v2 workflows; candidate/eval baselines
-  that byte-compare packets must re-baseline (schema-versioned, so bounded).
-- Over-classification (`Agent` stamped on genuinely server-derived data)
-  degrades prompt authority gracefully — content still present, just
-  fenced; under-classification is the dangerous direction and is prevented
-  by the fail-closed default plus writer-side tests.
+- Fencing changes prompt shape for v3 packets; candidate/eval baselines
+  that byte-compare packets must re-baseline (schema-versioned, bounded).
+- Over-classification (`Agent` stamped on server-derived data) degrades
+  gracefully — content present, just fenced; under-classification is the
+  dangerous direction and is blocked by the fail-closed tier plus
+  writer-side tests.
 - Host egress on Linux is the highest-effort item; it ships last and its
   absence blocks only configurations that explicitly demand enforcement.
+- Scoped-default flip can break operator setups that relied on implicit
+  full permissions; mitigated by release-note callout and explicit opt-up.
+
+## Test Plan
+
+- `cargo test --package harness-workflow runtime::data_provenance`
+- `cargo test --package harness-server workflow_runtime_worker::prompt_packet`
+- `cargo test --package harness-agents` (spawn arg contracts, both
+  adapters, `SpawnPermissionMode`)
+- `cargo test --package harness-sandbox` (policy generation per
+  `EgressPolicy`)
+- Full gates before push: `cargo clippy --workspace --all-targets -- -D
+  warnings`, `cargo fmt --all -- --check`.
+
+## Rollback Plan
+
+Each step is independently revertible:
+
+1. Provenance sidecar (dark): revert the migration consumer; the JSONB
+   column and accumulated classifications are inert.
+2. v3 fencing: pin the packet schema constant back to v2 — rendering
+   reverts wholesale with no data migration; the sidecar keeps
+   accumulating classifications for a later re-flip. Historical packets
+   are untouched either way.
+3. Scoped default: configuration flip back to the previous default
+   profile; no code revert needed.
+4. Egress: disable per-tier enforcement config; container tier returns to
+   the existing allowlist+proxy env-export behavior, host tier to
+   unconditional `(allow network-outbound)`.

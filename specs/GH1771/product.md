@@ -34,8 +34,12 @@ and a network floor that Harness itself enforces or verifies.
 - Define an egress enforcement contract: deny-by-default allowlist on the
   host tier, and a bundled-proxy option so the container tier can reach its
   allowlist without unshipped infrastructure.
-- Fail closed: unclassified provenance in a v2 packet is an error, not a
-  silently trusted default.
+- Attach fencing obligations to a `harness.runtime.prompt_packet.v3`
+  schema bump above GH1732's mandatory v2, so the declared schema states
+  which obligations apply.
+- Never render an unclassified field as trusted: legacy pre-sidecar fields
+  degrade to fenced-untrusted with recorded evidence; post-sidecar
+  unclassified writes are an error.
 
 ## Non-Goals
 
@@ -58,17 +62,23 @@ and a network floor that Harness itself enforces or verifies.
    agent-authored output), or `external` (issue, comment, review, or
    webhook text). Provenance rides beside the data without changing the
    shapes existing consumers read.
-2. **B-002:** When a prompt packet is constructed for a workflow whose
-   packet schema is v2 or later, fields classed `agent` or `external`
-   appear only inside untrusted framing (the existing external-data fence
-   or the repo-memory untrusted preamble contract). Fields classed
-   `server` render as today.
+2. **B-002:** Once this feature ships, every newly produced
+   workflow-runtime prompt packet declares packet schema
+   `harness.runtime.prompt_packet.v3`, which carries all v2 (GH1732)
+   obligations plus fencing: fields classed `agent` or `external` appear
+   only inside untrusted framing (the existing external-data fence or the
+   repo-memory untrusted preamble contract). Fields classed `server`
+   render byte-identically to v2. Historical v1 and v2 packets remain
+   valid lower-evidence records and are never reinterpreted as v3.
 3. **B-003:** Continuation context is always treated as agent-origin and is
    always fenced, regardless of stored provenance.
-4. **B-004:** A v2-packet construction that encounters a `workflow.data`
-   field with missing or unrecognized provenance fails packet construction
-   with a typed error; it does not render the field as trusted. Workflows
-   still on v1 packets render as today and are unaffected.
+4. **B-004:** A v3-packet construction that encounters a `workflow.data`
+   field with missing or unrecognized provenance never renders it as
+   trusted. A field last written before the provenance sidecar existed
+   (grandfathered by the sidecar migration marker) renders inside
+   untrusted framing and records a degradation artifact naming the field.
+   A field written after the sidecar exists with no classification is a
+   writer defect and fails packet construction with a typed error.
 5. **B-005:** Workflow-runtime Claude spawns default to a scoped tool
    profile derived from the activity policy. Read-class activities receive
    a read-only tool set; implementation-class activities receive the write
@@ -93,8 +103,12 @@ and a network floor that Harness itself enforces or verifies.
    tool profile, egress mode and verification result) is observable in the
    runtime evidence for the job, so an operator can answer "what surface
    did this activity actually have" after the fact.
-10. **B-010:** No existing green workflow that uses server-origin data,
-    v1 packets, or the container `--network none` path changes behavior.
+10. **B-010:** Server-origin fields, the container `--network none` path,
+    and every historical v1/v2 packet keep their current behavior and
+    recorded semantics. For in-flight workflows, the only rendering change
+    on their first v3 packet is that agent-, external-, and grandfathered
+    unclassified fields move inside untrusted framing; no workflow is
+    blocked solely because it predates the sidecar.
 
 ## Acceptance Criteria
 
@@ -102,7 +116,7 @@ and a network floor that Harness itself enforces or verifies.
       `workflow.data` records the expected provenance class, including
       continuation payloads (`agent`) and snapshot-derived facts (`server`).
 - [ ] Packet tests prove `agent`/`external` fields render only inside
-      untrusted framing in v2 packets, byte-identical trusted rendering for
+      untrusted framing in v3 packets, byte-identical trusted rendering for
       `server` fields, and a typed error for unclassified fields.
 - [ ] A regression test replays the two-turn attack: external text fenced
       on turn 1, stored via an agent summary, and proven fenced again on
@@ -117,7 +131,10 @@ and a network floor that Harness itself enforces or verifies.
       `--network none` fallback.
 - [ ] Evidence tests prove profile, egress mode, and fencing counts are
       recorded per job.
-- [ ] v1-packet workflows show no behavior change in existing tests.
+- [ ] Grandfathering tests prove a pre-sidecar field renders fenced with a
+      degradation artifact while a post-sidecar unclassified write fails
+      construction; historical v1/v2 packet fixtures remain readable and
+      unreinterpreted.
 
 ## Boundary Checklist
 
@@ -129,7 +146,7 @@ and a network floor that Harness itself enforces or verifies.
 | Concurrency / race / ordering | Provenance is written in the same store transaction as the data mutation; packet construction reads a single snapshot. |
 | Retry / repetition / idempotency | Re-dispatch reconstructs the packet from stored data + provenance; fencing decisions are deterministic per snapshot. |
 | Illegal state transitions | N/A directly; workflow transition rules unchanged. |
-| Compatibility / migration | Covered by B-004 and B-010: v1 packets unaffected; v2 gate carries the new obligations. |
+| Compatibility / migration | Covered by B-002, B-004, and B-010: historical v1/v2 packets keep their semantics; the v3 schema carries the new obligations; pre-sidecar fields are grandfathered to fenced-untrusted instead of blocking. |
 | Degradation / fallback | Covered by B-007/B-008: no silent fallback from enforced to open network, no silent fallback from scoped to full profile. |
 | Evidence and audit integrity | Covered by B-009. |
 | Cancellation / interruption / partial completion | A dispatch blocked by enforcement leaves the job undispatched and retryable; no partial spawn. |
@@ -150,16 +167,22 @@ and a network floor that Harness itself enforces or verifies.
 - Proxy verification succeeds but the proxy later dies mid-turn: the run
   fails on network errors like any outage; post-hoc evidence still shows
   verified-at-dispatch.
-- A legacy v1 workflow is recovered/retried after the feature ships: still
-  v1, still unaffected.
+- An in-flight workflow whose packets were v2 is recovered/retried after
+  the feature ships: its next packet is v3, its pre-sidecar fields render
+  fenced with degradation artifacts, and it is not blocked.
 
 ## Rollout Notes
 
-Ships dark behind the packet schema version: provenance recording lands
-first (additive, v1 unaffected), fencing activates with v2 packet adoption
-per workflow definition. Profile default flips via configuration with a
-release-note callout; operators needing the old behavior opt profiles up
-explicitly. Egress enforcement is opt-in per tier configuration at first,
-with deny-by-default targeted once the bundled proxy has soaked. Reverting
-the packet change restores v1 rendering without data migration; provenance
-sidecar data is inert under v1.
+Two-step rollout aligned with GH1732's every-new-packet discipline. Step
+one lands the provenance sidecar dark: writers classify, nothing renders
+differently, and a sidecar migration marker records when classification
+began (the grandfathering boundary). Step two bumps the packet schema to
+v3, at which point every newly produced packet fences agent-, external-,
+and grandfathered fields; there is no per-definition adoption window, so
+declared schema and rendering behavior never diverge. Profile default
+flips via configuration with a release-note callout; operators needing
+the old behavior opt profiles up explicitly. Egress enforcement is opt-in
+per tier configuration at first, with deny-by-default targeted once the
+bundled proxy has soaked. Reverting step two pins packets back to v2
+rendering without data migration; the provenance sidecar stays inert
+under v2 and keeps accumulating classifications for a later re-flip.
