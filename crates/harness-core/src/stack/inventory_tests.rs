@@ -256,19 +256,20 @@ fn configured_repository_rule_sources_are_inventoried_once() {
     let dir = tmp();
     let root = dir.path();
     write_file(root, "harness.toml", br#"[rules]
-discovery_paths = ["policies", "policies", "./policies", "/absolute/outside"]
+discovery_paths = ["rules", "rules", "./rules", "/absolute/outside"]
 builtin_path = "builtin.toml"
 exec_policy_paths = ["exec.policy.toml"]
 requirements_path = "reqs.toml"
 "#);
-    write_file(root, "policies/p.md", b"p");
-    write_file(root, "policies/p.toml", b"q = 1");
-    write_file(root, "policies/skip.txt", b"not selected");
+    write_file(root, "rules/p.md", b"p");
+    write_file(root, "rules/p.toml", b"q = 1");
+    write_file(root, "rules/skip.txt", b"not selected");
     write_file(root, "builtin.toml", b"b = 1");
     write_file(root, "exec.policy.toml", b"e = 1");
     write_file(root, "reqs.toml", b"r = 1");
-    let listed = pairs(&run_ok(root));
-    let expected = ["builtin.toml", "exec.policy.toml", "policies/p.md", "policies/p.toml", "reqs.toml"];
+    let options = opts(root).with_max_directories(2).expect("root plus rules");
+    let listed = pairs(&inventory_repository_stack(&options).expect("merged static and derived rules"));
+    let expected = ["builtin.toml", "exec.policy.toml", "reqs.toml", "rules/p.md", "rules/p.toml"];
     assert_eq!(of_kind(&listed, "policy"), expected, "each binding is inventoried once");
     assert!(listed.contains(&("harness.toml".to_owned(), "validation")));
     assert!(!listed.iter().any(|(l, _)| l.contains("absolute") || l.contains("outside")));
@@ -301,6 +302,9 @@ fn missing_allowlisted_entries_emit_no_placeholders() {
     write_file(dir.path(), "WORKFLOW.md", b"w");
     let listed = pairs(&run_ok(dir.path()));
     assert_eq!(listed, vec![("WORKFLOW.md".to_owned(), "workflow")]);
+    let wrong_case = tmp();
+    write_file(wrong_case.path(), "agents.md", b"wrong case");
+    assert!(run_ok(wrong_case.path()).entries().is_empty());
 }
 
 // ── B-005 ────────────────────────────────────────────────────────────────────
@@ -517,13 +521,13 @@ fn symlink_swaps_remain_root_confined_and_hash_the_opened_target() {
     let cap = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).expect("root");
     assert_eq!(classify_resolution_failure(&cap, "CLAUDE.md", std::io::ErrorKind::NotFound), EK::EntryRaced);
     symlink("gone.txt", root.join("CLAUDE.md")).expect("broken link");
+    assert_eq!(classify_selected_open_failure(&cap, "CLAUDE.md", std::io::ErrorKind::NotFound), EK::BrokenSymlink);
     assert_fail(&root, EK::BrokenSymlink);
 }
 
 #[cfg(not(unix))]
 #[test]
 fn symlink_swaps_remain_root_confined_and_hash_the_opened_target() {
-    // Symlink fixtures are Unix-only; assert digests bind to opened bytes.
     let dir = tmp();
     write_file(dir.path(), "CLAUDE.md", b"target a");
     let inventory = run_ok(dir.path());
@@ -605,17 +609,15 @@ fn unreadable_and_non_utf8_entries_fail_without_lossy_locators() {
         assert!(!error.locator().unwrap_or_default().contains('\u{FFFD}'), "no lossy locator");
     }
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod back");
-    // Deterministic injected failure mapping covers privileged environments
-    // where permission bits cannot produce an unreadable file.
     assert_eq!(classify_open_failure(std::io::ErrorKind::PermissionDenied), EK::ReadFailed);
     assert_eq!(classify_open_failure(std::io::ErrorKind::NotFound), EK::EntryRaced);
+    assert_eq!(classify_entry_metadata_failure(std::io::ErrorKind::NotFound), EK::EntryRaced);
     assert_eq!(classify_directory_open_failure(std::io::ErrorKind::NotADirectory), EK::EntryRaced);
 }
 
 #[cfg(not(unix))]
 #[test]
 fn unreadable_and_non_utf8_entries_fail_without_lossy_locators() {
-    // Deterministic injected failure mapping replaces permission fixtures.
     let denied = classify_open_failure(std::io::ErrorKind::PermissionDenied);
     assert_eq!(denied, EK::ReadFailed);
     let raced = classify_open_failure(std::io::ErrorKind::NotFound);
@@ -661,7 +663,6 @@ fn every_traversal_limit_has_an_exact_boundary_fixture() {
     assert!(run_with(base(files.path()).with_max_files(2)).is_ok());
     let error = run_with(base(files.path()).with_max_files(1)).expect_err("file budget");
     assert_eq!((error.kind(), error.locator()), (EK::LimitExceeded, Some("CLAUDE.md")));
-    // max_file_bytes: a 4-byte file passes at 4 and fails at 3.
     assert!(run_with(base(files.path()).with_max_file_bytes(4)).is_ok());
     let error = run_with(base(files.path()).with_max_file_bytes(3)).expect_err("per-file bytes");
     assert_eq!(error.kind(), EK::LimitExceeded);
@@ -691,7 +692,7 @@ fn every_traversal_limit_has_an_exact_boundary_fixture() {
     // suffix enumeration yields 1 (the `skills` directory itself): 4 exactly.
     assert!(run_with(base(wide.path()).with_max_total_entries(4)).is_ok());
     let error = run_with(base(wide.path()).with_max_total_entries(3)).expect_err("entries");
-    assert_eq!((error.kind(), error.locator()), (EK::LimitExceeded, None));
+    assert_eq!((error.kind(), error.locator()), (EK::LimitExceeded, Some("skills")));
 }
 
 #[test]
@@ -702,8 +703,6 @@ fn reads_never_exceed_remaining_aggregate_or_per_file_budget() {
     let options = opts(dir.path()).with_max_file_bytes(4).expect("options");
     let error = inventory_repository_stack(&options).expect_err("oversized file");
     assert_eq!((error.kind(), error.locator()), (EK::LimitExceeded, Some("AGENTS.md")));
-    // The second file exceeds the remaining aggregate budget even though it
-    // stays within the per-file budget.
     let pair = tmp();
     write_file(pair.path(), "AGENTS.md", b"aaaa");
     write_file(pair.path(), "CLAUDE.md", b"bbbb");

@@ -1,9 +1,4 @@
-//! Repository-observed Agent Stack inventory (GH-1731): discovers a closed
-//! allowlist of stack surfaces beneath one explicit repository root and emits
-//! validated ASC-001 components. All traversal is capability-scoped through
-//! one opened root directory handle, so path or symlink races cannot grant
-//! access outside the repository; discovery proves that content exists under
-//! the root and never claims runtime selection.
+//! Capability-scoped repository Agent Stack inventory (GH-1731).
 
 use super::{
     AgentStackComponent, AgentStackComponentKind, AgentStackFreshnessEvidence,
@@ -19,8 +14,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Validated inventory options: one explicit repository root plus non-zero
-/// resource budgets that all permit a checked `+ 1` sentinel.
+/// Validated root and resource budgets for one inventory.
 #[derive(Debug, Clone)]
 pub struct AgentStackInventoryOptions {
     root: PathBuf,
@@ -60,7 +54,6 @@ impl AgentStackInventoryOptions {
         with_max_entries_per_directory => max_entries_per_directory: usize,
     );
 
-    /// Limits must be non-zero and permit `+ 1` sentinels; fails pre-open.
     fn validated(self) -> Result<Self, AgentStackInventoryError> {
         let bytes_ok = |v: u64| v > 0 && v < u64::MAX;
         let count_ok = |v: usize| v > 0 && v < usize::MAX;
@@ -79,15 +72,13 @@ impl AgentStackInventoryOptions {
     }
 }
 
-/// A regular file read through the opened handle (with its Unix executable
-/// bit when observed), or the non-recursive `spec` directory-presence probe.
+/// Observed file or directory-presence class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStackEntryClass {
     RegularFile { unix_executable: Option<bool> },
     DirectoryPresence,
 }
 
-/// One inventoried surface: a validated ASC-001 component plus entry class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentStackInventoryEntry {
     component: AgentStackComponent,
@@ -100,8 +91,7 @@ impl AgentStackInventoryEntry {
     pub fn entry_class(&self) -> &AgentStackEntryClass { &self.entry_class }
 }
 
-/// Ordered repository-observed inventory, sorted by normalized locator; no
-/// ambient canonical root path is claimed or exposed.
+/// Repository-observed inventory sorted by normalized locator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentStackInventory {
     entries: Vec<AgentStackInventoryEntry>,
@@ -138,9 +128,7 @@ error_kinds!(
 use AgentStackComponentKind as Kind;
 use AgentStackInventoryErrorKind as EK;
 
-/// Typed inventory error: a stable category plus, when representable, a safe
-/// repository-relative locator. Evidence never carries file bytes, ambient
-/// target paths, configured absolute paths, or OS error strings.
+/// Stable failure category with an optional repository-relative locator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentStackInventoryError {
     kind: AgentStackInventoryErrorKind,
@@ -174,9 +162,6 @@ fn err(kind: AgentStackInventoryErrorKind, locator: &str) -> IErr {
     IErr::new(kind, (!locator.is_empty()).then(|| locator.to_owned()))
 }
 
-/// Closed per-directory entry selector: pure rule-table data, never content
-/// sniffing. Direct selectors apply only to a rule root's immediate children;
-/// recursive selectors apply at every depth.
 #[derive(Debug, Clone, Copy)]
 struct DirSelector {
     direct_extensions: &'static [&'static str],
@@ -197,9 +182,6 @@ const fn sel(
     DirSelector { direct_extensions, direct_basenames, recursive_extensions, recursive_basenames }
 }
 
-/// General skill roots select direct `*.md` plus recursive exact `SKILL.md`;
-/// `.harness/skills` selects direct `*.md` only, so usage sidecars and
-/// package support files are never stack units.
 #[rustfmt::skip]
 mod selectors {
     use super::{sel, DirSelector, NONE};
@@ -217,8 +199,6 @@ mod selectors {
 }
 use selectors::*;
 
-/// Documented Git lifecycle hook basenames: the only direct `.githooks`
-/// children that can carry the ASC-001 `hook` kind.
 #[rustfmt::skip]
 const GIT_LIFECYCLE_HOOKS: &[&str] = &[
     "applypatch-msg", "pre-applypatch", "post-applypatch", "pre-commit", "pre-merge-commit",
@@ -234,7 +214,6 @@ impl DirSelector {
         !self.recursive_extensions.is_empty() || !self.recursive_basenames.is_empty()
     }
 
-    /// Match against a native basename before any locator normalization.
     fn matches(&self, name: &OsStr, direct_level: bool) -> bool {
         let ext_match = |ext: &&str| has_extension(name, ext);
         let base_match = |base: &&str| name == OsStr::new(base);
@@ -251,7 +230,6 @@ fn has_extension(name: &OsStr, ext: &str) -> bool { Path::new(name).extension() 
 #[rustfmt::skip]
 fn has_suffix(name: &OsStr, suffix: &str) -> bool { name.as_encoded_bytes().ends_with(suffix.as_bytes()) }
 
-/// Expected entry class for a rule target.
 #[derive(Debug, Clone, Copy)]
 enum RuleTarget {
     File,
@@ -286,50 +264,36 @@ const fn sfx(suffix: &'static str, kind: Kind) -> StaticRule {
     StaticRule { matcher: Matcher::RootSuffix(suffix), target: RuleTarget::File, kind }
 }
 
-/// The single typed representation of the B-003 v0.1 allowlist. Table order
-/// is stable; output order is lexicographic over normalized locators.
 #[rustfmt::skip]
 const STATIC_RULES: &[StaticRule] = &[
     fr("AGENTS.md", Kind::Instructions), fr("AGENTS.override.md", Kind::Instructions),
     fr("CLAUDE.md", Kind::Instructions), fr("WORKFLOW.md", Kind::Workflow),
     fr("MEMORY.md", Kind::Memory),
-    fr("src/AGENTS.md", Kind::Instructions), fr("src/AGENTS.override.md", Kind::Instructions),
-    fr("src/CLAUDE.md", Kind::Instructions), fr("crates/AGENTS.md", Kind::Instructions),
-    fr("crates/AGENTS.override.md", Kind::Instructions), fr("crates/CLAUDE.md", Kind::Instructions),
-    fr("lib/AGENTS.md", Kind::Instructions), fr("lib/AGENTS.override.md", Kind::Instructions),
-    fr("lib/CLAUDE.md", Kind::Instructions), fr("pkg/AGENTS.md", Kind::Instructions),
-    fr("pkg/AGENTS.override.md", Kind::Instructions), fr("pkg/CLAUDE.md", Kind::Instructions),
-    dr(".claude/skills", SKILL_ROOT, Kind::Skill), dr(".codex/skills", SKILL_ROOT, Kind::Skill),
-    dr(".agents/skills", SKILL_ROOT, Kind::Skill), dr("skills", SKILL_ROOT, Kind::Skill),
-    dr(".harness/skills", HARNESS_SKILLS, Kind::Skill),
-    dr(".harness/guards", GUARDS, Kind::Hook), dr(".githooks", GITHOOKS, Kind::Hook),
-    fr(".mcp.json", Kind::McpServer), fr("mcp.json", Kind::McpServer),
+    fr("src/AGENTS.md", Kind::Instructions), fr("src/AGENTS.override.md", Kind::Instructions), fr("src/CLAUDE.md", Kind::Instructions),
+    fr("crates/AGENTS.md", Kind::Instructions), fr("crates/AGENTS.override.md", Kind::Instructions), fr("crates/CLAUDE.md", Kind::Instructions),
+    fr("lib/AGENTS.md", Kind::Instructions), fr("lib/AGENTS.override.md", Kind::Instructions), fr("lib/CLAUDE.md", Kind::Instructions),
+    fr("pkg/AGENTS.md", Kind::Instructions), fr("pkg/AGENTS.override.md", Kind::Instructions), fr("pkg/CLAUDE.md", Kind::Instructions),
+    dr(".claude/skills", SKILL_ROOT, Kind::Skill), dr(".codex/skills", SKILL_ROOT, Kind::Skill), dr(".agents/skills", SKILL_ROOT, Kind::Skill),
+    dr("skills", SKILL_ROOT, Kind::Skill), dr(".harness/skills", HARNESS_SKILLS, Kind::Skill),
+    dr(".harness/guards", GUARDS, Kind::Hook), dr(".githooks", GITHOOKS, Kind::Hook), fr(".mcp.json", Kind::McpServer), fr("mcp.json", Kind::McpServer),
     dr(".vibeguard", VIBEGUARD, Kind::Policy), fr(".vibeguard/run-guards.sh", Kind::Validation),
-    dr("rules", MD_TOML, Kind::Policy), fr("requirements.toml", Kind::Policy),
-    dr(".remem", REMEM, Kind::Memory), fr("remem.toml", Kind::Memory),
+    dr("rules", MD_TOML, Kind::Policy), fr("requirements.toml", Kind::Policy), dr(".remem", REMEM, Kind::Memory), fr("remem.toml", Kind::Memory),
     fr(".harness/config.toml", Kind::Validation), dr(".harness/rules", MD_TOML, Kind::Policy),
     dr(".harness/sg", SG, Kind::Policy), fr("harness.toml", Kind::Validation),
     dr(".github/workflows", WORKFLOWS, Kind::Workflow), dr(".cursor/rules", CURSOR_RULES, Kind::Policy),
-    // Toolchain and validation selectors mirrored from `lang_detect.rs`.
-    fr("Cargo.toml", Kind::Validation), fr("go.mod", Kind::Validation),
-    fr("package.json", Kind::Validation), fr("pyproject.toml", Kind::Validation),
-    fr("setup.py", Kind::Validation), fr("requirements.txt", Kind::Validation),
-    fr("build.gradle", Kind::Validation), fr("build.gradle.kts", Kind::Validation),
-    fr("pom.xml", Kind::Validation), fr("Gemfile", Kind::Validation),
-    fr("yarn.lock", Kind::Validation), fr("pnpm-lock.yaml", Kind::Validation),
-    fr(".eslintrc", Kind::Validation), fr(".eslintrc.js", Kind::Validation),
-    fr(".eslintrc.cjs", Kind::Validation), fr(".eslintrc.json", Kind::Validation),
-    fr(".eslintrc.yaml", Kind::Validation), fr(".eslintrc.yml", Kind::Validation),
-    fr("eslint.config.js", Kind::Validation), fr("eslint.config.mjs", Kind::Validation),
-    fr("eslint.config.cjs", Kind::Validation), fr("biome.json", Kind::Validation),
-    fr(".rubocop.yml", Kind::Validation),
+    fr("Cargo.toml", Kind::Validation), fr("go.mod", Kind::Validation), fr("package.json", Kind::Validation),
+    fr("pyproject.toml", Kind::Validation), fr("setup.py", Kind::Validation), fr("requirements.txt", Kind::Validation),
+    fr("build.gradle", Kind::Validation), fr("build.gradle.kts", Kind::Validation), fr("pom.xml", Kind::Validation),
+    fr("Gemfile", Kind::Validation), fr("yarn.lock", Kind::Validation), fr("pnpm-lock.yaml", Kind::Validation),
+    fr(".eslintrc", Kind::Validation), fr(".eslintrc.js", Kind::Validation), fr(".eslintrc.cjs", Kind::Validation),
+    fr(".eslintrc.json", Kind::Validation), fr(".eslintrc.yaml", Kind::Validation), fr(".eslintrc.yml", Kind::Validation),
+    fr("eslint.config.js", Kind::Validation), fr("eslint.config.mjs", Kind::Validation), fr("eslint.config.cjs", Kind::Validation),
+    fr("biome.json", Kind::Validation), fr(".rubocop.yml", Kind::Validation),
     sfx(".csproj", Kind::Validation), sfx(".sln", Kind::Validation),
     StaticRule { matcher: Matcher::Exact("spec"), target: RuleTarget::DirectoryPresence, kind: Kind::Validation },
     fr("Makefile", Kind::Validation), fr("justfile", Kind::Validation),
 ];
 
-/// Minimal `harness.toml` shape: only repository-relative rule sources are
-/// deserialized; unrelated Harness settings are ignored, never validated.
 #[rustfmt::skip]
 #[derive(Debug, Default, Deserialize)]
 struct ConfigShape {
@@ -345,9 +309,6 @@ struct ConfigRules {
     #[serde(default)] requirements_path: Option<String>,
 }
 
-/// Lexically normalize a configured repository-relative source. Absolute
-/// sources are out of scope (`Ok(None)`); empty, parent-traversing, or
-/// otherwise unportable sources are invalid.
 fn normalize_configured_source(raw: &str) -> Result<Option<String>, AgentStackInventoryErrorKind> {
     let bytes = raw.as_bytes();
     if raw.starts_with('/')
@@ -387,11 +348,21 @@ pub(super) fn classify_resolution_failure(
     }
 }
 
-/// A selected entry that disappeared before open is a race; any other open
-/// failure of an already-selected candidate is a read failure.
 #[rustfmt::skip]
 pub(super) fn classify_open_failure(kind: std::io::ErrorKind) -> AgentStackInventoryErrorKind {
     if kind == std::io::ErrorKind::NotFound { EK::EntryRaced } else { EK::ReadFailed }
+}
+
+#[rustfmt::skip]
+pub(super) fn classify_selected_open_failure(
+    root: &Dir, path: &str, kind: std::io::ErrorKind,
+) -> AgentStackInventoryErrorKind {
+    if kind == std::io::ErrorKind::NotFound { classify_resolution_failure(root, path, kind) } else { classify_open_failure(kind) }
+}
+
+#[rustfmt::skip]
+pub(super) fn classify_entry_metadata_failure(kind: std::io::ErrorKind) -> AgentStackInventoryErrorKind {
+    if kind == std::io::ErrorKind::NotFound { EK::EntryRaced } else { EK::EntryMetadata }
 }
 
 #[rustfmt::skip]
@@ -400,6 +371,7 @@ pub(super) fn classify_directory_open_failure(kind: std::io::ErrorKind) -> Agent
 }
 
 type DerivedRule = (String, RuleTarget, AgentStackComponentKind);
+type ExactRule = (String, RuleTarget, AgentStackComponentKind, bool);
 type Listing = Vec<(OsString, FileType)>;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -414,11 +386,10 @@ struct Scan<'a> {
     files_used: usize, dirs_opened: usize, entries_seen: usize, bytes_used: u64,
     entries: BTreeMap<(String, &'static str), AgentStackInventoryEntry>,
     file_observations: BTreeMap<String, FileObservation>,
-    root_listing: Option<Listing>,
+    listings: BTreeMap<String, Listing>,
     ancestors: Vec<DirectoryIdentity>,
 }
 
-/// Checked budget increment: fail before a configured limit can be exceeded.
 fn charge(counter: &mut usize, max: usize, locator: &str) -> Result<(), IErr> {
     match counter.checked_add(1) {
         Some(next) if next <= max => {
@@ -429,7 +400,7 @@ fn charge(counter: &mut usize, max: usize, locator: &str) -> Result<(), IErr> {
     }
 }
 
-/// Run the repository-observed stack inventory for one explicit root.
+/// Inventory one explicit repository root.
 pub fn inventory_repository_stack(
     options: &AgentStackInventoryOptions,
 ) -> Result<AgentStackInventory, AgentStackInventoryError> {
@@ -438,8 +409,7 @@ pub fn inventory_repository_stack(
     inventory_with_root(&root, options)
 }
 
-/// Inventory against an already-opened root capability; all discovery stays
-/// relative to this handle and no ambient path is reconstructed from it.
+#[rustfmt::skip]
 pub(crate) fn inventory_with_root(
     root: &Dir,
     options: &AgentStackInventoryOptions,
@@ -452,20 +422,31 @@ pub(crate) fn inventory_with_root(
         bytes_used: 0,
         entries: BTreeMap::new(),
         file_observations: BTreeMap::new(),
-        root_listing: None,
+        listings: BTreeMap::new(),
         ancestors: vec![directory_identity(root, "")?],
     };
     let derived = scan.load_config(root)?;
-    for static_rule in STATIC_RULES {
-        match static_rule.matcher {
-            Matcher::Exact(path) => {
-                scan.apply_exact(root, path, static_rule.target, static_rule.kind, false)?;
-            }
-            Matcher::RootSuffix(suffix) => scan.apply_suffix(root, suffix, static_rule.kind)?,
+    let mut exact_rules: Vec<ExactRule> = STATIC_RULES.iter().filter_map(|rule| match rule.matcher {
+        Matcher::Exact(path) => Some((path.to_owned(), rule.target, rule.kind, false)),
+        Matcher::RootSuffix(_) => None,
+    }).collect();
+    for (locator, target, kind) in derived {
+        if let Some(rule) = exact_rules.iter_mut()
+            .find(|rule| rule.0 == locator && rule.2.as_str() == kind.as_str())
+        {
+            rule.1 = target;
+            rule.3 = true;
+        } else {
+            exact_rules.push((locator, target, kind, true));
         }
     }
-    for (locator, target, kind) in derived {
-        scan.apply_exact(root, &locator, target, kind, true)?;
+    for (locator, target, kind, derived) in exact_rules {
+        scan.apply_exact(root, &locator, target, kind, derived)?;
+    }
+    for static_rule in STATIC_RULES {
+        if let Matcher::RootSuffix(suffix) = static_rule.matcher {
+            scan.apply_suffix(root, suffix, static_rule.kind)?;
+        }
     }
     Ok(AgentStackInventory {
         entries: scan.entries.into_values().collect(),
@@ -473,8 +454,6 @@ pub(crate) fn inventory_with_root(
 }
 
 impl Scan<'_> {
-    /// Read `harness.toml` at most once through the bounded handle-first path
-    /// and derive typed `policy` rules from the four documented rule sources.
     fn load_config(&mut self, root: &Dir) -> Result<Vec<DerivedRule>, IErr> {
         const CONFIG: &str = "harness.toml";
         match self.lookup_exact(root, CONFIG)? {
@@ -519,12 +498,12 @@ impl Scan<'_> {
         Ok(derived)
     }
 
-    /// Non-following lookup of one exact path, resolving a symlink target
-    /// through the root capability: `None` is absent, `Some(is_dir)` present.
-    fn lookup_exact(&self, root: &Dir, path: &str) -> Result<Option<bool>, IErr> {
+    #[rustfmt::skip]
+    fn lookup_exact(&mut self, root: &Dir, path: &str) -> Result<Option<bool>, IErr> {
+        if !self.has_exact_case(root, path)? { return Ok(None); }
         let meta = match root.symlink_metadata(path) {
             Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(err(EK::EntryRaced, path)),
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 return Err(err(EK::RootEscape, path))
             }
@@ -538,6 +517,31 @@ impl Scan<'_> {
             meta.is_dir()
         };
         Ok(Some(is_dir))
+    }
+
+    #[rustfmt::skip]
+    fn has_exact_case(&mut self, root: &Dir, path: &str) -> Result<bool, IErr> {
+        let mut parent = String::new();
+        for (depth, segment) in path.split('/').enumerate() {
+            if !self.listings.contains_key(&parent) {
+                if parent.is_empty() { self.enumerate(root, "")?; } else {
+                    if depth > self.opts.max_depth { return Err(err(EK::LimitExceeded, &parent)); }
+                    charge(&mut self.dirs_opened, self.opts.max_directories, &parent)?;
+                    let dir = root.open_dir(&parent).map_err(|error| {
+                        let kind = if error.kind() == std::io::ErrorKind::NotFound {
+                            classify_resolution_failure(root, &parent, error.kind())
+                        } else { classify_directory_open_failure(error.kind()) };
+                        err(kind, &parent)
+                    })?;
+                    self.enumerate(&dir, &parent)?;
+                }
+            }
+            let exact = self.listings.get(&parent)
+                .is_some_and(|listing| listing.iter().any(|(name, _)| name == OsStr::new(segment)));
+            if !exact { return Ok(false); }
+            parent = if parent.is_empty() { segment.to_owned() } else { format!("{parent}/{segment}") };
+        }
+        Ok(true)
     }
 
     #[rustfmt::skip]
@@ -568,14 +572,8 @@ impl Scan<'_> {
         }
     }
 
-    /// Root-only suffix rules (`*.csproj`, `*.sln`) select regular-file
-    /// children of the repository root from one charged root enumeration.
     fn apply_suffix(&mut self, root: &Dir, suffix: &str, kind: Kind) -> Result<(), IErr> {
-        if self.root_listing.is_none() {
-            let listing = self.enumerate(root, "")?;
-            self.root_listing = Some(listing);
-        }
-        let listing = self.root_listing.clone().unwrap_or_default();
+        let listing = self.enumerate(root, "")?;
         let mut selected = Vec::new();
         for (name, file_type) in listing {
             if !has_suffix(&name, suffix) {
@@ -608,9 +606,9 @@ impl Scan<'_> {
         Ok(())
     }
 
-    /// Enumerate one directory with the checked `N + 1` sentinel, charging
-    /// every yielded item to the encountered-entry budget pre-classification.
+    #[rustfmt::skip]
     fn enumerate(&mut self, dir: &Dir, prefix: &str) -> Result<Listing, IErr> {
+        if let Some(listing) = self.listings.get(prefix) { return Ok(listing.clone()); }
         let iter = dir.entries().map_err(|_| err(EK::EntryMetadata, prefix))?;
         let mut listing = Vec::new();
         for entry in iter {
@@ -621,9 +619,10 @@ impl Scan<'_> {
             charge(&mut self.entries_seen, self.opts.max_total_entries, prefix)?;
             let file_type = entry
                 .file_type()
-                .map_err(|_| err(EK::EntryMetadata, prefix))?;
+                .map_err(|error| err(classify_entry_metadata_failure(error.kind()), prefix))?;
             listing.push((entry.file_name(), file_type));
         }
+        self.listings.insert(prefix.to_owned(), listing.clone());
         Ok(listing)
     }
 
@@ -722,7 +721,12 @@ impl Scan<'_> {
         }
         let file = root
             .open_with(&locator, &open_options)
-            .map_err(|error| err(classify_open_failure(error.kind()), &locator))?;
+            .map_err(|error| {
+                err(
+                    classify_selected_open_failure(root, &locator, error.kind()),
+                    &locator,
+                )
+            })?;
         let meta = file.metadata().map_err(|_| err(EK::EntryMetadata, &locator))?;
         if !meta.is_file() {
             return Err(err(EK::NonRegularEntry, &locator));
