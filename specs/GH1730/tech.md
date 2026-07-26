@@ -116,7 +116,8 @@ these identifiers in declared/granted/observed evidence without changing them.
 `AgentStackComponent::validate()` returns the first typed invariant violation:
 
 1. exact schema version;
-2. non-empty component ID;
+2. non-empty component ID that is not a reserved missing-evidence sentinel
+   such as `unknown-component`;
 3. valid source scope and locator;
 4. valid optional digest;
 5. observation/selection compatibility;
@@ -207,7 +208,8 @@ warning-only fallback, filesystem mutation, or persistence occurs.
       every kind.
 - [ ] Add exhaustive observation × selection and observation × trust tables.
 - [ ] Add schema-valid negative fixtures for unknown fields and aliases.
-- [ ] Add digest, blank identity, traversal, and duplicate capability tests.
+- [ ] Add digest, blank/reserved identity, drive-prefixed and traversal locator,
+      and duplicate capability tests.
 - [ ] Run `cargo check -p harness-core --all-targets`.
 - [ ] Run `cargo test -p harness-core stack`.
 - [ ] Run `cargo test -p harness-core`.
