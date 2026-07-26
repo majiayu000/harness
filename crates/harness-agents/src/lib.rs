@@ -149,7 +149,9 @@ unsafe fn nix_kill(pid: i32, sig: i32) -> i32 {
 }
 
 pub(crate) struct ManagedChild {
-    child: tokio::process::Child,
+    /// Only `None` after `Drop` has taken the child for background reaping;
+    /// every other method may assume it is present.
+    child: Option<tokio::process::Child>,
     process_group_id: Option<u32>,
     label: &'static str,
     cleanup_disarmed: bool,
@@ -159,15 +161,21 @@ impl ManagedChild {
     pub(crate) fn new(child: tokio::process::Child, label: &'static str) -> Self {
         let process_group_id = child.id();
         Self {
-            child,
+            child: Some(child),
             process_group_id,
             label,
             cleanup_disarmed: false,
         }
     }
 
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("ManagedChild is only vacated during drop")
+    }
+
     pub(crate) fn inner_mut(&mut self) -> &mut tokio::process::Child {
-        &mut self.child
+        self.child_mut()
     }
 
     pub(crate) fn terminate_now(&mut self) {
@@ -175,11 +183,11 @@ impl ManagedChild {
         if let Some(pid) = self.process_group_id {
             kill_process_group_id(pid);
         }
-        let _ = self.child.start_kill();
+        let _ = self.child_mut().start_kill();
     }
 
     pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        self.child_mut().wait().await
     }
 
     pub(crate) async fn wait_and_cleanup_descendants(
@@ -199,8 +207,8 @@ impl ManagedChild {
     pub(crate) async fn wait_with_output(&mut self) -> std::io::Result<std::process::Output> {
         use tokio::io::AsyncReadExt;
 
-        let stdout = self.child.stdout.take();
-        let stderr = self.child.stderr.take();
+        let stdout = self.child_mut().stdout.take();
+        let stderr = self.child_mut().stderr.take();
         let stdout_task = tokio::spawn(async move {
             let mut bytes = Vec::new();
             if let Some(mut pipe) = stdout {
@@ -277,7 +285,10 @@ impl Drop for ManagedChild {
         if self.cleanup_disarmed {
             return;
         }
-        let mut child_reaped = match self.child.try_wait() {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let child_reaped = match child.try_wait() {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(error) => {
@@ -303,56 +314,186 @@ impl Drop for ManagedChild {
             agent_process = self.label,
             "agent child dropped while still running; killing process group before workspace release"
         );
-        self.terminate_now();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            if !child_reaped {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => {
-                        child_reaped = true;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            agent_process = self.label,
-                            "failed waiting for killed agent child to exit: {error}"
-                        );
-                        child_reaped = true;
-                    }
-                }
-            }
-
-            #[cfg(unix)]
-            let group_drained = self
-                .process_group_id
-                .is_none_or(|pid| !process_group_has_members(pid));
-            #[cfg(not(unix))]
-            let group_drained = true;
-
-            if child_reaped && group_drained {
-                self.cleanup_disarmed = true;
-                return;
-            }
-
-            if std::time::Instant::now() >= deadline {
-                if !child_reaped {
-                    tracing::warn!(
-                        agent_process = self.label,
-                        "timed out waiting for killed agent child to exit"
-                    );
-                }
-                if !group_drained {
-                    tracing::warn!(
-                        agent_process = self.label,
-                        "timed out waiting for killed agent process group to drain"
-                    );
-                }
-                return;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        #[cfg(unix)]
+        if let Some(pid) = self.process_group_id {
+            kill_process_group_id(pid);
         }
+        let _ = child.start_kill();
+
+        // Drop runs on the async runtime for every cancelled/timed-out turn, so
+        // it must not block the worker thread: hand reaping and group-drain
+        // verification to a detached task. The blocking loop is kept only for
+        // drops outside a runtime (e.g. process teardown).
+        let label = self.label;
+        let process_group_id = self.process_group_id;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(reap_killed_child(child, label, process_group_id));
+            }
+            Err(_) => drain_killed_child_blocking(child, child_reaped, label, process_group_id),
+        }
+    }
+}
+
+/// Await the killed child's exit and verify its process group drains.
+///
+/// The SIGKILL was already issued by `Drop`; this task only reaps and reports.
+async fn reap_killed_child(
+    mut child: tokio::process::Child,
+    label: &'static str,
+    process_group_id: Option<u32>,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(
+                agent_process = label,
+                "failed waiting for killed agent child to exit: {error}"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                agent_process = label,
+                "timed out waiting for killed agent child to exit"
+            );
+            return;
+        }
+    }
+
+    #[cfg(unix)]
+    if let Some(pgid) = process_group_id {
+        loop {
+            if !process_group_has_members(pgid) {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    agent_process = label,
+                    "timed out waiting for killed agent process group to drain"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = process_group_id;
+}
+
+/// Blocking fallback for drops outside a tokio runtime, where a detached
+/// reaper task cannot be spawned.
+fn drain_killed_child_blocking(
+    mut child: tokio::process::Child,
+    mut child_reaped: bool,
+    label: &'static str,
+    process_group_id: Option<u32>,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if !child_reaped {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    child_reaped = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        agent_process = label,
+                        "failed waiting for killed agent child to exit: {error}"
+                    );
+                    child_reaped = true;
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        let group_drained = process_group_id.is_none_or(|pid| !process_group_has_members(pid));
+        #[cfg(not(unix))]
+        let group_drained = true;
+
+        if child_reaped && group_drained {
+            return;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            if !child_reaped {
+                tracing::warn!(
+                    agent_process = label,
+                    "timed out waiting for killed agent child to exit"
+                );
+            }
+            if !group_drained {
+                tracing::warn!(
+                    agent_process = label,
+                    "timed out waiting for killed agent process group to drain"
+                );
+            }
+            return;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod managed_child_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_of_running_child_returns_promptly_and_reaps_in_background() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 5").kill_on_drop(true);
+        set_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn sleeping child");
+        let pgid = child.id().expect("child pid");
+        let managed = ManagedChild::new(child, "drop latency test");
+
+        let start = std::time::Instant::now();
+        drop(managed);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "drop must not block the runtime worker; took {elapsed:?}"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if !process_group_has_members(pgid) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "detached reaper should drain the killed process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn drop_outside_runtime_falls_back_to_blocking_drain() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let (managed, pgid) = runtime.block_on(async {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg("sleep 5").kill_on_drop(true);
+            set_process_group(&mut cmd);
+            let child = cmd.spawn().expect("spawn sleeping child");
+            let pgid = child.id().expect("child pid");
+            (ManagedChild::new(child, "blocking drain test"), pgid)
+        });
+
+        // Dropping outside any runtime context must still fully drain the
+        // group before returning (there is no executor to run a reaper task).
+        drop(managed);
+        assert!(
+            !process_group_has_members(pgid),
+            "blocking fallback should drain the killed process group before returning"
+        );
+        drop(runtime);
     }
 }
 
