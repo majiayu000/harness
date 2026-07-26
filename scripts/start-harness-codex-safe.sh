@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/binary-freshness.sh
+. "$SCRIPT_DIR/lib/binary-freshness.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -23,6 +27,15 @@ environment such as PATH, HOME, GITHUB_TOKEN, and API keys, but removes local
 Codex/Claude wrapper variables that can confuse spawned agent subprocesses.
 When available, background mode runs the server in a detached tmux session so it
 does not depend on the calling tool process lifetime.
+
+Binary freshness: when the binary is selected implicitly from
+./target/release/harness or ./target/debug/harness, the wrapper verifies it
+against the Cargo dep-info evidence next to it plus the root manifests. A
+stale or unverifiable default binary is never silently started; rebuild it or
+select a binary explicitly. Explicit --bin or HARNESS_BIN values are
+operator-owned: freshness is reported as a warning but not enforced.
+--status and the recorded-live-PID fast path report binary freshness
+separately from process health.
 EOF
 }
 
@@ -40,6 +53,10 @@ PROJECT_ROOT=""
 PROJECT_ROOT_EXPLICIT=0
 CONFIG=""
 BIN="${HARNESS_BIN:-}"
+EXPLICIT_BIN=0
+if [[ -n "$BIN" ]]; then
+  EXPLICIT_BIN=1
+fi
 LOG_DIR=".harness/local"
 WAIT_SECS="${HARNESS_STARTER_WAIT_SECS:-60}"
 HEALTH_CURL_TIMEOUT_SECS="${HARNESS_STARTER_HEALTH_TIMEOUT_SECS:-2}"
@@ -69,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --bin)
       require_value "$1" "${2:-}"
       BIN="$2"
+      EXPLICIT_BIN=1
       shift 2
       ;;
     --log-dir)
@@ -197,6 +215,53 @@ listener_pid_for_port() {
   fi
 }
 
+# Reports binary freshness separately from process health. Prefers the
+# executable of the given live PID when it is a repository-local binary,
+# otherwise falls back to the selected or default repository binary.
+live_executable_for_pid() {
+  local live_pid="$1"
+  if [[ -e "/proc/$live_pid/exe" ]]; then
+    readlink "/proc/$live_pid/exe" 2>/dev/null || true
+    return 0
+  fi
+  ps -p "$live_pid" -o comm= 2>/dev/null | tail -1 || true
+}
+
+report_binary_freshness() {
+  local live_pid="${1:-}"
+  local assessed="" exe="" state=""
+  if [[ -n "$live_pid" ]]; then
+    # Linux ps comm output is only a process name, so prefer the exact procfs
+    # executable link. Other platforms use ps comm and fall back below when it
+    # does not identify a repository-local binary.
+    exe="$(live_executable_for_pid "$live_pid")"
+    case "$exe" in
+      "$PWD"/target/*|./target/*|target/*)
+        assessed="$exe"
+        ;;
+    esac
+  fi
+  if [[ -z "$assessed" ]]; then
+    if [[ -n "$BIN" ]]; then
+      assessed="$BIN"
+    elif [[ -e ./target/release/harness ]]; then
+      assessed="./target/release/harness"
+    elif [[ -e ./target/debug/harness ]]; then
+      assessed="./target/debug/harness"
+    fi
+  fi
+  if [[ -z "$assessed" ]]; then
+    echo "binary_freshness=unverifiable binary=none detail=no repository-local harness binary found"
+    return 0
+  fi
+  harness_binary_freshness "$assessed" "$PWD" > /dev/null
+  state="$HARNESS_BINARY_FRESHNESS_STATE"
+  echo "binary_freshness=$state binary=$assessed detail=${HARNESS_BINARY_FRESHNESS_DETAIL}"
+  if [[ "$state" != "fresh" ]]; then
+    echo "note: binary freshness is independent of process health; rebuild with: $(harness_binary_rebuild_hint "$assessed")"
+  fi
+}
+
 require_listener_check_for_start() {
   if ! command -v lsof >/dev/null 2>&1; then
     echo "refusing to start harness server: lsof is required to verify port $PORT ownership" >&2
@@ -241,6 +306,7 @@ if [[ "$STATUS" -eq 1 ]]; then
   if pid_alive "$pid"; then
     echo "$pid" > "$PID_FILE"
     echo "pid=$pid status=running log=$LOG_FILE"
+    report_binary_freshness "$pid"
   else
     if command -v lsof >/dev/null 2>&1; then
       listener_pid="$(listener_pid_for_port)"
@@ -273,6 +339,7 @@ require_listener_check_for_start
 pid="$(recorded_pid)"
 if pid_alive "$pid"; then
   echo "harness server already recorded as running pid=$pid port=$PORT"
+  report_binary_freshness "$pid"
   exit 0
 fi
 
@@ -296,6 +363,21 @@ fi
 if [[ ! -x "$BIN" ]]; then
   echo "harness binary is not executable: $BIN" >&2
   exit 3
+fi
+
+harness_binary_freshness "$BIN" "$PWD" > /dev/null
+binary_freshness_state="$HARNESS_BINARY_FRESHNESS_STATE"
+if [[ "$binary_freshness_state" != "fresh" ]]; then
+  if [[ "$EXPLICIT_BIN" -eq 0 ]]; then
+    echo "refusing to start harness server: default binary is ${binary_freshness_state}: $BIN" >&2
+    echo "reason: ${HARNESS_BINARY_FRESHNESS_DETAIL}" >&2
+    echo "rebuild with: $(harness_binary_rebuild_hint "$BIN")" >&2
+    echo "or select an operator-owned binary explicitly with --bin/HARNESS_BIN" >&2
+    exit 3
+  fi
+  echo "warning: operator-selected binary is ${binary_freshness_state}: $BIN" >&2
+  echo "warning: reason: ${HARNESS_BINARY_FRESHNESS_DETAIL}" >&2
+  echo "warning: freshness is not enforced for explicit --bin/HARNESS_BIN selections" >&2
 fi
 
 unset_args=()
