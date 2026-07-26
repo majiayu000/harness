@@ -508,14 +508,14 @@ fn symlink_swaps_remain_root_confined_and_hash_the_opened_target() {
     symlink("b.txt", root.join("CLAUDE.md")).expect("relink");
     let swapped = run_ok(&root);
     assert_eq!(entry_digest(find(&swapped, "CLAUDE.md")), digest_of(b"target b"));
-    // An escaping target is rejected by the root capability.
     write_file(outer.path(), "outside.txt", b"outside");
     fs::remove_file(root.join("CLAUDE.md")).expect("remove link");
     symlink("../outside.txt", root.join("CLAUDE.md")).expect("escape link");
     let error = assert_fail(&root, EK::RootEscape);
     assert_eq!(error.locator(), Some("CLAUDE.md"));
-    // A dangling in-root target is a broken symlink, not a silent omission.
     fs::remove_file(root.join("CLAUDE.md")).expect("remove link");
+    let cap = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).expect("root");
+    assert_eq!(classify_resolution_failure(&cap, "CLAUDE.md", std::io::ErrorKind::NotFound), EK::EntryRaced);
     symlink("gone.txt", root.join("CLAUDE.md")).expect("broken link");
     assert_fail(&root, EK::BrokenSymlink);
 }
@@ -724,10 +724,12 @@ fn selected_fifo_targets_fail_without_blocking() {
         .status()
         .expect("spawn mkfifo");
     assert!(status.success(), "mkfifo must succeed");
+    write_file(dir.path(), "AGENTS.md", b"regular file consumes the budget");
     let root = dir.path().to_path_buf();
+    let options = opts(&root).with_max_files(1).expect("one regular file");
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = sender.send(run(&root));
+        let _ = sender.send(inventory_repository_stack(&options));
     });
     let result = receiver
         .recv_timeout(Duration::from_secs(10))
@@ -739,7 +741,6 @@ fn selected_fifo_targets_fail_without_blocking() {
 #[cfg(not(unix))]
 #[test]
 fn selected_fifo_targets_fail_without_blocking() {
-    // FIFOs are Unix-specific; assert the typed rejection category directly.
     assert_eq!(EK::NonRegularEntry.as_str(), "non_regular_entry");
 }
 

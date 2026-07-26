@@ -374,11 +374,17 @@ fn normalize_configured_source(raw: &str) -> Result<Option<String>, AgentStackIn
     }
 }
 
-/// `NotFound` on symlink-target resolution is a broken symlink; every other
-/// failure (including escape) rejects without leaking ambient targets.
 #[rustfmt::skip]
-fn classify_resolution_failure(kind: std::io::ErrorKind) -> AgentStackInventoryErrorKind {
-    if kind == std::io::ErrorKind::NotFound { EK::BrokenSymlink } else { EK::RootEscape }
+pub(super) fn classify_resolution_failure(
+    root: &Dir, path: impl AsRef<Path>, kind: std::io::ErrorKind,
+) -> AgentStackInventoryErrorKind {
+    if kind != std::io::ErrorKind::NotFound { return EK::RootEscape; }
+    match root.symlink_metadata(path) {
+        Ok(meta) if meta.is_symlink() => EK::BrokenSymlink,
+        Ok(_) => EK::EntryRaced,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => EK::EntryRaced,
+        Err(_) => EK::EntryMetadata,
+    }
 }
 
 /// A selected entry that disappeared before open is a race; any other open
@@ -395,7 +401,7 @@ type Listing = Vec<(OsString, FileType)>;
 pub(super) struct DirectoryIdentity(Arc<same_file::Handle>);
 #[derive(Clone)]
 #[rustfmt::skip]
-struct FileObservation { bytes: Vec<u8>, digest: Sha256Digest, class: AgentStackEntryClass }
+struct FileObservation { digest: Sha256Digest, class: AgentStackEntryClass }
 
 #[rustfmt::skip]
 struct Scan<'a> {
@@ -521,7 +527,7 @@ impl Scan<'_> {
         };
         let is_dir = if meta.is_symlink() {
             root.metadata(path)
-                .map_err(|error| err(classify_resolution_failure(error.kind()), path))?
+                .map_err(|error| err(classify_resolution_failure(root, path, error.kind()), path))?
                 .is_dir()
         } else {
             meta.is_dir()
@@ -578,9 +584,12 @@ impl Scan<'_> {
                 return Err(err(EK::NonRegularEntry, &locator));
             }
             if file_type.is_symlink() {
-                let resolved = root
-                    .metadata(&name)
-                    .map_err(|error| err(classify_resolution_failure(error.kind()), &locator))?;
+                let resolved = root.metadata(&name).map_err(|error| {
+                    err(
+                        classify_resolution_failure(root, &name, error.kind()),
+                        &locator,
+                    )
+                })?;
                 if resolved.is_dir() {
                     return Err(err(EK::NonRegularEntry, &locator));
                 }
@@ -660,7 +669,8 @@ impl Scan<'_> {
                         let hint = name
                             .to_str()
                             .map_or_else(|| prefix.to_owned(), |n| format!("{prefix}/{n}"));
-                        err(classify_resolution_failure(error.kind()), &hint)
+                        let path = Path::new(prefix).join(name);
+                        err(classify_resolution_failure(root, path, error.kind()), &hint)
                     })?
                     .is_dir()
             } else {
@@ -700,9 +710,8 @@ impl Scan<'_> {
         }
         if let Some(observation) = self.file_observations.get(&locator).cloned() {
             self.emit(kind, locator, Some(observation.digest), observation.class)?;
-            return Ok(Some(observation.bytes));
+            return Ok(None);
         }
-        charge(&mut self.files_used, self.opts.max_files, &locator)?;
         let mut open_options = OpenOptions::new();
         open_options.read(true);
         #[cfg(unix)]
@@ -717,6 +726,7 @@ impl Scan<'_> {
         if !meta.is_file() {
             return Err(err(EK::NonRegularEntry, &locator));
         }
+        charge(&mut self.files_used, self.opts.max_files, &locator)?;
         #[cfg(unix)]
         let unix_executable = {
             use cap_std::fs::MetadataExt;
@@ -739,7 +749,7 @@ impl Scan<'_> {
         let digest = Sha256Digest::from_bytes(&bytes);
         let class = AgentStackEntryClass::RegularFile { unix_executable };
         self.file_observations.insert(locator.clone(), FileObservation {
-            bytes: bytes.clone(), digest: digest.clone(), class: class.clone(),
+            digest: digest.clone(), class: class.clone(),
         });
         self.emit(kind, locator, Some(digest), class)?;
         Ok(Some(bytes))
