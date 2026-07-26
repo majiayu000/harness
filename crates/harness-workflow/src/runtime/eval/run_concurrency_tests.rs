@@ -1,6 +1,7 @@
 use super::manifest::EvalBenchmarkCase;
 use super::run::*;
 use crate::runtime::{WorkflowCommandStatus, WorkflowRuntimeStore};
+use harness_core::db::resolve_database_url;
 use serde_json::json;
 use tokio::time::{sleep, timeout, Duration};
 
@@ -42,7 +43,7 @@ async fn wait_for_command_cancellation(
 #[tokio::test]
 async fn eval_enqueue_does_not_return_a_plan_for_a_same_state_stale_snapshot() -> anyhow::Result<()>
 {
-    if std::env::var_os("HARNESS_DATABASE_URL").is_none() {
+    if resolve_database_url(None).is_err() {
         return Ok(());
     }
     let dir = tempfile::tempdir()?;
@@ -92,7 +93,7 @@ async fn eval_enqueue_does_not_return_a_plan_for_a_same_state_stale_snapshot() -
 #[tokio::test]
 async fn eval_cleanup_reloads_latest_instance_after_a_same_state_stale_transition(
 ) -> anyhow::Result<()> {
-    if std::env::var_os("HARNESS_DATABASE_URL").is_none() {
+    if resolve_database_url(None).is_err() {
         return Ok(());
     }
     let dir = tempfile::tempdir()?;
@@ -196,7 +197,7 @@ async fn eval_cleanup_reloads_latest_instance_after_a_same_state_stale_transitio
 
 #[tokio::test]
 async fn eval_cleanup_reports_reload_failure_when_the_workflow_disappears() -> anyhow::Result<()> {
-    if std::env::var_os("HARNESS_DATABASE_URL").is_none() {
+    if resolve_database_url(None).is_err() {
         return Ok(());
     }
     let dir = tempfile::tempdir()?;
