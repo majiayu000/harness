@@ -20,7 +20,7 @@ Three review-integrity defects verified at commit `81c78255` (full analysis:
    lines) including the external-bot review escalation driver
    (`ReviewBotKey`, quota detection, `ReviewFallbackTier` graduation). The
    data model survives producer-less in
-   `crates/harness-workflow/src/issue_lifecycle.rs:102-121` and
+   `crates/harness-workflow/src/issue_lifecycle.rs:101-126` and
    `issue_workflow_store.rs:411`; no runtime path references bot fallback at
    all.
 
@@ -100,7 +100,13 @@ pub fn evaluate_escalation(
   review events, comment bodies + authors, timestamps, head push time).
   Agent activity results are not consulted (B-009).
 - Quota patterns are configuration (`WORKFLOW.md` `review_escalation.bots[]`
-  with `name`, `quota_patterns[]`), not hardcoded prose heuristics.
+  with `name`, `quota_patterns[]`), not hardcoded prose heuristics. This is
+  distinct from the legacy approach in kind, not just configurability: the
+  patterns match against **server-collected bot comments** from the GraphQL
+  snapshot (attributed author, timestamp, durable), whereas the deleted
+  ladder — and the surviving `is_quota_failure_message` /
+  `text:review_quota_blocker` checks — match agent-reported stdout/summary
+  prose, which B-009 excludes as a trigger source.
 - Tier order is monotonic; `evaluate_escalation` returns `None` when the
   persisted tier already covers the observed trigger (idempotent under
   re-observation, satisfying GH-1715 first-snapshot-wins).

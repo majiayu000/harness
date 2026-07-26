@@ -38,10 +38,11 @@ merge:
 - **The merge gate is deterministic and server-fed.** Every predicate is
   evaluated against a server-collected GraphQL snapshot, never against agent
   prose.
-- **No self-approval by construction.** The harness never calls the GitHub
-  review-submission API (no `submit_review` / `pulls/*/reviews` call sites
-  anywhere in `crates/`), so the `review_decision == APPROVED` requirement can
-  only be satisfied by an external reviewer.
+- **No self-approval by construction.** The harness never submits reviews:
+  the only `pulls/*/reviews` references in `crates/` are read-only `gh api`
+  GETs embedded in agent prompts (`prompts/pr.rs:25,204`;
+  `prompts/review.rs:94,124`), so the `review_decision == APPROVED`
+  requirement can only be satisfied by an external reviewer.
 - **Head identity is pinned at merge.** A stale snapshot cannot merge a PR
   whose head moved (`server_merge.rs:147-151`).
 
@@ -123,16 +124,25 @@ What survived, verified at `81c78255`:
 
 - The **data model** survived: `ReviewFallbackSnapshot`, `ReviewFallbackTier`,
   `ReviewFallbackTrigger` in
-  `crates/harness-workflow/src/issue_lifecycle.rs:102-121`, plus the store
+  `crates/harness-workflow/src/issue_lifecycle.rs:101-126`, plus the store
   method `record_ready_to_merge_with_fallback`
   (`issue_workflow_store.rs:411`).
 - The **producers did not**: the only non-test constructor of
   `ReviewFallbackSnapshot` is inside `issue_lifecycle.rs` itself; grep over
   `crates/harness-server/src/workflow_runtime_worker/`,
   `workflow_runtime_pr_feedback/`, and `crates/harness-workflow/src/runtime/`
-  finds **zero** references to Gemini, review bots, quota triggers, or
-  fallback tiers. Nothing on the live path ever creates a Tier-A/B/C
-  snapshot.
+  finds **zero** references to fallback tiers or any `ReviewFallbackSnapshot`
+  producer. Nothing on the live path ever creates a Tier-A/B/C snapshot.
+  Quota *detection* does exist on the runtime path — but it is derived from
+  agent-reported prose, not server observation:
+  `turn_error_is_non_retryable_agent_limit` calls
+  `is_quota_failure_message` over turn error text
+  (`workflow_runtime_worker/activity_result.rs:462`), and the status contract
+  emits a `text:review_quota_blocker` signal from substring matching on the
+  agent's own summary (`activity_status_contract.rs:204-205`). Neither feeds
+  any escalation; both strengthen the case for B-009's server-derived
+  triggers, since today's only quota signals originate in the very
+  agent-authored text the escalation contract must not trust.
 
 Consequences:
 

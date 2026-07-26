@@ -40,6 +40,12 @@ response to external-reviewer unavailability.
   triggers.
 - Changing the `pr_feedback` inspection ownership (it remains server-owned).
 - Altering the GH-1715 legacy lifecycle transition contract.
+- Head-SHA-bound local-review verification. The runtime's local review gate
+  currently accepts `LocalReviewPassed` without binding the approval to the
+  reviewed commit (the legacy `approved_review_sha` re-verification was
+  deleted with `task_executor`); restoring that binding is a real gap but is
+  deferred to a follow-up spec — this contract covers cross-review protocol
+  integrity and external-review escalation only.
 
 ## User-Visible Behavior
 
