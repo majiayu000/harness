@@ -29,8 +29,11 @@ See `specs/GH1731/product.md`.
 - `crates/harness-core/src/capability.rs:11-49` canonicalizes scoped paths for
   enforcement; inventory requires a separate read-only root containment
   helper and must not change capability-token behavior.
-- ASC-001 will add `crates/harness-core/src/stack/mod.rs` with the typed
-  component contract used by this issue.
+- `crates/harness-core/src/stack/mod.rs:10-319` now owns the merged ASC-001
+  component contract. This issue constructs repository sources with
+  `AgentStackSource::new`, hashes exact opened bytes with
+  `Sha256Digest::from_bytes`, and builds validated components with
+  `AgentStackComponent::new` plus `with_integrity`.
 - `crates/harness-core/Cargo.toml:25-30` already includes sha2 and tempfile but
   has no capability-scoped filesystem API. Bare `std::fs` path validation
   cannot bind containment checks to the file handle opened after the check.
@@ -41,11 +44,11 @@ See `specs/GH1731/product.md`.
 
 Add `stack::inventory` with:
 
-- `AgentStackInventoryOptions { root, max_file_bytes, max_total_bytes,
-  max_files, max_depth, max_entries_per_directory }`;
+- `AgentStackInventoryOptions`;
 - `AgentStackInventory`;
 - `AgentStackInventoryEntry`;
 - `AgentStackEntryClass`;
+- `AgentStackInventoryErrorKind`;
 - `AgentStackInventoryError`;
 - a private `InventoryRule` table;
 - `inventory_repository_stack(options) -> Result<AgentStackInventory, ...>`.
@@ -53,11 +56,32 @@ Add `stack::inventory` with:
 `stack/mod.rs` exposes the service and its public option/result/error types. It
 does not expose traversal helpers or mutable rule tables.
 
-The result contains the canonical root derived from the opened root handle and
-ordered inventory entries. Each entry contains one ASC-001 component plus its
-typed file or directory-presence observation. The root is observation metadata
-and is not represented as a component. This issue does not add an aggregate
-digest or snapshot identity.
+`AgentStackInventoryOptions` has private fields and a constructor accepting a
+`PathBuf` root. Its byte limits are `u64`; its file-count, depth, and
+entries-per-directory limits are `usize`. The defaults are 1 MiB per file,
+64 MiB total, 10,000 regular files, depth 32, and 10,000 entries per directory.
+Builder methods return a validated options value. Every limit is non-zero,
+byte limits must permit a checked `+ 1` sentinel, and invalid values fail
+before the root is opened. The allowlisted directory itself is depth 0; each
+descended directory increments depth by one. `max_files` counts regular files,
+while the single non-recursive `spec` directory-presence observation consumes
+no file or byte budget.
+
+`AgentStackInventory` has one private ordered entry vector and exposes it as a
+slice. It does not expose an ambient or canonical root path:
+`cap_std::fs::Dir::canonicalize` returns a capability-relative path and cannot
+prove an ambient absolute identity. `AgentStackInventoryEntry` has private
+component and entry-class fields with read-only accessors. Regular-file class
+stores `unix_executable: Option<bool>`; directory presence has no executable
+fact.
+
+`AgentStackInventoryError` contains an `AgentStackInventoryErrorKind` and an
+optional sanitized repository-relative locator. The closed initial categories
+are `invalid_options`, `root_open`, `entry_metadata`, `broken_symlink`,
+`root_escape`, `non_regular_entry`, `non_utf8_locator`, `read_failed`,
+`limit_exceeded`, and `component_validation`. Error evidence never serializes
+file bytes, ambient target paths, or arbitrary OS error strings. This issue
+does not add an aggregate digest or snapshot identity.
 
 ### Closed Discovery Table
 
@@ -104,33 +128,37 @@ adding a rule cannot reorder unrelated existing components.
 
 ### Safe Traversal
 
-Add audited `cap-std` workspace and `harness-core` dependencies. Call
-`Dir::open_ambient_dir` exactly once for the caller-supplied root, then verify
-the directory and derive the reported canonical root with handle-relative
-metadata and `Dir::canonicalize(".")` on that same handle. Do not call
-`std::fs::canonicalize` before opening and then reopen by pathname. Perform all
-discovery, metadata, directory iteration, and file opens relative to the
-resulting `cap_std::fs::Dir`; no descendant operation converts back to an
-ambient path or uses `std::fs` free functions.
+Run a baseline `cargo audit` before changing either manifest, then add the
+audited `cap-std` workspace and `harness-core` dependencies. Call
+`Dir::open_ambient_dir` exactly once for the caller-supplied root and treat that
+opened directory handle—not a reconstructed ambient path—as the root identity
+and access boundary. Do not canonicalize and reopen the root by pathname.
+Perform all discovery, metadata, directory iteration, and file opens relative
+to the resulting `cap_std::fs::Dir`; no descendant operation converts back to
+an ambient path or uses `std::fs` free functions.
 
 Validate every numeric limit before traversal. `max_file_bytes` must permit a
 checked `+ 1` sentinel read; zero limits and arithmetic overflow return a typed
 configuration error. For each rule:
 
-1. inspect relative metadata through the root directory capability;
-2. treat `NotFound` from that initial lookup as absence;
-3. return a typed error for every other metadata or path-resolution failure,
-   including broken and escaping symlinks;
+1. inspect every exact allowlist path with capability-relative,
+   non-following `symlink_metadata`;
+2. treat `NotFound` only from that initial non-following lookup as absence; an
+   entry already yielded by `read_dir` followed by `NotFound` is a race error;
+3. follow or open an observed symlink through the directory capability and
+   classify `NotFound` as `broken_symlink`; reject escaping targets and every
+   other metadata or path-resolution failure;
 4. visit directories through capability-relative handles, collect at most
-   `max_entries_per_directory` entries, normalize losslessly, and sort before
-   recursion;
+   `max_entries_per_directory + 1` entries with checked arithmetic, fail on the
+   sentinel entry, then normalize losslessly and sort before recursion;
 5. track opened directory identities in the active ancestor stack to reject
    cycles while permitting non-cyclic duplicate paths to the same directory;
 6. increment checked depth and file-count budgets before descending or reading
    and fail before a configured limit can be exceeded;
 7. reject sockets, FIFOs, devices, and every other non-regular special entry;
 8. open each file through its containing directory capability and validate
-   regular-file metadata from the opened handle;
+   regular-file metadata from the opened handle, which becomes the authority
+   for the observed type, bytes, and executable mode;
 9. compute checked per-file and remaining-aggregate `+ 1` sentinels, read in
    bounded chunks through `File::take(min(per_file_sentinel,
    remaining_total_sentinel))`, account each chunk before the next read, and
@@ -139,9 +167,11 @@ configuration error. For each rule:
     handle.
 
 Safe in-root symlinks retain their link locator as component identity while
-hashing target bytes. Duplicate target content may therefore produce multiple
-components with distinct repository locators, which accurately reflects
-multiple declared stack entry points.
+hashing target bytes. If a symlink changes between two valid in-root regular
+files, the scan may observe either opened target; it does not claim to detect
+that swap. Duplicate target content may therefore produce multiple components
+with distinct repository locators, which accurately reflects multiple declared
+stack entry points.
 
 Errors carry a stable category and sanitized repository-relative locator.
 They do not include file bytes, resolved out-of-root locations, or arbitrary OS
@@ -149,27 +179,26 @@ error strings in serialized evidence.
 
 Capability-relative lookup and open bind root containment to directory/file
 handles even when a pathname or symlink changes concurrently. The scan is not
-an atomic filesystem snapshot: an in-place writer can change bytes during a
-read. The digest remains the digest of bytes actually returned by the opened
-handle, and callers that require repeatable snapshot semantics must scan a
-quiescent checkout.
+an atomic filesystem snapshot: an in-root symlink swap may select either valid
+target and an in-place writer can change bytes during a read. The digest remains
+the digest of bytes actually returned by the opened handle, and callers that
+require repeatable snapshot semantics must scan a quiescent checkout.
 
 ### Component Construction
 
 Each regular file becomes an `AgentStackInventoryEntry` containing an ASC-001
-component:
+component constructed through the merged public API:
 
-- `schema_version`: ASC-001 constant;
-- component ID from the ASC-001 helper:
+- `AgentStackSource::new(AgentStackSourceScope::Repository, locator)`;
+- `Sha256Digest::from_bytes(opened_bytes)`;
+- `AgentStackComponent::new(rule.kind, source,
+  AgentStackObservationClass::RepositoryObserved,
+  AgentStackSelectionState::Discovered,
+  AgentStackTrustLevel::RepositoryObserved, AgentStackFreshness::Unknown)`;
+- `.with_integrity(Some(digest))` for regular files;
+- the constructor-derived component ID
   `repository:<component kind>:<normalized locator>`;
-- source scope: `repository`;
-- source locator: normalized locator;
-- kind: rule kind;
-- digest: validated SHA-256;
-- observation/trust: `repository_observed`;
-- selection: `discovered`;
-- freshness: `unknown`;
-- capabilities: empty.
+- no capabilities.
 
 `AgentStackEntryClass::RegularFile` additionally carries
 `unix_executable: Some(bool)` from the opened handle's `mode & 0o111` on Unix,
@@ -190,18 +219,20 @@ platform supports unreadable-file assertions. Platform-specific inability to
 create an unreadable file must use a deterministic injected reader failure
 fixture rather than silently skip the behavior. Unix-only non-UTF-8 fixtures
 assert a typed locator error; other platforms assert the same validator
-directly. A coordinated symlink-swap fixture proves that a raced path cannot
-escape the opened root capability. A root-swap fixture proves the canonical
-observation path is derived from the opened handle rather than a pathname
-canonicalized before open. Unix fixtures toggle a hook's executable bits while
-holding bytes constant; non-Unix tests assert the explicit unobserved state.
+directly. A coordinated escaping-symlink fixture proves that a raced path
+cannot escape the opened root capability. An in-root swap fixture accepts
+either valid opened target and proves the digest matches that handle. A
+root-path replacement fixture proves traversal remains bound to the originally
+opened handle without claiming an ambient canonical root. Unix fixtures toggle
+a hook's executable bits while holding bytes constant; non-Unix tests assert
+the explicit unobserved state.
 
 ## Data Flow
 
-Explicit root/options → one ambient root-handle open → handle-derived canonical
-root → fixed rule lookup → safe, sorted traversal → remaining-budget-capped byte
-read → SHA-256 and file metadata → validated ASC-001 component → typed entry →
-ordered `AgentStackInventory`.
+Explicit root/options → validated limits → one ambient root-handle open → fixed
+rule lookup → safe, sorted capability-relative traversal →
+remaining-budget-capped byte read → SHA-256 and file metadata → validated
+ASC-001 component → typed entry → ordered `AgentStackInventory`.
 
 Any existing-entry failure aborts the operation. Missing allowlisted entries
 produce no component. No subprocess, network, persistence, or repository write
@@ -211,14 +242,14 @@ occurs.
 
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
-| B-001 | root-handle-first preflight | `cargo test -p harness-core stack::inventory_tests::inventory_derives_canonical_root_from_the_opened_handle` |
+| B-001 | root-handle-first preflight with no ambient-root claim | `cargo test -p harness-core stack::inventory_tests::inventory_stays_bound_to_the_opened_root_handle` |
 | B-002 | root-only rule table | `cargo test -p harness-core stack::inventory_tests::inventory_never_reads_user_global_or_sibling_paths` |
 | B-003 | `InventoryRule` constant | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector` |
-| B-004 | NotFound handling | `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders` |
+| B-004 | non-following initial lookup and missing-entry handling | `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders` |
 | B-005 | entry/component construction, hashing, executable mode, and directory presence | `cargo test -p harness-core stack::inventory_tests::entries_bind_content_mode_and_directory_presence_to_valid_components` |
 | B-006 | typed rule classification | `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
 | B-007 | sorted traversal/output | `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory` |
-| B-008 | capability-relative traversal/open | `cargo test -p harness-core stack::inventory_tests::raced_or_escaping_symlinks_cannot_escape_root_capability` |
+| B-008 | capability-relative traversal/open and opened-handle observation | `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target` |
 | B-009 | typed read/path errors | `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators` |
 | B-010 | checked streaming aggregate/per-entry limits | `cargo test -p harness-core stack::inventory_tests::reads_never_exceed_remaining_aggregate_or_per_file_budget` |
 | B-011 | repeated full-entry fixture comparison | `cargo test -p harness-core stack::inventory_tests::unchanged_repository_inventory_is_repeatable` |
@@ -241,8 +272,9 @@ occurs.
 
 - Security: path escape and symlink races could read outside the requested
   root. All descendant operations use the root directory capability, and tests
-  race symlink replacement against handle-relative opens. Run `cargo audit`
-  when introducing the security-sensitive dependency.
+  race symlink replacement against handle-relative opens. Run a baseline
+  `cargo audit` before adding the security-sensitive dependency and run it
+  again after the manifest and lockfile change.
 - Logic: an incomplete allowlist omits behavior-affecting sources. The product
   contract and table test enumerate the exact v0.1 surface, including every
   current `lang_detect.rs` predicate.
@@ -264,13 +296,15 @@ occurs.
 - [ ] Add Unix executable-bit change and non-Unix unobserved-mode fixtures, plus
       a non-recursive root `spec` directory-presence fixture.
 - [ ] Validate every emitted component with the ASC-001 API.
+- [ ] Before editing `Cargo.toml`, `crates/harness-core/Cargo.toml`, or
+      `Cargo.lock`, run baseline `cargo audit`.
 - [ ] Run `cargo check -p harness-core --all-targets`.
 - [ ] Run `cargo test -p harness-core stack::inventory_tests`.
 - [ ] Run `cargo test -p harness-core`.
 - [ ] Run `cargo fmt --all` and `cargo fmt --all -- --check`.
 - [ ] Before push, run
       `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `cargo audit` after adding `cap-std`.
+- [ ] Run `cargo audit` again after adding `cap-std` and updating `Cargo.lock`.
 - [ ] Run
       `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1731`.
 - [ ] Confirm the implementation diff contains only the six paths in the
