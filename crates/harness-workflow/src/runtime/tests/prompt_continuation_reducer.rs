@@ -52,6 +52,14 @@ fn prompt_task_without_policy_ignores_forged_structured_continuation() {
                 "Completed the single-shot prompt task.",
             )
             .with_validation(ValidationRecord::new("cargo test", "passed"))
+    .with_artifact(ActivityArtifact::new(
+        "validation_report",
+        json!([{ "command": "cargo test", "exit_code": 0 }]),
+    ))
+            .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([{ "command": "cargo test", "exit_code": 0 }]),
+            ))
             .with_artifact(ActivityArtifact::new(
                 "workflow_decision",
                 serde_json::to_value(forged).expect("forged decision should serialize"),
@@ -81,7 +89,11 @@ fn runtime_completion_reducer_finishes_prompt_task_after_implementation() {
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
         "Prompt implementation completed.",
     )
-    .with_validation(ValidationRecord::new("cargo test", "passed"));
+    .with_validation(ValidationRecord::new("cargo test", "passed"))
+    .with_artifact(ActivityArtifact::new(
+        "validation_report",
+        json!([{ "command": "cargo test", "exit_code": 0 }]),
+    ));
     let event = WorkflowEvent::new(
         &instance.id,
         1,

@@ -389,3 +389,49 @@ fn declared_evidence_gates_a_decision_and_enforcement_can_be_lifted() {
         )
         .expect("kill switch must restore claim-trusting behavior");
 }
+
+#[test]
+fn prompt_task_done_requires_completion_evidence_even_if_the_reducer_is_bypassed() {
+    let instance = WorkflowInstance::new(
+        "prompt_task",
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "task-1"),
+    );
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "implementing",
+        "finish_prompt_task",
+        "done",
+        "prompt implementation activity completed successfully",
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::MarkDone,
+        "prompt-task-1-done",
+        json!({ "reason": "done" }),
+    ));
+
+    let err = DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect_err("implementing -> done without completion evidence must be rejected");
+    assert_eq!(
+        err.kind,
+        WorkflowDecisionRejectionKind::MissingRequiredEvidence
+    );
+
+    let evidenced = decision.with_evidence(WorkflowEvidence::new(
+        "prompt_completion_evidence",
+        "validation_report: 1 command(s) reported, 0 non-zero exit(s)",
+    ));
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &evidenced,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("the declared evidence unlocks the transition");
+}

@@ -370,6 +370,14 @@ impl TransitionAllowlist {
             .allow("blocked", "awaiting_dependencies", [Wait])
             .allow("blocked", "implementing", [EnqueueActivity, Wait])
             .allow("implementing", "done", [MarkDone])
+            // A prompt task may mint Done only with server-checkable completion
+            // evidence; the reducer resolves validation-report-or-no-change and
+            // mints this kind (GH-1817).
+            .require_evidence(
+                "implementing",
+                "done",
+                [super::model::EVIDENCE_PROMPT_COMPLETION],
+            )
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
