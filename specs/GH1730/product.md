@@ -46,7 +46,12 @@ runtime use or local observation with trusted attestation.
 2. **B-002:** Component kind is a closed snake_case vocabulary containing
    `instructions`, `skill`, `mcp_server`, `mcp_tool`, `hook`, `memory`,
    `policy`, `workflow`, `validation`, and `agent_runtime`. Unknown spellings,
-   aliases, and case variants are rejected.
+   aliases, and case variants are rejected. The normative role table below
+   determines classification from an explicit typed registration or discovery
+   surface; producers do not infer kind from a file name, extension, or content.
+   One backing source explicitly bound to multiple roles represents distinct
+   components, while an untyped or ambiguous single-role discovery fails
+   closed.
 3. **B-003:** Every component has one canonical stable component ID derived
    exactly as `<source_scope>:<component_kind>:<source_locator>`, one typed
    source scope from `repository`, `user_global`, `admin`, `system`, `runtime`,
@@ -56,6 +61,9 @@ runtime use or local observation with trusted attestation.
    portable paths relative to their fixed roots. User-global locators use
    `<root_namespace>/<portable_relative_path>` and select one root by the
    contract's fixed precedence when roots overlap under its lexical comparison.
+   An absent or relative `XDG_CONFIG_HOME` is ignored in favor of an absolute
+   `HOME/.config/harness` fallback; the XDG namespace is unavailable only when
+   neither input can produce an absolute root.
    Windows drive-letter casing is canonical-equivalent; other case-varied path
    segments and symlink aliases remain distinct logical sources. v0.1 accepts at
    most one configured-user root and rejects ambiguous configuration.
@@ -83,7 +91,12 @@ runtime use or local observation with trusted attestation.
    evidence.
 6. **B-006:** Integrity is either absent or a validated lowercase SHA-256
    digest. Blank, malformed, mixed-case, or non-SHA-256 values are invalid.
-   Absence remains distinct from a digest of empty content.
+   When present, it hashes the exact source bytes: raw file bytes for a file or
+   the exact embedded payload bytes for a built-in. No decoding, newline, BOM,
+   Unicode, frontmatter, metadata, or multi-file normalization is implicit.
+   A logical, structured, or multi-file source without a versioned canonical
+   byte encoding omits integrity. Absence remains distinct from the standard
+   SHA-256 digest of empty content.
 7. **B-007:** Capability identifiers use the closed initial vocabulary
    `destructive`, `secret_read`, `network`, `privileged`,
    `production_write`, `shell`, and `file_write`. This field states associated
@@ -98,9 +111,15 @@ runtime use or local observation with trusted attestation.
    first three, and runner observation accepts all four. Stronger attestation
    and human-approval claims remain out of scope for this schema version.
 9. **B-009:** Freshness is exactly one of `unknown`, `fresh`, `stale`, or
-   `expired`. When no supported freshness fact exists, the value is `unknown`;
-   callers do not infer freshness from file names, enumeration order, or the
-   current clock.
+   `expired` and describes evidence freshness, not skill usage health. `fresh`
+   requires a direct source read or probe in the current observation; `stale`
+   identifies a cached prior observation not revalidated in the current one;
+   `expired` requires authoritative invalidation or an explicit producer
+   validity deadline for which `observation_time >= valid_until`; and `unknown`
+   means none of those facts exists. Precedence is explicit expiry, current
+   observation, cached prior observation, then unknown. Callers do not infer
+   this value from file names, enumeration order, the current clock alone, or
+   the existing skill `FreshnessClass`.
 10. **B-010:** Optional unavailable facts remain absent. Empty strings, sentinel
     names such as `unknown-component`, fabricated aliases, and zero digests may
     not substitute for missing evidence.
@@ -114,6 +133,21 @@ runtime use or local observation with trusted attestation.
     prompt construction, skill injection, capability enforcement, persisted
     workflow data, or public wire behavior outside the new schema.
 
+### Component Kind Semantics
+
+| Kind | Normative typed role |
+| --- | --- |
+| `instructions` | Agent directive content not registered as a skill or policy |
+| `skill` | A named reusable unit registered with a skill registry |
+| `mcp_server` | An MCP server connection or process definition |
+| `mcp_tool` | One tool definition advertised by an identified MCP server |
+| `hook` | An action bound to an explicit lifecycle hook slot |
+| `memory` | Content retained and recalled across agent invocations |
+| `policy` | A constraint that decides allow, deny, required, or routing behavior |
+| `workflow` | A multi-step orchestration definition |
+| `validation` | A registered check that emits validation or pass/fail evidence |
+| `agent_runtime` | The adapter, executable, or profile that starts an agent |
+
 ## Acceptance Criteria
 
 - [ ] Public Rust types represent every field and closed vocabulary in
@@ -126,6 +160,16 @@ runtime use or local observation with trusted attestation.
 - [ ] Positive fixtures round-trip every component kind, observation class,
       source scope, user-global root, selection state, trust level, freshness
       value, and capability.
+- [ ] Core fixtures prove the closed kind vocabulary and that explicit
+      multi-role bindings produce distinct component IDs. Producer handoff
+      requirements assign typed-role classification and fail-closed handling
+      for untyped or ambiguous discovery to ASC-002, ASC-003, and ASC-004.
+- [ ] Integrity fixtures prove exact-byte hashing, byte-level distinctions, the
+      empty-content digest, and optional-field behavior. Producer handoff
+      requirements prohibit integrity when canonical source bytes do not exist.
+- [ ] Core fixtures prove freshness evidence precedence and the exact deadline
+      boundary. ASC-002 handoff requirements prohibit automatic mapping from
+      skill usage freshness.
 - [ ] Negative fixtures prove unknown fields, aliases, malformed digests,
       traversal and NUL-containing locators, explicit `null` integrity, missing
       required values, non-UTF-8 path inputs, and impossible evidence
@@ -157,7 +201,12 @@ runtime use or local observation with trusted attestation.
 - Repository discovery labels a component `loaded`.
 - A runtime observation claims `runner_observed` trust.
 - A future producer emits a new component kind to a v0.1 reader.
+- A backing file is explicitly bound to multiple typed roles.
+- A producer has an artifact but no typed role from which to classify it.
 - A component has no freshness evidence.
+- A cached observation has no current source read, or an explicit validity
+  deadline has ended.
+- Two byte sequences differ only by LF/CRLF, BOM, or Unicode encoding.
 - A non-repository producer supplies a UUID, display label, reserved missing
   sentinel, or newly generated per-scan value as its source locator.
 - Two user-global producers observe the same root but choose different base

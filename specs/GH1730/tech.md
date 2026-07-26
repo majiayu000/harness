@@ -58,6 +58,7 @@ changes.
 - `AgentStackCapability`;
 - `AgentStackTrustLevel`;
 - `AgentStackFreshness`;
+- `AgentStackFreshnessEvidence`;
 - `Sha256Digest`;
 - `AgentStackSource`;
 - `AgentStackComponent`;
@@ -103,6 +104,34 @@ explicit JSON `null` is rejected rather than being accepted as absence.
 Deserialization rejects a missing required field rather than inventing a
 default.
 
+### Component Kind Classification
+
+`AgentStackComponentKind` is selected from a producer's typed registration or
+discovery role, never guessed from a file name, extension, path, or content:
+
+| Kind | Required typed role |
+| --- | --- |
+| `instructions` | Agent directive content not registered as a skill or policy |
+| `skill` | Named reusable unit registered with a skill registry |
+| `mcp_server` | MCP server connection or process definition |
+| `mcp_tool` | One tool definition advertised by an identified MCP server |
+| `hook` | Action bound to an explicit lifecycle hook slot |
+| `memory` | Content retained and recalled across agent invocations |
+| `policy` | Constraint deciding allow, deny, required, or routing behavior |
+| `workflow` | Multi-step orchestration definition |
+| `validation` | Registered check producing validation or pass/fail evidence |
+| `agent_runtime` | Adapter, executable, or profile that starts an agent |
+
+The core constructor accepts the closed typed enum and performs no artifact
+classification. Later producer constructors must fail closed when their input
+has no typed role or has an ambiguous single binding. If one backing source is
+explicitly registered in multiple roles, each binding is a distinct component
+whose kind participates in a distinct component ID; a producer must not choose
+one role by precedence. GH1730 proves that explicit distinct kinds derive
+distinct component IDs. ASC-002, ASC-003, and ASC-004 must each test typed role
+mapping and fail-closed untyped or ambiguous discovery on their actual
+registration surfaces.
+
 `AgentStackSourceScope` contains explicit `repository`, `user_global`, `admin`,
 `system`, `runtime`, and `runner` values.
 
@@ -140,8 +169,17 @@ equivalence and directory-segment case distinction through the same
 platform-neutral root-match helper used by the selector. Containment is
 segment-aware, not string-prefix based. Root comparison does not resolve
 symlinks; differently configured symlink roots are distinct logical sources in
-v0.1. An absent or relative environment root is a producer discovery error, not
-a wire-parse error.
+v0.1.
+
+Before selection, a pure XDG-root resolver accepts optional expanded XDG and
+HOME inputs without reading the environment. An absolute XDG input resolves to
+`<XDG_CONFIG_HOME>/harness`. If XDG is absent or relative, it is ignored and an
+absolute HOME resolves to `<HOME>/.config/harness`. Only when neither branch
+produces an absolute root does the resolver return a typed producer-discovery
+error. Focused tests cover both absent and relative XDG fallback plus the
+double-unusable error. The resolver lexically normalizes its absolute output
+before it becomes an XDG candidate for the selector. This resolution is
+producer preparation, not wire parsing.
 
 System locators use `builtin/<namespace>/<stable_path>` for embedded
 components. Runtime and runner locators use
@@ -232,8 +270,20 @@ the producer's cross-scan stable-key provenance.
 Integrity is represented by `Option<Sha256Digest>`, where `Sha256Digest` is a
 validated newtype around the 64-character lowercase hexadecimal wire value.
 The all-zero value is rejected as the missing-integrity sentinel prohibited by
-B-010. This issue validates supplied digests but does not hash content. Digest
-calculation belongs to inventory and snapshot producers.
+B-010. `Sha256Digest::from_bytes` is a pure helper over the existing `sha2`
+dependency and computes lowercase, prefix-free `SHA-256(exact_source_bytes)`.
+For file-backed components, exact source bytes are the raw bytes read from that
+one file. For built-ins, they are the exact embedded payload bytes named by the
+locator. UTF-8 decoding, newline conversion, BOM removal, Unicode
+normalization, frontmatter parsing, and component metadata are never part of
+the digest transform. A logical, structured, generated, or multi-file source
+without a separately versioned canonical byte encoding must use `None`; a
+producer may not invent JSON serialization or file concatenation rules.
+Filesystem I/O remains in later producers. The standard digest of an empty byte
+slice is valid and distinct from missing integrity; only the all-zero sentinel
+is invalid. Core parsing validates the digest value but cannot attest which
+bytes a producer hashed. ASC-002, ASC-003, and ASC-004 must test omission when
+their source lacks canonical bytes and exact-byte hashing when it has them.
 
 Capabilities use the sensitivity vocabulary required by B-007. They are kept
 distinct from `types::Capability`, which describes broad adapter support, and
@@ -243,6 +293,40 @@ Canonical serialization sorts capabilities lexicographically by their exact
 snake_case wire spelling:
 `destructive`, `file_write`, `network`, `privileged`, `production_write`,
 `secret_read`, `shell`.
+
+Freshness describes the observation evidence carried by this component, not
+the component's usage or quality:
+
+| Freshness | Required evidence |
+| --- | --- |
+| `expired` | An authoritative invalidation, or an explicit producer-contract deadline where `observation_time >= valid_until` |
+| `fresh` | The current observation directly read or probed the source and has no explicit expiry evidence |
+| `stale` | The value came from a prior observation or cache that the current observation did not revalidate |
+| `unknown` | No supported expiry, current-observation, or cached-observation fact exists |
+
+`AgentStackFreshnessEvidence` is this public immutable typed input, with private
+fields and a validated constructor:
+
+```rust
+pub struct AgentStackFreshnessEvidence {
+    authoritatively_invalidated: bool,
+    observation_time: Option<chrono::DateTime<chrono::Utc>>,
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    current_source_observed: bool,
+    cached_prior_observation: bool,
+}
+```
+
+Its pure `classify(&self) -> AgentStackFreshness` applies `expired` before
+`fresh` before `stale` before `unknown`; a deadline can expire only when both
+timestamps exist, with equality counting as expired. The current clock alone
+is not evidence and the helper does not read it. The wire parser accepts the
+resulting closed freshness value but does not attest producer evidence
+provenance. The existing
+`harness_skills::FreshnessClass::{Fresh, Active, Dormant, Stale}` describes
+skill usage health and has no automatic mapping to `AgentStackFreshness`;
+ASC-002 must test that boundary without creating a reverse dependency from
+`harness-core`.
 
 ### Validation Invariants
 
@@ -328,14 +412,14 @@ or persistence occurs.
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
 | B-001 | schema constant and version-envelope-first parsing | `cargo test -p harness-core stack::tests::schema_version_is_required_and_exact`; `cargo test -p harness-core stack::tests::unsupported_version_precedes_strict_v01_shape_validation` |
-| B-002 | `AgentStackComponentKind` | `cargo test -p harness-core stack::tests::component_kind_wire_vocabulary_is_closed` |
-| B-003 | source-mapping contract examples, canonical root selection, lossless locator encoding, and component-ID derivation | `cargo test -p harness-core stack::tests::source_mapping_contract_examples_are_canonical`; `cargo test -p harness-core stack::tests::component_identity_is_stable_across_observation_classes`; `cargo test -p harness-core stack::tests::user_global_root_selection_collapses_overlaps_by_precedence`; `cargo test -p harness-core stack::tests::multiple_configured_user_roots_fail_as_ambiguous`; `cargo test -p harness-core stack::tests::wire_parser_is_environment_independent`; `cargo test -p harness-core stack::tests::path_locator_rejects_non_utf8_without_lossy_conversion`; `cargo test -p harness-core stack::tests::portable_segment_encoder_uses_forward_slashes`; `cargo test -p harness-core stack::tests::path_adapter_canonicalizes_curdir_and_rejects_parentdir`; `cargo test -p harness-core stack::tests::windows_drive_letter_casing_is_canonical_equivalent`; `cargo test -p harness-core stack::tests::windows_directory_segment_casing_remains_distinct`; `cargo test -p harness-core stack::tests::logical_path_grammar_covers_system_runtime_and_runner`; `cargo test -p harness-core stack::tests::logical_path_preserves_case_distinct_tool_names` |
+| B-002 | typed component-kind contract | `cargo test -p harness-core stack::tests::component_kind_wire_vocabulary_is_closed`; `cargo test -p harness-core stack::tests::explicit_multi_role_bindings_have_distinct_component_ids` |
+| B-003 | source-mapping contract examples, canonical root selection, lossless locator encoding, and component-ID derivation | `cargo test -p harness-core stack::tests::source_mapping_contract_examples_are_canonical`; `cargo test -p harness-core stack::tests::component_identity_is_stable_across_observation_classes`; `cargo test -p harness-core stack::tests::user_global_root_selection_collapses_overlaps_by_precedence`; `cargo test -p harness-core stack::tests::multiple_configured_user_roots_fail_as_ambiguous`; `cargo test -p harness-core stack::tests::xdg_root_falls_back_to_absolute_home_when_xdg_is_missing_or_relative`; `cargo test -p harness-core stack::tests::xdg_root_fails_when_xdg_and_home_are_unusable`; `cargo test -p harness-core stack::tests::wire_parser_is_environment_independent`; `cargo test -p harness-core stack::tests::path_locator_rejects_non_utf8_without_lossy_conversion`; `cargo test -p harness-core stack::tests::portable_segment_encoder_uses_forward_slashes`; `cargo test -p harness-core stack::tests::path_adapter_canonicalizes_curdir_and_rejects_parentdir`; `cargo test -p harness-core stack::tests::windows_drive_letter_casing_is_canonical_equivalent`; `cargo test -p harness-core stack::tests::windows_directory_segment_casing_remains_distinct`; `cargo test -p harness-core stack::tests::logical_path_grammar_covers_system_runtime_and_runner`; `cargo test -p harness-core stack::tests::logical_path_preserves_case_distinct_tool_names`; `cargo test -p harness-core stack::tests::untyped_custom_discovery_source_fails_closed`; `cargo test -p harness-core stack::tests::runtime_locator_rejects_reserved_segments`; `cargo test -p harness-core stack::tests::portable_path_locator_rejects_nul`; `cargo test -p harness-core stack::tests::source_locator_validation_precedes_component_id_derivation` |
 | B-004 | `AgentStackObservationClass` | `cargo test -p harness-core stack::tests::observation_class_round_trips_without_implied_trust` |
 | B-005 | observation/selection validation matrix | `cargo test -p harness-core stack::tests::selection_state_requires_supporting_observation` |
-| B-006 | `Sha256Digest` newtype | `cargo test -p harness-core stack::tests::sha256_digest_rejects_blank_malformed_and_mixed_case_values` |
+| B-006 | `Sha256Digest` newtype and exact-byte helper | `cargo test -p harness-core stack::tests::sha256_digest_rejects_blank_malformed_and_mixed_case_values`; `cargo test -p harness-core stack::tests::sha256_digest_hashes_exact_source_bytes`; `cargo test -p harness-core stack::tests::sha256_digest_distinguishes_lf_crlf_bom_and_unicode_bytes`; `cargo test -p harness-core stack::tests::empty_content_digest_is_distinct_from_missing_integrity` |
 | B-007 | `AgentStackCapability` | `cargo test -p harness-core stack::tests::capability_wire_vocabulary_is_closed` |
 | B-008 | observation/trust validation matrix | `cargo test -p harness-core stack::tests::trust_cannot_exceed_observation_source` |
-| B-009 | `AgentStackFreshness` | `cargo test -p harness-core stack::tests::missing_freshness_is_explicitly_unknown` |
+| B-009 | `AgentStackFreshnessEvidence` decision contract | `cargo test -p harness-core stack::tests::missing_freshness_is_explicitly_unknown`; `cargo test -p harness-core stack::tests::freshness_evidence_mapping_is_deterministic`; `cargo test -p harness-core stack::tests::freshness_deadline_is_expired_at_exact_boundary`; `cargo test -p harness-core stack::tests::explicit_expiry_precedes_current_and_cached_evidence`; `cargo test -p harness-core stack::tests::cached_without_current_observation_is_stale` |
 | B-010 | constructors, reserved locator rejection, and optional-field validation | `cargo test -p harness-core stack::tests::source_locator_rejects_reserved_sentinels`; `cargo test -p harness-core stack::tests::missing_optional_facts_are_not_fabricated` |
 | B-011 | serde attributes, canonical capability order, and round-trip table | `cargo test -p harness-core stack::tests::all_component_values_round_trip_in_canonical_wire_order` |
 | B-012 | manifest scope and existing core tests | `git diff --name-only origin/main...HEAD`; `cargo test -p harness-core` |
@@ -374,14 +458,23 @@ or persistence occurs.
       every kind.
 - [ ] Add exhaustive observation × selection and observation × trust tables.
 - [ ] Add schema-valid negative fixtures for unknown fields and aliases.
+- [ ] Prove the closed component-kind vocabulary and that explicit multi-role
+      bindings produce distinct component IDs. Record typed-role and
+      untyped/ambiguous classification tests as mandatory producer handoffs.
 - [ ] Add digest, canonical identity, drive-prefixed and traversal locator,
       NUL locator, reserved-sentinel locator, runtime/runner UUID and
       display-label locator, duplicate and canonically ordered capability, and
       explicit-null integrity tests.
+- [ ] Prove exact-byte SHA-256 distinguishes LF, CRLF, BOM, and Unicode byte
+      encodings and accepts the standard empty-content digest. Record
+      canonical-byte availability and omission tests as mandatory producer
+      handoffs.
 - [ ] Prove user-global producers using the same root namespace derive the same
       locator, reject unknown root namespaces, and collapse equal or overlapping
       XDG/platform roots by the fixed precedence.
 - [ ] Prove multiple equal or nested configured-user roots fail as ambiguous.
+- [ ] Prove absent or relative XDG falls back to absolute HOME and that the pure
+      resolver returns a typed error only when both roots are unusable.
 - [ ] Prove system, runtime, and runner logical-path grammar in one
       table-driven suite, including system's fixed `builtin/` prefix and
       per-segment UUID, sentinel, and display-label rejection.
@@ -399,6 +492,8 @@ or persistence occurs.
       casing canonical-equivalent while preserving directory-segment casing.
 - [ ] Prove stronger runtime/runner observation preserves the original source
       scope, locator, and component ID.
+- [ ] Prove the typed evidence-freshness precedence and exact deadline boundary.
+      Record the skill usage freshness non-mapping test as an ASC-002 handoff.
 - [ ] Prove a future-version fixture with v0.1-unknown fields returns the typed
       unsupported-version error before strict v0.1 shape validation.
 - [ ] Add separate typed assertions for JSON syntax/shape failures and domain

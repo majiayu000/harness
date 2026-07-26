@@ -27,19 +27,34 @@ GH-1730
 - Done when:
   - `harness_core::stack` exposes the schema version and every closed enum
     named by the product spec.
-  - Public validated component ID, source locator, digest, component, and parse
-    error types expose read-only accessors without public invariant mutation.
+  - Public validated component ID, source locator, digest, freshness evidence,
+    component, and parse error types expose read-only accessors without public
+    invariant mutation.
   - Serde uses the exact snake_case wire spellings and rejects unknown enum
     values without aliases or catch-all variants.
+  - The closed component-kind enum participates in component ID derivation, so
+    explicit multi-role bindings produce distinct IDs without a core artifact
+    classifier.
   - Observation, selection, trust, and freshness combinations fail closed
     according to the product invariants.
   - Observation-to-trust validation uses the complete matrix from B-008 rather
     than inferring an implementation-specific observer relationship.
+  - The pure typed freshness-evidence helper uses
+    expiry/current/cached/no-evidence precedence without reading the clock, and
+    treats `observation_time == valid_until` as expired.
 - Verify:
   - `cargo check -p harness-core --all-targets`
   - `cargo test -p harness-core stack::tests::component_kind_wire_vocabulary_is_closed`
+  - `cargo test -p harness-core stack::tests::explicit_multi_role_bindings_have_distinct_component_ids`
+  - `cargo test -p harness-core stack::tests::observation_class_round_trips_without_implied_trust`
   - `cargo test -p harness-core stack::tests::selection_state_requires_supporting_observation`
   - `cargo test -p harness-core stack::tests::trust_cannot_exceed_observation_source`
+  - `cargo test -p harness-core stack::tests::capability_wire_vocabulary_is_closed`
+  - `cargo test -p harness-core stack::tests::missing_freshness_is_explicitly_unknown`
+  - `cargo test -p harness-core stack::tests::freshness_evidence_mapping_is_deterministic`
+  - `cargo test -p harness-core stack::tests::freshness_deadline_is_expired_at_exact_boundary`
+  - `cargo test -p harness-core stack::tests::explicit_expiry_precedes_current_and_cached_evidence`
+  - `cargo test -p harness-core stack::tests::cached_without_current_observation_is_stale`
 
 ### SP1730-T2 — Implement canonical source identity, integrity, and typed parsing
 
@@ -58,6 +73,10 @@ GH-1730
     `home_harness`, `xdg_config_harness`, `platform_config_harness`,
     `configured_user`; more than one configured-user candidate fails as
     ambiguous.
+  - A pure resolver uses absolute XDG when available, otherwise falls back from
+    absent or relative XDG to absolute HOME, and returns a typed discovery error
+    only when neither root is usable. Its lexically normalized output becomes
+    the XDG candidate passed to the selector.
   - Filesystem-derived locators reject non-UTF-8, absolute, drive-prefixed,
     backslash, NUL, empty, and traversal inputs without filesystem access or
     lossy conversion. Redundant `.` canonicalizes away; `..` fails.
@@ -77,8 +96,10 @@ GH-1730
     filesystem; producer constructors own environment/root applicability.
   - Source locators are validated before their canonical component IDs are
     derived and compared.
-  - Integrity accepts only non-zero lowercase SHA-256 values; omission remains
-    distinct from explicit JSON `null`.
+  - Integrity accepts only non-zero lowercase SHA-256 values and hashes exact
+    raw file or embedded payload bytes without implicit canonicalization.
+    Standard empty-content SHA-256 remains distinct from omission and explicit
+    JSON `null`; core parsing does not attest producer byte provenance.
   - The public JSON entry point distinguishes syntax/shape failures from typed
     invariant failures without an untyped public escape hatch, and checks a
     minimal version envelope before strict v0.1 shape decoding.
@@ -87,6 +108,8 @@ GH-1730
   - `cargo test -p harness-core stack::tests::component_identity_is_stable_across_observation_classes`
   - `cargo test -p harness-core stack::tests::user_global_root_selection_collapses_overlaps_by_precedence`
   - `cargo test -p harness-core stack::tests::multiple_configured_user_roots_fail_as_ambiguous`
+  - `cargo test -p harness-core stack::tests::xdg_root_falls_back_to_absolute_home_when_xdg_is_missing_or_relative`
+  - `cargo test -p harness-core stack::tests::xdg_root_fails_when_xdg_and_home_are_unusable`
   - `cargo test -p harness-core stack::tests::wire_parser_is_environment_independent`
   - `cargo test -p harness-core stack::tests::path_locator_rejects_non_utf8_without_lossy_conversion`
   - `cargo test -p harness-core stack::tests::portable_segment_encoder_uses_forward_slashes`
@@ -102,6 +125,9 @@ GH-1730
   - `cargo test -p harness-core stack::tests::source_locator_validation_precedes_component_id_derivation`
   - `cargo test -p harness-core stack::tests::unsupported_version_precedes_strict_v01_shape_validation`
   - `cargo test -p harness-core stack::tests::sha256_digest_rejects_blank_malformed_and_mixed_case_values`
+  - `cargo test -p harness-core stack::tests::sha256_digest_hashes_exact_source_bytes`
+  - `cargo test -p harness-core stack::tests::sha256_digest_distinguishes_lf_crlf_bom_and_unicode_bytes`
+  - `cargo test -p harness-core stack::tests::empty_content_digest_is_distinct_from_missing_integrity`
   - `cargo test -p harness-core stack::tests::missing_optional_facts_are_not_fabricated`
 
 ### SP1730-T3 — Canonicalize component serialization
@@ -133,10 +159,15 @@ GH-1730
     illegal observation/selection/trust cross-product.
   - Exact-shape fixtures prove canonical identity, capability ordering,
     optional-integrity behavior, and unknown-field rejection.
+  - Kind fixtures cover the closed vocabulary and explicit multi-role identity
+    separation without a test-only artifact classifier.
   - Source contract fixtures cover repository, user, admin, system, runtime,
     and runner examples plus overlapping-root, non-UTF-8, portable-segment,
-    path-adapter, Windows root-casing, logical-identity casing, and
-    observation-stability cases.
+    path-adapter, Windows root-casing, XDG fallback, logical-identity casing,
+    and observation-stability cases.
+  - Digest fixtures distinguish exact byte encodings and optional-field
+    behavior; freshness fixtures exercise the production typed evidence helper
+    and exact deadline boundary.
   - Negative fixtures separately prove JSON syntax/shape failures and typed
     domain validation failures.
 - Verify:
@@ -167,6 +198,20 @@ GH-1730
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `python3 checks/check_workflow.py --repo .`
   - `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1730`
+
+## Producer Handoff Requirements
+
+These checks are mandatory in the linked producer issues, not executable
+GH1730 `harness-core` tests:
+
+- ASC-002, ASC-003, and ASC-004 must prove typed role-to-kind mapping and
+  fail-closed handling for untyped or ambiguous discovery on their actual
+  registration surfaces.
+- Each producer must omit integrity when its source has no versioned canonical
+  byte encoding and hash exact source bytes when one exists.
+- ASC-002 must prove `harness_skills::FreshnessClass` does not determine
+  `AgentStackFreshness`; this stays in `harness-skills` to avoid a crate
+  dependency cycle.
 
 ## Parallelization
 
