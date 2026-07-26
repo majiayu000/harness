@@ -60,10 +60,13 @@ does not prove it was selected or loaded for a runtime activity.
    zero-based order, observation class, selection state, and trust level using
    the ASC-001 model.
 4. **B-004:** Runtime provenance records runtime kind, profile name, execution
-   phase, effective max-turns and timeout, plus final model, reasoning effort,
-   sandbox, and approval policy after their profile/workflow/server fallbacks.
-   This includes Claude's phase-sensitive model and effort selection when the
-   profile omits explicit values. The final launch settings are computed once
+   phase, effective max-turns, timeout, and stall timeout, plus final model,
+   reasoning effort, sandbox, and approval policy after their
+   profile/workflow/server fallbacks. This includes Claude's phase-sensitive
+   model and effort selection when the profile omits explicit values. A setting
+   whose effective value is resolved outside Harness — such as a Codex approval
+   policy the profile omits — is recorded as explicitly unobserved rather than
+   given a fabricated final value. The final launch settings are computed once
    before packet construction and shared by packet construction and agent
    launch. The source is runtime-scoped, observation and trust are
    `runtime_observed`, selection state is `loaded`, and changing any recorded
@@ -113,6 +116,9 @@ does not prove it was selected or loaded for a runtime activity.
     profile selection, activity policy, activity-result status, and workflow
     state transitions remain unchanged. The intentional wire change is the
     prompt-packet schema bump from v1 to v2 plus redacted provenance metadata.
+    Audit-only packet fields are stripped from the model-facing prompt
+    rendering, so the agent-visible prompt bytes for unchanged inputs are
+    identical to the v1 rendering.
 
 ## Acceptance Criteria
 

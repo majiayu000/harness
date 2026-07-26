@@ -86,12 +86,17 @@ external consumer contract.
 
 Add private `ResolvedRuntimeSettings` in `runtime_profile.rs`. One resolver
 accepts the already timeout-adjusted `RuntimeProfile`, `RuntimeKind`, derived
-`ExecutionPhase`, and complete server agent configuration and returns the final
-profile name, kind, execution phase, model, reasoning effort, sandbox, approval
-policy, max-turns, and timeout. `executor.rs` derives activity and execution
-phase before packet construction, creates this value once, passes it to
-packet/provenance construction, and uses the same launch fields for
-`TurnLifecycleOptions` and agent request construction.
+`ExecutionPhase`, and complete server agent and concurrency configuration and
+returns the final profile name, kind, execution phase, model, reasoning effort,
+sandbox, approval policy, max-turns, timeout, and effective stall timeout.
+`executor.rs` derives activity and execution phase before packet construction,
+creates this value once, passes it to packet/provenance construction, and uses
+the same launch fields for `TurnLifecycleOptions` and agent request
+construction. The resolver normalizes
+`server.config.concurrency.stall_timeout_secs` into the resolved value, and the
+executor passes that resolved stall timeout explicitly through
+`TurnLifecycleOptions.stall_timeout_secs`, so the lifecycle no longer re-reads
+server configuration after `RuntimePromptPrepared` is recorded.
 `max_turns` is copied from the effective profile already enforced by the
 workflow runtime; it is evidence, not a second enforcement point. Existing
 validation helpers become implementation details of this single resolver.
@@ -107,6 +112,16 @@ API records no unsupported effort value. Passing the resolved model and effort
 explicitly to `TurnLifecycleOptions` makes the existing agent implementations
 take those values before any internal default or phase fallback, so provenance
 and launch cannot diverge.
+
+Approval policy is truthful, not guessed. When the profile supplies
+`approval_policy`, the resolver records it and the executor passes it
+explicitly to launch. When a Codex profile omits it, `CodexAgent::base_args`
+emits no override and the Codex CLI resolves the effective policy from its own
+independently loaded configuration, so no server-side final value exists;
+the resolved settings then record the approval policy as explicitly unset
+(`None` serialized as a distinct `unobserved` marker, never a fabricated
+default), and the `agent_cli_context_not_observed` coverage marker documents
+that the effective policy lives outside Harness observation.
 
 The packet retains the declared/effective `runtime_profile` section for
 compatibility and adds `resolved_runtime_settings`. Provenance hashes canonical
@@ -188,6 +203,10 @@ Workflow sources and effective document:
   by `WorkflowDocument`;
 - source digests cover exact bytes read, while the effective-document digest
   covers canonical JSON containing merged `config` and `prompt_template`;
+- the defaults entry digest covers the same canonical JSON shape as the
+  effective document — normalized default `WorkflowConfig` plus the empty
+  prompt template — so conforming producers emit identical defaults digests
+  and any change to behavior-affecting defaults changes this digest;
 - central absolute paths are represented only by a runtime-scoped path digest;
 - the repository source uses the normalized `WORKFLOW.md` locator;
 - reasons distinguish `workflow_base_selected`,
@@ -232,6 +251,15 @@ task text. Do not place raw task text in the packet or provenance. The existing
 `build_runtime_job_prompt` appends that same text after packet rendering, so
 prompt semantics remain unchanged while the recorded packet digest becomes
 sensitive to the text actually executed.
+
+Audit metadata never reaches the model. `build_runtime_job_prompt` already
+renders a clone of the packet with `workflow_file.prompt_template` removed;
+extend that same model-facing clone to also strip the audit-only
+`context_provenance`, `resolved_runtime_settings`, and `prompt_task_request`
+sections before rendering. The durable packet persisted in
+`RuntimePromptPrepared` keeps all of these fields; only the model-facing
+rendering excludes them, so the agent-visible prompt bytes for unchanged
+inputs are identical to today's v1 rendering and B-014 holds.
 
 Add closed coverage markers for:
 
@@ -350,6 +378,15 @@ event and agent execution.
 - [ ] Add same-reference/different-prompt-text packet digest fixtures.
 - [ ] Add packet v1 historical compatibility, v2 required provenance, repo
       memory `self_declared` trust, and zero-timeout rejection fixtures.
+- [ ] Add a Codex omitted-approval-policy fixture asserting the resolved
+      settings record an explicit unobserved marker, not a fabricated default.
+- [ ] Add a resolved stall-timeout fixture asserting the same normalized value
+      appears in provenance and `TurnLifecycleOptions`.
+- [ ] Add a defaults-entry digest fixture asserting two independent builds emit
+      identical digests over the normalized default `WorkflowConfig`.
+- [ ] Add a model-facing prompt assertion proving `context_provenance`,
+      `resolved_runtime_settings`, and `prompt_task_request` are absent from
+      the rendered agent prompt while present in the durable packet.
 - [ ] Update the runtime-worker integration assertion to v2 and assert the
       activity artifact carries the same schema constant and packet digest.
 - [ ] Add redaction and external-context coverage assertions.
