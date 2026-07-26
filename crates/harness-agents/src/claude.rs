@@ -48,6 +48,16 @@ impl ClaudeCodeAgent {
         }
     }
 
+    /// Compatibility no-op retained for callers that previously enabled the
+    /// removed session-persistence probe.
+    #[deprecated(
+        since = "0.6.34",
+        note = "session persistence is always enabled; this no-op is scheduled for removal in 0.7"
+    )]
+    pub fn with_no_session_persistence_probe(self) -> Self {
+        self
+    }
+
     /// Attach a ReasoningBudget for per-phase model selection.
     pub fn with_reasoning_budget(mut self, budget: ReasoningBudget) -> Self {
         self.reasoning_budget = Some(budget);
@@ -511,3 +521,23 @@ mod tests;
 #[cfg(test)]
 #[path = "claude_prompt_layer_tests.rs"]
 mod prompt_layer_tests;
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    #[allow(deprecated)]
+    fn no_session_persistence_probe_builder_remains_chainable() {
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        )
+        .with_no_session_persistence_probe();
+
+        assert_eq!(agent.cli_path, PathBuf::from("claude"));
+        assert_eq!(agent.default_model, "test-model");
+        assert_eq!(agent.sandbox_mode, SandboxMode::DangerFullAccess);
+    }
+}
