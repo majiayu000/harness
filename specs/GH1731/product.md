@@ -4,7 +4,7 @@
 
 GH-1731
 
-complexity: medium
+complexity: high
 
 ## User Problem
 
@@ -49,13 +49,14 @@ repository root, not that an agent selected, loaded, or executed it.
    unless a later contract explicitly adds a separately labeled scope.
 3. **B-003:** The v0.1 allowlist discovers root instruction files
    `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `WORKFLOW.md`, and
-   `MEMORY.md`; skill roots `.claude/skills`, `.codex/skills`,
-   `.agents/skills`, and `skills`; hook roots `.claude/hooks`, `hooks`, and
-   `.githooks`; MCP files `.mcp.json` and `mcp.json`; policy/validation roots
-   `.vibeguard`, `rules`, `requirements.toml`, `.remem`, `remem.toml`,
-   `.harness`, `harness.toml`, `.github/workflows`, and `.cursor/rules`; and
-   toolchain files `Cargo.toml`, `package.json`, `pyproject.toml`, `Makefile`,
-   and `justfile`.
+   `MEMORY.md`; the instruction files `AGENTS.md`, `AGENTS.override.md`, and
+   `CLAUDE.md` immediately beneath `src`, `crates`, `lib`, and `pkg`; skill
+   roots `.claude/skills`, `.codex/skills`, `.agents/skills`, and `skills`;
+   hook roots `.claude/hooks`, `hooks`, and `.githooks`; MCP files `.mcp.json`
+   and `mcp.json`; policy/validation roots `.vibeguard`, `rules`,
+   `requirements.toml`, `.remem`, `remem.toml`, `.harness`, `harness.toml`,
+   `.github/workflows`, and `.cursor/rules`; and toolchain files `Cargo.toml`,
+   `package.json`, `pyproject.toml`, `Makefile`, and `justfile`.
 4. **B-004:** A missing allowlisted file or directory means no component for
    that location. Harness does not emit placeholder components, fabricated
    digests, aliases, or warning-only fallback content.
@@ -69,18 +70,22 @@ repository root, not that an agent selected, loaded, or executed it.
 7. **B-007:** Discovery order and output order are deterministic: allowlist
    rule order is stable, directory entries are sorted by normalized relative
    locator, and filesystem enumeration order cannot change output.
-8. **B-008:** Symlinks are never followed outside the canonical repository
-   root. A symlink whose resolved target escapes the root returns an explicit
-   error; a safe in-root symlink is represented by its repository locator and
-   hashes the resolved regular-file content once.
+8. **B-008:** Traversal and file opens are relative to one capability-scoped
+   directory handle, so absolute paths, `..`, symlink swaps, and symlinks whose
+   targets escape the repository cannot grant access outside that handle. An
+   escaping or raced path returns an explicit error; a safe in-root symlink is
+   represented by its repository locator and hashes the opened regular-file
+   content once.
 9. **B-009:** An allowlisted entry that exists but cannot be opened, read,
-   canonicalized, or classified returns an error naming only its safe relative
-   locator and failure category. Harness does not silently omit it and report a
-   complete successful inventory.
-10. **B-010:** Directory traversal is bounded to allowlisted roots, skips
-    non-regular special files, and rejects recursive symlink cycles. Discovery
-    does not read file content beyond the configured per-file byte ceiling;
-    over-limit files fail visibly.
+   resolved, classified, or represented as a lossless UTF-8 portable locator
+   returns an error with a failure category and, when representable, its safe
+   relative locator; a non-UTF-8 name reports only the nearest representable
+   ancestor. Harness does not use lossy path conversion, silently omit the
+   entry, or report a complete successful inventory.
+10. **B-010:** Directory traversal is bounded by configured file-count,
+    aggregate-byte, depth, entries-per-directory, and per-file byte limits.
+    Non-regular special files, recursive symlink cycles, invalid limit values,
+    and every exceeded limit fail visibly rather than being skipped.
 11. **B-011:** Repeating inventory against unchanged repository bytes produces
     the same ordered components and digests regardless of current time or
     filesystem enumeration order.
@@ -96,10 +101,11 @@ repository root, not that an agent selected, loaded, or executed it.
       files are excluded.
 - [ ] Every output validates under the ASC-001 component contract.
 - [ ] Tests prove path normalization, stable ordering, content hashing,
-      missing-entry behavior, root escape rejection, cycles, unreadable files,
-      and size-limit failure.
-- [ ] The service uses standard-library filesystem traversal and existing
-      workspace SHA-256 support; no new dependency is added.
+      missing-entry behavior, root escape and symlink-race rejection, cycles,
+      non-UTF-8 paths, special files, unreadable files, and every resource
+      limit.
+- [ ] Capability-scoped filesystem traversal is introduced as one audited,
+      narrowly owned dependency; existing workspace SHA-256 support is reused.
 - [ ] The implementation exposes a library service for later CLI and runtime
       consumers but adds no new command in this issue.
 
@@ -110,7 +116,7 @@ repository root, not that an agent selected, loaded, or executed it.
 | Empty / missing input | Covered by B-001 and B-004. |
 | Error and failure paths | Covered by B-001, B-008, B-009, and B-010. |
 | Authorization / permission | Covered by B-001, B-002, and B-012; the caller selects one readable root and inventory gains no external authority. |
-| Concurrency / race / ordering | Covered by B-007 and B-011. Inventory is a point-in-time read of a caller-controlled repository. Detected path or metadata changes fail the run; resistance to an adversary concurrently mutating the filesystem requires the isolated runtime-host work in ASC-021 through ASC-024. |
+| Concurrency / race / ordering | Covered by B-007, B-008, and B-011. Handle-relative opens prevent path/symlink races from escaping the root. The scan is non-atomic: in-place writes may change bytes during a read, so callers requiring a stable snapshot must provide a quiescent repository. |
 | Retry / repetition / idempotency | Covered by B-011 and B-012. |
 | Illegal state transitions | N/A. Inventory is a stateless read operation. |
 | Compatibility / migration | Covered by B-003, B-005, and B-012; no existing persisted representation changes. |
