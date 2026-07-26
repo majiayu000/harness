@@ -101,10 +101,11 @@ repository root, not that an agent selected, loaded, or executed it.
    relative locator; a non-UTF-8 name reports only the nearest representable
    ancestor. Harness does not use lossy path conversion, silently omit the
    entry, or report a complete successful inventory.
-10. **B-010:** Directory traversal is bounded by configured file-count,
-    aggregate-byte, depth, entries-per-directory, and per-file byte limits.
-    Non-regular special files, recursive symlink cycles, invalid limit values,
-    and every exceeded limit fail visibly rather than being skipped.
+10. **B-010:** Directory traversal is bounded by configured regular-file,
+    opened-directory, aggregate-encountered-entry, aggregate-byte, depth,
+    entries-per-directory, and per-file byte limits. Non-regular special files,
+    recursive symlink cycles, invalid limit values, and every exceeded limit
+    fail visibly rather than being skipped.
 11. **B-011:** Repeating inventory against unchanged repository bytes,
     executable metadata, and directory-presence predicates produces the same
     ordered entries and digests regardless of current time or filesystem

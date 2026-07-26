@@ -34,6 +34,9 @@ GH-1731
     APIs match `tech.md`, keep invariant-bearing fields private, and expose
     read-only accessors.
   - Invalid limits fail before the repository root is opened.
+  - Options expose exact non-zero regular-file, opened-directory,
+    aggregate-encountered-entry, depth, entries-per-directory, per-file byte,
+    and aggregate-byte limits with the defaults and integer types in `tech.md`.
   - The result contains ordered entries and makes no ambient canonical-root
     claim.
 - Verify:
@@ -73,13 +76,17 @@ GH-1731
   - The caller-supplied root is opened once and all descendant operations stay
     relative to that directory capability.
   - Broken symlinks, escaping targets, non-regular entries, unreadable data,
-    non-UTF-8 locators, cycles, and observed-entry races return typed errors
-    without leaking ambient target paths.
+    non-UTF-8 locators, ancestor cycles, and entries that disappear after
+    `read_dir` return their specified typed error kinds without leaking ambient
+    target paths.
   - A valid in-root symlink swap may select either valid target, and the digest
-    covers exactly the bytes from the opened regular-file handle.
+    covers exactly the bytes from the opened regular-file handle without
+    reporting `entry_raced`.
   - Depth uses the allowlisted directory as depth 0; directory enumeration
-    reads at most the checked N+1 sentinel; regular-file and byte budgets are
-    charged before another read or descent.
+    reads at most the checked N+1 sentinel; every yielded item charges the
+    aggregate encountered-entry budget; each opened directory including the
+    repository root charges the directory budget; regular-file and byte
+    budgets are charged before another read or descent.
   - Traversal performs no repository write, process launch, network operation,
     hook invocation, or MCP connection.
 - Verify:
@@ -102,7 +109,9 @@ GH-1731
     non-recursive `spec` predicate.
   - Negative fixtures cover missing versus broken symlinks, root replacement,
     escaping and in-root symlink swaps, cycles, special files, unreadable
-    files, non-UTF-8 paths, invalid limits, and every exact resource boundary.
+    files, non-UTF-8 paths, post-`read_dir` disappearance, invalid limits, and
+    every exact resource boundary including aggregate entries and opened
+    directories.
   - Unix executable-bit changes alter entry evidence without changing the
     content digest; non-Unix reports executable state as unobserved.
   - A deterministic injected read failure covers platforms where permission

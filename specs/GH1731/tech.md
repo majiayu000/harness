@@ -57,15 +57,19 @@ Add `stack::inventory` with:
 does not expose traversal helpers or mutable rule tables.
 
 `AgentStackInventoryOptions` has private fields and a constructor accepting a
-`PathBuf` root. Its byte limits are `u64`; its file-count, depth, and
-entries-per-directory limits are `usize`. The defaults are 1 MiB per file,
-64 MiB total, 10,000 regular files, depth 32, and 10,000 entries per directory.
-Builder methods return a validated options value. Every limit is non-zero,
-byte limits must permit a checked `+ 1` sentinel, and invalid values fail
-before the root is opened. The allowlisted directory itself is depth 0; each
-descended directory increments depth by one. `max_files` counts regular files,
-while the single non-recursive `spec` directory-presence observation consumes
-no file or byte budget.
+`PathBuf` root. Its byte limits are `u64`; its regular-file, opened-directory,
+aggregate-encountered-entry, depth, and entries-per-directory limits are
+`usize`. The defaults are 1 MiB per file, 64 MiB total, 10,000 regular files,
+1,000 opened directories, 50,000 aggregate encountered entries, depth 32, and
+10,000 entries per directory. Builder methods return a validated options
+value. Every limit is non-zero, byte and entry limits must permit a checked
+`+ 1` sentinel, and invalid values fail before the root is opened. The opened
+repository root counts as directory 1 and is depth 0; each recursively opened
+directory increments the directory budget and depth. Every item yielded by
+`read_dir` increments `max_total_entries` before classification, including
+entries later rejected or excluded. `max_files` counts regular files, while the
+single non-recursive `spec` directory-presence observation consumes no file,
+directory, encountered-entry, or byte budget.
 
 `AgentStackInventory` has one private ordered entry vector and exposes it as a
 slice. It does not expose an ambient or canonical root path:
@@ -79,9 +83,15 @@ fact.
 optional sanitized repository-relative locator. The closed initial categories
 are `invalid_options`, `root_open`, `entry_metadata`, `broken_symlink`,
 `root_escape`, `non_regular_entry`, `non_utf8_locator`, `read_failed`,
-`limit_exceeded`, and `component_validation`. Error evidence never serializes
-file bytes, ambient target paths, or arbitrary OS error strings. This issue
-does not add an aggregate digest or snapshot identity.
+`entry_raced`, `cycle_detected`, `limit_exceeded`, and
+`component_validation`. `entry_raced` means an entry already returned by
+`read_dir` disappeared or could no longer be opened/represented under the
+observed locator; a symlink swapped to another valid in-root regular file is
+not an error and follows B-008. `cycle_detected` is used only when an opened
+directory identity is already present in the active ancestor stack. Error
+evidence never serializes file bytes, ambient target paths, or arbitrary OS
+error strings. This issue does not add an aggregate digest or snapshot
+identity.
 
 ### Closed Discovery Table
 
@@ -150,11 +160,13 @@ configuration error. For each rule:
    other metadata or path-resolution failure;
 4. visit directories through capability-relative handles, collect at most
    `max_entries_per_directory + 1` entries with checked arithmetic, fail on the
-   sentinel entry, then normalize losslessly and sort before recursion;
+   sentinel entry, charge each yielded entry to `max_total_entries` before
+   classification, then normalize losslessly and sort before recursion;
 5. track opened directory identities in the active ancestor stack to reject
-   cycles while permitting non-cyclic duplicate paths to the same directory;
-6. increment checked depth and file-count budgets before descending or reading
-   and fail before a configured limit can be exceeded;
+   cycles as `cycle_detected` while permitting non-cyclic duplicate paths to
+   the same directory;
+6. increment checked depth, opened-directory, and file-count budgets before
+   descending or reading and fail before a configured limit can be exceeded;
 7. reject sockets, FIFOs, devices, and every other non-regular special entry;
 8. open each file through its containing directory capability and validate
    regular-file metadata from the opened handle, which becomes the authority
@@ -169,9 +181,11 @@ configuration error. For each rule:
 Safe in-root symlinks retain their link locator as component identity while
 hashing target bytes. If a symlink changes between two valid in-root regular
 files, the scan may observe either opened target; it does not claim to detect
-that swap. Duplicate target content may therefore produce multiple components
-with distinct repository locators, which accurately reflects multiple declared
-stack entry points.
+that swap and does not emit `entry_raced`. If an entry already yielded by
+`read_dir` disappears or cannot be opened under its observed locator, the scan
+returns `entry_raced`. Duplicate target content may therefore produce multiple
+components with distinct repository locators, which accurately reflects
+multiple declared stack entry points.
 
 Errors carry a stable category and sanitized repository-relative locator.
 They do not include file bytes, resolved out-of-root locations, or arbitrary OS
@@ -251,7 +265,7 @@ occurs.
 | B-007 | sorted traversal/output | `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory` |
 | B-008 | capability-relative traversal/open and opened-handle observation | `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target` |
 | B-009 | typed read/path errors | `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators` |
-| B-010 | checked streaming aggregate/per-entry limits | `cargo test -p harness-core stack::inventory_tests::reads_never_exceed_remaining_aggregate_or_per_file_budget` |
+| B-010 | checked file/directory/entry/depth/byte limits | `cargo test -p harness-core stack::inventory_tests::every_traversal_limit_has_an_exact_boundary_fixture` |
 | B-011 | repeated full-entry fixture comparison | `cargo test -p harness-core stack::inventory_tests::unchanged_repository_inventory_is_repeatable` |
 | B-012 | read-only API surface and side-effect fixture | `cargo test -p harness-core stack::inventory_tests::inventory_is_read_only_and_invokes_no_external_behavior`; `rg -n "Command::new|TcpStream|UdpSocket|reqwest|std::fs::(write|remove|rename|create_dir)" crates/harness-core/src/stack/inventory.rs` (expect no matches); `cargo test -p harness-core agents_md` |
 
@@ -291,8 +305,9 @@ occurs.
       test-directory selector consumed by `lang_detect.rs`.
 - [ ] Add missing, unrelated, nested ordering, in-root symlink, escaping
       symlink, root-swap, symlink-race, cycle, special-file, non-UTF-8,
-      per-file, remaining-aggregate-byte, file-count, depth,
-      entries-per-directory, overflow, and read-failure fixtures.
+      per-file, remaining-aggregate-byte, file-count, opened-directory,
+      aggregate-encountered-entry, depth, entries-per-directory, overflow, and
+      read-failure fixtures.
 - [ ] Add Unix executable-bit change and non-Unix unobserved-mode fixtures, plus
       a non-recursive root `spec` directory-presence fixture.
 - [ ] Validate every emitted component with the ASC-001 API.
