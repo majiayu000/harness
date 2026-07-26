@@ -66,7 +66,10 @@ quality, GC) inherits unverified state.
    claim is recorded for the issue.
 7. **B-007:** A prompt task reaches `done` only when its result carries a
    `validation_report` artifact (command list and exit codes) or an explicit
-   structured `no_change_rationale`. Otherwise the decision is blocked with
+   structured `no_change_rationale`. When either is present, the server
+   records a single `prompt_completion_evidence` evidence entry naming which
+   alternative satisfied it, and the `implementing → done` transition
+   requires that evidence kind. Otherwise the decision is blocked with
    reason `prompt_completion_evidence_missing`.
 8. **B-008:** Prompt-task continuation semantics (external-state signals,
    attempt budgets, scope-too-large) are unchanged; only the terminal step
@@ -86,7 +89,7 @@ quality, GC) inherits unverified state.
 | --- | --- | --- |
 | `github_issue_pr` | `implementing → pr_open` | `verified_pr_binding` |
 | `github_issue_pr` | any non-reconciliation `→ done` | `github_pr` + `server_pr_snapshot` |
-| `prompt_task` | `implementing → done` | `validation_report` or `no_change_rationale` |
+| `prompt_task` | `implementing → done` | `prompt_completion_evidence` (umbrella kind) |
 | `quality_gate` | `checking → passed` | `server_validation_digest` |
 | `pr_feedback` | `inspecting → ready_to_merge` | `server_pr_snapshot` |
 

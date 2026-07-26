@@ -32,25 +32,25 @@ survives this boundary.
 
 `crates/harness-server/src/workflow_runtime_worker/activity_result.rs`
 counts assistant messages, tool invocations, and structured result blocks
-(`agent_activity_summary`, line 431; `is_zero_output`, line 424). A turn that
-completes with no observable work is classified as
-`ActivityResultEnvelopeOutcome::ZeroOutputSpawnFailure` (line 232, consumed at
-line 356), logged at error level, and surfaced as an
-`AgentZeroOutputSpawnFailure` signal (line 254). An exit-0 no-op spawn cannot
-become `succeeded`. This closed the worst historical false-done class
+(`agent_activity_summary` / `is_zero_output`). A turn that completes with no
+observable work is classified as
+`ActivityResultEnvelopeOutcome::ZeroOutputSpawnFailure`, logged at error
+level, and surfaced as an `AgentZeroOutputSpawnFailure` signal. An exit-0
+no-op spawn cannot become `succeeded`. This closed the worst historical
+false-done class
 (zero-output spawns counted as done during the 2026-07 retry storms).
 
 ### 1.2 Structured result required, fail-closed
 
 A `Completed` turn without a fenced `harness-activity-result` JSON block is
-`MissingStructuredOutput` (line 215) and maps to a failed activity, explicitly
+`MissingStructuredOutput` and maps to a failed activity, explicitly
 to prevent silent state-machine no-progress loops. Invalid JSON or a
 mismatched activity name also fails.
 
 ### 1.3 Self-contradiction downgrade
 
 `workflow_runtime_worker/activity_status_contract.rs::enforce_activity_status_contract`
-(line 4) rewrites `succeeded` to `blocked` when the agent's own payload
+rewrites `succeeded` to `blocked` when the agent's own payload
 reports blockers: blocking signals (`ChangesRequested`, `ChecksFailed`,
 `QualityFailed`, …), structured fields (`failing_checks`,
 `unresolved_review_threads`, adverse `merge_state_status`), or textual
@@ -68,19 +68,18 @@ harness never calls the GitHub review-approval API.
 
 ### 1.5 Piecemeal reducer contract checks
 
-`pr_feedback_completion.rs::pr_feedback_success_contract_error` (line 62)
+`pr_feedback_completion.rs::pr_feedback_success_contract_error`
 rejects an `address_pr_feedback` success that lacks a `pr_repair_snapshot`
 proving pushed changes, review-thread action, or an explicit no-code-change
-reason plus validation (line 71-78). This is the model the rest of the system
+reason plus validation. This is the model the rest of the system
 should follow — but it is hand-built for one activity, not a general
 mechanism.
 
 ### 1.6 Terminal-evidence validation for hidden transitions
 
 `runtime/validator_github_issue_pr.rs::validate_reconciliation_only_done`
-(line 58) restricts hidden `→ done` transitions to the `reconciliation` actor
-and requires `pr_number` plus `github_pr`/`github_issue` evidence (lines
-62-97). Reconciliation itself maps real GitHub facts (`PrMerged`,
+restricts hidden `→ done` transitions to the `reconciliation` actor
+and requires `pr_number` plus `github_pr`/`github_issue` evidence. Reconciliation itself maps real GitHub facts (`PrMerged`,
 `IssueCompleted`) to terminal states independently of any agent claim.
 
 ## 2. The false-done risks
@@ -89,8 +88,7 @@ and requires `pr_number` plus `github_pr`/`github_issue` evidence (lines
 
 `crates/harness-workflow/src/runtime/reducer/prompt_task_completion.rs`:
 with no continuation policy configured, a `succeeded` `implement_prompt`
-activity immediately produces `single_shot_done_decision` (call at line 30,
-definition at line 166) — a `MarkDone` command with only
+activity immediately produces `single_shot_done_decision` — a `MarkDone` command with only
 `runtime_completion_evidence` (a record *of the agent's result*, not an
 independent fact). The activity contract for `implement_prompt` nominally
 requires `validation_evidence`
@@ -118,8 +116,8 @@ There is no server-side re-execution of any claimed validation for
 ### Risk C — `BindPr` trusts an agent artifact at bind time
 
 `runtime/reducer/github_issue_completion.rs::bind_pr_from_activity_result`
-(line 177) reads `pr_number`/`pr_url` straight from the agent artifact via
-`pull_request_artifact(result)` (line 193) and issues
+reads `pr_number`/`pr_url` straight from the agent artifact via
+`pull_request_artifact(result)` and issues
 `WorkflowCommand::bind_pr`. No GraphQL existence check, no verification that
 the PR head belongs to the workflow's branch, no repo match. A fabricated or
 mistyped PR number moves the workflow to `pr_open`, and server verification
@@ -128,24 +126,33 @@ dashboards, and coverage accounting operate on an unverified binding.
 
 ### Risk D — `required_evidence` is empty for every built-in workflow
 
-`runtime/validator.rs` defines `TransitionRule::required_evidence` (line 24),
-but both rule constructors default it to empty (lines 39, 53), and all four
-built-in allowlists (`github_issue_pr_defaults` line 119,
-`quality_gate_defaults` line 275, `pr_feedback_defaults` line 293,
-`prompt_task_defaults` line 312) build rules exclusively via `.allow(...)`.
+`runtime/validator.rs` defines `TransitionRule::required_evidence`, but both
+rule constructors default it to empty, and all four built-in allowlists
+(`github_issue_pr_defaults`, `quality_gate_defaults`, `pr_feedback_defaults`,
+`prompt_task_defaults`) build rules exclusively via `.allow(...)`.
 `implementing → done` is an allowed transition gated on nothing but the
-command being `MarkDone` (lines 211 and 334). The only population site is
-`declarative.rs:526` (YAML policy files) and the only enforcement site is
-`store/runtime_completion.rs:169`
-(`declarative_decision_missing_required_evidence`, line 219) — so the evidence
-machinery protects optional declarative workflows while the shipped
-workflows that do all the real work run without it. The machinery's presence
-gives false assurance in audits.
+command being `MarkDone`.
+
+Importantly, the *enforcement* path is already general: every decision
+transition passes through
+`validator_progress::validate_declarative_transition_metadata` (called from
+`DecisionValidator::validate_decision` in `validator.rs`), which rejects a
+decision missing any kind in the rule's `required_evidence` set — regardless
+of whether the definition is built-in or declarative. (The similarly named
+`declarative_decision_missing_required_evidence` in
+`store/runtime_completion.rs` is an additional declarative-only pre-check,
+not the enforcement site.) The gap is therefore purely one of population:
+the only site that ever fills `required_evidence` is `declarative.rs:526`
+(YAML policy files). The shipped workflows that do all the real work run
+with empty sets, so the machinery protects optional declarative workflows
+while giving false assurance about the built-ins. One nuance to preserve:
+the check deliberately exempts same-state `retry_failed_runtime_activity`
+decisions, so evidence requirements bind terminal transitions, not retries.
 
 ### Risk E — quality gate is an LLM reporting on itself
 
 `runtime/quality_gate.rs` (62 lines) only *builds the decision* to enqueue a
-`run_quality_gate` activity carrying `validation_commands` (line 20, 49). The
+`run_quality_gate` activity carrying `validation_commands`. The
 activity is executed by an agent under the output contract
 `quality_gate_status_signal_and_validation_evidence`
 (`activity_contract.rs:153-155`) — i.e. the "independent" gate is another LLM
@@ -157,7 +164,7 @@ this agent-executed gate.)
 
 ### Risk F — advisory quality grading scores a do-nothing window as 100/A
 
-`crates/harness-observe/src/quality.rs::grade` (line 26): with zero events,
+`crates/harness-observe/src/quality.rs::grade`: with zero events,
 `total = events.len().max(1)`, so security/stability/coverage/performance all
 compute to 100 and the weighted grade is A. Mitigated by being advisory (it
 only tunes GC trigger frequency), but it is a misleading surface on
@@ -168,20 +175,28 @@ the bias.
 
 ### R1 — Populate `required_evidence` on built-in critical transitions
 
-Pure wiring of existing machinery. Define evidence classes and attach them to
+Because enforcement is already live in the shared validation path (Risk D),
+populating the sets in the built-in default constructors activates it
+directly — no enforcement-path changes are needed. The remaining work beyond
+population is defining the evidence-kind constants, building the producers
+that mint them server-side (R2–R4), and tests. Attach evidence classes to
 the transitions that mint user-visible facts:
 
 | Workflow | Transition | Required evidence class |
 | --- | --- | --- |
 | `github_issue_pr` | `* → done` (non-reconciliation) | `github_pr` (verified PR identity) + `server_pr_snapshot` |
 | `github_issue_pr` | `implementing → pr_open` | `verified_pr_binding` (see R3) |
-| `prompt_task` | `implementing → done` | `validation_report` or `no_change_rationale` |
+| `prompt_task` | `implementing → done` | `prompt_completion_evidence` (umbrella kind, see R4) |
 | `quality_gate` | `checking → passed` | `server_validation_digest` (see R2) |
 | `pr_feedback` | `inspecting → ready_to_merge` | `server_pr_snapshot` (already produced; make it structurally required) |
 
-Enforcement generalizes `declarative_decision_missing_required_evidence` from
-declarative-only to all definitions. Fail closed: missing evidence blocks the
-decision with a typed reason code; it must never downgrade to a warning.
+`required_evidence` is a conjunctive set — every listed kind must be present.
+Where the product rule is disjunctive ("validation report OR explicit
+no-change rationale"), the reducer checks the concrete alternatives and mints
+a single umbrella evidence kind that the transition requires (R4), keeping
+the validator check simple and conjunctive. Fail closed: missing evidence
+blocks the decision with a typed reason code
+(`MissingRequiredEvidence`); it must never downgrade to a warning.
 
 ### R2 — Server-side re-execution of quality-gate validation
 
@@ -207,10 +222,15 @@ than `pr_open`. This converts Risk C's delay-shaped hole into a gate.
 
 `single_shot_done_decision` and `settled_done_decision` require either a
 `validation_report` artifact (server-checkable: command list + exit codes) or
-an explicit structured `no_change_rationale`. Absent both, the decision is
-`blocked` with reason `prompt_completion_evidence_missing`. The continuation
-path keeps its external-state semantics; only the terminal step gains an
-evidence requirement.
+an explicit structured `no_change_rationale`. When either is present, the
+reducer attaches the umbrella `prompt_completion_evidence` kind (recording
+which alternative satisfied it), and the transition's `required_evidence`
+names only that umbrella kind — encoding the OR in the reducer, where the
+branching context lives, rather than extending `TransitionRule` with
+alternative-set semantics. Absent both, the decision is `blocked` with reason
+`prompt_completion_evidence_missing`. The continuation path keeps its
+external-state semantics; only the terminal step gains an evidence
+requirement.
 
 ### R5 — Truthful empty-window grading (small, independent)
 

@@ -8,10 +8,10 @@ GH-1766
 
 Four fail-closed changes, all reusing existing machinery:
 
-1. **Evidence enforcement unification** — populate
-   `TransitionRule::required_evidence` for the built-in definitions and move
-   enforcement from the declarative-only check into the shared decision
-   transition path.
+1. **Evidence population** — populate
+   `TransitionRule::required_evidence` for the built-in definitions; the
+   shared decision-validation path already enforces the field for all
+   definition kinds, so population alone activates it.
 2. **Server-side quality-gate validation** — the runtime worker executes the
    configured `validation_commands` itself and attaches a
    `server_validation_digest` evidence record; the reducer requires it for
@@ -31,9 +31,11 @@ fact before the claim can mint a transition.
 | Fact | Location |
 | --- | --- |
 | `required_evidence` field exists, defaults empty | `crates/harness-workflow/src/runtime/validator.rs:24,39,53` |
-| Built-in allowlists never populate it | `validator.rs:119` (`github_issue_pr_defaults`), `:275`, `:293`, `:312`; `implementing → done` via bare `.allow` at `:211` and `:334` |
+| Built-in allowlists never populate it | `validator.rs`: `github_issue_pr_defaults`, `quality_gate_defaults`, `pr_feedback_defaults`, `prompt_task_defaults`; `implementing → done` via bare `.allow("implementing", "done", [MarkDone])` in the `github_issue_pr` and `prompt_task` defaults |
 | Only declarative workflows populate evidence | `crates/harness-workflow/src/runtime/declarative.rs:526` |
-| Only declarative decisions are checked | `crates/harness-workflow/src/runtime/store/runtime_completion.rs:169,219` |
+| Enforcement is already general: every decision transition runs the `required_evidence` check for all definition kinds | `validator.rs::validate_decision` → `validator_progress::validate_declarative_transition_metadata` (rejects with `MissingRequiredEvidence`; exempts same-state `retry_failed_runtime_activity`) |
+| A separate declarative-only pre-check also exists | `crates/harness-workflow/src/runtime/store/runtime_completion.rs` (`declarative_decision_missing_required_evidence`) |
+| `required_evidence` is a conjunctive `BTreeSet` — no OR semantics | `validator_progress.rs` (missing-kind filter over the set) |
 | Quality gate builds an enqueue decision only | `crates/harness-workflow/src/runtime/quality_gate.rs` (62 lines) |
 | Gate contract is prompt prose, not enforcement | `crates/harness-server/src/workflow_runtime_worker/activity_contract.rs:25,63,153`; `success_requires` consumed only by `prompt_packet.rs` |
 | `BindPr` reads the agent artifact unverified | `crates/harness-workflow/src/runtime/reducer/github_issue_completion.rs:177,193` |
@@ -44,23 +46,35 @@ fact before the claim can mint a transition.
 
 ## Component Changes
 
-### 1. Evidence enforcement (`harness-workflow`)
+### 1. Evidence population (`harness-workflow`)
+
+Enforcement already exists and is general:
+`DecisionValidator::validate_decision` calls
+`validator_progress::validate_declarative_transition_metadata` for every
+matched rule, and that function rejects any decision missing a kind from the
+rule's `required_evidence` set with `MissingRequiredEvidence`, for built-in
+and declarative definitions alike (exempting same-state
+`retry_failed_runtime_activity` decisions). No enforcement-path change is
+required or made.
+
+The work is therefore population plus producers:
 
 - `runtime/validator.rs`: add a builder method
-  `require_evidence(from, to, [classes])` usable by the default constructors;
-  populate the Evidence Contract table from `product.md` in
-  `github_issue_pr_defaults`, `prompt_task_defaults`,
-  `quality_gate_defaults`, `pr_feedback_defaults`.
-- `runtime/store/runtime_completion.rs`: generalize
-  `declarative_decision_missing_required_evidence` into
-  `decision_missing_required_evidence(definition, transition, decision)`
-  applied to every decision transition, keeping the declarative call site's
-  behavior byte-compatible. Missing evidence yields the existing
-  `missing_required_evidence` reason-code path
-  (`store/recovery_validation.rs:51` already knows it).
-- Evidence classes are matched by `WorkflowEvidence` kind string; new kinds:
-  `verified_pr_binding`, `server_validation_digest`, `validation_report`,
-  `no_change_rationale`. Kinds are constants in `runtime/model.rs`.
+  `require_evidence(from, to, [classes])` and populate the Evidence Contract
+  table from `product.md` in `github_issue_pr_defaults`,
+  `prompt_task_defaults`, `quality_gate_defaults`, `pr_feedback_defaults`.
+  Population alone activates enforcement on the next decision through the
+  existing path.
+- `runtime/store/runtime_completion.rs`
+  (`declarative_decision_missing_required_evidence`) stays as-is: it is a
+  declarative-only pre-check layered above the general validator and its
+  behavior must remain byte-compatible.
+- Evidence classes are matched by `WorkflowEvidence` kind string
+  (conjunctive `BTreeSet` — see Component 4 for how the one disjunctive rule
+  is encoded). New kinds: `verified_pr_binding`, `server_validation_digest`,
+  `prompt_completion_evidence`. Kinds are constants in `runtime/model.rs`.
+- The retry exemption is intentional and preserved: evidence requirements
+  bind fact-minting transitions, not same-state activity retries.
 
 ### 2. Server-side quality-gate validation (`harness-server`)
 
@@ -103,14 +117,27 @@ fact before the claim can mint a transition.
 
 ### 4. Prompt-task completion evidence (`harness-workflow`)
 
+The product rule is disjunctive (`validation_report` OR
+`no_change_rationale`), but `TransitionRule::required_evidence` is a
+conjunctive set — listing both kinds would reject every valid decision, and
+listing neither enforces nothing. Chosen encoding: the reducer mints a
+single umbrella evidence kind, and the transition requires only that kind.
+This keeps the shared validator simple and conjunctive, avoids extending
+`TransitionRule` (and the declarative YAML schema that feeds it) with
+alternative-set semantics, and places the OR where the branching context
+already lives.
+
 - `reducer/prompt_task_completion.rs`: before returning
   `single_shot_done_decision` or `settled_done_decision`, check the result
   for a `validation_report` artifact (structured: list of `{command,
-  exit_code}`) or a `no_change_rationale` string artifact. Absent both,
-  return the existing `blocked_decision` helper with reason
+  exit_code}`) or a `no_change_rationale` string artifact. When either is
+  present, attach `WorkflowEvidence::new("prompt_completion_evidence",
+  <which alternative satisfied it>)` to the decision. Absent both, return
+  the existing `blocked_decision` helper with reason
   `prompt_completion_evidence_missing`.
-- The evidence is attached to the decision so the R1 transition check for
-  `implementing → done` observes it; the reducer check gives the agent a
+- `prompt_task_defaults` requires `prompt_completion_evidence` on
+  `implementing → done`, so a done-decision that bypasses the reducer check
+  still fails validation; the reducer check exists to give the agent a
   precise, retryable reason instead of a bare transition rejection.
 
 ### 5. Honest empty-window grading (`harness-observe`)
