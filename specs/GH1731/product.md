@@ -55,15 +55,18 @@ repository root, not that an agent selected, loaded, or executed it.
    `MEMORY.md`; the instruction files `AGENTS.md`, `AGENTS.override.md`, and
    `CLAUDE.md` immediately beneath `src`, `crates`, `lib`, and `pkg`; skill
    roots `.claude/skills`, `.codex/skills`, `.agents/skills`, and `skills`;
-   hook roots `.claude/hooks`, `hooks`, and `.githooks`; MCP files `.mcp.json`
-   and `mcp.json`; policy/validation roots `.vibeguard`, `rules`,
+   hook entrypoints `.harness/guards/*.sh` and direct children of `.githooks`
+   whose basename is a documented Git lifecycle hook; MCP files `.mcp.json` and
+   `mcp.json`; policy/validation roots `.vibeguard`, `rules`,
    `requirements.toml`, `.remem`, `remem.toml`, `.harness/config.toml`,
-   `.harness/skills`, `.harness/rules`, `.harness/guards`, `.harness/sg`,
+   `.harness/skills`, `.harness/rules`, `.harness/sg`,
    `harness.toml`, `.github/workflows`, and `.cursor/rules`. Skill discovery
    emits direct `*.md` definitions from every skill root and recursively emits
    exact `SKILL.md` package entrypoints from non-Harness skill roots;
    `.harness/skills/*.usage.json`, package references, and other sidecar files
-   are not independent stack units. Toolchain and validation selectors include
+   are not independent stack units. Generic `.claude/hooks` and `hooks`
+   directories are not inventoried because directory membership alone does not
+   prove lifecycle binding. Toolchain and validation selectors include
    `Cargo.toml`, `go.mod`, `package.json`,
    `pyproject.toml`, `setup.py`, `requirements.txt`, `build.gradle`,
    `build.gradle.kts`, `pom.xml`, root `*.csproj` and `*.sln` files, `Gemfile`,
@@ -95,8 +98,10 @@ repository root, not that an agent selected, loaded, or executed it.
    because it is beneath a typed directory; unsupported files outside every
    selector are not inventoried.
 7. **B-007:** Discovery order and output order are deterministic: allowlist
-   rule order is stable, directory entries are sorted by normalized relative
-   locator, and filesystem enumeration order cannot change output.
+   rule order is stable, selected files and directories required for recursive
+   discovery are sorted by normalized relative locator, and filesystem
+   enumeration order cannot change output. Unsupported descendants are filtered
+   by native basename or extension before portable locator normalization.
 8. **B-008:** Traversal and file opens are relative to one capability-scoped
    directory handle, so absolute paths, `..`, symlink swaps, and symlinks whose
    targets escape the repository cannot grant access outside that handle. An
@@ -115,7 +120,10 @@ repository root, not that an agent selected, loaded, or executed it.
     opened-directory, aggregate-encountered-entry, aggregate-byte, depth,
     entries-per-directory, and per-file byte limits. Selected non-regular
     special files, recursive symlink cycles, invalid limit values, and every
-    exceeded limit fail visibly rather than being skipped.
+    exceeded limit fail visibly rather than being skipped. On Unix, selected
+    file candidates are opened capability-relatively with nonblocking semantics
+    before handle metadata is trusted, so a path raced to a FIFO cannot hang
+    inventory; other platforms use the corresponding handle-first type check.
 11. **B-011:** Repeating inventory against unchanged repository bytes,
     executable metadata, and directory-presence predicates produces the same
     ordered entries and digests regardless of current time or filesystem
@@ -130,6 +138,9 @@ repository root, not that an agent selected, loaded, or executed it.
       kind and file/directory behavior.
 - [ ] Fixture repositories cover every allowlisted surface and prove unrelated
       files are excluded.
+- [ ] Hook fixtures prove only `.harness/guards/*.sh` and documented direct Git
+      hook basenames become `hook` components; README, helper, and nested
+      fixture files are excluded.
 - [ ] Every output validates under the ASC-001 component contract.
 - [ ] Tests prove path normalization, stable ordering, content hashing,
       missing-entry behavior, root-handle containment across path replacement,
@@ -140,8 +151,9 @@ repository root, not that an agent selected, loaded, or executed it.
       rules stay root-scoped, the `spec` predicate does not recurse, and
       executable-bit changes alter hook evidence without changing content
       digests.
-- [ ] Capability-scoped filesystem traversal is introduced as one audited,
-      narrowly owned dependency; existing workspace SHA-256 support is reused.
+- [ ] Capability-scoped filesystem traversal is introduced through one audited,
+      narrowly owned dependency; the already-locked `libc` crate supplies only
+      Unix `O_NONBLOCK`, and existing workspace SHA-256 support is reused.
 - [ ] The implementation exposes a library service for later CLI and runtime
       consumers but adds no new command in this issue.
 
@@ -169,6 +181,9 @@ repository root, not that an agent selected, loaded, or executed it.
 - An allowlisted path exists as a directory where a file is expected.
 - A skill directory contains usage sidecars, package references, binary files,
   or special files that are not selected definition entrypoints.
+- A generic hook directory contains README, helper, and fixture files with no
+  lifecycle binding.
+- A selected regular file is replaced by a FIFO immediately before open.
 - `Makefile` exists while `makefile` does not; matching remains exact.
 - The repository has no allowlisted surfaces.
 

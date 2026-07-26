@@ -30,6 +30,9 @@ GH-1731
     edit.
   - The audited `cap-std` dependency is added without downgrading another
     dependency.
+  - The already-locked `libc` crate is promoted to a workspace dependency and
+    used by `harness-core` only for Unix `O_NONBLOCK`; no additional syscall
+    wrapper is added.
   - The public options, result, entry, entry-class, and typed error-category
     APIs match `tech.md`, keep invariant-bearing fields private, and expose
     read-only accessors.
@@ -57,6 +60,9 @@ GH-1731
   - Every directory row uses the closed surface-specific selector in
     `tech.md`; general skill roots select direct `*.md` and nested `SKILL.md`,
     while `.harness/skills` selects direct `*.md` only.
+  - Hook selection is limited to direct `.harness/guards/*.sh` and the closed
+    direct `.githooks` lifecycle basename vocabulary; generic hook directories,
+    README, helper, and fixture files emit no component.
   - Harness-native roots have their specific component kinds and no recursive
     catch-all `.harness` rule exists.
   - Missing exact entries are omitted only after a non-following
@@ -66,11 +72,15 @@ GH-1731
     current observation as `fresh`.
   - `.usage.json`, skill package references, and other unmatched support files
     do not emit independent stack components.
+  - Native basename/extension selection excludes an unmatched non-UTF-8
+    ordinary file before portable locator normalization.
   - Output order is the lexicographic order of lossless portable locators.
 - Verify:
   - `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector`
   - `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders`
   - `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`
+  - `cargo test -p harness-core stack::inventory_tests::only_lifecycle_bound_hook_entrypoints_are_inventoried`
+  - `cargo test -p harness-core stack::inventory_tests::unsupported_non_utf8_entries_are_filtered_before_locator_normalization`
   - `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule`
   - `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh`
   - `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory`
@@ -91,6 +101,9 @@ GH-1731
   - A valid in-root symlink swap may select either valid target, and the digest
     covers exactly the bytes from the opened regular-file handle without
     reporting `entry_raced`.
+  - In-root directory symlinks are resolved through the capability and
+    traversed before file selection; recursive symlink identities still return
+    `cycle_detected`.
   - Depth uses the repository root as depth 0; directory enumeration
     reads at most the checked N+1 sentinel; every yielded item charges the
     aggregate encountered-entry budget; each opened directory including the
@@ -98,9 +111,14 @@ GH-1731
     budgets are charged before another read or descent.
   - Traversal performs no repository write, process launch, network operation,
     hook invocation, or MCP connection.
+  - Unix selected-file opens use `O_NONBLOCK` and validate opened-handle type
+    before reading, so a path raced to a FIFO returns `non_regular_entry`
+    without waiting for a writer.
 - Verify:
   - `cargo test -p harness-core stack::inventory_tests::inventory_stays_bound_to_the_opened_root_handle`
   - `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target`
+  - `cargo test -p harness-core stack::inventory_tests::in_root_directory_symlinks_are_traversed_and_cycles_fail`
+  - `cargo test -p harness-core stack::inventory_tests::selected_fifo_targets_fail_without_blocking`
   - `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators`
   - `cargo test -p harness-core stack::inventory_tests::reads_never_exceed_remaining_aggregate_or_per_file_budget`
   - `cargo test -p harness-core stack::inventory_tests::every_traversal_limit_has_an_exact_boundary_fixture`
@@ -120,6 +138,9 @@ GH-1731
   - Skill fixtures prove direct Markdown and nested `SKILL.md` definitions are
     discovered while usage sidecars, package references, and support files are
     excluded.
+  - Hook fixtures prove exact lifecycle selectors exclude README, helpers, and
+    nested fixtures; Unix FIFO fixtures prove selected opens cannot block before
+    handle type validation.
   - Negative fixtures cover missing versus broken symlinks, root replacement,
     escaping and in-root symlink swaps, cycles, special files, unreadable
     files, non-UTF-8 paths, post-`read_dir` disappearance, invalid limits, and

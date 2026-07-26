@@ -105,9 +105,8 @@ Define the B-003 allowlist as one constant typed table. Every row has:
 
 The private directory selector vocabulary is:
 
-- `all_regular_descendants` for documented roots where each descendant is a
-  declaration source;
 - `direct_extension` for definitions registered only as direct children;
+- `direct_basename` for one exact registered child name;
 - `recursive_extension` for recursive extension-governed sources;
 - `recursive_basename` for package entrypoints with one exact basename.
 
@@ -121,14 +120,27 @@ emit components. `.github/workflows` uses direct extensions `yml` and `yaml`;
 `.harness/rules` and `rules` use recursive extensions `md` and `toml`;
 `.harness/guards` uses direct extension `sh`; `.harness/sg` uses recursive
 extensions `yml` and `yaml`; and `.cursor/rules` uses recursive extensions
-`md` and `mdc`. The remaining documented directory roots use
-`all_regular_descendants`.
+`md` and `mdc`. `.vibeguard` uses recursive extensions `md`, `toml`, `yaml`,
+`yml`, `json`, and `json5`; `.remem` uses recursive extensions `toml`, `yaml`,
+`yml`, and `json`, so databases and runtime state are excluded.
+
+`.githooks` uses direct basenames from this closed Git lifecycle vocabulary:
+`applypatch-msg`, `pre-applypatch`, `post-applypatch`, `pre-commit`,
+`pre-merge-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit`,
+`pre-rebase`, `post-checkout`, `post-merge`, `pre-push`, `pre-receive`,
+`update`, `proc-receive`, `post-receive`, `post-update`,
+`reference-transaction`, `push-to-checkout`, `pre-auto-gc`, `post-rewrite`,
+`sendemail-validate`, `fsmonitor-watchman`, `p4-changelist`,
+`p4-prepare-changelist`, `p4-post-changelist`, `p4-pre-submit`, and
+`post-index-change`. Generic `.claude/hooks` and `hooks` rows do not exist:
+without an explicit lifecycle binding, their README, helpers, and fixtures
+cannot satisfy the ASC-001 `hook` kind.
 
 Root instruction names map to `instructions`, workflow files and
-`.github/workflows` map to `workflow`, skill roots map to `skill`, hook roots
-map to `hook`, MCP files map to `mcp_server`, memory/remem surfaces map to
-`memory`, policy/rule surfaces map to `policy`, Harness configuration maps to
-`validation`, and package/toolchain files map to `validation`.
+`.github/workflows` map to `workflow`, skill roots map to `skill`, selected hook
+entrypoints map to `hook`, MCP files map to `mcp_server`, memory/remem surfaces
+map to `memory`, policy/rule surfaces map to `policy`, Harness configuration
+maps to `validation`, and package/toolchain files map to `validation`.
 
 Harness-native rows are exact and independently typed:
 `.harness/config.toml` maps to `validation`, `.harness/skills` to `skill`,
@@ -161,7 +173,9 @@ adding a rule cannot reorder unrelated existing components.
 ### Safe Traversal
 
 Run a baseline `cargo audit` before changing either manifest, then add the
-audited `cap-std` workspace and `harness-core` dependencies. Call
+audited `cap-std` workspace and `harness-core` dependencies. Promote the
+already-locked `libc` crate to a workspace dependency used by `harness-core`
+only for Unix `O_NONBLOCK`; do not add another syscall wrapper. Call
 `Dir::open_ambient_dir` exactly once for the caller-supplied root and treat that
 opened directory handle—not a reconstructed ambient path—as the root identity
 and access boundary. Do not canonicalize and reopen the root by pathname.
@@ -177,32 +191,41 @@ configuration error. For each rule:
    non-following `symlink_metadata`;
 2. treat `NotFound` only from that initial non-following lookup as absence; an
    entry already yielded by `read_dir` followed by `NotFound` is a race error;
-3. follow or open an observed symlink through the directory capability and
-   classify `NotFound` as `broken_symlink`; reject escaping targets and every
-   other metadata or path-resolution failure;
-4. visit directories through capability-relative handles, collect at most
+3. visit directories through capability-relative handles, collect at most
    `max_entries_per_directory + 1` entries with checked arithmetic, fail on the
-   sentinel entry, charge each yielded entry to `max_total_entries` before
-   classification, then normalize losslessly and sort before recursion;
-5. track opened directory identities in the active ancestor stack to reject
+   sentinel entry, and charge every yielded entry to `max_total_entries` before
+   classification;
+4. inspect the yielded entry's non-following type. For an ordinary non-directory
+   entry, compare ASCII basename and extension selectors against its native
+   `OsStr` before portable normalization; exclude an unmatched entry without
+   opening it or requiring UTF-8. A directory required for recursive discovery
+   must have a lossless portable locator before descent;
+5. for a symlink, resolve target metadata through the directory capability
+   before applying a file selector. Classify `NotFound` as `broken_symlink`,
+   reject escape or other resolution failure, descend through an in-root
+   directory target, and apply the native basename/extension selector only when
+   the resolved target is not a directory;
+6. normalize every selected file and recursively visited directory losslessly,
+   sort those candidates by portable locator, and then process them. A non-UTF-8
+   unmatched ordinary file is ignored, while a non-UTF-8 selected file or
+   directory required for recursion returns `non_utf8_locator`;
+7. track opened directory identities in the active ancestor stack to reject
    cycles as `cycle_detected` while permitting non-cyclic duplicate paths to
    the same directory;
-6. increment checked depth, opened-directory, and file-count budgets before
+8. increment checked depth, opened-directory, and file-count budgets before
    descending or reading and fail before a configured limit can be exceeded;
-7. apply the matched rule's entry selector to the normalized locator before
-   file metadata or open; an unmatched regular, symlink, or special descendant
-   is excluded without becoming a component or failure, while directories
-   required to find recursive matches remain subject to traversal budgets and
-   cycle checks;
-8. reject sockets, FIFOs, devices, and every other non-regular entry selected as
-   a definition source;
-9. open each selected file through its containing directory capability and
-   validate regular-file metadata from the opened handle, which becomes the
-   authority for the observed type, bytes, and executable mode;
+9. open every selected file through its containing directory capability. On
+   Unix, construct `cap_std::fs::OpenOptions` with read access and
+   `libc::O_NONBLOCK` through
+   `cap_std::fs::OpenOptionsExt::custom_flags`; on other platforms use read-only
+   handle open. Validate regular-file metadata from the opened handle before the
+   first content read. A raced FIFO, socket, device, directory, or other
+   non-regular opened handle returns `non_regular_entry` and cannot block the
+   inventory worker;
 10. compute checked per-file and remaining-aggregate `+ 1` sentinels, read in
-   bounded chunks through `File::take(min(per_file_sentinel,
-   remaining_total_sentinel))`, account each chunk before the next read, and
-   reject immediately when either byte limit would be exceeded;
+    bounded chunks through `File::take(min(per_file_sentinel,
+    remaining_total_sentinel))`, account each chunk before the next read, and
+    reject immediately when either byte limit would be exceeded;
 11. calculate SHA-256 and Unix executable metadata from the exact opened file
     handle.
 
@@ -263,10 +286,15 @@ Keep production traversal in `inventory.rs` and table-driven fixtures in
 platform supports unreadable-file assertions. Platform-specific inability to
 create an unreadable file must use a deterministic injected reader failure
 fixture rather than silently skip the behavior. Unix-only non-UTF-8 fixtures
-assert a typed locator error; other platforms assert the same validator
-directly. A coordinated escaping-symlink fixture proves that a raced path
-cannot escape the opened root capability. An in-root swap fixture accepts
-either valid opened target and proves the digest matches that handle. A
+assert that unmatched native names are excluded before normalization and that a
+selected name or traversed directory returns a typed locator error; other
+platforms assert the same validator directly. Exact hook fixtures include valid
+lifecycle basenames plus README, helpers, and nested fixtures. A Unix FIFO
+fixture uses a bounded test timeout and proves `O_NONBLOCK` reaches handle-type
+rejection without a writer. A coordinated escaping-symlink fixture proves that
+a raced path cannot escape the opened root capability. An in-root swap fixture
+accepts either valid opened target and proves the digest matches that handle. A
+directory-symlink fixture proves recursive discovery and cycle rejection. A
 root-path replacement fixture proves traversal remains bound to the originally
 opened handle without claiming an ambient canonical root. Unix fixtures toggle
 a hook's executable bits while holding bytes constant; non-Unix tests assert
@@ -275,13 +303,14 @@ the explicit unobserved state.
 ## Data Flow
 
 Explicit root/options → validated limits → one ambient root-handle open → fixed
-rule lookup → safe, sorted capability-relative traversal →
+rule lookup → native selector filtering → safe, sorted capability-relative
+traversal → nonblocking candidate open and handle-type validation →
 remaining-budget-capped byte read → SHA-256 and file metadata → validated
 ASC-001 component → typed entry → ordered `AgentStackInventory`.
 
-Any existing-entry failure aborts the operation. Missing allowlisted entries
-produce no component. No subprocess, network, persistence, or repository write
-occurs.
+Any selected-entry or required traversal-directory failure aborts the operation.
+Missing allowlisted entries and unmatched descendants produce no component. No
+subprocess, network, persistence, or repository write occurs.
 
 ## Product-to-Test Mapping
 
@@ -292,11 +321,11 @@ occurs.
 | B-003 | `InventoryRule` constant | `cargo test -p harness-core stack::inventory_tests::inventory_discovers_every_stack_and_language_validation_selector` |
 | B-004 | non-following initial lookup and missing-entry handling | `cargo test -p harness-core stack::inventory_tests::missing_allowlisted_entries_emit_no_placeholders` |
 | B-005 | entry/component construction, hashing, executable mode, directory presence, and current-observation freshness | `cargo test -p harness-core stack::inventory_tests::entries_bind_content_mode_and_directory_presence_to_valid_components`; `cargo test -p harness-core stack::inventory_tests::current_observations_are_fresh` |
-| B-006 | surface-specific typed selector classification | `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`; `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
-| B-007 | sorted traversal/output | `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory` |
-| B-008 | capability-relative traversal/open and opened-handle observation | `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target` |
+| B-006 | surface-specific typed selector classification | `cargo test -p harness-core stack::inventory_tests::sidecars_and_support_files_do_not_emit_stack_units`; `cargo test -p harness-core stack::inventory_tests::only_lifecycle_bound_hook_entrypoints_are_inventoried`; `cargo test -p harness-core stack::inventory_tests::component_kind_comes_from_matching_rule` |
+| B-007 | native prefilter plus sorted selected traversal/output | `cargo test -p harness-core stack::inventory_tests::unsupported_non_utf8_entries_are_filtered_before_locator_normalization`; `cargo test -p harness-core stack::inventory_tests::filesystem_enumeration_order_does_not_change_inventory` |
+| B-008 | capability-relative file/directory symlink traversal and opened-handle observation | `cargo test -p harness-core stack::inventory_tests::symlink_swaps_remain_root_confined_and_hash_the_opened_target`; `cargo test -p harness-core stack::inventory_tests::in_root_directory_symlinks_are_traversed_and_cycles_fail` |
 | B-009 | typed read/path errors | `cargo test -p harness-core stack::inventory_tests::unreadable_and_non_utf8_entries_fail_without_lossy_locators` |
-| B-010 | checked file/directory/entry/depth/byte limits | `cargo test -p harness-core stack::inventory_tests::every_traversal_limit_has_an_exact_boundary_fixture` |
+| B-010 | checked file/directory/entry/depth/byte limits and nonblocking handle validation | `cargo test -p harness-core stack::inventory_tests::every_traversal_limit_has_an_exact_boundary_fixture`; `cargo test -p harness-core stack::inventory_tests::selected_fifo_targets_fail_without_blocking` |
 | B-011 | repeated full-entry fixture comparison | `cargo test -p harness-core stack::inventory_tests::unchanged_repository_inventory_is_repeatable` |
 | B-012 | read-only API surface and side-effect fixture | `cargo test -p harness-core stack::inventory_tests::inventory_is_read_only_and_invokes_no_external_behavior`; `rg -n "Command::new|TcpStream|UdpSocket|reqwest|std::fs::(write|remove|rename|create_dir)" crates/harness-core/src/stack/inventory.rs` (expect no matches); `cargo test -p harness-core agents_md` |
 
@@ -325,8 +354,9 @@ occurs.
   current `lang_detect.rs` predicate.
 - Compatibility: broadening the table changes observed output; later changes
   require explicit review.
-- Performance: checked file-count, aggregate-byte, depth,
-  entries-per-directory, and per-file limits bound traversal work.
+- Performance: checked file-count, opened-directory, aggregate-entry,
+  aggregate-byte, depth, entries-per-directory, and per-file limits bound
+  traversal work; Unix candidate opens are nonblocking.
 - Maintenance: classification must remain centralized in the typed rule table.
 
 ## Test Plan
@@ -342,6 +372,11 @@ occurs.
 - [ ] Prove direct Markdown and nested `SKILL.md` skill selectors include only
       registered definition entrypoints, while `.usage.json`, package
       references, and unrelated support files emit no component.
+- [ ] Prove closed hook selectors exclude README, helpers, and nested fixtures.
+- [ ] Prove unmatched non-UTF-8 ordinary files are excluded before locator
+      normalization, while selected files and traversed directories fail typed.
+- [ ] Prove in-root directory symlinks recurse, escaping targets fail, cycles
+      fail, and selected Unix FIFO targets return without blocking.
 - [ ] Prove every successful file read and `spec` directory probe classifies
       freshness as `fresh`.
 - [ ] Add Unix executable-bit change and non-Unix unobserved-mode fixtures, plus
@@ -355,7 +390,8 @@ occurs.
 - [ ] Run `cargo fmt --all` and `cargo fmt --all -- --check`.
 - [ ] Before push, run
       `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `cargo audit` again after adding `cap-std` and updating `Cargo.lock`.
+- [ ] Run `cargo audit` again after adding `cap-std`, promoting `libc`, and
+      updating `Cargo.lock`.
 - [ ] Run
       `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1731`.
 - [ ] Confirm the implementation diff contains only the six paths in the
