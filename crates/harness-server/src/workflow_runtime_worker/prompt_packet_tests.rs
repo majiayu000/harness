@@ -1,4 +1,5 @@
 use super::*;
+use crate::workflow_runtime_worker::runtime_profile::resolve_runtime_settings;
 use harness_workflow::runtime::{
     RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord,
     RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
@@ -7,6 +8,21 @@ use harness_workflow::runtime::{
     ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
+
+fn resolved_settings_for_tests(profile: &RuntimeProfile) -> ResolvedRuntimeSettings {
+    let mut profile = profile.clone();
+    if profile.timeout_secs.is_none() {
+        profile.timeout_secs = Some(3600);
+    }
+    resolve_runtime_settings(
+        &profile,
+        profile.kind,
+        None,
+        &harness_core::config::agents::AgentsConfig::default(),
+        &harness_core::config::concurrency::ConcurrencyConfig::default(),
+    )
+    .unwrap_or_else(|error| panic!("test runtime settings should resolve: {error}"))
+}
 
 #[test]
 fn activity_result_schema_describes_issue_implementation_terminal_evidence_contract() {
@@ -427,8 +443,10 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &workflow_document,
         &[],
+        None,
     )
     .expect("built-in prompt packet should build");
     assert_eq!(packet["project"]["root"], "/workspaces/job-1");
@@ -479,8 +497,10 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
         Path::new("/workspaces/job-continue"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &WorkflowDocument::default(),
         &[],
+        None,
     )
     .expect("continuation prompt packet should build");
 
@@ -526,8 +546,10 @@ fn runtime_prompt_packet_describes_deferred_candidate_submission_contract() {
         Path::new("/workspaces/issue-1449-c1"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &workflow_document,
         &[],
+        None,
     )
     .expect("candidate prompt packet should build");
 
@@ -578,8 +600,10 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &workflow_document,
         &repo_memory,
+        None,
     )
     .expect("repo-memory prompt packet should build");
 
@@ -629,8 +653,10 @@ fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &workflow_document,
         &[],
+        None,
     )
     .expect("fresh-repo prompt packet should build");
 
