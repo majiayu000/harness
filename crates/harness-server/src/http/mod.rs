@@ -236,9 +236,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     .count()
             })
             .unwrap_or(0);
-        harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
+        harness_observe::quality::QualityGrader::grade(&events, violation_count).map(|r| r.grade)
     };
-    crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
+    crate::scheduler::Scheduler::from_initial_grade(initial_grade).start(state.clone());
     // Pass the pre-built GitHub pollers from AppState to the orchestrator so
     // both share the same Arc instances and on_task_complete operates on the
     // live poller's dispatched map.

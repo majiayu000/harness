@@ -268,7 +268,9 @@ impl CodexAgent {
                 })?;
         }
 
-        let output = child.wait_with_output().await.map_err(|error| {
+        let mut child = crate::ManagedChild::new(child, "codex review");
+        let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
+        let output = child.wait_with_output(&limits).await.map_err(|error| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to wait for codex review: {error}"
             ))
@@ -455,7 +457,8 @@ impl CodeAgent for CodexAgent {
             );
         }
         let mut child = crate::ManagedChild::new(child, "codex execute");
-        let output = child.wait_with_output().await.map_err(|err| {
+        let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
+        let output = child.wait_with_output(&limits).await.map_err(|err| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to wait for codex: {err}"
             ))
