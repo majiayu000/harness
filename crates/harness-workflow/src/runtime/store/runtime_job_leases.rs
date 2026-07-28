@@ -1,4 +1,4 @@
-use super::{enum_str, to_jsonb_string, WorkflowRuntimeStore};
+use super::{enum_str, to_jsonb_string, RuntimeJobNotFoundError, WorkflowRuntimeStore};
 use crate::runtime::model::{RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind};
 use chrono::{DateTime, TimeDelta, Timelike, Utc};
 use serde_json::{json, Value};
@@ -414,6 +414,14 @@ pub(crate) async fn append_runtime_event_tx(
     event_type: &str,
     payload: Value,
 ) -> anyhow::Result<RuntimeEvent> {
+    let parent: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM runtime_jobs WHERE id = $1 FOR KEY SHARE")
+            .bind(runtime_job_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if parent.is_none() {
+        return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+    }
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("runtime_events:{runtime_job_id}"))
         .execute(&mut **tx)
