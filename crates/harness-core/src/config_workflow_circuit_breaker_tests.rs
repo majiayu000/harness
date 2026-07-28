@@ -143,6 +143,26 @@ runtime_worker:
 }
 
 #[test]
+fn project_workflow_rejects_completion_evidence_key_under_workflow() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+workflow:
+  completion_evidence_enforced: false
+---
+"#,
+    )?;
+
+    let error = load_workflow_config(dir.path())
+        .expect_err("a deployment-global switch nested under workflow must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+    Ok(())
+}
+
+#[test]
 fn project_workflow_rejects_legacy_root_completion_evidence_key() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(
