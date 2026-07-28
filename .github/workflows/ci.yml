@@ -79,10 +79,13 @@ jobs:
         with:
           python-version: "3.x"
       - name: Install test dependencies
-        run: python3 -m pip install pytest
+        run: python3 -I -m pip install --disable-pip-version-check 'pytest==9.0.3'
       - name: Test repository contracts
         env:
+          PYTHONPATH: ""
+          PYTEST_ADDOPTS: ""
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTEST_PLUGINS: ""
         run: python3 -I -m pytest -q -c /dev/null --noconftest -p no:cacheprovider tests
       - name: Check committed whitespace
         run: python3 scripts/check_committed_whitespace.py

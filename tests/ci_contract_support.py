@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -13,6 +14,24 @@ from shutil import which
 from textwrap import dedent
 from typing import TypeAlias
 from unittest import SkipTest
+
+
+TRUSTED_ROOT = Path(__file__).resolve().parents[1]
+CANDIDATE_ROOT = Path(os.environ.get("HARNESS_CONTRACT_CANDIDATE_ROOT", TRUSTED_ROOT))
+
+
+def contract_candidate_file(relative: str, max_bytes: int = 1_000_000) -> Path:
+    root = CANDIDATE_ROOT.resolve(strict=True)
+    path = CANDIDATE_ROOT / relative
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise AssertionError(f"candidate contract path is not a regular file: {relative}")
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(root):
+        raise AssertionError(f"candidate contract path escapes checkout: {relative}")
+    if metadata.st_size > max_bytes:
+        raise AssertionError(f"candidate contract path is too large: {relative}")
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -200,7 +219,12 @@ HERMETIC_PYTEST_ARGUMENTS = (
     "-p", "no:cacheprovider", "tests",
 )
 REPOSITORY_PYTEST_COMMAND = f"python3 {' '.join(HERMETIC_PYTEST_ARGUMENTS)}"
-REPOSITORY_PYTEST_ENV = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": '"1"'}
+REPOSITORY_PYTEST_ENV = {
+    "PYTHONPATH": '""',
+    "PYTEST_ADDOPTS": '""',
+    "PYTEST_DISABLE_PLUGIN_AUTOLOAD": '"1"',
+    "PYTEST_PLUGINS": '""',
+}
 PYTEST_EXECUTION_CANARY = "HARNESS_PYTEST_EXECUTION_CANARY"
 PYTEST_CONFIG_BAITS = (
     ("pytest.ini", "[pytest]\naddopts = --collect-only\n"),
@@ -536,7 +560,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
             {"uses": "actions/setup-python@v5", "with": {"python-version": '"3.x"'}},
             {
                 "name": "Install test dependencies",
-                "run": "python3 -m pip install pytest",
+                "run": "python3 -I -m pip install --disable-pip-version-check 'pytest==9.0.3'",
             },
             {
                 "name": "Test repository contracts",

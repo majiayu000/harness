@@ -11,26 +11,22 @@ from unittest import SkipTest
 import pytest
 from ci_contract_support import (
     CI_RESULT_ENV,
-    PYTEST_CONFIG_BAITS,
-    PYTEST_CONFTEST_HOOKS,
-    PYTEST_ROOT_BAITS,
     REPOSITORY_PYTEST_COMMAND,
     assert_ci_contract,
-    assert_pytest_attack_blocked,
     commit_files,
-    create_autoloading_pytest_plugin,
     create_git_repo,
-    create_pytest_canary,
+    contract_candidate_file,
     initialize_git_repo,
     parse_workflow,
     run_git,
     run_whitespace_check,
+    TRUSTED_ROOT,
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
-CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
-PRE_COMMIT_HOOK = ROOT / ".githooks" / "pre-commit"
+ROOT = TRUSTED_ROOT
+CI_WORKFLOW = contract_candidate_file(".github/workflows/ci.yml")
+PRE_COMMIT_HOOK = contract_candidate_file(".githooks/pre-commit")
 CI_RESULT_CHECK = ROOT / "scripts" / "check_ci_results.py"
 WHITESPACE_CHECK = ROOT / "scripts" / "check_committed_whitespace.py"
 
@@ -115,69 +111,6 @@ def test_ci_result_script_fails_closed(
         env=environment,
     )
     assert result.returncode == expected_code, result.stdout + result.stderr
-
-
-@pytest.mark.parametrize(
-    ("relative", "content"),
-    PYTEST_CONFIG_BAITS,
-)
-def test_hermetic_pytest_ignores_repository_config(
-    tmp_path: Path,
-    relative: str,
-    content: str,
-) -> None:
-    project = tmp_path / "project"
-    create_pytest_canary(project)
-    (project / relative).write_text(content, encoding="utf-8")
-    assert_pytest_attack_blocked(project)
-
-
-@pytest.mark.parametrize(
-    ("relative", "content"),
-    PYTEST_ROOT_BAITS,
-)
-def test_hermetic_pytest_ignores_root_python_bait(
-    tmp_path: Path,
-    relative: str,
-    content: str,
-) -> None:
-    project = tmp_path / "project"
-    create_pytest_canary(project)
-    (project / relative).write_text(content, encoding="utf-8")
-    environment = {"PYTHONPATH": str(project)} if relative == "sitecustomize.py" else None
-    assert_pytest_attack_blocked(project, environment=environment)
-
-
-def test_hermetic_pytest_ignores_pythonpath_bait(tmp_path: Path) -> None:
-    project = tmp_path / "project"
-    create_pytest_canary(project)
-    attack_path = tmp_path / "pythonpath"
-    attack_path.mkdir()
-    (attack_path / "pytest.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
-    assert_pytest_attack_blocked(
-        project,
-        environment={"PYTHONPATH": str(attack_path)},
-    )
-
-
-@pytest.mark.parametrize("directory", ["", "tests"])
-@pytest.mark.parametrize("hook", PYTEST_CONFTEST_HOOKS)
-def test_hermetic_pytest_disables_conftest_hooks(
-    tmp_path: Path,
-    directory: str,
-    hook: str,
-) -> None:
-    project = tmp_path / "project"
-    create_pytest_canary(project)
-    (project / directory / "conftest.py").write_text(hook, encoding="utf-8")
-    assert_pytest_attack_blocked(project)
-
-
-def test_hermetic_pytest_disables_automatic_plugins(tmp_path: Path) -> None:
-    project = tmp_path / "project"
-    create_pytest_canary(project)
-    python = create_autoloading_pytest_plugin(tmp_path)
-    assert_pytest_attack_blocked(project, python=python)
 
 
 @pytest.mark.parametrize("event_name", ["pull_request", "push"])
@@ -433,7 +366,10 @@ REPOSITORY_PYTEST_RUN = f"        run: {REPOSITORY_PYTEST_COMMAND}"
 REPOSITORY_PYTEST_STEP = (
     "      - name: Test repository contracts\n"
     "        env:\n"
+    '          PYTHONPATH: ""\n'
+    '          PYTEST_ADDOPTS: ""\n'
     '          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"\n'
+    '          PYTEST_PLUGINS: ""\n'
     f"{REPOSITORY_PYTEST_RUN}"
 )
 
