@@ -44,6 +44,7 @@ jobs:
             ci:
               - '.github/workflows/**'
               - '.bun-version'
+              - 'scripts/check_ci_results.py'
               - 'scripts/check_storage_legacy_openers.py'
             workspace:
               - 'Cargo.toml'
@@ -262,22 +263,15 @@ jobs:
     if: always()
     needs: [changed, storage-legacy-openers, repository-checks, fmt, web-build, clippy, test, audit]
     steps:
+      - uses: actions/checkout@v4
       - name: Check all jobs
         run: |
-          results=(
-            "${{ needs.changed.result }}"
-            "${{ needs.storage-legacy-openers.result }}"
-            "${{ needs.repository-checks.result }}"
-            "${{ needs.fmt.result }}"
-            "${{ needs.web-build.result }}"
-            "${{ needs.clippy.result }}"
-            "${{ needs.test.result }}"
-            "${{ needs.audit.result }}"
-          )
-          for r in "${results[@]}"; do
-            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
-              echo "Job failed or cancelled: $r"
-              exit 1
-            fi
-          done
-          echo "All CI jobs passed or were skipped"
+          python3 scripts/check_ci_results.py \
+            "changed=${{ needs.changed.result }}" \
+            "storage-legacy-openers=${{ needs.storage-legacy-openers.result }}" \
+            "repository-checks=${{ needs.repository-checks.result }}" \
+            "fmt=${{ needs.fmt.result }}" \
+            "web-build=${{ needs.web-build.result }}" \
+            "clippy=${{ needs.clippy.result }}" \
+            "test=${{ needs.test.result }}" \
+            "audit=${{ needs.audit.result }}"
