@@ -9,7 +9,11 @@ pub mod manifest;
 pub mod model;
 pub mod report;
 pub mod run;
+#[cfg(test)]
+#[path = "run_concurrency_tests.rs"]
+mod run_concurrency_tests;
 pub mod scoring;
+mod transition_outcome;
 
 pub use evidence::{
     collect_eval_case_evidence, collect_eval_case_evidence_from_records, EvalCaseEvidence,
