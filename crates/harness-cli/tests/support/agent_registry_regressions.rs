@@ -354,3 +354,57 @@ fn generic_factory_resolution_covers_impls_without_merging_local_scopes() {
         "associated factories must be detected without merging same-name local factories"
     );
 }
+
+#[test]
+fn generic_factories_with_inputs_and_wrapped_outputs_are_detected() {
+    let with_input = analyze_source(
+        r#"
+        use harness_agents::provider_backpressure::ProviderBackpressureGate;
+        fn make<T: Default>(_: ()) -> T { T::default() }
+        fn build() {
+            let _gate = make::<ProviderBackpressureGate>(());
+        }
+        "#,
+    )
+    .expect("argument-taking generic factory parses");
+    assert_eq!(with_input.direct_constructions.len(), 1);
+
+    let wrapped_output = analyze_source(
+        r#"
+        use harness_agents::provider_backpressure::ProviderBackpressureGate;
+        fn make<T: Default>() -> Result<T, &'static str> { Ok(T::default()) }
+        fn build() {
+            let _gate = make::<ProviderBackpressureGate>();
+        }
+        "#,
+    )
+    .expect("wrapped generic factory parses");
+    assert_eq!(wrapped_output.direct_constructions.len(), 1);
+}
+
+#[test]
+fn generic_transformers_with_inputs_are_not_constructions() {
+    let analysis = analyze_source(
+        r#"
+        use harness_agents::provider_backpressure::ProviderBackpressureGate;
+        use std::marker::PhantomData;
+        fn identity<T>(value: T) -> T { value }
+        fn validate<T>(value: T) -> Result<T, ()> { Ok(value) }
+        fn inspect<T>(_: u8) -> usize { std::mem::size_of::<T>() }
+        fn marker<T>() -> PhantomData<T> { PhantomData }
+        fn borrow<T>() -> &'static T { loop {} }
+        fn observe(gate: ProviderBackpressureGate) {
+            let gate = identity::<ProviderBackpressureGate>(gate);
+            let _validated = validate::<ProviderBackpressureGate>(gate);
+            let _size = inspect::<ProviderBackpressureGate>(0);
+            let _marker = marker::<ProviderBackpressureGate>();
+            let _borrowed = borrow::<ProviderBackpressureGate>();
+        }
+        "#,
+    )
+    .expect("generic transformer source parses");
+    assert!(
+        analysis.direct_constructions.is_empty(),
+        "passing or observing an existing value must not count as construction"
+    );
+}

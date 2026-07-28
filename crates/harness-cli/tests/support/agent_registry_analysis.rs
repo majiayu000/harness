@@ -1,5 +1,5 @@
 use super::{
-    cfg_test::{has_cfg_test, CfgTestModules},
+    cfg_test::{has_cfg_gate, has_cfg_test, CfgTestModules},
     resolution::{
         alias_scope_from_block, alias_scope_from_items, collect_crate_aliases,
         collect_generic_factories, ident_name, path_segments, type_paths, AliasScope, CrateAliases,
@@ -198,8 +198,8 @@ impl<'a> SourceScanner<'a> {
             }));
     }
 
-    fn record_generic_factory_call(&mut self, call: &ExprCall, function: &ExprPath) {
-        if function.qself.is_some() || !call.args.is_empty() {
+    fn record_generic_factory_call(&mut self, function: &ExprPath) {
+        if function.qself.is_some() {
             return;
         }
         let original = path_segments(&function.path);
@@ -402,7 +402,9 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
         };
         let top_level_item = self.function_frames.is_empty()
             && self.inline_module_depth == 0
-            && self.block_depth == 0;
+            && self.block_depth == 0
+            && !self.in_cfg_test_module
+            && !has_cfg_gate(&item.attrs);
         self.function_frames.push(FunctionFrame {
             name: ident_name(&item.sig.ident),
             body_address: item.block.as_ref() as *const Block as usize,
@@ -473,7 +475,7 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
 
     fn visit_expr_call(&mut self, expression: &'ast ExprCall) {
         if let Expr::Path(function) = expression.func.as_ref() {
-            self.record_generic_factory_call(expression, function);
+            self.record_generic_factory_call(function);
             if function.qself.is_none() {
                 let original = path_segments(&function.path);
                 let resolved = self.resolver().resolve(original.clone());
@@ -558,12 +560,25 @@ fn root_call(expression: &Expr) -> Option<&ExprCall> {
     }
 }
 
+fn root_call_has_cfg_gate(expression: &Expr) -> bool {
+    match expression {
+        Expr::Call(call) => has_cfg_gate(&call.attrs),
+        Expr::Group(group) => has_cfg_gate(&group.attrs) || root_call_has_cfg_gate(&group.expr),
+        Expr::Paren(paren) => has_cfg_gate(&paren.attrs) || root_call_has_cfg_gate(&paren.expr),
+        Expr::Try(try_) => has_cfg_gate(&try_.attrs) || root_call_has_cfg_gate(&try_.expr),
+        _ => false,
+    }
+}
+
 fn direct_builder_target(
     statement: &Stmt,
     is_tail_statement: bool,
 ) -> Option<(usize, BuilderCallUse)> {
     match statement {
         Stmt::Local(local) => {
+            if has_cfg_gate(&local.attrs) || root_call_has_cfg_gate(&local.init.as_ref()?.expr) {
+                return None;
+            }
             let binding = pattern_binding_name(&local.pat)?;
             let call = root_call(&local.init.as_ref()?.expr)?;
             Some((
@@ -571,12 +586,16 @@ fn direct_builder_target(
                 BuilderCallUse::LetBinding(binding),
             ))
         }
-        Stmt::Expr(expression, None) if is_tail_statement => root_call(expression).map(|call| {
-            (
-                call as *const ExprCall as usize,
-                BuilderCallUse::TailExpression,
-            )
-        }),
+        Stmt::Expr(expression, None)
+            if is_tail_statement && !root_call_has_cfg_gate(expression) =>
+        {
+            root_call(expression).map(|call| {
+                (
+                    call as *const ExprCall as usize,
+                    BuilderCallUse::TailExpression,
+                )
+            })
+        }
         _ => None,
     }
 }

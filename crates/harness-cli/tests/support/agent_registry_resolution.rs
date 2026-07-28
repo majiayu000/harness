@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use syn::{
     visit::{self, Visit},
-    Block, GenericArgument, GenericParam, ImplItem, Item, ItemFn, ItemImpl, ItemMod, ItemType,
-    ItemUse, Path as SynPath, ReturnType, Signature, Stmt, Type, TypePath, UseTree,
+    Block, FnArg, GenericArgument, GenericParam, ImplItem, Item, ItemFn, ItemImpl, ItemMod,
+    ItemType, ItemUse, Path as SynPath, PathArguments, ReturnType, Signature, Stmt, Type, TypePath,
+    UseTree,
 };
 
 pub(super) type Segments = Vec<String>;
@@ -32,7 +33,7 @@ impl AliasScope {
             .local_function_outputs
             .entry(ident_name(&function.sig.ident))
             .or_default();
-        if let Some(position) = generic_factory_output_position(&function.sig) {
+        for position in generic_factory_output_positions(&function.sig) {
             if !positions.contains(&position) {
                 positions.push(position);
             }
@@ -446,33 +447,87 @@ pub(super) fn collect_crate_aliases(
     }
 }
 
-fn generic_factory_output_position(signature: &Signature) -> Option<usize> {
-    if !signature.inputs.is_empty() {
-        return None;
-    }
+fn generic_factory_output_positions(signature: &Signature) -> Vec<usize> {
     let ReturnType::Type(_, output) = &signature.output else {
-        return None;
+        return Vec::new();
     };
-    let Type::Path(output) = output.as_ref() else {
-        return None;
-    };
-    if output.qself.is_some() || output.path.segments.len() != 1 {
-        return None;
-    }
-    let output_name = ident_name(&output.path.segments[0].ident);
+    let mut output_names = HashSet::new();
+    collect_value_type_names(output, &mut output_names);
+    let input_names = signature
+        .inputs
+        .iter()
+        .flat_map(|input| match input {
+            FnArg::Receiver(receiver) => type_paths(&receiver.ty),
+            FnArg::Typed(argument) => type_paths(&argument.ty),
+        })
+        .filter_map(|path| match path.as_slice() {
+            [name] => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    let mut positions = Vec::new();
     let mut argument_position = 0;
     for parameter in &signature.generics.params {
         match parameter {
             GenericParam::Lifetime(_) => continue,
-            GenericParam::Type(type_parameter)
-                if ident_name(&type_parameter.ident) == output_name =>
-            {
-                return Some(argument_position);
+            GenericParam::Type(type_parameter) => {
+                let name = ident_name(&type_parameter.ident);
+                if output_names.contains(&name) && !input_names.contains(&name) {
+                    positions.push(argument_position);
+                }
+                argument_position += 1;
             }
-            GenericParam::Type(_) | GenericParam::Const(_) => argument_position += 1,
+            GenericParam::Const(_) => argument_position += 1,
         }
     }
-    None
+    positions
+}
+
+fn collect_value_type_names(type_: &Type, names: &mut HashSet<String>) {
+    match type_ {
+        Type::Array(array) => collect_value_type_names(&array.elem, names),
+        Type::Group(group) => collect_value_type_names(&group.elem, names),
+        Type::Paren(paren) => collect_value_type_names(&paren.elem, names),
+        Type::Path(type_path) if type_path.qself.is_none() => {
+            for segment in &type_path.path.segments {
+                let name = ident_name(&segment.ident);
+                if type_path.path.segments.len() == 1
+                    && matches!(&segment.arguments, PathArguments::None)
+                {
+                    names.insert(name.clone());
+                }
+                if name == "PhantomData" {
+                    continue;
+                }
+                let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                    continue;
+                };
+                for argument in &arguments.args {
+                    if let GenericArgument::Type(argument) = argument {
+                        collect_value_type_names(argument, names);
+                    }
+                }
+            }
+        }
+        Type::Slice(slice) => collect_value_type_names(&slice.elem, names),
+        Type::Tuple(tuple) => {
+            for element in &tuple.elems {
+                collect_value_type_names(element, names);
+            }
+        }
+        Type::BareFn(_)
+        | Type::ImplTrait(_)
+        | Type::Infer(_)
+        | Type::Macro(_)
+        | Type::Never(_)
+        | Type::Ptr(_)
+        | Type::Reference(_)
+        | Type::TraitObject(_)
+        | Type::Verbatim(_)
+        | Type::Path(_) => {}
+        _ => {}
+    }
 }
 
 pub(super) fn collect_generic_factories(
@@ -487,7 +542,8 @@ pub(super) fn collect_generic_factories(
 
     impl<'ast> Visit<'ast> for FactoryCollector<'_> {
         fn visit_item_fn(&mut self, function: &'ast ItemFn) {
-            if let Some(position) = generic_factory_output_position(&function.sig) {
+            let output_positions = generic_factory_output_positions(&function.sig);
+            if !output_positions.is_empty() {
                 let mut path = vec!["crate".to_string()];
                 path.extend(self.module_path.iter().cloned());
                 path.push(ident_name(&function.sig.ident));
@@ -496,8 +552,10 @@ pub(super) fn collect_generic_factories(
                     .output_parameters_by_path
                     .entry(path)
                     .or_default();
-                if !positions.contains(&position) {
-                    positions.push(position);
+                for position in output_positions {
+                    if !positions.contains(&position) {
+                        positions.push(position);
+                    }
                 }
             }
         }
@@ -514,17 +572,20 @@ pub(super) fn collect_generic_factories(
                 let ImplItem::Fn(function) = impl_item else {
                     continue;
                 };
-                let Some(position) = generic_factory_output_position(&function.sig) else {
+                let output_positions = generic_factory_output_positions(&function.sig);
+                if output_positions.is_empty() {
                     continue;
-                };
+                }
                 impl_path.push(ident_name(&function.sig.ident));
                 let positions = self
                     .factories
                     .output_parameters_by_path
                     .entry(impl_path.clone())
                     .or_default();
-                if !positions.contains(&position) {
-                    positions.push(position);
+                for position in output_positions {
+                    if !positions.contains(&position) {
+                        positions.push(position);
+                    }
                 }
                 impl_path.pop();
             }
