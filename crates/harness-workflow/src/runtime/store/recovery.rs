@@ -136,8 +136,6 @@ impl WorkflowRuntimeStore {
                 return Ok(outcome);
             }
         }
-        let (superseded_command_count, superseded_runtime_job_count) =
-            skip_superseded_active_commands_tx(&mut tx, &snapshot.id).await?;
         let Some(mut instance) =
             select_instance_for_update_tx(&mut tx, request.workflow_id).await?
         else {
@@ -153,6 +151,8 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(unsupported_stopped_activity(&instance, None));
         }
+        let (superseded_command_count, superseded_runtime_job_count) =
+            skip_superseded_active_commands_tx(&mut tx, &instance.id).await?;
         let previous_state = instance.state.clone();
 
         let event = insert_event_tx(

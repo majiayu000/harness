@@ -1,5 +1,5 @@
-//! Lint over the store sources: no function may take ordered row locks out of
-//! the order documented in [`super::lock_order`].
+//! Lint over runtime store implementations: no function may take ordered row
+//! locks out of the order documented in [`super::lock_order`].
 //!
 //! This is a source lint rather than a runtime check because the invariant is
 //! about the *shape* of every transaction, including ones no test happens to
@@ -19,7 +19,39 @@ struct LockSite {
 }
 
 fn store_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime/store")
+    runtime_dir().join("store")
+}
+
+fn runtime_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime")
+}
+
+fn production_runtime_sources() -> Vec<(PathBuf, String)> {
+    fn collect(dir: &Path, sources: &mut Vec<(PathBuf, String)>) {
+        for entry in std::fs::read_dir(dir).expect("runtime source directory") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "tests") {
+                    continue;
+                }
+                collect(&path, sources);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            if stem == "tests" || stem.ends_with("_tests") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("readable runtime source");
+            sources.push((path, source));
+        }
+    }
+
+    let mut sources = Vec::new();
+    collect(&runtime_dir(), &mut sources);
+    sources
 }
 
 /// Rank of a lock hierarchy table, or `None` for tables outside the hierarchy
@@ -146,24 +178,12 @@ fn inversions(sites: &[LockSite]) -> Vec<Inversion> {
 }
 
 #[test]
-fn store_sources_lock_hierarchy_tables_parent_first() {
+fn runtime_store_sources_lock_hierarchy_tables_parent_first() {
     let mut violations = Vec::new();
     let mut checked_files = 0;
     let mut checked_locks = 0;
 
-    let entries = std::fs::read_dir(store_dir()).expect("store source directory");
-    for entry in entries {
-        let path = entry.expect("readable dir entry").path();
-        if path.extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        // `*_tests.rs` holds fixtures, including this file's deliberate
-        // inverted sample. Only production transactions are linted.
-        let name = path.file_stem().unwrap_or_default().to_string_lossy();
-        if name.ends_with("_tests") {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("readable store source");
+    for (path, source) in production_runtime_sources() {
         checked_files += 1;
 
         let sites = lock_sites(&source);
@@ -175,7 +195,7 @@ fn store_sources_lock_hierarchy_tables_parent_first() {
         );
     }
 
-    assert!(checked_files > 0, "lint found no store sources to scan");
+    assert!(checked_files > 0, "lint found no runtime sources to scan");
     assert!(
         checked_locks > 0,
         "lint found no FOR UPDATE sites — the extraction heuristic has drifted"
@@ -184,6 +204,49 @@ fn store_sources_lock_hierarchy_tables_parent_first() {
         violations.is_empty(),
         "row locks acquired out of order:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn workflow_event_inserts_are_centralized() {
+    let root = runtime_dir();
+    let mut writers = production_runtime_sources()
+        .into_iter()
+        .filter(|(_, source)| source.contains("INSERT INTO workflow_events"))
+        .map(|(path, _)| {
+            path.strip_prefix(&root)
+                .expect("runtime source path")
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    writers.sort();
+
+    assert_eq!(
+        writers,
+        vec!["store/transaction_helpers.rs"],
+        "workflow event inserts must use the canonical helper so every path \
+         locks the instance row before the event-sequence advisory lock"
+    );
+}
+
+#[test]
+fn event_sequence_helper_locks_parent_before_advisory() {
+    let source = std::fs::read_to_string(store_dir().join("transaction_helpers.rs"))
+        .expect("transaction helper source");
+    let parent_lock = source
+        .find("lock_instance_for_event_sequence_tx(tx, workflow_id)")
+        .expect("event helper must explicitly lock the workflow instance");
+    let advisory_lock = source
+        .find("pg_advisory_xact_lock")
+        .expect("event helper must serialize sequence allocation");
+    let event_insert = source
+        .find("INSERT INTO workflow_events")
+        .expect("event helper must persist the event");
+
+    assert!(
+        parent_lock < advisory_lock && advisory_lock < event_insert,
+        "event writes must lock workflow_instances before the sequence advisory lock"
     );
 }
 

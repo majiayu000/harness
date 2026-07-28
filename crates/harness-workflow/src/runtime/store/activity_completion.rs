@@ -330,43 +330,20 @@ impl WorkflowRuntimeStore {
                 0
             };
 
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!("workflow_events:{}", command.workflow_id))
-            .execute(&mut *tx)
-            .await?;
-        let (next_sequence,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
-        )
-        .bind(&command.workflow_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let event = WorkflowEvent::new(
+        let event = transaction_helpers::insert_event_tx(
+            &mut tx,
             &command.workflow_id,
-            next_sequence as u64,
             "RuntimeJobCompleted",
             owner,
+            json!({
+                "command_id": command.id,
+                "command": command.command,
+                "runtime_job_id": job.id,
+                "runtime_job_status": job.status,
+                "active_start_child_workflow_commands": active_start_child_workflow_commands,
+                "activity_result": result,
+            }),
         )
-        .with_payload(json!({
-            "command_id": command.id,
-            "command": command.command,
-            "runtime_job_id": job.id,
-            "runtime_job_status": job.status,
-            "active_start_child_workflow_commands": active_start_child_workflow_commands,
-            "activity_result": result,
-        }));
-        let event_data = to_jsonb_string(&event)?;
-        sqlx::query(
-            "INSERT INTO workflow_events
-                (id, workflow_id, sequence, event_type, source, data)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
-        )
-        .bind(&event.id)
-        .bind(&event.workflow_id)
-        .bind(event.sequence as i64)
-        .bind(&event.event_type)
-        .bind(&event.source)
-        .bind(&event_data)
-        .execute(&mut *tx)
         .await?;
 
         let decision_record = runtime_completion::apply_runtime_completion_decision_tx(

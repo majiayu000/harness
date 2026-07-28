@@ -1,5 +1,5 @@
-//! Canonical row-lock order for the workflow runtime store, and the retry
-//! policy for the aborts that violating it used to produce.
+//! Canonical row/advisory-lock order for the workflow runtime store, and the
+//! retry policy for the aborts that violating it used to produce.
 //!
 //! # The order
 //!
@@ -17,7 +17,16 @@
 //! locks in order. `commands.rs` and `activity_completion.rs` both do this to
 //! resolve `workflow_id` before locking the instance.
 //!
-//! `lock_order_tests.rs` enforces this by scanning the store sources.
+//! Workflow event writers have one additional invariant: lock the referenced
+//! `workflow_instances` row first, then take the per-workflow event-sequence
+//! advisory lock. The event foreign key takes a parent `KEY SHARE` lock during
+//! insert; taking the advisory lock first would let it deadlock with a
+//! transition that already holds the instance `FOR UPDATE` and is waiting for
+//! the same advisory lock. All production event inserts therefore go through
+//! `insert_event_tx_with_id`.
+//!
+//! `lock_order_tests.rs` enforces this by scanning the runtime store sources
+//! and the store implementations that live in sibling runtime modules.
 //!
 //! # Why
 //!
@@ -50,10 +59,14 @@ pub(super) const LOCK_HIERARCHY: [&str; 3] =
 ///
 /// Add an entry whenever a `_tx` helper starts taking a hierarchy row lock.
 #[cfg(test)]
-pub(super) const LOCK_TAKING_HELPERS: [(&str, &str); 4] = [
+pub(super) const LOCK_TAKING_HELPERS: [(&str, &str); 8] = [
     ("select_instance_for_update_tx", "workflow_instances"),
     ("lock_instance_for_update_tx", "workflow_instances"),
+    ("lock_instance_for_event_sequence_tx", "workflow_instances"),
     ("apply_runtime_completion_decision_tx", "workflow_instances"),
+    ("insert_event_tx", "workflow_instances"),
+    ("insert_event_tx_with_id", "workflow_instances"),
+    ("skip_superseded_active_commands_tx", "workflow_commands"),
     ("cancel_unfinished_runtime_jobs_tx", "runtime_jobs"),
 ];
 
