@@ -1,0 +1,13 @@
+{
+  "issue": 1837,
+  "recommended_state": "ready_to_implement",
+  "confidence": 0.98,
+  "evidence": [
+    "PR #1821 is the only open pull request covering the complete fresh-clone README onboarding and server startup contract.",
+    "The affected behavior is documentation-only and has bounded acceptance checks for install, agent execution, database startup, authentication, and protected HTTP examples.",
+    "Search found related work in GH-930, GH-1360, GH-832, and GH-1416, but none owns the complete acceptance scope of GH-1837."
+  ],
+  "maintainer_questions": [
+    "Confirm ready_to_implement only after the current PR head satisfies repository review and merge gates."
+  ]
+}
