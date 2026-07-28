@@ -139,8 +139,8 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
         .requires("pr_repair_snapshot_with_action_and_passing_validation_or_closed_issue_evidence"),
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)
-                .with_accepted_artifacts(vec!["validation_report"])
-                .requires("validation_evidence")
+                .with_accepted_artifacts(vec!["validation_report", "no_change_rationale"])
+                .requires("validation_report artifact ([{command, exit_code}]) or no_change_rationale string artifact; completion is rejected without one of them")
         }
         (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)

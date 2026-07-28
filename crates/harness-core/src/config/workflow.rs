@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 mod candidates;
 mod defaults;
 mod intake_binding;
+mod reserved_keys;
 mod storage;
 pub use candidates::WorkflowCandidatesPolicy;
 use defaults::*;
@@ -48,6 +49,7 @@ pub struct WorkflowSourceObservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowIdentityPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -282,6 +284,7 @@ pub struct RuntimeDispatchProfileOverride {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerPolicy {
     #[serde(default)]
     pub enabled: bool,
@@ -291,10 +294,6 @@ pub struct RuntimeWorkerPolicy {
     pub concurrency: u32,
     #[serde(default = "default_runtime_worker_lease_ttl_secs")]
     pub lease_ttl_secs: u64,
-    /// Enforce the declared completion-evidence contract on built-in workflow
-    /// transitions. Kill switch for one release; enforcement is the default.
-    #[serde(default = "default_true")]
-    pub completion_evidence_enforced: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -476,7 +475,6 @@ impl Default for RuntimeWorkerPolicy {
             interval_secs: default_runtime_worker_interval_secs(),
             concurrency: default_runtime_worker_concurrency(),
             lease_ttl_secs: default_runtime_worker_lease_ttl_secs(),
-            completion_evidence_enforced: true,
         }
     }
 }
@@ -580,6 +578,10 @@ fn read_workflow_file(path: &Path) -> anyhow::Result<Option<LoadedWorkflowFile>>
             )
         })?,
     };
+    reserved_keys::reject_misplaced_completion_evidence_fields(
+        &value,
+        &path.display().to_string(),
+    )?;
     Ok(Some(LoadedWorkflowFile {
         front_matter: value,
         body: body.trim().to_string(),
@@ -633,7 +635,7 @@ pub fn load_workflow_document(project_root: &Path) -> anyhow::Result<WorkflowDoc
 
 /// Core resolution with an explicit base path (kept separate from the global
 /// registration so it can be unit-tested without touching process state).
-fn load_workflow_document_with_base(
+pub(super) fn load_workflow_document_with_base(
     project_root: &Path,
     base_path: Option<&Path>,
 ) -> anyhow::Result<WorkflowDocument> {

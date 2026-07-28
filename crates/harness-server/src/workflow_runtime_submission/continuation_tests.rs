@@ -1,7 +1,7 @@
 use super::*;
 use harness_core::db::resolve_database_url;
 use harness_workflow::runtime::{
-    ActivityResult, ActivitySignal, PromptContinuationPolicy, ValidationRecord,
+    ActivityArtifact, ActivityResult, ActivitySignal, PromptContinuationPolicy, ValidationRecord,
     WorkflowCommandStatus, PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 use serde_json::json;
@@ -98,7 +98,11 @@ async fn prompt_continuation_submit_active_settled_reaches_done() -> anyhow::Res
                 "external_state",
                 json!({ "state": "Done", "subject": "TEAM-123" }),
             ))
-            .with_validation(ValidationRecord::new("cargo test", "passed"));
+            .with_validation(ValidationRecord::new("cargo test", "passed"))
+            .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([{ "command": "cargo test", "exit_code": 0 }]),
+            ));
     let finished = store
         .commit_parent_runtime_completion(
             &submission.workflow_id,
