@@ -1,0 +1,14 @@
+# Crate-local accidental-drift guard. This is not a security boundary: it keeps
+# configured CLI construction on the shared builder by linting resolved HIR.
+disallowed-methods = [
+    { path = "harness_agents::registry::AgentRegistry::new", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::claude::ClaudeCodeAgent::new", reason = "Use harness_agents::builder::claude_agent_from_config or registry_from_config." },
+    { path = "harness_agents::claude_adapter::ClaudeAdapter::new", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::codex::CodexAgent::from_config", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::codex_adapter::CodexAdapter::new", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::codex_adapter::CodexAdapter::from_config", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::anthropic_api::AnthropicApiAgent::new", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::anthropic_api::AnthropicApiAgent::from_config", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::provider_backpressure::ProviderBackpressureGate::disabled", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::provider_backpressure::ProviderBackpressureGate::from_claude_config", reason = "Use harness_agents::builder::registry_from_config." },
+]
