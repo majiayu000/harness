@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from shutil import which
+from unittest import SkipTest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,17 +16,33 @@ def top_level_jobs(workflow: str) -> set[str]:
     in_jobs = False
 
     for line in workflow.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
         if line == "jobs:":
             in_jobs = True
             continue
-        if in_jobs and line and not line.startswith(" "):
+        if in_jobs and not line.startswith(" "):
             break
         if in_jobs and line.startswith("  ") and not line.startswith("    "):
-            stripped = line.strip()
-            if stripped.endswith(":") and not stripped.startswith("#"):
+            if stripped.endswith(":"):
                 jobs.add(stripped.removesuffix(":"))
 
     return jobs
+
+
+def test_top_level_jobs_ignores_comments_and_blank_lines() -> None:
+    workflow = """\
+jobs:
+  first:
+    runs-on: ubuntu-latest
+
+# Keep the next job in the jobs mapping.
+  second:
+    runs-on: ubuntu-latest
+"""
+
+    assert top_level_jobs(workflow) == {"first", "second"}
 
 
 def test_scoped_ci_pipeline_contract() -> None:
@@ -65,8 +83,12 @@ def test_pre_commit_hook_contract_and_syntax() -> None:
     for command in ("git diff --cached --name-only", "cargo clippy $scope"):
         assert command in hook, f"pre-commit hook is missing: {command}"
 
+    bash = which("bash")
+    if bash is None:
+        raise SkipTest("bash is required to validate the pre-commit hook syntax")
+
     result = subprocess.run(
-        ["bash", "-n", str(PRE_COMMIT_HOOK)],
+        [bash, "-n", str(PRE_COMMIT_HOOK)],
         cwd=ROOT,
         check=False,
         capture_output=True,
