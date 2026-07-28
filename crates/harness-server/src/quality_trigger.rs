@@ -163,9 +163,9 @@ impl QualityTrigger {
             .unwrap_or(0);
 
         let Some(mut report) = QualityGrader::grade(&window_events, violation_count) else {
-            // No events and no violations in the window: there is nothing to
-            // grade. Leaving GC cadence untouched is the honest response —
-            // grading an empty window would report a perfect score.
+            // No independent gradeable events and no violations in the window:
+            // there is nothing to grade. Leaving GC cadence untouched is the
+            // honest response; derived grade events cannot become new evidence.
             tracing::debug!(
                 "quality_trigger: observation window held no evidence; leaving GC cadence unchanged"
             );

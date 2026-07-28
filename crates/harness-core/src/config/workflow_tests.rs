@@ -61,7 +61,6 @@ fn load_workflow_config_defaults_when_missing() -> anyhow::Result<()> {
     assert!(cfg.pr_scope_guard.enabled);
     assert_eq!(cfg.pr_scope_guard.max_files_changed, 30);
     assert_eq!(cfg.pr_scope_guard.max_lines_added, 1500);
-    assert!(cfg.runtime_worker.completion_evidence_enforced);
     assert_eq!(cfg.storage.schema_namespace, "workflow");
     assert!(cfg.storage.orphan_reaper_enabled);
     assert_eq!(cfg.storage.orphan_reaper_interval_secs, 3600);
@@ -196,7 +195,6 @@ runtime_worker:
   interval_secs: 3
   concurrency: 2
   lease_ttl_secs: 120
-  completion_evidence_enforced: false
 runtime_retry_policy:
   max_failed_activity_retries: 1
   retry_delay_secs: 30
@@ -386,7 +384,6 @@ Body
     assert_eq!(cfg.storage.orphan_reaper_interval_secs, 44);
     assert!(!cfg.storage.orphan_reaper_legacy_enabled);
     assert_eq!(cfg.storage.orphan_reaper_legacy_batch, 55);
-    assert!(!cfg.runtime_worker.completion_evidence_enforced);
     assert!(cfg.storage.workflow_watchdog_enabled);
     assert_eq!(cfg.storage.workflow_watchdog_age_minutes, 12);
     assert_eq!(cfg.storage.workflow_watchdog_interval_secs, 13);

@@ -2,6 +2,24 @@ use super::*;
 use harness_core::types::Item;
 use std::collections::HashMap;
 
+fn test_turn_request(project_root: PathBuf) -> TurnRequest {
+    TurnRequest {
+        prompt: "ping".to_string(),
+        prompt_layers: None,
+        project_root,
+        model: None,
+        reasoning_effort: None,
+        execution_phase: None,
+        sandbox_mode: None,
+        approval_policy: None,
+        allowed_tools: None,
+        context: vec![],
+        timeout_secs: None,
+        env_vars: HashMap::new(),
+        capability_token: None,
+    }
+}
+
 #[test]
 fn parse_no_jsonrpc_thread_started_notification() {
     let line = r#"{"method":"thread/started","params":{"thread":{"id":"thread-1"}}}"#;
@@ -257,7 +275,7 @@ fn start_params_include_runtime_profile_overrides() {
     };
 
     assert_eq!(
-        thread_start_params(&req),
+        thread_start_params(&req, &req.project_root),
         json!({
             "cwd": "/tmp/project",
             "model": "gpt-runtime",
@@ -267,7 +285,7 @@ fn start_params_include_runtime_profile_overrides() {
         })
     );
     assert_eq!(
-        turn_start_params(&req, "thread-1"),
+        turn_start_params(&req, "thread-1", &req.project_root),
         json!({
             "threadId": "thread-1",
             "cwd": "/tmp/project",
@@ -417,12 +435,46 @@ fn app_server_spawn_honors_container_isolation() -> anyhow::Result<()> {
         .collect::<Vec<_>>();
 
     assert_eq!(spawn.program, PathBuf::from("docker"));
+    assert_eq!(spawn.child_workspace, PathBuf::from("/workspace"));
     assert!(spawn.clear_inherited_env);
     assert!(args.contains(&"--network".to_string()));
     assert!(args.contains(&"none".to_string()));
     assert!(args.contains(&"app-server".to_string()));
     assert!(args.contains(&"stdio://".to_string()));
     Ok(())
+}
+
+#[test]
+fn app_server_spawn_keeps_host_workspace_path() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let request = test_turn_request(root.path().to_path_buf());
+
+    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request)?;
+
+    assert_eq!(spawn.child_workspace, root.path());
+    assert_eq!(
+        thread_start_params(&request, &spawn.child_workspace)["cwd"],
+        json!(root.path())
+    );
+    Ok(())
+}
+
+#[test]
+fn app_server_params_use_container_workspace_path() {
+    let mut request = test_turn_request(PathBuf::from("/host/project"));
+    request.sandbox_mode = Some(SandboxMode::WorkspaceWrite);
+    let child_workspace = PathBuf::from("/workspace");
+
+    assert_eq!(
+        thread_start_params(&request, &child_workspace)["cwd"],
+        json!("/workspace")
+    );
+    let turn = turn_start_params(&request, "thread-1", &child_workspace);
+    assert_eq!(turn["cwd"], json!("/workspace"));
+    assert_eq!(
+        turn["sandboxPolicy"]["writableRoots"],
+        json!(["/workspace"])
+    );
 }
 
 #[test]
@@ -548,6 +600,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         state.stdin = Some(stdin);
         state.stdout_lines = Some(BufReader::new(stdout).lines());
         state.thread_id = Some("thread-1".into());
+        state.child_workspace = Some(PathBuf::from("/tmp/project"));
     }
 
     let req = TurnRequest {
