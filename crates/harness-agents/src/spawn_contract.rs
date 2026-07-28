@@ -11,6 +11,8 @@ use crate::scoped_token::{
     CONTAINER_GH_TOKEN_ENV, CONTAINER_GITHUB_TOKEN_ENV, SCOPED_GITHUB_TOKEN_ENV,
 };
 
+mod review_git;
+
 /// Env keys Claude Code uses to detect that it is running nested inside
 /// another Claude Code session; leaking any of them into a spawned agent
 /// causes SIGTRAP. Only these markers are stripped — legitimate `CLAUDE_*`
@@ -31,6 +33,7 @@ const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
 const AGENT_EGRESS_PROXY_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY";
 const CONTAINER_EGRESS_ALLOWLIST_ENV: &str = "HARNESS_AGENT_EGRESS_ALLOWLIST";
 const CONTAINER_WORKSPACE: &str = "/workspace";
+pub(crate) const REVIEW_GIT_SAFE_WORKSPACE_ENV: &str = "HARNESS_AGENT_REVIEW_GIT_SAFE_WORKSPACE";
 
 pub(crate) struct AgentSpawnInput<'a> {
     pub(crate) program: &'a Path,
@@ -38,6 +41,10 @@ pub(crate) struct AgentSpawnInput<'a> {
     pub(crate) project_root: &'a Path,
     pub(crate) sandbox_spec: &'a SandboxSpec,
     pub(crate) env_vars: &'a HashMap<String, String>,
+    /// The caller pipes the prompt through the child's stdin. The container
+    /// tier must keep stdin open (`docker run -i`) or the prompt is silently
+    /// dropped; the host tier inherits stdin either way.
+    pub(crate) forward_stdin: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +52,8 @@ pub(crate) struct PreparedAgentSpawn {
     pub(crate) program: PathBuf,
     pub(crate) args: Vec<OsString>,
     pub(crate) current_dir: PathBuf,
+    /// Workspace path as seen by the child after host/container path mapping.
+    pub(crate) child_workspace: PathBuf,
     pub(crate) process_env: BTreeMap<String, String>,
     pub(crate) clear_inherited_env: bool,
     pub(crate) sandbox_engine: SandboxEngine,
@@ -66,6 +75,7 @@ impl AgentSpawnContract for HostSpawn {
             program: wrapped_command.program,
             args: wrapped_command.args,
             current_dir: input.project_root.to_path_buf(),
+            child_workspace: input.project_root.to_path_buf(),
             process_env: host_process_env(input.env_vars),
             clear_inherited_env: false,
             sandbox_engine: wrapped_command.engine,
@@ -77,7 +87,7 @@ pub(crate) struct ContainerSpawn;
 
 impl AgentSpawnContract for ContainerSpawn {
     fn prepare(&self, input: AgentSpawnInput<'_>) -> Result<PreparedAgentSpawn, HarnessError> {
-        let workspace = canonical_workspace(input.project_root)?;
+        let project_root = canonical_workspace(input.project_root)?;
         let tier = isolation_tier(input.env_vars)?;
         if tier != IsolationTier::Container {
             return Err(HarnessError::AgentExecution(format!(
@@ -88,14 +98,48 @@ impl AgentSpawnContract for ContainerSpawn {
 
         let allowlist = network_allowlist(input.env_vars);
         let image = container_image(input.env_vars);
+        let review_layout = review_git_safe_workspace(input.env_vars)
+            .then(|| review_git::plan(&project_root))
+            .transpose()?;
+        let workspace_source = review_layout
+            .as_ref()
+            .map(|layout| layout.workspace_source.as_path())
+            .unwrap_or(&project_root);
+        let child_workspace = review_layout
+            .as_ref()
+            .map(|layout| layout.child_workspace.clone())
+            .unwrap_or_else(|| PathBuf::from(CONTAINER_WORKSPACE));
+        let workspace_read_only = review_layout.is_some()
+            || matches!(
+                input.sandbox_spec.mode,
+                harness_core::config::agents::SandboxMode::ReadOnly
+                    | harness_core::config::agents::SandboxMode::ReadOnlyWithNetwork
+            );
         let mut args = vec![OsString::from("run"), OsString::from("--rm")];
+        if input.forward_stdin {
+            args.push(OsString::from("--interactive"));
+        }
         args.push(OsString::from("--workdir"));
-        args.push(OsString::from(CONTAINER_WORKSPACE));
+        args.push(child_workspace.as_os_str().to_os_string());
         args.push(OsString::from("--mount"));
-        args.push(OsString::from(format!(
+        let mut workspace_mount = format!(
             "type=bind,src={},dst={CONTAINER_WORKSPACE}",
-            workspace.display()
-        )));
+            workspace_source.display()
+        );
+        if workspace_read_only {
+            workspace_mount.push_str(",readonly");
+        }
+        args.push(OsString::from(workspace_mount));
+        if let Some(layout) = &review_layout {
+            for mount in &layout.git_mounts {
+                args.push(OsString::from("--mount"));
+                args.push(OsString::from(format!(
+                    "type=bind,src={},dst={},readonly",
+                    mount.source.display(),
+                    mount.destination.display()
+                )));
+            }
+        }
         args.push(OsString::from("--network"));
         args.push(OsString::from(container_network_mode(
             input.env_vars,
@@ -120,6 +164,22 @@ impl AgentSpawnContract for ContainerSpawn {
             args.push(OsString::from("--env"));
             args.push(OsString::from("NO_PROXY=localhost,127.0.0.1"));
         }
+        if review_git_safe_workspace(input.env_vars) {
+            for (key, value) in [
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "safe.directory"),
+                ("GIT_CONFIG_VALUE_0", CONTAINER_WORKSPACE),
+            ] {
+                args.push(OsString::from("--env"));
+                args.push(OsString::from(format!("{key}={value}")));
+            }
+            if let Some(layout) = &review_layout {
+                for (key, value) in &layout.git_env {
+                    args.push(OsString::from("--env"));
+                    args.push(OsString::from(format!("{key}={}", value.display())));
+                }
+            }
+        }
         args.push(OsString::from(image));
         args.push(container_program(input.program));
         args.extend(input.args.iter().cloned());
@@ -127,7 +187,8 @@ impl AgentSpawnContract for ContainerSpawn {
         Ok(PreparedAgentSpawn {
             program: PathBuf::from("docker"),
             args,
-            current_dir: workspace,
+            current_dir: project_root,
+            child_workspace,
             process_env: docker_process_env(),
             clear_inherited_env: true,
             sandbox_engine: SandboxEngine::None,
@@ -243,7 +304,14 @@ fn is_spawn_control_env(key: &str) -> bool {
             | AGENT_CONTAINER_IMAGE_ENV
             | AGENT_EGRESS_PROXY_ENV
             | SCOPED_GITHUB_TOKEN_ENV
+            | REVIEW_GIT_SAFE_WORKSPACE_ENV
     )
+}
+
+fn review_git_safe_workspace(env_vars: &HashMap<String, String>) -> bool {
+    env_vars
+        .get(REVIEW_GIT_SAFE_WORKSPACE_ENV)
+        .is_some_and(|value| value == "1")
 }
 
 fn is_operator_secret_env(key: &str) -> bool {
@@ -328,6 +396,7 @@ mod container_spawn_tests {
             project_root,
             sandbox_spec,
             env_vars,
+            forward_stdin: false,
         }
     }
 
@@ -371,6 +440,9 @@ mod container_spawn_tests {
             "type=bind,src={},dst={CONTAINER_WORKSPACE}",
             std::fs::canonicalize(root.path())?.display()
         )));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("type=bind,") && arg.ends_with(",readonly")));
         assert!(!args
             .iter()
             .any(|arg| arg.contains("/Users/") && arg.contains("home")));
