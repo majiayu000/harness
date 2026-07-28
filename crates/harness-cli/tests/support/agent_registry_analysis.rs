@@ -1,28 +1,18 @@
-//! Structural guard for configured agent construction in `harness-cli`, with one
-//! exact exception for the read-only Codex PR reviewer.
-
+use super::{
+    BuilderCall, BuilderCallUse, DirectConstruction, ExpectedBuilderUse, MacroViolation, SourceUnit,
+};
 use proc_macro2::{TokenStream, TokenTree};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 use syn::{
     visit::{self, Visit},
     Block, Expr, ExprCall, ExprPath, ExprStruct, File, Item, ItemFn, ItemImpl, ItemMod, ItemType,
-    ItemUse, Macro, Member, Path as SynPath, Stmt, Type, UseTree,
+    ItemUse, Local, Macro, Member, Pat, Path as SynPath, Stmt, Type, UseTree, Visibility,
 };
 
 type Segments = Vec<String>;
-
-const REGISTRY_BUILDER: &str = "harness_agents::builder::registry_from_config";
-const CLAUDE_BUILDER: &str = "harness_agents::builder::claude_agent_from_config";
-pub(super) const REQUIRED_BUILDER_CALLS: [(&str, &str); 5] = [
-    ("src/commands/serve.rs", REGISTRY_BUILDER),
-    ("src/commands/exec.rs", REGISTRY_BUILDER),
-    ("src/gc.rs", REGISTRY_BUILDER),
-    ("src/cmd/mcp_server.rs", REGISTRY_BUILDER),
-    ("src/cmd/pr.rs", CLAUDE_BUILDER),
-];
 
 const FORBIDDEN_TYPES: [&str; 7] = [
     "AgentRegistry",
@@ -33,8 +23,6 @@ const FORBIDDEN_TYPES: [&str; 7] = [
     "AnthropicApiAgent",
     "ProviderBackpressureGate",
 ];
-
-pub(super) const ALLOWED_DIRECT_CONSTRUCTION_PATH: &str = "src/cmd/pr.rs";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AliasTarget {
@@ -78,28 +66,12 @@ impl CrateAliases {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct DirectConstruction {
-    pub(super) type_name: String,
-    pub(super) syntax: String,
-    pub(super) module_path: String,
-    pub(super) enclosing_function: Option<String>,
-    pub(super) intentional_pr_review_constructor: bool,
-    associated_item: Option<String>,
-    is_call: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct MacroViolation {
-    pub(super) macro_path: String,
-    pub(super) forbidden_type: String,
-}
-
 #[derive(Default)]
 pub(super) struct SourceAnalysis {
-    direct_builder_calls: Vec<Segments>,
+    direct_builder_calls: Vec<BuilderCall>,
     pub(super) direct_constructions: Vec<DirectConstruction>,
     pub(super) macro_violations: Vec<MacroViolation>,
+    pub(super) public_glob_reexports: usize,
 }
 
 impl SourceAnalysis {
@@ -107,15 +79,44 @@ impl SourceAnalysis {
         let expected = expected_path.split("::").collect::<Vec<_>>();
         self.direct_builder_calls
             .iter()
-            .filter(|path| path.iter().map(String::as_str).eq(expected.iter().copied()))
+            .filter(|call| {
+                call.path
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied())
+            })
             .count()
     }
-}
 
-struct SourceUnit {
-    relative: PathBuf,
-    module_path: Segments,
-    file: File,
+    pub(super) fn required_builder_call_count(
+        &self,
+        expected_path: &str,
+        function: &str,
+        expected_usage: ExpectedBuilderUse,
+    ) -> usize {
+        let expected = expected_path.split("::").collect::<Vec<_>>();
+        self.direct_builder_calls
+            .iter()
+            .filter(|call| {
+                call.path
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied())
+                    && call.function.as_deref() == Some(function)
+                    && call.top_level
+                    && match (&call.usage, expected_usage) {
+                        (
+                            BuilderCallUse::LetBinding(actual),
+                            ExpectedBuilderUse::LetBinding(expected),
+                        ) => actual == expected,
+                        (BuilderCallUse::TailExpression, ExpectedBuilderUse::TailExpression) => {
+                            true
+                        }
+                        _ => false,
+                    }
+            })
+            .count()
+    }
 }
 
 struct Resolver<'a> {
@@ -184,6 +185,8 @@ struct SourceScanner<'a> {
     module_path: Segments,
     impl_types: Vec<Segments>,
     function_names: Vec<String>,
+    builder_usage_targets: Vec<(usize, BuilderCallUse)>,
+    inline_module_depth: usize,
     analysis: SourceAnalysis,
 }
 
@@ -195,6 +198,8 @@ impl<'a> SourceScanner<'a> {
             module_path,
             impl_types: Vec::new(),
             function_names: Vec::new(),
+            builder_usage_targets: Vec::new(),
+            inline_module_depth: 0,
             analysis: SourceAnalysis::default(),
         }
     }
@@ -206,6 +211,15 @@ impl<'a> SourceScanner<'a> {
             module_path: &self.module_path,
             impl_types: &self.impl_types,
         }
+    }
+
+    fn builder_usage(&self, expression: &ExprCall) -> BuilderCallUse {
+        let address = expression as *const ExprCall as usize;
+        self.builder_usage_targets
+            .iter()
+            .rev()
+            .find(|(target, _)| *target == address)
+            .map_or(BuilderCallUse::Other, |(_, usage)| usage.clone())
     }
 
     fn record_expr_path(&mut self, expression: &ExprPath, call: Option<&ExprCall>) {
@@ -223,6 +237,7 @@ impl<'a> SourceScanner<'a> {
         }
 
         let original = path_segments(&expression.path).join("::");
+        let mut expression_constructions = Vec::new();
         for candidate in candidates {
             let Some((type_name, associated_item)) = forbidden_type_in_path(&candidate) else {
                 continue;
@@ -230,23 +245,27 @@ impl<'a> SourceScanner<'a> {
             let construction = DirectConstruction {
                 intentional_pr_review_constructor: type_name == "CodexAgent"
                     && associated_item.as_deref() == Some("new")
+                    && candidate
+                        == ["harness_agents", "codex", "CodexAgent", "new"].map(str::to_string)
                     && original == "CodexAgent::new"
                     && call.is_some_and(intentional_codex_review_call)
                     && self
                         .function_names
                         .last()
-                        .is_some_and(|name| name == "review"),
+                        .is_some_and(|name| name == "review")
+                    && self.inline_module_depth == 0,
                 type_name,
-                associated_item,
                 syntax: original.clone(),
                 module_path: self.module_path.join("::"),
-                is_call: call.is_some(),
                 enclosing_function: self.function_names.last().cloned(),
             };
-            if !self.analysis.direct_constructions.contains(&construction) {
-                self.analysis.direct_constructions.push(construction);
+            if !expression_constructions.contains(&construction) {
+                expression_constructions.push(construction);
             }
         }
+        self.analysis
+            .direct_constructions
+            .extend(expression_constructions);
     }
 
     fn scan_macro_tokens(&mut self, macro_: &Macro) {
@@ -293,6 +312,7 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
             return;
         };
         let parent_scopes = std::mem::take(&mut self.scopes);
+        self.inline_module_depth += 1;
         self.module_path.push(ident_name(&item.ident));
         self.scopes
             .push(alias_scope_from_items(items, &self.module_path));
@@ -301,6 +321,7 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
         }
         self.scopes.clear();
         self.module_path.pop();
+        self.inline_module_depth -= 1;
         self.scopes = parent_scopes;
     }
 
@@ -315,8 +336,46 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
         self.function_names.push(ident_name(&item.sig.ident));
+        let tail_target = item.block.stmts.last().and_then(|statement| {
+            let Stmt::Expr(expression, None) = statement else {
+                return None;
+            };
+            root_call(expression).map(|call| {
+                (
+                    call as *const ExprCall as usize,
+                    BuilderCallUse::TailExpression,
+                )
+            })
+        });
+        if let Some(target) = tail_target.clone() {
+            self.builder_usage_targets.push(target);
+        }
         visit::visit_item_fn(self, item);
+        if tail_target.is_some() {
+            self.builder_usage_targets.pop();
+        }
         self.function_names.pop();
+    }
+
+    fn visit_local(&mut self, local: &'ast Local) {
+        let target = local.init.as_ref().and_then(|init| {
+            let Pat::Ident(binding) = &local.pat else {
+                return None;
+            };
+            root_call(&init.expr).map(|call| {
+                (
+                    call as *const ExprCall as usize,
+                    BuilderCallUse::LetBinding(ident_name(&binding.ident)),
+                )
+            })
+        });
+        if let Some(target) = target.clone() {
+            self.builder_usage_targets.push(target);
+        }
+        visit::visit_local(self, local);
+        if target.is_some() {
+            self.builder_usage_targets.pop();
+        }
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
@@ -333,14 +392,17 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
         if let Expr::Path(function) = expression.func.as_ref() {
             if function.qself.is_none() {
                 let original = path_segments(&function.path);
+                let resolved = self.resolver().resolve(original.clone());
                 if is_canonical_builder_path(&original)
-                    && self
-                        .resolver()
-                        .resolve(original.clone())
-                        .iter()
-                        .any(|resolved| resolved == &original)
+                    && resolved.len() == 1
+                    && resolved.first() == Some(&original)
                 {
-                    self.analysis.direct_builder_calls.push(original);
+                    self.analysis.direct_builder_calls.push(BuilderCall {
+                        path: original,
+                        function: self.function_names.last().cloned(),
+                        usage: self.builder_usage(expression),
+                        top_level: self.inline_module_depth == 0,
+                    });
                 }
             }
             self.record_expr_path(function, Some(expression));
@@ -363,29 +425,57 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
 
     fn visit_expr_struct(&mut self, expression: &'ast ExprStruct) {
         let original = path_segments(&expression.path);
+        let mut expression_constructions = Vec::new();
         for resolved in self.resolver().resolve(original.clone()) {
             let Some((type_name, _)) = forbidden_type_in_path(&resolved) else {
                 continue;
             };
             let construction = DirectConstruction {
                 type_name,
-                associated_item: None,
                 syntax: format!("{} {{ .. }}", original.join("::")),
                 module_path: self.module_path.join("::"),
-                is_call: false,
                 enclosing_function: self.function_names.last().cloned(),
                 intentional_pr_review_constructor: false,
             };
-            if !self.analysis.direct_constructions.contains(&construction) {
-                self.analysis.direct_constructions.push(construction);
+            if !expression_constructions.contains(&construction) {
+                expression_constructions.push(construction);
             }
         }
+        self.analysis
+            .direct_constructions
+            .extend(expression_constructions);
         visit::visit_expr_struct(self, expression);
     }
 
     fn visit_macro(&mut self, macro_: &'ast Macro) {
         self.scan_macro_tokens(macro_);
         visit::visit_macro(self, macro_);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        if !matches!(item.vis, Visibility::Inherited) && use_tree_has_glob(&item.tree) {
+            self.analysis.public_glob_reexports += 1;
+        }
+        visit::visit_item_use(self, item);
+    }
+}
+
+fn root_call(expression: &Expr) -> Option<&ExprCall> {
+    match expression {
+        Expr::Call(call) => Some(call),
+        Expr::Group(group) => root_call(&group.expr),
+        Expr::Paren(paren) => root_call(&paren.expr),
+        Expr::Try(try_) => root_call(&try_.expr),
+        _ => None,
+    }
+}
+
+fn use_tree_has_glob(tree: &UseTree) -> bool {
+    match tree {
+        UseTree::Glob(_) => true,
+        UseTree::Group(group) => group.items.iter().any(use_tree_has_glob),
+        UseTree::Path(path) => use_tree_has_glob(&path.tree),
+        UseTree::Name(_) | UseTree::Rename(_) => false,
     }
 }
 
@@ -682,96 +772,24 @@ fn intentional_codex_review_call(call: &ExprCall) -> bool {
             .ends_with(&["SandboxMode".to_string(), "ReadOnlyWithNetwork".to_string()])
 }
 
-fn source_module_path(relative: &Path) -> Segments {
-    let relative = relative.strip_prefix("src").unwrap_or(relative);
-    let mut components = relative
-        .parent()
-        .into_iter()
-        .flat_map(Path::components)
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    let stem = relative
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default();
-    if !matches!(stem, "main" | "lib" | "mod") {
-        components.push(stem.to_string());
-    }
-    components
-}
-
-fn analyze_units(units: &[SourceUnit]) -> HashMap<PathBuf, SourceAnalysis> {
-    let mut crate_aliases = CrateAliases::default();
+pub(super) fn analyze_units(units: &[SourceUnit]) -> HashMap<PathBuf, SourceAnalysis> {
+    let mut aliases_by_crate = HashMap::<String, CrateAliases>::new();
     for unit in units {
-        collect_crate_aliases(&unit.file.items, &unit.module_path, &mut crate_aliases);
+        collect_crate_aliases(
+            &unit.file.items,
+            &unit.module_path,
+            aliases_by_crate.entry(unit.crate_id.clone()).or_default(),
+        );
     }
     units
         .iter()
         .map(|unit| {
-            let mut scanner = SourceScanner::new(&crate_aliases, unit.module_path.clone());
+            let crate_aliases = aliases_by_crate
+                .get(&unit.crate_id)
+                .expect("source crate aliases exist");
+            let mut scanner = SourceScanner::new(crate_aliases, unit.module_path.clone());
             scanner.visit_file(&unit.file);
             (unit.relative.clone(), scanner.analysis)
         })
         .collect()
-}
-
-pub(super) fn analyze_source(source: &str) -> syn::Result<SourceAnalysis> {
-    let unit = SourceUnit {
-        relative: PathBuf::from("src/main.rs"),
-        module_path: Vec::new(),
-        file: syn::parse_file(source)?,
-    };
-    Ok(analyze_units(&[unit])
-        .remove(Path::new("src/main.rs"))
-        .expect("single source analysis exists"))
-}
-
-pub(super) fn analyze_source_set(
-    sources: &[(&str, &str)],
-) -> syn::Result<HashMap<PathBuf, SourceAnalysis>> {
-    let mut units = Vec::new();
-    for (relative, source) in sources {
-        let relative = PathBuf::from(relative);
-        units.push(SourceUnit {
-            module_path: source_module_path(&relative),
-            relative,
-            file: syn::parse_file(source)?,
-        });
-    }
-    Ok(analyze_units(&units))
-}
-
-fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("readable source directory") {
-        let path = entry.expect("readable dir entry").path();
-        if path.is_dir() {
-            rust_sources(&path, out);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-pub(super) fn analyze_cli_sources() -> HashMap<PathBuf, SourceAnalysis> {
-    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut paths = Vec::new();
-    rust_sources(&crate_dir.join("src"), &mut paths);
-    paths.sort();
-    let units = paths
-        .into_iter()
-        .map(|path| {
-            let relative = path
-                .strip_prefix(&crate_dir)
-                .expect("CLI source stays within crate")
-                .to_path_buf();
-            let source = std::fs::read_to_string(&path).expect("readable CLI source");
-            SourceUnit {
-                module_path: source_module_path(&relative),
-                relative,
-                file: syn::parse_file(&source)
-                    .unwrap_or_else(|error| panic!("{} should parse: {error}", path.display())),
-            }
-        })
-        .collect::<Vec<_>>();
-    analyze_units(&units)
 }
