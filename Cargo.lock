@@ -1303,6 +1303,7 @@ dependencies = [
  "harness-skills",
  "harness-workflow",
  "libc",
+ "proc-macro2",
  "reqwest",
  "serde",
  "serde_json",

@@ -1,490 +1,338 @@
-//! Parity guard: every CLI entry point must build agents from the shared
-//! builders.
-//!
-//! The drift this prevents was not hypothetical. Four hand-assembled copies had
-//! diverged — the provider backpressure gate reached only `serve`,
-//! `reasoning_budget` only `serve` and `exec`, adapters only `serve` and the
-//! MCP server, and `anthropic-api` was missing from the MCP server entirely.
-//! Asserting equality between two registries at runtime cannot catch that,
-//! because the divergence lives in each call site's construction code. So this
-//! asserts the structural property instead: no entry point constructs backends
-//! itself, apart from the separately configured read-only PR review provider.
+//! Structural guard for configured agent construction in `harness-cli`.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-};
-use syn::{
-    visit::{self, Visit},
-    Expr, ExprCall, ExprPath, ExprStruct, ItemType, ItemUse, Path as SynPath, Type, UseTree,
-};
+#[path = "support/agent_registry_analysis.rs"]
+mod analysis;
 
-/// CLI paths that construct configured agents, and the exact shared-builder
-/// invocation each must make once.
-const REQUIRED_BUILDER_CALLS: [(&str, &str); 5] = [
-    (
-        "src/commands/serve.rs",
-        "harness_agents::builder::registry_from_config",
-    ),
-    (
-        "src/commands/exec.rs",
-        "harness_agents::builder::registry_from_config",
-    ),
-    ("src/gc.rs", "harness_agents::builder::registry_from_config"),
-    (
-        "src/cmd/mcp_server.rs",
-        "harness_agents::builder::registry_from_config",
-    ),
-    (
-        "src/cmd/pr.rs",
-        "harness_agents::builder::claude_agent_from_config",
-    ),
-];
-
-/// Types whose construction belongs to `harness_agents::builder`. Matching
-/// the type qualifier catches alternate and future associated constructors
-/// instead of maintaining a method-by-method denylist.
-const FORBIDDEN_TYPES: [&str; 7] = [
-    "AgentRegistry",
-    "ClaudeCodeAgent",
-    "CodexAgent",
-    "ClaudeAdapter",
-    "CodexAdapter",
-    "AnthropicApiAgent",
-    "ProviderBackpressureGate",
-];
-
-/// The PR review provider has its own config shape and intentionally creates
-/// one read-only Codex agent outside the normal agent registry.
-const ALLOWED_DIRECT_CONSTRUCTION: (&str, &str, &str, usize) =
-    ("src/cmd/pr.rs", "CodexAgent", "new", 1);
-
-#[derive(Debug, PartialEq, Eq)]
-struct DirectConstruction {
-    type_name: String,
-    associated_item: Option<String>,
-    syntax: String,
-    is_call: bool,
-}
-
-#[derive(Default)]
-struct SourceAnalysis {
-    called_paths: Vec<Vec<String>>,
-    direct_constructions: Vec<DirectConstruction>,
-}
-
-impl SourceAnalysis {
-    fn call_count(&self, expected_path: &str) -> usize {
-        let expected = expected_path.split("::").collect::<Vec<_>>();
-        self.called_paths
-            .iter()
-            .filter(|path| path_matches(path, &expected))
-            .count()
-    }
-}
-
-#[derive(Default)]
-struct Aliases {
-    paths: HashMap<String, Vec<String>>,
-}
-
-impl Aliases {
-    fn resolve_path(&self, path: &SynPath) -> Vec<String> {
-        self.resolve_segments(path_segments(path))
-    }
-
-    fn resolve_segments(&self, mut segments: Vec<String>) -> Vec<String> {
-        let mut visited = HashSet::new();
-        while let Some(first) = segments.first().cloned() {
-            let Some(target) = self.paths.get(&first) else {
-                break;
-            };
-            if !visited.insert(first) {
-                break;
-            }
-
-            let mut expanded = target.clone();
-            expanded.extend(segments.into_iter().skip(1));
-            segments = expanded;
-        }
-        segments
-    }
-
-    fn forbidden_type_at_path_end(&self, segments: &[String]) -> Option<String> {
-        let resolved = self.resolve_segments(segments.to_vec());
-        resolved
-            .last()
-            .filter(|name| is_forbidden_type(name))
-            .cloned()
-            .or_else(|| {
-                segments.last().and_then(|name| {
-                    let resolved_name = self.resolve_segments(vec![name.clone()]);
-                    resolved_name
-                        .last()
-                        .filter(|resolved| is_forbidden_type(resolved))
-                        .cloned()
-                })
-            })
-    }
-
-    fn forbidden_type_before_last(&self, segments: &[String]) -> Option<String> {
-        let resolved = self.resolve_segments(segments.to_vec());
-        resolved[..resolved.len().saturating_sub(1)]
-            .iter()
-            .rev()
-            .find(|name| is_forbidden_type(name))
-            .cloned()
-            .or_else(|| {
-                segments
-                    .get(..segments.len().saturating_sub(1))
-                    .and_then(|qualifiers| {
-                        qualifiers.iter().rev().find_map(|name| {
-                            self.forbidden_type_at_path_end(std::slice::from_ref(name))
-                        })
-                    })
-            })
-    }
-}
-
-#[derive(Default)]
-struct AliasCollector {
-    aliases: Aliases,
-}
-
-impl<'ast> Visit<'ast> for AliasCollector {
-    fn visit_item_use(&mut self, item: &'ast ItemUse) {
-        collect_use_aliases(&item.tree, &mut Vec::new(), &mut self.aliases.paths);
-        visit::visit_item_use(self, item);
-    }
-
-    fn visit_item_type(&mut self, item: &'ast ItemType) {
-        if let Type::Path(type_path) = item.ty.as_ref() {
-            if type_path.qself.is_none() {
-                self.aliases
-                    .paths
-                    .insert(item.ident.to_string(), path_segments(&type_path.path));
-            }
-        }
-        visit::visit_item_type(self, item);
-    }
-}
-
-struct SourceScanner<'a> {
-    aliases: &'a Aliases,
-    analysis: SourceAnalysis,
-}
-
-impl SourceScanner<'_> {
-    fn record_expr_path(&mut self, expression: &ExprPath, is_call: bool) {
-        if let Some(qself) = &expression.qself {
-            if let Type::Path(type_path) = qself.ty.as_ref() {
-                if let Some(type_name) = self
-                    .aliases
-                    .forbidden_type_at_path_end(&path_segments(&type_path.path))
-                {
-                    self.analysis.direct_constructions.push(DirectConstruction {
-                        type_name,
-                        associated_item: expression
-                            .path
-                            .segments
-                            .last()
-                            .map(|segment| segment.ident.to_string()),
-                        syntax: format!(
-                            "<{}>::{}",
-                            path_segments(&type_path.path).join("::"),
-                            path_segments(&expression.path).join("::")
-                        ),
-                        is_call,
-                    });
-                    return;
-                }
-            }
-        }
-
-        let original = path_segments(&expression.path);
-        let resolved = self.aliases.resolve_segments(original.clone());
-        let associated_item = resolved.last().cloned();
-        if let Some(type_name) = self.aliases.forbidden_type_before_last(&original) {
-            self.analysis.direct_constructions.push(DirectConstruction {
-                type_name,
-                associated_item,
-                syntax: original.join("::"),
-                is_call,
-            });
-        } else if let Some(type_name) = self.aliases.forbidden_type_at_path_end(&original) {
-            self.analysis.direct_constructions.push(DirectConstruction {
-                type_name,
-                associated_item: None,
-                syntax: original.join("::"),
-                is_call,
-            });
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for SourceScanner<'_> {
-    fn visit_expr_call(&mut self, expression: &'ast ExprCall) {
-        if let Expr::Path(function) = expression.func.as_ref() {
-            if function.qself.is_none() {
-                self.analysis
-                    .called_paths
-                    .push(self.aliases.resolve_path(&function.path));
-            }
-            self.record_expr_path(function, true);
-            if let Some(qself) = &function.qself {
-                visit::visit_qself(self, qself);
-            }
-            visit::visit_path(self, &function.path);
-            for argument in &expression.args {
-                self.visit_expr(argument);
-            }
-            return;
-        }
-        visit::visit_expr_call(self, expression);
-    }
-
-    fn visit_expr_path(&mut self, expression: &'ast ExprPath) {
-        self.record_expr_path(expression, false);
-        visit::visit_expr_path(self, expression);
-    }
-
-    fn visit_expr_struct(&mut self, expression: &'ast ExprStruct) {
-        let original = path_segments(&expression.path);
-        if let Some(type_name) = self.aliases.forbidden_type_at_path_end(&original) {
-            self.analysis.direct_constructions.push(DirectConstruction {
-                type_name,
-                associated_item: None,
-                syntax: format!("{} {{ .. }}", original.join("::")),
-                is_call: false,
-            });
-        }
-        visit::visit_expr_struct(self, expression);
-    }
-}
-
-fn crate_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn is_forbidden_type(name: &str) -> bool {
-    FORBIDDEN_TYPES.contains(&name)
-}
-
-fn path_segments(path: &SynPath) -> Vec<String> {
-    path.segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .collect()
-}
-
-fn path_matches(path: &[String], expected: &[&str]) -> bool {
-    path.iter().map(String::as_str).eq(expected.iter().copied())
-}
-
-fn collect_use_aliases(
-    tree: &UseTree,
-    prefix: &mut Vec<String>,
-    aliases: &mut HashMap<String, Vec<String>>,
-) {
-    match tree {
-        UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
-            collect_use_aliases(&path.tree, prefix, aliases);
-            prefix.pop();
-        }
-        UseTree::Name(name) => {
-            let imported = name.ident.to_string();
-            if imported == "self" {
-                if let Some(local_name) = prefix.last() {
-                    aliases.insert(local_name.clone(), prefix.clone());
-                }
-            } else {
-                let mut target = prefix.clone();
-                target.push(imported.clone());
-                aliases.insert(imported, target);
-            }
-        }
-        UseTree::Rename(rename) => {
-            let imported = rename.ident.to_string();
-            let mut target = prefix.clone();
-            if imported != "self" {
-                target.push(imported);
-            }
-            aliases.insert(rename.rename.to_string(), target);
-        }
-        UseTree::Group(group) => {
-            for item in &group.items {
-                collect_use_aliases(item, prefix, aliases);
-            }
-        }
-        UseTree::Glob(_) => {}
-    }
-}
-
-fn analyze_source(source: &str) -> syn::Result<SourceAnalysis> {
-    let file = syn::parse_file(source)?;
-    let mut collector = AliasCollector::default();
-    collector.visit_file(&file);
-
-    let mut scanner = SourceScanner {
-        aliases: &collector.aliases,
-        analysis: SourceAnalysis::default(),
-    };
-    scanner.visit_file(&file);
-    Ok(scanner.analysis)
-}
-
-fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir).expect("readable source directory");
-    for entry in entries {
-        let path = entry.expect("readable dir entry").path();
-        if path.is_dir() {
-            rust_sources(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-}
+use analysis::*;
+use std::path::Path;
 
 #[test]
-fn required_cli_paths_call_the_shared_builder() {
+fn required_cli_paths_call_the_shared_builder_directly() {
+    let analyses = analyze_cli_sources();
     for (relative, expected_call) in REQUIRED_BUILDER_CALLS {
-        let path = crate_dir().join(relative);
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("{} should be readable: {error}", path.display()));
-        let analysis = analyze_source(&source)
-            .unwrap_or_else(|error| panic!("{} should parse as Rust: {error}", path.display()));
+        let analysis = analyses
+            .get(Path::new(relative))
+            .unwrap_or_else(|| panic!("{relative} should be analyzed"));
         assert_eq!(
-            analysis.call_count(expected_call),
+            analysis.direct_builder_call_count(expected_call),
             1,
-            "{relative} must invoke `{expected_call}` exactly once"
+            "{relative} must directly invoke canonical `{expected_call}` exactly once"
         );
     }
 }
 
 #[test]
 fn no_cli_source_assembles_agent_backends_by_hand() {
-    let mut sources = Vec::new();
-    rust_sources(&crate_dir().join("src"), &mut sources);
-    sources.sort();
-    assert!(!sources.is_empty(), "lint found no sources to scan");
-
-    let (allowed_path, allowed_type, allowed_item, expected_count) = ALLOWED_DIRECT_CONSTRUCTION;
-    let allowed_source = std::fs::read_to_string(crate_dir().join(allowed_path))
-        .unwrap_or_else(|error| panic!("{allowed_path} should be readable: {error}"));
-    let allowed_analysis = analyze_source(&allowed_source)
-        .unwrap_or_else(|error| panic!("{allowed_path} should parse as Rust: {error}"));
-    assert_eq!(
-        allowed_analysis
-            .direct_constructions
-            .iter()
-            .filter(|construction| {
-                construction.type_name == allowed_type
-                    && construction.associated_item.as_deref() == Some(allowed_item)
-                    && construction.is_call
-            })
-            .count(),
-        expected_count,
-        "{allowed_path} must contain exactly {expected_count} intentional \
-         `{allowed_type}::{allowed_item}` call"
-    );
-
+    let mut allowed = 0;
     let mut violations = Vec::new();
-    for path in sources {
-        let source = std::fs::read_to_string(&path).expect("readable source");
-        let relative = path
-            .strip_prefix(crate_dir())
-            .expect("source should be inside harness-cli");
-        let analysis = analyze_source(&source)
-            .unwrap_or_else(|error| panic!("{} should parse as Rust: {error}", path.display()));
+    for (relative, analysis) in analyze_cli_sources() {
         for construction in analysis.direct_constructions {
-            if relative == Path::new(allowed_path)
-                && construction.type_name == allowed_type
-                && construction.associated_item.as_deref() == Some(allowed_item)
-                && construction.is_call
+            if relative == Path::new(ALLOWED_DIRECT_CONSTRUCTION_PATH)
+                && construction.intentional_pr_review_constructor
             {
+                allowed += 1;
                 continue;
             }
             violations.push(format!(
-                "{} — `{}` constructs `{}` outside harness_agents::builder",
+                "{} — `{}` constructs `{}` in {}::{:?}",
                 relative.display(),
                 construction.syntax,
-                construction.type_name
+                construction.type_name,
+                construction.module_path,
+                construction.enclosing_function
+            ));
+        }
+        for violation in analysis.macro_violations {
+            violations.push(format!(
+                "{} — macro `{}` contains potential `{}` construction tokens",
+                relative.display(),
+                violation.macro_path,
+                violation.forbidden_type
             ));
         }
     }
-
+    assert_eq!(
+        allowed, 1,
+        "{ALLOWED_DIRECT_CONSTRUCTION_PATH} must contain exactly the intentional read-only \
+         CodexAgent::new call in review"
+    );
     assert!(
         violations.is_empty(),
-        "agent backends must be constructed by `harness_agents::builder`, \
-         so every entry point gets the same configuration:\n{}",
+        "agent construction must stay in harness_agents::builder:\n{}",
         violations.join("\n")
     );
 }
 
 #[test]
-fn syntax_scan_ignores_comment_and_string_bait() {
-    let source = r#"
+fn syntax_scan_ignores_comments_and_string_literals() {
+    let analysis = analyze_source(
+        r#"
         fn bait() {
             // AgentRegistry::new();
             /* CodexAgent::new(); */
             let _ = "ClaudeCodeAgent::new()";
-            let _ = "harness_agents::builder::registry_from_config(";
+            stringify!("ProviderBackpressureGate::default()");
         }
-    "#;
-
-    let analysis = analyze_source(source).expect("bait source should parse");
+        "#,
+    )
+    .expect("bait source parses");
     assert!(analysis.direct_constructions.is_empty());
+    assert!(analysis.macro_violations.is_empty());
+}
+
+#[test]
+fn scoped_aliases_respect_sibling_and_local_shadowing_in_both_orders() {
+    let analysis = analyze_source(
+        r#"
+        mod forbidden_then_harmless {
+            mod a {
+                use harness_agents::registry::AgentRegistry as Registry;
+                fn build() { let _ = Registry::new("default"); }
+            }
+            mod b {
+                use harmless::Thing as Registry;
+                fn harmless() { let _ = Registry::new(); }
+            }
+        }
+        mod harmless_then_forbidden {
+            mod a {
+                use harmless::Thing as Registry;
+                fn harmless() { let _ = Registry::new(); }
+            }
+            mod b {
+                use harness_agents::registry::AgentRegistry as Registry;
+                fn build() { let _ = Registry::new("default"); }
+            }
+        }
+        fn forbidden_local_alias() {
+            type Registry = harness_agents::registry::AgentRegistry;
+            let _ = Registry::new("default");
+        }
+        fn harmless_local_alias() {
+            type Registry = harmless::Thing;
+            let _ = Registry::new();
+        }
+        mod reversed_local_aliases {
+            fn harmless() {
+                type Registry = harmless::Thing;
+                let _ = Registry::new();
+            }
+            fn forbidden() {
+                type Registry = harness_agents::registry::AgentRegistry;
+                let _ = Registry::new("default");
+            }
+        }
+        "#,
+    )
+    .expect("scoped aliases parse");
     assert_eq!(
-        analysis.call_count("harness_agents::builder::registry_from_config"),
-        0
+        analysis.direct_constructions.len(),
+        4,
+        "constructions: {:?}",
+        analysis.direct_constructions
+    );
+    assert!(analysis
+        .direct_constructions
+        .iter()
+        .all(|construction| construction.type_name == "AgentRegistry"));
+    let locations = analysis
+        .direct_constructions
+        .iter()
+        .map(|construction| {
+            (
+                construction.module_path.as_str(),
+                construction.enclosing_function.as_deref(),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        locations,
+        std::collections::HashSet::from([
+            ("forbidden_then_harmless::a", Some("build")),
+            ("harmless_then_forbidden::b", Some("build")),
+            ("", Some("forbidden_local_alias")),
+            ("reversed_local_aliases", Some("forbidden")),
+        ])
     );
 }
 
 #[test]
-fn syntax_scan_detects_renamed_and_type_aliased_construction() {
-    let renamed = r#"
-        use harness_agents::registry::AgentRegistry as Registry;
+fn cross_file_reexports_resolve_to_forbidden_types() {
+    let analyses = analyze_source_set(&[
+        (
+            "src/agent_alias.rs",
+            r#"
+            pub use harness_agents::registry::AgentRegistry as Registry;
+            pub type RegistryType = Registry;
+            "#,
+        ),
+        (
+            "src/consumer.rs",
+            r#"
+            use crate::agent_alias::RegistryType;
+            fn build() { let _ = RegistryType::new("default"); }
+            "#,
+        ),
+    ])
+    .expect("cross-file aliases parse");
+    assert_eq!(
+        analyses[Path::new("src/consumer.rs")]
+            .direct_constructions
+            .len(),
+        1
+    );
+}
 
-        fn build() {
-            let _ = Registry::new();
+#[test]
+fn builder_aliases_and_reexports_do_not_count_as_direct_calls() {
+    let analyses = analyze_source_set(&[
+        (
+            "src/build_alias.rs",
+            "pub use harness_agents::builder::registry_from_config as build;",
+        ),
+        (
+            "src/main.rs",
+            r#"
+            use harness_agents::builder::registry_from_config as aliased;
+            use crate::build_alias::build;
+            fn bait() {
+                aliased();
+                build();
+                harness_agents::builder::registry_from_config();
+            }
+            "#,
+        ),
+    ])
+    .expect("builder aliases parse");
+    assert_eq!(
+        analyses[Path::new("src/main.rs")]
+            .direct_builder_call_count("harness_agents::builder::registry_from_config"),
+        1
+    );
+
+    for bait in [
+        r#"
+        use harmless as harness_agents;
+        fn bait() { harness_agents::builder::registry_from_config(); }
+        "#,
+        r#"
+        mod harness_agents {
+            mod builder { fn registry_from_config() {} }
         }
-    "#;
-    let type_aliased = r#"
-        use harness_agents::codex::CodexAgent;
-        type ReviewAgent = CodexAgent;
-
-        fn build() {
-            let _ = ReviewAgent::new();
-        }
-    "#;
-
-    for source in [renamed, type_aliased] {
-        let analysis = analyze_source(source).expect("alias source should parse");
-        assert_eq!(analysis.direct_constructions.len(), 1);
+        fn bait() { harness_agents::builder::registry_from_config(); }
+        "#,
+    ] {
+        let analysis = analyze_source(bait).expect("shadowed canonical path parses");
+        assert_eq!(
+            analysis.direct_builder_call_count("harness_agents::builder::registry_from_config"),
+            0
+        );
     }
 }
 
 #[test]
-fn syntax_scan_detects_struct_literal_construction() {
-    let source = r#"
-        use harness_agents::codex::CodexAgent as ReviewAgent;
-
-        fn build() {
-            let _ = ReviewAgent {
-                field: unreachable!(),
-            };
+fn macro_tokens_fail_closed_without_literal_false_positives() {
+    let analysis = analyze_source(
+        r#"
+        use harness_agents::registry::AgentRegistry as Registry;
+        macro_rules! direct { () => { Registry::new("default") }; }
+        macro_rules! via_self { () => { Self::new("default") }; }
+        fn unused_builder_bait() {
+            harness_agents::builder::registry_from_config();
         }
-    "#;
-
-    let analysis = analyze_source(source).expect("struct literal source should parse");
+        fn invoke() {
+            direct!();
+            some_macro!(harness_agents::codex::CodexAgent::new());
+            some_macro!("ClaudeCodeAgent::new()");
+        }
+        "#,
+    )
+    .expect("macro source parses");
     assert_eq!(
-        analysis.direct_constructions,
-        [DirectConstruction {
-            type_name: "CodexAgent".to_string(),
-            associated_item: None,
-            syntax: "ReviewAgent { .. }".to_string(),
-            is_call: false,
-        }]
+        analysis.direct_builder_call_count("harness_agents::builder::registry_from_config"),
+        1
     );
+    assert_eq!(analysis.macro_violations.len(), 3);
+    assert!(analysis
+        .macro_violations
+        .iter()
+        .any(|violation| violation.forbidden_type == "AgentRegistry"));
+    assert!(analysis
+        .macro_violations
+        .iter()
+        .any(|violation| violation.forbidden_type == "CodexAgent"));
+    assert!(analysis
+        .macro_violations
+        .iter()
+        .any(|violation| violation.forbidden_type == "unresolved Self"));
+}
+
+#[test]
+fn constructor_references_calls_struct_tuple_unit_and_self_are_detected() {
+    let analysis = analyze_source(
+        r#"
+        use harness_agents::registry::AgentRegistry as Registry;
+        use harness_agents::registry::AgentRegistry as r#RawRegistry;
+        use harness_agents::codex::CodexAgent as ReviewAgent;
+        trait Build { fn build() -> Registry; }
+        impl Build for Registry {
+            fn build() -> Self { Self::new("default") }
+        }
+        fn forms() {
+            let _reference = Registry::new;
+            let _call = Registry::new("default");
+            let _raw = r#RawRegistry::new("default");
+            let _struct = ReviewAgent { field: unreachable!() };
+            let _tuple = ReviewAgent(unreachable!());
+            let _unit = ReviewAgent;
+        }
+        "#,
+    )
+    .expect("constructor forms parse");
+    assert_eq!(analysis.direct_constructions.len(), 7);
+}
+
+#[test]
+fn codex_exception_is_anchored_to_review_and_read_only_arguments() {
+    let valid = analyze_source(
+        r#"
+        use harness_agents::codex::CodexAgent;
+        use harness_core::config::agents::SandboxMode;
+        fn review() {
+            CodexAgent::new(review_config.cli_path.clone(), SandboxMode::ReadOnlyWithNetwork);
+        }
+        "#,
+    )
+    .expect("valid exception parses");
+    assert!(valid.direct_constructions[0].intentional_pr_review_constructor);
+
+    for invalid in [
+        r#"
+        use harness_agents::codex::CodexAgent;
+        use harness_core::config::agents::SandboxMode;
+        fn fix() {
+            CodexAgent::new(review_config.cli_path.clone(), SandboxMode::ReadOnlyWithNetwork);
+        }
+        "#,
+        r#"
+        use harness_agents::codex::CodexAgent;
+        use harness_core::config::agents::SandboxMode;
+        fn review() {
+            CodexAgent::new(review_config.cli_path.clone(), SandboxMode::DangerFullAccess);
+        }
+        "#,
+        r#"
+        use harness_agents::codex::CodexAgent as ReviewAgent;
+        use harness_core::config::agents::SandboxMode;
+        fn review() {
+            ReviewAgent::new(
+                review_config.cli_path.clone(),
+                SandboxMode::ReadOnlyWithNetwork,
+            );
+        }
+        "#,
+    ] {
+        let analysis = analyze_source(invalid).expect("invalid exception parses");
+        assert!(!analysis.direct_constructions[0].intentional_pr_review_constructor);
+    }
 }
