@@ -1,4 +1,7 @@
-use super::{workflow::load_workflow_config, HarnessConfig};
+use super::{
+    workflow::{load_workflow_config, load_workflow_document_with_base},
+    HarnessConfig,
+};
 
 fn workflow_breaker_harness_config_toml(workflow_section: &str) -> String {
     format!(
@@ -46,6 +49,24 @@ fn workflow_breaker_harness_config_toml(workflow_section: &str) -> String {
         {workflow_section}
         "#
     )
+}
+
+fn replace_first_toml_assignment(input: &str, prefix: &str, replacement: &str) -> String {
+    let mut replaced = false;
+    let output = input
+        .lines()
+        .map(|line| {
+            if !replaced && line.starts_with(prefix) {
+                replaced = true;
+                replacement
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(replaced, "missing TOML assignment starting with {prefix:?}");
+    output
 }
 
 #[test]
@@ -203,6 +224,127 @@ fn harness_config_retains_unrelated_nested_extension_compatibility() {
     let config = toml::from_str::<HarnessConfig>(&toml_str)
         .expect("unrelated fields in known and extension tables must remain compatible");
     assert!(config.workflow.completion_evidence_enforced);
+}
+
+#[test]
+fn harness_config_json_and_yaml_null_round_trip() {
+    let config = HarnessConfig::default();
+
+    let json = serde_json::to_string(&config).expect("default config must serialize as JSON");
+    assert!(json.contains("\"database_url\":null"));
+    let from_json: HarnessConfig =
+        serde_json::from_str(&json).expect("JSON null options must round-trip");
+    assert!(from_json.server.database_url.is_none());
+
+    let yaml = serde_yaml::to_string(&config).expect("default config must serialize as YAML");
+    assert!(yaml.contains("database_url: null"));
+    let from_yaml: HarnessConfig =
+        serde_yaml::from_str(&yaml).expect("YAML null options must round-trip");
+    assert!(from_yaml.server.database_url.is_none());
+}
+
+#[test]
+fn harness_config_preserves_native_toml_datetime_type_errors_and_spans() {
+    let serialized =
+        toml::to_string_pretty(&HarnessConfig::default()).expect("default config must serialize");
+    let cases = [
+        (
+            replace_first_toml_assignment(
+                &serialized,
+                "quiet_window_start =",
+                "quiet_window_start = 06:00:00",
+            ),
+            "expected a formatted time string",
+        ),
+        (
+            replace_first_toml_assignment(&serialized, "data_dir =", "data_dir = 1979-05-27"),
+            "expected path string",
+        ),
+        (
+            replace_first_toml_assignment(
+                &serialized,
+                "default_agent =",
+                "default_agent = 1979-05-27",
+            ),
+            "expected a string",
+        ),
+    ];
+
+    for (input, expected) in cases {
+        let error = toml::from_str::<HarnessConfig>(&input)
+            .expect_err("native TOML datetime values must retain typed-field rejection");
+        let message = error.to_string();
+        assert!(message.contains(expected), "{message}");
+        assert!(message.contains("TOML parse error at line"), "{message}");
+    }
+}
+
+#[test]
+fn harness_config_rejects_literal_dotted_reserved_keys() {
+    let base = workflow_breaker_harness_config_toml("");
+    let cases = [
+        format!("\"workflow.completion_evidence_enforced\" = false\n{base}"),
+        format!("[\"operator.runtime_completion_evidence_enforced\"]\nmode = \"audit\"\n{base}"),
+    ];
+
+    for input in cases {
+        let error = toml::from_str::<HarnessConfig>(&input)
+            .expect_err("literal dotted reserved keys must not mimic canonical placement");
+        assert!(error.to_string().contains("unknown field `"), "{error}");
+    }
+}
+
+#[test]
+fn harness_config_rejects_reserved_key_in_known_table_ignored_subtree() {
+    let input = workflow_breaker_harness_config_toml("").replacen(
+        "[agents]",
+        r#"[server.operator_extension]
+values = [{ nested = { completion_evidence_enforced = false } }]
+
+[agents]"#,
+        1,
+    );
+
+    let error = toml::from_str::<HarnessConfig>(&input)
+        .expect_err("ignored subtrees under known tables must be scanned recursively");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+}
+
+#[test]
+fn harness_config_accepts_unrelated_datetime_in_known_table_ignored_subtree() {
+    let input = workflow_breaker_harness_config_toml("").replacen(
+        "[agents]",
+        r#"[server.operator_extension]
+values = [{ observed_at = 1979-05-27T07:32:00Z, mode = "audit" }]
+
+[agents]"#,
+        1,
+    );
+
+    let config = toml::from_str::<HarnessConfig>(&input)
+        .expect("recursive ignored-value scanning must preserve unrelated TOML values");
+    assert!(config.workflow.completion_evidence_enforced);
+}
+
+#[test]
+fn harness_config_scans_json_arrays_in_extensions() {
+    let mut json =
+        serde_json::to_value(HarnessConfig::default()).expect("default config must serialize");
+    json.as_object_mut()
+        .expect("config must serialize as a map")
+        .insert(
+            "operator_extension".to_string(),
+            serde_json::json!({
+                "values": [{"completion_evidence_enforced": false}]
+            }),
+        );
+    let json_error = serde_json::from_value::<HarnessConfig>(json)
+        .expect_err("reserved keys in JSON extension arrays must fail");
+    assert!(json_error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
 }
 
 #[test]
@@ -368,6 +510,82 @@ operator_extension:
         config.workflow.id.as_deref(),
         Some("nested-extension-compatibility")
     );
+    Ok(())
+}
+
+#[test]
+fn project_workflow_rejects_reserved_keys_in_sequences_tags_and_dotted_keys() -> anyhow::Result<()>
+{
+    let cases = [
+        (
+            "operator_extension:\n  values:\n    - completion_evidence_enforced: false",
+            "completion_evidence_enforced",
+        ),
+        (
+            "operator_extension:\n  nested: !audit\n    runtime_completion_evidence_enforced: false",
+            "runtime_completion_evidence_enforced",
+        ),
+        (
+            "operator_extension:\n  nested:\n    ? !reserved completion_evidence_enforced\n    : false",
+            "completion_evidence_enforced",
+        ),
+        (
+            "\"workflow.completion_evidence_enforced\": false",
+            "completion_evidence_enforced",
+        ),
+    ];
+
+    for (front_matter, field) in cases {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            format!("---\n{front_matter}\n---\n"),
+        )?;
+        let error = load_workflow_config(dir.path())
+            .expect_err("reserved keys in any project workflow shape must fail");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unknown field `{field}`")),
+            "{error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn project_workflow_validates_base_before_overriding_extension() -> anyhow::Result<()> {
+    let base_dir = tempfile::tempdir()?;
+    let project_dir = tempfile::tempdir()?;
+    let base_path = base_dir.path().join("WORKFLOW.md");
+    std::fs::write(
+        &base_path,
+        "---\noperator_extension:\n  completion_evidence_enforced: false\n---\n",
+    )?;
+    std::fs::write(
+        project_dir.path().join("WORKFLOW.md"),
+        "---\noperator_extension: replaced\n---\n",
+    )?;
+
+    let error = load_workflow_document_with_base(project_dir.path(), Some(&base_path))
+        .expect_err("a repo override must not hide a reserved key in the base workflow");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+    Ok(())
+}
+
+#[test]
+fn project_workflow_accepts_unrelated_tagged_extension() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        "---\nworkflow:\n  id: tagged-extension\noperator_extension: !audit\n  values: [one, two]\n---\n",
+    )?;
+
+    let config = load_workflow_config(dir.path())
+        .expect("unrelated tagged extension values must remain compatible");
+    assert_eq!(config.workflow.id.as_deref(), Some("tagged-extension"));
     Ok(())
 }
 

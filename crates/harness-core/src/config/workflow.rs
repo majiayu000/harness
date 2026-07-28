@@ -577,6 +577,7 @@ fn read_workflow_file(path: &Path) -> anyhow::Result<Option<LoadedWorkflowFile>>
             )
         })?,
     };
+    reject_misplaced_completion_evidence_fields(&value, &path.display().to_string())?;
     Ok(Some(LoadedWorkflowFile {
         front_matter: value,
         body: body.trim().to_string(),
@@ -625,7 +626,8 @@ fn reject_misplaced_completion_evidence_fields(
             serde_yaml::Value::Mapping(fields) => fields.iter().find_map(|(field, nested)| {
                 field
                     .as_str()
-                    .filter(|field| super::COMPLETION_EVIDENCE_CONFIG_FIELDS.contains(field))
+                    .and_then(super::completion_evidence_config_field)
+                    .or_else(|| find_reserved_field(field))
                     .or_else(|| find_reserved_field(nested))
             }),
             serde_yaml::Value::Sequence(values) => values.iter().find_map(find_reserved_field),
@@ -633,7 +635,6 @@ fn reject_misplaced_completion_evidence_fields(
             _ => None,
         }
     }
-
     if let Some(field) = find_reserved_field(value) {
         anyhow::bail!(
             "failed to parse merged workflow front matter ({source_path}): unknown field `{field}`"
@@ -656,7 +657,7 @@ pub fn load_workflow_document(project_root: &Path) -> anyhow::Result<WorkflowDoc
 
 /// Core resolution with an explicit base path (kept separate from the global
 /// registration so it can be unit-tested without touching process state).
-fn load_workflow_document_with_base(
+pub(super) fn load_workflow_document_with_base(
     project_root: &Path,
     base_path: Option<&Path>,
 ) -> anyhow::Result<WorkflowDocument> {
@@ -713,7 +714,6 @@ fn load_workflow_document_with_base(
         }
     };
 
-    reject_misplaced_completion_evidence_fields(&merged_value, &source_path)?;
     let mut config: WorkflowConfig = match merged_value {
         serde_yaml::Value::Null => WorkflowConfig::default(),
         value => serde_yaml::from_value(value).map_err(|e| {

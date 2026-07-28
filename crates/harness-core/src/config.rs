@@ -16,6 +16,8 @@ pub mod stall_timeout;
 pub mod workflow;
 pub mod workflow_circuit_breaker;
 
+mod reserved_key_deserializer;
+
 use self::agents::*;
 use self::alerting::AlertingConfig;
 use self::intake::*;
@@ -25,7 +27,7 @@ use self::misc::*;
 use self::observe::*;
 use self::server::*;
 use self::workflow_circuit_breaker::*;
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
 const COMPLETION_EVIDENCE_CONFIG_FIELDS: [&str; 2] = [
@@ -33,26 +35,13 @@ const COMPLETION_EVIDENCE_CONFIG_FIELDS: [&str; 2] = [
     "runtime_completion_evidence_enforced",
 ];
 
-fn find_misplaced_completion_evidence_field(
-    value: &toml::Value,
-    is_root: bool,
-    is_canonical_workflow_table: bool,
-) -> Option<&str> {
-    match value {
-        toml::Value::Table(fields) => fields.iter().find_map(|(field, nested)| {
-            let is_canonical =
-                is_canonical_workflow_table && field == COMPLETION_EVIDENCE_CONFIG_FIELDS[0];
-            if COMPLETION_EVIDENCE_CONFIG_FIELDS.contains(&field.as_str()) && !is_canonical {
-                return Some(field.as_str());
-            }
-
-            find_misplaced_completion_evidence_field(nested, false, is_root && field == "workflow")
-        }),
-        toml::Value::Array(values) => values
+fn completion_evidence_config_field(key: &str) -> Option<&'static str> {
+    key.split('.').find_map(|component| {
+        COMPLETION_EVIDENCE_CONFIG_FIELDS
             .iter()
-            .find_map(|nested| find_misplaced_completion_evidence_field(nested, false, false)),
-        _ => None,
-    }
+            .copied()
+            .find(|field| *field == component)
+    })
 }
 
 /// A project entry declared in the config file under `[[projects]]`.
@@ -250,11 +239,7 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             _unknown_fields: BTreeMap<String, serde::de::IgnoredAny>,
         }
 
-        let value = toml::Value::deserialize(deserializer)?;
-        if let Some(field) = find_misplaced_completion_evidence_field(&value, true, false) {
-            return Err(D::Error::custom(format!("unknown field `{field}`")));
-        }
-        let input = HarnessConfigInput::deserialize(value).map_err(D::Error::custom)?;
+        let input: HarnessConfigInput = reserved_key_deserializer::deserialize(deserializer)?;
         let mut config = Self {
             server: input.server,
             agents: input.agents,
