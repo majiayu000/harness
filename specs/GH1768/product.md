@@ -26,6 +26,8 @@ unreliable at scale.
 - Run the suite on a schedule in CI with a loud failure on regression.
 - Emit typed eval-outcome events into the observe stream so downstream
   consumers (skill governance, GC signals) can attribute measured quality.
+- Restore the GH1454 scoped-CI case with a versioned, evaluator-owned verifier
+  that runs against its historical candidate workspace.
 
 ## Non-Goals
 
@@ -86,6 +88,10 @@ unreliable at scale.
     as today.
 12. **B-012:** Re-running `harness eval run` with the same manifest and run id
     refuses to overwrite an existing completed report for that run id.
+13. **B-013:** The GH1454 scoped-CI benchmark is restored only when its
+    verifier is evaluator-owned, versioned, executed against the pinned
+    candidate workspace, and excluded from the agent prompt. The accepted
+    gold patch must pass it and the pinned base must fail it.
 
 ## Acceptance Criteria
 
@@ -110,6 +116,10 @@ unreliable at scale.
       `budget-exhausted` and the run as failed.
 - [ ] Idempotency test: duplicate run id against an existing completed report
       is refused without modifying the original.
+- [ ] Historical verifier test: `gh1454_ci_contract_v1` fails the pinned
+      GH1454 base, passes its accepted gold patch, runs from evaluator-owned
+      bytes rather than the candidate checkout, and records its verifier
+      digest in evidence.
 
 ## Boundary Checklist
 

@@ -15,7 +15,7 @@ workspace, burning quota and flooding session logs.
 ## 2. Evidence
 
 Audit of 132 Codex implx sessions (2026-06-30 → 2026-07-04) driven by the harness
-runtime and SpecRail queue workflows. On 2026-07-02 between 18:50 and 19:25 the
+runtime and agent queue workflows. On 2026-07-02 between 18:50 and 19:25 the
 runtime respawned near-identical dead Codex jobs every ~30–60s across 7
 `runtime-wf-repo-backlog-*` workspaces plus `issue_1415` / `issue_1416` /
 `issue_1417` — approximately 248 sessions in 35 minutes, each ending:
