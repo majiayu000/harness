@@ -78,8 +78,8 @@ jobs:
           python-version: "3.x"
       - name: Install test dependencies
         run: python3 -m pip install pytest
-      - name: Test task event liveness
-        run: python3 -m pytest -q tests/test_task_event_liveness.py
+      - name: Test repository contracts
+        run: python3 -m pytest -q tests
       - name: Check committed whitespace
         run: |
           set -euo pipefail

@@ -63,10 +63,7 @@ case_id = "gh1454-scoped-ci-jobs"
 repo = "majiayu000/harness"
 issue = 1454
 base_commit = "9c0099ad458e82fd377fd20a8e288a46722762ef"
-verify_commands = [
-  "bash -n .githooks/pre-commit",
-  "python3 -c 'from pathlib import Path as P; c=P(\".github/workflows/ci.yml\").read_text(); h=P(\".githooks/pre-commit\").read_text(); assert not any(line.strip() == \"check:\" for line in c.splitlines()), \"check job still exists in ci.yml\"; assert c.count(\"bun run build\") == 1, \"bun run build count mismatch\"; assert all(x in c for x in (\"steps.filter.outputs.workspace\",\"steps.filter.outputs.other_crates\",\"Compute test scope\",\"steps.scope.outputs.packages\",\"actions/upload-artifact@v4\",\"actions/download-artifact@v4\",\"needs.web-build.result\")), \"missing required ci.yml steps\"; assert all(x in h for x in (\"git diff --cached --name-only\",\"cargo clippy $scope\")), \"missing required pre-commit hooks\"'",
-]
+verify_commands = ["python3 -m pytest -q tests/test_ci_contract.py"]
 
 # PR #1446 closed GH-1430.
 [[cases]]
