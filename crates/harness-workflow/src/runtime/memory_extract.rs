@@ -576,6 +576,13 @@ mod tests {
             .with_validation(ValidationRecord::new(
                 "cargo test -p harness-workflow memory_extract",
                 "passed",
+            ))
+            .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([{
+                    "command": "cargo test -p harness-workflow memory_extract",
+                    "exit_code": 0,
+                }]),
             )),
         );
 
@@ -610,6 +617,13 @@ mod tests {
             .with_validation(ValidationRecord::new(
                 "cargo test -p harness-workflow memory_extract",
                 "passed",
+            ))
+            .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([{
+                    "command": "cargo test -p harness-workflow memory_extract",
+                    "exit_code": 0,
+                }]),
             )),
         );
 

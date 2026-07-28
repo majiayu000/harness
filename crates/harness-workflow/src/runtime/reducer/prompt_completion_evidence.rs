@@ -75,62 +75,142 @@ fn enforced() -> bool {
 fn resolve_completion_evidence(
     result: &ActivityResult,
 ) -> Result<PromptCompletionEvidence, String> {
-    if let Some(artifact) = find_artifact(result, PROMPT_VALIDATION_REPORT_ARTIFACT) {
-        let entries = artifact.as_array().ok_or_else(|| {
-            format!("`{PROMPT_VALIDATION_REPORT_ARTIFACT}` must be an array of {{command, exit_code}} entries")
-        })?;
-        if entries.is_empty() {
-            return Err(format!(
-                "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` is empty; report the commands you ran or supply `{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}`"
-            ));
+    let mut invalid_alternatives = Vec::new();
+    for artifact in artifacts_of_type(result, PROMPT_VALIDATION_REPORT_ARTIFACT) {
+        match validation_report_evidence(artifact) {
+            Ok(evidence) => return Ok(evidence),
+            Err(error) => invalid_alternatives.push(error),
         }
-        let mut failures = 0usize;
-        for entry in entries {
-            let command = entry.get("command").and_then(Value::as_str);
-            let exit_code = entry.get("exit_code").and_then(Value::as_i64);
-            match (command, exit_code) {
-                (Some(command), Some(exit_code)) => {
-                    if command.trim().is_empty() {
-                        return Err(format!(
-                            "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` entry has an empty `command`"
-                        ));
-                    }
-                    if exit_code != 0 {
-                        failures += 1;
-                    }
-                }
-                _ => {
-                    return Err(format!(
-                        "each `{PROMPT_VALIDATION_REPORT_ARTIFACT}` entry needs a string `command` and an integer `exit_code`"
-                    ));
-                }
-            }
-        }
-        return Ok(PromptCompletionEvidence::ValidationReport {
-            commands: entries.len(),
-            failures,
-        });
     }
-    if let Some(artifact) = find_artifact(result, PROMPT_NO_CHANGE_RATIONALE_ARTIFACT) {
-        let rationale = artifact.as_str().ok_or_else(|| {
-            format!("`{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}` must be a string explaining why no change was made")
-        })?;
-        if rationale.trim().is_empty() {
-            return Err(format!(
-                "`{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}` is empty; state why no change was made"
-            ));
+    for artifact in artifacts_of_type(result, PROMPT_NO_CHANGE_RATIONALE_ARTIFACT) {
+        match no_change_rationale_evidence(artifact) {
+            Ok(evidence) => return Ok(evidence),
+            Err(error) => invalid_alternatives.push(error),
         }
-        return Ok(PromptCompletionEvidence::NoChangeRationale);
     }
-    Err(format!(
-        "completion requires a `{PROMPT_VALIDATION_REPORT_ARTIFACT}` artifact ([{{command, exit_code}}]) or a `{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}` string artifact"
-    ))
+    if invalid_alternatives.is_empty() {
+        Err(format!(
+            "completion requires a `{PROMPT_VALIDATION_REPORT_ARTIFACT}` artifact ([{{command, exit_code}}]) or a `{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}` string artifact"
+        ))
+    } else {
+        Err(invalid_alternatives.join("; "))
+    }
 }
 
-fn find_artifact<'a>(result: &'a ActivityResult, artifact_type: &str) -> Option<&'a Value> {
+fn validation_report_evidence(artifact: &Value) -> Result<PromptCompletionEvidence, String> {
+    let entries = artifact.as_array().ok_or_else(|| {
+        format!(
+            "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` must be an array of {{command, exit_code}} entries"
+        )
+    })?;
+    if entries.is_empty() {
+        return Err(format!(
+            "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` is empty; report the commands you ran or supply `{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}`"
+        ));
+    }
+    let mut failures = 0usize;
+    for entry in entries {
+        let command = entry.get("command").and_then(Value::as_str);
+        let exit_code = entry.get("exit_code").and_then(Value::as_i64);
+        match (command, exit_code) {
+            (Some(command), Some(exit_code)) => {
+                if command.trim().is_empty() {
+                    return Err(format!(
+                        "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` entry has an empty `command`"
+                    ));
+                }
+                if exit_code != 0 {
+                    failures += 1;
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "each `{PROMPT_VALIDATION_REPORT_ARTIFACT}` entry needs a string `command` and an integer `exit_code`"
+                ));
+            }
+        }
+    }
+    Ok(PromptCompletionEvidence::ValidationReport {
+        commands: entries.len(),
+        failures,
+    })
+}
+
+fn no_change_rationale_evidence(artifact: &Value) -> Result<PromptCompletionEvidence, String> {
+    let rationale = artifact.as_str().ok_or_else(|| {
+        format!(
+            "`{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}` must be a string explaining why no change was made"
+        )
+    })?;
+    if rationale.trim().is_empty() {
+        return Err(format!(
+            "`{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}` is empty; state why no change was made"
+        ));
+    }
+    Ok(PromptCompletionEvidence::NoChangeRationale)
+}
+
+fn artifacts_of_type<'a>(
+    result: &'a ActivityResult,
+    artifact_type: &'a str,
+) -> impl Iterator<Item = &'a Value> {
     result
         .artifacts
         .iter()
-        .find(|artifact| artifact.artifact_type == artifact_type)
+        .filter(move |artifact| artifact.artifact_type == artifact_type)
         .map(|artifact| &artifact.artifact)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::model::ActivityArtifact;
+    use serde_json::json;
+
+    fn result_with_artifacts(
+        artifacts: impl IntoIterator<Item = ActivityArtifact>,
+    ) -> ActivityResult {
+        artifacts.into_iter().fold(
+            ActivityResult::succeeded("implement_prompt", "Prompt task completed."),
+            ActivityResult::with_artifact,
+        )
+    }
+
+    #[test]
+    fn valid_no_change_rationale_wins_over_a_malformed_validation_report() {
+        let result = result_with_artifacts([
+            ActivityArtifact::new(PROMPT_VALIDATION_REPORT_ARTIFACT, json!([])),
+            ActivityArtifact::new(
+                PROMPT_NO_CHANGE_RATIONALE_ARTIFACT,
+                json!("No repository change was necessary."),
+            ),
+        ]);
+
+        assert!(matches!(
+            resolve_completion_evidence(&result),
+            Ok(PromptCompletionEvidence::NoChangeRationale)
+        ));
+    }
+
+    #[test]
+    fn later_valid_validation_report_wins_over_an_earlier_malformed_report() {
+        let result = result_with_artifacts([
+            ActivityArtifact::new(
+                PROMPT_VALIDATION_REPORT_ARTIFACT,
+                json!([{ "command": "cargo test" }]),
+            ),
+            ActivityArtifact::new(
+                PROMPT_VALIDATION_REPORT_ARTIFACT,
+                json!([{ "command": "cargo test", "exit_code": 0 }]),
+            ),
+        ]);
+
+        assert!(matches!(
+            resolve_completion_evidence(&result),
+            Ok(PromptCompletionEvidence::ValidationReport {
+                commands: 1,
+                failures: 0
+            })
+        ));
+    }
 }

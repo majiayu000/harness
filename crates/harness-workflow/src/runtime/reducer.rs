@@ -48,10 +48,7 @@ use super::model::{
     WorkflowEvent, WorkflowInstance,
 };
 use super::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
-use super::prompt_task::{
-    parse_external_state_signal, prompt_continuation_state_from_data, PROMPT_TASK_DEFINITION_ID,
-    PROMPT_TASK_IMPLEMENT_ACTIVITY,
-};
+use super::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use super::state_registry::decision_validator_for_definition;
 use super::state_registry::{resolve_declarative_definition, DeclarativeDefinitionResolution};
@@ -253,11 +250,6 @@ fn reduce_success(
     }
 
     if prompt_task_activity_matches(instance, result) {
-        if let Some(reason) = prompt_task_success_contract_error(instance, result) {
-            return Some(invalid_agent_output_blocked_decision(
-                instance, event, result, reason,
-            ));
-        }
         return prompt_task_success_decision(instance, event, result);
     }
 
@@ -490,13 +482,6 @@ fn structured_decision_validates(
     {
         return false;
     }
-    if prompt_task_activity_matches(instance, result)
-        && decision.next_state == "done"
-        && prompt_task_success_contract_error(instance, result).is_some()
-    {
-        return false;
-    }
-
     let Some(validator) = decision_validator_for_definition(&instance.definition_id) else {
         return true;
     };
@@ -521,41 +506,6 @@ fn prompt_task_activity_matches(instance: &WorkflowInstance, result: &ActivityRe
     )
 }
 
-/// The outer structured-output gate. It fires before the prompt-task reducer,
-/// so its message must name the same two artifacts the reducer demands —
-/// otherwise a result with no evidence at all would be told only that
-/// "validation evidence" was missing, while a result carrying agent prose would
-/// get the precise reason.
-fn prompt_task_success_contract_error(
-    instance: &WorkflowInstance,
-    result: &ActivityResult,
-) -> Option<&'static str> {
-    if prompt_task_has_validation_evidence(result) {
-        return None;
-    }
-    const MISSING: &str = "implement_prompt succeeded without completion evidence: attach a validation_report artifact ([{command, exit_code}]) or a no_change_rationale string artifact";
-    match prompt_continuation_state_from_data(&instance.data) {
-        Ok(Some(continuation)) => match parse_external_state_signal(result) {
-            Ok(signal) if continuation.policy.active_states.contains(&signal.state) => None,
-            Err(_) => None,
-            _ => Some(MISSING),
-        },
-        Ok(None) => Some(MISSING),
-        Err(_) => None,
-    }
-}
-
-fn prompt_task_has_validation_evidence(result: &ActivityResult) -> bool {
-    result
-        .validation
-        .iter()
-        .any(|record| !record.command.trim().is_empty())
-        || result
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.artifact_type == "validation_report")
-}
-
 #[cfg(test)]
 #[path = "reducer/declarative_tests.rs"]
 mod declarative_tests;
@@ -564,8 +514,8 @@ mod declarative_tests;
 mod tests {
     use super::*;
     use crate::runtime::model::{
-        ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowEvent,
-        WorkflowInstance, WorkflowSubject,
+        ActivityArtifact, ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType,
+        WorkflowEvent, WorkflowInstance, WorkflowSubject,
     };
     use crate::runtime::validator::{DecisionValidator, ValidationContext};
     use chrono::Utc;
@@ -594,7 +544,7 @@ mod tests {
             anyhow::anyhow!("prompt success without validation evidence should block")
         })?;
 
-        assert_eq!(decision.decision, "block_invalid_agent_output");
+        assert_eq!(decision.decision, "prompt_completion_evidence_missing");
         assert_eq!(decision.next_state, "blocked");
         assert!(decision
             .commands
@@ -609,6 +559,38 @@ mod tests {
             &decision,
             &ValidationContext::new("runtime-1", Utc::now()),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_task_no_change_rationale_reaches_done_through_runtime_reducer() -> anyhow::Result<()>
+    {
+        let instance = WorkflowInstance::new(
+            PROMPT_TASK_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("prompt", "task-123"),
+        );
+        let result = ActivityResult::succeeded(
+            PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "No implementation change was needed.",
+        )
+        .with_artifact(ActivityArtifact::new(
+            "no_change_rationale",
+            json!("The requested behavior is already present and verified."),
+        ));
+        let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
+            .with_payload(json!({
+                "command_id": "command-1",
+                "runtime_job_id": "job-1",
+                "activity_result": result,
+            }));
+
+        let decision = reduce_runtime_job_completed(&instance, &event)?
+            .ok_or_else(|| anyhow::anyhow!("prompt completion should produce a decision"))?;
+
+        assert_eq!(decision.decision, "finish_prompt_task");
+        assert_eq!(decision.next_state, "done");
         Ok(())
     }
 

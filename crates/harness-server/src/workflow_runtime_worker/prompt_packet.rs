@@ -380,14 +380,16 @@ pub(super) fn activity_result_schema(
         schema["transition_contract"]["on_succeeded"] = json!({
             "reducer_next_state": "implementing_when_external_state_is_active_else_done; malformed_or_missing_signal_blocks",
             "accepted_signals": ["external_state"],
-            "success_requires": "Exactly one external_state signal with an object payload containing a non-empty string state. Active states continue within the configured attempt and no-progress bounds. Settled states still require validation evidence before done."
+            "success_requires": "Exactly one external_state signal with an object payload containing a non-empty string state. Active states continue within the configured attempt and no-progress bounds. Settled states still require either a validation_report artifact — a non-empty array of {command, exit_code} entries — or a nonblank no_change_rationale string artifact before done."
         });
         schema["activity_contract"]["accepted_signals"] = json!(["external_state"]);
         schema["activity_contract"]["success_requires"] = json!(
-            "exactly_one_external_state_signal; settled external states also require validation evidence"
+            "exactly_one_external_state_signal; settled external states also require a validation_report artifact ([{command, exit_code}]) or no_change_rationale string artifact"
         );
         schema["agent_summary_contract"]["artifacts"]["validation_report"]["required_when"] =
-            json!("The reported external_state is settled and no validation records are present.");
+            json!("The reported external_state is settled and validation commands were run; use this or no_change_rationale.");
+        schema["agent_summary_contract"]["artifacts"]["no_change_rationale"]["required_when"] =
+            json!("The reported external_state is settled and no repository change was needed; use this or validation_report.");
     }
     schema
 }
@@ -642,8 +644,19 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_not_include": ["workflow table mutations", "unverified merge claims"],
             "artifacts": {
                 "validation_report": {
-                    "required_when": "No validation records are present in the activity result.",
-                    "fields": ["commands", "passed", "failed", "blocked"]
+                    "required_when": "The prompt task is ready to complete and validation commands were run; use this or no_change_rationale.",
+                    "type": "array",
+                    "min_items": 1,
+                    "item_fields": ["command", "exit_code"],
+                    "field_contract": {
+                        "command": "nonblank string",
+                        "exit_code": "integer; report non-zero exits truthfully"
+                    }
+                },
+                "no_change_rationale": {
+                    "required_when": "The prompt task is ready to complete and no repository change was needed; use this or validation_report.",
+                    "type": "string",
+                    "non_blank": true
                 }
             }
         }),
