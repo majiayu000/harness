@@ -2,7 +2,7 @@
 
 # Harness
 
-**Run fleets of parallel coding agents with governance — orchestrate, police, review, and observe Claude Code / Codex at scale.**
+**Ship code with a fleet of AI agents you can actually trust — orchestrated, policed, reviewed, and observable.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](Cargo.toml)
@@ -29,6 +29,127 @@
 AI development is no longer one agent in one terminal — it is fleets of agents working in parallel across issues, branches, and repositories. The hard problems move up a level: who assigns the work, what each agent is allowed to do, who reviews the output, and what happens when a run goes wrong at 3 a.m.
 
 Harness is a Rust-native control plane for that fleet. It wraps AI coding agents (Claude Code, Codex, Anthropic API) with structured lifecycle management, policy enforcement, and continuous feedback loops. Instead of replacing agents, it standardizes how they run, what they're allowed to do, and how their output is reviewed.
+
+## Install
+
+Build from source (no prebuilt binaries or Homebrew formula yet):
+
+```bash
+git clone https://github.com/majiayu000/harness.git
+cd harness
+cargo build --release -p harness-cli
+# binary at ./target/release/harness
+```
+
+Requires Rust 1.88+. A fresh release build also requires Bun 1.1+ because it
+embeds the web dashboard; if `web/dist` is already built, the release build can
+reuse it without Bun. Postgres and an API authentication token are only needed
+for the server / fleet features below; a GitHub token is additionally needed
+for GitHub integration.
+
+## Quickstart: run one agent task
+
+Install one local coding runtime on your `PATH`: either
+[`codex`](https://github.com/openai/codex) or
+[`claude`](https://docs.anthropic.com/en/docs/claude-code). Run Harness as an
+unprivileged OS user: `--drop-sudo` defaults to `true`, so `harness exec`
+rejects root and sudo environments. Only pass `--drop-sudo=false` when elevated
+execution is deliberate.
+
+On Linux, the default `workspace-write` sandbox also requires
+`harness-landlock` or [`bwrap`](https://github.com/containers/bubblewrap) on
+`PATH`; install your distribution's Bubblewrap package if you do not have the
+Landlock helper. Harness fails closed when neither helper is available.
+
+```bash
+# With Codex CLI (Linux or macOS)
+./target/release/harness exec --agent codex \
+  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
+
+# Or with Claude Code CLI on Linux
+./target/release/harness exec --agent claude \
+  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
+
+# Claude Code on macOS cannot run under the Seatbelt workspace-write sandbox
+./target/release/harness exec --agent claude --sandbox-mode danger-full-access \
+  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
+```
+
+Harness runs the explicitly selected coding agent against the current directory
+and prints the agent's final response to stdout. The default is
+`workspace-write`. The macOS Claude exception grants the agent unrestricted
+filesystem and process access; use it only in a trusted repository and review
+the resulting changes.
+
+The `anthropic-api` adapter is for text generation: it sends the prompt without
+repository context or tools, so it cannot inspect or modify the project in this
+coding example.
+
+Useful flags: `--project <dir>`, `--agent claude|codex|anthropic-api`,
+`--model <id>`, `--sandbox-mode <mode>`, `--output-file result.md`. Supported
+sandbox modes are `read-only`, `read-only-with-network`, `workspace-write`, and
+`danger-full-access`.
+
+## Level up: the fleet control plane
+
+For parallel agents, task queues, cross-agent review, and the web dashboard,
+start the server (needs Postgres 14+, an API bearer token, and Docker Engine
+with the Docker Compose v2.1+ plugin for the bundled database). The copy-paste
+token generation below also needs the OpenSSL CLI. The Codex-safe launcher
+additionally requires `curl` and `lsof`.
+
+In a normal standalone terminal, start Postgres and the foreground server:
+
+```bash
+# Terminal 1
+HARNESS_API_TOKEN="$(openssl rand -hex 32)" &&
+  test -n "$HARNESS_API_TOKEN" &&
+  export HARNESS_API_TOKEN &&
+  printf '\nCopy this command into every client terminal:\n  export HARNESS_API_TOKEN=%s\n\n' \
+    "$HARNESS_API_TOKEN" &&
+  bash scripts/dev-db.sh &&
+  ./start-server.sh
+```
+
+From a Codex-owned session, use the sanitized launcher instead; it removes
+wrapper variables that can confuse child Codex agents. This environment-based
+quickstart selects its background `nohup` path so the database and authentication
+settings reach the server even when another tmux server already exists:
+
+```bash
+HARNESS_API_TOKEN="$(openssl rand -hex 32)" &&
+  test -n "$HARNESS_API_TOKEN" &&
+  export HARNESS_API_TOKEN &&
+  printf '\nCopy this command into every client terminal:\n  export HARNESS_API_TOKEN=%s\n\n' \
+    "$HARNESS_API_TOKEN" &&
+  bash scripts/dev-db.sh &&
+  export HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness &&
+  export HARNESS_DATABASE_POOL_MAX_CONNECTIONS=16 &&
+  export HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS=60 &&
+  HARNESS_STARTER_NO_TMUX=1 bash scripts/start-harness-codex-safe.sh
+```
+
+For the standalone path, `start-server.sh` remains in the foreground, so check
+it from a second terminal. First paste the exact
+`export HARNESS_API_TOKEN=...` command printed by Terminal 1, then verify both
+the unauthenticated health endpoint and an authenticated API endpoint:
+
+```bash
+# Terminal 2
+# Paste the export command printed by Terminal 1 before running these commands.
+curl http://127.0.0.1:9800/health
+curl http://127.0.0.1:9800/api/dashboard \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
+```
+
+Open `http://127.0.0.1:9800/` and enter the same token when the dashboard
+prompts for it. The token grants API access; treat the printed command as a
+secret and do not commit or share it. Shell environments are not shared between
+terminals or persisted across restarts; after restarting, use the newly printed
+export command.
+
+Full server setup, configuration, and workflows are covered in
+[Quick Start](#quick-start) below.
 
 ## Key Features
 
@@ -72,31 +193,19 @@ Harness is a Rust-native control plane for that fleet. It wraps AI coding agents
 
 ## Quick Start
 
-### Prerequisites
+CLI install and one-shot execution are covered in [Install](#install) and
+[Quickstart](#quickstart-run-one-agent-task) above. This section covers the
+server and development setup.
 
-- Rust 1.88+
+### Server prerequisites
+
 - Bun 1.1+ for release builds that embed the web dashboard. If `web/dist` is
   already built, release builds can reuse it.
 - Postgres 14+. For local development, `scripts/dev-db.sh` starts the bundled
-  Docker Compose Postgres service.
+  Postgres service and requires Docker Engine with the Docker Compose v2.1+
+  plugin (`docker compose`, not legacy `docker-compose` v1).
 - A GitHub token for issue/PR automation. Use `gh auth login`, `GITHUB_TOKEN`,
   `GH_TOKEN`, or `server.github_token`.
-- At least one agent runtime for autonomous execution:
-  - [`codex`](https://github.com/openai/codex) CLI
-  - [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI
-  - Anthropic API key (for direct API adapter)
-
-### Build
-
-```bash
-git clone https://github.com/majiayu000/harness.git
-cd harness
-cargo build --release -p harness-cli
-```
-
-`./start-server.sh` also builds the release CLI automatically when
-`./target/release/harness` is missing, but running the build yourself keeps the
-startup prerequisite explicit.
 
 ### Rust API Facade
 
@@ -236,14 +345,19 @@ cargo run -p harness-cli -- serve --transport stdio
 **One-shot execution:**
 
 ```bash
-cargo run -p harness-cli -- exec "Fix the failing test in src/lib.rs"
+cargo run -p harness-cli -- exec \
+  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
 ```
 
 ### Common Workflows
 
+The protected HTTP examples assume `HARNESS_API_TOKEN` is exported in the
+client shell as shown in the server quickstart above.
+
 ```bash
 # Workflow-runtime submission
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Add input validation to the API handler"}'
 
@@ -375,11 +489,15 @@ max_turns = 20
 
 ## HTTP REST API
 
+Except for `/health`, the examples below assume `HARNESS_API_TOKEN` is exported
+in the client shell and send it as a bearer token.
+
 ### Workflow Runtime Submissions
 
 ```bash
 # Submit work by prompt
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Add input validation to the API handler",
@@ -388,6 +506,7 @@ curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 
 # Submit work by GitHub issue number
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -397,6 +516,7 @@ curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 
 # Submit an issue but bypass triage/plan and go straight to implementation
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -406,6 +526,7 @@ curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 
 # Submit a PR for review/fix
 curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "project": "/path/to/project",
@@ -415,28 +536,34 @@ curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 # Submit multiple issues (one durable submission per request)
 for issue in 10 11 12; do
   curl -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
+    -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
     -H "Content-Type: application/json" \
     -d "{\"project\":\"/path/to/project\",\"issue\":$issue}"
 done
 
 # Get submission status
-curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id} \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 
 # List submissions
-curl http://127.0.0.1:9800/api/workflows/runtime/submissions
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 
 # Stream submission output (SSE)
-curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}/stream
+curl http://127.0.0.1:9800/api/workflows/runtime/submissions/{submission_id}/stream \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 ```
 
 ### Project Management
 
 ```bash
 # List registered projects
-curl http://127.0.0.1:9800/projects
+curl http://127.0.0.1:9800/projects \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 
 # Register a new project at runtime
 curl -X POST http://127.0.0.1:9800/projects \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "id": "my-project",
@@ -445,14 +572,16 @@ curl -X POST http://127.0.0.1:9800/projects \
   }'
 
 # Remove a project
-curl -X DELETE http://127.0.0.1:9800/projects/my-project
+curl -X DELETE http://127.0.0.1:9800/projects/my-project \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 ```
 
 ### Dashboard
 
 ```bash
 # Get aggregated status across all projects
-curl http://127.0.0.1:9800/api/dashboard
+curl http://127.0.0.1:9800/api/dashboard \
+  -H "Authorization: Bearer ${HARNESS_API_TOKEN}"
 
 # Response:
 # {

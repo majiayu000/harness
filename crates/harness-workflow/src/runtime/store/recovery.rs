@@ -1,13 +1,14 @@
 use super::runtime_completion::validator_for_instance;
-use super::runtime_job_leases::delete_runtime_job_lease_receipts_tx;
+use super::runtime_job_state::{
+    cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation,
+};
 use super::{
-    apply_inline_command_side_effect, command_store, enum_str, insert_decision_record_tx,
-    insert_event_tx, select_instance_for_update_tx, to_jsonb_string, upsert_instance_tx,
-    WorkflowInstance, WorkflowRuntimeStore,
+    apply_inline_command_side_effect, command_store, insert_decision_record_tx, insert_event_tx,
+    select_instance_for_update_tx, upsert_instance_tx, WorkflowInstance, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
-    ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, WorkflowCommand,
-    WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord, WorkflowEvidence,
+    ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
+    WorkflowDecisionRecord, WorkflowEvidence,
 };
 use crate::runtime::pr_feedback::{
     LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
@@ -136,8 +137,6 @@ impl WorkflowRuntimeStore {
                 return Ok(outcome);
             }
         }
-        let (superseded_command_count, superseded_runtime_job_count) =
-            skip_superseded_active_commands_tx(&mut tx, &snapshot.id).await?;
         let Some(mut instance) =
             select_instance_for_update_tx(&mut tx, request.workflow_id).await?
         else {
@@ -153,6 +152,8 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(unsupported_stopped_activity(&instance, None));
         }
+        let (superseded_command_count, superseded_runtime_job_count) =
+            skip_superseded_active_commands_tx(&mut tx, &instance.id).await?;
         let previous_state = instance.state.clone();
 
         let event = insert_event_tx(
@@ -499,7 +500,10 @@ async fn skip_superseded_active_commands_tx(
     workflow_id: &str,
 ) -> anyhow::Result<(u64, u64)> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id, status, data::text FROM workflow_commands WHERE workflow_id = $1 AND status IN ($2, $3, $4, $5) FOR UPDATE",
+        "SELECT id, status, data::text FROM workflow_commands
+         WHERE workflow_id = $1 AND status IN ($2, $3, $4, $5)
+         ORDER BY id
+         FOR UPDATE",
     )
     .bind(workflow_id)
     .bind(WorkflowCommandStatus::Pending.as_str())
@@ -509,17 +513,32 @@ async fn skip_superseded_active_commands_tx(
     .fetch_all(&mut **tx)
     .await?;
 
-    let mut superseded_runtime_job_count = 0u64;
-    for (command_id, status, data) in &rows {
-        let command: WorkflowCommand = serde_json::from_str(data)?;
-        let next_status = if status == WorkflowCommandStatus::Dispatched.as_str() {
-            superseded_runtime_job_count += cancel_unfinished_runtime_jobs_tx(
-                tx,
+    let commands = rows
+        .into_iter()
+        .map(|(command_id, status, data)| {
+            Ok((
+                command_id,
+                status,
+                serde_json::from_str::<WorkflowCommand>(&data)?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let cancellations = commands
+        .iter()
+        .filter(|(_, status, _)| status == WorkflowCommandStatus::Dispatched.as_str())
+        .map(|(command_id, _, command)| {
+            RuntimeJobCancellation::new(
                 command_id,
                 command.runtime_activity_key(),
                 "Workflow runtime operator recovery superseded this command.",
             )
-            .await?;
+        })
+        .collect::<Vec<_>>();
+    let superseded_runtime_job_count =
+        cancel_unfinished_runtime_jobs_for_commands_tx(tx, &cancellations).await? as u64;
+
+    for (command_id, status, _) in &commands {
+        let next_status = if status == WorkflowCommandStatus::Dispatched.as_str() {
             WorkflowCommandStatus::Cancelled
         } else {
             WorkflowCommandStatus::Skipped
@@ -535,44 +554,7 @@ async fn skip_superseded_active_commands_tx(
         .await?;
     }
 
-    Ok((rows.len() as u64, superseded_runtime_job_count))
-}
-
-async fn cancel_unfinished_runtime_jobs_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    command_id: &str,
-    activity: &str,
-    summary: &str,
-) -> anyhow::Result<u64> {
-    let pending_status = enum_str(&RuntimeJobStatus::Pending)?;
-    let running_status = enum_str(&RuntimeJobStatus::Running)?;
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, data::text FROM runtime_jobs WHERE command_id = $1 AND status IN ($2, $3) FOR UPDATE",
-    )
-    .bind(command_id)
-    .bind(&pending_status)
-    .bind(&running_status)
-    .fetch_all(&mut **tx)
-    .await?;
-
-    for (job_id, data) in &rows {
-        let mut job: RuntimeJob = serde_json::from_str(data)?;
-        job.complete(&ActivityResult::cancelled(activity, summary))?;
-        let updated = to_jsonb_string(&job)?;
-        let status = enum_str(&job.status)?;
-        sqlx::query(
-            "UPDATE runtime_jobs SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $4",
-        )
-        .bind(&status)
-        .bind(job.not_before)
-        .bind(&updated)
-        .bind(job_id)
-        .execute(&mut **tx)
-        .await?;
-        delete_runtime_job_lease_receipts_tx(tx, job_id, job.lease_generation).await?;
-    }
-
-    Ok(rows.len() as u64)
+    Ok((commands.len() as u64, superseded_runtime_job_count))
 }
 
 fn persist_operator_recovery_data(

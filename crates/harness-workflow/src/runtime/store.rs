@@ -43,6 +43,11 @@ mod events;
 mod instance_helpers;
 #[path = "store/instances.rs"]
 mod instances;
+#[path = "store/lock_order.rs"]
+mod lock_order;
+#[path = "store/lock_order_tests.rs"]
+#[cfg(test)]
+mod lock_order_tests;
 #[path = "store/prompt_payloads.rs"]
 mod prompt_payloads;
 #[path = "store/recovery.rs"]

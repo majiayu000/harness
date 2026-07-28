@@ -191,74 +191,10 @@ pub async fn run(
     );
 
     let thread_manager = harness_server::thread_manager::ThreadManager::new();
-    let mut agent_registry =
-        harness_agents::registry::AgentRegistry::new(&serve_config.agents.default_agent);
-    agent_registry
-        .set_complexity_preferences(serve_config.agents.complexity_preferred_agents.clone());
-    let claude_provider_gate =
-        harness_agents::provider_backpressure::ProviderBackpressureGate::from_claude_config(
-            &serve_config.agents.claude.provider_backpressure,
-        );
-    let mut claude_agent = harness_agents::claude::ClaudeCodeAgent::new(
-        serve_config.agents.claude.cli_path.clone(),
-        serve_config.agents.claude.default_model.clone(),
+    let agent_registry = harness_agents::builder::registry_from_config(
+        &serve_config.agents,
         serve_config.agents.sandbox_mode,
-    )
-    .with_no_session_persistence_probe()
-    .with_provider_backpressure_gate(claude_provider_gate.clone());
-    if let Some(budget) = serve_config.agents.claude.reasoning_budget.clone() {
-        claude_agent = claude_agent.with_reasoning_budget(budget);
-    }
-    claude_agent = claude_agent.with_stream_timeout(serve_config.agents.stream_timeout_secs);
-    agent_registry.register("claude", Arc::new(claude_agent));
-    agent_registry
-        .register_adapter_with_strategy(
-            "claude",
-            Arc::new(
-                harness_agents::claude_adapter::ClaudeAdapter::new(
-                    serve_config.agents.claude.cli_path.clone(),
-                    serve_config.agents.claude.default_model.clone(),
-                )
-                .with_provider_backpressure_gate(claude_provider_gate),
-            ),
-            harness_agents::registry::AdapterExecutionStrategy::ControlOnly,
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    agent_registry.register(
-        "codex",
-        Arc::new(
-            harness_agents::codex::CodexAgent::from_config(
-                serve_config.agents.codex.clone(),
-                serve_config.agents.sandbox_mode,
-            )
-            .with_stream_timeout(serve_config.agents.stream_timeout_secs),
-        ),
-    );
-    let codex_adapter_config = serve_config.agents.codex.clone();
-    let codex_adapter_sandbox_mode = serve_config.agents.sandbox_mode;
-    agent_registry
-        .register_adapter_factory_with_strategy(
-            "codex",
-            move || {
-                Arc::new(harness_agents::codex_adapter::CodexAdapter::from_config(
-                    codex_adapter_config.clone(),
-                    codex_adapter_sandbox_mode,
-                ))
-            },
-            harness_agents::registry::AdapterExecutionStrategy::ExecuteTurns,
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-        agent_registry.register(
-            "anthropic-api",
-            Arc::new(
-                harness_agents::anthropic_api::AnthropicApiAgent::from_config(
-                    api_key,
-                    &serve_config.agents.anthropic_api,
-                ),
-            ),
-        );
-    }
+    )?;
     let mut server = harness_server::server::HarnessServer::new(
         serve_config.clone(),
         thread_manager,

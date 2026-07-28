@@ -17,6 +17,14 @@ retrieved memory, dynamic task input, or context that Harness cannot observe.
 Repository inventory also cannot solve this problem because discovering a file
 does not prove it was selected or loaded for a runtime activity.
 
+The first implementation exposed compatibility and validation gaps after merge:
+profile names accepted by runtime configuration could make provenance
+construction fail, hashing every name would migrate already-valid audit
+identities, the model-facing packet still advertised the durable v2 schema, and
+approval policy was misclassified or silently discarded for runtimes that do
+not support that setting. The remediation must correct those claims without
+weakening durable v2 evidence.
+
 ## Goals
 
 - Record a redacted provenance manifest for sources the workflow runtime
@@ -27,6 +35,15 @@ does not prove it was selected or loaded for a runtime activity.
   class, and coverage limitations.
 - Make missing or unserializable required provenance a visible error.
 - Avoid persisting raw memory payloads, secrets, or hidden model reasoning.
+- Accept every profile name already accepted by runtime configuration while
+  preserving existing valid provenance identities and providing a
+  collision-disjoint deterministic fallback for other names.
+- Keep durable packets on v2 while preserving the model-facing v1 packet
+  contract, including historical prompt-template handling, for unchanged
+  inputs.
+- Distinguish an unobserved Codex default from a setting that is not applicable
+  to the selected runtime, and reject rather than discard an explicitly
+  unsupported policy.
 
 ## Non-Goals
 
@@ -64,9 +81,11 @@ does not prove it was selected or loaded for a runtime activity.
    reasoning effort, sandbox, and approval policy after their
    profile/workflow/server fallbacks. This includes Claude's phase-sensitive
    model and effort selection when the profile omits explicit values. A setting
-   whose effective value is resolved outside Harness — such as a Codex approval
-   policy the profile omits — is recorded as explicitly unobserved rather than
-   given a fabricated final value. The final launch settings are computed once
+   whose effective value is resolved outside Harness — specifically a Codex
+   approval policy the profile omits — is recorded as explicitly unobserved
+   rather than given a fabricated final value. A setting unsupported by the
+   selected runtime is recorded as not applicable, not unobserved. The final
+   launch settings are computed once
    before packet construction and shared by packet construction and agent
    launch. The source is runtime-scoped, observation and trust are
    `runtime_observed`, selection state is `loaded`, and changing any recorded
@@ -113,12 +132,36 @@ does not prove it was selected or loaded for a runtime activity.
     without a second partially committed record. The activity artifact carries
     that same digest and the same packet-schema constant.
 14. **B-014:** Existing prompt semantics, repo-memory selection, runtime
-    profile selection, activity policy, activity-result status, and workflow
-    state transitions remain unchanged. The intentional wire change is the
-    prompt-packet schema bump from v1 to v2 plus redacted provenance metadata.
-    Audit-only packet fields are stripped from the model-facing prompt
-    rendering, so the agent-visible prompt bytes for unchanged inputs are
-    identical to the v1 rendering.
+   profile selection, activity policy, activity-result status, and workflow
+   state transitions remain unchanged. Durable packets and their activity
+   artifacts retain schema `harness.runtime.prompt_packet.v2` and all required
+   audit metadata. Before rendering for the agent, the model-facing clone
+   removes audit-only fields, removes `workflow_file.prompt_template` from the
+   packet JSON, and restores schema `harness.runtime.prompt_packet.v1`. A
+   non-empty prompt template is appended exactly once through the historical
+   template section. For unchanged inputs, the serialized packet section and
+   complete prompt bytes are identical to an independently frozen pre-v2
+   rendering.
+15. **B-015:** Every profile name accepted by `RuntimeProfile` produces a valid,
+   deterministic runtime provenance locator without migrating existing valid
+   identities. Harness first attempts the historical
+   `runtime_profile/<exact-name>` locator. If it validates, the locator and
+   component ID remain unchanged, including multi-segment names such as
+   `team/codex`. Only names that fail that validation use the disjoint
+   `runtime_profile_name_sha256/<lowercase SHA-256 of exact UTF-8 name bytes>`
+   namespace. The unhashed profile name remains byte-for-byte unchanged in
+   `resolved_runtime_settings.profile_name`; neither path trims, case-folds, or
+   Unicode-normalizes it. Equal invalid byte sequences produce equal fallbacks;
+   the enumerated byte-distinct acceptance vectors must produce different
+   fallbacks.
+16. **B-016:** Approval policy resolves by runtime capability. Omitted policy
+   records `unobserved_agent_default` for both Codex runtime kinds and
+   `not_applicable` for Claude Code and Anthropic API. Remote Host remains
+   rejected by local runtime-settings resolution. An explicit approval policy
+   declared for Claude Code, Anthropic API, or Remote Host is rejected both by
+   dispatch-policy resolution and direct runtime-settings resolution; it is
+   never silently discarded. Switching from Codex to a non-Codex runtime
+   without an explicit policy does not inherit the Codex-only value.
 
 ## Acceptance Criteria
 
@@ -144,6 +187,27 @@ does not prove it was selected or loaded for a runtime activity.
       construction fails.
 - [ ] Existing prompt, memory, activity-policy, and activity-result tests
       remain green without weakening assertions.
+- [ ] Named test
+      `profile_locator_preserves_valid_identity_and_hashes_invalid_exact_bytes`
+      proves B-015 with frozen component IDs for valid names and known SHA-256
+      vectors for empty, whitespace-distinct, case-distinct, slash-invalid,
+      UUID-shaped, and NFC/NFD Unicode names.
+- [ ] Named test
+      `model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2`
+      proves the exact B-014 durable/model schema split, non-empty
+      prompt-template handling, and complete pre-v2 prompt bytes without
+      deriving the expected value from the current v2 packet.
+- [ ] Named test
+      `approval_policy_resolution_matches_runtime_capability_matrix` proves
+      omitted-policy behavior for Codex Exec, Codex JSON-RPC, Claude Code,
+      Anthropic API, and the Remote Host rejection boundary.
+- [ ] Explicit-policy dispatch and direct-resolution matrix tests reject Claude
+      Code, Anthropic API, and Remote Host rather than dropping the value.
+- [ ] Named test
+      `provenance_failure_prevents_prompt_event_and_agent_start` proves B-012
+      through the real worker boundary: the job fails, no
+      `RuntimePromptPrepared` event is recorded, and the registered agent
+      receives no prompt.
 - [ ] No database migration, new runtime event type, or external dependency is
       introduced.
 
@@ -151,15 +215,15 @@ does not prove it was selected or loaded for a runtime activity.
 
 | Boundary | Verdict |
 | --- | --- |
-| Empty / missing input | Covered by B-001, B-005, B-007, and B-009. |
+| Empty / missing input | Covered by B-001, B-005, B-007, B-009, and B-016. |
 | Error and failure paths | Covered by B-007 and B-012. |
-| Authorization / permission | Covered by B-009 and B-010; provenance observes no new authority and exposes no credentials. |
+| Authorization / permission | Covered by B-009, B-010, and B-016; provenance observes no new authority, distinguishes unsupported policy, and exposes no credentials. |
 | Concurrency / race / ordering | Covered by B-006, B-011, and B-013; provenance is built from the same immutable inputs before the existing event write. |
 | Retry / repetition / idempotency | Covered by B-011 and B-013. |
 | Illegal state transitions | N/A. Provenance does not change workflow state; ASC-001 validation rejects illegal evidence combinations. |
-| Compatibility / migration | Covered by B-001, B-013, and B-014. |
+| Compatibility / migration | Covered by B-001, B-013, B-014, B-015, and B-016. |
 | Degradation / fallback | Covered by B-007, B-009, and B-012; missing evidence is never success-shaped. |
-| Evidence and audit integrity | Covered by B-002 through B-13. |
+| Evidence and audit integrity | Covered by B-002 through B-013, B-015, and B-016. |
 | Cancellation / interruption / partial completion | Covered by B-012 and B-013; failure precedes agent execution and the existing event records packet plus provenance atomically. |
 
 ## Edge Cases
@@ -173,6 +237,17 @@ does not prove it was selected or loaded for a runtime activity.
 - An adapter independently reads repository instructions after Harness creates
   the packet.
 - A runtime profile has absent optional fields.
+- A valid runtime profile name such as `codex-default` or `team/codex` retains
+  its historical locator and component ID.
+- An accepted profile name is empty or contains whitespace, an invalid slash
+  shape, Unicode, or UUID-shaped text and therefore uses the hashed fallback.
+- Two invalid names differ only by leading/trailing whitespace, case, or
+  NFC/NFD Unicode bytes.
+- Claude Code or Anthropic API omits the unsupported approval-policy field.
+- A dispatch policy explicitly declares approval policy for Claude Code,
+  Anthropic API, or Remote Host.
+- A dispatch override switches from Codex to a non-Codex runtime without
+  explicitly declaring approval policy.
 - Server defaults resolve two otherwise identical runtime profiles to
   different effective model or sandbox settings.
 - One durable prompt reference resolves to changed task text.
@@ -185,4 +260,8 @@ This emits version-2 prompt packets and leaves stored version-1 packets
 unchanged. Consumers that only render the packet continue to treat it as a JSON
 object. Evidence readers require provenance only for v2, treat v1 as
 lower-evidence history, and never infer provenance for a packet lacking the
-field.
+field. Agent prompt rendering continues to receive a v1-schema compatibility
+clone; the v2 schema and evidence remain confined to the durable packet and
+activity artifact. Existing valid runtime-profile component IDs remain stable;
+the disjoint hashed namespace is used only for names that previously could not
+produce provenance.

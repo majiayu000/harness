@@ -1,30 +1,56 @@
-use harness_agents::claude::ClaudeCodeAgent;
 use harness_agents::codex::{CodexAgent, CodexReviewRequest};
 use harness_core::{
-    agent::AgentRequest,
-    agent::CodeAgent,
+    agent::{AgentRequest, CodeAgent, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV},
     config::{agents::SandboxMode, HarnessConfig},
     prompts,
     review::{parse_review_report, ReviewDecision, ReviewProviderKind},
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 
 const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
+const CODEX_REVIEW_PROCESS_SPAWN_CONTROL_ENV: [&str; 2] = [
+    "HARNESS_AGENT_CONTAINER_IMAGE",
+    "HARNESS_AGENT_EGRESS_PROXY",
+];
 
-fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
-    ClaudeCodeAgent::new(
-        config.agents.claude.cli_path.clone(),
-        config.agents.claude.default_model.clone(),
-        config.agents.sandbox_mode,
-    )
-    .with_no_session_persistence_probe()
-    .with_provider_backpressure_gate(
-        harness_agents::provider_backpressure::ProviderBackpressureGate::from_claude_config(
-            &config.agents.claude.provider_backpressure,
-        ),
-    )
-    .with_stream_timeout(config.agents.stream_timeout_secs)
+fn codex_review_spawn_env(config: &HarnessConfig) -> HashMap<String, String> {
+    codex_review_spawn_env_with(config, |key| std::env::var(key).ok())
+}
+
+fn codex_review_spawn_env_with(
+    config: &HarnessConfig,
+    mut read_process_env: impl FnMut(&str) -> Option<String>,
+) -> HashMap<String, String> {
+    let mut env_vars = HashMap::from([(
+        AGENT_ISOLATION_TIER_ENV.to_string(),
+        config.isolation.default_tier.as_str().to_string(),
+    )]);
+    let allowlist = config
+        .isolation
+        .network_allowlist
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !allowlist.is_empty() {
+        env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
+    }
+    for key in CODEX_REVIEW_PROCESS_SPAWN_CONTROL_ENV {
+        if let Some(value) = read_process_env(key).filter(|value| !value.trim().is_empty()) {
+            env_vars.insert(key.to_string(), value);
+        }
+    }
+    env_vars
+}
+
+fn create_agent(config: &HarnessConfig) -> impl CodeAgent {
+    // This path needs the Claude backend alone, not a registry — but it takes
+    // it from the same builder, so it cannot drift from the entry points.
+    harness_agents::builder::claude_agent_from_config(&config.agents, config.agents.sandbox_mode)
 }
 
 pub async fn fix(
@@ -118,13 +144,12 @@ pub async fn review(
         anyhow::bail!("codex_cli_review requires a non-empty base ref");
     }
 
-    let mut agent = CodexAgent::new(
+    #[allow(clippy::disallowed_methods)]
+    let agent = CodexAgent::new(
         review_config.cli_path.clone(),
         SandboxMode::ReadOnlyWithNetwork,
     )
     .with_stream_timeout(Some(review_config.timeout_secs));
-    agent.default_model = review_config.model.clone();
-    agent.reasoning_effort = review_config.reasoning_effort.clone();
 
     let started_at = chrono::Utc::now();
     let response = tokio::time::timeout(
@@ -141,7 +166,7 @@ pub async fn review(
             reasoning_effort: Some(review_config.reasoning_effort),
             sandbox_mode: SandboxMode::ReadOnlyWithNetwork,
             approval_policy: Some("never".to_string()),
-            env_vars: Default::default(),
+            env_vars: codex_review_spawn_env(config),
         }),
     )
     .await
@@ -299,6 +324,62 @@ async fn run_review_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::{
+        agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV},
+        config::isolation::IsolationTier,
+    };
+
+    #[test]
+    fn codex_review_spawn_env_uses_only_configured_spawn_controls() {
+        let mut config = HarnessConfig::default();
+        config.isolation.default_tier = IsolationTier::Container;
+        config.isolation.network_allowlist = vec![
+            "github.com".to_string(),
+            " api.openai.com ".to_string(),
+            String::new(),
+        ];
+        let process_env = HashMap::from([
+            (
+                "HARNESS_AGENT_CONTAINER_IMAGE".to_string(),
+                "example/reviewer:sha256-test".to_string(),
+            ),
+            (
+                "HARNESS_AGENT_EGRESS_PROXY".to_string(),
+                "http://review-proxy.local:8080".to_string(),
+            ),
+            (
+                "OPERATOR_API_KEY".to_string(),
+                "operator-secret".to_string(),
+            ),
+        ]);
+
+        let env_vars = codex_review_spawn_env_with(&config, |key| process_env.get(key).cloned());
+
+        assert_eq!(
+            env_vars.get(AGENT_ISOLATION_TIER_ENV).map(String::as_str),
+            Some("container")
+        );
+        assert_eq!(
+            env_vars
+                .get(AGENT_NETWORK_ALLOWLIST_ENV)
+                .map(String::as_str),
+            Some("github.com,api.openai.com")
+        );
+        assert_eq!(
+            env_vars
+                .get("HARNESS_AGENT_CONTAINER_IMAGE")
+                .map(String::as_str),
+            Some("example/reviewer:sha256-test")
+        );
+        assert_eq!(
+            env_vars
+                .get("HARNESS_AGENT_EGRESS_PROXY")
+                .map(String::as_str),
+            Some("http://review-proxy.local:8080")
+        );
+        assert!(!env_vars.contains_key("OPERATOR_API_KEY"));
+        assert!(!env_vars.values().any(|value| value == "operator-secret"));
+    }
 
     #[tokio::test]
     async fn resolve_repo_slug_with_url_does_not_call_gh() -> anyhow::Result<()> {
