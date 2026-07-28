@@ -45,6 +45,7 @@ jobs:
               - '.github/workflows/**'
               - '.bun-version'
               - 'scripts/check_ci_results.py'
+              - 'scripts/check_committed_whitespace.py'
               - 'scripts/check_storage_legacy_openers.py'
             workspace:
               - 'Cargo.toml'
@@ -82,17 +83,7 @@ jobs:
       - name: Test repository contracts
         run: python3 -m pytest -q tests
       - name: Check committed whitespace
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git diff --check "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
-          elif git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
-            git diff --check "${{ github.event.before }}" HEAD
-          elif git rev-parse HEAD^ >/dev/null 2>&1; then
-            git diff --check HEAD^ HEAD
-          else
-            git diff --check
-          fi
+        run: python3 scripts/check_committed_whitespace.py
 
   # ── Step 2: Fast checks (always run on Rust changes) ──────────────────
   fmt:
@@ -265,13 +256,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check all jobs
-        run: |
-          python3 scripts/check_ci_results.py \
-            "changed=${{ needs.changed.result }}" \
-            "storage-legacy-openers=${{ needs.storage-legacy-openers.result }}" \
-            "repository-checks=${{ needs.repository-checks.result }}" \
-            "fmt=${{ needs.fmt.result }}" \
-            "web-build=${{ needs.web-build.result }}" \
-            "clippy=${{ needs.clippy.result }}" \
-            "test=${{ needs.test.result }}" \
-            "audit=${{ needs.audit.result }}"
+        env:
+          HARNESS_CI_RESULT_CHANGED: ${{ needs.changed.result }}
+          HARNESS_CI_RESULT_STORAGE_LEGACY_OPENERS: ${{ needs.storage-legacy-openers.result }}
+          HARNESS_CI_RESULT_REPOSITORY_CHECKS: ${{ needs.repository-checks.result }}
+          HARNESS_CI_RESULT_FMT: ${{ needs.fmt.result }}
+          HARNESS_CI_RESULT_WEB_BUILD: ${{ needs.web-build.result }}
+          HARNESS_CI_RESULT_CLIPPY: ${{ needs.clippy.result }}
+          HARNESS_CI_RESULT_TEST: ${{ needs.test.result }}
+          HARNESS_CI_RESULT_AUDIT: ${{ needs.audit.result }}
+        run: python3 scripts/check_ci_results.py

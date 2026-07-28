@@ -1,35 +1,46 @@
 #!/usr/bin/env python3
-"""Fail closed when any required GitHub Actions job did not succeed or skip."""
+"""Fail closed unless every required GitHub Actions job succeeded or skipped."""
 
 from __future__ import annotations
 
+import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 
 PASSING_RESULTS = {"success", "skipped"}
 FAILING_RESULTS = {"failure", "cancelled"}
 KNOWN_RESULTS = PASSING_RESULTS | FAILING_RESULTS
+RESULT_ENV_PREFIX = "HARNESS_CI_RESULT_"
+EXPECTED_RESULT_ENV = {
+    "changed": f"{RESULT_ENV_PREFIX}CHANGED",
+    "storage-legacy-openers": f"{RESULT_ENV_PREFIX}STORAGE_LEGACY_OPENERS",
+    "repository-checks": f"{RESULT_ENV_PREFIX}REPOSITORY_CHECKS",
+    "fmt": f"{RESULT_ENV_PREFIX}FMT",
+    "web-build": f"{RESULT_ENV_PREFIX}WEB_BUILD",
+    "clippy": f"{RESULT_ENV_PREFIX}CLIPPY",
+    "test": f"{RESULT_ENV_PREFIX}TEST",
+    "audit": f"{RESULT_ENV_PREFIX}AUDIT",
+}
 
 
-def evaluate_results(raw_results: Sequence[str]) -> tuple[list[str], list[str]]:
+def evaluate_results(environment: Mapping[str, str]) -> tuple[list[str], list[str]]:
     failures: list[str] = []
     errors: list[str] = []
-    seen: set[str] = set()
+    expected_env = set(EXPECTED_RESULT_ENV.values())
+    provided_env = {
+        name for name in environment if name.startswith(RESULT_ENV_PREFIX)
+    }
 
-    if not raw_results:
-        return failures, ["no required job results were provided"]
+    for name in sorted(expected_env - provided_env):
+        errors.append(f"missing required job result environment variable: {name}")
+    for name in sorted(provided_env - expected_env):
+        errors.append(f"unexpected job result environment variable: {name}")
 
-    for raw in raw_results:
-        name, separator, result = raw.partition("=")
-        if not separator or not name or not result:
-            errors.append(f"invalid job result argument: {raw!r}")
+    for name, env_name in EXPECTED_RESULT_ENV.items():
+        result = environment.get(env_name)
+        if result is None:
             continue
-        if name in seen:
-            errors.append(f"duplicate job result: {name}")
-            continue
-        seen.add(name)
-
         if result not in KNOWN_RESULTS:
             errors.append(f"unknown result for {name}: {result!r}")
         elif result in FAILING_RESULTS:
@@ -38,9 +49,18 @@ def evaluate_results(raw_results: Sequence[str]) -> tuple[list[str], list[str]]:
     return failures, errors
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    raw_results = list(sys.argv[1:] if argv is None else argv)
-    failures, errors = evaluate_results(raw_results)
+def main(
+    argv: Sequence[str] | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments:
+        print("job results must be supplied through the fixed CI environment", file=sys.stderr)
+        return 2
+
+    failures, errors = evaluate_results(
+        os.environ if environment is None else environment
+    )
 
     if errors:
         for error in errors:
