@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use harness_core::config::isolation::IsolationTrustClass;
-use reqwest::header::{HeaderMap, ACCEPT, LINK, RETRY_AFTER, USER_AGENT};
+use reqwest::header::{HeaderMap, LINK, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -507,13 +507,7 @@ async fn fetch_github_issue_page(
     repo: &str,
     github_token: Option<&str>,
 ) -> anyhow::Result<GitHubIssuePageFetch> {
-    let mut request = client
-        .get(url)
-        .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, "harness-server");
-    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
-        request = request.bearer_auth(token);
-    }
+    let request = crate::github_client::apply_github_headers(client.get(url), github_token);
     let response = request.send().await?;
     let status = response.status();
     if !status.is_success() {
@@ -638,7 +632,8 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
-        self.poll_from_api_base_url("https://api.github.com").await
+        self.poll_from_api_base_url(&crate::github_client::github_api_base_url())
+            .await
     }
 
     async fn mark_dispatched(&self, external_id: &str, task_id: &TaskId) -> anyhow::Result<()> {

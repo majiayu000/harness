@@ -26,14 +26,7 @@ pub(super) struct GitHubIssueState {
     pub(super) state_reason: Option<String>,
 }
 
-pub(crate) fn github_api_base_url() -> String {
-    std::env::var("HARNESS_GITHUB_API_BASE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_string())
-        .trim_end_matches('/')
-        .to_string()
-}
+pub(crate) use crate::github_client::github_api_base_url;
 
 async fn github_get_json<T: DeserializeOwned>(path: &str, github_token: Option<&str>) -> Option<T> {
     let client = reqwest::Client::new();

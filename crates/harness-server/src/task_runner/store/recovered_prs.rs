@@ -147,16 +147,14 @@ async fn check_recovered_pr_state(
         );
         return None;
     };
-    let client = reqwest::Client::new();
-    let mut request = client
-        .get(format!(
-            "https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-        ))
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "harness-server");
-    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
-        request = request.bearer_auth(token);
-    }
+    let client = crate::github_client::github_request();
+    let request = crate::github_client::apply_github_headers(
+        client.get(format!(
+            "{}/repos/{owner}/{repo}/pulls/{pr_number}",
+            crate::github_client::github_api_base_url()
+        )),
+        github_token,
+    );
     let response = match tokio::time::timeout(RECOVERED_PR_VIEW_TIMEOUT, request.send()).await {
         Err(_elapsed) => {
             tracing::warn!(

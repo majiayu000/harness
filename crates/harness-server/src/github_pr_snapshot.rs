@@ -4,12 +4,10 @@ use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, RemoteFactSnapshot,
     PR_FEEDBACK_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
-use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-const DEFAULT_GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const SERVER_PR_SNAPSHOT_SCHEMA: &str = "harness.github.pr_snapshot.v1";
 pub(crate) const GITHUB_PR_SNAPSHOT_ARTIFACT: &str = "github_pr_snapshot";
 pub(crate) const SERVER_PR_SNAPSHOT_ERROR_ARTIFACT: &str = "server_pr_snapshot_error";
@@ -232,21 +230,17 @@ async fn fetch_github_pr_snapshot_value(
         }
     "#;
 
-    let mut request = client
-        .post(graphql_url)
-        .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, "harness-server")
-        .json(&json!({
+    let request = crate::github_client::apply_github_headers(
+        client.post(graphql_url).json(&json!({
             "query": query,
             "variables": {
                 "owner": owner,
                 "repo": repo,
                 "pr": target.pr_number as i64,
             }
-        }));
-    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
-        request = request.bearer_auth(token);
-    }
+        })),
+        github_token,
+    );
 
     let response = tokio::time::timeout(Duration::from_secs(15), request.send()).await??;
     let status = response.status();
@@ -271,7 +265,7 @@ pub(crate) fn github_graphql_url() -> String {
     std::env::var("HARNESS_GITHUB_GRAPHQL_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_GITHUB_GRAPHQL_URL.to_string())
+        .unwrap_or_else(crate::github_client::graphql_url)
 }
 
 #[derive(Debug, Deserialize)]

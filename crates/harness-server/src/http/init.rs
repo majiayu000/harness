@@ -623,17 +623,17 @@ async fn post_review_bot_comment(
     body: &str,
     github_token: &str,
 ) -> anyhow::Result<()> {
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments");
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {github_token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", "harness-bot")
-        .json(&serde_json::json!({ "body": body }))
-        .send()
-        .await?;
+    let url = format!(
+        "{}/repos/{owner}/{repo}/issues/{pr_number}/comments",
+        crate::github_client::github_api_base_url()
+    );
+    let client = crate::github_client::github_request();
+    let resp = crate::github_client::apply_github_headers(
+        client.post(&url).json(&serde_json::json!({ "body": body })),
+        Some(github_token),
+    )
+    .send()
+    .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
