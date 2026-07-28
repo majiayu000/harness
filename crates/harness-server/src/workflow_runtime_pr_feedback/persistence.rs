@@ -7,6 +7,20 @@ pub(super) enum RuntimeDecisionCommitOutcome {
     Stale,
 }
 
+pub(super) fn outcome_from_atomic_record(
+    record: Option<WorkflowDecisionRecord>,
+) -> RuntimeDecisionCommitOutcome {
+    match record {
+        Some(record) if record.accepted => RuntimeDecisionCommitOutcome::Accepted,
+        Some(record) => RuntimeDecisionCommitOutcome::Rejected {
+            reason: record
+                .rejection_reason
+                .unwrap_or_else(|| "transition rejected by atomic validation".to_string()),
+        },
+        None => RuntimeDecisionCommitOutcome::Stale,
+    }
+}
+
 impl RuntimeDecisionCommitOutcome {
     #[cfg(test)]
     fn into_result(self) -> anyhow::Result<()> {
@@ -654,19 +668,19 @@ pub(super) async fn commit_runtime_decision(
     final_instance.data = merge_last_decision(accepted_data, &decision.decision);
     let create_if_missing = new_instance.then_some(&instance);
     let record = store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: &expected_state,
-            create_if_missing,
-            event_type,
-            source,
-            payload: event_payload,
-            decision: &decision,
-            final_instance: &final_instance,
-            command_status: WorkflowCommandStatus::Pending,
-        })
+        .apply_decision_transition(
+            WorkflowDecisionTransition {
+                expected_state: &expected_state,
+                create_if_missing,
+                event_type,
+                source,
+                payload: event_payload,
+                decision: &decision,
+                final_instance: &final_instance,
+                command_status: WorkflowCommandStatus::Pending,
+            },
+            "workflow-policy",
+        )
         .await?;
-    Ok(match record {
-        Some(_) => RuntimeDecisionCommitOutcome::Accepted,
-        None => RuntimeDecisionCommitOutcome::Stale,
-    })
+    Ok(outcome_from_atomic_record(record))
 }
