@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::activity_result::activity_result_from_turn;
+use super::activity_result::activity_result_from_turn_with_workflow;
 use super::child_workflow::execute_start_child_workflow;
 use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
@@ -228,7 +228,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 .thread_manager
                 .get_turn(&thread_id, &turn_id)
                 .ok_or_else(|| anyhow::anyhow!("runtime turn disappeared before completion"))?;
-            let result = activity_result_from_turn(
+            let result = activity_result_from_turn_with_workflow(
                 &job,
                 &turn.status,
                 &turn.items,
@@ -237,6 +237,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 agent_name,
                 &project_root,
                 &prompt_packet_digest,
+                workflow
+                    .as_ref()
+                    .map(|workflow| workflow.definition_id.as_str()),
             );
             let result =
                 super::transcript_durability::attach_runtime_transcript_source(result, &turn)?

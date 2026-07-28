@@ -462,6 +462,40 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
 }
 
 #[test]
+fn prompt_task_packet_describes_disjunctive_completion_evidence_contract() {
+    let job = RuntimeJob::pending(
+        "command-prompt",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY }),
+    );
+    let workflow = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "TEAM-123"),
+    )
+    .with_id("prompt-workflow-1");
+
+    let schema = activity_result_schema(&job, Some(&workflow));
+    let artifacts = &schema["agent_summary_contract"]["artifacts"];
+
+    assert_eq!(artifacts["validation_report"]["type"], "array");
+    assert_eq!(artifacts["validation_report"]["min_items"], 1);
+    assert_eq!(
+        artifacts["validation_report"]["item_fields"],
+        json!(["command", "exit_code"])
+    );
+    assert_eq!(artifacts["no_change_rationale"]["type"], "string");
+    assert_eq!(artifacts["no_change_rationale"]["non_blank"], true);
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("Free-text validation records do not satisfy"))
+    );
+}
+
+#[test]
 fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     let job = RuntimeJob::pending(
         "command-continue",
@@ -512,6 +546,27 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     assert_eq!(
         packet["activity_result_schema"]["continuation_signal_contract"]["required_signal_type"],
         "external_state"
+    );
+    let schema = &packet["activity_result_schema"];
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("validation_report"))
+    );
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("no_change_rationale"))
+    );
+    assert!(
+        schema["agent_summary_contract"]["artifacts"]["validation_report"]["required_when"]
+            .as_str()
+            .is_some_and(|value| value.contains("use this or no_change_rationale"))
+    );
+    assert!(
+        schema["agent_summary_contract"]["artifacts"]["no_change_rationale"]["required_when"]
+            .as_str()
+            .is_some_and(|value| value.contains("use this or validation_report"))
     );
     let prompt = build_runtime_job_prompt(&packet, Some("Continue TEAM-123."));
     assert!(prompt.contains("Continuation context:"));

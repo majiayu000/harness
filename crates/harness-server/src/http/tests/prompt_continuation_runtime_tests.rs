@@ -71,6 +71,9 @@ fn prompt_result(summary: &str, state: &str, subject: &str, revision: u64) -> Va
                 "subject": subject,
                 "revision": revision
             }
+        }, {
+            "artifact_type": "validation_report",
+            "artifact": [{ "command": "check external tracker", "exit_code": 0 }]
         }],
         "signals": [{
             "signal_type": "external_state",

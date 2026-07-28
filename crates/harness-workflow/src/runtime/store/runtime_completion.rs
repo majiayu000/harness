@@ -392,14 +392,17 @@ async fn apply_prompt_continuation_side_effect(
     instance: &mut WorkflowInstance,
     decision: &WorkflowDecision,
 ) -> anyhow::Result<PromptContinuationSideEffect> {
+    let missing_completion_evidence_for_continuation = decision.decision
+        == "prompt_completion_evidence_missing"
+        && instance.data.get("continuation").is_some();
     if instance.definition_id != PROMPT_TASK_DEFINITION_ID
-        || !matches!(
+        || (!matches!(
             decision.decision.as_str(),
             "continue_prompt_task"
                 | "finish_prompt_task_external_settled"
                 | "prompt_continuation_exhausted"
                 | "prompt_continuation_no_progress"
-        )
+        ) && !missing_completion_evidence_for_continuation)
     {
         return Ok(PromptContinuationSideEffect::Applied);
     }
