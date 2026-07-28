@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
+from shutil import which
 from textwrap import dedent
 from typing import TypeAlias
+from unittest import SkipTest
 
 
 @dataclass(frozen=True)
@@ -188,6 +195,218 @@ def block(body: str, style: str = "|") -> BlockScalar:
     return BlockScalar(style, dedent(body).strip("\n"))
 
 
+HERMETIC_PYTEST_ARGUMENTS = (
+    "-I", "-m", "pytest", "-q", "-c", "/dev/null", "--noconftest",
+    "-p", "no:cacheprovider", "tests",
+)
+REPOSITORY_PYTEST_COMMAND = f"python3 {' '.join(HERMETIC_PYTEST_ARGUMENTS)}"
+REPOSITORY_PYTEST_ENV = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": '"1"'}
+PYTEST_EXECUTION_CANARY = "HARNESS_PYTEST_EXECUTION_CANARY"
+PYTEST_CONFIG_BAITS = (
+    ("pytest.ini", "[pytest]\naddopts = --collect-only\n"),
+    ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = "--collect-only"\n'),
+    ("setup.cfg", "[tool:pytest]\naddopts = --collect-only\n"),
+)
+PYTEST_ROOT_BAITS = (
+    ("pytest.py", "raise SystemExit(0)\n"),
+    ("sitecustomize.py", "import os\nos._exit(0)\n"),
+)
+PYTEST_CONFTEST_HOOKS = (
+    "def pytest_cmdline_main(config):\n    return 0\n",
+    "def pytest_sessionfinish(session, exitstatus):\n    session.exitstatus = 0\n",
+)
+WHITESPACE_CHECK_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "check_committed_whitespace.py"
+)
+
+
+def run_git(repo: Path, *arguments: str) -> str:
+    git = which("git")
+    if git is None:
+        raise SkipTest("git is required to validate committed whitespace")
+    result = subprocess.run(
+        [git, *arguments],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
+
+
+def commit_files(repo: Path, changes: dict[str, str], message: str) -> str:
+    for relative, content in changes.items():
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        run_git(repo, "add", relative)
+    run_git(repo, "commit", "-m", message)
+    return run_git(repo, "rev-parse", "HEAD")
+
+
+def initialize_git_repo(path: Path) -> None:
+    path.mkdir()
+    run_git(path, "init")
+    run_git(path, "config", "user.email", "ci-contract@example.invalid")
+    run_git(path, "config", "user.name", "CI Contract Test")
+    run_git(path, "config", "commit.gpgSign", "false")
+    run_git(path, "config", "core.hooksPath", ".git/hooks")
+
+
+def create_git_repo(path: Path) -> tuple[str, str]:
+    initialize_git_repo(path)
+    base = commit_files(path, {"sample.txt": "clean\n"}, "base")
+    head = commit_files(
+        path,
+        {"sample.txt": "trailing whitespace \n"},
+        "candidate",
+    )
+    return base, head
+
+
+def run_whitespace_check(
+    repo: Path,
+    event_path: Path,
+    event_name: str,
+    payload: dict[str, object],
+    arguments: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    event_path.write_text(json.dumps(payload), encoding="utf-8")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GITHUB_EVENT_NAME": event_name,
+            "GITHUB_EVENT_PATH": str(event_path),
+        }
+    )
+    return subprocess.run(
+        [sys.executable, str(WHITESPACE_CHECK_PATH), *(arguments or [])],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
+def create_pytest_canary(project: Path) -> None:
+    tests = project / "tests"
+    tests.mkdir(parents=True)
+    (tests / "test_execution_canary.py").write_text(
+        "def test_execution_canary():\n"
+        f"    raise AssertionError({PYTEST_EXECUTION_CANARY!r})\n",
+        encoding="utf-8",
+    )
+
+
+def run_repository_pytest(
+    project: Path,
+    *,
+    hardened: bool,
+    python: str | Path = sys.executable,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    process_environment = os.environ.copy()
+    for name in (
+        "PYTHONPATH",
+        "PYTHONSAFEPATH",
+        "PYTEST_ADDOPTS",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+        "PYTEST_PLUGINS",
+    ):
+        process_environment.pop(name, None)
+    process_environment.update(environment or {})
+    if hardened:
+        process_environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    arguments = (
+        HERMETIC_PYTEST_ARGUMENTS
+        if hardened
+        else ("-m", "pytest", "-q", "tests")
+    )
+    return subprocess.run(
+        [str(python), *arguments],
+        cwd=project,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=process_environment,
+    )
+
+
+def assert_pytest_attack_blocked(
+    project: Path,
+    *,
+    python: str | Path = sys.executable,
+    environment: dict[str, str] | None = None,
+) -> None:
+    bypassed = run_repository_pytest(
+        project,
+        hardened=False,
+        python=python,
+        environment=environment,
+    )
+    assert bypassed.returncode == 0, bypassed.stdout + bypassed.stderr
+
+    protected = run_repository_pytest(
+        project,
+        hardened=True,
+        python=python,
+        environment=environment,
+    )
+    output = protected.stdout + protected.stderr
+    assert protected.returncode != 0, output
+    assert PYTEST_EXECUTION_CANARY in output, output
+    assert "1 failed" in output, output
+
+
+def create_autoloading_pytest_plugin(root: Path) -> Path:
+    environment = root / "plugin-venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(environment)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    purelib = subprocess.run(
+        [str(python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    site_packages = Path(purelib)
+    parent_site = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, pytest; print(pathlib.Path(pytest.__file__).parent.parent)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (site_packages / "harness_parent_site.pth").write_text(
+        f"{parent_site}\n",
+        encoding="utf-8",
+    )
+    (site_packages / "harness_bypass_plugin.py").write_text(
+        "def pytest_cmdline_main(config):\n    return 0\n",
+        encoding="utf-8",
+    )
+    metadata = site_packages / "harness_bypass_plugin-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: harness-bypass-plugin\nVersion: 1.0\n",
+        encoding="utf-8",
+    )
+    (metadata / "entry_points.txt").write_text(
+        "[pytest11]\nharness_bypass_plugin = harness_bypass_plugin\n",
+        encoding="utf-8",
+    )
+    return python
+
+
 RUST_OR_CI_CHANGED = (
     "needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'"
 )
@@ -321,7 +540,8 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
             },
             {
                 "name": "Test repository contracts",
-                "run": "python3 -m pytest -q tests",
+                "env": REPOSITORY_PYTEST_ENV,
+                "run": REPOSITORY_PYTEST_COMMAND,
             },
             {
                 "name": "Check committed whitespace",

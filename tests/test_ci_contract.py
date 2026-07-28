@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -10,7 +9,23 @@ from shutil import which
 from unittest import SkipTest
 
 import pytest
-from ci_contract_support import CI_RESULT_ENV, assert_ci_contract, parse_workflow
+from ci_contract_support import (
+    CI_RESULT_ENV,
+    PYTEST_CONFIG_BAITS,
+    PYTEST_CONFTEST_HOOKS,
+    PYTEST_ROOT_BAITS,
+    REPOSITORY_PYTEST_COMMAND,
+    assert_ci_contract,
+    assert_pytest_attack_blocked,
+    commit_files,
+    create_autoloading_pytest_plugin,
+    create_git_repo,
+    create_pytest_canary,
+    initialize_git_repo,
+    parse_workflow,
+    run_git,
+    run_whitespace_check,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,74 +117,67 @@ def test_ci_result_script_fails_closed(
     assert result.returncode == expected_code, result.stdout + result.stderr
 
 
-def run_git(repo: Path, *arguments: str) -> str:
-    git = which("git")
-    if git is None:
-        raise SkipTest("git is required to validate committed whitespace")
-    result = subprocess.run(
-        [git, *arguments],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-        text=True,
+@pytest.mark.parametrize(
+    ("relative", "content"),
+    PYTEST_CONFIG_BAITS,
+)
+def test_hermetic_pytest_ignores_repository_config(
+    tmp_path: Path,
+    relative: str,
+    content: str,
+) -> None:
+    project = tmp_path / "project"
+    create_pytest_canary(project)
+    (project / relative).write_text(content, encoding="utf-8")
+    assert_pytest_attack_blocked(project)
+
+
+@pytest.mark.parametrize(
+    ("relative", "content"),
+    PYTEST_ROOT_BAITS,
+)
+def test_hermetic_pytest_ignores_root_python_bait(
+    tmp_path: Path,
+    relative: str,
+    content: str,
+) -> None:
+    project = tmp_path / "project"
+    create_pytest_canary(project)
+    (project / relative).write_text(content, encoding="utf-8")
+    environment = {"PYTHONPATH": str(project)} if relative == "sitecustomize.py" else None
+    assert_pytest_attack_blocked(project, environment=environment)
+
+
+def test_hermetic_pytest_ignores_pythonpath_bait(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    create_pytest_canary(project)
+    attack_path = tmp_path / "pythonpath"
+    attack_path.mkdir()
+    (attack_path / "pytest.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    assert_pytest_attack_blocked(
+        project,
+        environment={"PYTHONPATH": str(attack_path)},
     )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return result.stdout.strip()
 
 
-def commit_files(repo: Path, changes: dict[str, str], message: str) -> str:
-    for relative, content in changes.items():
-        path = repo / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        run_git(repo, "add", relative)
-    run_git(repo, "commit", "-m", message)
-    return run_git(repo, "rev-parse", "HEAD")
+@pytest.mark.parametrize("directory", ["", "tests"])
+@pytest.mark.parametrize("hook", PYTEST_CONFTEST_HOOKS)
+def test_hermetic_pytest_disables_conftest_hooks(
+    tmp_path: Path,
+    directory: str,
+    hook: str,
+) -> None:
+    project = tmp_path / "project"
+    create_pytest_canary(project)
+    (project / directory / "conftest.py").write_text(hook, encoding="utf-8")
+    assert_pytest_attack_blocked(project)
 
 
-def initialize_git_repo(path: Path) -> None:
-    path.mkdir()
-    run_git(path, "init")
-    run_git(path, "config", "user.email", "ci-contract@example.invalid")
-    run_git(path, "config", "user.name", "CI Contract Test")
-    run_git(path, "config", "commit.gpgSign", "false")
-    run_git(path, "config", "core.hooksPath", ".git/hooks")
-
-
-def create_git_repo(path: Path) -> tuple[str, str]:
-    initialize_git_repo(path)
-    base = commit_files(path, {"sample.txt": "clean\n"}, "base")
-    head = commit_files(
-        path,
-        {"sample.txt": "trailing whitespace \n"},
-        "candidate",
-    )
-    return base, head
-
-
-def run_whitespace_check(
-    repo: Path,
-    event_path: Path,
-    event_name: str,
-    payload: dict[str, object],
-    arguments: list[str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    event_path.write_text(json.dumps(payload), encoding="utf-8")
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "GITHUB_EVENT_NAME": event_name,
-            "GITHUB_EVENT_PATH": str(event_path),
-        }
-    )
-    return subprocess.run(
-        [sys.executable, str(WHITESPACE_CHECK), *(arguments or [])],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
+def test_hermetic_pytest_disables_automatic_plugins(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    create_pytest_canary(project)
+    python = create_autoloading_pytest_plugin(tmp_path)
+    assert_pytest_attack_blocked(project, python=python)
 
 
 @pytest.mark.parametrize("event_name", ["pull_request", "push"])
@@ -421,6 +429,14 @@ def test_whitespace_check_rejects_unsupported_event_and_arguments(
     assert "does not accept arguments" in with_arguments.stderr
 
 
+REPOSITORY_PYTEST_RUN = f"        run: {REPOSITORY_PYTEST_COMMAND}"
+REPOSITORY_PYTEST_STEP = (
+    "      - name: Test repository contracts\n"
+    "        env:\n"
+    '          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"\n'
+    f"{REPOSITORY_PYTEST_RUN}"
+)
+
 CI_MUTATIONS = [
     (
         "remove fan-in dependency",
@@ -469,26 +485,27 @@ CI_MUTATIONS = [
     ),
     (
         "repository pytest environment",
-        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
-        "      - name: Test repository contracts\n"
-        "        env:\n"
-        "          PYTEST_ADDOPTS: --collect-only\n"
-        "        run: python3 -m pytest -q tests",
+        REPOSITORY_PYTEST_STEP,
+        REPOSITORY_PYTEST_STEP.replace(
+            "        env:\n",
+            "        env:\n          PYTEST_ADDOPTS: --collect-only\n",
+        ),
     ),
     (
         "repository pytest PATH",
-        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
-        "      - name: Test repository contracts\n"
-        "        env:\n"
-        "          PATH: bypass\n"
-        "        run: python3 -m pytest -q tests",
+        REPOSITORY_PYTEST_STEP,
+        REPOSITORY_PYTEST_STEP.replace(
+            "        env:\n",
+            "        env:\n          PATH: bypass\n",
+        ),
     ),
     (
         "repository pytest working directory",
-        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
-        "      - name: Test repository contracts\n"
-        "        working-directory: bypass\n"
-        "        run: python3 -m pytest -q tests",
+        REPOSITORY_PYTEST_STEP,
+        REPOSITORY_PYTEST_STEP.replace(
+            "        env:\n",
+            "        working-directory: bypass\n        env:\n",
+        ),
     ),
     (
         "repository checkout depth",
@@ -497,18 +514,18 @@ CI_MUTATIONS = [
     ),
     (
         "repository pytest conditional",
-        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
-        "      - name: Test repository contracts\n"
-        "        if: ${{ false }}\n"
-        "        run: python3 -m pytest -q tests",
+        REPOSITORY_PYTEST_STEP,
+        REPOSITORY_PYTEST_STEP.replace(
+            "        env:\n",
+            "        if: ${{ false }}\n        env:\n",
+        ),
     ),
     (
         "repository pytest command guard",
-        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
-        "      - name: Test repository contracts\n"
+        REPOSITORY_PYTEST_RUN,
         "        run: |\n"
         "          if false; then\n"
-        "            python3 -m pytest -q tests\n"
+        f"            {REPOSITORY_PYTEST_COMMAND}\n"
         "          fi",
     ),
     (
@@ -645,7 +662,7 @@ CI_MUTATIONS = [
     ),
     (
         "repository test command",
-        "        run: python3 -m pytest -q tests",
+        REPOSITORY_PYTEST_RUN,
         "        run: echo tests-disabled",
     ),
     (

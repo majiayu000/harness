@@ -81,7 +81,9 @@ jobs:
       - name: Install test dependencies
         run: python3 -m pip install pytest
       - name: Test repository contracts
-        run: python3 -m pytest -q tests
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: python3 -I -m pytest -q -c /dev/null --noconftest -p no:cacheprovider tests
       - name: Check committed whitespace
         run: python3 scripts/check_committed_whitespace.py
 
