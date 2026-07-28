@@ -6,12 +6,11 @@
 
 use crate::http::AppState;
 use harness_core::config::workflow::WorkflowConfig;
-use harness_workflow::runtime::completion_evidence::ARTIFACT_COMPLETION_EVIDENCE_POLICY;
 use harness_workflow::runtime::quality_gate::QUALITY_GATE_ACTIVITY;
-use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, ActivityStatus, RuntimeJob, WorkflowInstance,
-};
-use serde_json::{json, Value};
+use harness_workflow::runtime::{ActivityResult, ActivityStatus, RuntimeJob, WorkflowInstance};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,10 +21,13 @@ use super::server_validation::{apply_server_validation, run_validation_commands}
 
 /// Apply the completion-evidence pipeline to an agent-turn activity result.
 ///
-/// With enforcement disabled (`runtime_completion.evidence_enforced = false`)
-/// the result only gains an explicit policy waiver artifact, so reducers
-/// record waiver evidence instead of blocking — trust-by-claim behavior with
-/// a visible audit trail, for one transition release.
+/// This runs unconditionally. The deployment-global kill switch
+/// (`workflow.completion_evidence_enforced = false`) governs whether a
+/// missing proof *blocks* a transition, not whether the server bothers to
+/// look: it strips the declared requirements from the transition table at
+/// startup, and the reducers read that table. Verification therefore keeps
+/// producing evidence in the audit trail even during a kill-switch release,
+/// which is what makes turning enforcement back on a safe, observable step.
 pub(super) async fn apply_completion_evidence(
     state: &Arc<AppState>,
     job: &RuntimeJob,
@@ -35,13 +37,6 @@ pub(super) async fn apply_completion_evidence(
     result: ActivityResult,
 ) -> ActivityResult {
     let policy = &config.runtime_completion;
-    if !policy.evidence_enforced {
-        return result.with_artifact(ActivityArtifact::new(
-            ARTIFACT_COMPLETION_EVIDENCE_POLICY,
-            json!({ "enforced": false }),
-        ));
-    }
-
     let mut result = result;
     if activity_name(job) == QUALITY_GATE_ACTIVITY && result.status == ActivityStatus::Succeeded {
         let commands = validation_commands_for_job(job, workflow);

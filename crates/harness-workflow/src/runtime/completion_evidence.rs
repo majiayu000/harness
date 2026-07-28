@@ -30,9 +30,6 @@ pub const ARTIFACT_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verificati
 /// Server-attached artifact carrying the server validation digest for a
 /// quality-gate run (per-command exit codes and output hashes).
 pub const ARTIFACT_SERVER_VALIDATION_DIGEST: &str = "server_validation_digest";
-/// Server-attached artifact declaring the completion-evidence enforcement
-/// policy for this activity result. Absent means enforced (fail closed).
-pub const ARTIFACT_COMPLETION_EVIDENCE_POLICY: &str = "completion_evidence_policy";
 
 /// Blocked-decision reason when a prompt task completes without validation
 /// evidence or an explicit no-change rationale.
@@ -44,35 +41,32 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 4] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 3] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
-    ARTIFACT_COMPLETION_EVIDENCE_POLICY,
 ];
 
-/// Summary recorded on waiver evidence when the operator kill switch
-/// (`runtime_completion.evidence_enforced = false`) is active.
-pub const WAIVER_SUMMARY: &str = "enforcement_disabled_by_config";
-
-/// Whether completion-evidence enforcement is active for this result.
+/// Whether the transition table still demands `evidence_kind` for this
+/// transition.
 ///
-/// Enforcement is on unless the server explicitly attached a
-/// `completion_evidence_policy` artifact with `enforced: false` (the
-/// one-release operator kill switch). A missing or malformed policy artifact
-/// means enforced — fail closed.
-pub fn completion_evidence_enforced(result: &ActivityResult) -> bool {
-    result
-        .artifacts
-        .iter()
-        .filter(|artifact| artifact.artifact_type == ARTIFACT_COMPLETION_EVIDENCE_POLICY)
-        .all(|artifact| {
-            artifact
-                .artifact
-                .get("enforced")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
-        })
+/// The registered transition table is the single authority (GH-1815). The
+/// deployment-global kill switch `workflow.completion_evidence_enforced`
+/// strips declared requirements at startup, so a reducer that asks the table
+/// cannot drift from what the validator will accept: lifting the contract
+/// lifts the reducer gate with it, and nothing else can lift either.
+pub fn transition_evidence_enforced(
+    definition_id: &str,
+    from_state: &str,
+    to_state: &str,
+    evidence_kind: &str,
+) -> bool {
+    crate::runtime::state_registry::transition_requires_evidence(
+        definition_id,
+        from_state,
+        to_state,
+        evidence_kind,
+    )
 }
 
 /// The server-attached verified-PR-binding payload, if present.
@@ -115,10 +109,10 @@ pub fn server_validation_digest_passed(result: &ActivityResult) -> bool {
     !commands.is_empty()
         && commands.iter().all(|command| {
             command.get("exit_code").and_then(Value::as_i64) == Some(0)
-                && !command
+                && command
                     .get("startup_error")
                     .and_then(Value::as_str)
-                    .is_some_and(|error| !error.is_empty())
+                    .is_none_or(str::is_empty)
         })
 }
 
@@ -171,21 +165,6 @@ mod tests {
 
     fn result() -> ActivityResult {
         ActivityResult::succeeded("implement_prompt", "summary")
-    }
-
-    #[test]
-    fn enforcement_defaults_on_and_honors_explicit_waiver() {
-        assert!(completion_evidence_enforced(&result()));
-        let waived = result().with_artifact(ActivityArtifact::new(
-            ARTIFACT_COMPLETION_EVIDENCE_POLICY,
-            json!({ "enforced": false }),
-        ));
-        assert!(!completion_evidence_enforced(&waived));
-        let malformed = result().with_artifact(ActivityArtifact::new(
-            ARTIFACT_COMPLETION_EVIDENCE_POLICY,
-            json!({}),
-        ));
-        assert!(completion_evidence_enforced(&malformed));
     }
 
     #[test]

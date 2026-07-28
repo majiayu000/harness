@@ -6,9 +6,8 @@ use super::{
     ISSUE_STATE_ARTIFACT, SCOPE_TOO_LARGE_SIGNAL,
 };
 use crate::runtime::completion_evidence::{
-    completion_evidence_enforced, pr_binding_verification_failure, verified_pr_binding_artifact,
+    pr_binding_verification_failure, transition_evidence_enforced, verified_pr_binding_artifact,
     EVIDENCE_GITHUB_TERMINAL, EVIDENCE_VERIFIED_PR_BINDING, REASON_PR_BINDING_VERIFICATION_FAILED,
-    WAIVER_SUMMARY,
 };
 use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
@@ -254,10 +253,17 @@ pub(crate) fn verified_pr_binding_evidence(
             verified.to_string(),
         ));
     }
-    if !completion_evidence_enforced(result) {
+    if !transition_evidence_enforced(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        "implementing",
+        "pr_open",
+        EVIDENCE_VERIFIED_PR_BINDING,
+    ) {
+        // The transition table no longer demands it, so neither does this
+        // reducer: one authority, no drift.
         return Ok(WorkflowEvidence::new(
             EVIDENCE_VERIFIED_PR_BINDING,
-            WAIVER_SUMMARY,
+            "enforcement_lifted_by_deployment_config",
         ));
     }
     Err(

@@ -206,10 +206,15 @@ pub(super) fn pr_feedback_child_decision_from_activity_result(
                 crate::runtime::completion_evidence::EVIDENCE_SERVER_PR_SNAPSHOT,
                 "server_github_graphql snapshot proves the PR is ready to merge",
             ));
-        } else if !crate::runtime::completion_evidence::completion_evidence_enforced(result) {
+        } else if !crate::runtime::completion_evidence::transition_evidence_enforced(
+            PR_FEEDBACK_DEFINITION_ID,
+            "inspecting",
+            "ready_to_merge",
+            crate::runtime::completion_evidence::EVIDENCE_SERVER_PR_SNAPSHOT,
+        ) {
             decision = decision.with_evidence(WorkflowEvidence::new(
                 crate::runtime::completion_evidence::EVIDENCE_SERVER_PR_SNAPSHOT,
-                crate::runtime::completion_evidence::WAIVER_SUMMARY,
+                "enforcement_lifted_by_deployment_config",
             ));
         }
     }
