@@ -75,6 +75,7 @@ pub async fn metrics_collect(
     };
 
     let violation_count = violations.len();
+    // `None` (serialized as null) means the window held nothing to grade.
     let report = harness_observe::quality::QualityGrader::grade(&evts, violation_count);
     match serde_json::to_value(&report) {
         Ok(v) => RpcResponse::success(id, v),

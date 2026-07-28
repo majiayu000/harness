@@ -1,4 +1,3 @@
-use harness_agents::claude::ClaudeCodeAgent;
 use harness_agents::codex::{CodexAgent, CodexReviewRequest};
 use harness_core::{
     agent::{AgentRequest, CodeAgent, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV},
@@ -48,19 +47,10 @@ fn codex_review_spawn_env_with(
     env_vars
 }
 
-fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
-    ClaudeCodeAgent::new(
-        config.agents.claude.cli_path.clone(),
-        config.agents.claude.default_model.clone(),
-        config.agents.sandbox_mode,
-    )
-    .with_no_session_persistence_probe()
-    .with_provider_backpressure_gate(
-        harness_agents::provider_backpressure::ProviderBackpressureGate::from_claude_config(
-            &config.agents.claude.provider_backpressure,
-        ),
-    )
-    .with_stream_timeout(config.agents.stream_timeout_secs)
+fn create_agent(config: &HarnessConfig) -> impl CodeAgent {
+    // This path needs the Claude backend alone, not a registry — but it takes
+    // it from the same builder, so it cannot drift from the entry points.
+    harness_agents::builder::claude_agent_from_config(&config.agents, config.agents.sandbox_mode)
 }
 
 pub async fn fix(
@@ -154,13 +144,12 @@ pub async fn review(
         anyhow::bail!("codex_cli_review requires a non-empty base ref");
     }
 
-    let mut agent = CodexAgent::new(
+    #[allow(clippy::disallowed_methods)]
+    let agent = CodexAgent::new(
         review_config.cli_path.clone(),
         SandboxMode::ReadOnlyWithNetwork,
     )
     .with_stream_timeout(Some(review_config.timeout_secs));
-    agent.default_model = review_config.model.clone();
-    agent.reasoning_effort = review_config.reasoning_effort.clone();
 
     let started_at = chrono::Utc::now();
     let response = tokio::time::timeout(

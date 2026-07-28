@@ -109,6 +109,22 @@ pub(in crate::runtime) async fn insert_event_tx(
     insert_event_tx_with_id(tx, workflow_id, event_type, source, payload, None).await
 }
 
+async fn lock_instance_for_event_sequence_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+) -> anyhow::Result<()> {
+    // The workflow_events FK will take the same parent KEY SHARE lock during
+    // INSERT. Take it before the sequence advisory lock so this writer cannot
+    // deadlock with a transition that already holds the instance FOR UPDATE
+    // and is waiting to allocate its event sequence.
+    let _: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM workflow_instances WHERE id = $1 FOR KEY SHARE")
+            .bind(workflow_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(())
+}
+
 pub(super) async fn insert_event_tx_with_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
@@ -117,6 +133,7 @@ pub(super) async fn insert_event_tx_with_id(
     payload: Value,
     event_id: Option<&str>,
 ) -> anyhow::Result<WorkflowEvent> {
+    lock_instance_for_event_sequence_tx(tx, workflow_id).await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("workflow_events:{workflow_id}"))
         .execute(&mut **tx)

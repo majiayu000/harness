@@ -38,4 +38,5 @@ chrono = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
 tempfile = { workspace = true }

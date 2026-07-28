@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use harness_core::config::HarnessConfig;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecSandboxMode {
@@ -356,41 +355,10 @@ pub async fn run(
         ..Default::default()
     };
 
-    let mut agent_registry =
-        harness_agents::registry::AgentRegistry::new(&config.agents.default_agent);
-    agent_registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
-    let mut claude_agent = harness_agents::claude::ClaudeCodeAgent::new(
-        config.agents.claude.cli_path.clone(),
-        config.agents.claude.default_model.clone(),
-        runtime_sandbox_mode,
-    )
-    .with_no_session_persistence_probe()
-    .with_stream_timeout(config.agents.stream_timeout_secs);
-    if let Some(budget) = config.agents.claude.reasoning_budget.clone() {
-        claude_agent = claude_agent.with_reasoning_budget(budget);
-    }
-    agent_registry.register("claude", Arc::new(claude_agent));
-    agent_registry.register(
-        "codex",
-        Arc::new(
-            harness_agents::codex::CodexAgent::from_config(
-                config.agents.codex.clone(),
-                runtime_sandbox_mode,
-            )
-            .with_stream_timeout(config.agents.stream_timeout_secs),
-        ),
-    );
-    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-        agent_registry.register(
-            "anthropic-api",
-            Arc::new(
-                harness_agents::anthropic_api::AnthropicApiAgent::from_config(
-                    api_key,
-                    &config.agents.anthropic_api,
-                ),
-            ),
-        );
-    }
+    // `exec` resolves the sandbox mode from its own flags, so it passes that
+    // rather than `config.agents.sandbox_mode`.
+    let agent_registry =
+        harness_agents::builder::registry_from_config(&config.agents, runtime_sandbox_mode)?;
 
     let selected_agent = if agent.eq_ignore_ascii_case("auto") {
         agent_registry.default_agent()

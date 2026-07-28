@@ -154,9 +154,10 @@ digests are evidence payloads, not new tables. No migration.
 
 ## Configuration
 
-- `runtime_completion_evidence_enforced: bool` (default `true`) in the
-  runtime section of `WORKFLOW.md` config — one release of kill-switch,
-  then removed.
+- `runtime_worker.completion_evidence_enforced: bool` (default `true`) in
+  `WORKFLOW.md` — one release of kill-switch, then removed. Applied to the
+  built-in definitions at server startup, before the definition registry is
+  frozen; a config that fails to load keeps enforcement on.
 - Validation timeout: reuse the existing activity timeout configuration with
   a dedicated `quality_gate_validation_timeout_secs` override (default 900).
 
