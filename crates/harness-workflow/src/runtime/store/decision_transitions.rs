@@ -121,24 +121,7 @@ impl WorkflowRuntimeStore {
                     return Ok(Some(record));
                 }
             };
-        let decision_data = to_jsonb_string(&record)?;
-        sqlx::query(
-            "INSERT INTO workflow_decisions
-                (id, workflow_id, event_id, accepted, data, rejection_reason)
-             VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-             ON CONFLICT (id) DO UPDATE SET
-                accepted = EXCLUDED.accepted,
-                data = EXCLUDED.data,
-                rejection_reason = EXCLUDED.rejection_reason",
-        )
-        .bind(&record.id)
-        .bind(&record.workflow_id)
-        .bind(&record.event_id)
-        .bind(record.accepted)
-        .bind(&decision_data)
-        .bind(&record.rejection_reason)
-        .execute(&mut *tx)
-        .await?;
+        insert_decision_record_tx(&mut tx, &record).await?;
 
         for command in &decision.commands {
             let status = if command.requires_runtime_job() {
