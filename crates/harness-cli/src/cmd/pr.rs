@@ -15,13 +15,7 @@ const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
 fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
     // This path needs the Claude backend alone, not a registry — but it takes
     // it from the same builder, so it cannot drift from the entry points.
-    harness_agents::builder::claude_agent_from_config(
-        &config.agents,
-        config.agents.sandbox_mode,
-        harness_agents::provider_backpressure::ProviderBackpressureGate::from_claude_config(
-            &config.agents.claude.provider_backpressure,
-        ),
-    )
+    harness_agents::builder::claude_agent_from_config(&config.agents, config.agents.sandbox_mode)
 }
 
 pub async fn fix(

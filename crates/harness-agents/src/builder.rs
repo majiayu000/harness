@@ -25,7 +25,18 @@ use std::sync::Arc;
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
 /// Builds the Claude backend with every configured knob applied.
+///
+/// Provider backpressure is derived internally so callers cannot replace the
+/// configured gate.
 pub fn claude_agent_from_config(
+    config: &AgentsConfig,
+    sandbox_mode: SandboxMode,
+) -> ClaudeCodeAgent {
+    let gate = ProviderBackpressureGate::from_claude_config(&config.claude.provider_backpressure);
+    claude_agent_from_config_with_gate(config, sandbox_mode, gate)
+}
+
+fn claude_agent_from_config_with_gate(
     config: &AgentsConfig,
     sandbox_mode: SandboxMode,
     gate: ProviderBackpressureGate,
@@ -67,7 +78,7 @@ pub fn registry_from_config(
         ProviderBackpressureGate::from_claude_config(&config.claude.provider_backpressure);
     registry.register(
         "claude",
-        Arc::new(claude_agent_from_config(
+        Arc::new(claude_agent_from_config_with_gate(
             config,
             sandbox_mode,
             claude_gate.clone(),
@@ -135,11 +146,7 @@ mod tests {
 
     #[test]
     fn claude_backend_applies_the_configured_stream_timeout() {
-        let agent = claude_agent_from_config(
-            &config(),
-            SandboxMode::default(),
-            ProviderBackpressureGate::disabled(),
-        );
+        let agent = claude_agent_from_config(&config(), SandboxMode::default());
         assert_eq!(agent.stream_timeout_secs, Some(120));
     }
 
@@ -147,11 +154,7 @@ mod tests {
     fn claude_backend_applies_a_disabled_stream_timeout() {
         let mut config = config();
         config.stream_timeout_secs = None;
-        let agent = claude_agent_from_config(
-            &config,
-            SandboxMode::default(),
-            ProviderBackpressureGate::disabled(),
-        );
+        let agent = claude_agent_from_config(&config, SandboxMode::default());
         assert_eq!(
             agent.stream_timeout_secs, None,
             "an explicitly disabled timeout must not fall back to the 3600s default"
@@ -162,11 +165,7 @@ mod tests {
     fn claude_backend_applies_the_configured_reasoning_budget() {
         let mut config = config();
         config.claude.reasoning_budget = Some(ReasoningBudget::default());
-        let agent = claude_agent_from_config(
-            &config,
-            SandboxMode::default(),
-            ProviderBackpressureGate::disabled(),
-        );
+        let agent = claude_agent_from_config(&config, SandboxMode::default());
         assert!(agent.reasoning_budget.is_some());
     }
 
@@ -174,9 +173,7 @@ mod tests {
     fn claude_backend_applies_the_configured_provider_gate() {
         let mut config = config();
         config.claude.provider_backpressure.max_concurrent_sessions = NonZeroUsize::new(2);
-        let gate =
-            ProviderBackpressureGate::from_claude_config(&config.claude.provider_backpressure);
-        let agent = claude_agent_from_config(&config, SandboxMode::default(), gate);
+        let agent = claude_agent_from_config(&config, SandboxMode::default());
         assert!(
             agent.provider_gate.is_enabled(),
             "a configured concurrency limit must reach the agent, not be dropped"
@@ -214,11 +211,7 @@ mod tests {
         // must win over `config.sandbox_mode`.
         let mut config = config();
         config.sandbox_mode = SandboxMode::ReadOnly;
-        let agent = claude_agent_from_config(
-            &config,
-            SandboxMode::WorkspaceWrite,
-            ProviderBackpressureGate::disabled(),
-        );
+        let agent = claude_agent_from_config(&config, SandboxMode::WorkspaceWrite);
         assert_eq!(agent.sandbox_mode, SandboxMode::WorkspaceWrite);
     }
 }
