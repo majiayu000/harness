@@ -424,11 +424,8 @@ async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::
 }
 
 #[tokio::test]
-async fn runtime_recovery_waiting_on_command_does_not_lock_instance() -> anyhow::Result<()> {
-    if resolve_database_url(None).is_err() {
-        return Ok(());
-    }
-
+#[ignore = "requires an isolated HARNESS_DATABASE_URL"]
+async fn runtime_recovery_locks_instance_before_waiting_on_command() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = Arc::new(WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?);
     let instance = project_issue_instance("/project-a", 1568, "blocked");
@@ -451,6 +448,9 @@ async fn runtime_recovery_waiting_on_command_does_not_lock_instance() -> anyhow:
         .bind(&stale_command_id)
         .execute(&mut *command_tx)
         .await?;
+    let (command_backend,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut *command_tx)
+        .await?;
 
     let recovery_store = Arc::clone(&store);
     let recovery_workflow_id = instance.id.clone();
@@ -463,17 +463,42 @@ async fn runtime_recovery_waiting_on_command_does_not_lock_instance() -> anyhow:
         .await
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let mut instance_tx = store.pool().begin().await?;
-    sqlx::query("SET LOCAL lock_timeout = '250ms'")
-        .execute(&mut *instance_tx)
+    let mut blocked_backend: Option<(i32,)> = None;
+    for _ in 0..100 {
+        blocked_backend = sqlx::query_as(
+            "SELECT pid
+             FROM pg_stat_activity
+             WHERE pid <> $1
+               AND $1 = ANY(pg_blocking_pids(pid))
+             LIMIT 1",
+        )
+        .bind(command_backend)
+        .fetch_optional(&mut *command_tx)
         .await?;
-    sqlx::query("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
+        if blocked_backend.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (blocked_backend,) =
+        blocked_backend.ok_or_else(|| anyhow::anyhow!("recovery did not wait on command lock"))?;
+    assert_ne!(
+        command_backend, blocked_backend,
+        "recovery must use a second PostgreSQL backend"
+    );
+
+    let instance_lock_code =
+        sqlx::query("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE NOWAIT")
         .bind(&instance.id)
-        .fetch_optional(&mut *instance_tx)
+        .fetch_optional(&mut *command_tx)
         .await
-        .expect("recovery waiting on a command must not already hold the instance lock");
-    instance_tx.rollback().await?;
+        .err()
+        .and_then(|error| {
+            error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .map(|code| code.into_owned())
+        });
 
     command_tx.rollback().await?;
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), recovery).await???;
@@ -481,6 +506,11 @@ async fn runtime_recovery_waiting_on_command_does_not_lock_instance() -> anyhow:
         outcome,
         super::WorkflowRuntimeRecoveryOutcome::Recovered { .. }
     ));
+    assert_eq!(
+        instance_lock_code.as_deref(),
+        Some("55P03"),
+        "recovery must lock the instance before waiting on its command rows"
+    );
     Ok(())
 }
 

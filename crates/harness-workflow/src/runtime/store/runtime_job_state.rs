@@ -261,22 +261,74 @@ impl WorkflowRuntimeStore {
     }
 }
 
+pub(super) struct RuntimeJobCancellation {
+    command_id: String,
+    activity: String,
+    summary: String,
+}
+
+impl RuntimeJobCancellation {
+    pub(super) fn new(
+        command_id: impl Into<String>,
+        activity: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            command_id: command_id.into(),
+            activity: activity.into(),
+            summary: summary.into(),
+        }
+    }
+}
+
 pub(super) async fn cancel_unfinished_runtime_jobs_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     command_id: &str,
     activity: &str,
     summary: &str,
 ) -> anyhow::Result<usize> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, data::text FROM runtime_jobs
-         WHERE command_id = $1 AND status IN ('pending', 'running') FOR UPDATE",
+    cancel_unfinished_runtime_jobs_for_commands_tx(
+        tx,
+        &[RuntimeJobCancellation::new(command_id, activity, summary)],
     )
-    .bind(command_id)
+    .await
+}
+
+pub(super) async fn cancel_unfinished_runtime_jobs_for_commands_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cancellations: &[RuntimeJobCancellation],
+) -> anyhow::Result<usize> {
+    if cancellations.is_empty() {
+        return Ok(0);
+    }
+    let command_ids = cancellations
+        .iter()
+        .map(|cancellation| cancellation.command_id.clone())
+        .collect::<Vec<_>>();
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, command_id, data::text FROM runtime_jobs
+         WHERE command_id = ANY($1::text[]) AND status IN ('pending', 'running')
+         ORDER BY id
+         FOR UPDATE",
+    )
+    .bind(&command_ids)
     .fetch_all(&mut **tx)
     .await?;
-    for (id, data) in &rows {
+    for (id, command_id, data) in &rows {
+        let cancellation = cancellations
+            .iter()
+            .find(|cancellation| cancellation.command_id == *command_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime job `{id}` was locked without a cancellation for command \
+                     `{command_id}`"
+                )
+            })?;
         let mut job: RuntimeJob = serde_json::from_str(data)?;
-        job.complete(&ActivityResult::cancelled(activity, summary))?;
+        job.complete(&ActivityResult::cancelled(
+            &cancellation.activity,
+            &cancellation.summary,
+        ))?;
         sqlx::query(
             "UPDATE runtime_jobs SET status = $1, not_before = $2, data = $3::jsonb,
                 updated_at = CURRENT_TIMESTAMP WHERE id = $4",

@@ -1,4 +1,4 @@
-use super::manifest::EvalBenchmarkCase;
+use super::{manifest::EvalBenchmarkCase, transition_outcome::accepted_transition_record};
 use crate::runtime::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeCommandDispatcher,
     RuntimeJobStatus, RuntimeProfile, SubmissionMode, ValidationContext, WorkflowCommand,
@@ -160,30 +160,36 @@ pub async fn enqueue_eval_case_workflow(
     submitted_instance.state = decision.next_state.clone();
     submitted_instance.version = submitted_instance.version.saturating_add(1);
     submitted_instance.data = eval_case_submitted_data(input, &decision.decision);
-    let record = store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: &initial_instance.state,
-            create_if_missing: Some(&initial_instance),
-            event_type: "EvalCaseSubmitted",
-            source: "eval-run",
-            payload: json!({
-                "eval_run_id": input.eval_run_id,
-                "case_id": input.case.case_id,
-                "issue": input.case.issue,
-                "repo": input.case.repo,
-            }),
-            decision: &decision,
-            final_instance: &submitted_instance,
-            command_status: WorkflowCommandStatus::Pending,
-        })
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "eval case workflow {} was not in the expected `{}` state",
-                initial_instance.id,
-                initial_instance.state
+    let record = accepted_transition_record(
+        store
+            .apply_decision_transition(
+                WorkflowDecisionTransition {
+                    expected_state: &initial_instance.state,
+                    create_if_missing: Some(&initial_instance),
+                    event_type: "EvalCaseSubmitted",
+                    source: "eval-run",
+                    payload: json!({
+                        "eval_run_id": input.eval_run_id,
+                        "case_id": input.case.case_id,
+                        "issue": input.case.issue,
+                        "repo": input.case.repo,
+                    }),
+                    decision: &decision,
+                    final_instance: &submitted_instance,
+                    command_status: WorkflowCommandStatus::Pending,
+                },
+                "eval-run",
             )
-        })?;
+            .await?,
+        &initial_instance.id,
+        "eval case enqueue",
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "eval case workflow {} changed or disappeared before commit",
+            initial_instance.id
+        )
+    })?;
     let command_ids = store
         .commands_for(&submitted_instance.id)
         .await?
@@ -287,15 +293,28 @@ pub async fn cleanup_cancelled_eval_run(
         let mut final_instance = instance.clone();
         if !instance.is_terminal() {
             match cancel_eval_workflow_instance(store, &instance, eval_run_id, case, reason).await {
-                Ok(Some(cancelled_instance)) => {
-                    summary.workflows_cancelled += 1;
-                    final_instance = cancelled_instance;
-                }
+                Ok(Some(_)) => summary.workflows_cancelled += 1,
                 Ok(None) => {}
                 Err(error) => {
                     summary.record_failure(&case.case_id, &workflow_id, "cancel_workflow", error);
                 }
             }
+            final_instance = match store.get_instance(&workflow_id).await {
+                Ok(Some(latest_instance)) => latest_instance,
+                Ok(None) => {
+                    summary.record_failure(
+                        &case.case_id,
+                        &workflow_id,
+                        "reload_workflow",
+                        "workflow disappeared after cleanup transition",
+                    );
+                    instance.clone()
+                }
+                Err(error) => {
+                    summary.record_failure(&case.case_id, &workflow_id, "reload_workflow", error);
+                    continue;
+                }
+            };
         };
 
         if let Err(error) =
@@ -356,22 +375,29 @@ async fn cancel_eval_workflow_instance(
         &ValidationContext::new("eval-cleanup", Utc::now()),
     )?;
 
-    let record = store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: &observed_state,
-            create_if_missing: None,
-            event_type: "EvalRunCancelled",
-            source: "eval-cleanup",
-            payload: json!({
-                "eval_run_id": eval_run_id,
-                "case_id": case.case_id,
-                "reason": reason,
-            }),
-            decision: &decision,
-            final_instance: &final_instance,
-            command_status: WorkflowCommandStatus::Pending,
-        })
-        .await?;
+    let record = accepted_transition_record(
+        store
+            .apply_decision_transition(
+                WorkflowDecisionTransition {
+                    expected_state: &observed_state,
+                    create_if_missing: None,
+                    event_type: "EvalRunCancelled",
+                    source: "eval-cleanup",
+                    payload: json!({
+                        "eval_run_id": eval_run_id,
+                        "case_id": case.case_id,
+                        "reason": reason,
+                    }),
+                    decision: &decision,
+                    final_instance: &final_instance,
+                    command_status: WorkflowCommandStatus::Pending,
+                },
+                "eval-cleanup",
+            )
+            .await?,
+        &instance.id,
+        "eval cleanup",
+    )?;
     Ok(record.map(|_| final_instance))
 }
 
@@ -461,7 +487,7 @@ fn active_runtime_job_status(status: RuntimeJobStatus) -> bool {
     )
 }
 
-fn eval_case_initial_instance(input: EvalCaseWorkflowInput<'_>) -> WorkflowInstance {
+pub(super) fn eval_case_initial_instance(input: EvalCaseWorkflowInput<'_>) -> WorkflowInstance {
     WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
@@ -745,7 +771,6 @@ mod tests {
             },
         )
         .await?;
-
         assert_eq!(outcome.dispatched_jobs, 1);
         assert_eq!(outcome.enqueue.command_ids.len(), 1);
         let jobs = store
@@ -762,7 +787,6 @@ mod tests {
             jobs[0].input["command"]["pull_request_mode"],
             EVAL_PR_DRAFT_MODE
         );
-
         Ok(())
     }
 }

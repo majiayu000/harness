@@ -29,6 +29,8 @@ mod command_facade;
 mod command_store;
 #[path = "store/coverage_recovery.rs"]
 mod coverage_recovery;
+#[path = "store/decision_transitions.rs"]
+mod decision_transitions;
 #[path = "store/decisions.rs"]
 mod decisions;
 #[path = "store/definitions.rs"]
@@ -41,6 +43,11 @@ mod events;
 mod instance_helpers;
 #[path = "store/instances.rs"]
 mod instances;
+#[path = "store/lock_order.rs"]
+mod lock_order;
+#[path = "store/lock_order_tests.rs"]
+#[cfg(test)]
+mod lock_order_tests;
 #[path = "store/prompt_payloads.rs"]
 mod prompt_payloads;
 #[path = "store/recovery.rs"]
@@ -65,6 +72,8 @@ mod submission_instances;
 mod terminal_instance_queries;
 #[path = "store/transaction_helpers.rs"]
 mod transaction_helpers;
+#[path = "store/transition_validation.rs"]
+mod transition_validation;
 pub use coverage_recovery::{
     WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
     WorkflowCoverageRecoveryTransition,
