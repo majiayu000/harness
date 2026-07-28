@@ -192,13 +192,19 @@ fn review_spawn_filters_operator_secrets() -> anyhow::Result<()> {
     let args = spawn_args(&spawn);
     assert!(!args.iter().any(|arg| arg.contains("operator-token")));
     assert!(!args.iter().any(|arg| arg.contains("operator-key")));
-    assert!(!spawn.process_env.contains_key("GITHUB_TOKEN"));
     assert!(!spawn.process_env.contains_key("ANTHROPIC_API_KEY"));
-    // The scoped token is the only credential the container receives.
-    assert!(args.contains(&"GITHUB_TOKEN=scoped-token".to_string()));
+    // The scoped token is the only credential the container receives, and it
+    // travels by name in argv with the value in the Docker client environment
+    // (GH-1831), never as `--env KEY=value`.
+    assert!(args.contains(&"GITHUB_TOKEN".to_string()));
+    assert!(!args.iter().any(|arg| arg.contains("scoped-token")));
+    assert_eq!(
+        spawn.process_env.get("GITHUB_TOKEN"),
+        Some(&"scoped-token".to_string())
+    );
     assert!(!args
         .iter()
-        .any(|arg| arg.starts_with("HARNESS_SCOPED_GITHUB_TOKEN=")));
+        .any(|arg| arg.starts_with("HARNESS_SCOPED_GITHUB_TOKEN")));
     Ok(())
 }
 
