@@ -118,6 +118,7 @@ impl AgentAdapter for ClaudeAdapter {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                forward_stdin: false,
             })?;
 
         let mut cmd = Command::new(&prepared_spawn.program);
