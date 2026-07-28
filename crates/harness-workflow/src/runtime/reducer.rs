@@ -2,10 +2,17 @@ pub(crate) mod declarative_completion;
 mod github_issue_completion;
 mod plan_issue_completion;
 mod pr_feedback_completion;
+mod prompt_completion_evidence;
 mod prompt_task_completion;
 mod quality_gate_completion;
 mod runtime_failure;
 mod support;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptValidationReportEntry {
+    pub(crate) command: String,
+    pub(crate) exit_code: i64,
+}
 
 use self::declarative_completion::{
     definition_pin_blocked_decision, reduce_declarative_completion,
@@ -26,6 +33,7 @@ use self::pr_feedback_completion::{
     pr_feedback_child_decision_from_activity_result, pr_feedback_success_contract_error,
     pr_feedback_sweep_decision_from_activity_result,
 };
+pub(crate) use self::prompt_completion_evidence::first_valid_prompt_validation_report;
 use self::prompt_task_completion::prompt_task_success_decision;
 use self::quality_gate_completion::{
     parent_quality_gate_pass_decision, quality_gate_activity_matches,
@@ -50,10 +58,7 @@ use super::model::{
     WorkflowEvent, WorkflowInstance,
 };
 use super::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
-use super::prompt_task::{
-    parse_external_state_signal, prompt_continuation_state_from_data, PROMPT_TASK_DEFINITION_ID,
-    PROMPT_TASK_IMPLEMENT_ACTIVITY,
-};
+use super::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
 use super::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use super::state_registry::decision_validator_for_definition;
 use super::state_registry::{resolve_declarative_definition, DeclarativeDefinitionResolution};
@@ -66,6 +71,11 @@ pub const ISSUE_CLOSED_SIGNAL: &str = "IssueClosed";
 pub const ISSUE_ALREADY_RESOLVED_SIGNAL: &str = "IssueAlreadyResolved";
 pub const ISSUE_STATE_ARTIFACT: &str = "issue_state";
 pub const SCOPE_TOO_LARGE_SIGNAL: &str = "SCOPE_TOO_LARGE";
+
+pub fn prompt_validation_report_has_nonzero_exit(result: &ActivityResult) -> bool {
+    first_valid_prompt_validation_report(result)
+        .is_some_and(|entries| entries.iter().any(|entry| entry.exit_code != 0))
+}
 
 pub fn activity_result_has_closed_issue_evidence(result: &ActivityResult) -> bool {
     closed_issue_evidence_from_activity_result(result).is_some()
@@ -255,11 +265,6 @@ fn reduce_success(
     }
 
     if prompt_task_activity_matches(instance, result) {
-        if let Some(reason) = prompt_task_success_contract_error(instance, result) {
-            return Some(invalid_agent_output_blocked_decision(
-                instance, event, result, reason,
-            ));
-        }
         return prompt_task_success_decision(instance, event, result);
     }
 
@@ -543,13 +548,6 @@ fn structured_decision_validates(
     {
         return false;
     }
-    if prompt_task_activity_matches(instance, result)
-        && decision.next_state == "done"
-        && prompt_task_success_contract_error(instance, result).is_some()
-    {
-        return false;
-    }
-
     let Some(validator) = decision_validator_for_definition(&instance.definition_id) else {
         return true;
     };
@@ -574,35 +572,6 @@ fn prompt_task_activity_matches(instance: &WorkflowInstance, result: &ActivityRe
     )
 }
 
-fn prompt_task_success_contract_error(
-    instance: &WorkflowInstance,
-    result: &ActivityResult,
-) -> Option<&'static str> {
-    if prompt_task_has_validation_evidence(result) {
-        return None;
-    }
-    match prompt_continuation_state_from_data(&instance.data) {
-        Ok(Some(continuation)) => match parse_external_state_signal(result) {
-            Ok(signal) if continuation.policy.active_states.contains(&signal.state) => None,
-            Err(_) => None,
-            _ => Some("implement_prompt succeeded without validation evidence"),
-        },
-        Ok(None) => Some("implement_prompt succeeded without validation evidence"),
-        Err(_) => None,
-    }
-}
-
-fn prompt_task_has_validation_evidence(result: &ActivityResult) -> bool {
-    result
-        .validation
-        .iter()
-        .any(|record| !record.command.trim().is_empty())
-        || result
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.artifact_type == "validation_report")
-}
-
 #[cfg(test)]
 #[path = "reducer/declarative_tests.rs"]
 mod declarative_tests;
@@ -611,8 +580,8 @@ mod declarative_tests;
 mod tests {
     use super::*;
     use crate::runtime::model::{
-        ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowEvent,
-        WorkflowInstance, WorkflowSubject,
+        ActivityArtifact, ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType,
+        WorkflowEvent, WorkflowInstance, WorkflowSubject,
     };
     use crate::runtime::validator::{DecisionValidator, ValidationContext};
     use chrono::Utc;
@@ -641,7 +610,7 @@ mod tests {
             anyhow::anyhow!("prompt success without validation evidence should block")
         })?;
 
-        assert_eq!(decision.decision, "block_invalid_agent_output");
+        assert_eq!(decision.decision, "prompt_completion_evidence_missing");
         assert_eq!(decision.next_state, "blocked");
         assert!(decision
             .commands
@@ -656,6 +625,38 @@ mod tests {
             &decision,
             &ValidationContext::new("runtime-1", Utc::now()),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_task_no_change_rationale_reaches_done_through_runtime_reducer() -> anyhow::Result<()>
+    {
+        let instance = WorkflowInstance::new(
+            PROMPT_TASK_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("prompt", "task-123"),
+        );
+        let result = ActivityResult::succeeded(
+            PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "No implementation change was needed.",
+        )
+        .with_artifact(ActivityArtifact::new(
+            "no_change_rationale",
+            json!("The requested behavior is already present and verified."),
+        ));
+        let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
+            .with_payload(json!({
+                "command_id": "command-1",
+                "runtime_job_id": "job-1",
+                "activity_result": result,
+            }));
+
+        let decision = reduce_runtime_job_completed(&instance, &event)?
+            .ok_or_else(|| anyhow::anyhow!("prompt completion should produce a decision"))?;
+
+        assert_eq!(decision.decision, "finish_prompt_task");
+        assert_eq!(decision.next_state, "done");
         Ok(())
     }
 

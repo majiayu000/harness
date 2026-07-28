@@ -48,9 +48,12 @@ impl ClaudeCodeAgent {
         }
     }
 
-    /// Previously probed and enabled `--no-session-persistence`. Now a no-op:
-    /// session persistence is required for token-usage tracking and learn
-    /// system observability. Retained for API compatibility.
+    /// Compatibility no-op retained for callers that previously enabled the
+    /// removed session-persistence probe.
+    #[deprecated(
+        since = "0.6.34",
+        note = "session persistence is always enabled; this no-op is scheduled for removal in 0.7"
+    )]
     pub fn with_no_session_persistence_probe(self) -> Self {
         self
     }
@@ -198,6 +201,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                forward_stdin: false,
             })?;
 
         tracing::debug!(
@@ -217,7 +221,6 @@ impl CodeAgent for ClaudeCodeAgent {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
 
         let _provider_permit = self
             .provider_gate
@@ -261,7 +264,8 @@ impl CodeAgent for ClaudeCodeAgent {
         }
         let mut child = crate::ManagedChild::new(child, "claude execute");
 
-        let output = child.wait_with_output().await.map_err(|e| {
+        let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
+        let output = child.wait_with_output(&limits).await.map_err(|e| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to wait for claude: {e}"
             ))
@@ -283,6 +287,12 @@ impl CodeAgent for ClaudeCodeAgent {
                 "claude exited with {}: stderr=[{}] stdout_tail=[{}]",
                 output.status, stderr, stdout_tail
             )));
+        }
+
+        // The CLI reports terminal failures via a `result` event while still
+        // exiting 0, so the exit-status check above is not sufficient.
+        if let Some(failure) = parsed.failure {
+            return Err(harness_core::error::HarnessError::AgentExecution(failure));
         }
 
         Ok(AgentResponse {
@@ -327,6 +337,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                forward_stdin: false,
             })?;
 
         // Dump full args (truncate each to 120 chars) so we can diagnose
@@ -370,7 +381,6 @@ impl CodeAgent for ClaudeCodeAgent {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
 
         // ETXTBSY (error 26) occurs on Linux when a security scanner or indexer
         // briefly opens the executable for writing after it is written. Retry once.
@@ -513,3 +523,23 @@ mod tests;
 #[cfg(test)]
 #[path = "claude_prompt_layer_tests.rs"]
 mod prompt_layer_tests;
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    #[allow(deprecated)]
+    fn no_session_persistence_probe_builder_remains_chainable() {
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "test-model".to_string(),
+            SandboxMode::DangerFullAccess,
+        )
+        .with_no_session_persistence_probe();
+
+        assert_eq!(agent.cli_path, PathBuf::from("claude"));
+        assert_eq!(agent.default_model, "test-model");
+        assert_eq!(agent.sandbox_mode, SandboxMode::DangerFullAccess);
+    }
+}

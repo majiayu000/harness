@@ -1,6 +1,7 @@
 use super::{
     command_store, insert_decision_record_tx, insert_event_tx_with_id,
-    insert_instance_if_absent_tx, runtime_job_state::cancel_unfinished_runtime_jobs_tx,
+    insert_instance_if_absent_tx,
+    runtime_job_state::{cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation},
     select_instance_for_update_tx, upsert_instance_tx, WorkflowRuntimeStore,
 };
 use crate::runtime::remote_facts::upsert_remote_fact_snapshot_tx;
@@ -147,23 +148,37 @@ impl WorkflowRuntimeStore {
         let active: Vec<(String, String)> = sqlx::query_as(
             "SELECT id, data::text FROM workflow_commands
              WHERE workflow_id = $1 AND status IN ('pending', 'dispatching', 'dispatched', 'deferred')
+             ORDER BY id
              FOR UPDATE",
         )
         .bind(transition.workflow_id)
         .fetch_all(&mut *tx)
         .await?;
-        for (command_id, data) in active {
-            let command: crate::runtime::WorkflowCommand = serde_json::from_str(&data)?;
-            if desired_keys.contains(&command.dedupe_key.as_str()) {
-                continue;
-            }
-            cancel_unfinished_runtime_jobs_tx(
-                &mut tx,
-                &command_id,
-                "github_coverage_recovery",
-                "GitHub reported an existing closing pull request.",
-            )
-            .await?;
+        let active = active
+            .into_iter()
+            .map(|(command_id, data)| {
+                Ok((
+                    command_id,
+                    serde_json::from_str::<crate::runtime::WorkflowCommand>(&data)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let superseded = active
+            .iter()
+            .filter(|(_, command)| !desired_keys.contains(&command.dedupe_key.as_str()))
+            .collect::<Vec<_>>();
+        let cancellations = superseded
+            .iter()
+            .map(|(command_id, _)| {
+                RuntimeJobCancellation::new(
+                    command_id,
+                    "github_coverage_recovery",
+                    "GitHub reported an existing closing pull request.",
+                )
+            })
+            .collect::<Vec<_>>();
+        cancel_unfinished_runtime_jobs_for_commands_tx(&mut tx, &cancellations).await?;
+        for (command_id, _) in superseded {
             sqlx::query(
                 "UPDATE workflow_commands SET status = 'cancelled', dispatch_owner = NULL,
                     dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,

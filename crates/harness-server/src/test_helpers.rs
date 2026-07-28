@@ -8,6 +8,53 @@ use std::time::Duration;
 use harness_core::db::{pg_open_pool, resolve_test_database_url};
 use tokio::sync::OnceCell;
 
+/// Install a process-global no-op subscriber whose only job is to keep every
+/// tracing callsite's cached `Interest` at `always`.
+///
+/// Tests that assert on captured log wording install a thread-scoped
+/// capture subscriber via `tracing::subscriber::set_default`. Under parallel
+/// test execution, other tests' scoped-subscriber guards dropping trigger
+/// interest-cache rebuilds; a rebuild that runs in the window where the
+/// registry does not include the capturing dispatcher caches `Interest::never`
+/// for a callsite, and the event macros then skip emission entirely - the
+/// capture subscriber never sees the event even though it is the thread's
+/// current dispatcher. Verified empirically: the aggregate replay log line
+/// vanished in ~30-40% of full-suite runs while `LevelFilter::current()` was
+/// `TRACE` and the scoped dispatcher was current on the emitting thread;
+/// with this keeper installed the failure did not reproduce in 15 runs.
+///
+/// The keeper reports `Interest::always` for every callsite so the macro
+/// fast path stays open, and `enabled() == false` so threads without a
+/// scoped capture subscriber pay no delivery cost.
+pub fn install_tracing_interest_keeper() {
+    use std::sync::Once;
+    use tracing::span;
+    use tracing::subscriber::Interest;
+    use tracing::{Event, Metadata};
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        struct InterestKeeper;
+        impl tracing::Subscriber for InterestKeeper {
+            fn register_callsite(&self, _m: &'static Metadata<'static>) -> Interest {
+                Interest::always()
+            }
+            fn enabled(&self, _m: &Metadata<'_>) -> bool {
+                false
+            }
+            fn new_span(&self, _a: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _s: &span::Id, _v: &span::Record<'_>) {}
+            fn record_follows_from(&self, _s: &span::Id, _f: &span::Id) {}
+            fn event(&self, _e: &Event<'_>) {}
+            fn enter(&self, _s: &span::Id) {}
+            fn exit(&self, _s: &span::Id) {}
+        }
+        let _ = tracing::subscriber::set_global_default(InterestKeeper);
+    });
+}
+
 /// Serialises every test that reads or mutates the process-global `HOME` env
 /// var.  `tokio::test` runs tests concurrently in the same process; without
 /// this lock, a test that temporarily changes `HOME` races with any other test

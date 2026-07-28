@@ -580,8 +580,7 @@ fn compute_grade(events: &[Event]) -> (Option<f64>, Option<Value>) {
         })
         .unwrap_or(0);
     let Some(report) = QualityGrader::grade(events, violation_count) else {
-        // Empty observation window: the grade is unknown, not perfect.
-        return (None, Some(serde_json::Value::String("unknown".to_string())));
+        return (None, None);
     };
     let letter = serde_json::to_value(report.grade).ok();
     (Some(report.score), letter)

@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
+mod evidence_policy;
 mod versioning;
+
+pub use evidence_policy::{apply_builtin_evidence_enforcement, transition_requires_evidence};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclarativeDefinitionPinError {

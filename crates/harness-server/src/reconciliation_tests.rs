@@ -355,6 +355,140 @@ fn ready_to_merge_open_alert_uses_row_age() {
 }
 
 #[tokio::test]
+async fn atomic_stale_reconciliation_does_not_record_issue_side_effects() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+    let Some(stores) = open_runtime_stores().await? else {
+        return Ok(());
+    };
+    let project_root = stores.dir.path().join("stale-reconciliation");
+    std::fs::create_dir(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    stores
+        .issue_store
+        .record_issue_scheduled(
+            &project_id,
+            Some("owner/repo"),
+            42,
+            "stale-reconciliation-task",
+            &[],
+            false,
+        )
+        .await?;
+    stores
+        .issue_store
+        .record_implement_started(
+            &project_id,
+            Some("owner/repo"),
+            42,
+            "stale-reconciliation-task",
+        )
+        .await?;
+    let workflow_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 42);
+    let instance = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
+    )
+    .with_id(&workflow_id)
+    .with_data(json!({
+        "project_id": project_id.as_str(),
+        "repo": "owner/repo",
+        "issue_number": 42,
+        "task_id": "stale-reconciliation-task",
+    }));
+    stores.runtime_store.upsert_instance(&instance).await?;
+    let stale_instance = instance.clone();
+    stores
+        .runtime_store
+        .ensure_otel_trace_context(&workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("concurrent workflow update must persist"))?;
+    let candidate = RuntimeWorkflowCandidate {
+        workflow_id: workflow_id.clone(),
+        state: "implementing".to_string(),
+        row_updated_at: chrono::Utc::now(),
+        repo: Some("owner/repo".to_string()),
+        project_root: Some(project_root),
+        issue_number: Some(42),
+        pr_number: None,
+        pr_url: None,
+    };
+
+    let applied = reconciliation_apply::apply_loaded_runtime_workflow_transition(
+        &stores.runtime_store,
+        Some(&stores.issue_store),
+        &candidate,
+        stale_instance,
+        "done",
+        "remote issue is closed",
+    )
+    .await?;
+
+    assert!(!applied, "a stale atomic transition must not be applied");
+    let stored = stores
+        .runtime_store
+        .get_instance(&workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("runtime workflow must remain"))?;
+    assert_eq!(stored.state, "implementing");
+    assert_eq!(stored.version, instance.version + 1);
+    assert!(stored.data.get("otel_trace_context").is_some());
+    assert!(stores
+        .runtime_store
+        .events_for(&workflow_id)
+        .await?
+        .is_empty());
+    assert!(stores
+        .runtime_store
+        .decisions_for(&workflow_id)
+        .await?
+        .is_empty());
+    assert!(stores
+        .runtime_store
+        .commands_for(&workflow_id)
+        .await?
+        .is_empty());
+    let rejected_record = harness_workflow::runtime::WorkflowDecisionRecord::rejected(
+        WorkflowDecision::new(
+            &workflow_id,
+            "implementing",
+            "reconcile_issue_completed",
+            "done",
+            "remote issue is closed",
+        ),
+        None,
+        "lease expired before commit",
+    );
+    let rejected_applied = reconciliation_apply::complete_runtime_workflow_transition(
+        Some(rejected_record),
+        Some(&stores.issue_store),
+        &candidate,
+        "done",
+        "remote issue is closed",
+    )
+    .await;
+    assert!(
+        !rejected_applied,
+        "an atomic rejection must not run reconciliation side effects"
+    );
+    let issue_workflow = stores
+        .issue_store
+        .get_by_issue(&project_id, Some("owner/repo"), 42)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("issue workflow must remain"))?;
+    assert_eq!(
+        issue_workflow.state,
+        harness_workflow::issue_lifecycle::IssueLifecycleState::Implementing
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> {
     let _env_guard = async_env_lock().lock().await;
     if !crate::test_helpers::db_tests_enabled().await {

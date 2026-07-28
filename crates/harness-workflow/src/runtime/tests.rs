@@ -61,6 +61,7 @@ include!("tests/driverless_progress.rs");
 
 mod issue_planning;
 mod local_review;
+mod lock_order_stress;
 mod otel_spans;
 mod p1_followups;
 mod pr_repair_evidence;

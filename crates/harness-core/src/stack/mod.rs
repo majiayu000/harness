@@ -5,8 +5,16 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
+pub mod inventory;
+#[cfg(test)]
+mod inventory_tests;
 #[cfg(test)]
 mod tests;
+pub use inventory::{
+    inventory_repository_stack, AgentStackEntryClass, AgentStackInventory,
+    AgentStackInventoryEntry, AgentStackInventoryError, AgentStackInventoryErrorKind,
+    AgentStackInventoryOptions,
+};
 pub const AGENT_STACK_COMPONENT_SCHEMA_VERSION: &str = "agent-stack-component/v0.1";
 
 macro_rules! closed_enum {
@@ -600,17 +608,11 @@ fn reject_reserved_segments(value: &str) -> Result<(), AgentStackComponentError>
     }
 }
 
+#[rustfmt::skip]
 fn is_reserved(value: &str) -> bool {
-    [
-        "unknown",
-        "unknown-component",
-        "unknown_component",
-        "missing",
-        "null",
-        "none",
-    ]
-    .iter()
-    .any(|reserved| value.eq_ignore_ascii_case(reserved))
+    ["unknown", "unknown-component", "unknown_component", "missing", "null", "none"]
+        .iter()
+        .any(|reserved| value.eq_ignore_ascii_case(reserved))
 }
 
 fn is_uuid_shaped(value: &str) -> bool {
@@ -779,21 +781,17 @@ fn drives_match(left: Option<u8>, right: Option<u8>) -> bool {
     left.map(|drive| drive.to_ascii_uppercase()) == right.map(|drive| drive.to_ascii_uppercase())
 }
 
+#[rustfmt::skip]
 fn root_key_matches<T: PartialEq>(
-    root_drive: Option<u8>,
-    root: &[T],
-    source_drive: Option<u8>,
-    source: &[T],
+    root_drive: Option<u8>, root: &[T], source_drive: Option<u8>, source: &[T],
 ) -> bool {
     drives_match(root_drive, source_drive) && source.starts_with(root)
 }
 
 #[cfg(test)]
+#[rustfmt::skip]
 fn root_keys_match_for_test(
-    drive_a: Option<u8>,
-    segments_a: &[&str],
-    drive_b: Option<u8>,
-    segments_b: &[&str],
+    drive_a: Option<u8>, segments_a: &[&str], drive_b: Option<u8>, segments_b: &[&str],
 ) -> bool {
     segments_a.len() == segments_b.len()
         && root_key_matches(drive_a, segments_a, drive_b, segments_b)

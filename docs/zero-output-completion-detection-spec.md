@@ -19,7 +19,7 @@ The failing sessions share a fixed event signature: exactly 9 events —
 ## 2. Evidence
 
 Audit of 132 Codex implx sessions (2026-06-30 → 2026-07-04) driven by the harness
-runtime and SpecRail queue workflows. On the evening of 2026-07-03, 4 of 22 lanes
+runtime and agent queue workflows. On the evening of 2026-07-03, 4 of 22 lanes
 (18%) died this way; two were real implementation tasks (ccstats GH38, GH47-T6
 workers) whose work silently never started, and a PR #485 reviewer lane had to be
 re-spawned manually later.

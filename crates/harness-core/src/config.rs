@@ -16,6 +16,8 @@ pub mod stall_timeout;
 pub mod workflow;
 pub mod workflow_circuit_breaker;
 
+mod reserved_key_deserializer;
+
 use self::agents::*;
 use self::alerting::AlertingConfig;
 use self::intake::*;
@@ -27,6 +29,20 @@ use self::server::*;
 use self::workflow_circuit_breaker::*;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
+
+const COMPLETION_EVIDENCE_CONFIG_FIELDS: [&str; 2] = [
+    "completion_evidence_enforced",
+    "runtime_completion_evidence_enforced",
+];
+
+fn completion_evidence_config_field(key: &str) -> Option<&'static str> {
+    key.split('.').find_map(|component| {
+        COMPLETION_EVIDENCE_CONFIG_FIELDS
+            .iter()
+            .copied()
+            .find(|field| *field == component)
+    })
+}
 
 /// A project entry declared in the config file under `[[projects]]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,7 +237,7 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             projects: Vec<ProjectEntry>,
         }
 
-        let input = HarnessConfigInput::deserialize(deserializer)?;
+        let input: HarnessConfigInput = reserved_key_deserializer::deserialize(deserializer)?;
         let mut config = Self {
             server: input.server,
             agents: input.agents,
@@ -259,3 +275,7 @@ mod context_tests;
 #[cfg(test)]
 #[path = "config_workflow_circuit_breaker_tests.rs"]
 mod workflow_circuit_breaker_tests;
+
+#[cfg(test)]
+#[path = "config_reserved_key_regression_tests.rs"]
+mod reserved_key_regression_tests;

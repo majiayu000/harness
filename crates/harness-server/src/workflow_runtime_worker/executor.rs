@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::activity_result::activity_result_from_turn;
+use super::activity_result::activity_result_from_turn_with_workflow;
 use super::child_workflow::execute_start_child_workflow;
 use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
@@ -28,8 +28,7 @@ use super::prompt_packet::{
 };
 use super::repo_memory_prompt::{repo_memory_config_artifact, repo_memory_for_prompt_packet};
 use super::runtime_profile::{
-    agent_name_for_runtime_kind, runtime_profile_approval_policy, runtime_profile_for_job,
-    runtime_profile_model_and_reasoning, runtime_profile_sandbox_mode,
+    agent_name_for_runtime_kind, resolve_runtime_settings, runtime_profile_for_job,
 };
 use super::runtime_turn_control::{force_code_agent_for_runtime_turn, RuntimeTurnAliasGuard};
 use super::runtime_usage::runtime_usage_context;
@@ -96,16 +95,18 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             workflow.as_ref(),
             &job,
         );
-        let sandbox_mode = Some(
-            runtime_profile_sandbox_mode(&runtime_profile)?
-                .unwrap_or(self.state.core.server.config.agents.sandbox_mode),
-        );
-        let (model, reasoning_effort) = runtime_profile_model_and_reasoning(
+        let activity = activity_name(&job);
+        let execution_phase = execution_phase_for_runtime_activity(&activity);
+        // Final launch settings are computed once before packet construction
+        // and shared by provenance and agent launch (GH-1732); nothing is
+        // recomputed after `RuntimePromptPrepared` is recorded.
+        let resolved_settings = resolve_runtime_settings(
             &runtime_profile,
             job.runtime_kind,
-            &self.state.core.server.config.agents.codex,
-        );
-        let approval_policy = runtime_profile_approval_policy(&runtime_profile, job.runtime_kind)?;
+            execution_phase,
+            &self.state.core.server.config.agents,
+            &self.state.core.server.config.concurrency,
+        )?;
         let prompt_task_request =
             prompt_task_request_for_job(&job, self.state.core.workflow_runtime_store.as_deref())
                 .await?;
@@ -137,16 +138,16 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 &project_root,
                 &source_project_root,
                 &runtime_profile,
+                &resolved_settings,
                 &workflow_document,
                 &repo_memory.records,
+                prompt_task_request.prompt_text(),
             )?;
             let prompt_packet_digest = prompt_packet_digest(&prompt_packet);
             self.record_prompt_packet_prepared(&job, &prompt_packet, &prompt_packet_digest)
                 .await?;
             let prompt =
                 build_runtime_job_prompt(&prompt_packet, prompt_task_request.prompt_text());
-            let activity = activity_name(&job);
-            let execution_phase = execution_phase_for_runtime_activity(&activity);
             record_runtime_prompt_input(
                 self.state,
                 &job,
@@ -180,8 +181,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         turn_id.clone(),
                     )
                 });
-            let force_code_agent =
-                force_code_agent_for_runtime_turn(job.runtime_kind, approval_policy.as_deref());
+            let force_code_agent = force_code_agent_for_runtime_turn(
+                job.runtime_kind,
+                resolved_settings.approval_policy.explicit_value(),
+            );
             run_turn_lifecycle_with_options(
                 self.state.core.server.clone(),
                 self.state.notifications.notify_tx.clone(),
@@ -191,13 +194,16 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 prompt,
                 agent_name.to_string(),
                 TurnLifecycleOptions {
-                    model,
-                    reasoning_effort,
+                    model: Some(resolved_settings.model.clone()),
+                    reasoning_effort: resolved_settings.reasoning_effort.clone(),
                     execution_phase,
-                    sandbox_mode,
-                    approval_policy,
-                    timeout_secs: runtime_profile.timeout_secs,
-                    stall_timeout_secs: None,
+                    sandbox_mode: Some(resolved_settings.sandbox_mode),
+                    approval_policy: resolved_settings
+                        .approval_policy
+                        .explicit_value()
+                        .map(str::to_owned),
+                    timeout_secs: Some(resolved_settings.timeout_secs),
+                    stall_timeout_secs: Some(resolved_settings.stall_timeout_secs),
                     env_vars: isolation_spawn_env_vars(&job),
                     // Prefer the stable `codex exec` path for non-interactive turns.
                     // Approval-gated turns use the app-server adapter because it owns
@@ -222,7 +228,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 .thread_manager
                 .get_turn(&thread_id, &turn_id)
                 .ok_or_else(|| anyhow::anyhow!("runtime turn disappeared before completion"))?;
-            let result = activity_result_from_turn(
+            let result = activity_result_from_turn_with_workflow(
                 &job,
                 &turn.status,
                 &turn.items,
@@ -231,6 +237,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 agent_name,
                 &project_root,
                 &prompt_packet_digest,
+                workflow
+                    .as_ref()
+                    .map(|workflow| workflow.definition_id.as_str()),
             );
             // Agent output can never carry server-reserved evidence artifacts
             // (GH-1766): strip before the server attaches its own.

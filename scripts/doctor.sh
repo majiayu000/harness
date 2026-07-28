@@ -3,6 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# shellcheck source=lib/binary-freshness.sh
+. "scripts/lib/binary-freshness.sh"
+
 usage() {
     cat <<'EOF'
 Usage:
@@ -237,8 +240,22 @@ database_host_port() {
 }
 
 check_release_binary() {
+    local freshness
+
     if [ -x "./target/release/harness" ]; then
-        status_ok "release binary is executable: ./target/release/harness"
+        harness_binary_freshness ./target/release/harness "$PWD" > /dev/null
+        freshness="$HARNESS_BINARY_FRESHNESS_STATE"
+        case "$freshness" in
+            fresh)
+                status_ok "release binary is executable and fresh: ./target/release/harness"
+                ;;
+            stale)
+                fail "release binary is stale (${HARNESS_BINARY_FRESHNESS_DETAIL}); rebuild with: cargo build --release -p harness-cli"
+                ;;
+            *)
+                warn "release binary freshness is unverifiable (${HARNESS_BINARY_FRESHNESS_DETAIL}); rebuild with: cargo build --release -p harness-cli"
+                ;;
+        esac
         return 0
     fi
 

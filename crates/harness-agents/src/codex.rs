@@ -8,7 +8,7 @@ use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::agents::SandboxMode;
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig};
 use harness_core::types::Capability;
-use harness_sandbox::{wrap_command, SandboxSpec};
+use harness_sandbox::SandboxSpec;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -144,8 +144,6 @@ impl CodexAgent {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let mut args = vec![
-            OsString::from("-C"),
-            req.project_root.as_os_str().to_os_string(),
             OsString::from("-m"),
             OsString::from(model),
             OsString::from("-c"),
@@ -177,26 +175,59 @@ impl CodexAgent {
         args
     }
 
+    /// Plan the review spawn without launching it.
+    ///
+    /// Review must go through the same spawn contract as the execute paths.
+    /// Calling `wrap_command` directly (as this path used to) skipped container
+    /// isolation and the operator-secret env filtering that
+    /// `prepare_agent_spawn` applies.
+    fn prepare_review_spawn(
+        &self,
+        req: &CodexReviewRequest,
+    ) -> harness_core::error::Result<(
+        crate::spawn_contract::PreparedAgentSpawn,
+        harness_core::run_id::RunIdentity,
+    )> {
+        let review_args = self.review_args(req);
+        let sandbox_spec = SandboxSpec::new(req.sandbox_mode, &req.project_root);
+
+        let mut spawn_env_vars = req.env_vars.clone();
+        spawn_env_vars.insert(
+            crate::spawn_contract::REVIEW_GIT_SAFE_WORKSPACE_ENV.to_string(),
+            "1".to_string(),
+        );
+        let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
+        run_identity.write_env_vars(&mut spawn_env_vars);
+        if self.cloud.enabled {
+            for key in &self.cloud.setup_secret_env {
+                spawn_env_vars.remove(key);
+            }
+        }
+
+        let prepared_spawn =
+            crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+                program: &self.cli_path,
+                args: &review_args,
+                project_root: &req.project_root,
+                sandbox_spec: &sandbox_spec,
+                env_vars: &spawn_env_vars,
+                forward_stdin: review_uses_stdin_prompt(req),
+            })?;
+        Ok((prepared_spawn, run_identity))
+    }
+
     pub async fn execute_review(
         &self,
         req: CodexReviewRequest,
     ) -> harness_core::error::Result<AgentResponse> {
         self.run_setup_phase(&req.project_root).await?;
 
-        let review_args = self.review_args(&req);
         let use_stdin_prompt = review_uses_stdin_prompt(&req);
-        let sandbox_spec = SandboxSpec::new(req.sandbox_mode, &req.project_root);
-        let wrapped_command =
-            wrap_command(&self.cli_path, &review_args, &sandbox_spec).map_err(|error| {
-                harness_core::error::HarnessError::AgentExecution(format!(
-                    "sandbox setup failed for codex review: {error}"
-                ))
-            })?;
+        let (prepared_spawn, run_identity) = self.prepare_review_spawn(&req)?;
 
-        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let mut cmd = Command::new(&wrapped_command.program);
-        cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root)
+        let mut cmd = Command::new(&prepared_spawn.program);
+        cmd.args(&prepared_spawn.args)
+            .current_dir(&prepared_spawn.current_dir)
             .stdin(if use_stdin_prompt {
                 Stdio::piped()
             } else {
@@ -207,9 +238,7 @@ impl CodexAgent {
             .kill_on_drop(true);
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
-        crate::strip_claude_env(&mut cmd);
-        cmd.envs(&req.env_vars);
-        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
+        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -220,20 +249,20 @@ impl CodexAgent {
         tracing::debug!(
             agent = "codex",
             mode = "review",
-            program = %wrapped_command.program.display(),
-            current_dir = %req.project_root.display(),
-            sandbox_engine = ?wrapped_command.engine,
-            arg_count = wrapped_command.args.len(),
+            program = %prepared_spawn.program.display(),
+            current_dir = %prepared_spawn.current_dir.display(),
+            sandbox_engine = ?prepared_spawn.sandbox_engine,
+            arg_count = prepared_spawn.args.len(),
             has_stdin_instructions = use_stdin_prompt,
             "codex review spawn prepared"
         );
         let mut child = cmd.spawn().map_err(|error| {
             let message = format!(
                 "failed to run codex review: {error}; mode=review; program={}; current_dir={}; sandbox_engine={:?}; arg_count={}",
-                wrapped_command.program.display(),
-                req.project_root.display(),
-                wrapped_command.engine,
-                wrapped_command.args.len()
+                prepared_spawn.program.display(),
+                prepared_spawn.current_dir.display(),
+                prepared_spawn.sandbox_engine,
+                prepared_spawn.args.len()
             );
             let message =
                 crate::classify_missing_workspace_spawn_failure(&error, &req.project_root, message);
@@ -245,7 +274,7 @@ impl CodexAgent {
                 &run_identity,
                 "codex",
                 pid,
-                &req.project_root,
+                &prepared_spawn.current_dir,
             );
         }
 
@@ -268,7 +297,9 @@ impl CodexAgent {
                 })?;
         }
 
-        let output = child.wait_with_output().await.map_err(|error| {
+        let mut child = crate::ManagedChild::new(child, "codex review");
+        let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
+        let output = child.wait_with_output(&limits).await.map_err(|error| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to wait for codex review: {error}"
             ))
@@ -404,6 +435,7 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                forward_stdin: false,
             })?;
 
         let mut cmd = Command::new(&prepared_spawn.program);
@@ -416,7 +448,6 @@ impl CodeAgent for CodexAgent {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {
@@ -456,7 +487,8 @@ impl CodeAgent for CodexAgent {
             );
         }
         let mut child = crate::ManagedChild::new(child, "codex execute");
-        let output = child.wait_with_output().await.map_err(|err| {
+        let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
+        let output = child.wait_with_output(&limits).await.map_err(|err| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to wait for codex: {err}"
             ))
@@ -532,6 +564,7 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                forward_stdin: false,
             })?;
 
         let mut cmd = Command::new(&prepared_spawn.program);
@@ -544,7 +577,6 @@ impl CodeAgent for CodexAgent {
         #[cfg(unix)]
         crate::set_process_group(&mut cmd);
         crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::strip_claude_env(&mut cmd);
 
         if self.cloud.enabled {
             for key in &self.cloud.setup_secret_env {

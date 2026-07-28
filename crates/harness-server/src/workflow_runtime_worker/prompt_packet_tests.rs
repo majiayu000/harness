@@ -1,4 +1,5 @@
 use super::*;
+use crate::workflow_runtime_worker::runtime_profile::resolve_runtime_settings;
 use harness_workflow::runtime::{
     RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord,
     RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
@@ -7,6 +8,21 @@ use harness_workflow::runtime::{
     ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
+
+fn resolved_settings_for_tests(profile: &RuntimeProfile) -> ResolvedRuntimeSettings {
+    let mut profile = profile.clone();
+    if profile.timeout_secs.is_none() {
+        profile.timeout_secs = Some(3600);
+    }
+    resolve_runtime_settings(
+        &profile,
+        profile.kind,
+        None,
+        &harness_core::config::agents::AgentsConfig::default(),
+        &harness_core::config::concurrency::ConcurrencyConfig::default(),
+    )
+    .unwrap_or_else(|error| panic!("test runtime settings should resolve: {error}"))
+}
 
 #[test]
 fn activity_result_schema_describes_issue_implementation_terminal_evidence_contract() {
@@ -427,8 +443,10 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &workflow_document,
         &[],
+        None,
     )
     .expect("built-in prompt packet should build");
     assert_eq!(packet["project"]["root"], "/workspaces/job-1");
@@ -441,6 +459,40 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
     let prompt = build_runtime_job_prompt(&packet, None);
     assert!(prompt.contains("Repository workflow prompt template:"));
     assert!(prompt.contains("Follow the repository workflow prompt."));
+}
+
+#[test]
+fn prompt_task_packet_describes_disjunctive_completion_evidence_contract() {
+    let job = RuntimeJob::pending(
+        "command-prompt",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY }),
+    );
+    let workflow = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "TEAM-123"),
+    )
+    .with_id("prompt-workflow-1");
+
+    let schema = activity_result_schema(&job, Some(&workflow));
+    let artifacts = &schema["agent_summary_contract"]["artifacts"];
+
+    assert_eq!(artifacts["validation_report"]["type"], "array");
+    assert_eq!(artifacts["validation_report"]["min_items"], 1);
+    assert_eq!(
+        artifacts["validation_report"]["item_fields"],
+        json!(["command", "exit_code"])
+    );
+    assert_eq!(artifacts["no_change_rationale"]["type"], "string");
+    assert_eq!(artifacts["no_change_rationale"]["non_blank"], true);
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("Free-text validation records do not satisfy"))
+    );
 }
 
 #[test]
@@ -479,8 +531,10 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
         Path::new("/workspaces/job-continue"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &WorkflowDocument::default(),
         &[],
+        None,
     )
     .expect("continuation prompt packet should build");
 
@@ -492,6 +546,27 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     assert_eq!(
         packet["activity_result_schema"]["continuation_signal_contract"]["required_signal_type"],
         "external_state"
+    );
+    let schema = &packet["activity_result_schema"];
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("validation_report"))
+    );
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("no_change_rationale"))
+    );
+    assert!(
+        schema["agent_summary_contract"]["artifacts"]["validation_report"]["required_when"]
+            .as_str()
+            .is_some_and(|value| value.contains("use this or no_change_rationale"))
+    );
+    assert!(
+        schema["agent_summary_contract"]["artifacts"]["no_change_rationale"]["required_when"]
+            .as_str()
+            .is_some_and(|value| value.contains("use this or validation_report"))
     );
     let prompt = build_runtime_job_prompt(&packet, Some("Continue TEAM-123."));
     assert!(prompt.contains("Continuation context:"));
@@ -526,8 +601,10 @@ fn runtime_prompt_packet_describes_deferred_candidate_submission_contract() {
         Path::new("/workspaces/issue-1449-c1"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &workflow_document,
         &[],
+        None,
     )
     .expect("candidate prompt packet should build");
 
@@ -578,8 +655,10 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &workflow_document,
         &repo_memory,
+        None,
     )
     .expect("repo-memory prompt packet should build");
 
@@ -629,8 +708,10 @@ fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
         &workflow_document,
         &[],
+        None,
     )
     .expect("fresh-repo prompt packet should build");
 

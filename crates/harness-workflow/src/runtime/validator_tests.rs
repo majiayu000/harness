@@ -270,3 +270,168 @@ fn github_issue_pr_validator_rejects_unevidenced_blocked_done() {
         WorkflowDecisionRejectionKind::MissingTerminalEvidence
     );
 }
+
+#[test]
+fn require_evidence_attaches_classes_to_an_allowed_transition() {
+    let allowlist = TransitionAllowlist::default()
+        .allow("implementing", "done", [WorkflowCommandType::MarkDone])
+        .require_evidence("implementing", "done", ["prompt_completion_evidence"]);
+
+    let rule = allowlist
+        .rule_for("implementing", "done")
+        .expect("transition must exist");
+    assert!(rule
+        .required_evidence
+        .contains("prompt_completion_evidence"));
+}
+
+#[test]
+fn allow_alone_leaves_a_transition_evidence_free() {
+    let allowlist = TransitionAllowlist::default().allow(
+        "implementing",
+        "done",
+        [WorkflowCommandType::MarkDone],
+    );
+
+    let rule = allowlist
+        .rule_for("implementing", "done")
+        .expect("transition must exist");
+    assert!(rule.required_evidence.is_empty());
+}
+
+#[test]
+#[should_panic(expected = "cannot require evidence for unallowed transition")]
+fn require_evidence_rejects_a_transition_that_was_never_allowed() {
+    let _ = TransitionAllowlist::default().require_evidence(
+        "implementing",
+        "done",
+        ["prompt_completion_evidence"],
+    );
+}
+
+#[test]
+fn without_required_evidence_strips_requirements_but_keeps_commands() {
+    let allowlist = TransitionAllowlist::default()
+        .allow("implementing", "done", [WorkflowCommandType::MarkDone])
+        .require_evidence("implementing", "done", ["prompt_completion_evidence"])
+        .without_required_evidence();
+
+    let rule = allowlist
+        .rule_for("implementing", "done")
+        .expect("transition must exist");
+    assert!(rule.required_evidence.is_empty());
+    assert!(rule
+        .allowed_commands
+        .contains(&WorkflowCommandType::MarkDone));
+}
+
+#[test]
+fn declared_evidence_gates_a_decision_and_enforcement_can_be_lifted() {
+    let instance = WorkflowInstance::new(
+        "prompt_task",
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "task-1"),
+    );
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "implementing",
+        "agent_reported_done",
+        "done",
+        "agent reported completion",
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::MarkDone,
+        "task-1-done",
+        json!({ "reason": "done" }),
+    ));
+
+    let enforcing = DecisionValidator::new(
+        TransitionAllowlist::default()
+            .allow("implementing", "done", [WorkflowCommandType::MarkDone])
+            .require_evidence("implementing", "done", ["prompt_completion_evidence"]),
+    );
+    let err = enforcing
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime", Utc::now()),
+        )
+        .expect_err("decision without the declared evidence must be rejected");
+    assert_eq!(
+        err.kind,
+        WorkflowDecisionRejectionKind::MissingRequiredEvidence
+    );
+
+    let evidenced = decision.clone().with_evidence(WorkflowEvidence::new(
+        "prompt_completion_evidence",
+        "validation report attached",
+    ));
+    enforcing
+        .validate(
+            &instance,
+            &evidenced,
+            &ValidationContext::new("runtime", Utc::now()),
+        )
+        .expect("decision carrying the declared evidence must be accepted");
+
+    let lifted = DecisionValidator::new(
+        TransitionAllowlist::default()
+            .allow("implementing", "done", [WorkflowCommandType::MarkDone])
+            .require_evidence("implementing", "done", ["prompt_completion_evidence"])
+            .without_required_evidence(),
+    );
+    lifted
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime", Utc::now()),
+        )
+        .expect("kill switch must restore claim-trusting behavior");
+}
+
+#[test]
+fn prompt_task_done_requires_completion_evidence_even_if_the_reducer_is_bypassed() {
+    let instance = WorkflowInstance::new(
+        "prompt_task",
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "task-1"),
+    );
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "implementing",
+        "finish_prompt_task",
+        "done",
+        "prompt implementation activity completed successfully",
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::MarkDone,
+        "prompt-task-1-done",
+        json!({ "reason": "done" }),
+    ));
+
+    let err = DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect_err("implementing -> done without completion evidence must be rejected");
+    assert_eq!(
+        err.kind,
+        WorkflowDecisionRejectionKind::MissingRequiredEvidence
+    );
+
+    let evidenced = decision.with_evidence(WorkflowEvidence::new(
+        "prompt_completion_evidence",
+        "validation_report: 1 command(s) reported, 0 non-zero exit(s)",
+    ));
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &evidenced,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("the declared evidence unlocks the transition");
+}

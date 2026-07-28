@@ -1,8 +1,5 @@
 use anyhow::Context;
-use harness_agents::{
-    claude::ClaudeCodeAgent, claude_adapter::ClaudeAdapter, codex::CodexAgent,
-    codex_adapter::CodexAdapter, registry::AgentRegistry,
-};
+use harness_agents::registry::AgentRegistry;
 use harness_core::{agent::AgentRequest, config::HarnessConfig, prompts, types::ThreadId};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -486,45 +483,8 @@ async fn write_json_line(stdout: &mut tokio::io::Stdout, value: &Value) -> anyho
 }
 
 pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
-    let mut agent_registry = AgentRegistry::new(&config.agents.default_agent);
-    agent_registry.set_complexity_preferences(config.agents.complexity_preferred_agents.clone());
-    agent_registry.register(
-        "claude",
-        Arc::new(
-            ClaudeCodeAgent::new(
-                config.agents.claude.cli_path.clone(),
-                config.agents.claude.default_model.clone(),
-                config.agents.sandbox_mode,
-            )
-            .with_no_session_persistence_probe()
-            .with_stream_timeout(config.agents.stream_timeout_secs),
-        ),
-    );
-    agent_registry
-        .register_adapter(
-            "claude",
-            Arc::new(ClaudeAdapter::new(
-                config.agents.claude.cli_path.clone(),
-                config.agents.claude.default_model.clone(),
-            )),
-        )
-        .context("failed to attach claude adapter")?;
-    agent_registry.register(
-        "codex",
-        Arc::new(
-            CodexAgent::from_config(config.agents.codex.clone(), config.agents.sandbox_mode)
-                .with_stream_timeout(config.agents.stream_timeout_secs),
-        ),
-    );
-    agent_registry
-        .register_adapter(
-            "codex",
-            Arc::new(CodexAdapter::from_config(
-                config.agents.codex.clone(),
-                config.agents.sandbox_mode,
-            )),
-        )
-        .context("failed to attach codex adapter")?;
+    let agent_registry =
+        harness_agents::builder::registry_from_config(&config.agents, config.agents.sandbox_mode)?;
 
     let default_agent_name = agent_registry
         .resolved_default_agent_name()

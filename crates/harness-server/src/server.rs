@@ -107,6 +107,7 @@ impl HarnessServer {
 
     /// Start in stdio mode (JSON-RPC over stdin/stdout).
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
+        self.apply_completion_evidence_policy()?;
         self.register_declarative_workflow_definitions()?;
         let state = crate::http::build_app_state(Arc::new(self)).await?;
         harness_workflow::runtime::freeze_workflow_definition_registry();
@@ -115,8 +116,23 @@ impl HarnessServer {
 
     /// Start in HTTP + WebSocket mode.
     pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
+        self.apply_completion_evidence_policy()?;
         self.register_declarative_workflow_definitions()?;
         crate::http::serve(self, addr).await
+    }
+
+    fn apply_completion_evidence_policy(&self) -> anyhow::Result<()> {
+        let enforced = self.completion_evidence_enforced();
+        if !enforced {
+            tracing::warn!(
+                "deployment-wide workflow completion-evidence enforcement is disabled; terminal transitions accept agent-claimed results without server-verified evidence"
+            );
+        }
+        harness_workflow::runtime::apply_builtin_evidence_enforcement(enforced)
+    }
+
+    fn completion_evidence_enforced(&self) -> bool {
+        self.config.workflow.completion_evidence_enforced
     }
 
     fn register_declarative_workflow_definitions(&self) -> anyhow::Result<()> {
@@ -240,6 +256,15 @@ mod tests {
             Some(active_path.to_string_lossy().as_ref())
         );
         assert_eq!(metadata.retention_max_files, 30);
+    }
+
+    #[test]
+    fn startup_policy_reads_the_deployment_global_harness_config() {
+        let mut config = HarnessConfig::default();
+        config.workflow.completion_evidence_enforced = false;
+        let server = HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+
+        assert!(!server.completion_evidence_enforced());
     }
 
     #[test]

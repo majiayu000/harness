@@ -335,6 +335,29 @@ fn parse_claude_stream_output_keeps_plaintext_fallback() {
     assert_eq!(parsed.token_usage.total_tokens, 0);
 }
 
+#[test]
+fn parse_claude_stream_output_records_result_failure() {
+    let stdout = [
+        r#"{"type":"assistant","message":"working on it"}"#,
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"usage":{"input_tokens":7,"output_tokens":1}}"#,
+    ]
+    .join("\n");
+
+    let parsed = parse_claude_stream_output(&stdout);
+
+    let failure = parsed.failure.expect("error result should record failure");
+    assert!(failure.contains("error_during_execution"), "{failure}");
+    // Usage from the failed result is still recorded for accounting.
+    assert_eq!(parsed.token_usage.input_tokens, 7);
+}
+
+#[test]
+fn parse_claude_stream_output_success_has_no_failure() {
+    let parsed = parse_claude_stream_output(r#"{"type":"result","result":"done"}"#);
+    assert!(parsed.failure.is_none());
+    assert_eq!(parsed.output, "done");
+}
+
 fn write_executable_script(script_body: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("create tempdir");
     let path = dir.path().join("mock-claude.sh");
@@ -690,6 +713,140 @@ printf '%s\n' '{"type":"result","result":"hello","usage":{"input_tokens":10,"out
     assert_eq!(usage.input_tokens, 10);
     assert_eq!(usage.output_tokens, 2);
     assert_eq!(usage.total_tokens, 15);
+}
+
+#[tokio::test]
+async fn execute_fails_on_error_result_despite_exit_zero() {
+    let (dir, script) = write_executable_script(
+        r#"
+printf '%s\n' '{"type":"assistant","message":"trying"}'
+printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"tool crashed"}'
+exit 0
+"#,
+    );
+    let agent = ClaudeCodeAgent::new(
+        script,
+        "test-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    );
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+
+    let error = match agent.execute(request).await {
+        Ok(response) => panic!("error result must not be reported as success: {response:?}"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("error_during_execution"), "{error}");
+    assert!(error.contains("tool crashed"), "{error}");
+}
+
+#[tokio::test]
+async fn execute_stream_fails_on_error_result_despite_exit_zero() {
+    let (dir, script) = write_executable_script(
+        r#"
+printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true}'
+exit 0
+"#,
+    );
+    let agent = ClaudeCodeAgent::new(
+        script,
+        "test-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    );
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let stream_result = agent.execute_stream(request, tx).await;
+    let error = match stream_result {
+        Ok(()) => panic!("error result must not be reported as stream success"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("error_max_turns"), "{error}");
+
+    // The failure is reported exactly once — via the Err return. A duplicate
+    // StreamItem::Error would make the turn lifecycle persist the same
+    // failure twice.
+    while let Ok(Some(item)) = timeout(Duration::from_secs(2), rx.recv()).await {
+        assert!(
+            !matches!(item, StreamItem::Error { .. }),
+            "terminal failure must not also be emitted as a stream Error item"
+        );
+    }
+}
+
+#[tokio::test]
+async fn execute_strips_injected_nested_session_markers_but_keeps_claude_config() {
+    let (dir, script) = write_executable_script(
+        r#"
+printf '{"type":"result","result":"CLAUDECODE=%s ENTRYPOINT=%s CONFIG_DIR=%s"}\n' \
+    "${CLAUDECODE:-unset}" "${CLAUDE_CODE_ENTRYPOINT:-unset}" "${CLAUDE_CONFIG_DIR:-unset}"
+"#,
+    );
+    let agent = ClaudeCodeAgent::new(
+        script,
+        "test-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    );
+    let mut env_vars = std::collections::HashMap::new();
+    // Injected via the request rather than inherited from the parent env —
+    // the historical bug only stripped keys present in the parent env.
+    env_vars.insert("CLAUDECODE".to_string(), "1".to_string());
+    env_vars.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), "cli".to_string());
+    env_vars.insert(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        "/tmp/claude-cfg".to_string(),
+    );
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        env_vars,
+        ..AgentRequest::default()
+    };
+
+    let response = match agent.execute(request).await {
+        Ok(response) => response,
+        Err(error) => panic!("execution should succeed, got: {error}"),
+    };
+    assert_eq!(
+        response.output,
+        "CLAUDECODE=unset ENTRYPOINT=unset CONFIG_DIR=/tmp/claude-cfg"
+    );
+}
+
+#[tokio::test]
+async fn execute_times_out_on_hung_agent() {
+    let (dir, script) = write_executable_script("sleep 30");
+    let agent = ClaudeCodeAgent::new(
+        script,
+        "test-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    )
+    .with_stream_timeout(Some(1));
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+
+    let started = std::time::Instant::now();
+    let error = match timeout(Duration::from_secs(10), agent.execute(request)).await {
+        Ok(Ok(response)) => panic!("hung agent must not report success: {response:?}"),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => panic!("execute must fail at the configured timeout, not hang"),
+    };
+    assert!(error.contains("idle timeout"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "took {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]

@@ -30,8 +30,8 @@ pub struct EventSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthReport {
-    /// `None` when the observation window was empty: the grade is unknown,
-    /// not perfect (GH-1766, B-011).
+    /// `None` when the window held no independent gradeable events and no
+    /// violations. Derived `quality_grade` events do not create a verdict.
     pub quality: Option<QualityReport>,
     pub violation_summary: Vec<ViolationSummary>,
     pub signal_summary: Vec<SignalSummary>,
@@ -44,8 +44,13 @@ pub fn generate_health_report(events: &[Event], violations: &[Violation]) -> Hea
     let signal_summary = derive_signals(events);
     let event_summary = count_events(events);
     let quality = QualityGrader::grade(events, violations.len());
-    let recommendations =
-        build_recommendations(quality.as_ref(), &violation_summary, &event_summary);
+    let recommendations = match quality.as_ref() {
+        Some(quality) => build_recommendations(quality, &violation_summary, &event_summary),
+        None => vec![
+            "No independent observability evidence in this window; run a task before reading a quality verdict."
+                .to_string(),
+        ],
+    };
 
     HealthReport {
         quality,
@@ -127,24 +132,18 @@ fn count_events(events: &[Event]) -> EventSummary {
 }
 
 fn build_recommendations(
-    quality: Option<&QualityReport>,
+    quality: &QualityReport,
     violations: &[ViolationSummary],
     summary: &EventSummary,
 ) -> Vec<String> {
     let mut recs = Vec::new();
 
-    if quality.is_none() {
-        recs.push(
-            "No observations were recorded in the grading window; quality grade is unknown."
-                .to_string(),
-        );
-    }
-    if quality.is_some_and(|quality| quality.dimensions.security < 90.0) {
+    if quality.dimensions.security < 90.0 {
         recs.push(
             "Review and fix security-related violations to improve security score.".to_string(),
         );
     }
-    if quality.is_some_and(|quality| quality.dimensions.stability < 80.0) {
+    if quality.dimensions.stability < 80.0 {
         recs.push("Reduce block rate to improve stability score.".to_string());
     }
     if summary.escalate_count > 0 {
@@ -159,7 +158,7 @@ fn build_recommendations(
             top.rule_id, top.count
         ));
     }
-    if quality.is_some_and(|quality| quality.grade == Grade::D) {
+    if quality.grade == Grade::D {
         recs.push(
             "Consider running garbage collection immediately to clean up accumulated issues."
                 .to_string(),
@@ -187,6 +186,15 @@ mod tests {
         Event::new(SessionId::new(), "security_check", "Edit", Decision::Block)
     }
 
+    fn quality_grade_event() -> Event {
+        Event::new(
+            SessionId::new(),
+            "quality_grade",
+            "QualityGrader",
+            Decision::Pass,
+        )
+    }
+
     fn escalate_event(hook: &str) -> Event {
         Event::new(SessionId::new(), hook, "Edit", Decision::Escalate)
     }
@@ -201,17 +209,23 @@ mod tests {
         }
     }
 
-    /// GH-1766 B-011: an unobserved window has an unknown grade, not a
-    /// perfect one.
     #[test]
-    fn zero_events_zero_violations_grade_is_unknown() {
+    fn zero_events_zero_violations_has_no_quality_verdict() {
         let report = generate_health_report(&[], &[]);
         assert!(report.quality.is_none());
         assert!(report.violation_summary.is_empty());
         assert!(report.signal_summary.is_empty());
         assert_eq!(report.event_summary.total, 0);
         assert_eq!(report.recommendations.len(), 1);
-        assert!(report.recommendations[0].contains("unknown"));
+        assert!(report.recommendations[0].contains("No independent observability evidence"));
+    }
+
+    #[test]
+    fn derived_grade_without_independent_evidence_has_no_verdict() {
+        let report = generate_health_report(&[quality_grade_event()], &[]);
+        assert!(report.quality.is_none());
+        assert_eq!(report.event_summary.total, 1);
+        assert!(report.recommendations[0].contains("No independent observability evidence"));
     }
 
     #[test]
@@ -268,7 +282,9 @@ mod tests {
             .map(|_| make_violation("SEC-01", Severity::High))
             .collect();
         let report = generate_health_report(&[], &violations);
-        let quality = report.quality.expect("violations make the window observed");
+        let quality = report
+            .quality
+            .expect("violations are evidence enough to grade");
         assert!(quality.dimensions.coverage < 100.0);
     }
 }

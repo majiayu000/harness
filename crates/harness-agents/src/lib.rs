@@ -1,4 +1,5 @@
 pub mod anthropic_api;
+pub mod builder;
 pub mod claude;
 pub mod claude_adapter;
 mod claude_stream;
@@ -16,18 +17,6 @@ use harness_core::run_id::{RunIdentity, AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
 use harness_core::run_registry::{append_binding_nonblocking, BindingRecord};
 use std::collections::HashMap;
 use std::path::Path;
-
-/// Remove all `CLAUDE`-prefixed environment variables from a command to prevent
-/// nested Claude Code detection (SIGTRAP).
-pub(crate) fn strip_claude_env(cmd: &mut tokio::process::Command) {
-    let claude_keys: Vec<String> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("CLAUDE"))
-        .map(|(k, _)| k)
-        .collect();
-    for key in &claude_keys {
-        cmd.env_remove(key);
-    }
-}
 
 pub(crate) fn resolve_agent_run_identity(env_vars: &HashMap<String, String>) -> RunIdentity {
     match RunIdentity::from_env_vars(env_vars) {
@@ -149,7 +138,9 @@ unsafe fn nix_kill(pid: i32, sig: i32) -> i32 {
 }
 
 pub(crate) struct ManagedChild {
-    child: tokio::process::Child,
+    /// Only `None` after `Drop` has taken the child for background reaping;
+    /// every other method may assume it is present.
+    child: Option<tokio::process::Child>,
     process_group_id: Option<u32>,
     label: &'static str,
     cleanup_disarmed: bool,
@@ -159,15 +150,21 @@ impl ManagedChild {
     pub(crate) fn new(child: tokio::process::Child, label: &'static str) -> Self {
         let process_group_id = child.id();
         Self {
-            child,
+            child: Some(child),
             process_group_id,
             label,
             cleanup_disarmed: false,
         }
     }
 
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("ManagedChild is only vacated during drop")
+    }
+
     pub(crate) fn inner_mut(&mut self) -> &mut tokio::process::Child {
-        &mut self.child
+        self.child_mut()
     }
 
     pub(crate) fn terminate_now(&mut self) {
@@ -175,11 +172,11 @@ impl ManagedChild {
         if let Some(pid) = self.process_group_id {
             kill_process_group_id(pid);
         }
-        let _ = self.child.start_kill();
+        let _ = self.child_mut().start_kill();
     }
 
     pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.wait().await
+        self.child_mut().wait().await
     }
 
     pub(crate) async fn wait_and_cleanup_descendants(
@@ -196,35 +193,116 @@ impl ManagedChild {
         Ok(())
     }
 
-    pub(crate) async fn wait_with_output(&mut self) -> std::io::Result<std::process::Output> {
-        use tokio::io::AsyncReadExt;
+    /// Wait for the child while capturing bounded output with an idle timeout.
+    ///
+    /// Unlike `Child::wait_with_output`, this never buffers unbounded process
+    /// output (only the tail up to `limits.max_captured_bytes` per stream is
+    /// kept, which preserves the trailing result line agents emit) and it
+    /// declares the child a zombie when neither pipe produces data for
+    /// `limits.idle_timeout`, killing the process group instead of hanging
+    /// the caller forever.
+    pub(crate) async fn wait_with_output(
+        &mut self,
+        limits: &OutputLimits,
+    ) -> std::io::Result<BoundedOutput> {
+        let mut stdout_pipe = self.child_mut().stdout.take();
+        let mut stderr_pipe = self.child_mut().stderr.take();
+        let mut stdout_buf = TailBuffer::new(limits.max_captured_bytes);
+        let mut stderr_buf = TailBuffer::new(limits.max_captured_bytes);
+        let mut stdout_chunk = vec![0u8; OUTPUT_READ_CHUNK_BYTES];
+        let mut stderr_chunk = vec![0u8; OUTPUT_READ_CHUNK_BYTES];
 
-        let stdout = self.child.stdout.take();
-        let stderr = self.child.stderr.take();
-        let stdout_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = stdout {
-                pipe.read_to_end(&mut bytes).await?;
+        let mut exit_status: Option<std::process::ExitStatus> = None;
+        while stdout_pipe.is_some() || stderr_pipe.is_some() {
+            let child_running = exit_status.is_none();
+            let read = async {
+                tokio::select! {
+                    result = read_from_pipe(&mut stdout_pipe, &mut stdout_chunk) => {
+                        PipeRead::Stdout(result)
+                    }
+                    result = read_from_pipe(&mut stderr_pipe, &mut stderr_chunk) => {
+                        PipeRead::Stderr(result)
+                    }
+                    // Watch for root exit while pipes stay open: a descendant
+                    // holding the pipe must be killed so the reads reach EOF
+                    // instead of hanging until the idle timeout.
+                    result = self.child.as_mut().expect(
+                        "ManagedChild is only vacated during drop",
+                    ).wait(), if child_running => {
+                        PipeRead::Exited(result)
+                    }
+                }
+            };
+            let event = if let Some(idle) = limits.idle_timeout {
+                match tokio::time::timeout(idle, read).await {
+                    Ok(event) => event,
+                    Err(_) => {
+                        self.terminate_now();
+                        return Err(self.idle_timeout_error(idle));
+                    }
+                }
+            } else {
+                read.await
+            };
+            match event {
+                PipeRead::Stdout(Ok(0)) => stdout_pipe = None,
+                PipeRead::Stderr(Ok(0)) => stderr_pipe = None,
+                PipeRead::Stdout(Ok(n)) => stdout_buf.push(&stdout_chunk[..n]),
+                PipeRead::Stderr(Ok(n)) => stderr_buf.push(&stderr_chunk[..n]),
+                PipeRead::Stdout(Err(error)) | PipeRead::Stderr(Err(error)) => {
+                    self.terminate_now();
+                    return Err(error);
+                }
+                PipeRead::Exited(result) => {
+                    exit_status = Some(result?);
+                    self.cleanup_after_child_exit().await?;
+                }
             }
-            Ok::<_, std::io::Error>(bytes)
-        });
-        let stderr_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = stderr {
-                pipe.read_to_end(&mut bytes).await?;
+        }
+
+        let status = match exit_status {
+            Some(status) => status,
+            None => {
+                if let Some(idle) = limits.idle_timeout {
+                    match tokio::time::timeout(idle, self.wait_and_cleanup_descendants()).await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            self.terminate_now();
+                            return Err(self.idle_timeout_error(idle));
+                        }
+                    }
+                } else {
+                    self.wait_and_cleanup_descendants().await?
+                }
             }
-            Ok::<_, std::io::Error>(bytes)
-        });
+        };
 
-        let status = self.wait_and_cleanup_descendants().await?;
-        let stdout = join_reader(stdout_task).await?;
-        let stderr = join_reader(stderr_task).await?;
+        if stdout_buf.truncated || stderr_buf.truncated {
+            tracing::warn!(
+                agent_process = self.label,
+                max_captured_bytes = limits.max_captured_bytes,
+                stdout_truncated = stdout_buf.truncated,
+                stderr_truncated = stderr_buf.truncated,
+                "agent output exceeded the capture limit; kept only the tail"
+            );
+        }
 
-        Ok(std::process::Output {
+        Ok(BoundedOutput {
             status,
-            stdout,
-            stderr,
+            stdout: stdout_buf.data,
+            stderr: stderr_buf.data,
         })
+    }
+
+    fn idle_timeout_error(&self, idle: std::time::Duration) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "{} idle timeout after {}s: zombie process terminated",
+                self.label,
+                idle.as_secs()
+            ),
+        )
     }
 
     #[cfg(unix)]
@@ -265,11 +343,89 @@ impl ManagedChild {
     }
 }
 
-async fn join_reader(
-    task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-) -> std::io::Result<Vec<u8>> {
-    task.await
-        .map_err(|error| std::io::Error::other(error.to_string()))?
+/// Default per-stream capture ceiling for non-streaming execution. Generous
+/// enough for any legitimate agent transcript while preventing a runaway
+/// child (e.g. one that dumps a build log) from holding gigabytes in RAM.
+pub(crate) const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+
+const OUTPUT_READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Limits applied by [`ManagedChild::wait_with_output`].
+pub(crate) struct OutputLimits {
+    /// Kill the child when neither pipe produces data for this long.
+    pub(crate) idle_timeout: Option<std::time::Duration>,
+    /// Per-stream capture ceiling; only the tail is kept beyond it.
+    pub(crate) max_captured_bytes: usize,
+}
+
+impl OutputLimits {
+    /// Build limits from an agent's `stream_timeout_secs` configuration so the
+    /// non-streaming path shares the streaming path's zombie detection.
+    pub(crate) fn from_stream_timeout_secs(secs: Option<u64>) -> Self {
+        Self {
+            idle_timeout: secs.map(std::time::Duration::from_secs),
+            max_captured_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundedOutput {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// Fixed-capacity byte buffer that keeps the most recent bytes pushed into it.
+struct TailBuffer {
+    data: Vec<u8>,
+    cap: usize,
+    truncated: bool,
+}
+
+impl TailBuffer {
+    fn new(cap: usize) -> Self {
+        Self {
+            data: Vec::new(),
+            cap,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if chunk.len() >= self.cap {
+            self.truncated = self.truncated || !self.data.is_empty() || chunk.len() > self.cap;
+            self.data.clear();
+            self.data
+                .extend_from_slice(&chunk[chunk.len() - self.cap..]);
+            return;
+        }
+        let overflow = (self.data.len() + chunk.len()).saturating_sub(self.cap);
+        if overflow > 0 {
+            self.data.drain(..overflow);
+            self.truncated = true;
+        }
+        self.data.extend_from_slice(chunk);
+    }
+}
+
+enum PipeRead {
+    Stdout(std::io::Result<usize>),
+    Stderr(std::io::Result<usize>),
+    Exited(std::io::Result<std::process::ExitStatus>),
+}
+
+/// Read from an optional pipe; a vacated pipe never resolves, letting
+/// `select!` wait solely on the remaining stream.
+async fn read_from_pipe<R>(pipe: &mut Option<R>, buf: &mut [u8]) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    match pipe {
+        Some(reader) => reader.read(buf).await,
+        None => std::future::pending().await,
+    }
 }
 
 impl Drop for ManagedChild {
@@ -277,7 +433,10 @@ impl Drop for ManagedChild {
         if self.cleanup_disarmed {
             return;
         }
-        let mut child_reaped = match self.child.try_wait() {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let child_reaped = match child.try_wait() {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(error) => {
@@ -303,136 +462,264 @@ impl Drop for ManagedChild {
             agent_process = self.label,
             "agent child dropped while still running; killing process group before workspace release"
         );
-        self.terminate_now();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            if !child_reaped {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => {
-                        child_reaped = true;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            agent_process = self.label,
-                            "failed waiting for killed agent child to exit: {error}"
-                        );
-                        child_reaped = true;
-                    }
-                }
-            }
-
-            #[cfg(unix)]
-            let group_drained = self
-                .process_group_id
-                .is_none_or(|pid| !process_group_has_members(pid));
-            #[cfg(not(unix))]
-            let group_drained = true;
-
-            if child_reaped && group_drained {
-                self.cleanup_disarmed = true;
-                return;
-            }
-
-            if std::time::Instant::now() >= deadline {
-                if !child_reaped {
-                    tracing::warn!(
-                        agent_process = self.label,
-                        "timed out waiting for killed agent child to exit"
-                    );
-                }
-                if !group_drained {
-                    tracing::warn!(
-                        agent_process = self.label,
-                        "timed out waiting for killed agent process group to drain"
-                    );
-                }
-                return;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        #[cfg(unix)]
+        if let Some(pid) = self.process_group_id {
+            kill_process_group_id(pid);
         }
+        let _ = child.start_kill();
+
+        // Drop runs on the async runtime for every cancelled/timed-out turn, so
+        // it must not block the worker thread: hand reaping and group-drain
+        // verification to a detached task. The blocking loop is kept only for
+        // drops outside a runtime (e.g. process teardown).
+        let label = self.label;
+        let process_group_id = self.process_group_id;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(reap_killed_child(child, label, process_group_id));
+            }
+            Err(_) => drain_killed_child_blocking(child, child_reaped, label, process_group_id),
+        }
+    }
+}
+
+/// Await the killed child's exit and verify its process group drains.
+///
+/// The SIGKILL was already issued by `Drop`; this task only reaps and reports.
+async fn reap_killed_child(
+    mut child: tokio::process::Child,
+    label: &'static str,
+    process_group_id: Option<u32>,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(
+                agent_process = label,
+                "failed waiting for killed agent child to exit: {error}"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                agent_process = label,
+                "timed out waiting for killed agent child to exit"
+            );
+            return;
+        }
+    }
+
+    #[cfg(unix)]
+    if let Some(pgid) = process_group_id {
+        loop {
+            if !process_group_has_members(pgid) {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    agent_process = label,
+                    "timed out waiting for killed agent process group to drain"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = process_group_id;
+}
+
+/// Blocking fallback for drops outside a tokio runtime, where a detached
+/// reaper task cannot be spawned.
+fn drain_killed_child_blocking(
+    mut child: tokio::process::Child,
+    mut child_reaped: bool,
+    label: &'static str,
+    process_group_id: Option<u32>,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if !child_reaped {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    child_reaped = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        agent_process = label,
+                        "failed waiting for killed agent child to exit: {error}"
+                    );
+                    child_reaped = true;
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        let group_drained = process_group_id.is_none_or(|pid| !process_group_has_members(pid));
+        #[cfg(not(unix))]
+        let group_drained = true;
+
+        if child_reaped && group_drained {
+            return;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            if !child_reaped {
+                tracing::warn!(
+                    agent_process = label,
+                    "timed out waiting for killed agent child to exit"
+                );
+            }
+            if !group_drained {
+                tracing::warn!(
+                    agent_process = label,
+                    "timed out waiting for killed agent process group to drain"
+                );
+            }
+            return;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
 #[cfg(test)]
-mod run_id_tests {
+#[cfg(unix)]
+mod managed_child_tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[test]
-    fn run_id_resolution_prefers_request_env() {
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            AGENT_RUN_ID_ENV.to_string(),
-            "ar-01j1qb3c9r7v5m2k8x4tznq6wd".to_string(),
-        );
-        env_vars.insert(
-            AGENT_RUN_PARENT_ENV.to_string(),
-            "ar-01j1qb3c9r7v5m2k8x4tznq6we".to_string(),
-        );
-
-        let identity = resolve_agent_run_identity(&env_vars);
-
-        assert_eq!(identity.run_id.as_str(), "ar-01j1qb3c9r7v5m2k8x4tznq6wd");
-        assert_eq!(
-            identity.parent.as_ref().map(|id| id.as_str()),
-            Some("ar-01j1qb3c9r7v5m2k8x4tznq6we")
-        );
-    }
-
-    #[test]
-    fn run_id_resolution_mints_when_absent() {
-        let _guard = env_lock().lock().unwrap();
-        let original_id = std::env::var(AGENT_RUN_ID_ENV).ok();
-        let original_parent = std::env::var(AGENT_RUN_PARENT_ENV).ok();
-        unsafe { std::env::remove_var(AGENT_RUN_ID_ENV) };
-        unsafe { std::env::remove_var(AGENT_RUN_PARENT_ENV) };
-
-        let identity = resolve_agent_run_identity(&HashMap::new());
-
-        assert!(identity.run_id.as_str().starts_with("ar-"));
-        assert!(identity.parent.is_none());
-
-        match original_id {
-            Some(value) => unsafe { std::env::set_var(AGENT_RUN_ID_ENV, value) },
-            None => unsafe { std::env::remove_var(AGENT_RUN_ID_ENV) },
-        }
-        match original_parent {
-            Some(value) => unsafe { std::env::set_var(AGENT_RUN_PARENT_ENV, value) },
-            None => unsafe { std::env::remove_var(AGENT_RUN_PARENT_ENV) },
-        }
-    }
-
-    #[test]
-    fn run_id_provisional_binding_uses_harness_adapter_source() {
-        let identity = RunIdentity::from_env_values(
-            Some("ar-01j1qb3c9r7v5m2k8x4tznq6wd"),
-            Some("ar-01j1qb3c9r7v5m2k8x4tznq6we"),
+    fn spawn_shell(script: &str) -> ManagedChild {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        set_process_group(&mut cmd);
+        ManagedChild::new(
+            cmd.spawn().expect("spawn shell child"),
+            "managed child test",
         )
-        .expect("valid identity")
-        .expect("identity");
+    }
 
-        let record =
-            provisional_agent_run_binding_record(&identity, "claude-code", 42, Path::new("/tmp/x"));
+    #[test]
+    fn tail_buffer_keeps_only_most_recent_bytes() {
+        let mut buf = TailBuffer::new(4);
+        buf.push(b"ab");
+        assert_eq!(buf.data, b"ab");
+        assert!(!buf.truncated);
+        buf.push(b"cdef");
+        assert_eq!(buf.data, b"cdef");
+        assert!(buf.truncated);
 
-        assert_eq!(record.run_id.as_str(), "ar-01j1qb3c9r7v5m2k8x4tznq6wd");
-        assert_eq!(
-            record.parent.as_ref().map(|id| id.as_str()),
-            Some("ar-01j1qb3c9r7v5m2k8x4tznq6we")
+        let mut big = TailBuffer::new(4);
+        big.push(b"0123456789");
+        assert_eq!(big.data, b"6789");
+        assert!(big.truncated);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_with_output_times_out_on_silent_child() {
+        let mut child = spawn_shell("sleep 30");
+        let limits = OutputLimits {
+            idle_timeout: Some(std::time::Duration::from_millis(300)),
+            max_captured_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+        };
+
+        let start = std::time::Instant::now();
+        let error = child
+            .wait_with_output(&limits)
+            .await
+            .expect_err("a silent child must trip the idle timeout");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "timeout must fire near the configured deadline, took {:?}",
+            start.elapsed()
         );
-        assert_eq!(record.native.kind, "claude-code");
-        assert!(record.native.id.is_empty());
-        assert_eq!(record.pid, 42);
-        assert_eq!(record.source, "harness-adapter");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_with_output_caps_capture_to_the_tail() {
+        let mut child = spawn_shell("printf 'a%.0s' $(seq 1 8000); printf 'END-MARKER'; exit 0");
+        let limits = OutputLimits {
+            idle_timeout: Some(std::time::Duration::from_secs(10)),
+            max_captured_bytes: 512,
+        };
+
+        let output = child
+            .wait_with_output(&limits)
+            .await
+            .expect("bounded wait should succeed");
+        assert!(output.status.success());
+        assert!(output.stdout.len() <= 512, "len={}", output.stdout.len());
+        assert!(
+            output.stdout.ends_with(b"END-MARKER"),
+            "the trailing bytes must survive truncation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_of_running_child_returns_promptly_and_reaps_in_background() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 5").kill_on_drop(true);
+        set_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn sleeping child");
+        let pgid = child.id().expect("child pid");
+        let managed = ManagedChild::new(child, "drop latency test");
+
+        let start = std::time::Instant::now();
+        drop(managed);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "drop must not block the runtime worker; took {elapsed:?}"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if !process_group_has_members(pgid) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "detached reaper should drain the killed process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[test]
+    fn drop_outside_runtime_falls_back_to_blocking_drain() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let (managed, pgid) = runtime.block_on(async {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg("sleep 5").kill_on_drop(true);
+            set_process_group(&mut cmd);
+            let child = cmd.spawn().expect("spawn sleeping child");
+            let pgid = child.id().expect("child pid");
+            (ManagedChild::new(child, "blocking drain test"), pgid)
+        });
+
+        // Dropping outside any runtime context must still fully drain the
+        // group before returning (there is no executor to run a reaper task).
+        drop(managed);
+        assert!(
+            !process_group_has_members(pgid),
+            "blocking fallback should drain the killed process group before returning"
+        );
+        drop(runtime);
     }
 }
+
+#[cfg(test)]
+#[path = "run_id_tests.rs"]
+mod run_id_tests;
 
 #[cfg(test)]
 mod spawn_failure_tests {
