@@ -1,5 +1,5 @@
 use super::*;
-use harness_workflow::runtime::{ActivityStatus, RuntimeKind};
+use harness_workflow::runtime::{ActivityStatus, RuntimeKind, PROMPT_TASK_DEFINITION_ID};
 
 #[test]
 fn activity_result_from_turn_fails_when_no_fenced_block_present() {
@@ -255,6 +255,48 @@ fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
     let envelope = envelope_artifact(&result);
     assert_eq!(envelope["outcome"], "status_contract_downgraded");
     assert_eq!(envelope["final_result"]["status"], "blocked");
+}
+
+#[test]
+fn activity_result_from_turn_preserves_prompt_nonzero_validation_report() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "implement_prompt"
+        }),
+    );
+    let items = vec![Item::AgentReasoning {
+        content: r#"Prompt implementation report.
+
+```harness-activity-result
+{"activity":"implement_prompt","status":"succeeded","summary":"Implementation completed; validation reported failed checks.","artifacts":[{"artifact_type":"validation_report","artifact":[{"command":"cargo clippy","exit_code":101}]}]}
+```"#
+            .to_string(),
+    }];
+
+    let result = activity_result_from_turn_with_workflow(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+        Some(PROMPT_TASK_DEFINITION_ID),
+    );
+
+    assert_eq!(result.activity, "implement_prompt");
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+    assert!(!result
+        .signals
+        .iter()
+        .any(|signal| signal.signal_type == "ActivityStatusContractDowngraded"));
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "accepted");
+    assert_eq!(envelope["final_result"]["status"], "succeeded");
 }
 
 #[test]

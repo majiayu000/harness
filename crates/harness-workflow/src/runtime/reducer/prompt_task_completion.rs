@@ -189,6 +189,7 @@ fn missing_completion_evidence_decision(
     event: &WorkflowEvent,
     result: &ActivityResult,
     detail: &str,
+    signal_and_state: Option<(&ExternalStateSignal, &PromptContinuationState)>,
 ) -> WorkflowDecision {
     blocked_decision(
         instance,
@@ -196,7 +197,7 @@ fn missing_completion_evidence_decision(
         result,
         "prompt_completion_evidence_missing",
         detail,
-        None,
+        signal_and_state,
     )
 }
 
@@ -208,7 +209,7 @@ fn single_shot_done_decision(
     let completion = match prompt_completion_evidence(result) {
         Ok(completion) => completion,
         Err(detail) => {
-            return missing_completion_evidence_decision(instance, event, result, &detail)
+            return missing_completion_evidence_decision(instance, event, result, &detail, None)
         }
     };
     let decision = WorkflowDecision::new(
@@ -233,7 +234,13 @@ fn settled_done_decision(
     let completion = match prompt_completion_evidence(result) {
         Ok(completion) => completion,
         Err(detail) => {
-            return missing_completion_evidence_decision(instance, event, result, &detail)
+            return missing_completion_evidence_decision(
+                instance,
+                event,
+                result,
+                &detail,
+                Some((signal, continuation)),
+            )
         }
     };
     let decision = WorkflowDecision::new(
@@ -735,5 +742,14 @@ mod tests {
 
         assert_eq!(decision.decision, "prompt_completion_evidence_missing");
         assert_eq!(decision.next_state, "blocked");
+        assert_eq!(
+            decision.commands[0].command["continuation"]["last_external_state"],
+            "Done"
+        );
+        assert_eq!(
+            decision.commands[0].command["continuation"]["last_summary"],
+            "attempt summary"
+        );
+        assert_eq!(decision.commands[0].command["continuation"]["attempt"], 1);
     }
 }

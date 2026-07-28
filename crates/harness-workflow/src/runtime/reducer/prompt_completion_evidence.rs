@@ -10,6 +10,8 @@ use crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID;
 use crate::runtime::state_registry::transition_requires_evidence;
 use serde_json::Value;
 
+use super::PromptValidationReportEntry;
+
 /// The artifact carrying the commands a prompt task ran, as
 /// `[{ "command": ..., "exit_code": ... }]`.
 pub const PROMPT_VALIDATION_REPORT_ARTIFACT: &str = "validation_report";
@@ -97,7 +99,23 @@ fn resolve_completion_evidence(
     }
 }
 
+pub(crate) fn first_valid_prompt_validation_report(
+    result: &ActivityResult,
+) -> Option<Vec<PromptValidationReportEntry>> {
+    artifacts_of_type(result, PROMPT_VALIDATION_REPORT_ARTIFACT)
+        .find_map(|artifact| parse_validation_report(artifact).ok())
+}
+
 fn validation_report_evidence(artifact: &Value) -> Result<PromptCompletionEvidence, String> {
+    let entries = parse_validation_report(artifact)?;
+    let failures = entries.iter().filter(|entry| entry.exit_code != 0).count();
+    Ok(PromptCompletionEvidence::ValidationReport {
+        commands: entries.len(),
+        failures,
+    })
+}
+
+fn parse_validation_report(artifact: &Value) -> Result<Vec<PromptValidationReportEntry>, String> {
     let entries = artifact.as_array().ok_or_else(|| {
         format!(
             "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` must be an array of {{command, exit_code}} entries"
@@ -108,7 +126,7 @@ fn validation_report_evidence(artifact: &Value) -> Result<PromptCompletionEviden
             "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` is empty; report the commands you ran or supply `{PROMPT_NO_CHANGE_RATIONALE_ARTIFACT}`"
         ));
     }
-    let mut failures = 0usize;
+    let mut parsed = Vec::with_capacity(entries.len());
     for entry in entries {
         let command = entry.get("command").and_then(Value::as_str);
         let exit_code = entry.get("exit_code").and_then(Value::as_i64);
@@ -119,9 +137,10 @@ fn validation_report_evidence(artifact: &Value) -> Result<PromptCompletionEviden
                         "`{PROMPT_VALIDATION_REPORT_ARTIFACT}` entry has an empty `command`"
                     ));
                 }
-                if exit_code != 0 {
-                    failures += 1;
-                }
+                parsed.push(PromptValidationReportEntry {
+                    command: command.to_string(),
+                    exit_code,
+                });
             }
             _ => {
                 return Err(format!(
@@ -130,10 +149,7 @@ fn validation_report_evidence(artifact: &Value) -> Result<PromptCompletionEviden
             }
         }
     }
-    Ok(PromptCompletionEvidence::ValidationReport {
-        commands: entries.len(),
-        failures,
-    })
+    Ok(parsed)
 }
 
 fn no_change_rationale_evidence(artifact: &Value) -> Result<PromptCompletionEvidence, String> {

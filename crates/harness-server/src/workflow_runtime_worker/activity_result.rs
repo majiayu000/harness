@@ -23,7 +23,7 @@ const CODEX_SKILL_BUDGET_STRUCTURED_AGENT_ERROR: &str =
 const CODEX_SKILL_BUDGET_STRUCTURED_AGENT_ERROR_PREFIX: &str =
     "agent execution failed: codex structured error: exit ";
 
-pub(super) fn activity_result_from_turn(
+pub(super) fn activity_result_from_turn_with_workflow(
     job: &RuntimeJob,
     status: &TurnStatus,
     items: &[Item],
@@ -32,6 +32,7 @@ pub(super) fn activity_result_from_turn(
     agent_name: &str,
     project_root: &Path,
     prompt_packet_digest: &str,
+    workflow_definition: Option<&str>,
 ) -> ActivityResult {
     let activity = activity_name(job);
     let summary = last_agent_summary(items).unwrap_or_else(|| match status {
@@ -40,7 +41,8 @@ pub(super) fn activity_result_from_turn(
         TurnStatus::Failed => "Agent turn failed.".to_string(),
         TurnStatus::Running => "Agent turn is still running after lifecycle returned.".to_string(),
     });
-    let envelope = activity_result_envelope_from_turn(status, items, &activity, summary);
+    let envelope =
+        activity_result_envelope_from_turn(status, items, &activity, summary, workflow_definition);
     match envelope.outcome {
         ActivityResultEnvelopeOutcome::MissingStructuredOutput => {
             tracing::warn!(
@@ -131,6 +133,30 @@ pub(super) fn activity_result_from_turn(
         ))
 }
 
+#[cfg(test)]
+fn activity_result_from_turn(
+    job: &RuntimeJob,
+    status: &TurnStatus,
+    items: &[Item],
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
+    agent_name: &str,
+    project_root: &Path,
+    prompt_packet_digest: &str,
+) -> ActivityResult {
+    activity_result_from_turn_with_workflow(
+        job,
+        status,
+        items,
+        thread_id,
+        turn_id,
+        agent_name,
+        project_root,
+        prompt_packet_digest,
+        None,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ActivityResultExtractionStrategy {
@@ -166,8 +192,9 @@ impl ActivityResultEnvelope {
         raw_status: TurnStatus,
         extraction_strategy: ActivityResultExtractionStrategy,
         result: ActivityResult,
+        workflow_definition: Option<&str>,
     ) -> Self {
-        let (downgraded, result) = enforce_activity_status_contract(result);
+        let (downgraded, result) = enforce_activity_status_contract(workflow_definition, result);
         let outcome = if downgraded {
             ActivityResultEnvelopeOutcome::StatusContractDowngraded
         } else {
@@ -187,8 +214,9 @@ impl ActivityResultEnvelope {
         raw_status: TurnStatus,
         result: ActivityResult,
         warning: String,
+        workflow_definition: Option<&str>,
     ) -> Self {
-        let (downgraded, result) = enforce_activity_status_contract(result);
+        let (downgraded, result) = enforce_activity_status_contract(workflow_definition, result);
         let outcome = if downgraded {
             ActivityResultEnvelopeOutcome::StatusContractDowngraded
         } else {
@@ -343,6 +371,7 @@ fn activity_result_envelope_from_turn(
     items: &[Item],
     activity: &str,
     summary: String,
+    workflow_definition: Option<&str>,
 ) -> ActivityResultEnvelope {
     match status {
         TurnStatus::Completed => match structured_activity_result(items, activity) {
@@ -350,6 +379,7 @@ fn activity_result_envelope_from_turn(
                 *status,
                 ActivityResultExtractionStrategy::FencedActivityResult,
                 result,
+                workflow_definition,
             ),
             StructuredActivityResult::Missing => {
                 let activity_summary = agent_activity_summary(items);
@@ -386,7 +416,10 @@ fn activity_result_envelope_from_turn(
                 match structured_activity_result(items, activity) {
                     StructuredActivityResult::Parsed(result) => {
                         return ActivityResultEnvelope::accepted_with_turn_warning(
-                            *status, result, warning,
+                            *status,
+                            result,
+                            warning,
+                            workflow_definition,
                         );
                     }
                     StructuredActivityResult::Invalid {

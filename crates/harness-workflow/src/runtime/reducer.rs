@@ -8,6 +8,12 @@ mod quality_gate_completion;
 mod runtime_failure;
 mod support;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptValidationReportEntry {
+    pub(crate) command: String,
+    pub(crate) exit_code: i64,
+}
+
 use self::declarative_completion::{
     definition_pin_blocked_decision, reduce_declarative_completion,
 };
@@ -24,6 +30,7 @@ use self::pr_feedback_completion::{
     pr_feedback_child_decision_from_activity_result, pr_feedback_success_contract_error,
     pr_feedback_sweep_decision_from_activity_result,
 };
+pub(crate) use self::prompt_completion_evidence::first_valid_prompt_validation_report;
 use self::prompt_task_completion::prompt_task_success_decision;
 use self::quality_gate_completion::{
     parent_quality_gate_pass_decision, quality_gate_activity_matches,
@@ -61,6 +68,11 @@ pub const ISSUE_CLOSED_SIGNAL: &str = "IssueClosed";
 pub const ISSUE_ALREADY_RESOLVED_SIGNAL: &str = "IssueAlreadyResolved";
 pub const ISSUE_STATE_ARTIFACT: &str = "issue_state";
 pub const SCOPE_TOO_LARGE_SIGNAL: &str = "SCOPE_TOO_LARGE";
+
+pub fn prompt_validation_report_has_nonzero_exit(result: &ActivityResult) -> bool {
+    first_valid_prompt_validation_report(result)
+        .is_some_and(|entries| entries.iter().any(|entry| entry.exit_code != 0))
+}
 
 pub fn activity_result_has_closed_issue_evidence(result: &ActivityResult) -> bool {
     closed_issue_evidence_from_activity_result(result).is_some()

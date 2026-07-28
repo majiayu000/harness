@@ -1,14 +1,19 @@
-use harness_workflow::runtime::{ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus};
+use harness_workflow::runtime::reducer::prompt_validation_report_has_nonzero_exit;
+use harness_workflow::runtime::{
+    ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY,
+};
 use serde_json::{json, Value};
 
 pub(super) fn enforce_activity_status_contract(
+    workflow_definition: Option<&str>,
     mut result: ActivityResult,
 ) -> (bool, ActivityResult) {
     if result.status != ActivityStatus::Succeeded {
         return (false, result);
     }
 
-    let blockers = activity_status_contract_blockers(&result);
+    let blockers = activity_status_contract_blockers(workflow_definition, &result);
     if blockers.is_empty() {
         return (false, result);
     }
@@ -60,7 +65,10 @@ pub(super) fn status_contract_blockers_from_result(result: &ActivityResult) -> V
         .unwrap_or_default()
 }
 
-fn activity_status_contract_blockers(result: &ActivityResult) -> Vec<String> {
+fn activity_status_contract_blockers(
+    workflow_definition: Option<&str>,
+    result: &ActivityResult,
+) -> Vec<String> {
     let mut blockers = Vec::new();
 
     for signal in &result.signals {
@@ -81,7 +89,17 @@ fn activity_status_contract_blockers(result: &ActivityResult) -> Vec<String> {
         collect_structured_blockers(&artifact.artifact, &mut blockers);
     }
 
-    collect_textual_blockers(&result.summary, &mut blockers);
+    let mut summary_blockers = Vec::new();
+    collect_textual_blockers(&result.summary, &mut summary_blockers);
+    if workflow_definition == Some(PROMPT_TASK_DEFINITION_ID)
+        && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
+        && prompt_validation_report_has_nonzero_exit(result)
+    {
+        summary_blockers.retain(|blocker| blocker != "text:failing_checks");
+    }
+    for blocker in summary_blockers {
+        push_unique(&mut blockers, blocker);
+    }
     if let Some(error) = result.error.as_deref() {
         collect_textual_blockers(error, &mut blockers);
     }
@@ -226,5 +244,74 @@ fn push_unique(blockers: &mut Vec<String>, blocker: impl Into<String>) {
     let blocker = blocker.into();
     if !blockers.contains(&blocker) {
         blockers.push(blocker);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prompt_result_with_report(exit_code: Value) -> ActivityResult {
+        ActivityResult::succeeded(
+            PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "Validation reported failed checks.",
+        )
+        .with_artifact(ActivityArtifact::new(
+            "validation_report",
+            json!([{
+                "command": "cargo test",
+                "exit_code": exit_code,
+            }]),
+        ))
+    }
+
+    #[test]
+    fn prompt_failed_checks_without_nonzero_report_remain_blocking() {
+        let (changed, result) = enforce_activity_status_contract(
+            Some(PROMPT_TASK_DEFINITION_ID),
+            prompt_result_with_report(json!(0)),
+        );
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::Blocked);
+        assert_eq!(
+            status_contract_blockers_from_result(&result),
+            vec!["text:failing_checks"]
+        );
+    }
+
+    #[test]
+    fn prompt_nonzero_report_does_not_hide_explicit_checks_failed_signal() {
+        let claimed = prompt_result_with_report(json!(101)).with_signal(ActivitySignal::new(
+            "ChecksFailed",
+            json!({ "check": "cargo test" }),
+        ));
+
+        let (changed, result) =
+            enforce_activity_status_contract(Some(PROMPT_TASK_DEFINITION_ID), claimed);
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::Blocked);
+        assert_eq!(
+            status_contract_blockers_from_result(&result),
+            vec!["signal:ChecksFailed"]
+        );
+    }
+
+    #[test]
+    fn missing_or_custom_workflow_keeps_prompt_named_failed_checks_blocking() {
+        for workflow_definition in [None, Some("custom_prompt_workflow")] {
+            let (changed, result) = enforce_activity_status_contract(
+                workflow_definition,
+                prompt_result_with_report(json!(101)),
+            );
+
+            assert!(changed);
+            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec!["text:failing_checks"]
+            );
+        }
     }
 }
