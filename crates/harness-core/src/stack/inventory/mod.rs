@@ -161,8 +161,46 @@ fn err(kind: AgentStackInventoryErrorKind, locator: &str) -> IErr {
     IErr::new(kind, (!locator.is_empty()).then(|| locator.to_owned()))
 }
 
+#[cfg(test)]
+mod review_tests;
 mod rules;
 use rules::*;
+
+#[cfg(test)]
+thread_local! {
+    /// §3 seam: force the initial recursive `open_dir` for one prefix to fail
+    /// once with `NotFound`, simulating a directory-open race.
+    pub(super) static FORCE_DIR_OPEN_NOT_FOUND: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// §5 seam: reverse each freshly collected native listing before caching.
+    pub(super) static REVERSE_LISTING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// §6 seam: fail the next bounded read during `read_to_end`.
+    pub(super) static INJECT_READ_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Bounded-read wrapper whose only production job is to forward reads; under
+/// `cfg(test)` it can fail deterministically during `read_to_end` (§6 seam).
+/// Production still reads from the opened regular-file handle and honors the
+/// per-file and aggregate `+ 1` sentinels unchanged.
+struct ReadSeam<R> {
+    inner: R,
+}
+
+impl<R: Read> Read for ReadSeam<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if INJECT_READ_FAILURE.get() {
+            INJECT_READ_FAILURE.set(false);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "injected read failure",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
 
 #[rustfmt::skip]
 pub(super) fn classify_resolution_failure(
@@ -208,9 +246,78 @@ pub(super) fn classify_directory_open_failure(kind: std::io::ErrorKind) -> Agent
     match kind { std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => EK::EntryRaced, std::io::ErrorKind::PermissionDenied => EK::RootEscape, _ => EK::EntryMetadata }
 }
 
+/// Open a directory for traversal, honoring the §3 directory-open-race seam.
+#[rustfmt::skip]
+fn open_dir_initial(root: &Dir, prefix: &str) -> std::io::Result<Dir> {
+    #[cfg(test)]
+    {
+        let injected = FORCE_DIR_OPEN_NOT_FOUND.with(|forced| {
+            let mut forced = forced.borrow_mut();
+            if forced.as_deref() == Some(prefix) {
+                *forced = None;
+                true
+            } else {
+                false
+            }
+        });
+        if injected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "injected directory-open race",
+            ));
+        }
+    }
+    root.open_dir(prefix)
+}
+
+/// Re-resolve a recursive candidate whose directory open raced to `NotFound`.
+///
+/// Recheck with non-following metadata through the same root capability; a
+/// still-present symlink is resolved and reopened capability-relatively once:
+/// a valid in-root directory is returned so traversal continues without a
+/// second directory or depth charge, a target resolution returning `NotFound`
+/// is `broken_symlink`, and a vanished, non-symlink, non-directory, or
+/// re-raced candidate is `entry_raced`. Other containment, permission, and
+/// metadata faults keep their typed category. The retry is bounded to one
+/// re-resolution/reopen.
+#[rustfmt::skip]
+pub(super) fn reopen_raced_directory(root: &Dir, prefix: &str) -> Result<Dir, IErr> {
+    let meta = match root.symlink_metadata(prefix) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(err(EK::EntryRaced, prefix)),
+        Err(_) => return Err(err(EK::EntryMetadata, prefix)),
+    };
+    if !meta.is_symlink() {
+        return Err(err(EK::EntryRaced, prefix));
+    }
+    match root.open_dir(prefix) {
+        Ok(dir) => Ok(dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(err(EK::BrokenSymlink, prefix)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => Err(err(EK::EntryRaced, prefix)),
+        Err(error) => Err(err(classify_directory_open_failure(error.kind()), prefix)),
+    }
+}
+
 type DerivedRule = (String, RuleTarget, AgentStackComponentKind);
 type ExactRule = (String, RuleTarget, AgentStackComponentKind, bool);
 type Listing = Vec<(OsString, FileType)>;
+
+/// Merge derived (configured) bindings into the static exact-rule table,
+/// composing the strictest target constraint per normalized (locator, kind)
+/// independent of the order configured fields were declared (§1).
+fn merge_derived_rules(exact_rules: &mut Vec<ExactRule>, derived: Vec<DerivedRule>) {
+    for (locator, target, kind) in derived {
+        if let Some(rule) = exact_rules
+            .iter_mut()
+            .find(|rule| rule.0 == locator && rule.2.as_str() == kind.as_str())
+        {
+            rule.1 = compose_target(rule.1, target);
+            rule.3 = true;
+        } else {
+            exact_rules.push((locator, target, kind, true));
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct DirectoryIdentity(Arc<same_file::Handle>);
@@ -226,6 +333,9 @@ struct Scan<'a> {
     file_observations: BTreeMap<String, FileObservation>,
     listings: BTreeMap<String, Listing>,
     ancestors: Vec<DirectoryIdentity>,
+    /// Repository-relative depth of the rule root currently being traversed;
+    /// its immediate children are the "direct level" for direct selectors (§2).
+    base_depth: usize,
 }
 
 fn charge(counter: &mut usize, max: usize, locator: &str) -> Result<(), IErr> {
@@ -262,21 +372,14 @@ pub(crate) fn inventory_with_root(
         file_observations: BTreeMap::new(),
         listings: BTreeMap::new(),
         ancestors: vec![directory_identity(root, "")?],
+        base_depth: 0,
     };
     let derived = scan.load_config(root)?;
     let mut exact_rules: Vec<ExactRule> = STATIC_RULES.iter().filter_map(|rule| match rule.matcher {
         Matcher::Exact(path) => Some((path.to_owned(), rule.target, rule.kind, false)),
         Matcher::RootSuffix(_) => None,
     }).collect();
-    for (locator, target, kind) in derived {
-        if let Some(rule) = exact_rules.iter_mut()
-            .find(|rule| rule.0 == locator && rule.2.as_str() == kind.as_str())
-        {
-            rule.3 = true;
-        } else {
-            exact_rules.push((locator, target, kind, true));
-        }
-    }
+    merge_derived_rules(&mut exact_rules, derived);
     for (locator, target, kind, derived) in exact_rules {
         scan.apply_exact(root, &locator, target, kind, derived)?;
     }
@@ -402,7 +505,12 @@ impl Scan<'_> {
                 Ok(())
             }
             RuleTarget::Directory(selector) | RuleTarget::FileOrDirectory(selector) if is_dir => {
-                self.traverse(root, path.to_owned(), &selector, kind, 1)
+                // Depth is measured from the repository root (depth 0): the
+                // initial traversal depth is the count of this directory's
+                // lossless normalized repository-relative components (§2).
+                let depth = path.split('/').count();
+                self.base_depth = depth;
+                self.traverse(root, path.to_owned(), &selector, kind, depth)
             }
             RuleTarget::File if is_dir => Err(err(EK::NonRegularEntry, path)),
             RuleTarget::Directory(_) => Err(err(EK::NonRegularEntry, path)),
@@ -413,7 +521,10 @@ impl Scan<'_> {
     }
 
     fn apply_suffix(&mut self, root: &Dir, suffix: &str, kind: Kind) -> Result<(), IErr> {
-        let listing = self.enumerate(root, "")?;
+        let mut listing = self.enumerate(root, "")?;
+        // Sort by stable native-name order before any fallible per-candidate
+        // op, mirroring the recursive boundary (§5).
+        listing.sort_by(|a, b| a.0.cmp(&b.0));
         let mut selected = Vec::new();
         for (name, file_type) in listing {
             if !has_suffix(&name, suffix) {
@@ -462,6 +573,10 @@ impl Scan<'_> {
                 .map_err(|error| err(classify_entry_metadata_failure(error.kind()), prefix))?;
             listing.push((entry.file_name(), file_type));
         }
+        #[cfg(test)]
+        if REVERSE_LISTING.get() {
+            listing.reverse();
+        }
         self.listings.insert(prefix.to_owned(), listing.clone());
         Ok(listing)
     }
@@ -475,10 +590,13 @@ impl Scan<'_> {
             return Err(err(EK::LimitExceeded, &prefix));
         }
         charge(&mut self.dirs_opened, self.opts.max_directories, &prefix)?;
-        let dir = root.open_dir(&prefix).map_err(|error| {
-            let kind = classify_directory_open_failure(error.kind());
-            err(kind, &prefix)
-        })?;
+        let dir = match open_dir_initial(root, &prefix) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                reopen_raced_directory(root, &prefix)?
+            }
+            Err(error) => return Err(err(classify_directory_open_failure(error.kind()), &prefix)),
+        };
         let identity = directory_identity(&dir, &prefix)?;
         if self.ancestors.contains(&identity) {
             return Err(err(EK::CycleDetected, &prefix));
@@ -494,8 +612,14 @@ impl Scan<'_> {
         &mut self, root: &Dir, dir: &Dir, prefix: &str,
         selector: &DirSelector, kind: Kind, depth: usize,
     ) -> Result<(), IErr> {
-        let direct_level = depth == 1;
-        let listing = self.enumerate(dir, prefix)?;
+        // The rule root's immediate children are the direct level (§2); deeper
+        // recursive descendants are not.
+        let direct_level = depth == self.base_depth;
+        let mut listing = self.enumerate(dir, prefix)?;
+        // Sort by stable native-name order BEFORE any fallible per-candidate
+        // op (symlink resolution, lossless conversion, selection, open) so the
+        // first typed error is independent of enumeration order (§5).
+        listing.sort_by(|a, b| a.0.cmp(&b.0));
         let mut candidates: Vec<(bool, String)> = Vec::new();
         for (name, file_type) in &listing {
             let is_dir = if file_type.is_symlink() {
@@ -574,7 +698,8 @@ impl Scan<'_> {
         let remaining = self.opts.max_total_bytes - self.bytes_used;
         let limit = (self.opts.max_file_bytes + 1).min(remaining + 1);
         let mut bytes = Vec::new();
-        file.take(limit)
+        ReadSeam { inner: file }
+            .take(limit)
             .read_to_end(&mut bytes)
             .map_err(|_| err(EK::ReadFailed, &locator))?;
         let read = bytes.len() as u64;

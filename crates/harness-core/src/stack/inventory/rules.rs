@@ -84,6 +84,25 @@ pub(super) enum RuleTarget {
     DirectoryPresence,
 }
 
+/// Compose the strictest constraint for one normalized (locator, kind).
+///
+/// `RuleTarget::File` is stricter than any directory-capable target and wins
+/// regardless of whether it comes from a static rule, `exec_policy_paths`,
+/// `requirements_path`, or their field order. When no exact-file constraint is
+/// present, a static directory target keeps its closed selector instead of
+/// being replaced by the configured `md`/`toml` selector, and equivalent
+/// flexible targets merge without another traversal.
+#[rustfmt::skip]
+pub(super) fn compose_target(existing: RuleTarget, incoming: RuleTarget) -> RuleTarget {
+    use RuleTarget::*;
+    match (existing, incoming) {
+        (File, _) | (_, File) => File,
+        (DirectoryPresence, other) | (other, DirectoryPresence) => other,
+        (Directory(selector), _) | (_, Directory(selector)) => Directory(selector),
+        (FileOrDirectory(selector), FileOrDirectory(_)) => FileOrDirectory(selector),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Matcher {
     Exact(&'static str),
@@ -159,11 +178,19 @@ pub(super) fn normalize_configured_source(
     raw: &str,
 ) -> Result<Option<String>, AgentStackInventoryErrorKind> {
     let bytes = raw.as_bytes();
-    if raw.starts_with('/')
-        || raw.starts_with('\\')
-        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-    {
+    if raw.starts_with('/') || raw.starts_with('\\') {
         return Ok(None);
+    }
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        // A drive prefix is absolute only with a root separator after the
+        // colon (`C:\...` or `C:/...`). A drive-relative form such as
+        // `C:policy.toml` has no absolute root and must fail typed on every
+        // host so CI can exercise the contract deterministically.
+        return if bytes.len() >= 3 && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            Ok(None)
+        } else {
+            Err(EK::ConfiguredSourceInvalid)
+        };
     }
     if raw.is_empty() || raw.contains('\0') || raw.contains('\\') {
         return Err(EK::ConfiguredSourceInvalid);
