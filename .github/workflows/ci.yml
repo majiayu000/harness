@@ -66,6 +66,33 @@ jobs:
       - run: python3 scripts/check_storage_legacy_openers.py --self-test
       - run: python3 scripts/check_storage_legacy_openers.py
 
+  repository-checks:
+    name: Repository Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install test dependencies
+        run: python3 -m pip install pytest
+      - name: Test task event liveness
+        run: python3 -m pytest -q tests/test_task_event_liveness.py
+      - name: Check committed whitespace
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+          elif git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
+            git diff --check "${{ github.event.before }}" HEAD
+          elif git rev-parse HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          else
+            git diff --check
+          fi
+
   # ── Step 2: Fast checks (always run on Rust changes) ──────────────────
   fmt:
     name: Format
@@ -233,13 +260,14 @@ jobs:
     name: CI Result
     runs-on: ubuntu-latest
     if: always()
-    needs: [changed, storage-legacy-openers, fmt, web-build, clippy, test, audit]
+    needs: [changed, storage-legacy-openers, repository-checks, fmt, web-build, clippy, test, audit]
     steps:
       - name: Check all jobs
         run: |
           results=(
             "${{ needs.changed.result }}"
             "${{ needs.storage-legacy-openers.result }}"
+            "${{ needs.repository-checks.result }}"
             "${{ needs.fmt.result }}"
             "${{ needs.web-build.result }}"
             "${{ needs.clippy.result }}"
