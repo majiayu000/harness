@@ -28,6 +28,10 @@ impl ConfigPath {
         is_root: true,
         is_root_workflow: false,
     };
+    const NON_CANONICAL: Self = Self {
+        is_root: false,
+        is_root_workflow: false,
+    };
 
     fn field(self, key: Option<&str>) -> Self {
         Self {
@@ -37,10 +41,7 @@ impl ConfigPath {
     }
 
     fn nested(self) -> Self {
-        Self {
-            is_root: false,
-            is_root_workflow: false,
-        }
+        Self::NON_CANONICAL
     }
 
     fn allows_completion_evidence_field(self, key: &str) -> bool {
@@ -512,7 +513,6 @@ where
         deserialize_unit,
         deserialize_seq,
         deserialize_map,
-        deserialize_ignored_any,
         deserialize_identifier,
     );
 
@@ -527,6 +527,16 @@ where
 
     fn is_human_readable(&self) -> bool {
         self.delegate.is_human_readable()
+    }
+
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, D::Error>
+    where
+        V: Visitor<'de>,
+    {
+        // Ignored map keys need the same recursive treatment as ignored
+        // values; otherwise compound keys can hide reserved nested fields.
+        self.delegate
+            .deserialize_any(CaptureKey::new(visitor, self.key))
     }
 }
 
@@ -615,14 +625,16 @@ where
     where
         A: SeqAccess<'de>,
     {
-        self.delegate.visit_seq(sequence)
+        self.delegate
+            .visit_seq(Tracked::new(sequence, ConfigPath::NON_CANONICAL))
     }
 
     fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
     where
         A: MapAccess<'de>,
     {
-        self.delegate.visit_map(map)
+        self.delegate
+            .visit_map(TrackedMap::new(map, ConfigPath::NON_CANONICAL))
     }
 
     fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
@@ -659,12 +671,54 @@ where
     A: EnumAccess<'de>,
 {
     type Error = A::Error;
-    type Variant = A::Variant;
+    type Variant = CaptureKey<'a, A::Variant>;
 
-    fn variant_seed<S>(self, seed: S) -> Result<(S::Value, A::Variant), A::Error>
+    fn variant_seed<S>(self, seed: S) -> Result<(S::Value, Self::Variant), A::Error>
     where
         S: DeserializeSeed<'de>,
     {
-        self.delegate.variant_seed(CaptureKey::new(seed, self.key))
+        let (value, variant) = self
+            .delegate
+            .variant_seed(CaptureKey::new(seed, &mut *self.key))?;
+        Ok((value, CaptureKey::new(variant, self.key)))
+    }
+}
+
+impl<'a, 'de, A> VariantAccess<'de> for CaptureKey<'a, A>
+where
+    A: VariantAccess<'de>,
+{
+    type Error = A::Error;
+
+    fn unit_variant(self) -> Result<(), A::Error> {
+        self.delegate.unit_variant()
+    }
+
+    fn newtype_variant_seed<S>(self, seed: S) -> Result<S::Value, A::Error>
+    where
+        S: DeserializeSeed<'de>,
+    {
+        self.delegate
+            .newtype_variant_seed(CaptureKey::new(seed, self.key))
+    }
+
+    fn tuple_variant<V>(self, len: usize, visitor: V) -> Result<V::Value, A::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.delegate
+            .tuple_variant(len, CaptureKey::new(visitor, self.key))
+    }
+
+    fn struct_variant<V>(
+        self,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, A::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.delegate
+            .struct_variant(fields, CaptureKey::new(visitor, self.key))
     }
 }

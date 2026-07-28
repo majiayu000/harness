@@ -69,6 +69,12 @@ fn replace_first_toml_assignment(input: &str, prefix: &str, replacement: &str) -
     output
 }
 
+fn yaml_mapping_with(field: &str, value: serde_yaml::Value) -> serde_yaml::Mapping {
+    let mut mapping = serde_yaml::Mapping::new();
+    mapping.insert(serde_yaml::Value::String(field.to_owned()), value);
+    mapping
+}
+
 #[test]
 fn workflow_circuit_breaker_config_defaults() {
     let config = HarnessConfig::default();
@@ -345,6 +351,109 @@ fn harness_config_scans_json_arrays_in_extensions() {
     assert!(json_error
         .to_string()
         .contains("unknown field `completion_evidence_enforced`"));
+}
+
+#[test]
+fn harness_config_scans_compound_yaml_keys_in_extensions() {
+    let compound_keys = [
+        serde_yaml::Value::Mapping(yaml_mapping_with(
+            "completion_evidence_enforced",
+            serde_yaml::Value::Bool(false),
+        )),
+        serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(yaml_mapping_with(
+            "completion_evidence_enforced",
+            serde_yaml::Value::Bool(false),
+        ))]),
+    ];
+
+    for (case_index, compound_key) in compound_keys.into_iter().enumerate() {
+        let mut yaml =
+            serde_yaml::to_value(HarnessConfig::default()).expect("default config must serialize");
+        let mut extension = serde_yaml::Mapping::new();
+        extension.insert(compound_key, serde_yaml::Value::Null);
+        yaml.as_mapping_mut()
+            .expect("config must serialize as a map")
+            .insert(
+                serde_yaml::Value::String("operator_extension".to_owned()),
+                serde_yaml::Value::Mapping(extension),
+            );
+
+        let error = serde_yaml::from_value::<HarnessConfig>(yaml)
+            .expect_err("compound extension keys must not hide reserved fields");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `completion_evidence_enforced`"),
+            "compound-key case {case_index}: {error}"
+        );
+    }
+}
+
+#[test]
+fn reserved_key_deserializer_scans_tagged_compound_map_keys() {
+    use serde::de::IntoDeserializer as _;
+
+    let tagged_key = serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+        tag: serde_yaml::value::Tag::new("scope"),
+        value: serde_yaml::Value::Mapping(yaml_mapping_with(
+            "completion_evidence_enforced",
+            serde_yaml::Value::Bool(false),
+        )),
+    }));
+    let mut yaml = serde_yaml::Mapping::new();
+    yaml.insert(tagged_key, serde_yaml::Value::Null);
+
+    let error = super::reserved_key_deserializer::deserialize::<_, serde::de::IgnoredAny>(
+        serde_yaml::Value::Mapping(yaml).into_deserializer(),
+    )
+    .expect_err("tagged compound keys must not hide reserved fields");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+
+    let tagged_key = serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+        tag: serde_yaml::value::Tag::new("scope"),
+        value: serde_yaml::Value::Mapping(yaml_mapping_with(
+            "mode",
+            serde_yaml::Value::String("audit".to_owned()),
+        )),
+    }));
+    let mut yaml = serde_yaml::Mapping::new();
+    yaml.insert(tagged_key, serde_yaml::Value::Null);
+    super::reserved_key_deserializer::deserialize::<_, serde::de::IgnoredAny>(
+        serde_yaml::Value::Mapping(yaml).into_deserializer(),
+    )
+    .expect("unrelated tagged compound keys must remain compatible");
+}
+
+#[test]
+fn harness_config_accepts_unrelated_compound_yaml_keys_in_extensions() {
+    let mut nested = serde_yaml::Mapping::new();
+    nested.insert(
+        serde_yaml::Value::String("mode".to_owned()),
+        serde_yaml::Value::String("audit".to_owned()),
+    );
+    let compound_keys = [
+        serde_yaml::Value::Mapping(nested.clone()),
+        serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(nested)]),
+    ];
+
+    for compound_key in compound_keys {
+        let mut yaml =
+            serde_yaml::to_value(HarnessConfig::default()).expect("default config must serialize");
+        let mut extension = serde_yaml::Mapping::new();
+        extension.insert(compound_key, serde_yaml::Value::Null);
+        yaml.as_mapping_mut()
+            .expect("config must serialize as a map")
+            .insert(
+                serde_yaml::Value::String("operator_extension".to_owned()),
+                serde_yaml::Value::Mapping(extension),
+            );
+
+        let config = serde_yaml::from_value::<HarnessConfig>(yaml)
+            .expect("unrelated compound extension keys must remain compatible");
+        assert!(config.workflow.completion_evidence_enforced);
+    }
 }
 
 #[test]
