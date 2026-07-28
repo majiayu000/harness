@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed unless every required GitHub Actions job succeeded or skipped."""
+"""Fail closed unless every GitHub Actions job has its permitted result."""
 
 from __future__ import annotations
 
@@ -8,9 +8,7 @@ import sys
 from collections.abc import Mapping, Sequence
 
 
-PASSING_RESULTS = {"success", "skipped"}
-FAILING_RESULTS = {"failure", "cancelled"}
-KNOWN_RESULTS = PASSING_RESULTS | FAILING_RESULTS
+KNOWN_RESULTS = {"success", "skipped", "failure", "cancelled"}
 RESULT_ENV_PREFIX = "HARNESS_CI_RESULT_"
 EXPECTED_RESULT_ENV = {
     "changed": f"{RESULT_ENV_PREFIX}CHANGED",
@@ -22,6 +20,7 @@ EXPECTED_RESULT_ENV = {
     "test": f"{RESULT_ENV_PREFIX}TEST",
     "audit": f"{RESULT_ENV_PREFIX}AUDIT",
 }
+UNCONDITIONAL_JOBS = {"changed", "repository-checks"}
 
 
 def evaluate_results(environment: Mapping[str, str]) -> tuple[list[str], list[str]]:
@@ -43,7 +42,9 @@ def evaluate_results(environment: Mapping[str, str]) -> tuple[list[str], list[st
             continue
         if result not in KNOWN_RESULTS:
             errors.append(f"unknown result for {name}: {result!r}")
-        elif result in FAILING_RESULTS:
+        elif result != "success" and not (
+            result == "skipped" and name not in UNCONDITIONAL_JOBS
+        ):
             failures.append(f"{name}={result}")
 
     return failures, errors
@@ -68,7 +69,7 @@ def main(
         return 2
     if failures:
         for failure in failures:
-            print(f"required job failed or was cancelled: {failure}", file=sys.stderr)
+            print(f"required job did not pass: {failure}", file=sys.stderr)
         return 1
 
     print("All required CI jobs passed or were skipped")

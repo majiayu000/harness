@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from shutil import which
 from unittest import SkipTest
 
 import pytest
+from ci_contract_support import CI_RESULT_ENV, assert_ci_contract, parse_workflow
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,366 +20,13 @@ CI_RESULT_CHECK = ROOT / "scripts" / "check_ci_results.py"
 WHITESPACE_CHECK = ROOT / "scripts" / "check_committed_whitespace.py"
 
 CI_RESULT_ENV_PREFIX = "HARNESS_CI_RESULT_"
-CI_RESULT_ENV_BINDINGS = {
-    "HARNESS_CI_RESULT_CHANGED": "${{ needs.changed.result }}",
-    "HARNESS_CI_RESULT_STORAGE_LEGACY_OPENERS": (
-        "${{ needs.storage-legacy-openers.result }}"
-    ),
-    "HARNESS_CI_RESULT_REPOSITORY_CHECKS": "${{ needs.repository-checks.result }}",
-    "HARNESS_CI_RESULT_FMT": "${{ needs.fmt.result }}",
-    "HARNESS_CI_RESULT_WEB_BUILD": "${{ needs.web-build.result }}",
-    "HARNESS_CI_RESULT_CLIPPY": "${{ needs.clippy.result }}",
-    "HARNESS_CI_RESULT_TEST": "${{ needs.test.result }}",
-    "HARNESS_CI_RESULT_AUDIT": "${{ needs.audit.result }}",
-}
-
-JOB_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):(?:\s+#.*)?$")
-RUN_KEY = re.compile(r"^(\s*)(?:-\s+)?run:\s*(.*?)\s*$")
-USES_KEY = re.compile(r"^\s+-\s+uses:\s*(\S+)\s*$")
+ZERO_OBJECT_ID = "0" * 40
+UNREACHABLE_OBJECT_ID = "f" * 40
 
 
-def top_level_job_blocks(workflow: str) -> dict[str, str]:
-    lines = workflow.splitlines()
-    try:
-        jobs_index = lines.index("jobs:")
-    except ValueError as error:
-        raise AssertionError("CI workflow is missing a top-level jobs mapping") from error
-
-    jobs: dict[str, str] = {}
-    current_name: str | None = None
-    current_lines: list[str] = []
-
-    def finish_current() -> None:
-        if current_name is not None:
-            jobs[current_name] = "\n".join(current_lines)
-
-    for line in lines[jobs_index + 1 :]:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and not line.startswith(" "):
-            break
-
-        header = JOB_HEADER.fullmatch(line)
-        if header is not None:
-            finish_current()
-            current_name = header.group(1)
-            current_lines = []
-        elif current_name is not None:
-            current_lines.append(line)
-
-    finish_current()
-    return jobs
-
-
-def job_level_value(block: str, key: str) -> str | None:
-    prefix = f"    {key}:"
-    for line in block.splitlines():
-        if line.startswith(prefix):
-            return line.removeprefix(prefix).strip()
-    return None
-
-
-def job_needs(block: str) -> set[str]:
-    lines = block.splitlines()
-    for index, line in enumerate(lines):
-        if not line.startswith("    needs:"):
-            continue
-
-        value = line.removeprefix("    needs:").strip()
-        if value.startswith("[") and value.endswith("]"):
-            return {item.strip() for item in value[1:-1].split(",") if item.strip()}
-        if value:
-            return {value}
-
-        needs: set[str] = set()
-        for nested in lines[index + 1 :]:
-            if nested.strip() and len(nested) - len(nested.lstrip()) <= 4:
-                break
-            match = re.fullmatch(r"\s{6}-\s+([A-Za-z0-9_-]+)\s*", nested)
-            if match is not None:
-                needs.add(match.group(1))
-        return needs
-
-    return set()
-
-
-def run_commands(block: str) -> list[str]:
-    lines = block.splitlines()
-    commands: list[str] = []
-    index = 0
-
-    while index < len(lines):
-        line = lines[index]
-        if line.lstrip().startswith("#"):
-            index += 1
-            continue
-
-        match = RUN_KEY.fullmatch(line)
-        if match is None:
-            index += 1
-            continue
-
-        indent = len(match.group(1))
-        value = match.group(2)
-        if value not in {"|", "|-", ">", ">-"}:
-            commands.append(value)
-            index += 1
-            continue
-
-        block_lines: list[str] = []
-        index += 1
-        while index < len(lines):
-            nested = lines[index]
-            nested_indent = len(nested) - len(nested.lstrip())
-            if nested.strip() and nested_indent <= indent:
-                break
-            block_lines.append(nested.strip())
-            index += 1
-        commands.append("\n".join(block_lines))
-
-    return commands
-
-
-def active_run_lines(block: str) -> list[str]:
-    return [
-        line.strip()
-        for command in run_commands(block)
-        for line in command.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-
-
-def action_uses(block: str) -> list[str]:
-    return [
-        match.group(1)
-        for line in block.splitlines()
-        if not line.lstrip().startswith("#")
-        if (match := USES_KEY.fullmatch(line)) is not None
-    ]
-
-
-def job_mapping_value(block: str, mapping: str, key: str) -> str | None:
-    lines = block.splitlines()
-    for index, line in enumerate(lines):
-        if line != f"    {mapping}:":
-            continue
-        for nested in lines[index + 1 :]:
-            if nested.strip() and len(nested) - len(nested.lstrip()) <= 4:
-                break
-            prefix = f"      {key}:"
-            if nested.startswith(prefix):
-                return nested.removeprefix(prefix).strip().strip("\"'")
-        return None
-    return None
-
-
-def step_blocks(block: str) -> list[str]:
-    lines = block.splitlines()
-    steps: list[str] = []
-    current: list[str] | None = None
-    in_steps = False
-
-    for line in lines:
-        if line == "    steps:":
-            in_steps = True
-            continue
-        if not in_steps:
-            continue
-        if line.strip() and len(line) - len(line.lstrip()) <= 4:
-            break
-        if line.startswith("      - "):
-            if current is not None:
-                steps.append("\n".join(current))
-            current = [line]
-        elif current is not None:
-            current.append(line)
-
-    if current is not None:
-        steps.append("\n".join(current))
-    return steps
-
-
-def step_value(step: str, key: str) -> str | None:
-    prefixes = (f"      - {key}:", f"        {key}:")
-    for line in step.splitlines():
-        for prefix in prefixes:
-            if line.startswith(prefix):
-                return line.removeprefix(prefix).strip()
-    return None
-
-
-def step_mapping_values(step: str, mapping: str) -> dict[str, str]:
-    lines = step.splitlines()
-    for index, line in enumerate(lines):
-        if line != f"        {mapping}:":
-            continue
-
-        values: dict[str, str] = {}
-        for nested in lines[index + 1 :]:
-            if nested.strip() and len(nested) - len(nested.lstrip()) <= 8:
-                break
-            match = re.fullmatch(r"\s{10}([A-Za-z0-9_-]+):\s*(.*?)\s*", nested)
-            if match is None:
-                continue
-            key, value = match.groups()
-            assert key not in values, f"duplicate {mapping} key in step: {key}"
-            values[key] = value
-        return values
-
-    return {}
-
-
-def named_steps(block: str) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for step in step_blocks(block):
-        name = step_value(step, "name")
-        if name is not None:
-            assert name not in result, f"duplicate step name: {name}"
-            result[name] = step
-    return result
-
-
-def assert_required_step(step: str) -> None:
-    assert step_value(step, "if") is None, "required step must not be conditionally disabled"
-    assert step_value(step, "continue-on-error") in {
-        None,
-        "false",
-        '"false"',
-        "'false'",
-    }, "required step must fail the job on error"
-    assert step_value(step, "shell") is None, "required step must use the default fail-fast shell"
-
-
-def assert_exact_run_step(step: str, expected_command: str) -> None:
-    assert_required_step(step)
-    assert run_commands(step) == [expected_command], (
-        f"required step must run exactly {expected_command!r}: {run_commands(step)}"
-    )
-
-
-def assert_ci_contract(workflow: str, hook: str) -> None:
-    jobs = top_level_job_blocks(workflow)
-    expected_jobs = {
-        "changed",
-        "storage-legacy-openers",
-        "repository-checks",
-        "fmt",
-        "web-build",
-        "clippy",
-        "test",
-        "audit",
-        "ci-result",
-    }
-    assert set(jobs) == expected_jobs, (
-        f"unexpected CI jobs: missing={sorted(expected_jobs - jobs.keys())}, "
-        f"extra={sorted(jobs.keys() - expected_jobs)}"
-    )
-
-    changed_lines = {
-        line.strip()
-        for line in jobs["changed"].splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
-    for output in ("workspace", "other_crates"):
-        expected = f"{output}: ${{{{ steps.filter.outputs.{output} }}}}"
-        assert expected in changed_lines, f"changed job is missing output mapping: {expected}"
-    for script in (
-        "scripts/check_ci_results.py",
-        "scripts/check_committed_whitespace.py",
-    ):
-        assert f"- '{script}'" in changed_lines
-
-    all_runs = {
-        name: active_run_lines(block)
-        for name, block in jobs.items()
-    }
-    bun_builds = [
-        name
-        for name, lines in all_runs.items()
-        for line in lines
-        if line == "bun run build"
-    ]
-    assert bun_builds == ["web-build"], f"web bundle builds must be isolated: {bun_builds}"
-
-    assert action_uses(jobs["web-build"]).count("actions/upload-artifact@v4") == 1
-    for consumer in ("clippy", "test"):
-        assert action_uses(jobs[consumer]).count("actions/download-artifact@v4") == 1
-        assert job_needs(jobs[consumer]) == {"changed", "web-build"}
-        assert job_mapping_value(jobs[consumer], "env", "HARNESS_SKIP_WEB_BUILD") == "1"
-        for step in step_blocks(jobs[consumer]):
-            assert "HARNESS_SKIP_WEB_BUILD" not in step, (
-                f"{consumer} step must not override HARNESS_SKIP_WEB_BUILD"
-            )
-
-    test_lines = all_runs["test"]
-    assert "cargo test ${{ steps.scope.outputs.packages }}" in test_lines
-    assert "cargo clippy --workspace --all-targets -- -D warnings" in all_runs["clippy"]
-    for token in (
-        "packages=--workspace --exclude harness-server",
-        "-p harness-core -p harness-workflow",
-        "-p harness-agents",
-        "scripts/test-server-fast.sh",
-        "scripts/test-server-db.sh",
-    ):
-        assert any(token in line for line in test_lines), f"test scope is missing: {token}"
-
-    assert job_level_value(jobs["repository-checks"], "if") is None
-    assert job_level_value(jobs["repository-checks"], "continue-on-error") is None
-    assert job_level_value(jobs["repository-checks"], "defaults") is None
-    repository_step_blocks = step_blocks(jobs["repository-checks"])
-    repository_checkouts = [
-        step
-        for step in repository_step_blocks
-        if step_value(step, "uses") == "actions/checkout@v4"
-    ]
-    assert len(repository_checkouts) == 1
-    assert_required_step(repository_checkouts[0])
-    assert step_mapping_values(repository_checkouts[0], "with") == {
-        "fetch-depth": "0"
-    }
-    repository_steps = named_steps(jobs["repository-checks"])
-    assert_exact_run_step(
-        repository_steps["Test repository contracts"],
-        "python3 -m pytest -q tests",
-    )
-    assert_exact_run_step(
-        repository_steps["Check committed whitespace"],
-        "python3 scripts/check_committed_whitespace.py",
-    )
-
-    fan_in = jobs["ci-result"]
-    expected_needs = expected_jobs - {"ci-result"}
-    assert job_needs(fan_in) == expected_needs
-    assert job_level_value(fan_in, "if") in {"always()", "${{ always() }}"}
-    assert job_level_value(fan_in, "continue-on-error") in {None, "false"}
-    assert job_level_value(fan_in, "defaults") is None
-
-    fan_in_step_blocks = step_blocks(fan_in)
-    assert len(fan_in_step_blocks) == 2, "CI Result must only checkout and evaluate"
-    checkout_step, fan_in_step = fan_in_step_blocks
-    assert step_value(checkout_step, "uses") == "actions/checkout@v4"
-    assert_required_step(checkout_step)
-    assert step_mapping_values(checkout_step, "with") == {}
-    assert_exact_run_step(fan_in_step, "python3 scripts/check_ci_results.py")
-    assert step_value(fan_in_step, "name") == "Check all jobs"
-    assert step_mapping_values(fan_in_step, "env") == CI_RESULT_ENV_BINDINGS
-
-    hook_lines = {
-        line.strip()
-        for line in hook.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
-    for line in (
-        "derive_scope() {",
-        "staged=$(git diff --cached --name-only)",
-        'echo "--workspace"',
-        "scope=$(derive_scope)",
-        "cargo clippy $scope --all-targets -- -D warnings",
-    ):
-        assert line in hook_lines, f"pre-commit hook is missing active line: {line}"
-
-
-def test_job_parser_accepts_comments_and_block_needs() -> None:
-    workflow = """\
+def test_restricted_yaml_parser_accepts_comments_and_block_sequences() -> None:
+    parsed = parse_workflow(
+        """\
 jobs:
   first:
     runs-on: ubuntu-latest
@@ -389,10 +37,17 @@ jobs:
       - first
     runs-on: ubuntu-latest
 """
+    )
 
-    jobs = top_level_job_blocks(workflow)
-    assert set(jobs) == {"first", "second"}
-    assert job_needs(jobs["second"]) == {"first"}
+    assert parsed == {
+        "jobs": {
+            "first": {"runs-on": "ubuntu-latest"},
+            "second": {
+                "needs": ["first"],
+                "runs-on": "ubuntu-latest",
+            },
+        }
+    }
 
 
 def test_scoped_ci_pipeline_contract() -> None:
@@ -406,6 +61,9 @@ def test_scoped_ci_pipeline_contract() -> None:
     [
         ({}, None, None, [], 0),
         ({"HARNESS_CI_RESULT_TEST": "skipped"}, None, None, [], 0),
+        ({"HARNESS_CI_RESULT_AUDIT": "skipped"}, None, None, [], 0),
+        ({"HARNESS_CI_RESULT_CHANGED": "skipped"}, None, None, [], 1),
+        ({"HARNESS_CI_RESULT_REPOSITORY_CHECKS": "skipped"}, None, None, [], 1),
         ({"HARNESS_CI_RESULT_TEST": "failure"}, None, None, [], 1),
         ({"HARNESS_CI_RESULT_CLIPPY": "cancelled"}, None, None, [], 1),
         ({"HARNESS_CI_RESULT_FMT": "unknown"}, None, None, [], 2),
@@ -426,7 +84,7 @@ def test_ci_result_script_fails_closed(
         for name, value in os.environ.items()
         if not name.startswith(CI_RESULT_ENV_PREFIX)
     }
-    environment.update({name: "success" for name in CI_RESULT_ENV_BINDINGS})
+    environment.update({name: "success" for name in CI_RESULT_ENV})
     environment.update(updates)
     if removed is not None:
         environment.pop(removed)
@@ -459,9 +117,12 @@ def run_git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def commit_file(repo: Path, content: str, message: str) -> str:
-    (repo / "sample.txt").write_text(content, encoding="utf-8")
-    run_git(repo, "add", "sample.txt")
+def commit_files(repo: Path, changes: dict[str, str], message: str) -> str:
+    for relative, content in changes.items():
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        run_git(repo, "add", relative)
     run_git(repo, "commit", "-m", message)
     return run_git(repo, "rev-parse", "HEAD")
 
@@ -477,8 +138,12 @@ def initialize_git_repo(path: Path) -> None:
 
 def create_git_repo(path: Path) -> tuple[str, str]:
     initialize_git_repo(path)
-    base = commit_file(path, "clean\n", "base")
-    head = commit_file(path, "trailing whitespace \n", "candidate")
+    base = commit_files(path, {"sample.txt": "clean\n"}, "base")
+    head = commit_files(
+        path,
+        {"sample.txt": "trailing whitespace \n"},
+        "candidate",
+    )
     return base, head
 
 
@@ -487,6 +152,7 @@ def run_whitespace_check(
     event_path: Path,
     event_name: str,
     payload: dict[str, object],
+    arguments: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     event_path.write_text(json.dumps(payload), encoding="utf-8")
     environment = os.environ.copy()
@@ -497,7 +163,7 @@ def run_whitespace_check(
         }
     )
     return subprocess.run(
-        [sys.executable, str(WHITESPACE_CHECK)],
+        [sys.executable, str(WHITESPACE_CHECK), *(arguments or [])],
         cwd=repo,
         check=False,
         capture_output=True,
@@ -506,7 +172,7 @@ def run_whitespace_check(
     )
 
 
-@pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("event_name", ["pull_request", "push"])
 def test_whitespace_check_fails_on_committed_trailing_space(
     tmp_path: Path,
     event_name: str,
@@ -520,10 +186,8 @@ def test_whitespace_check_fails_on_committed_trailing_space(
                 "head": {"sha": head},
             }
         }
-    elif event_name == "push":
-        payload = {"before": base}
     else:
-        payload = {}
+        payload = {"before": base, "after": head}
 
     result = run_whitespace_check(
         repo,
@@ -536,26 +200,182 @@ def test_whitespace_check_fails_on_committed_trailing_space(
     assert "trailing whitespace" in result.stdout
 
 
-def test_whitespace_check_passes_clean_pull_request(tmp_path: Path) -> None:
+def test_whitespace_check_uses_pull_request_merge_base(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     initialize_git_repo(repo)
-    base = commit_file(repo, "clean\n", "base")
-    head = commit_file(repo, "still clean\n", "candidate")
-    payload: dict[str, object] = {
-        "pull_request": {
-            "base": {"sha": base},
-            "head": {"sha": head},
-        }
-    }
+    root = commit_files(
+        repo,
+        {"sample.txt": "legacy trailing whitespace \n"},
+        "root",
+    )
+    run_git(repo, "branch", "pr-head", root)
+    base = commit_files(
+        repo,
+        {"sample.txt": "legacy trailing whitespace\n"},
+        "base fixes legacy whitespace",
+    )
+    run_git(repo, "checkout", "pr-head")
+    head = commit_files(repo, {"clean.txt": "clean\n"}, "PR adds clean file")
 
     result = run_whitespace_check(
         repo,
         tmp_path / "pull-request.json",
         "pull_request",
-        payload,
+        {
+            "pull_request": {
+                "base": {"sha": base},
+                "head": {"sha": head},
+            }
+        },
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_whitespace_check_covers_entire_multi_commit_push(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    initialize_git_repo(repo)
+    base = commit_files(repo, {"sample.txt": "clean\n"}, "base")
+    commit_files(
+        repo,
+        {"sample.txt": "trailing whitespace \n"},
+        "introduce whitespace",
+    )
+    head = commit_files(repo, {"other.txt": "clean\n"}, "later commit")
+
+    result = run_whitespace_check(
+        repo,
+        tmp_path / "push.json",
+        "push",
+        {"before": base, "after": head},
+    )
+
+    assert result.returncode != 0
+    assert "trailing whitespace" in result.stdout
+
+
+def test_whitespace_check_passes_clean_push_and_pull_request(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    initialize_git_repo(repo)
+    base = commit_files(repo, {"sample.txt": "clean\n"}, "base")
+    head = commit_files(repo, {"sample.txt": "still clean\n"}, "candidate")
+    payloads = {
+        "push": {"before": base, "after": head},
+        "pull_request": {
+            "pull_request": {
+                "base": {"sha": base},
+                "head": {"sha": head},
+            }
+        },
+    }
+
+    for event_name, payload in payloads.items():
+        result = run_whitespace_check(
+            repo,
+            tmp_path / f"{event_name}.json",
+            event_name,
+            payload,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("payload_factory", "expected_message"),
+    [
+        (lambda _base, head: {"after": head}, "push.before must be a full"),
+        (lambda base, _head: {"before": base}, "push.after must be a full"),
+        (
+            lambda _base, head: {"before": ZERO_OBJECT_ID, "after": head},
+            "push.before must not be the zero",
+        ),
+        (
+            lambda base, _head: {"before": base, "after": ZERO_OBJECT_ID},
+            "push.after must not be the zero",
+        ),
+        (
+            lambda _base, head: {
+                "before": UNREACHABLE_OBJECT_ID,
+                "after": head,
+            },
+            "push.before is not available",
+        ),
+    ],
+)
+def test_whitespace_check_rejects_unsafe_push_ranges(
+    tmp_path: Path,
+    payload_factory: Callable[[str, str], dict[str, object]],
+    expected_message: str,
+) -> None:
+    repo = tmp_path / "repo"
+    base, head = create_git_repo(repo)
+
+    result = run_whitespace_check(
+        repo,
+        tmp_path / "push.json",
+        "push",
+        payload_factory(base, head),
+    )
+
+    assert result.returncode == 2
+    assert expected_message in result.stderr
+
+
+def test_whitespace_check_rejects_zero_before_on_root_push(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    initialize_git_repo(repo)
+    head = commit_files(
+        repo,
+        {"sample.txt": "root trailing whitespace \n"},
+        "root",
+    )
+
+    result = run_whitespace_check(
+        repo,
+        tmp_path / "push.json",
+        "push",
+        {"before": ZERO_OBJECT_ID, "after": head},
+    )
+
+    assert result.returncode == 2
+    assert "push.before must not be the zero" in result.stderr
+
+
+def test_whitespace_check_rejects_unavailable_pull_request_commit(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    base, _head = create_git_repo(repo)
+
+    result = run_whitespace_check(
+        repo,
+        tmp_path / "pull-request.json",
+        "pull_request",
+        {
+            "pull_request": {
+                "base": {"sha": base},
+                "head": {"sha": UNREACHABLE_OBJECT_ID},
+            }
+        },
+    )
+
+    assert result.returncode == 2
+    assert "pull_request.head.sha is not available" in result.stderr
+
+
+def test_whitespace_check_rejects_missing_pull_request_range(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    initialize_git_repo(repo)
+    commit_files(repo, {"sample.txt": "clean\n"}, "base")
+
+    result = run_whitespace_check(
+        repo,
+        tmp_path / "pull-request.json",
+        "pull_request",
+        {"pull_request": {}},
+    )
+
+    assert result.returncode == 2
+    assert "base and head payloads are required" in result.stderr
 
 
 def test_whitespace_check_fails_closed_without_event(tmp_path: Path) -> None:
@@ -575,111 +395,363 @@ def test_whitespace_check_fails_closed_without_event(tmp_path: Path) -> None:
     assert "GITHUB_EVENT_NAME is required" in result.stderr
 
 
-def test_whitespace_check_fails_closed_without_pull_request_range(
+def test_whitespace_check_rejects_unsupported_event_and_arguments(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
-    initialize_git_repo(repo)
-    commit_file(repo, "clean\n", "base")
+    base, head = create_git_repo(repo)
 
-    result = run_whitespace_check(
+    unsupported = run_whitespace_check(
         repo,
-        tmp_path / "pull-request.json",
-        "pull_request",
-        {"pull_request": {}},
+        tmp_path / "workflow-dispatch.json",
+        "workflow_dispatch",
+        {"before": base, "after": head},
+    )
+    with_arguments = run_whitespace_check(
+        repo,
+        tmp_path / "push.json",
+        "push",
+        {"before": base, "after": head},
+        ["HEAD^"],
     )
 
-    assert result.returncode == 2
-    assert "base and head payloads are required" in result.stderr
+    assert unsupported.returncode == 2
+    assert "unsupported GitHub event" in unsupported.stderr
+    assert with_arguments.returncode == 2
+    assert "does not accept arguments" in with_arguments.stderr
 
 
-@pytest.mark.parametrize(
-    ("old", "new"),
-    [
-        (
-            "needs: [changed, storage-legacy-openers, repository-checks, "
-            "fmt, web-build, clippy, test, audit]",
-            "needs: [changed, storage-legacy-openers, fmt, web-build, clippy, test, audit]",
-        ),
-        (
-            "        run: python3 scripts/check_ci_results.py",
-            "        run: python3 scripts/check_ci_results.py || true",
-        ),
-        (
-            "        run: python3 scripts/check_ci_results.py",
-            "        run: |\n          python3 scripts/check_ci_results.py\n          echo bypass",
-        ),
-        (
-            "          HARNESS_CI_RESULT_AUDIT: ${{ needs.audit.result }}",
-            "          HARNESS_CI_RESULT_BOGUS: ${{ needs.audit.result }}",
-        ),
-        (
-            "        run: python3 scripts/check_ci_results.py",
-            "        shell: bash {0} || true\n        run: python3 scripts/check_ci_results.py",
-        ),
-        (
-            "      - uses: actions/checkout@v4\n"
-            "      - name: Check all jobs",
-            "      - uses: actions/checkout@v4\n"
-            "        with:\n"
-            "          path: source\n"
-            "      - name: Check all jobs",
-        ),
-        ("          fetch-depth: 0", "          fetch-depth: 1"),
-        (
-            "- run: cargo test ${{ steps.scope.outputs.packages }}",
-            "- run: echo tests-disabled",
-        ),
-        (
-            "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
-            "      - name: Test repository contracts\n"
-            "        if: ${{ false }}\n"
-            "        run: python3 -m pytest -q tests",
-        ),
-        (
-            "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
-            "      - name: Test repository contracts\n"
-            "        run: |\n"
-            "          if false; then\n"
-            "            python3 -m pytest -q tests\n"
-            "          fi",
-        ),
-        (
-            "      - name: Check committed whitespace\n"
-            "        run: python3 scripts/check_committed_whitespace.py",
-            "      - name: Check committed whitespace\n"
-            "        continue-on-error: true\n"
-            "        run: python3 scripts/check_committed_whitespace.py",
-        ),
-        (
-            "        run: python3 scripts/check_committed_whitespace.py",
-            "        run: python3 scripts/check_committed_whitespace.py || true",
-        ),
-        (
-            "      - run: cargo clippy --workspace --all-targets -- -D warnings",
-            "      - run: cargo clippy --workspace --all-targets -- -D warnings\n"
-            "        env:\n"
-            '          HARNESS_SKIP_WEB_BUILD: "0"',
-        ),
-        (
-            "      - run: cargo test ${{ steps.scope.outputs.packages }}\n"
-            "        env:\n"
-            "          HARNESS_DATABASE_URL:",
-            "      - run: cargo test ${{ steps.scope.outputs.packages }}\n"
-            "        env:\n"
-            '          HARNESS_SKIP_WEB_BUILD: "0"\n'
-            "          HARNESS_DATABASE_URL:",
-        ),
-        ('HARNESS_SKIP_WEB_BUILD: "1"', 'HARNESS_SKIP_WEB_BUILD: "0"'),
-    ],
-)
-def test_ci_contract_rejects_silent_regressions(old: str, new: str) -> None:
+CI_MUTATIONS = [
+    (
+        "remove fan-in dependency",
+        "needs: [changed, storage-legacy-openers, repository-checks, "
+        "fmt, web-build, clippy, test, audit]",
+        "needs: [changed, storage-legacy-openers, fmt, web-build, clippy, test, audit]",
+    ),
+    (
+        "fan-in shell suffix",
+        "        run: python3 scripts/check_ci_results.py",
+        "        run: python3 scripts/check_ci_results.py || true",
+    ),
+    (
+        "fan-in multi-command block",
+        "        run: python3 scripts/check_ci_results.py",
+        "        run: |\n          python3 scripts/check_ci_results.py\n          echo bypass",
+    ),
+    (
+        "fan-in shell override",
+        "        run: python3 scripts/check_ci_results.py",
+        "        shell: bash {0} || true\n        run: python3 scripts/check_ci_results.py",
+    ),
+    (
+        "fan-in result binding",
+        "          HARNESS_CI_RESULT_AUDIT: ${{ needs.audit.result }}",
+        "          HARNESS_CI_RESULT_BOGUS: ${{ needs.audit.result }}",
+    ),
+    (
+        "fan-in checkout path",
+        "      - uses: actions/checkout@v4\n"
+        "      - name: Check all jobs",
+        "      - uses: actions/checkout@v4\n"
+        "        with:\n"
+        "          path: source\n"
+        "      - name: Check all jobs",
+    ),
+    (
+        "workflow shell default",
+        "env:\n  CARGO_TERM_COLOR: always",
+        "defaults:\n  run:\n    shell: bash {0} || true\n\nenv:\n  CARGO_TERM_COLOR: always",
+    ),
+    (
+        "workflow PATH override",
+        "env:\n  CARGO_TERM_COLOR: always",
+        "env:\n  CARGO_TERM_COLOR: always\n  PATH: bypass",
+    ),
+    (
+        "repository pytest environment",
+        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
+        "      - name: Test repository contracts\n"
+        "        env:\n"
+        "          PYTEST_ADDOPTS: --collect-only\n"
+        "        run: python3 -m pytest -q tests",
+    ),
+    (
+        "repository pytest PATH",
+        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
+        "      - name: Test repository contracts\n"
+        "        env:\n"
+        "          PATH: bypass\n"
+        "        run: python3 -m pytest -q tests",
+    ),
+    (
+        "repository pytest working directory",
+        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
+        "      - name: Test repository contracts\n"
+        "        working-directory: bypass\n"
+        "        run: python3 -m pytest -q tests",
+    ),
+    (
+        "repository checkout depth",
+        "          fetch-depth: 0",
+        "          fetch-depth: 1",
+    ),
+    (
+        "repository pytest conditional",
+        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
+        "      - name: Test repository contracts\n"
+        "        if: ${{ false }}\n"
+        "        run: python3 -m pytest -q tests",
+    ),
+    (
+        "repository pytest command guard",
+        "      - name: Test repository contracts\n        run: python3 -m pytest -q tests",
+        "      - name: Test repository contracts\n"
+        "        run: |\n"
+        "          if false; then\n"
+        "            python3 -m pytest -q tests\n"
+        "          fi",
+    ),
+    (
+        "whitespace event override",
+        "      - name: Check committed whitespace\n"
+        "        run: python3 scripts/check_committed_whitespace.py",
+        "      - name: Check committed whitespace\n"
+        "        env:\n"
+        "          GITHUB_EVENT_NAME: workflow_dispatch\n"
+        "          GITHUB_EVENT_PATH: bypass-event.json\n"
+        "        run: python3 scripts/check_committed_whitespace.py",
+    ),
+    (
+        "whitespace PYTHONPATH override",
+        "      - name: Check committed whitespace\n"
+        "        run: python3 scripts/check_committed_whitespace.py",
+        "      - name: Check committed whitespace\n"
+        "        env:\n"
+        "          PYTHONPATH: bypass\n"
+        "        run: python3 scripts/check_committed_whitespace.py",
+    ),
+    (
+        "whitespace continue on error",
+        "      - name: Check committed whitespace\n"
+        "        run: python3 scripts/check_committed_whitespace.py",
+        "      - name: Check committed whitespace\n"
+        "        continue-on-error: true\n"
+        "        run: python3 scripts/check_committed_whitespace.py",
+    ),
+    (
+        "whitespace command suffix",
+        "        run: python3 scripts/check_committed_whitespace.py",
+        "        run: python3 scripts/check_committed_whitespace.py || true",
+    ),
+    (
+        "repository job environment",
+        "  repository-checks:\n    name: Repository Checks",
+        "  repository-checks:\n"
+        "    name: Repository Checks\n"
+        "    env:\n"
+        "      PYTEST_ADDOPTS: --collect-only",
+    ),
+    (
+        "repository job defaults",
+        "  repository-checks:\n    name: Repository Checks",
+        "  repository-checks:\n"
+        "    name: Repository Checks\n"
+        "    defaults:\n"
+        "      run:\n"
+        "        shell: bash {0} || true",
+    ),
+    (
+        "fan-in working directory",
+        "      - name: Check all jobs\n        env:",
+        "      - name: Check all jobs\n        working-directory: bypass\n        env:",
+    ),
+    (
+        "fan-in job PYTHONPATH",
+        "  ci-result:\n    name: CI Result",
+        "  ci-result:\n"
+        "    name: CI Result\n"
+        "    env:\n"
+        "      PYTHONPATH: bypass",
+    ),
+    (
+        "fan-in extra step environment",
+        "        env:\n          HARNESS_CI_RESULT_CHANGED:",
+        "        env:\n"
+        "          PYTHONPATH: bypass\n"
+        "          HARNESS_CI_RESULT_CHANGED:",
+    ),
+    (
+        "changed job skipped",
+        "  changed:\n    name: Detect Changes",
+        "  changed:\n    name: Detect Changes\n    if: false",
+    ),
+    (
+        "storage job skipped",
+        "  storage-legacy-openers:\n    name: Storage Legacy Openers\n"
+        "    runs-on: ubuntu-latest\n"
+        "    needs: changed\n"
+        "    if: needs.changed.outputs.rust == 'true' || "
+        "needs.changed.outputs.ci == 'true'",
+        "  storage-legacy-openers:\n    name: Storage Legacy Openers\n"
+        "    runs-on: ubuntu-latest\n"
+        "    needs: changed\n"
+        "    if: false",
+    ),
+    (
+        "clippy job skipped",
+        "  clippy:\n    name: Clippy\n"
+        "    runs-on: ubuntu-latest\n"
+        "    needs: [changed, web-build]\n"
+        "    if: needs.changed.outputs.rust == 'true' || "
+        "needs.changed.outputs.ci == 'true'",
+        "  clippy:\n    name: Clippy\n"
+        "    runs-on: ubuntu-latest\n"
+        "    needs: [changed, web-build]\n"
+        "    if: false",
+    ),
+    (
+        "test job skipped",
+        "  test:\n    name: Test\n"
+        "    runs-on: ubuntu-latest\n"
+        "    needs: [changed, web-build]\n"
+        "    if: needs.changed.outputs.rust == 'true' || "
+        "needs.changed.outputs.ci == 'true'",
+        "  test:\n    name: Test\n"
+        "    runs-on: ubuntu-latest\n"
+        "    needs: [changed, web-build]\n"
+        "    if: false",
+    ),
+    (
+        "audit job skipped",
+        "  audit:\n    name: Security Audit\n"
+        "    runs-on: ubuntu-latest\n"
+        "    needs: changed\n"
+        "    if: needs.changed.outputs.rust == 'true' || "
+        "needs.changed.outputs.ci == 'true'",
+        "  audit:\n    name: Security Audit\n"
+        "    runs-on: ubuntu-latest\n"
+        "    needs: changed\n"
+        "    if: false",
+    ),
+    (
+        "changed filter coverage",
+        "              - 'scripts/check_committed_whitespace.py'",
+        "              - 'scripts/not-the-whitespace-check.py'",
+    ),
+    (
+        "storage self-test",
+        "      - run: python3 scripts/check_storage_legacy_openers.py --self-test",
+        "      - run: echo self-test-disabled",
+    ),
+    (
+        "repository test command",
+        "        run: python3 -m pytest -q tests",
+        "        run: echo tests-disabled",
+    ),
+    (
+        "format command",
+        "      - run: cargo fmt --all -- --check",
+        "      - run: echo format-disabled",
+    ),
+    (
+        "web build command",
+        "          bun run build",
+        "          echo build-disabled",
+    ),
+    (
+        "clippy command",
+        "      - run: cargo clippy --workspace --all-targets -- -D warnings",
+        "      - run: echo clippy-disabled",
+    ),
+    (
+        "clippy step environment",
+        "      - run: cargo clippy --workspace --all-targets -- -D warnings",
+        "      - run: cargo clippy --workspace --all-targets -- -D warnings\n"
+        "        env:\n"
+        '          HARNESS_SKIP_WEB_BUILD: "0"',
+    ),
+    (
+        "cargo test command",
+        "      - run: cargo test ${{ steps.scope.outputs.packages }}",
+        "      - run: echo tests-disabled",
+    ),
+    (
+        "cargo test skip environment",
+        "      - run: cargo test ${{ steps.scope.outputs.packages }}\n"
+        "        env:\n"
+        "          HARNESS_DATABASE_URL:",
+        "      - run: cargo test ${{ steps.scope.outputs.packages }}\n"
+        "        env:\n"
+        '          HARNESS_SKIP_WEB_BUILD: "0"\n'
+        "          HARNESS_DATABASE_URL:",
+    ),
+    (
+        "server fast command",
+        "        run: scripts/test-server-fast.sh",
+        "        run: echo server-fast-disabled",
+    ),
+    (
+        "server database command",
+        "        run: scripts/test-server-db.sh",
+        "        run: echo server-db-disabled",
+    ),
+    (
+        "audit action",
+        "      - uses: rustsec/audit-check@v2.0.0",
+        "      - uses: actions/checkout@v4",
+    ),
+    (
+        "changed output binding",
+        "      workspace: ${{ steps.filter.outputs.workspace }}",
+        "      workspace: 'false'",
+    ),
+    (
+        "test timeout",
+        "    timeout-minutes: 15",
+        "    timeout-minutes: 1",
+    ),
+    (
+        "postgres service",
+        "        image: postgres:16",
+        "        image: postgres:latest",
+    ),
+    (
+        "web build skip environment",
+        '      HARNESS_SKIP_WEB_BUILD: "1"',
+        '      HARNESS_SKIP_WEB_BUILD: "0"',
+    ),
+    (
+        "pull request trigger",
+        "  pull_request:\n    branches: [main]",
+        "  pull_request:\n    branches: [develop]",
+    ),
+]
+
+
+@pytest.mark.parametrize(("label", "old", "new"), CI_MUTATIONS)
+def test_ci_contract_rejects_execution_mutations(
+    label: str,
+    old: str,
+    new: str,
+) -> None:
     workflow = CI_WORKFLOW.read_text(encoding="utf-8")
     hook = PRE_COMMIT_HOOK.read_text(encoding="utf-8")
     mutated = workflow.replace(old, new)
-    assert mutated != workflow, f"mutation target is missing: {old}"
+    assert mutated != workflow, f"mutation target is missing: {label}"
 
     with pytest.raises(AssertionError):
+        assert_ci_contract(mutated, hook)
+
+
+def test_ci_contract_rejects_duplicate_keys() -> None:
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    hook = PRE_COMMIT_HOOK.read_text(encoding="utf-8")
+    mutated = workflow.replace(
+        "  changed:\n    name: Detect Changes",
+        "  changed:\n    name: Detect Changes\n    name: Duplicate",
+    )
+
+    with pytest.raises(AssertionError, match="duplicate mapping key"):
         assert_ci_contract(mutated, hook)
 
 

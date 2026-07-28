@@ -40,6 +40,8 @@ def load_event(environment: Mapping[str, str]) -> tuple[str, dict[str, Any]]:
 def require_object_id(value: object, label: str) -> str:
     if not isinstance(value, str) or OBJECT_ID.fullmatch(value) is None:
         raise WhitespaceCheckError(f"{label} must be a full Git object id")
+    if set(value) == {"0"}:
+        raise WhitespaceCheckError(f"{label} must not be the zero object id")
     return value
 
 
@@ -66,18 +68,26 @@ def select_diff_command(event_name: str, payload: Mapping[str, Any]) -> list[str
             )
         base_sha = require_object_id(base.get("sha"), "pull_request.base.sha")
         head_sha = require_object_id(head.get("sha"), "pull_request.head.sha")
-        return ["git", "diff", "--check", base_sha, head_sha]
+        for revision, label in (
+            (base_sha, "pull_request.base.sha"),
+            (head_sha, "pull_request.head.sha"),
+        ):
+            if not commit_exists(revision):
+                raise WhitespaceCheckError(f"{label} is not available in the checkout")
+        return ["git", "diff", "--check", f"{base_sha}...{head_sha}"]
 
-    before = payload.get("before")
-    if (
-        isinstance(before, str)
-        and OBJECT_ID.fullmatch(before) is not None
-        and commit_exists(before)
-    ):
-        return ["git", "diff", "--check", before, "HEAD"]
-    if commit_exists("HEAD^"):
-        return ["git", "diff", "--check", "HEAD^", "HEAD"]
-    return ["git", "diff", "--check"]
+    if event_name == "push":
+        before_sha = require_object_id(payload.get("before"), "push.before")
+        after_sha = require_object_id(payload.get("after"), "push.after")
+        for revision, label in (
+            (before_sha, "push.before"),
+            (after_sha, "push.after"),
+        ):
+            if not commit_exists(revision):
+                raise WhitespaceCheckError(f"{label} is not available in the checkout")
+        return ["git", "diff", "--check", before_sha, after_sha]
+
+    raise WhitespaceCheckError(f"unsupported GitHub event: {event_name}")
 
 
 def main(
