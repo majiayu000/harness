@@ -145,9 +145,18 @@ impl AgentSpawnContract for ContainerSpawn {
             input.env_vars,
             &allowlist,
         )));
-        for (key, value) in container_env_vars(input.env_vars) {
+        let ContainerEnv { plain, secret } = container_env_vars(input.env_vars);
+        for (key, value) in plain {
             args.push(OsString::from("--env"));
             args.push(OsString::from(format!("{key}={value}")));
+        }
+        // Secrets are passed by name only. `docker run --env KEY` (no `=value`)
+        // reads the value from the Docker client's own environment, keeping the
+        // token out of argv and therefore out of the host process list, the
+        // tracing arg count/dump, and spawn-failure error strings.
+        for key in secret.keys() {
+            args.push(OsString::from("--env"));
+            args.push(OsString::from(key));
         }
         if !allowlist.is_empty() {
             args.push(OsString::from("--env"));
@@ -189,7 +198,7 @@ impl AgentSpawnContract for ContainerSpawn {
             args,
             current_dir: project_root,
             child_workspace,
-            process_env: docker_process_env(),
+            process_env: docker_process_env(secret),
             clear_inherited_env: true,
             sandbox_engine: SandboxEngine::None,
         })
@@ -264,8 +273,19 @@ fn host_process_env(env_vars: &HashMap<String, String>) -> BTreeMap<String, Stri
         .collect()
 }
 
-fn container_env_vars(env_vars: &HashMap<String, String>) -> BTreeMap<String, String> {
-    let mut env = env_vars
+/// Container environment split by transport.
+///
+/// `plain` values are safe to render into Docker argv. `secret` values must
+/// never appear there: they reach the container through the Docker client's
+/// process environment, which is readable only by the same user, instead of
+/// through the world-readable process command line.
+struct ContainerEnv {
+    plain: BTreeMap<String, String>,
+    secret: BTreeMap<String, String>,
+}
+
+fn container_env_vars(env_vars: &HashMap<String, String>) -> ContainerEnv {
+    let plain = env_vars
         .iter()
         .filter(|(key, _)| !is_spawn_control_env(key))
         .filter(|(key, _)| !is_nested_session_env(key))
@@ -273,27 +293,30 @@ fn container_env_vars(env_vars: &HashMap<String, String>) -> BTreeMap<String, St
         .filter(|(key, _)| !is_operator_secret_env(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
+    let mut secret = BTreeMap::new();
     if let Some(scoped_token) = env_vars
         .get(SCOPED_GITHUB_TOKEN_ENV)
         .map(String::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        env.insert(
+        secret.insert(
             CONTAINER_GITHUB_TOKEN_ENV.to_string(),
             scoped_token.to_string(),
         );
-        env.insert(CONTAINER_GH_TOKEN_ENV.to_string(), scoped_token.to_string());
+        secret.insert(CONTAINER_GH_TOKEN_ENV.to_string(), scoped_token.to_string());
     }
-    env
+    ContainerEnv { plain, secret }
 }
 
-fn docker_process_env() -> BTreeMap<String, String> {
-    std::env::var("PATH")
+fn docker_process_env(secret: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut env = std::env::var("PATH")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(|path| BTreeMap::from([("PATH".to_string(), path)]))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    env.extend(secret);
+    env
 }
 
 fn is_spawn_control_env(key: &str) -> bool {
@@ -552,15 +575,103 @@ mod container_spawn_tests {
 
         let args = string_args(&spawn);
         assert!(args.contains(&format!("{AGENT_RUN_ID_ENV}=ar-01j00000000000000000000000")));
-        assert!(args.contains(&"GITHUB_TOKEN=scoped-token".to_string()));
-        assert!(args.contains(&"GH_TOKEN=scoped-token".to_string()));
+        // The scoped token reaches the container by name only: `--env KEY`
+        // with no `=value`, so no token value is ever rendered into argv.
+        assert!(args.contains(&"GITHUB_TOKEN".to_string()));
+        assert!(args.contains(&"GH_TOKEN".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("scoped-token")));
         assert!(!args
             .iter()
-            .any(|arg| arg.starts_with("HARNESS_SCOPED_GITHUB_TOKEN=")));
+            .any(|arg| arg.starts_with("HARNESS_SCOPED_GITHUB_TOKEN")));
         assert!(args.contains(&"CARGO_TARGET_DIR=/workspace/target".to_string()));
         assert!(!args.iter().any(|arg| arg.contains("operator-token")));
         assert!(!args.iter().any(|arg| arg.contains("operator-key")));
+        // The Docker client process carries the scoped value, and only it.
+        assert_eq!(
+            spawn.process_env.get("GITHUB_TOKEN"),
+            Some(&"scoped-token".to_string())
+        );
+        assert_eq!(
+            spawn.process_env.get("GH_TOKEN"),
+            Some(&"scoped-token".to_string())
+        );
+        assert!(!spawn
+            .process_env
+            .contains_key("HARNESS_SCOPED_GITHUB_TOKEN"));
+        assert!(!spawn.process_env.values().any(|v| v == "operator-token"));
+        assert!(spawn.clear_inherited_env);
+        Ok(())
+    }
+
+    #[test]
+    fn container_spawn_keeps_token_values_out_of_every_rendered_string() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            AGENT_ISOLATION_TIER_ENV.to_string(),
+            "container".to_string(),
+        );
+        env_vars.insert(
+            "HARNESS_SCOPED_GITHUB_TOKEN".to_string(),
+            "ghs_supersecretvalue".to_string(),
+        );
+        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
+
+        let spawn = ContainerSpawn.prepare(input(
+            Path::new("codex"),
+            &[],
+            root.path(),
+            &sandbox_spec,
+            &env_vars,
+        ))?;
+
+        // Everything an operator or another local user can observe about the
+        // launch: the program, the argv, and the Debug rendering used by
+        // tracing and error formatting.
+        let rendered = format!(
+            "{} {:?} {:?}",
+            spawn.program.display(),
+            spawn.args,
+            spawn.args
+        );
+        assert!(
+            !rendered.contains("ghs_supersecretvalue"),
+            "token value leaked into the rendered docker command: {rendered}"
+        );
+        // …while the container still receives it.
+        assert_eq!(
+            spawn.process_env.get("GITHUB_TOKEN"),
+            Some(&"ghs_supersecretvalue".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn container_spawn_omits_token_env_flags_without_a_scoped_token() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            AGENT_ISOLATION_TIER_ENV.to_string(),
+            "container".to_string(),
+        );
+        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
+
+        let spawn = ContainerSpawn.prepare(input(
+            Path::new("codex"),
+            &[],
+            root.path(),
+            &sandbox_spec,
+            &env_vars,
+        ))?;
+
+        // A bare `--env GITHUB_TOKEN` with nothing in the client environment
+        // would be a no-op, but emitting it anyway would imply a credential
+        // that does not exist. Nothing is emitted.
+        let args = string_args(&spawn);
+        assert!(!args.iter().any(|arg| arg == "GITHUB_TOKEN"));
+        assert!(!args.iter().any(|arg| arg == "GH_TOKEN"));
         assert!(!spawn.process_env.contains_key("GITHUB_TOKEN"));
+        assert!(!spawn.process_env.contains_key("GH_TOKEN"));
         Ok(())
     }
 
