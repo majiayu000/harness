@@ -1,6 +1,6 @@
 use crate::http::{
     auth,
-    misc_routes::{disabled_password_reset_response, prepare_password_reset_request},
+    auth_routes::{disabled_password_reset_response, prepare_password_reset_request},
     rate_limit::PasswordResetRateLimiter,
 };
 use axum::http::StatusCode;
