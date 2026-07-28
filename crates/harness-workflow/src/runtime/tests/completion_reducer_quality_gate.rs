@@ -43,7 +43,10 @@ fn runtime_completion_reducer_passes_quality_gate_after_success() {
             }),
         ))
         .with_validation(ValidationRecord::new("cargo check", "passed"))
-        .with_validation(ValidationRecord::new("cargo test", "passed"));
+        .with_validation(ValidationRecord::new("cargo test", "passed"))
+        // GH-1766 B-003: the server re-runs the validation commands and
+        // attaches the digest; an agent claim alone cannot pass the gate.
+        .with_artifact(server_validation_digest_ok(&["cargo check", "cargo test"]));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -83,7 +86,8 @@ fn runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass() {
                 "validation": "passed"
             }),
         ))
-        .with_validation(ValidationRecord::new("cargo check", "passed"));
+        .with_validation(ValidationRecord::new("cargo check", "passed"))
+        .with_artifact(server_validation_digest_ok(&["cargo check"]));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -320,6 +324,10 @@ fn runtime_completion_reducer_blocks_quality_gate_invalid_structured_decision_wi
             }),
         ))
         .with_validation(ValidationRecord::new("cargo test", "passed"))
+        // The gate contract itself is satisfied (GH-1766 digest present) so
+        // the block below comes from the stale structured decision, not from
+        // missing validation evidence.
+        .with_artifact(server_validation_digest_ok(&["cargo test"]))
         .with_artifact(ActivityArtifact::new(
             "workflow_decision",
             serde_json::to_value(&proposed_decision).expect("decision should serialize"),

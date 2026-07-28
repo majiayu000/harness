@@ -1,3 +1,36 @@
+/// GH-1766: the server-authored validation digest a quality-gate result must
+/// carry for `checking -> passed`, with every command exiting zero.
+fn server_validation_digest_ok(commands: &[&str]) -> ActivityArtifact {
+    ActivityArtifact::new(
+        crate::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST,
+        json!({
+            "commands": commands
+                .iter()
+                .map(|command| json!({
+                    "command": command,
+                    "exit_code": 0,
+                    "output_sha256": "0".repeat(64),
+                }))
+                .collect::<Vec<_>>(),
+            "cwd": "/workspace",
+        }),
+    )
+}
+
+/// GH-1766: the server-authored PR-binding verification a `BindPr`-minting
+/// result must carry.
+fn verified_pr_binding(pr_number: u64) -> ActivityArtifact {
+    ActivityArtifact::new(
+        crate::runtime::completion_evidence::ARTIFACT_VERIFIED_PR_BINDING,
+        json!({
+            "pr_number": pr_number,
+            "repo": "owner/repo",
+            "head_oid": "abc123",
+            "snapshot_source": "server_github_graphql",
+        }),
+    )
+}
+
 fn issue_instance(state: &str) -> WorkflowInstance {
     WorkflowInstance::new(
         "github_issue_pr",

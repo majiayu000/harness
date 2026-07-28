@@ -146,6 +146,12 @@ async fn durable_store_apply_decision_transition_can_create_initial_instance() -
         77,
         "https://github.com/owner/repo/pull/77",
         "pr-detected:task-1:77",
+    ))
+    // `implementing -> pr_open` requires server-verified PR evidence
+    // (GH-1766); a decision reaching the store without it is rejected.
+    .with_evidence(WorkflowEvidence::new(
+        ARTIFACT_VERIFIED_PR_BINDING,
+        json!({ "pr_number": 77, "repo": "owner/repo", "state": "OPEN" }).to_string(),
     ));
     let mut final_instance = initial.clone();
     final_instance.state = "pr_open".to_string();

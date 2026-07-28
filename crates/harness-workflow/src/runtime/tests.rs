@@ -1,3 +1,4 @@
+use super::completion_evidence::{ARTIFACT_SERVER_VALIDATION_DIGEST, ARTIFACT_VERIFIED_PR_BINDING};
 use super::model::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, ActivityStatus,
     RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord, WorkflowCommand,
