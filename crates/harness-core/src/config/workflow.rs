@@ -620,18 +620,24 @@ fn reject_misplaced_completion_evidence_fields(
     value: &serde_yaml::Value,
     source_path: &str,
 ) -> anyhow::Result<()> {
-    let Some(fields) = value.as_mapping() else {
-        return Ok(());
-    };
-    for field in [
-        "completion_evidence_enforced",
-        "runtime_completion_evidence_enforced",
-    ] {
-        if fields.contains_key(serde_yaml::Value::String(field.to_owned())) {
-            anyhow::bail!(
-                "failed to parse merged workflow front matter ({source_path}): unknown field `{field}`"
-            );
+    fn find_reserved_field(value: &serde_yaml::Value) -> Option<&str> {
+        match value {
+            serde_yaml::Value::Mapping(fields) => fields.iter().find_map(|(field, nested)| {
+                field
+                    .as_str()
+                    .filter(|field| super::COMPLETION_EVIDENCE_CONFIG_FIELDS.contains(field))
+                    .or_else(|| find_reserved_field(nested))
+            }),
+            serde_yaml::Value::Sequence(values) => values.iter().find_map(find_reserved_field),
+            serde_yaml::Value::Tagged(tagged) => find_reserved_field(&tagged.value),
+            _ => None,
         }
+    }
+
+    if let Some(field) = find_reserved_field(value) {
+        anyhow::bail!(
+            "failed to parse merged workflow front matter ({source_path}): unknown field `{field}`"
+        );
     }
     Ok(())
 }

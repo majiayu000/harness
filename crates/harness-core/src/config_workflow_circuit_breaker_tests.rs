@@ -156,6 +156,56 @@ fn harness_config_rejects_legacy_root_completion_evidence_key() {
 }
 
 #[test]
+fn harness_config_rejects_completion_evidence_key_under_server() {
+    let toml_str = workflow_breaker_harness_config_toml("").replacen(
+        "[agents]",
+        "completion_evidence_enforced = false\n\n[agents]",
+        1,
+    );
+
+    let error = toml::from_str::<HarnessConfig>(&toml_str)
+        .expect_err("a kill switch under [server] must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+}
+
+#[test]
+fn harness_config_rejects_legacy_key_in_nested_extension() {
+    let toml_str = workflow_breaker_harness_config_toml(
+        r#"
+        [operator_extension.nested]
+        runtime_completion_evidence_enforced = false
+        "#,
+    );
+
+    let error = toml::from_str::<HarnessConfig>(&toml_str)
+        .expect_err("a legacy kill switch in a nested extension must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `runtime_completion_evidence_enforced`"));
+}
+
+#[test]
+fn harness_config_retains_unrelated_nested_extension_compatibility() {
+    let toml_str = workflow_breaker_harness_config_toml(
+        r#"
+        [operator_extension.nested]
+        mode = "audit"
+        "#,
+    )
+    .replacen(
+        "[agents]",
+        "operator_extension_mode = \"audit\"\n\n[agents]",
+        1,
+    );
+
+    let config = toml::from_str::<HarnessConfig>(&toml_str)
+        .expect("unrelated fields in known and extension tables must remain compatible");
+    assert!(config.workflow.completion_evidence_enforced);
+}
+
+#[test]
 fn project_workflow_rejects_deployment_completion_evidence_key() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(
@@ -252,6 +302,72 @@ runtime_completion_evidence_enforced: false
     assert!(error
         .to_string()
         .contains("unknown field `runtime_completion_evidence_enforced`"));
+    Ok(())
+}
+
+#[test]
+fn project_workflow_rejects_completion_evidence_key_in_nested_extension() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+operator_extension:
+  nested:
+    completion_evidence_enforced: false
+---
+"#,
+    )?;
+
+    let error = load_workflow_config(dir.path())
+        .expect_err("a nested project kill switch must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+    Ok(())
+}
+
+#[test]
+fn project_workflow_rejects_legacy_key_in_nested_extension() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+operator_extension:
+  nested:
+    runtime_completion_evidence_enforced: false
+---
+"#,
+    )?;
+
+    let error = load_workflow_config(dir.path())
+        .expect_err("a nested legacy project kill switch must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `runtime_completion_evidence_enforced`"));
+    Ok(())
+}
+
+#[test]
+fn project_workflow_retains_unrelated_nested_extension_compatibility() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+workflow:
+  id: nested-extension-compatibility
+operator_extension:
+  nested:
+    mode: audit
+---
+"#,
+    )?;
+
+    let config = load_workflow_config(dir.path())
+        .expect("unrelated nested extension fields must remain compatible");
+    assert_eq!(
+        config.workflow.id.as_deref(),
+        Some("nested-extension-compatibility")
+    );
     Ok(())
 }
 
