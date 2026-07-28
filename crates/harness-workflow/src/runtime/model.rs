@@ -335,6 +335,18 @@ pub enum DecisionConfidence {
     High,
 }
 
+/// Evidence proving a bound PR was resolved through GitHub, not taken from the
+/// agent artifact alone.
+pub const EVIDENCE_VERIFIED_PR_BINDING: &str = "verified_pr_binding";
+
+/// Evidence carrying the digest of validation commands the server re-executed
+/// itself, rather than the agent's claim that they passed.
+pub const EVIDENCE_SERVER_VALIDATION_DIGEST: &str = "server_validation_digest";
+
+/// Evidence that a prompt task presented either a validation report or a
+/// structured no-change rationale before claiming completion.
+pub const EVIDENCE_PROMPT_COMPLETION: &str = "prompt_completion_evidence";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowEvidence {
     pub kind: String,

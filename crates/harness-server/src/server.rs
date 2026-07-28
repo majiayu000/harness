@@ -107,6 +107,7 @@ impl HarnessServer {
 
     /// Start in stdio mode (JSON-RPC over stdin/stdout).
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
+        self.apply_completion_evidence_policy()?;
         self.register_declarative_workflow_definitions()?;
         let state = crate::http::build_app_state(Arc::new(self)).await?;
         harness_workflow::runtime::freeze_workflow_definition_registry();
@@ -115,8 +116,31 @@ impl HarnessServer {
 
     /// Start in HTTP + WebSocket mode.
     pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
+        self.apply_completion_evidence_policy()?;
         self.register_declarative_workflow_definitions()?;
         crate::http::serve(self, addr).await
+    }
+
+    fn apply_completion_evidence_policy(&self) -> anyhow::Result<()> {
+        // A config that cannot be read must not silently disable enforcement:
+        // the safe direction is to keep the contract on.
+        let enforced = match harness_core::config::workflow::load_workflow_config(
+            &self.config.server.project_root,
+        ) {
+            Ok(workflow_cfg) => workflow_cfg.runtime_worker.completion_evidence_enforced,
+            Err(error) => {
+                tracing::error!(
+                        "workflow config load failed ({error}); keeping completion-evidence enforcement enabled"
+                    );
+                true
+            }
+        };
+        if !enforced {
+            tracing::warn!(
+                "workflow completion-evidence enforcement is disabled; terminal transitions accept agent-claimed results without server-verified evidence"
+            );
+        }
+        harness_workflow::runtime::apply_builtin_evidence_enforcement(enforced)
     }
 
     fn register_declarative_workflow_definitions(&self) -> anyhow::Result<()> {
