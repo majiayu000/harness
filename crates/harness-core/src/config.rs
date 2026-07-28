@@ -28,7 +28,7 @@ use self::observe::*;
 use self::server::*;
 use self::workflow_circuit_breaker::*;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 const COMPLETION_EVIDENCE_CONFIG_FIELDS: [&str; 2] = [
     "completion_evidence_enforced",
@@ -235,8 +235,6 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             alerting: AlertingConfig,
             #[serde(default)]
             projects: Vec<ProjectEntry>,
-            #[serde(flatten)]
-            _unknown_fields: BTreeMap<String, serde::de::IgnoredAny>,
         }
 
         let input: HarnessConfigInput = reserved_key_deserializer::deserialize(deserializer)?;
@@ -277,3 +275,7 @@ mod context_tests;
 #[cfg(test)]
 #[path = "config_workflow_circuit_breaker_tests.rs"]
 mod workflow_circuit_breaker_tests;
+
+#[cfg(test)]
+#[path = "config_reserved_key_regression_tests.rs"]
+mod reserved_key_regression_tests;

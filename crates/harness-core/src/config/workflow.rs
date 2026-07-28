@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 mod candidates;
 mod defaults;
 mod intake_binding;
+mod reserved_keys;
 mod storage;
 pub use candidates::WorkflowCandidatesPolicy;
 use defaults::*;
@@ -577,7 +578,10 @@ fn read_workflow_file(path: &Path) -> anyhow::Result<Option<LoadedWorkflowFile>>
             )
         })?,
     };
-    reject_misplaced_completion_evidence_fields(&value, &path.display().to_string())?;
+    reserved_keys::reject_misplaced_completion_evidence_fields(
+        &value,
+        &path.display().to_string(),
+    )?;
     Ok(Some(LoadedWorkflowFile {
         front_matter: value,
         body: body.trim().to_string(),
@@ -615,31 +619,6 @@ fn deep_merge_yaml_at(
         // Scalars and sequences: the override wins outright.
         (_, over) => over,
     }
-}
-
-fn reject_misplaced_completion_evidence_fields(
-    value: &serde_yaml::Value,
-    source_path: &str,
-) -> anyhow::Result<()> {
-    use serde_yaml::Value;
-
-    fn find(value: &serde_yaml::Value, in_key: bool) -> Option<&'static str> {
-        match value {
-            Value::String(field) if in_key => super::completion_evidence_config_field(field),
-            Value::Mapping(fields) => fields
-                .iter()
-                .find_map(|(field, nested)| find(field, true).or_else(|| find(nested, in_key))),
-            Value::Sequence(values) => values.iter().find_map(|value| find(value, in_key)),
-            Value::Tagged(tagged) => find(&tagged.value, in_key),
-            _ => None,
-        }
-    }
-    if let Some(field) = find(value, false) {
-        anyhow::bail!(
-            "failed to parse merged workflow front matter ({source_path}): unknown field `{field}`"
-        );
-    }
-    Ok(())
 }
 
 /// Load the workflow policy and prompt template for `project_root`.
