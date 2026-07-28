@@ -9,7 +9,8 @@ use std::{
 };
 use syn::{
     visit::{self, Visit},
-    Attribute, Expr, ExprCall, ExprPath, File, Item, ItemFn, Local, Member, Pat, Stmt,
+    Attribute, Expr, ExprCall, ExprMethodCall, ExprPath, ExprStruct, File, Item, ItemFn, Lit,
+    Local, Member, Pat, Stmt,
 };
 
 const REGISTRY_BUILDER: &str = "harness_agents::builder::registry_from_config";
@@ -78,6 +79,7 @@ fn fixed_entry_points_use_the_canonical_builder_directly() {
 #[test]
 fn codex_constructor_is_only_the_exact_read_only_review_exception() {
     let mut occurrences = Vec::new();
+    let mut suppressions = Vec::new();
     let mut pr_source = None;
 
     for (relative_path, source) in production_sources() {
@@ -89,6 +91,12 @@ fn codex_constructor_is_only_the_exact_read_only_review_exception() {
             relative_path.display().to_string(),
             visitor.count,
         ));
+        let mut suppression_counter = DisallowedMethodSuppressionCounter::default();
+        suppression_counter.visit_file(&file);
+        suppressions.extend(std::iter::repeat_n(
+            relative_path.display().to_string(),
+            suppression_counter.count,
+        ));
         if relative_path == Path::new("src/cmd/pr.rs") {
             pr_source = Some(source);
         }
@@ -98,6 +106,11 @@ fn codex_constructor_is_only_the_exact_read_only_review_exception() {
         occurrences,
         ["src/cmd/pr.rs"],
         "all production `CodexAgent::new` references must be the single review-only exception"
+    );
+    assert_eq!(
+        suppressions,
+        ["src/cmd/pr.rs"],
+        "`clippy::disallowed_methods` may only be suppressed for the reviewed Codex exception"
     );
     verify_codex_review_exception(
         pr_source
@@ -421,6 +434,20 @@ impl<'ast> Visit<'ast> for CodexConstructorPathCounter {
     }
 }
 
+#[derive(Default)]
+struct DisallowedMethodSuppressionCounter {
+    count: usize,
+}
+
+impl<'ast> Visit<'ast> for DisallowedMethodSuppressionCounter {
+    fn visit_attribute(&mut self, attribute: &'ast Attribute) {
+        if suppresses_disallowed_methods(attribute) {
+            self.count += 1;
+        }
+        visit::visit_attribute(self, attribute);
+    }
+}
+
 fn verify_codex_review_exception(source: &str) -> Result<(), String> {
     let file = syn::parse_file(source).map_err(|error| error.to_string())?;
     let review = unique_top_level_function(&file, "review")?;
@@ -446,17 +473,27 @@ fn verify_codex_review_exception(source: &str) -> Result<(), String> {
         .filter(|local| codex_review_initializer(local).is_ok())
         .count();
 
-    if matches == 1 {
-        Ok(())
-    } else {
-        Err(format!(
+    if matches != 1 {
+        return Err(format!(
             "expected one exact read-only Codex review initializer, found {matches}"
-        ))
+        ));
     }
+
+    verify_codex_review_request(review)
 }
 
 fn codex_review_initializer(local: &Local) -> Result<(), String> {
     reject_gated_attributes(&local.attrs, "Codex review binding")?;
+    let suppression_count = local
+        .attrs
+        .iter()
+        .filter(|attribute| suppresses_disallowed_methods(attribute))
+        .count();
+    if suppression_count != 1 {
+        return Err(format!(
+            "Codex review binding needs exactly one local `clippy::disallowed_methods` suppression, found {suppression_count}"
+        ));
+    }
     let init = local
         .init
         .as_ref()
@@ -503,6 +540,126 @@ fn codex_review_initializer(local: &Local) -> Result<(), String> {
         return Err("Codex review must use its configured timeout".to_string());
     }
     Ok(())
+}
+
+fn verify_codex_review_request(review: &ItemFn) -> Result<(), String> {
+    let mut calls = AgentReviewCallCollector::default();
+    calls.visit_block(&review.block);
+    let [call] = calls.calls.as_slice() else {
+        return Err(format!(
+            "expected one direct `agent.execute_review` call, found {}",
+            calls.calls.len()
+        ));
+    };
+    if call.turbofish.is_some() || call.args.len() != 1 || has_gate(&call.attrs) {
+        return Err("Codex review call shape changed".to_string());
+    }
+    let Expr::Struct(request) = call.args.first().expect("review call has one argument") else {
+        return Err("Codex review must construct `CodexReviewRequest` directly".to_string());
+    };
+    if request.qself.is_some()
+        || !path_ends_with(&request.path, &["CodexReviewRequest"])
+        || request.rest.is_some()
+        || has_gate(&request.attrs)
+    {
+        return Err("Codex review request construction changed".to_string());
+    }
+
+    require_request_field(request, "sandbox_mode", |expression| {
+        is_exact_expr_path(expression, "SandboxMode::ReadOnlyWithNetwork")
+    })?;
+    require_request_field(request, "approval_policy", is_never_approval_policy)?;
+    require_request_field(request, "model", |expression| {
+        is_some_review_config_field(expression, "model")
+    })?;
+    require_request_field(request, "reasoning_effort", |expression| {
+        is_some_review_config_field(expression, "reasoning_effort")
+    })?;
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct AgentReviewCallCollector<'ast> {
+    calls: Vec<&'ast ExprMethodCall>,
+}
+
+impl<'ast> Visit<'ast> for AgentReviewCallCollector<'ast> {
+    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+        if call.method == "execute_review" && is_exact_expr_path(&call.receiver, "agent") {
+            self.calls.push(call);
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_async(&mut self, _expression: &'ast syn::ExprAsync) {}
+
+    fn visit_expr_closure(&mut self, _expression: &'ast syn::ExprClosure) {}
+
+    fn visit_item(&mut self, _item: &'ast Item) {}
+}
+
+fn require_request_field(
+    request: &ExprStruct,
+    name: &str,
+    predicate: impl FnOnce(&Expr) -> bool,
+) -> Result<(), String> {
+    let matches = request
+        .fields
+        .iter()
+        .filter(|field| matches!(&field.member, Member::Named(field_name) if field_name == name))
+        .collect::<Vec<_>>();
+    let [field] = matches.as_slice() else {
+        return Err(format!(
+            "Codex review request needs exactly one `{name}` field, found {}",
+            matches.len()
+        ));
+    };
+    if has_gate(&field.attrs) || !predicate(&field.expr) {
+        return Err(format!("Codex review request `{name}` changed"));
+    }
+    Ok(())
+}
+
+fn is_never_approval_policy(expression: &Expr) -> bool {
+    let Expr::Call(some) = expression else {
+        return false;
+    };
+    if some.args.len() != 1 || !call_matches(some, "Some") {
+        return false;
+    }
+    let Some(Expr::MethodCall(to_string)) = some.args.first() else {
+        return false;
+    };
+    to_string.method == "to_string"
+        && to_string.turbofish.is_none()
+        && to_string.args.is_empty()
+        && matches!(
+            to_string.receiver.as_ref(),
+            Expr::Lit(literal) if matches!(&literal.lit, Lit::Str(value) if value.value() == "never")
+        )
+}
+
+fn suppresses_disallowed_methods(attribute: &Attribute) -> bool {
+    if !attribute
+        .path()
+        .segments
+        .last()
+        .is_some_and(|segment| matches!(segment.ident.to_string().as_str(), "allow" | "expect"))
+    {
+        return false;
+    }
+
+    let syn::Meta::List(arguments) = &attribute.meta else {
+        return false;
+    };
+    arguments
+        .tokens
+        .to_string()
+        .split_whitespace()
+        .collect::<String>()
+        .split(',')
+        .any(|lint| lint == "clippy::disallowed_methods")
 }
 
 fn is_review_config_clone(expression: &Expr, field: &str) -> bool {
@@ -589,211 +746,5 @@ fn collect_rust_sources(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()
 }
 
 #[cfg(test)]
-mod regressions {
-    use super::*;
-
-    const LET_CONTRACT: EntryContract = EntryContract {
-        relative_path: "fixture.rs",
-        function: "run",
-        builder: REGISTRY_BUILDER,
-        expected_use: ExpectedUse::LetBinding("agent_registry"),
-    };
-    const TAIL_CONTRACT: EntryContract = EntryContract {
-        relative_path: "fixture.rs",
-        function: "create_agent",
-        builder: CLAUDE_BUILDER,
-        expected_use: ExpectedUse::TailExpression,
-    };
-
-    #[test]
-    fn direct_ungated_binding_with_later_use_passes() {
-        expect_pass(
-            r#"
-            fn run() {
-                let agent_registry =
-                    harness_agents::builder::registry_from_config()?;
-                consume(&agent_registry);
-            }
-            "#,
-            LET_CONTRACT,
-        );
-    }
-
-    #[test]
-    fn function_and_statement_test_gates_fail_closed() {
-        for source in [
-            gated_function("#[test]"),
-            gated_function("#[cfg(unix)]"),
-            gated_function("#[cfg_attr(test, test)]"),
-            r#"
-            fn run() {
-                #[cfg(unix)]
-                let agent_registry =
-                    harness_agents::builder::registry_from_config()?;
-                consume(agent_registry);
-            }
-            "#
-            .to_string(),
-        ] {
-            expect_reject(&source, LET_CONTRACT);
-        }
-    }
-
-    #[test]
-    fn nested_const_closure_and_local_function_bait_do_not_pass() {
-        for source in [
-            r#"
-            fn run() {
-                {
-                    let agent_registry =
-                        harness_agents::builder::registry_from_config()?;
-                    consume(agent_registry);
-                }
-            }
-            "#,
-            r#"
-            fn run() {
-                let _bait = || harness_agents::builder::registry_from_config();
-            }
-            "#,
-            r#"
-            fn run() {
-                const BAIT: () = {
-                    harness_agents::builder::registry_from_config();
-                };
-            }
-            "#,
-            r#"
-            fn run() {
-                fn bait() {
-                    harness_agents::builder::registry_from_config();
-                }
-            }
-            "#,
-        ] {
-            expect_reject(source, LET_CONTRACT);
-        }
-    }
-
-    #[test]
-    fn unreachable_shadowed_and_unused_bindings_are_rejected() {
-        for source in [
-            r#"
-            fn run() {
-                return;
-                let agent_registry =
-                    harness_agents::builder::registry_from_config()?;
-                consume(agent_registry);
-            }
-            "#,
-            r#"
-            fn run() {
-                let agent_registry =
-                    harness_agents::builder::registry_from_config()?;
-                let agent_registry = replacement();
-                consume(agent_registry);
-            }
-            "#,
-            r#"
-            fn run() {
-                let agent_registry =
-                    harness_agents::builder::registry_from_config()?;
-                consume_something_else();
-            }
-            "#,
-        ] {
-            expect_reject(source, LET_CONTRACT);
-        }
-    }
-
-    #[test]
-    fn builder_alias_is_not_treated_as_the_canonical_call() {
-        expect_reject(
-            r#"
-            use harness_agents::builder::registry_from_config as build_registry;
-            fn run() {
-                let agent_registry = build_registry()?;
-                consume(agent_registry);
-            }
-            "#,
-            LET_CONTRACT,
-        );
-    }
-
-    #[test]
-    fn direct_ungated_reachable_tail_call_passes() {
-        expect_pass(
-            r#"
-            fn create_agent() {
-                harness_agents::builder::claude_agent_from_config()
-            }
-            "#,
-            TAIL_CONTRACT,
-        );
-    }
-
-    #[test]
-    fn tail_call_bait_and_unreachable_tail_are_rejected() {
-        for source in [
-            r#"
-            fn create_agent() {
-                || harness_agents::builder::claude_agent_from_config()
-            }
-            "#,
-            r#"
-            fn create_agent() {
-                {
-                    harness_agents::builder::claude_agent_from_config()
-                }
-            }
-            "#,
-            r#"
-            fn create_agent() {
-                return fallback();
-                harness_agents::builder::claude_agent_from_config()
-            }
-            "#,
-        ] {
-            expect_reject(source, TAIL_CONTRACT);
-        }
-    }
-
-    #[test]
-    fn review_exception_rejects_a_non_read_only_sandbox() {
-        let source = r#"
-            fn review() {
-                let mut agent = CodexAgent::new(
-                    review_config.cli_path.clone(),
-                    SandboxMode::DangerFullAccess,
-                )
-                .with_stream_timeout(Some(review_config.timeout_secs));
-            }
-        "#;
-        assert!(verify_codex_review_exception(source).is_err());
-    }
-
-    fn gated_function(attribute: &str) -> String {
-        format!(
-            r#"
-            {attribute}
-            fn run() {{
-                let agent_registry =
-                    harness_agents::builder::registry_from_config()?;
-                consume(agent_registry);
-            }}
-            "#
-        )
-    }
-
-    fn expect_pass(source: &str, contract: EntryContract) {
-        verify_entry_contract(source, contract)
-            .unwrap_or_else(|error| panic!("fixture should pass: {error}"));
-    }
-
-    fn expect_reject(source: &str, contract: EntryContract) {
-        assert!(
-            verify_entry_contract(source, contract).is_err(),
-            "fixture should be rejected"
-        );
-    }
-}
+#[path = "support/agent_registry_guard_regressions.rs"]
+mod regressions;

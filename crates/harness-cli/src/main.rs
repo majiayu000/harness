@@ -1,5 +1,5 @@
 #![allow(clippy::manual_map, clippy::needless_return, clippy::ptr_arg)]
-#![deny(clippy::disallowed_methods)]
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use clap::Parser;
 

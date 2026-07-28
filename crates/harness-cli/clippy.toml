@@ -2,8 +2,17 @@
 # configured CLI construction on the shared builder by linting resolved HIR.
 disallowed-methods = [
     { path = "harness_agents::registry::AgentRegistry::new", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::registry::AgentRegistry::register", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::registry::AgentRegistry::register_adapter", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::registry::AgentRegistry::register_adapter_with_strategy", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::registry::AgentRegistry::register_adapter_factory_with_strategy", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::registry::AgentRegistry::set_complexity_preferences", reason = "Use harness_agents::builder::registry_from_config." },
     { path = "harness_agents::claude::ClaudeCodeAgent::new", reason = "Use harness_agents::builder::claude_agent_from_config or registry_from_config." },
+    { path = "harness_agents::claude::ClaudeCodeAgent::with_provider_backpressure_gate", reason = "Use harness_agents::builder::claude_agent_from_config or registry_from_config." },
     { path = "harness_agents::claude_adapter::ClaudeAdapter::new", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::claude_adapter::ClaudeAdapter::with_provider_backpressure_gate", reason = "Use harness_agents::builder::registry_from_config." },
+    { path = "harness_agents::codex::CodexAgent::new", reason = "Use harness_agents::builder::codex_agent_from_config or registry_from_config; cmd/pr.rs has the only reviewed exception." },
+    { path = "harness_agents::codex::CodexAgent::with_cloud", reason = "Use harness_agents::builder::codex_agent_from_config or registry_from_config." },
     { path = "harness_agents::codex::CodexAgent::from_config", reason = "Use harness_agents::builder::registry_from_config." },
     { path = "harness_agents::codex_adapter::CodexAdapter::new", reason = "Use harness_agents::builder::registry_from_config." },
     { path = "harness_agents::codex_adapter::CodexAdapter::from_config", reason = "Use harness_agents::builder::registry_from_config." },
@@ -11,4 +20,8 @@ disallowed-methods = [
     { path = "harness_agents::anthropic_api::AnthropicApiAgent::from_config", reason = "Use harness_agents::builder::registry_from_config." },
     { path = "harness_agents::provider_backpressure::ProviderBackpressureGate::disabled", reason = "Use harness_agents::builder::registry_from_config." },
     { path = "harness_agents::provider_backpressure::ProviderBackpressureGate::from_claude_config", reason = "Use harness_agents::builder::registry_from_config." },
+]
+
+disallowed-types = [
+    { path = "harness_agents::provider_backpressure::ProviderBackpressureGate", reason = "Provider gates are configured inside harness_agents::builder." },
 ]

@@ -109,6 +109,7 @@ pub async fn review(
         anyhow::bail!("codex_cli_review requires a non-empty base ref");
     }
 
+    #[allow(clippy::disallowed_methods)]
     let mut agent = CodexAgent::new(
         review_config.cli_path.clone(),
         SandboxMode::ReadOnlyWithNetwork,
