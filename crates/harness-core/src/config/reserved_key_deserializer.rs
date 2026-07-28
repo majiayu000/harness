@@ -189,6 +189,9 @@ where
         (visit_f32, f32),
         (visit_f64, f64),
         (visit_char, char),
+        (visit_bytes, &[u8]),
+        (visit_borrowed_bytes, &'de [u8]),
+        (visit_byte_buf, Vec<u8>),
     );
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -264,27 +267,6 @@ where
         self.delegate
             .visit_enum(Tracked::new(data, self.path.nested()))
     }
-
-    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.delegate.visit_bytes(value)
-    }
-
-    fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.delegate.visit_borrowed_bytes(value)
-    }
-
-    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.delegate.visit_byte_buf(value)
-    }
 }
 
 impl<'de, S> DeserializeSeed<'de> for Tracked<S>
@@ -347,17 +329,20 @@ where
     where
         S: DeserializeSeed<'de>,
     {
-        self.key = None;
+        let mut captured = CapturedKey::default();
         let value = self
             .delegate
-            .next_key_seed(CaptureKey::new(seed, &mut self.key))?;
-        if let Some(key) = self.key.as_deref() {
-            if let Some(field) = completion_evidence_config_field(key) {
-                if !self.path.allows_completion_evidence_field(key) {
-                    return Err(A::Error::custom(format!("unknown field `{field}`")));
-                }
+            .next_key_seed(CaptureKey::direct(seed, &mut captured))?;
+        if let Some(field) = captured.first_reserved {
+            let allowed = captured
+                .direct_key
+                .as_deref()
+                .is_some_and(|key| self.path.allows_completion_evidence_field(key));
+            if !allowed {
+                return Err(A::Error::custom(format!("unknown field `{field}`")));
             }
         }
+        self.key = captured.direct_key;
         Ok(value)
     }
 
@@ -430,14 +415,48 @@ where
     }
 }
 
+#[derive(Default)]
+struct CapturedKey {
+    direct_key: Option<String>,
+    first_reserved: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+enum KeyContent {
+    Direct,
+    Compound,
+}
+
 struct CaptureKey<'a, T> {
     delegate: T,
-    key: &'a mut Option<String>,
+    captured: &'a mut CapturedKey,
+    content: KeyContent,
 }
 
 impl<'a, T> CaptureKey<'a, T> {
-    fn new(delegate: T, key: &'a mut Option<String>) -> Self {
-        Self { delegate, key }
+    fn direct(delegate: T, captured: &'a mut CapturedKey) -> Self {
+        Self::new(delegate, captured, KeyContent::Direct)
+    }
+
+    fn compound(delegate: T, captured: &'a mut CapturedKey) -> Self {
+        Self::new(delegate, captured, KeyContent::Compound)
+    }
+
+    fn new(delegate: T, captured: &'a mut CapturedKey, content: KeyContent) -> Self {
+        Self {
+            delegate,
+            captured,
+            content,
+        }
+    }
+
+    fn record(&mut self, value: &str) {
+        if matches!(self.content, KeyContent::Direct) && self.captured.direct_key.is_none() {
+            self.captured.direct_key = Some(value.to_owned());
+        }
+        if self.captured.first_reserved.is_none() {
+            self.captured.first_reserved = completion_evidence_config_field(value);
+        }
     }
 }
 
@@ -452,7 +471,7 @@ where
         D: Deserializer<'de>,
     {
         self.delegate
-            .deserialize(CaptureKey::new(deserializer, self.key))
+            .deserialize(CaptureKey::new(deserializer, self.captured, self.content))
     }
 }
 
@@ -463,7 +482,8 @@ macro_rules! forward_capture_deserializer {
             where
                 V: Visitor<'de>,
             {
-                self.delegate.$method(CaptureKey::new(visitor, self.key))
+                self.delegate
+                    .$method(CaptureKey::new(visitor, self.captured, self.content))
             }
         )+
     };
@@ -477,7 +497,10 @@ macro_rules! forward_capture_deserializer_with_args {
                 V: Visitor<'de>,
             {
                 self.delegate
-                    .$method($($arg,)* CaptureKey::new(visitor, self.key))
+                    .$method(
+                        $($arg,)*
+                        CaptureKey::new(visitor, self.captured, self.content),
+                    )
             }
         )+
     };
@@ -536,7 +559,7 @@ where
         // Ignored map keys need the same recursive treatment as ignored
         // values; otherwise compound keys can hide reserved nested fields.
         self.delegate
-            .deserialize_any(CaptureKey::new(visitor, self.key))
+            .deserialize_any(CaptureKey::new(visitor, self.captured, self.content))
     }
 }
 
@@ -565,29 +588,32 @@ where
         (visit_f32, f32),
         (visit_f64, f64),
         (visit_char, char),
+        (visit_bytes, &[u8]),
+        (visit_borrowed_bytes, &'de [u8]),
+        (visit_byte_buf, Vec<u8>),
     );
 
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    fn visit_str<E>(mut self, value: &str) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        *self.key = Some(value.to_owned());
+        self.record(value);
         self.delegate.visit_str(value)
     }
 
-    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    fn visit_borrowed_str<E>(mut self, value: &'de str) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        *self.key = Some(value.to_owned());
+        self.record(value);
         self.delegate.visit_borrowed_str(value)
     }
 
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    fn visit_string<E>(mut self, value: String) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        *self.key = Some(value.clone());
+        self.record(&value);
         self.delegate.visit_string(value)
     }
 
@@ -610,7 +636,7 @@ where
         D: Deserializer<'de>,
     {
         self.delegate
-            .visit_some(CaptureKey::new(deserializer, self.key))
+            .visit_some(CaptureKey::compound(deserializer, self.captured))
     }
 
     fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
@@ -618,7 +644,7 @@ where
         D: Deserializer<'de>,
     {
         self.delegate
-            .visit_newtype_struct(CaptureKey::new(deserializer, self.key))
+            .visit_newtype_struct(CaptureKey::compound(deserializer, self.captured))
     }
 
     fn visit_seq<A>(self, sequence: A) -> Result<Self::Value, A::Error>
@@ -626,7 +652,7 @@ where
         A: SeqAccess<'de>,
     {
         self.delegate
-            .visit_seq(Tracked::new(sequence, ConfigPath::NON_CANONICAL))
+            .visit_seq(CaptureKey::compound(sequence, self.captured))
     }
 
     fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
@@ -634,35 +660,61 @@ where
         A: MapAccess<'de>,
     {
         self.delegate
-            .visit_map(TrackedMap::new(map, ConfigPath::NON_CANONICAL))
+            .visit_map(CaptureKey::compound(map, self.captured))
     }
 
     fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
     where
         A: EnumAccess<'de>,
     {
-        self.delegate.visit_enum(CaptureKey::new(data, self.key))
+        self.delegate
+            .visit_enum(CaptureKey::compound(data, self.captured))
+    }
+}
+
+impl<'a, 'de, A> SeqAccess<'de> for CaptureKey<'a, A>
+where
+    A: SeqAccess<'de>,
+{
+    type Error = A::Error;
+
+    fn next_element_seed<S>(&mut self, seed: S) -> Result<Option<S::Value>, A::Error>
+    where
+        S: DeserializeSeed<'de>,
+    {
+        self.delegate
+            .next_element_seed(CaptureKey::compound(seed, &mut *self.captured))
     }
 
-    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+    fn size_hint(&self) -> Option<usize> {
+        self.delegate.size_hint()
+    }
+}
+
+impl<'a, 'de, A> MapAccess<'de> for CaptureKey<'a, A>
+where
+    A: MapAccess<'de>,
+{
+    type Error = A::Error;
+
+    fn next_key_seed<S>(&mut self, seed: S) -> Result<Option<S::Value>, A::Error>
     where
-        E: de::Error,
+        S: DeserializeSeed<'de>,
     {
-        self.delegate.visit_bytes(value)
+        self.delegate
+            .next_key_seed(CaptureKey::compound(seed, &mut *self.captured))
     }
 
-    fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
+    fn next_value_seed<S>(&mut self, seed: S) -> Result<S::Value, A::Error>
     where
-        E: de::Error,
+        S: DeserializeSeed<'de>,
     {
-        self.delegate.visit_borrowed_bytes(value)
+        self.delegate
+            .next_value_seed(CaptureKey::compound(seed, &mut *self.captured))
     }
 
-    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.delegate.visit_byte_buf(value)
+    fn size_hint(&self) -> Option<usize> {
+        self.delegate.size_hint()
     }
 }
 
@@ -677,10 +729,10 @@ where
     where
         S: DeserializeSeed<'de>,
     {
-        let (value, variant) = self
-            .delegate
-            .variant_seed(CaptureKey::new(seed, &mut *self.key))?;
-        Ok((value, CaptureKey::new(variant, self.key)))
+        let (value, variant) =
+            self.delegate
+                .variant_seed(CaptureKey::new(seed, &mut *self.captured, self.content))?;
+        Ok((value, CaptureKey::new(variant, self.captured, self.content)))
     }
 }
 
@@ -699,7 +751,7 @@ where
         S: DeserializeSeed<'de>,
     {
         self.delegate
-            .newtype_variant_seed(CaptureKey::new(seed, self.key))
+            .newtype_variant_seed(CaptureKey::new(seed, self.captured, self.content))
     }
 
     fn tuple_variant<V>(self, len: usize, visitor: V) -> Result<V::Value, A::Error>
@@ -707,7 +759,7 @@ where
         V: Visitor<'de>,
     {
         self.delegate
-            .tuple_variant(len, CaptureKey::new(visitor, self.key))
+            .tuple_variant(len, CaptureKey::new(visitor, self.captured, self.content))
     }
 
     fn struct_variant<V>(
@@ -718,7 +770,9 @@ where
     where
         V: Visitor<'de>,
     {
-        self.delegate
-            .struct_variant(fields, CaptureKey::new(visitor, self.key))
+        self.delegate.struct_variant(
+            fields,
+            CaptureKey::new(visitor, self.captured, self.content),
+        )
     }
 }

@@ -356,17 +356,43 @@ fn harness_config_scans_json_arrays_in_extensions() {
 #[test]
 fn harness_config_scans_compound_yaml_keys_in_extensions() {
     let compound_keys = [
-        serde_yaml::Value::Mapping(yaml_mapping_with(
+        (
+            serde_yaml::Value::Mapping(yaml_mapping_with(
+                "completion_evidence_enforced",
+                serde_yaml::Value::Bool(false),
+            )),
             "completion_evidence_enforced",
-            serde_yaml::Value::Bool(false),
-        )),
-        serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(yaml_mapping_with(
+        ),
+        (
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(yaml_mapping_with(
+                "completion_evidence_enforced",
+                serde_yaml::Value::Bool(false),
+            ))]),
             "completion_evidence_enforced",
-            serde_yaml::Value::Bool(false),
-        ))]),
+        ),
+        (
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("completion_evidence_enforced".to_owned()),
+                serde_yaml::Value::String("mode".to_owned()),
+            ]),
+            "completion_evidence_enforced",
+        ),
+        (
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(
+                "runtime_completion_evidence_enforced".to_owned(),
+            )]),
+            "runtime_completion_evidence_enforced",
+        ),
+        (
+            serde_yaml::Value::Mapping(yaml_mapping_with(
+                "mode",
+                serde_yaml::Value::String("completion_evidence_enforced".to_owned()),
+            )),
+            "completion_evidence_enforced",
+        ),
     ];
 
-    for (case_index, compound_key) in compound_keys.into_iter().enumerate() {
+    for (case_index, (compound_key, field)) in compound_keys.into_iter().enumerate() {
         let mut yaml =
             serde_yaml::to_value(HarnessConfig::default()).expect("default config must serialize");
         let mut extension = serde_yaml::Mapping::new();
@@ -383,7 +409,7 @@ fn harness_config_scans_compound_yaml_keys_in_extensions() {
         assert!(
             error
                 .to_string()
-                .contains("unknown field `completion_evidence_enforced`"),
+                .contains(&format!("unknown field `{field}`")),
             "compound-key case {case_index}: {error}"
         );
     }
@@ -396,8 +422,8 @@ fn reserved_key_deserializer_scans_tagged_compound_map_keys() {
     let tagged_key = serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
         tag: serde_yaml::value::Tag::new("scope"),
         value: serde_yaml::Value::Mapping(yaml_mapping_with(
-            "completion_evidence_enforced",
-            serde_yaml::Value::Bool(false),
+            "mode",
+            serde_yaml::Value::String("completion_evidence_enforced".to_owned()),
         )),
     }));
     let mut yaml = serde_yaml::Mapping::new();
@@ -436,6 +462,10 @@ fn harness_config_accepts_unrelated_compound_yaml_keys_in_extensions() {
     let compound_keys = [
         serde_yaml::Value::Mapping(nested.clone()),
         serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(nested)]),
+        serde_yaml::Value::Sequence(vec![
+            serde_yaml::Value::String("mode".to_owned()),
+            serde_yaml::Value::String("audit".to_owned()),
+        ]),
     ];
 
     for compound_key in compound_keys {
@@ -443,6 +473,10 @@ fn harness_config_accepts_unrelated_compound_yaml_keys_in_extensions() {
             serde_yaml::to_value(HarnessConfig::default()).expect("default config must serialize");
         let mut extension = serde_yaml::Mapping::new();
         extension.insert(compound_key, serde_yaml::Value::Null);
+        extension.insert(
+            serde_yaml::Value::String("literal_value".to_owned()),
+            serde_yaml::Value::String("completion_evidence_enforced".to_owned()),
+        );
         yaml.as_mapping_mut()
             .expect("config must serialize as a map")
             .insert(
@@ -623,8 +657,7 @@ operator_extension:
 }
 
 #[test]
-fn project_workflow_rejects_reserved_keys_in_sequences_tags_and_dotted_keys() -> anyhow::Result<()>
-{
+fn project_and_base_workflows_reject_reserved_keys_in_compound_keys() -> anyhow::Result<()> {
     let cases = [
         (
             "operator_extension:\n  values:\n    - completion_evidence_enforced: false",
@@ -640,6 +673,18 @@ fn project_workflow_rejects_reserved_keys_in_sequences_tags_and_dotted_keys() ->
         ),
         (
             "\"workflow.completion_evidence_enforced\": false",
+            "completion_evidence_enforced",
+        ),
+        (
+            "operator_extension:\n  ? [completion_evidence_enforced, mode]\n  : null",
+            "completion_evidence_enforced",
+        ),
+        (
+            "operator_extension:\n  ? {mode: runtime_completion_evidence_enforced}\n  : null",
+            "runtime_completion_evidence_enforced",
+        ),
+        (
+            "operator_extension:\n  ? !scope {mode: completion_evidence_enforced}\n  : null",
             "completion_evidence_enforced",
         ),
     ];
@@ -658,29 +703,24 @@ fn project_workflow_rejects_reserved_keys_in_sequences_tags_and_dotted_keys() ->
                 .contains(&format!("unknown field `{field}`")),
             "{error}"
         );
+
+        let base_dir = tempfile::tempdir()?;
+        let project_dir = tempfile::tempdir()?;
+        let base_path = base_dir.path().join("WORKFLOW.md");
+        std::fs::write(&base_path, format!("---\n{front_matter}\n---\n"))?;
+        std::fs::write(
+            project_dir.path().join("WORKFLOW.md"),
+            "---\noperator_extension: replaced\n---\n",
+        )?;
+        let error = load_workflow_document_with_base(project_dir.path(), Some(&base_path))
+            .expect_err("a repo override must not hide a reserved key in the base workflow");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unknown field `{field}`")),
+            "{error}"
+        );
     }
-    Ok(())
-}
-
-#[test]
-fn project_workflow_validates_base_before_overriding_extension() -> anyhow::Result<()> {
-    let base_dir = tempfile::tempdir()?;
-    let project_dir = tempfile::tempdir()?;
-    let base_path = base_dir.path().join("WORKFLOW.md");
-    std::fs::write(
-        &base_path,
-        "---\noperator_extension:\n  completion_evidence_enforced: false\n---\n",
-    )?;
-    std::fs::write(
-        project_dir.path().join("WORKFLOW.md"),
-        "---\noperator_extension: replaced\n---\n",
-    )?;
-
-    let error = load_workflow_document_with_base(project_dir.path(), Some(&base_path))
-        .expect_err("a repo override must not hide a reserved key in the base workflow");
-    assert!(error
-        .to_string()
-        .contains("unknown field `completion_evidence_enforced`"));
     Ok(())
 }
 
