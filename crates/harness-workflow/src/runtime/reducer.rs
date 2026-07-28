@@ -23,6 +23,9 @@ use self::github_issue_completion::{
     github_issue_closed_decision, issue_implementation_missing_result_decision,
     merged_pr_from_activity_result, scope_too_large_decision,
 };
+pub(crate) use self::github_issue_completion::{
+    pr_binding_verification_blocked_decision, verified_pr_binding_evidence,
+};
 use self::plan_issue_completion::issue_plan_decision_from_activity_result;
 use self::pr_feedback_completion::{
     local_review_decision_from_activity_result,
@@ -466,7 +469,58 @@ fn workflow_decision_from_activity_result(
         .find_map(|artifact| {
             serde_json::from_value::<WorkflowDecision>(artifact.artifact.clone()).ok()
         })
-        .map(|decision| decision.with_evidence(runtime_completion_evidence(event, result)))
+        .map(|decision| {
+            // GH-1766: the decision body is agent-authored, so it may not
+            // assert server-owned evidence classes. Drop any it claims and
+            // re-mint only the classes the server itself proved from its own
+            // reserved artifacts.
+            let mut decision = strip_server_owned_evidence(decision);
+            for evidence in server_owned_evidence_for_result(result) {
+                decision = decision.with_evidence(evidence);
+            }
+            decision.with_evidence(runtime_completion_evidence(event, result))
+        })
+}
+
+/// Evidence classes that only the server may assert.
+const SERVER_OWNED_EVIDENCE_KINDS: [&str; 3] = [
+    crate::runtime::completion_evidence::EVIDENCE_VERIFIED_PR_BINDING,
+    crate::runtime::completion_evidence::EVIDENCE_SERVER_VALIDATION_DIGEST,
+    crate::runtime::completion_evidence::EVIDENCE_GITHUB_TERMINAL,
+];
+
+fn strip_server_owned_evidence(mut decision: WorkflowDecision) -> WorkflowDecision {
+    decision
+        .evidence
+        .retain(|evidence| !SERVER_OWNED_EVIDENCE_KINDS.contains(&evidence.kind.as_str()));
+    decision
+}
+
+/// Server-owned evidence the runtime can vouch for, derived from the
+/// server-authored artifacts on this result.
+fn server_owned_evidence_for_result(
+    result: &ActivityResult,
+) -> Vec<crate::runtime::model::WorkflowEvidence> {
+    use crate::runtime::completion_evidence::{
+        server_validation_digest_passed, verified_pr_binding_artifact,
+        EVIDENCE_SERVER_VALIDATION_DIGEST, EVIDENCE_VERIFIED_PR_BINDING,
+    };
+    use crate::runtime::model::WorkflowEvidence;
+
+    let mut evidence = Vec::new();
+    if let Some(verified) = verified_pr_binding_artifact(result) {
+        evidence.push(WorkflowEvidence::new(
+            EVIDENCE_VERIFIED_PR_BINDING,
+            verified.to_string(),
+        ));
+    }
+    if server_validation_digest_passed(result) {
+        evidence.push(WorkflowEvidence::new(
+            EVIDENCE_SERVER_VALIDATION_DIGEST,
+            "server validation digest recorded all commands exiting zero",
+        ));
+    }
+    evidence
 }
 
 fn structured_decision_validates(

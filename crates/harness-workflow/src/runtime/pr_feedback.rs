@@ -135,6 +135,16 @@ pub fn build_pr_detected_decision(
         format!("pr-detected:{}:{}", input.task_id, input.pr_number),
     ))
     .with_evidence(WorkflowEvidence::new("pr", input.pr_url))
+    // PR detection is driven by a server-observed GitHub event or API
+    // response for this PR, so the binding is server-verified by origin
+    // (GH-1766, B-005).
+    .with_evidence(WorkflowEvidence::new(
+        super::completion_evidence::EVIDENCE_VERIFIED_PR_BINDING,
+        format!(
+            "server_observed_pr_event pr={} url={}",
+            input.pr_number, input.pr_url
+        ),
+    ))
     .high_confidence();
 
     PrFeedbackDecisionOutput {

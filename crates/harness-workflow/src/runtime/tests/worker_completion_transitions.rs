@@ -33,6 +33,19 @@ async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> any
                     "pr_number": 77,
                     "pr_url": "https://github.com/owner/repo/pull/77",
                 }),
+            ))
+            // `implementing -> pr_open` mints a fact, so it requires the
+            // server's own verification of the claimed PR (GH-1766). In
+            // production the runtime worker's executor attaches this after
+            // resolving the PR through GitHub; the static test executor
+            // stands in for that executor and must carry the same contract.
+            .with_artifact(ActivityArtifact::new(
+                ARTIFACT_VERIFIED_PR_BINDING,
+                json!({
+                    "pr_number": 77,
+                    "repo": "owner/repo",
+                    "state": "OPEN",
+                }),
             )),
     };
 

@@ -42,7 +42,18 @@ async fn runtime_worker_propagates_quality_gate_child_pass_to_parent() -> anyhow
                 QUALITY_PASSED_SIGNAL,
                 json!({ "validation": "passed" }),
             ))
-            .with_validation(ValidationRecord::new("cargo check", "passed")),
+            .with_validation(ValidationRecord::new("cargo check", "passed"))
+            // `checking -> passed` mints a fact, so it requires the digest of
+            // the server's own re-execution of the validation commands
+            // (GH-1766), not the agent's claim that they passed. In production
+            // the runtime worker's executor attaches this; the static test
+            // executor stands in for it and must carry the same contract.
+            .with_artifact(ActivityArtifact::new(
+                ARTIFACT_SERVER_VALIDATION_DIGEST,
+                json!({ "commands": [
+                    { "command": "cargo check", "exit_code": 0, "output_sha256": "d0" },
+                ]}),
+            )),
     };
 
     let completed = worker

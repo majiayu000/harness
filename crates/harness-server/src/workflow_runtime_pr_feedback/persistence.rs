@@ -478,6 +478,12 @@ pub(super) async fn persist_pr_merged(
         "pr_merged",
         ctx.pr_url.unwrap_or("merged externally"),
     ))
+    // A server-observed merge is the terminal proof the `-> done` contract
+    // requires (GH-1766); the agent never asserts this.
+    .with_evidence(WorkflowEvidence::new(
+        harness_workflow::runtime::completion_evidence::EVIDENCE_GITHUB_TERMINAL,
+        ctx.pr_url.unwrap_or("merged externally"),
+    ))
     .high_confidence();
     commit_runtime_decision(
         store,

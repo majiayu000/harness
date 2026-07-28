@@ -115,6 +115,137 @@ fn transition_allowlist_keeps_rule_metadata() {
     assert_eq!(compiled.required_evidence.len(), 2);
 }
 
+/// GH-1766 Evidence Contract table test: every contracted transition of the
+/// built-in definitions requires exactly the named evidence class, and every
+/// other explicit rule keeps an empty requirement set.
+#[test]
+fn builtin_evidence_contract_matches_spec_table() {
+    use crate::runtime::completion_evidence::{
+        EVIDENCE_GITHUB_TERMINAL, EVIDENCE_PROMPT_COMPLETION, EVIDENCE_SERVER_PR_SNAPSHOT,
+        EVIDENCE_SERVER_VALIDATION_DIGEST, EVIDENCE_VERIFIED_PR_BINDING,
+    };
+
+    /// definition id, its allowlist, and the contracted
+    /// `(from, to, required evidence kinds)` rows from `product.md`.
+    type EvidenceContract = (&'static str, TransitionAllowlist, Vec<ContractRow>);
+    type ContractRow = (&'static str, &'static str, Vec<&'static str>);
+
+    let contract: &[EvidenceContract] = &[
+        (
+            "github_issue_pr",
+            TransitionAllowlist::github_issue_pr_defaults(),
+            vec![
+                (
+                    "implementing",
+                    "pr_open",
+                    vec![EVIDENCE_VERIFIED_PR_BINDING],
+                ),
+                ("implementing", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                ("pr_open", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                ("awaiting_feedback", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                (
+                    "addressing_feedback",
+                    "done",
+                    vec![EVIDENCE_GITHUB_TERMINAL],
+                ),
+                (
+                    "quality_gate_pending",
+                    "done",
+                    vec![EVIDENCE_GITHUB_TERMINAL],
+                ),
+                ("ready_to_merge", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                ("merging", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+            ],
+        ),
+        (
+            "quality_gate",
+            TransitionAllowlist::quality_gate_defaults(),
+            vec![(
+                "checking",
+                "passed",
+                vec![EVIDENCE_SERVER_VALIDATION_DIGEST],
+            )],
+        ),
+        (
+            "pr_feedback",
+            TransitionAllowlist::pr_feedback_defaults(),
+            vec![(
+                "inspecting",
+                "ready_to_merge",
+                vec![EVIDENCE_SERVER_PR_SNAPSHOT],
+            )],
+        ),
+        (
+            "prompt_task",
+            TransitionAllowlist::prompt_task_defaults(),
+            vec![("implementing", "done", vec![EVIDENCE_PROMPT_COMPLETION])],
+        ),
+    ];
+
+    for (definition, allowlist, required) in contract {
+        for (from, to, evidence) in required {
+            let rule = allowlist
+                .rule_for(from, to)
+                .unwrap_or_else(|| panic!("{definition}: missing rule {from} -> {to}"));
+            for kind in evidence {
+                assert!(
+                    rule.required_evidence.contains(*kind),
+                    "{definition}: {from} -> {to} must require `{kind}`"
+                );
+            }
+        }
+        for rule in allowlist.rules() {
+            let Some(from) = rule.from_state.as_deref() else {
+                assert!(
+                    rule.required_evidence.is_empty(),
+                    "{definition}: from_any rules must not carry evidence requirements"
+                );
+                continue;
+            };
+            let contracted = required.iter().any(|(contract_from, contract_to, _)| {
+                *contract_from == from && *contract_to == rule.to_state
+            });
+            assert_eq!(
+                !rule.required_evidence.is_empty(),
+                contracted,
+                "{definition}: {from} -> {} evidence requirement diverges from the contract table",
+                rule.to_state
+            );
+        }
+    }
+}
+
+/// GH-1766: a contracted transition rejects a decision missing its evidence
+/// class with the typed reason, and accepts the same decision carrying it.
+#[test]
+fn contracted_transition_rejects_without_evidence_and_accepts_with_it() {
+    use crate::runtime::completion_evidence::EVIDENCE_SERVER_VALIDATION_DIGEST;
+
+    let allowlist = TransitionAllowlist::quality_gate_defaults();
+    let Some(rule) = allowlist.rule_for("checking", "passed") else {
+        panic!("quality_gate defaults must declare checking -> passed");
+    };
+    let context = ValidationContext::new("runtime-worker", chrono::Utc::now());
+    let bare = WorkflowDecision::new("wf-1", "checking", "quality_passed", "passed", "test");
+    let rejection = validate_declarative_transition_metadata(rule, &bare, &context)
+        .expect_err("missing digest evidence must reject");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::MissingRequiredEvidence
+    );
+    assert!(rejection
+        .message
+        .contains(EVIDENCE_SERVER_VALIDATION_DIGEST));
+
+    let evidenced = bare.with_evidence(WorkflowEvidence::new(
+        EVIDENCE_SERVER_VALIDATION_DIGEST,
+        "server executed 2 validation command(s), all exit 0",
+    ));
+    if let Err(rejection) = validate_declarative_transition_metadata(rule, &evidenced, &context) {
+        panic!("digest evidence should satisfy the contract: {rejection}");
+    }
+}
+
 #[test]
 fn declarative_rule_rejects_a_missing_target_driver() {
     let mut driver_rule = rule(false);

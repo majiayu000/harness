@@ -241,6 +241,12 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     .as_ref()
                     .map(|workflow| workflow.definition_id.as_str()),
             );
+            // Agent output can never carry server-reserved evidence artifacts
+            // (GH-1766): strip before the server attaches its own.
+            let result =
+                harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(
+                    result,
+                );
             let result =
                 super::transcript_durability::attach_runtime_transcript_source(result, &turn)?
                     .with_artifact(repo_memory_config_artifact(memory_enabled));
@@ -249,9 +255,19 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             } else {
                 result
             };
-            Ok(
+            let result =
                 verify_merge_completion_if_needed(self.state, &job, workflow.as_ref(), result)
-                    .await,
+                    .await;
+            Ok(
+                super::completion_evidence_integration::apply_completion_evidence(
+                    self.state,
+                    &job,
+                    workflow.as_ref(),
+                    &workflow_document.config,
+                    &project_root,
+                    result,
+                )
+                .await,
             )
         }
         .await;

@@ -7,10 +7,12 @@ mod candidates;
 mod defaults;
 mod intake_binding;
 mod reserved_keys;
+mod runtime_completion;
 mod storage;
 pub use candidates::WorkflowCandidatesPolicy;
 use defaults::*;
 pub use intake_binding::{IntakeFilterPolicy, WorkflowDefinitionIntakePolicy};
+pub use runtime_completion::RuntimeCompletionPolicy;
 pub use storage::WorkflowStoragePolicy;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -357,6 +359,8 @@ pub struct WorkflowConfig {
     pub runtime_dispatch: RuntimeDispatchPolicy,
     #[serde(default)]
     pub runtime_worker: RuntimeWorkerPolicy,
+    #[serde(default)]
+    pub runtime_completion: RuntimeCompletionPolicy,
     #[serde(default)]
     pub runtime_retry_policy: RuntimeRetryPolicy,
     #[serde(default)]

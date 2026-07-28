@@ -80,7 +80,19 @@ pub(super) async fn apply_loaded_runtime_workflow_transition(
             "github_issue"
         },
         runtime_remote_evidence_summary(candidate),
-    ))
+    ));
+    // Reconciliation reaches `done` from the server's own GitHub observation
+    // — a merged PR or a completed issue — never from an agent claim. That
+    // observation is exactly the server-recognized terminal proof the
+    // transition contract requires (GH-1766).
+    let decision = if target_state == "done" {
+        decision.with_evidence(WorkflowEvidence::new(
+            harness_workflow::runtime::completion_evidence::EVIDENCE_GITHUB_TERMINAL,
+            runtime_remote_evidence_summary(candidate),
+        ))
+    } else {
+        decision
+    }
     .high_confidence();
     let validator = DecisionValidator::github_issue_pr();
     if let Err(error) = validator.validate(

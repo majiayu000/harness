@@ -272,6 +272,7 @@ impl TransitionAllowlist {
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
+            .with_github_issue_pr_evidence_contract()
     }
 
     pub fn quality_gate_defaults() -> Self {
@@ -290,6 +291,7 @@ impl TransitionAllowlist {
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
+            .with_quality_gate_evidence_contract()
     }
 
     pub fn pr_feedback_defaults() -> Self {
@@ -309,6 +311,7 @@ impl TransitionAllowlist {
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
+            .with_pr_feedback_evidence_contract()
     }
 
     pub fn prompt_task_defaults() -> Self {
@@ -537,7 +540,12 @@ impl DecisionValidator {
             ));
         };
 
-        validator_progress::validate_declarative_transition_metadata(rule, decision, context)?;
+        // Rule metadata and required evidence are checked in that order with
+        // command structure in between (GH-1766). A decision that is both
+        // malformed and unproven must report the structural error: it is the
+        // actionable one, and reporting `MissingRequiredEvidence` first masks
+        // it. Both still block.
+        validator_progress::validate_declarative_transition_rule_metadata(rule, decision, context)?;
 
         if self.kind == DecisionValidatorKind::PromptTask
             && decision.observed_state == "implementing"
@@ -546,6 +554,7 @@ impl DecisionValidator {
             prompt_task_validation::validate_decision(decision)?;
         }
         self.validate_commands(rule, decision, context)?;
+        validator_progress::validate_required_evidence(rule, decision)?;
         validator_progress::validate_target_progress_contract_with_override(
             instance,
             decision,
