@@ -77,6 +77,25 @@ fn harness_config_deserializes_completion_evidence_kill_switch() {
 }
 
 #[test]
+fn harness_config_ignores_legacy_and_extension_root_keys() {
+    let toml_str = format!(
+        r#"
+        retired_q_value = 0.75
+
+        [rule_enforcer_extension]
+        mode = "audit"
+
+        {}
+        "#,
+        workflow_breaker_harness_config_toml("")
+    );
+
+    let config: HarnessConfig = toml::from_str(&toml_str)
+        .expect("retired and extension root keys must remain upgrade-compatible");
+    assert!(config.workflow.completion_evidence_enforced);
+}
+
+#[test]
 fn harness_config_rejects_unknown_completion_evidence_key() {
     let toml_str = workflow_breaker_harness_config_toml(
         r#"
@@ -103,6 +122,20 @@ fn harness_config_rejects_completion_evidence_key_inside_circuit_breaker() {
 
     let error = toml::from_str::<HarnessConfig>(&toml_str)
         .expect_err("a kill switch nested under the circuit breaker must fail visibly");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+}
+
+#[test]
+fn harness_config_rejects_root_completion_evidence_key() {
+    let toml_str = format!(
+        "completion_evidence_enforced = false\n{}",
+        workflow_breaker_harness_config_toml("")
+    );
+
+    let error = toml::from_str::<HarnessConfig>(&toml_str)
+        .expect_err("a misplaced root kill-switch key must fail visibly");
     assert!(error
         .to_string()
         .contains("unknown field `completion_evidence_enforced`"));
@@ -136,6 +169,47 @@ runtime_worker:
 
     let error = load_workflow_config(dir.path())
         .expect_err("the deployment-global switch must not be accepted in project config");
+    assert!(error
+        .to_string()
+        .contains("unknown field `completion_evidence_enforced`"));
+    Ok(())
+}
+
+#[test]
+fn project_workflow_ignores_retired_and_extension_root_sections() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+workflow:
+  id: compatibility-test
+repo_backlog:
+  enabled: true
+operator_extension:
+  mode: audit
+---
+"#,
+    )?;
+
+    let config = load_workflow_config(dir.path())
+        .expect("retired and extension sections must remain upgrade-compatible");
+    assert_eq!(config.workflow.id.as_deref(), Some("compatibility-test"));
+    Ok(())
+}
+
+#[test]
+fn project_workflow_rejects_root_completion_evidence_key() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        r#"---
+completion_evidence_enforced: false
+---
+"#,
+    )?;
+
+    let error = load_workflow_config(dir.path())
+        .expect_err("a deployment-global switch at the project root must fail visibly");
     assert!(error
         .to_string()
         .contains("unknown field `completion_evidence_enforced`"));

@@ -333,7 +333,6 @@ pub struct WorkflowMemoryPolicy {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WorkflowConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<WorkflowDefinitionPolicy>,
@@ -617,6 +616,26 @@ fn deep_merge_yaml_at(
     }
 }
 
+fn reject_misplaced_completion_evidence_fields(
+    value: &serde_yaml::Value,
+    source_path: &str,
+) -> anyhow::Result<()> {
+    let Some(fields) = value.as_mapping() else {
+        return Ok(());
+    };
+    for field in [
+        "completion_evidence_enforced",
+        "runtime_completion_evidence_enforced",
+    ] {
+        if fields.contains_key(serde_yaml::Value::String(field.to_owned())) {
+            anyhow::bail!(
+                "failed to parse merged workflow front matter ({source_path}): unknown field `{field}`"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Load the workflow policy and prompt template for `project_root`.
 ///
 /// Resolution: the central base `WORKFLOW.md` (registered via
@@ -688,6 +707,7 @@ fn load_workflow_document_with_base(
         }
     };
 
+    reject_misplaced_completion_evidence_fields(&merged_value, &source_path)?;
     let mut config: WorkflowConfig = match merged_value {
         serde_yaml::Value::Null => WorkflowConfig::default(),
         value => serde_yaml::from_value(value).map_err(|e| {

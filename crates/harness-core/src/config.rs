@@ -25,8 +25,8 @@ use self::misc::*;
 use self::observe::*;
 use self::server::*;
 use self::workflow_circuit_breaker::*;
-use serde::{Deserialize, Deserializer, Serialize};
-use std::path::PathBuf;
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use std::{collections::BTreeMap, path::PathBuf};
 
 /// A project entry declared in the config file under `[[projects]]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,7 +186,6 @@ impl<'de> Deserialize<'de> for HarnessConfig {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct HarnessConfigInput {
             server: ServerConfig,
             agents: AgentsConfig,
@@ -220,9 +219,20 @@ impl<'de> Deserialize<'de> for HarnessConfig {
             alerting: AlertingConfig,
             #[serde(default)]
             projects: Vec<ProjectEntry>,
+            #[serde(flatten)]
+            unknown_fields: BTreeMap<String, serde::de::IgnoredAny>,
         }
 
         let input = HarnessConfigInput::deserialize(deserializer)?;
+        if let Some(field) = [
+            "completion_evidence_enforced",
+            "runtime_completion_evidence_enforced",
+        ]
+        .into_iter()
+        .find(|field| input.unknown_fields.contains_key(*field))
+        {
+            return Err(D::Error::custom(format!("unknown field `{field}`")));
+        }
         let mut config = Self {
             server: input.server,
             agents: input.agents,
