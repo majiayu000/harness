@@ -17,12 +17,54 @@ use crate::codex::CodexAgent;
 use crate::codex_adapter::CodexAdapter;
 use crate::provider_backpressure::ProviderBackpressureGate;
 use crate::registry::{AdapterExecutionStrategy, AgentRegistry};
-use harness_core::config::agents::{AgentsConfig, SandboxMode};
+use async_trait::async_trait;
+use harness_core::{
+    agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem},
+    config::agents::{AgentsConfig, SandboxMode},
+    types::Capability,
+};
 use std::sync::Arc;
 
 /// Environment variable that supplies the Anthropic API key. The
 /// `anthropic-api` backend is registered only when it is set.
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+/// An agent whose configuration is sealed at the canonical builder boundary.
+///
+/// The wrapped concrete agent stays private so downstream entry points can
+/// execute it but cannot overwrite configured fields or call fluent setters.
+struct ConfiguredAgent<A> {
+    inner: A,
+}
+
+impl<A> ConfiguredAgent<A> {
+    fn new(inner: A) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl<A: CodeAgent> CodeAgent for ConfiguredAgent<A> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        self.inner.capabilities()
+    }
+
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.inner.execute(req).await
+    }
+
+    async fn execute_stream(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.inner.execute_stream(req, tx).await
+    }
+}
 
 /// Builds the Claude backend with every configured knob applied.
 ///
@@ -31,7 +73,14 @@ const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 pub fn claude_agent_from_config(
     config: &AgentsConfig,
     sandbox_mode: SandboxMode,
-) -> ClaudeCodeAgent {
+) -> impl CodeAgent {
+    configured_claude_agent_from_config(config, sandbox_mode)
+}
+
+fn configured_claude_agent_from_config(
+    config: &AgentsConfig,
+    sandbox_mode: SandboxMode,
+) -> ConfiguredAgent<ClaudeCodeAgent> {
     let gate = ProviderBackpressureGate::from_claude_config(&config.claude.provider_backpressure);
     claude_agent_from_config_with_gate(config, sandbox_mode, gate)
 }
@@ -40,7 +89,7 @@ fn claude_agent_from_config_with_gate(
     config: &AgentsConfig,
     sandbox_mode: SandboxMode,
     gate: ProviderBackpressureGate,
-) -> ClaudeCodeAgent {
+) -> ConfiguredAgent<ClaudeCodeAgent> {
     let mut agent = ClaudeCodeAgent::new(
         config.claude.cli_path.clone(),
         config.claude.default_model.clone(),
@@ -51,13 +100,22 @@ fn claude_agent_from_config_with_gate(
     if let Some(budget) = config.claude.reasoning_budget.clone() {
         agent = agent.with_reasoning_budget(budget);
     }
-    agent
+    ConfiguredAgent::new(agent)
 }
 
 /// Builds the Codex backend with every configured knob applied.
-pub fn codex_agent_from_config(config: &AgentsConfig, sandbox_mode: SandboxMode) -> CodexAgent {
-    CodexAgent::from_config(config.codex.clone(), sandbox_mode)
-        .with_stream_timeout(config.stream_timeout_secs)
+pub fn codex_agent_from_config(config: &AgentsConfig, sandbox_mode: SandboxMode) -> impl CodeAgent {
+    configured_codex_agent_from_config(config, sandbox_mode)
+}
+
+fn configured_codex_agent_from_config(
+    config: &AgentsConfig,
+    sandbox_mode: SandboxMode,
+) -> ConfiguredAgent<CodexAgent> {
+    ConfiguredAgent::new(
+        CodexAgent::from_config(config.codex.clone(), sandbox_mode)
+            .with_stream_timeout(config.stream_timeout_secs),
+    )
 }
 
 /// Assembles the registry every entry point runs on.
@@ -132,8 +190,34 @@ pub fn registry_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::error::HarnessError;
     use harness_core::types::ReasoningBudget;
     use std::num::NonZeroUsize;
+
+    struct TestAgent;
+
+    #[async_trait]
+    impl CodeAgent for TestAgent {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::Read]
+        }
+
+        async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+            Err(HarnessError::AgentExecution(req.prompt))
+        }
+
+        async fn execute_stream(
+            &self,
+            req: AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<StreamItem>,
+        ) -> harness_core::error::Result<()> {
+            Err(HarnessError::AgentExecution(req.prompt))
+        }
+    }
 
     fn config() -> AgentsConfig {
         AgentsConfig {
@@ -144,19 +228,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn configured_agent_delegates_only_the_code_agent_contract() {
+        let agent = ConfiguredAgent::new(TestAgent);
+        assert_eq!(agent.name(), "test");
+        assert_eq!(agent.capabilities(), vec![Capability::Read]);
+
+        let execute_error = agent
+            .execute(AgentRequest {
+                prompt: "execute".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("the test agent should surface its execute result");
+        assert!(execute_error.to_string().contains("execute"));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let stream_error = agent
+            .execute_stream(
+                AgentRequest {
+                    prompt: "stream".to_string(),
+                    ..Default::default()
+                },
+                tx,
+            )
+            .await
+            .expect_err("the test agent should surface its stream result");
+        assert!(stream_error.to_string().contains("stream"));
+    }
+
     #[test]
     fn claude_backend_applies_the_configured_stream_timeout() {
-        let agent = claude_agent_from_config(&config(), SandboxMode::default());
-        assert_eq!(agent.stream_timeout_secs, Some(120));
+        let agent = configured_claude_agent_from_config(&config(), SandboxMode::default());
+        assert_eq!(agent.inner.stream_timeout_secs, Some(120));
     }
 
     #[test]
     fn claude_backend_applies_a_disabled_stream_timeout() {
         let mut config = config();
         config.stream_timeout_secs = None;
-        let agent = claude_agent_from_config(&config, SandboxMode::default());
+        let agent = configured_claude_agent_from_config(&config, SandboxMode::default());
         assert_eq!(
-            agent.stream_timeout_secs, None,
+            agent.inner.stream_timeout_secs, None,
             "an explicitly disabled timeout must not fall back to the 3600s default"
         );
     }
@@ -165,25 +278,25 @@ mod tests {
     fn claude_backend_applies_the_configured_reasoning_budget() {
         let mut config = config();
         config.claude.reasoning_budget = Some(ReasoningBudget::default());
-        let agent = claude_agent_from_config(&config, SandboxMode::default());
-        assert!(agent.reasoning_budget.is_some());
+        let agent = configured_claude_agent_from_config(&config, SandboxMode::default());
+        assert!(agent.inner.reasoning_budget.is_some());
     }
 
     #[test]
     fn claude_backend_applies_the_configured_provider_gate() {
         let mut config = config();
         config.claude.provider_backpressure.max_concurrent_sessions = NonZeroUsize::new(2);
-        let agent = claude_agent_from_config(&config, SandboxMode::default());
+        let agent = configured_claude_agent_from_config(&config, SandboxMode::default());
         assert!(
-            agent.provider_gate.is_enabled(),
+            agent.inner.provider_gate.is_enabled(),
             "a configured concurrency limit must reach the agent, not be dropped"
         );
     }
 
     #[test]
     fn codex_backend_applies_the_configured_stream_timeout() {
-        let agent = codex_agent_from_config(&config(), SandboxMode::default());
-        assert_eq!(agent.stream_timeout_secs, Some(120));
+        let agent = configured_codex_agent_from_config(&config(), SandboxMode::default());
+        assert_eq!(agent.inner.stream_timeout_secs, Some(120));
     }
 
     #[test]
@@ -211,7 +324,7 @@ mod tests {
         // must win over `config.sandbox_mode`.
         let mut config = config();
         config.sandbox_mode = SandboxMode::ReadOnly;
-        let agent = claude_agent_from_config(&config, SandboxMode::WorkspaceWrite);
-        assert_eq!(agent.sandbox_mode, SandboxMode::WorkspaceWrite);
+        let agent = configured_claude_agent_from_config(&config, SandboxMode::WorkspaceWrite);
+        assert_eq!(agent.inner.sandbox_mode, SandboxMode::WorkspaceWrite);
     }
 }

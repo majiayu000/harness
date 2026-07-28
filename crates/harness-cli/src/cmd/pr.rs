@@ -1,4 +1,3 @@
-use harness_agents::claude::ClaudeCodeAgent;
 use harness_agents::codex::{CodexAgent, CodexReviewRequest};
 use harness_core::{
     agent::AgentRequest,
@@ -12,7 +11,7 @@ use tokio::time::{sleep, Duration};
 
 const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
 
-fn create_agent(config: &HarnessConfig) -> ClaudeCodeAgent {
+fn create_agent(config: &HarnessConfig) -> impl CodeAgent {
     // This path needs the Claude backend alone, not a registry — but it takes
     // it from the same builder, so it cannot drift from the entry points.
     harness_agents::builder::claude_agent_from_config(&config.agents, config.agents.sandbox_mode)
@@ -110,13 +109,11 @@ pub async fn review(
     }
 
     #[allow(clippy::disallowed_methods)]
-    let mut agent = CodexAgent::new(
+    let agent = CodexAgent::new(
         review_config.cli_path.clone(),
         SandboxMode::ReadOnlyWithNetwork,
     )
     .with_stream_timeout(Some(review_config.timeout_secs));
-    agent.default_model = review_config.model.clone();
-    agent.reasoning_effort = review_config.reasoning_effort.clone();
 
     let started_at = chrono::Utc::now();
     let response = tokio::time::timeout(

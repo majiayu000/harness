@@ -239,7 +239,7 @@ fn review_fixture_with_constructor(
         r#"
         async fn review() {{
             #[allow(clippy::disallowed_methods)]
-            let mut agent = CodexAgent::new(
+            let agent = CodexAgent::new(
                 review_config.cli_path.clone(),
                 {constructor_sandbox},
             )

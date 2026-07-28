@@ -465,7 +465,7 @@ fn verify_codex_review_exception(source: &str) -> Result<(), String> {
                 return None;
             };
             (pattern.ident == "agent"
-                && pattern.mutability.is_some()
+                && pattern.mutability.is_none()
                 && pattern.by_ref.is_none()
                 && pattern.subpat.is_none())
             .then_some(local)
