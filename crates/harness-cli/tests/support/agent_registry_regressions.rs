@@ -64,6 +64,34 @@ fn entrypoint_contract_rejects_dead_nested_scopes() {
 }
 
 #[test]
+fn entrypoint_contract_rejects_const_item_function_bait() {
+    let analysis = analyze_source(
+        r#"
+        const _: () = {
+            fn run() {
+                let agent_registry =
+                    harness_agents::builder::registry_from_config();
+            }
+        };
+        fn run() {
+            alternate_registry();
+        }
+        "#,
+    )
+    .expect("const-item builder bait parses");
+
+    assert_eq!(
+        analysis.required_builder_call_count(
+            REGISTRY_BUILDER,
+            "run",
+            ExpectedBuilderUse::LetBinding("agent_registry"),
+        ),
+        0,
+        "a function item nested in a const block is not a top-level entry point"
+    );
+}
+
+#[test]
 fn direct_typed_binding_still_satisfies_entrypoint_contract() {
     let analysis = analyze_source(
         r#"
@@ -165,6 +193,28 @@ fn all_production_globs_fail_closed_but_external_test_preludes_do_not() {
 }
 
 #[test]
+fn path_attributed_cfg_test_module_keeps_its_private_super_prelude() {
+    let test_sources = analyze_source_set(&[
+        (
+            "src/main.rs",
+            r#"
+            #[cfg(test)]
+            #[path = "main_tests.rs"]
+            mod tests;
+            "#,
+        ),
+        ("src/main_tests.rs", "use super::*;"),
+    ])
+    .expect("path-attributed test module parses");
+
+    assert_eq!(
+        test_sources[Path::new("src/main_tests.rs")].production_glob_imports,
+        0,
+        "a private super prelude in a path-attributed cfg(test) module is test-only"
+    );
+}
+
+#[test]
 fn typed_trait_constructions_are_detected_without_qself_duplicates() {
     for source in [
         r#"
@@ -207,6 +257,35 @@ fn typed_trait_constructions_are_detected_without_qself_duplicates() {
 }
 
 #[test]
+fn explicit_typed_returns_are_detected_in_free_and_impl_functions() {
+    for source in [
+        r#"
+        use harness_agents::provider_backpressure::ProviderBackpressureGate;
+        fn build() -> ProviderBackpressureGate {
+            return Default::default();
+        }
+        "#,
+        r#"
+        use harness_agents::provider_backpressure::ProviderBackpressureGate;
+        struct Factory;
+        impl Factory {
+            fn build() -> ProviderBackpressureGate {
+                return Default::default();
+            }
+        }
+        "#,
+    ] {
+        let analysis = analyze_source(source).expect("explicit typed return parses");
+        assert_eq!(
+            analysis.direct_constructions.len(),
+            1,
+            "constructions: {:?}",
+            analysis.direct_constructions
+        );
+    }
+}
+
+#[test]
 fn generic_factory_turbofish_detects_output_without_observation_false_positives() {
     let construction = analyze_source(
         r#"
@@ -234,4 +313,44 @@ fn generic_factory_turbofish_detects_output_without_observation_false_positives(
     )
     .expect("generic observation parses");
     assert!(observation.direct_constructions.is_empty());
+}
+
+#[test]
+fn generic_factory_resolution_covers_impls_without_merging_local_scopes() {
+    let associated = analyze_source(
+        r#"
+        use harness_agents::provider_backpressure::ProviderBackpressureGate;
+        struct Factory;
+        impl Factory {
+            fn make<T: Default>() -> T { T::default() }
+        }
+        fn build() {
+            let _gate = Factory::make::<ProviderBackpressureGate>();
+        }
+        "#,
+    )
+    .expect("associated generic factory parses");
+
+    let lexical = analyze_source(
+        r#"
+        use harness_agents::provider_backpressure::ProviderBackpressureGate;
+        fn first() {
+            fn make<T, U>() -> T { loop {} }
+            let _value: u8 = make::<u8, ProviderBackpressureGate>();
+        }
+        fn second() {
+            fn make<T, U>() -> U { loop {} }
+        }
+        "#,
+    )
+    .expect("lexically distinct generic factories parse");
+
+    assert_eq!(
+        (
+            associated.direct_constructions.len(),
+            lexical.direct_constructions.len(),
+        ),
+        (1, 0),
+        "associated factories must be detected without merging same-name local factories"
+    );
 }

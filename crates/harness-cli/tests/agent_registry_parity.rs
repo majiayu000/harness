@@ -2,6 +2,8 @@
 
 #[path = "support/agent_registry_analysis.rs"]
 mod analysis;
+#[path = "support/agent_registry_cfg_test.rs"]
+mod cfg_test;
 #[path = "support/agent_registry_regressions.rs"]
 mod regressions;
 #[path = "support/agent_registry_resolution.rs"]

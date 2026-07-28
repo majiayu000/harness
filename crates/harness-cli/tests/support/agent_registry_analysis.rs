@@ -1,4 +1,5 @@
 use super::{
+    cfg_test::{has_cfg_test, CfgTestModules},
     resolution::{
         alias_scope_from_block, alias_scope_from_items, collect_crate_aliases,
         collect_generic_factories, ident_name, path_segments, type_paths, AliasScope, CrateAliases,
@@ -8,15 +9,12 @@ use super::{
     SourceUnit,
 };
 use proc_macro2::{TokenStream, TokenTree};
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
+use std::{collections::HashMap, path::PathBuf};
 use syn::{
     visit::{self, Visit},
-    Attribute, Block, Expr, ExprCall, ExprPath, ExprStruct, File, ImplItemFn, Item, ItemFn,
-    ItemImpl, ItemMod, ItemUse, Local, Macro, Member, Pat, ReturnType, Stmt, Type, UseTree,
-    Visibility,
+    Block, Expr, ExprAsync, ExprCall, ExprClosure, ExprPath, ExprReturn, ExprStruct, File,
+    ImplItemFn, ItemFn, ItemImpl, ItemMod, ItemUse, Local, Macro, Member, Pat, ReturnType, Stmt,
+    Type, UseTree, Visibility,
 };
 
 const FORBIDDEN_TYPES: [&str; 7] = [
@@ -87,6 +85,7 @@ struct FunctionFrame {
     body_address: usize,
     top_level_item: bool,
     return_forbidden_types: Vec<String>,
+    return_scope_depth: usize,
 }
 
 struct SourceScanner<'a> {
@@ -99,6 +98,8 @@ struct SourceScanner<'a> {
     builder_usage_targets: Vec<(usize, BuilderCallUse)>,
     review_constructor_targets: Vec<usize>,
     inline_module_depth: usize,
+    block_depth: usize,
+    return_scope_depth: usize,
     in_cfg_test_module: bool,
     analysis: SourceAnalysis,
 }
@@ -120,6 +121,8 @@ impl<'a> SourceScanner<'a> {
             builder_usage_targets: Vec::new(),
             review_constructor_targets: Vec::new(),
             inline_module_depth: 0,
+            block_depth: 0,
+            return_scope_depth: 0,
             in_cfg_test_module,
             analysis: SourceAnalysis::default(),
         }
@@ -201,10 +204,19 @@ impl<'a> SourceScanner<'a> {
         }
         let original = path_segments(&function.path);
         let resolved = self.resolver().resolve(original.clone());
+        let local_positions = if original.len() == 1 {
+            self.scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.local_function_output_positions(original[0].as_str()))
+        } else {
+            None
+        };
         let output_types = self.generic_factories.output_type_arguments(
             &function.path,
             &resolved,
             &self.module_path,
+            local_positions,
         );
         let mut forbidden = Vec::new();
         for type_name in output_types
@@ -339,6 +351,7 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
     }
 
     fn visit_block(&mut self, block: &'ast Block) {
+        self.block_depth += 1;
         self.scopes
             .push(alias_scope_from_block(block, &self.module_path));
         let function_body = self
@@ -379,6 +392,7 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
             }
         }
         self.scopes.pop();
+        self.block_depth -= 1;
     }
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
@@ -386,12 +400,15 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
             ReturnType::Default => Vec::new(),
             ReturnType::Type(_, type_) => self.forbidden_types_in_type(type_),
         };
-        let top_level_item = self.function_frames.is_empty() && self.inline_module_depth == 0;
+        let top_level_item = self.function_frames.is_empty()
+            && self.inline_module_depth == 0
+            && self.block_depth == 0;
         self.function_frames.push(FunctionFrame {
             name: ident_name(&item.sig.ident),
             body_address: item.block.as_ref() as *const Block as usize,
             top_level_item,
             return_forbidden_types,
+            return_scope_depth: self.return_scope_depth,
         });
         visit::visit_item_fn(self, item);
         self.function_frames.pop();
@@ -425,9 +442,33 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
             body_address: &item.block as *const Block as usize,
             top_level_item: false,
             return_forbidden_types,
+            return_scope_depth: self.return_scope_depth,
         });
         visit::visit_impl_item_fn(self, item);
         self.function_frames.pop();
+    }
+
+    fn visit_expr_async(&mut self, expression: &'ast ExprAsync) {
+        self.return_scope_depth += 1;
+        visit::visit_expr_async(self, expression);
+        self.return_scope_depth -= 1;
+    }
+
+    fn visit_expr_closure(&mut self, expression: &'ast ExprClosure) {
+        self.return_scope_depth += 1;
+        visit::visit_expr_closure(self, expression);
+        self.return_scope_depth -= 1;
+    }
+
+    fn visit_expr_return(&mut self, expression: &'ast ExprReturn) {
+        let type_names = self.function_frames.last().and_then(|frame| {
+            (frame.return_scope_depth == self.return_scope_depth)
+                .then(|| frame.return_forbidden_types.clone())
+        });
+        if let (Some(type_names), Some(value)) = (type_names, expression.expr.as_deref()) {
+            self.record_typed_construction(&type_names, value);
+        }
+        visit::visit_expr_return(self, expression);
     }
 
     fn visit_expr_call(&mut self, expression: &'ast ExprCall) {
@@ -617,37 +658,6 @@ fn is_private_super_glob(item: &ItemUse) -> bool {
         )
 }
 
-fn has_cfg_test(attributes: &[Attribute]) -> bool {
-    attributes.iter().any(|attribute| {
-        attribute.path().is_ident("cfg")
-            && attribute
-                .parse_args::<syn::Ident>()
-                .is_ok_and(|condition| condition == "test")
-    })
-}
-
-fn collect_cfg_test_modules(
-    items: &[Item],
-    module_path: &[String],
-    inherited_test_context: bool,
-    test_modules: &mut HashSet<Segments>,
-) {
-    for item in items {
-        let Item::Mod(module) = item else {
-            continue;
-        };
-        let is_test_module = inherited_test_context || has_cfg_test(&module.attrs);
-        let mut nested_path = module_path.to_vec();
-        nested_path.push(ident_name(&module.ident));
-        if is_test_module {
-            test_modules.insert(nested_path.clone());
-        }
-        if let Some((_, nested)) = &module.content {
-            collect_cfg_test_modules(nested, &nested_path, is_test_module, test_modules);
-        }
-    }
-}
-
 fn is_canonical_builder_path(path: &[String]) -> bool {
     matches!(
         path,
@@ -735,7 +745,7 @@ fn intentional_codex_review_call(call: &ExprCall) -> bool {
 pub(super) fn analyze_units(units: &[SourceUnit]) -> HashMap<PathBuf, SourceAnalysis> {
     let mut aliases_by_crate = HashMap::<String, CrateAliases>::new();
     let mut factories_by_crate = HashMap::<String, GenericFactories>::new();
-    let mut test_modules_by_crate = HashMap::<String, HashSet<Segments>>::new();
+    let test_modules = CfgTestModules::collect(units);
     for unit in units {
         collect_crate_aliases(
             &unit.file.items,
@@ -747,14 +757,6 @@ pub(super) fn analyze_units(units: &[SourceUnit]) -> HashMap<PathBuf, SourceAnal
             &unit.module_path,
             factories_by_crate.entry(unit.crate_id.clone()).or_default(),
         );
-        collect_cfg_test_modules(
-            &unit.file.items,
-            &unit.module_path,
-            false,
-            test_modules_by_crate
-                .entry(unit.crate_id.clone())
-                .or_default(),
-        );
     }
     units
         .iter()
@@ -765,16 +767,11 @@ pub(super) fn analyze_units(units: &[SourceUnit]) -> HashMap<PathBuf, SourceAnal
             let generic_factories = factories_by_crate
                 .get(&unit.crate_id)
                 .expect("source generic factories exist");
-            let in_cfg_test_module = test_modules_by_crate
-                .get(&unit.crate_id)
-                .expect("source test modules exist")
-                .iter()
-                .any(|test_module| unit.module_path.starts_with(test_module));
             let mut scanner = SourceScanner::new(
                 crate_aliases,
                 generic_factories,
                 unit.module_path.clone(),
-                in_cfg_test_module,
+                test_modules.contains(unit),
             );
             scanner.visit_file(&unit.file);
             (unit.relative.clone(), scanner.analysis)

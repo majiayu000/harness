@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use syn::{
     visit::{self, Visit},
-    Block, GenericArgument, GenericParam, Item, ItemFn, ItemMod, ItemType, ItemUse,
-    Path as SynPath, ReturnType, Stmt, Type, TypePath, UseTree,
+    Block, GenericArgument, GenericParam, ImplItem, Item, ItemFn, ItemImpl, ItemMod, ItemType,
+    ItemUse, Path as SynPath, ReturnType, Signature, Stmt, Type, TypePath, UseTree,
 };
 
 pub(super) type Segments = Vec<String>;
@@ -16,6 +16,7 @@ struct AliasTarget {
 #[derive(Clone, Debug, Default)]
 pub(super) struct AliasScope {
     paths: HashMap<String, Vec<AliasTarget>>,
+    local_function_outputs: HashMap<String, Vec<usize>>,
 }
 
 impl AliasScope {
@@ -24,6 +25,22 @@ impl AliasScope {
         if !targets.contains(&target) {
             targets.push(target);
         }
+    }
+
+    fn insert_local_function(&mut self, function: &ItemFn) {
+        let positions = self
+            .local_function_outputs
+            .entry(ident_name(&function.sig.ident))
+            .or_default();
+        if let Some(position) = generic_factory_output_position(&function.sig) {
+            if !positions.contains(&position) {
+                positions.push(position);
+            }
+        }
+    }
+
+    pub(super) fn local_function_output_positions(&self, name: &str) -> Option<&[usize]> {
+        self.local_function_outputs.get(name).map(Vec::as_slice)
     }
 }
 
@@ -134,6 +151,7 @@ impl GenericFactories {
         path: &'a SynPath,
         resolved_paths: &[Segments],
         module_path: &[String],
+        local_positions: Option<&[usize]>,
     ) -> Vec<&'a Type> {
         let original = path_segments(path);
         let mut candidates = resolved_paths.to_vec();
@@ -160,24 +178,35 @@ impl GenericFactories {
         };
 
         let mut output_types: Vec<&'a Type> = Vec::new();
+        if let Some(positions) = local_positions {
+            collect_type_arguments(arguments, positions, &mut output_types);
+            return output_types;
+        }
         for candidate in candidates {
             let Some(positions) = self.output_parameters_by_path.get(&candidate) else {
                 continue;
             };
-            for position in positions {
-                let Some(GenericArgument::Type(output_type)) = arguments.args.iter().nth(*position)
-                else {
-                    continue;
-                };
-                if !output_types
-                    .iter()
-                    .any(|existing| std::ptr::eq(*existing, output_type))
-                {
-                    output_types.push(output_type);
-                }
-            }
+            collect_type_arguments(arguments, positions, &mut output_types);
         }
         output_types
+    }
+}
+
+fn collect_type_arguments<'a>(
+    arguments: &'a syn::AngleBracketedGenericArguments,
+    positions: &[usize],
+    output_types: &mut Vec<&'a Type>,
+) {
+    for position in positions {
+        let Some(GenericArgument::Type(output_type)) = arguments.args.iter().nth(*position) else {
+            continue;
+        };
+        if !output_types
+            .iter()
+            .any(|existing| std::ptr::eq(*existing, output_type))
+        {
+            output_types.push(output_type);
+        }
     }
 }
 
@@ -356,6 +385,9 @@ pub(super) fn alias_scope_from_block(block: &Block, module_path: &[String]) -> A
     for statement in &block.stmts {
         if let Stmt::Item(item) = statement {
             add_item_alias(item, &mut scope, module_path);
+            if let Item::Fn(function) = item {
+                scope.insert_local_function(function);
+            }
         }
     }
     scope
@@ -414,11 +446,11 @@ pub(super) fn collect_crate_aliases(
     }
 }
 
-fn generic_factory_output_position(item: &ItemFn) -> Option<usize> {
-    if !item.sig.inputs.is_empty() {
+fn generic_factory_output_position(signature: &Signature) -> Option<usize> {
+    if !signature.inputs.is_empty() {
         return None;
     }
-    let ReturnType::Type(_, output) = &item.sig.output else {
+    let ReturnType::Type(_, output) = &signature.output else {
         return None;
     };
     let Type::Path(output) = output.as_ref() else {
@@ -429,7 +461,7 @@ fn generic_factory_output_position(item: &ItemFn) -> Option<usize> {
     }
     let output_name = ident_name(&output.path.segments[0].ident);
     let mut argument_position = 0;
-    for parameter in &item.sig.generics.params {
+    for parameter in &signature.generics.params {
         match parameter {
             GenericParam::Lifetime(_) => continue,
             GenericParam::Type(type_parameter)
@@ -455,7 +487,7 @@ pub(super) fn collect_generic_factories(
 
     impl<'ast> Visit<'ast> for FactoryCollector<'_> {
         fn visit_item_fn(&mut self, function: &'ast ItemFn) {
-            if let Some(position) = generic_factory_output_position(function) {
+            if let Some(position) = generic_factory_output_position(&function.sig) {
                 let mut path = vec!["crate".to_string()];
                 path.extend(self.module_path.iter().cloned());
                 path.push(ident_name(&function.sig.ident));
@@ -468,7 +500,34 @@ pub(super) fn collect_generic_factories(
                     positions.push(position);
                 }
             }
-            visit::visit_item_fn(self, function);
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
+            let Type::Path(self_type) = item.self_ty.as_ref() else {
+                return;
+            };
+            if self_type.qself.is_some() {
+                return;
+            }
+            let mut impl_path = local_item_path(path_segments(&self_type.path), &self.module_path);
+            for impl_item in &item.items {
+                let ImplItem::Fn(function) = impl_item else {
+                    continue;
+                };
+                let Some(position) = generic_factory_output_position(&function.sig) else {
+                    continue;
+                };
+                impl_path.push(ident_name(&function.sig.ident));
+                let positions = self
+                    .factories
+                    .output_parameters_by_path
+                    .entry(impl_path.clone())
+                    .or_default();
+                if !positions.contains(&position) {
+                    positions.push(position);
+                }
+                impl_path.pop();
+            }
         }
 
         fn visit_item_mod(&mut self, module: &'ast ItemMod) {
@@ -490,4 +549,17 @@ pub(super) fn collect_generic_factories(
     for item in items {
         collector.visit_item(item);
     }
+}
+
+fn local_item_path(path: Segments, module_path: &[String]) -> Segments {
+    if path
+        .first()
+        .is_some_and(|segment| matches!(segment.as_str(), "crate" | "self" | "super"))
+    {
+        return normalize_relative(path, module_path);
+    }
+    let mut local = vec!["crate".to_string()];
+    local.extend(module_path.iter().cloned());
+    local.extend(path);
+    local
 }
