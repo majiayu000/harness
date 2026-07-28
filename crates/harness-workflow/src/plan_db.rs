@@ -27,7 +27,7 @@ static PLAN_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         description: "convert exec_plans.data from TEXT to JSONB",
-        sql: "ALTER TABLE exec_plans ALTER COLUMN data TYPE JSONB USING replace(data, '\\u0000', '')::jsonb",
+        sql: "ALTER TABLE exec_plans ALTER COLUMN data TYPE JSONB USING data::jsonb",
     },
     Migration {
         version: 4,
@@ -165,14 +165,9 @@ impl PlanDb {
     }
 
     pub async fn upsert(&self, plan: &ExecPlan) -> anyhow::Result<()> {
-        let data = serde_json::to_string(plan)?;
-        // PostgreSQL JSONB rejects \u0000; serde_json encodes NUL as the
-        // 6-char escape sequence, so strip that form (not the literal byte).
-        let data = if data.contains("\\u0000") {
-            data.replace("\\u0000", "")
-        } else {
-            data
-        };
+        // PostgreSQL JSONB rejects NUL; stripping happens at the JSON value
+        // level so escaped literals are not corrupted (see crate::jsonb).
+        let data = crate::jsonb::to_jsonb_string(plan)?;
         sqlx::query(
             "INSERT INTO exec_plans (store_key, id, data) VALUES ($1, $2, $3::jsonb)
              ON CONFLICT(store_key, id) DO UPDATE SET data = EXCLUDED.data,
@@ -348,13 +343,22 @@ pub async fn migrate_legacy_plan_db_if_needed(
         return Ok(0);
     }
 
+    let legacy_data_type: Option<String> = sqlx::query_scalar(
+        "SELECT data_type
+         FROM information_schema.columns
+         WHERE table_schema = $1
+           AND table_name = 'exec_plans'
+           AND column_name = 'data'",
+    )
+    .bind(legacy_schema)
+    .fetch_optional(&target_db.pool)
+    .await?;
+    let legacy_data_type = legacy_data_type.ok_or_else(|| {
+        anyhow::anyhow!("legacy plan database schema {legacy_schema} has no exec_plans.data column")
+    })?;
+
     let mut tx = target_db.pool.begin().await?;
-    let copy_sql = format!(
-        "INSERT INTO exec_plans (store_key, id, data, created_at, updated_at)
-         SELECT $1, id, replace(data::text, '\\u0000', '')::jsonb, created_at, updated_at
-         FROM \"{legacy_schema}\".exec_plans
-         ON CONFLICT (store_key, id) DO NOTHING"
-    );
+    let copy_sql = legacy_plan_backfill_sql(legacy_schema, &legacy_data_type)?;
     let copied = sqlx::query(&copy_sql)
         .bind(target_db.store_key())
         .execute(&mut *tx)
@@ -384,6 +388,22 @@ pub async fn migrate_legacy_plan_db_if_needed(
     }
 
     Ok(copied)
+}
+
+fn legacy_plan_backfill_sql(legacy_schema: &str, legacy_data_type: &str) -> anyhow::Result<String> {
+    let data_expression = match legacy_data_type {
+        "jsonb" => "data",
+        "text" => "data::jsonb",
+        other => {
+            anyhow::bail!("unsupported legacy exec_plans.data type {other}; expected text or jsonb")
+        }
+    };
+    Ok(format!(
+        "INSERT INTO exec_plans (store_key, id, data, created_at, updated_at)
+         SELECT $1, id, {data_expression}, created_at, updated_at
+         FROM \"{legacy_schema}\".exec_plans
+         ON CONFLICT (store_key, id) DO NOTHING"
+    ))
 }
 
 #[cfg(test)]

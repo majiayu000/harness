@@ -241,6 +241,7 @@ mod tests {
         let store_key = db.store_key().to_string();
         let captured = CapturedStartupLogs::default();
         let startup = async {
+            crate::test_helpers::install_tracing_interest_keeper();
             let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
             TaskStore::open(&db_path).await
         };
@@ -328,6 +329,7 @@ mod tests {
         let store_key = db.store_key().to_string();
         let captured = CapturedStartupLogs::default();
         let startup = async {
+            crate::test_helpers::install_tracing_interest_keeper();
             let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
             TaskStore::open(&db_path).await
         };
