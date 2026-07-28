@@ -424,11 +424,8 @@ async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::
 }
 
 #[tokio::test]
+#[ignore = "requires an isolated HARNESS_DATABASE_URL"]
 async fn runtime_recovery_locks_instance_before_waiting_on_command() -> anyhow::Result<()> {
-    if resolve_database_url(None).is_err() {
-        return Ok(());
-    }
-
     let dir = tempfile::tempdir()?;
     let store = Arc::new(WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?);
     let instance = project_issue_instance("/project-a", 1568, "blocked");

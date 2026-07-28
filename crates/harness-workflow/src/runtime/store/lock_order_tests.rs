@@ -251,6 +251,85 @@ fn event_sequence_helper_locks_parent_before_advisory() {
 }
 
 #[test]
+fn runtime_event_inserts_are_centralized() {
+    let root = runtime_dir();
+    let mut writers = production_runtime_sources()
+        .into_iter()
+        .filter(|(_, source)| source.contains("INSERT INTO runtime_events"))
+        .map(|(path, _)| {
+            path.strip_prefix(&root)
+                .expect("runtime source path")
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    writers.sort();
+
+    assert_eq!(
+        writers,
+        vec!["store/runtime_job_leases.rs"],
+        "runtime event inserts must use the canonical helper so every path \
+         locks the runtime job before the event-sequence advisory lock"
+    );
+}
+
+#[test]
+fn runtime_event_sequence_helper_locks_parent_before_advisory() {
+    let source = std::fs::read_to_string(store_dir().join("runtime_job_leases.rs"))
+        .expect("runtime job lease helper source");
+    let helper = source
+        .split_once("pub(crate) async fn append_runtime_event_tx")
+        .map(|(_, helper)| helper)
+        .expect("canonical runtime event helper");
+    let parent_lock = helper
+        .find("FROM runtime_jobs WHERE id = $1 FOR KEY SHARE")
+        .expect("runtime event helper must explicitly lock the runtime job");
+    let advisory_lock = helper
+        .find("pg_advisory_xact_lock")
+        .expect("runtime event helper must serialize sequence allocation");
+    let event_insert = helper
+        .find("INSERT INTO runtime_events")
+        .expect("runtime event helper must persist the event");
+
+    assert!(
+        parent_lock < advisory_lock && advisory_lock < event_insert,
+        "runtime event writes must lock runtime_jobs before the sequence advisory lock"
+    );
+}
+
+#[test]
+fn multi_command_runtime_job_cancellation_uses_one_global_id_order() {
+    let state_source = std::fs::read_to_string(store_dir().join("runtime_job_state.rs"))
+        .expect("runtime job state source");
+    let helper = state_source
+        .split_once("async fn cancel_unfinished_runtime_jobs_for_commands_tx")
+        .map(|(_, helper)| helper)
+        .expect("multi-command cancellation helper");
+    let all_commands = helper
+        .find("command_id = ANY($1::text[])")
+        .expect("multi-command cancellation must select all command jobs together");
+    let id_order = helper
+        .find("ORDER BY id")
+        .expect("multi-command cancellation must define a global job ID order");
+    let row_lock = helper
+        .find("FOR UPDATE")
+        .expect("multi-command cancellation must lock selected jobs");
+    assert!(
+        all_commands < id_order && id_order < row_lock,
+        "all unfinished jobs must be selected and locked once in global ID order"
+    );
+
+    for caller in ["recovery.rs", "coverage_recovery.rs"] {
+        let source =
+            std::fs::read_to_string(store_dir().join(caller)).expect("cancellation caller source");
+        assert!(
+            source.contains("cancel_unfinished_runtime_jobs_for_commands_tx"),
+            "{caller} must batch all command cancellations before updating jobs"
+        );
+    }
+}
+
+#[test]
 fn lint_detects_an_inverted_order() {
     // Guards the lint itself: the ABBA shape this issue fixed must still be
     // reported if it is reintroduced.

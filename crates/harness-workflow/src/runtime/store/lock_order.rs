@@ -25,6 +25,18 @@
 //! the same advisory lock. All production event inserts therefore go through
 //! `insert_event_tx_with_id`.
 //!
+//! Runtime event writers follow the same rule one level lower: lock the
+//! referenced `runtime_jobs` row in `KEY SHARE` mode before taking the
+//! per-runtime-job event-sequence advisory lock. This keeps standalone event
+//! writers compatible with lease operations that already hold the job
+//! `FOR UPDATE`. All production runtime event inserts go through
+//! `append_runtime_event_tx`.
+//!
+//! Transactions that lock runtime jobs for more than one command must select
+//! the whole job set once and lock it in global job-ID order. Ordering each
+//! command's jobs separately is insufficient because another transaction can
+//! lock the same union in job-ID order.
+//!
 //! `lock_order_tests.rs` enforces this by scanning the runtime store sources
 //! and the store implementations that live in sibling runtime modules.
 //!
@@ -59,7 +71,7 @@ pub(super) const LOCK_HIERARCHY: [&str; 3] =
 ///
 /// Add an entry whenever a `_tx` helper starts taking a hierarchy row lock.
 #[cfg(test)]
-pub(super) const LOCK_TAKING_HELPERS: [(&str, &str); 8] = [
+pub(super) const LOCK_TAKING_HELPERS: [(&str, &str); 10] = [
     ("select_instance_for_update_tx", "workflow_instances"),
     ("lock_instance_for_update_tx", "workflow_instances"),
     ("lock_instance_for_event_sequence_tx", "workflow_instances"),
@@ -68,6 +80,11 @@ pub(super) const LOCK_TAKING_HELPERS: [(&str, &str); 8] = [
     ("insert_event_tx_with_id", "workflow_instances"),
     ("skip_superseded_active_commands_tx", "workflow_commands"),
     ("cancel_unfinished_runtime_jobs_tx", "runtime_jobs"),
+    (
+        "cancel_unfinished_runtime_jobs_for_commands_tx",
+        "runtime_jobs",
+    ),
+    ("append_runtime_event_tx", "runtime_jobs"),
 ];
 
 /// `deadlock_detected` — PostgreSQL aborted this transaction to break a cycle.
