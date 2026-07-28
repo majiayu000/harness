@@ -30,8 +30,8 @@ pub struct EventSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthReport {
-    /// `None` when the window held no events and no violations: an empty
-    /// window has no quality verdict to report.
+    /// `None` when the window held no independent gradeable events and no
+    /// violations. Derived `quality_grade` events do not create a verdict.
     pub quality: Option<QualityReport>,
     pub violation_summary: Vec<ViolationSummary>,
     pub signal_summary: Vec<SignalSummary>,
@@ -47,7 +47,7 @@ pub fn generate_health_report(events: &[Event], violations: &[Violation]) -> Hea
     let recommendations = match quality.as_ref() {
         Some(quality) => build_recommendations(quality, &violation_summary, &event_summary),
         None => vec![
-            "No events observed in this window; run a task before reading a quality verdict."
+            "No independent observability evidence in this window; run a task before reading a quality verdict."
                 .to_string(),
         ],
     };
@@ -186,6 +186,15 @@ mod tests {
         Event::new(SessionId::new(), "security_check", "Edit", Decision::Block)
     }
 
+    fn quality_grade_event() -> Event {
+        Event::new(
+            SessionId::new(),
+            "quality_grade",
+            "QualityGrader",
+            Decision::Pass,
+        )
+    }
+
     fn escalate_event(hook: &str) -> Event {
         Event::new(SessionId::new(), hook, "Edit", Decision::Escalate)
     }
@@ -208,7 +217,15 @@ mod tests {
         assert!(report.signal_summary.is_empty());
         assert_eq!(report.event_summary.total, 0);
         assert_eq!(report.recommendations.len(), 1);
-        assert!(report.recommendations[0].contains("No events observed"));
+        assert!(report.recommendations[0].contains("No independent observability evidence"));
+    }
+
+    #[test]
+    fn derived_grade_without_independent_evidence_has_no_verdict() {
+        let report = generate_health_report(&[quality_grade_event()], &[]);
+        assert!(report.quality.is_none());
+        assert_eq!(report.event_summary.total, 1);
+        assert!(report.recommendations[0].contains("No independent observability evidence"));
     }
 
     #[test]
