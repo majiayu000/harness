@@ -328,6 +328,17 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 | `github_webhook_secret` | — | HMAC-SHA256 secret for GitHub webhook verification |
 | `notification_broadcast_capacity` | `256` | Internal notification channel capacity |
 
+### `[workflow]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `completion_evidence_enforced` | `true` | Deployment-wide enforcement of server-verified evidence for built-in workflow completion transitions. This temporary emergency kill switch is available for one release and is not accepted in project `WORKFLOW.md` files. |
+
+Keep `completion_evidence_enforced = true` under normal operation. Setting it
+to `false` is a security-sensitive rollback that allows agent-claimed terminal
+results without server-verified evidence for every project in the Harness
+deployment. Use it only as a controlled, temporary recovery measure.
+
 ### `[intake.github]`
 
 | Field | Default | Description |
