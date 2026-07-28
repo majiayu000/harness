@@ -1,7 +1,7 @@
 use super::*;
 
 pub(in crate::runtime) fn to_jsonb_string(value: &impl Serialize) -> anyhow::Result<String> {
-    Ok(serde_json::to_string(value)?.replace("\\u0000", ""))
+    crate::jsonb::to_jsonb_string(value)
 }
 
 pub(in crate::runtime) fn enum_str(value: &impl Serialize) -> anyhow::Result<String> {

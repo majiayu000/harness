@@ -367,6 +367,7 @@ async fn exercise_real_caller_interleave(
     let interleave = TaskDb::install_recovery_write_interleave_for_test(task_id.clone());
     let captured = CapturedSubscriber::default();
     let caller = async {
+        crate::test_helpers::install_tracing_interest_keeper();
         let _subscriber_guard = tracing::subscriber::set_default(captured.clone());
         match site {
             RecoverySite::TerminalReplay | RecoverySite::PrReplay => {
@@ -753,6 +754,7 @@ async fn recovery_counts_and_success_logs_require_applied_write() -> anyhow::Res
 
     let applied_output = CapturedSubscriber::default();
     let recovery = {
+        crate::test_helpers::install_tracing_interest_keeper();
         let _subscriber_guard = tracing::subscriber::set_default(applied_output.clone());
         db.recover_in_progress().await?
     };

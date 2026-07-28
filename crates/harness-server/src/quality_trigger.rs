@@ -162,7 +162,15 @@ impl QualityTrigger {
             .next_back()
             .unwrap_or(0);
 
-        let mut report = QualityGrader::grade(&window_events, violation_count);
+        let Some(mut report) = QualityGrader::grade(&window_events, violation_count) else {
+            // No independent gradeable events and no violations in the window:
+            // there is nothing to grade. Leaving GC cadence untouched is the
+            // honest response; derived grade events cannot become new evidence.
+            tracing::debug!(
+                "quality_trigger: observation window held no evidence; leaving GC cadence unchanged"
+            );
+            return;
+        };
 
         // Cross-review gate: skip if no challenger, no task context, or grade=A.
         if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {

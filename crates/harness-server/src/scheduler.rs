@@ -14,6 +14,28 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// GC cadence for a window that produced no quality verdict.
+    ///
+    /// A server starting with an empty event store used to be graded A and
+    /// given the 7-day cadence — a reward for having observed nothing. With no
+    /// verdict, fall back to the daily cadence and let the first real grade
+    /// take over.
+    pub const NO_VERDICT_GC_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+    /// Build a scheduler from an optional startup grade. `None` means the
+    /// startup window carried no evidence to grade.
+    pub fn from_initial_grade(grade: Option<Grade>) -> Self {
+        match grade {
+            Some(grade) => Self::from_grade(grade),
+            None => Self {
+                gc_interval: Self::NO_VERDICT_GC_INTERVAL,
+                health_interval: Duration::from_secs(24 * 3600),
+                self_evolution_interval: Duration::from_secs(24 * 3600),
+                workspace_gc_interval: Duration::from_secs(3600),
+            },
+        }
+    }
+
     pub fn from_grade(grade: Grade) -> Self {
         Self {
             gc_interval: grade.recommended_gc_interval(),
@@ -114,8 +136,8 @@ impl Scheduler {
         state.observability.events.log(&probe_report).await?;
         let report = generate_health_report(&events, &violations);
         tracing::info!(
-            grade = ?report.quality.grade,
-            score = report.quality.score,
+            grade = ?report.quality.as_ref().map(|quality| quality.grade),
+            score = report.quality.as_ref().map(|quality| quality.score),
             violations = report.violation_summary.len(),
             "scheduler: periodic health report"
         );
@@ -153,6 +175,19 @@ mod tests {
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
         assert_eq!(s.self_evolution_interval, Duration::from_secs(24 * 3600));
         assert_eq!(s.workspace_gc_interval, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn no_startup_verdict_uses_the_daily_cadence_not_the_grade_a_cadence() {
+        let s = Scheduler::from_initial_grade(None);
+        assert_eq!(s.gc_interval, Scheduler::NO_VERDICT_GC_INTERVAL);
+        assert_ne!(s.gc_interval, Grade::A.recommended_gc_interval());
+    }
+
+    #[test]
+    fn a_startup_verdict_still_drives_the_cadence() {
+        let s = Scheduler::from_initial_grade(Some(Grade::D));
+        assert_eq!(s.gc_interval, Grade::D.recommended_gc_interval());
     }
 
     #[test]

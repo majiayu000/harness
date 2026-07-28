@@ -154,10 +154,10 @@ pub use repo_memory::{
     REPO_MEMORY_DEGRADATION_ARTIFACT,
 };
 pub use state_registry::{
-    current_declarative_workflow_definition, decision_validator_for_definition,
-    decision_validator_for_instance, declarative_workflow_definition_for_instance,
-    freeze_workflow_definition_registry, known_workflow_definition_ids,
-    register_declarative_workflow_definitions,
+    apply_builtin_evidence_enforcement, current_declarative_workflow_definition,
+    decision_validator_for_definition, decision_validator_for_instance,
+    declarative_workflow_definition_for_instance, freeze_workflow_definition_registry,
+    known_workflow_definition_ids, register_declarative_workflow_definitions,
     register_historical_declarative_workflow_definitions, register_workflow_definition,
     resolve_declarative_definition, workflow_declarative_definition, workflow_definition,
     workflow_definition_for_version, workflow_instance_is_declarative, workflow_state_definition,

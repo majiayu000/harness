@@ -282,6 +282,45 @@ async fn rejected_new_runtime_decision_persists_initial_instance() -> anyhow::Re
     Ok(())
 }
 
+#[test]
+fn atomic_validation_rejection_is_not_reported_as_accepted() {
+    let workflow_id = "atomic-validation-rejection";
+    let decision = WorkflowDecision::new(
+        workflow_id,
+        "addressing_feedback",
+        "address_feedback",
+        "local_review_gate",
+        "feedback addressed",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "run_local_review",
+        "atomic-validation-rejection-command",
+    ));
+
+    assert_eq!(
+        outcome_from_atomic_record(Some(WorkflowDecisionRecord::accepted(
+            decision.clone(),
+            Some("atomic-validation-event".to_string()),
+        ))),
+        RuntimeDecisionCommitOutcome::Accepted
+    );
+    assert_eq!(
+        outcome_from_atomic_record(None),
+        RuntimeDecisionCommitOutcome::Stale
+    );
+
+    let outcome = outcome_from_atomic_record(Some(WorkflowDecisionRecord::rejected(
+        decision,
+        Some("atomic-validation-event".to_string()),
+        "atomic validator rejected the transition",
+    )));
+
+    let RuntimeDecisionCommitOutcome::Rejected { reason } = outcome else {
+        panic!("atomic validator rejection must not be reported as success");
+    };
+    assert_eq!(reason, "atomic validator rejected the transition");
+}
+
 #[tokio::test]
 async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
 ) -> anyhow::Result<()> {
