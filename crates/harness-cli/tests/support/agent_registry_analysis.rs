@@ -1,18 +1,23 @@
 use super::{
-    BuilderCall, BuilderCallUse, DirectConstruction, ExpectedBuilderUse, MacroViolation, SourceUnit,
+    resolution::{
+        alias_scope_from_block, alias_scope_from_items, collect_crate_aliases,
+        collect_generic_factories, ident_name, path_segments, type_paths, AliasScope, CrateAliases,
+        GenericFactories, Resolver, Segments,
+    },
+    BuilderCall, BuilderCallUse, DirectConstruction, ExpectedBuilderUse, MacroViolation,
+    SourceUnit,
 };
 use proc_macro2::{TokenStream, TokenTree};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     path::PathBuf,
 };
 use syn::{
     visit::{self, Visit},
-    Block, Expr, ExprCall, ExprPath, ExprStruct, File, Item, ItemFn, ItemImpl, ItemMod, ItemType,
-    ItemUse, Local, Macro, Member, Pat, Path as SynPath, Stmt, Type, UseTree, Visibility,
+    Attribute, Block, Expr, ExprCall, ExprPath, ExprStruct, File, ImplItemFn, Item, ItemFn,
+    ItemImpl, ItemMod, ItemUse, Local, Macro, Member, Pat, ReturnType, Stmt, Type, UseTree,
+    Visibility,
 };
-
-type Segments = Vec<String>;
 
 const FORBIDDEN_TYPES: [&str; 7] = [
     "AgentRegistry",
@@ -24,54 +29,12 @@ const FORBIDDEN_TYPES: [&str; 7] = [
     "ProviderBackpressureGate",
 ];
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct AliasTarget {
-    path: Segments,
-    module_path: Segments,
-}
-
-#[derive(Clone, Debug, Default)]
-struct AliasScope {
-    paths: HashMap<String, Vec<AliasTarget>>,
-}
-
-impl AliasScope {
-    fn insert(&mut self, name: String, target: AliasTarget) {
-        let targets = self.paths.entry(name).or_default();
-        if !targets.contains(&target) {
-            targets.push(target);
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct CrateAliases {
-    paths: HashMap<Segments, Vec<Segments>>,
-}
-
-impl CrateAliases {
-    fn insert(&mut self, name: Segments, target: Segments) {
-        let targets = self.paths.entry(name).or_default();
-        if !targets.contains(&target) {
-            targets.push(target);
-        }
-    }
-
-    fn longest_match(&self, path: &[String]) -> Option<(usize, &[Segments])> {
-        (1..=path.len()).rev().find_map(|length| {
-            self.paths
-                .get(&path[..length])
-                .map(|targets| (length, &targets[..]))
-        })
-    }
-}
-
 #[derive(Default)]
 pub(super) struct SourceAnalysis {
     direct_builder_calls: Vec<BuilderCall>,
     pub(super) direct_constructions: Vec<DirectConstruction>,
     pub(super) macro_violations: Vec<MacroViolation>,
-    pub(super) public_glob_reexports: usize,
+    pub(super) production_glob_imports: usize,
 }
 
 impl SourceAnalysis {
@@ -103,7 +66,7 @@ impl SourceAnalysis {
                     .map(String::as_str)
                     .eq(expected.iter().copied())
                     && call.function.as_deref() == Some(function)
-                    && call.top_level
+                    && call.direct_function_body
                     && match (&call.usage, expected_usage) {
                         (
                             BuilderCallUse::LetBinding(actual),
@@ -119,98 +82,76 @@ impl SourceAnalysis {
     }
 }
 
-struct Resolver<'a> {
-    crate_aliases: &'a CrateAliases,
-    scopes: &'a [AliasScope],
-    module_path: &'a [String],
-    impl_types: &'a [Segments],
-}
-
-impl Resolver<'_> {
-    fn resolve(&self, mut path: Segments) -> Vec<Segments> {
-        if path.first().is_some_and(|segment| segment == "Self") {
-            if let Some(impl_type) = self.impl_types.last() {
-                let mut expanded = impl_type.clone();
-                expanded.extend(path.into_iter().skip(1));
-                path = expanded;
-            }
-        }
-
-        let mut queue = VecDeque::from([normalize_relative(path, self.module_path)]);
-        let mut visited = HashSet::new();
-        let mut resolved = HashSet::new();
-
-        while let Some(candidate) = queue.pop_front() {
-            if !visited.insert(candidate.clone()) {
-                resolved.insert(candidate);
-                continue;
-            }
-
-            if let Some(first) = candidate.first() {
-                if let Some(targets) = self
-                    .scopes
-                    .iter()
-                    .rev()
-                    .find_map(|scope| scope.paths.get(first))
-                {
-                    for target in targets {
-                        let mut expanded =
-                            normalize_relative(target.path.clone(), &target.module_path);
-                        expanded.extend(candidate.iter().skip(1).cloned());
-                        queue.push_back(expanded);
-                    }
-                    continue;
-                }
-            }
-
-            if let Some((prefix_length, targets)) = self.crate_aliases.longest_match(&candidate) {
-                for target in targets {
-                    let mut expanded = target.clone();
-                    expanded.extend(candidate.iter().skip(prefix_length).cloned());
-                    queue.push_back(expanded);
-                }
-                continue;
-            }
-
-            resolved.insert(candidate);
-        }
-
-        resolved.into_iter().collect()
-    }
+struct FunctionFrame {
+    name: String,
+    body_address: usize,
+    top_level_item: bool,
+    return_forbidden_types: Vec<String>,
 }
 
 struct SourceScanner<'a> {
     crate_aliases: &'a CrateAliases,
+    generic_factories: &'a GenericFactories,
     scopes: Vec<AliasScope>,
     module_path: Segments,
     impl_types: Vec<Segments>,
-    function_names: Vec<String>,
+    function_frames: Vec<FunctionFrame>,
     builder_usage_targets: Vec<(usize, BuilderCallUse)>,
+    review_constructor_targets: Vec<usize>,
     inline_module_depth: usize,
+    in_cfg_test_module: bool,
     analysis: SourceAnalysis,
 }
 
 impl<'a> SourceScanner<'a> {
-    fn new(crate_aliases: &'a CrateAliases, module_path: Segments) -> Self {
+    fn new(
+        crate_aliases: &'a CrateAliases,
+        generic_factories: &'a GenericFactories,
+        module_path: Segments,
+        in_cfg_test_module: bool,
+    ) -> Self {
         Self {
             crate_aliases,
+            generic_factories,
             scopes: Vec::new(),
             module_path,
             impl_types: Vec::new(),
-            function_names: Vec::new(),
+            function_frames: Vec::new(),
             builder_usage_targets: Vec::new(),
+            review_constructor_targets: Vec::new(),
             inline_module_depth: 0,
+            in_cfg_test_module,
             analysis: SourceAnalysis::default(),
         }
     }
 
     fn resolver(&self) -> Resolver<'_> {
-        Resolver {
-            crate_aliases: self.crate_aliases,
-            scopes: &self.scopes,
-            module_path: &self.module_path,
-            impl_types: &self.impl_types,
-        }
+        Resolver::new(
+            self.crate_aliases,
+            &self.scopes,
+            &self.module_path,
+            &self.impl_types,
+        )
+    }
+
+    fn enclosing_function(&self) -> Option<String> {
+        self.function_frames.last().map(|frame| frame.name.clone())
+    }
+
+    fn in_top_level_item_function(&self) -> bool {
+        self.function_frames.len() == 1
+            && self
+                .function_frames
+                .last()
+                .is_some_and(|frame| frame.top_level_item)
+    }
+
+    fn in_direct_function_body(&self, block: &Block) -> bool {
+        self.function_frames.last().is_some_and(|frame| {
+            frame.top_level_item
+                && self.function_frames.len() == 1
+                && frame.body_address == block as *const Block as usize
+        })
     }
 
     fn builder_usage(&self, expression: &ExprCall) -> BuilderCallUse {
@@ -220,6 +161,71 @@ impl<'a> SourceScanner<'a> {
             .rev()
             .find(|(target, _)| *target == address)
             .map_or(BuilderCallUse::Other, |(_, usage)| usage.clone())
+    }
+
+    fn forbidden_types_in_type(&self, type_: &Type) -> Vec<String> {
+        let mut forbidden = Vec::new();
+        for path in type_paths(type_) {
+            for resolved in self.resolver().resolve(path) {
+                let Some((type_name, _)) = forbidden_type_in_path(&resolved) else {
+                    continue;
+                };
+                if !forbidden.contains(&type_name) {
+                    forbidden.push(type_name);
+                }
+            }
+        }
+        forbidden
+    }
+
+    fn record_typed_construction(&mut self, type_names: &[String], expression: &Expr) {
+        let Some(syntax) = trait_constructor_syntax(expression) else {
+            return;
+        };
+        let module_path = self.module_path.join("::");
+        let enclosing_function = self.enclosing_function();
+        self.analysis
+            .direct_constructions
+            .extend(type_names.iter().map(|type_name| DirectConstruction {
+                type_name: type_name.clone(),
+                syntax: format!("{syntax} -> {type_name}"),
+                module_path: module_path.clone(),
+                enclosing_function: enclosing_function.clone(),
+                intentional_pr_review_constructor: false,
+            }));
+    }
+
+    fn record_generic_factory_call(&mut self, call: &ExprCall, function: &ExprPath) {
+        if function.qself.is_some() || !call.args.is_empty() {
+            return;
+        }
+        let original = path_segments(&function.path);
+        let resolved = self.resolver().resolve(original.clone());
+        let output_types = self.generic_factories.output_type_arguments(
+            &function.path,
+            &resolved,
+            &self.module_path,
+        );
+        let mut forbidden = Vec::new();
+        for type_name in output_types
+            .into_iter()
+            .flat_map(|output_type| self.forbidden_types_in_type(output_type))
+        {
+            if !forbidden.contains(&type_name) {
+                forbidden.push(type_name);
+            }
+        }
+        let module_path = self.module_path.join("::");
+        let enclosing_function = self.enclosing_function();
+        self.analysis
+            .direct_constructions
+            .extend(forbidden.into_iter().map(|type_name| DirectConstruction {
+                syntax: format!("{}::<{type_name}>", original.join("::")),
+                type_name,
+                module_path: module_path.clone(),
+                enclosing_function: enclosing_function.clone(),
+                intentional_pr_review_constructor: false,
+            }));
     }
 
     fn record_expr_path(&mut self, expression: &ExprPath, call: Option<&ExprCall>) {
@@ -249,15 +255,19 @@ impl<'a> SourceScanner<'a> {
                         == ["harness_agents", "codex", "CodexAgent", "new"].map(str::to_string)
                     && original == "CodexAgent::new"
                     && call.is_some_and(intentional_codex_review_call)
+                    && call.is_some_and(|call| {
+                        let address = call as *const ExprCall as usize;
+                        self.review_constructor_targets.contains(&address)
+                    })
+                    && self.in_top_level_item_function()
                     && self
-                        .function_names
+                        .function_frames
                         .last()
-                        .is_some_and(|name| name == "review")
-                    && self.inline_module_depth == 0,
+                        .is_some_and(|frame| frame.name == "review"),
                 type_name,
                 syntax: original.clone(),
                 module_path: self.module_path.join("::"),
-                enclosing_function: self.function_names.last().cloned(),
+                enclosing_function: self.enclosing_function(),
             };
             if !expression_constructions.contains(&construction) {
                 expression_constructions.push(construction);
@@ -312,6 +322,8 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
             return;
         };
         let parent_scopes = std::mem::take(&mut self.scopes);
+        let parent_test_module = self.in_cfg_test_module;
+        self.in_cfg_test_module |= has_cfg_test(&item.attrs);
         self.inline_module_depth += 1;
         self.module_path.push(ident_name(&item.ident));
         self.scopes
@@ -322,60 +334,75 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
         self.scopes.clear();
         self.module_path.pop();
         self.inline_module_depth -= 1;
+        self.in_cfg_test_module = parent_test_module;
         self.scopes = parent_scopes;
     }
 
     fn visit_block(&mut self, block: &'ast Block) {
         self.scopes
             .push(alias_scope_from_block(block, &self.module_path));
-        for statement in &block.stmts {
+        let function_body = self
+            .function_frames
+            .last()
+            .filter(|frame| frame.body_address == block as *const Block as usize);
+        let return_forbidden_types =
+            function_body.map(|frame| frame.return_forbidden_types.clone());
+        let direct_function_body = self.in_direct_function_body(block);
+        let review_function =
+            direct_function_body && function_body.is_some_and(|frame| frame.name == "review");
+
+        if let (Some(type_names), Some(Stmt::Expr(expression, None))) =
+            (return_forbidden_types, block.stmts.last())
+        {
+            self.record_typed_construction(&type_names, expression);
+        }
+
+        for (index, statement) in block.stmts.iter().enumerate() {
+            let builder_target = direct_function_body
+                .then(|| direct_builder_target(statement, index + 1 == block.stmts.len()))
+                .flatten();
+            let review_target = review_function
+                .then(|| direct_review_constructor_target(statement))
+                .flatten();
+            if let Some(target) = builder_target.clone() {
+                self.builder_usage_targets.push(target);
+            }
+            if let Some(target) = review_target {
+                self.review_constructor_targets.push(target);
+            }
             self.visit_stmt(statement);
+            if review_target.is_some() {
+                self.review_constructor_targets.pop();
+            }
+            if builder_target.is_some() {
+                self.builder_usage_targets.pop();
+            }
         }
         self.scopes.pop();
     }
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
-        self.function_names.push(ident_name(&item.sig.ident));
-        let tail_target = item.block.stmts.last().and_then(|statement| {
-            let Stmt::Expr(expression, None) = statement else {
-                return None;
-            };
-            root_call(expression).map(|call| {
-                (
-                    call as *const ExprCall as usize,
-                    BuilderCallUse::TailExpression,
-                )
-            })
+        let return_forbidden_types = match &item.sig.output {
+            ReturnType::Default => Vec::new(),
+            ReturnType::Type(_, type_) => self.forbidden_types_in_type(type_),
+        };
+        let top_level_item = self.function_frames.is_empty() && self.inline_module_depth == 0;
+        self.function_frames.push(FunctionFrame {
+            name: ident_name(&item.sig.ident),
+            body_address: item.block.as_ref() as *const Block as usize,
+            top_level_item,
+            return_forbidden_types,
         });
-        if let Some(target) = tail_target.clone() {
-            self.builder_usage_targets.push(target);
-        }
         visit::visit_item_fn(self, item);
-        if tail_target.is_some() {
-            self.builder_usage_targets.pop();
-        }
-        self.function_names.pop();
+        self.function_frames.pop();
     }
 
     fn visit_local(&mut self, local: &'ast Local) {
-        let target = local.init.as_ref().and_then(|init| {
-            let Pat::Ident(binding) = &local.pat else {
-                return None;
-            };
-            root_call(&init.expr).map(|call| {
-                (
-                    call as *const ExprCall as usize,
-                    BuilderCallUse::LetBinding(ident_name(&binding.ident)),
-                )
-            })
-        });
-        if let Some(target) = target.clone() {
-            self.builder_usage_targets.push(target);
+        if let (Some(type_), Some(init)) = (explicit_pattern_type(&local.pat), &local.init) {
+            let forbidden = self.forbidden_types_in_type(type_);
+            self.record_typed_construction(&forbidden, &init.expr);
         }
         visit::visit_local(self, local);
-        if target.is_some() {
-            self.builder_usage_targets.pop();
-        }
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
@@ -388,8 +415,24 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
         self.impl_types.pop();
     }
 
+    fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
+        let return_forbidden_types = match &item.sig.output {
+            ReturnType::Default => Vec::new(),
+            ReturnType::Type(_, type_) => self.forbidden_types_in_type(type_),
+        };
+        self.function_frames.push(FunctionFrame {
+            name: ident_name(&item.sig.ident),
+            body_address: &item.block as *const Block as usize,
+            top_level_item: false,
+            return_forbidden_types,
+        });
+        visit::visit_impl_item_fn(self, item);
+        self.function_frames.pop();
+    }
+
     fn visit_expr_call(&mut self, expression: &'ast ExprCall) {
         if let Expr::Path(function) = expression.func.as_ref() {
+            self.record_generic_factory_call(expression, function);
             if function.qself.is_none() {
                 let original = path_segments(&function.path);
                 let resolved = self.resolver().resolve(original.clone());
@@ -397,11 +440,13 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
                     && resolved.len() == 1
                     && resolved.first() == Some(&original)
                 {
+                    let usage = self.builder_usage(expression);
                     self.analysis.direct_builder_calls.push(BuilderCall {
                         path: original,
-                        function: self.function_names.last().cloned(),
-                        usage: self.builder_usage(expression),
-                        top_level: self.inline_module_depth == 0,
+                        function: self.enclosing_function(),
+                        direct_function_body: !matches!(usage, BuilderCallUse::Other)
+                            && self.in_top_level_item_function(),
+                        usage,
                     });
                 }
             }
@@ -434,7 +479,7 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
                 type_name,
                 syntax: format!("{} {{ .. }}", original.join("::")),
                 module_path: self.module_path.join("::"),
-                enclosing_function: self.function_names.last().cloned(),
+                enclosing_function: self.enclosing_function(),
                 intentional_pr_review_constructor: false,
             };
             if !expression_constructions.contains(&construction) {
@@ -453,8 +498,10 @@ impl<'ast> Visit<'ast> for SourceScanner<'_> {
     }
 
     fn visit_item_use(&mut self, item: &'ast ItemUse) {
-        if !matches!(item.vis, Visibility::Inherited) && use_tree_has_glob(&item.tree) {
-            self.analysis.public_glob_reexports += 1;
+        if use_tree_has_glob(&item.tree)
+            && !(self.in_cfg_test_module && is_private_super_glob(item))
+        {
+            self.analysis.production_glob_imports += 1;
         }
         visit::visit_item_use(self, item);
     }
@@ -470,6 +517,87 @@ fn root_call(expression: &Expr) -> Option<&ExprCall> {
     }
 }
 
+fn direct_builder_target(
+    statement: &Stmt,
+    is_tail_statement: bool,
+) -> Option<(usize, BuilderCallUse)> {
+    match statement {
+        Stmt::Local(local) => {
+            let binding = pattern_binding_name(&local.pat)?;
+            let call = root_call(&local.init.as_ref()?.expr)?;
+            Some((
+                call as *const ExprCall as usize,
+                BuilderCallUse::LetBinding(binding),
+            ))
+        }
+        Stmt::Expr(expression, None) if is_tail_statement => root_call(expression).map(|call| {
+            (
+                call as *const ExprCall as usize,
+                BuilderCallUse::TailExpression,
+            )
+        }),
+        _ => None,
+    }
+}
+
+fn pattern_binding_name(pattern: &Pat) -> Option<String> {
+    match pattern {
+        Pat::Ident(binding) => Some(ident_name(&binding.ident)),
+        Pat::Type(type_) => pattern_binding_name(&type_.pat),
+        _ => None,
+    }
+}
+
+fn explicit_pattern_type(pattern: &Pat) -> Option<&Type> {
+    let Pat::Type(type_) = pattern else {
+        return None;
+    };
+    Some(&type_.ty)
+}
+
+fn direct_review_constructor_target(statement: &Stmt) -> Option<usize> {
+    let expression = match statement {
+        Stmt::Local(local) => &local.init.as_ref()?.expr,
+        Stmt::Expr(expression, _) => expression,
+        Stmt::Item(_) | Stmt::Macro(_) => return None,
+    };
+    transparent_receiver_call(expression).map(|call| call as *const ExprCall as usize)
+}
+
+fn transparent_receiver_call(expression: &Expr) -> Option<&ExprCall> {
+    match expression {
+        Expr::Call(call) => Some(call),
+        Expr::MethodCall(call) => transparent_receiver_call(&call.receiver),
+        Expr::Await(await_) => transparent_receiver_call(&await_.base),
+        Expr::Group(group) => transparent_receiver_call(&group.expr),
+        Expr::Paren(paren) => transparent_receiver_call(&paren.expr),
+        Expr::Try(try_) => transparent_receiver_call(&try_.expr),
+        _ => None,
+    }
+}
+
+fn trait_constructor_syntax(expression: &Expr) -> Option<String> {
+    let call = root_call(expression)?;
+    let Expr::Path(function) = call.func.as_ref() else {
+        return None;
+    };
+    if function.qself.is_some() {
+        return None;
+    }
+    let segments = path_segments(&function.path);
+    let is_trait_constructor = matches!(
+        segments.as_slice(),
+        [.., trait_name, method]
+            if matches!(
+                (trait_name.as_str(), method.as_str()),
+                ("Default", "default") | ("From", "from") | ("TryFrom", "try_from")
+            )
+    );
+    let is_zeroed = matches!(segments.as_slice(), [.., module, method]
+        if module == "mem" && method == "zeroed");
+    (is_trait_constructor || is_zeroed).then(|| segments.join("::"))
+}
+
 fn use_tree_has_glob(tree: &UseTree) -> bool {
     match tree {
         UseTree::Glob(_) => true,
@@ -479,16 +607,45 @@ fn use_tree_has_glob(tree: &UseTree) -> bool {
     }
 }
 
-fn path_segments(path: &SynPath) -> Segments {
-    path.segments
-        .iter()
-        .map(|segment| ident_name(&segment.ident))
-        .collect()
+fn is_private_super_glob(item: &ItemUse) -> bool {
+    matches!(item.vis, Visibility::Inherited)
+        && matches!(
+            &item.tree,
+            UseTree::Path(path)
+                if ident_name(&path.ident) == "super"
+                    && matches!(path.tree.as_ref(), UseTree::Glob(_))
+        )
 }
 
-fn ident_name(ident: &proc_macro2::Ident) -> String {
-    let name = ident.to_string();
-    name.strip_prefix("r#").unwrap_or(&name).to_string()
+fn has_cfg_test(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && attribute
+                .parse_args::<syn::Ident>()
+                .is_ok_and(|condition| condition == "test")
+    })
+}
+
+fn collect_cfg_test_modules(
+    items: &[Item],
+    module_path: &[String],
+    inherited_test_context: bool,
+    test_modules: &mut HashSet<Segments>,
+) {
+    for item in items {
+        let Item::Mod(module) = item else {
+            continue;
+        };
+        let is_test_module = inherited_test_context || has_cfg_test(&module.attrs);
+        let mut nested_path = module_path.to_vec();
+        nested_path.push(ident_name(&module.ident));
+        if is_test_module {
+            test_modules.insert(nested_path.clone());
+        }
+        if let Some((_, nested)) = &module.content {
+            collect_cfg_test_modules(nested, &nested_path, is_test_module, test_modules);
+        }
+    }
 }
 
 fn is_canonical_builder_path(path: &[String]) -> bool {
@@ -517,203 +674,6 @@ fn forbidden_type_in_path(path: &[String]) -> Option<(String, Option<String>)> {
                     .cloned(),
             )
         })
-}
-
-fn normalize_relative(mut path: Segments, module_path: &[String]) -> Segments {
-    if path.first().is_some_and(|segment| segment == "crate") {
-        return path;
-    }
-    if path.first().is_some_and(|segment| segment == "self") {
-        let mut normalized = vec!["crate".to_string()];
-        normalized.extend(module_path.iter().cloned());
-        normalized.extend(path.into_iter().skip(1));
-        return normalized;
-    }
-    if path.first().is_some_and(|segment| segment == "super") {
-        let mut module = module_path.to_vec();
-        while path.first().is_some_and(|segment| segment == "super") {
-            module.pop();
-            path.remove(0);
-        }
-        let mut normalized = vec!["crate".to_string()];
-        normalized.extend(module);
-        normalized.extend(path);
-        return normalized;
-    }
-    path
-}
-
-fn collect_use_aliases(
-    tree: &UseTree,
-    prefix: &mut Segments,
-    aliases: &mut AliasScope,
-    module_path: &[String],
-) {
-    match tree {
-        UseTree::Path(path) => {
-            prefix.push(ident_name(&path.ident));
-            collect_use_aliases(&path.tree, prefix, aliases, module_path);
-            prefix.pop();
-        }
-        UseTree::Name(name) => {
-            let imported = ident_name(&name.ident);
-            if imported == "self" {
-                if let Some(local_name) = prefix.last() {
-                    aliases.insert(
-                        local_name.clone(),
-                        AliasTarget {
-                            path: prefix.clone(),
-                            module_path: module_path.to_vec(),
-                        },
-                    );
-                }
-            } else {
-                let mut target = prefix.clone();
-                target.push(imported.clone());
-                aliases.insert(
-                    imported,
-                    AliasTarget {
-                        path: target,
-                        module_path: module_path.to_vec(),
-                    },
-                );
-            }
-        }
-        UseTree::Rename(rename) => {
-            let imported = ident_name(&rename.ident);
-            let mut target = prefix.clone();
-            if imported != "self" {
-                target.push(imported);
-            }
-            aliases.insert(
-                ident_name(&rename.rename),
-                AliasTarget {
-                    path: target,
-                    module_path: module_path.to_vec(),
-                },
-            );
-        }
-        UseTree::Group(group) => {
-            for item in &group.items {
-                collect_use_aliases(item, prefix, aliases, module_path);
-            }
-        }
-        UseTree::Glob(_) => {}
-    }
-}
-
-fn add_item_alias(item: &Item, scope: &mut AliasScope, module_path: &[String]) {
-    match item {
-        Item::Use(ItemUse { tree, .. }) => {
-            collect_use_aliases(tree, &mut Vec::new(), scope, module_path);
-        }
-        Item::Type(ItemType { ident, ty, .. }) => {
-            if let Type::Path(type_path) = ty.as_ref() {
-                if type_path.qself.is_none() {
-                    scope.insert(
-                        ident_name(ident),
-                        AliasTarget {
-                            path: path_segments(&type_path.path),
-                            module_path: module_path.to_vec(),
-                        },
-                    );
-                }
-            }
-        }
-        Item::Mod(ItemMod { ident, .. }) => {
-            let mut target = vec!["crate".to_string()];
-            target.extend(module_path.iter().cloned());
-            target.push(ident_name(ident));
-            scope.insert(
-                ident_name(ident),
-                AliasTarget {
-                    path: target,
-                    module_path: module_path.to_vec(),
-                },
-            );
-        }
-        Item::ExternCrate(item) => {
-            let local_name = item
-                .rename
-                .as_ref()
-                .map_or_else(|| ident_name(&item.ident), |(_, ident)| ident_name(ident));
-            scope.insert(
-                local_name,
-                AliasTarget {
-                    path: vec![ident_name(&item.ident)],
-                    module_path: module_path.to_vec(),
-                },
-            );
-        }
-        _ => {}
-    }
-}
-
-fn alias_scope_from_items(items: &[Item], module_path: &[String]) -> AliasScope {
-    let mut scope = AliasScope::default();
-    for item in items {
-        add_item_alias(item, &mut scope, module_path);
-    }
-    scope
-}
-
-fn alias_scope_from_block(block: &Block, module_path: &[String]) -> AliasScope {
-    let mut scope = AliasScope::default();
-    for statement in &block.stmts {
-        if let Stmt::Item(item) = statement {
-            add_item_alias(item, &mut scope, module_path);
-        }
-    }
-    scope
-}
-
-fn expand_in_scope(path: Segments, scope: &AliasScope, module_path: &[String]) -> Vec<Segments> {
-    let mut queue = VecDeque::from([path]);
-    let mut visited = HashSet::new();
-    let mut expanded = HashSet::new();
-    while let Some(candidate) = queue.pop_front() {
-        if !visited.insert(candidate.clone()) {
-            expanded.insert(normalize_relative(candidate, module_path));
-            continue;
-        }
-        if let Some(targets) = candidate.first().and_then(|first| scope.paths.get(first)) {
-            for target in targets {
-                let mut replacement = normalize_relative(target.path.clone(), &target.module_path);
-                replacement.extend(candidate.iter().skip(1).cloned());
-                queue.push_back(replacement);
-            }
-        } else {
-            expanded.insert(normalize_relative(candidate, module_path));
-        }
-    }
-    expanded.into_iter().collect()
-}
-
-fn collect_crate_aliases(items: &[Item], module_path: &[String], aliases: &mut CrateAliases) {
-    let scope = alias_scope_from_items(items, module_path);
-    for (local_name, targets) in &scope.paths {
-        let mut absolute_name = vec!["crate".to_string()];
-        absolute_name.extend(module_path.iter().cloned());
-        absolute_name.push(local_name.clone());
-        for target in targets {
-            for expanded in expand_in_scope(target.path.clone(), &scope, module_path) {
-                aliases.insert(absolute_name.clone(), expanded);
-            }
-        }
-    }
-
-    for item in items {
-        if let Item::Mod(ItemMod {
-            ident,
-            content: Some((_, nested)),
-            ..
-        }) = item
-        {
-            let mut nested_module = module_path.to_vec();
-            nested_module.push(ident_name(ident));
-            collect_crate_aliases(nested, &nested_module, aliases);
-        }
-    }
 }
 
 fn token_paths(stream: TokenStream, paths: &mut Vec<Segments>) {
@@ -774,11 +734,26 @@ fn intentional_codex_review_call(call: &ExprCall) -> bool {
 
 pub(super) fn analyze_units(units: &[SourceUnit]) -> HashMap<PathBuf, SourceAnalysis> {
     let mut aliases_by_crate = HashMap::<String, CrateAliases>::new();
+    let mut factories_by_crate = HashMap::<String, GenericFactories>::new();
+    let mut test_modules_by_crate = HashMap::<String, HashSet<Segments>>::new();
     for unit in units {
         collect_crate_aliases(
             &unit.file.items,
             &unit.module_path,
             aliases_by_crate.entry(unit.crate_id.clone()).or_default(),
+        );
+        collect_generic_factories(
+            &unit.file.items,
+            &unit.module_path,
+            factories_by_crate.entry(unit.crate_id.clone()).or_default(),
+        );
+        collect_cfg_test_modules(
+            &unit.file.items,
+            &unit.module_path,
+            false,
+            test_modules_by_crate
+                .entry(unit.crate_id.clone())
+                .or_default(),
         );
     }
     units
@@ -787,7 +762,20 @@ pub(super) fn analyze_units(units: &[SourceUnit]) -> HashMap<PathBuf, SourceAnal
             let crate_aliases = aliases_by_crate
                 .get(&unit.crate_id)
                 .expect("source crate aliases exist");
-            let mut scanner = SourceScanner::new(crate_aliases, unit.module_path.clone());
+            let generic_factories = factories_by_crate
+                .get(&unit.crate_id)
+                .expect("source generic factories exist");
+            let in_cfg_test_module = test_modules_by_crate
+                .get(&unit.crate_id)
+                .expect("source test modules exist")
+                .iter()
+                .any(|test_module| unit.module_path.starts_with(test_module));
+            let mut scanner = SourceScanner::new(
+                crate_aliases,
+                generic_factories,
+                unit.module_path.clone(),
+                in_cfg_test_module,
+            );
             scanner.visit_file(&unit.file);
             (unit.relative.clone(), scanner.analysis)
         })

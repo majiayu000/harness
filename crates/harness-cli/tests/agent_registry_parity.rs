@@ -2,6 +2,10 @@
 
 #[path = "support/agent_registry_analysis.rs"]
 mod analysis;
+#[path = "support/agent_registry_regressions.rs"]
+mod regressions;
+#[path = "support/agent_registry_resolution.rs"]
+mod resolution;
 
 use analysis::*;
 use std::path::{Path, PathBuf};
@@ -46,7 +50,7 @@ struct BuilderCall {
     path: Vec<String>,
     function: Option<String>,
     usage: BuilderCallUse,
-    top_level: bool,
+    direct_function_body: bool,
 }
 
 const REGISTRY_BUILDER: &str = "harness_agents::builder::registry_from_config";
@@ -129,12 +133,12 @@ fn no_cli_source_assembles_agent_backends_by_hand() {
                 violation.forbidden_type
             ));
         }
-        if analysis.public_glob_reexports > 0 {
+        if analysis.production_glob_imports > 0 {
             violations.push(format!(
-                "{} — contains {} production glob re-export(s), which the alias guard cannot \
+                "{} — contains {} production glob import(s), which the alias guard cannot \
                  resolve safely",
                 relative.display(),
-                analysis.public_glob_reexports
+                analysis.production_glob_imports
             ));
         }
     }
@@ -209,7 +213,7 @@ fn production_glob_reexports_fail_closed_without_rejecting_test_preludes() {
         "#,
     )
     .expect("production glob parses");
-    assert_eq!(production.public_glob_reexports, 1);
+    assert_eq!(production.production_glob_imports, 1);
 
     let test_prelude = analyze_source(
         r#"
@@ -220,14 +224,14 @@ fn production_glob_reexports_fail_closed_without_rejecting_test_preludes() {
         "#,
     )
     .expect("test prelude parses");
-    assert_eq!(test_prelude.public_glob_reexports, 0);
+    assert_eq!(test_prelude.production_glob_imports, 0);
 }
 
 #[test]
 fn binary_roots_resolve_their_own_cross_file_aliases() {
     let analyses = analyze_source_set(&[
         (
-            "src/bin/tool.rs",
+            "src/bin/tool/main.rs",
             r#"
             mod alias;
             use crate::alias::Registry;
@@ -241,7 +245,7 @@ fn binary_roots_resolve_their_own_cross_file_aliases() {
     ])
     .expect("binary source set parses");
     assert_eq!(
-        analyses[Path::new("src/bin/tool.rs")]
+        analyses[Path::new("src/bin/tool/main.rs")]
             .direct_constructions
             .len(),
         1
