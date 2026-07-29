@@ -58,9 +58,17 @@ async fn cancelled_recovered_quality_gate_is_reactivated_after_terminal_job() ->
     )
     .await?;
     let commands = store.commands_for(&workflow_id).await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].id, command.id);
-    assert_eq!(commands[0].status, WorkflowCommandStatus::Pending);
+    assert!(commands.iter().all(|record| {
+        record.command.requires_runtime_job()
+            || record.status == WorkflowCommandStatus::HandledInline
+    }));
+    let runtime_commands = commands
+        .iter()
+        .filter(|record| record.command.requires_runtime_job())
+        .collect::<Vec<_>>();
+    assert_eq!(runtime_commands.len(), 1);
+    assert_eq!(runtime_commands[0].id, command.id);
+    assert_eq!(runtime_commands[0].status, WorkflowCommandStatus::Pending);
     store
         .enqueue_runtime_job_for_pending_command(
             &command.id,
