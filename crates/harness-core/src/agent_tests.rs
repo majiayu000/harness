@@ -67,6 +67,25 @@ fn agent_request_does_not_infer_layers_from_flattened_prompt() {
 }
 
 #[test]
+fn flattened_prompt_without_layers_does_not_cross_associate_with_similar_prompt() {
+    let registered_flattened = prompts::PromptParts {
+        static_instructions: "shared static instructions\n".to_string(),
+        context: "shared request context\n".to_string(),
+        dynamic_payload: "shared dynamic payload\n".to_string(),
+    }
+    .to_prompt_string();
+    let similar_prompt = format!("{registered_flattened}runtime-specific suffix\n");
+    let request = AgentRequest {
+        prompt: similar_prompt.clone(),
+        project_root: PathBuf::from("/tmp/project"),
+        ..AgentRequest::default()
+    };
+
+    assert_eq!(request.claude_system_prompt().as_deref(), None);
+    assert_eq!(request.claude_main_prompt(), similar_prompt);
+}
+
+#[test]
 fn explicit_layers_keep_similar_prompts_test_isolated() {
     let short_layers = AgentPromptLayers::new("static\n", "context\n", "dynamic\n");
     let long_layers = AgentPromptLayers::new("static\ncontext\n", "dynamic\n", "runtime\n");

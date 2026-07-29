@@ -72,10 +72,13 @@ impl PromptParts {
     /// the prompt-building function. Callers that previously stored the return value as a
     /// `String` should call this method to obtain it.
     pub fn to_prompt_string(&self) -> String {
-        format!(
-            "{}{}{}",
-            self.static_instructions, self.context, self.dynamic_payload
-        )
+        let mut prompt = String::with_capacity(
+            self.static_instructions.len() + self.context.len() + self.dynamic_payload.len(),
+        );
+        prompt.push_str(&self.static_instructions);
+        prompt.push_str(&self.context);
+        prompt.push_str(&self.dynamic_payload);
+        prompt
     }
 }
 
