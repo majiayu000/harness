@@ -26,8 +26,8 @@ pub use migrations::EVENT_STORE_SCHEMA;
 /// Event store backed by Postgres.
 ///
 /// Backward compatibility: on first startup the store imports any existing
-/// `events.jsonl` file found in the data directory, then leaves it in place as
-/// an archive.
+/// `events.jsonl` file found in the data directory, then renames it as an
+/// archive after a successful import.
 pub struct EventStore {
     pool: PgPool,
     schema: String,
@@ -318,32 +318,15 @@ impl EventStore {
 
     /// Import events from an existing `events.jsonl` file (backward compat).
     ///
-    /// Fast-paths out when the `events` table already contains rows: on each
-    /// startup we previously re-read the full JSONL and fired one `INSERT
-    /// ... ON CONFLICT DO NOTHING` per line. Against a remote Postgres (e.g.
-    /// Supabase session pooler, ~1s RTT per statement) this added ~N seconds
-    /// to every server boot for N lines in the file, even though every row
-    /// was already in the DB. Checking the table once is a single query.
+    /// The JSONL file is archived only after all parsed events are inserted.
+    /// That keeps a partially failed batch migration retryable: already
+    /// inserted rows hit `ON CONFLICT DO NOTHING`, and remaining rows can still
+    /// be imported on the next startup.
     async fn migrate_from_jsonl(&self) {
         use std::io::BufRead as _;
 
-        // Fast-path only for this data directory. Other store keys in the
-        // shared schema must not suppress this store's legacy import.
-        match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE store_key = $1")
-            .bind(&self.store_key)
-            .fetch_one(&self.pool)
-            .await
-        {
-            Ok(n) if n > 0 => return,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    "event store: could not check existing event count, will still attempt JSONL migration: {e}"
-                );
-            }
-        }
-
         let path = self.data_dir.join("events.jsonl");
+        let archive_path = self.data_dir.join("events.jsonl.migrated");
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -378,8 +361,20 @@ impl EventStore {
             tracing::warn!("event store: failed to batch insert migrated events: {e}");
             return;
         }
+        if let Err(e) = std::fs::rename(&path, &archive_path) {
+            tracing::warn!(
+                "event store: migrated events.jsonl but could not archive {} to {}: {e}",
+                path.display(),
+                archive_path.display()
+            );
+            return;
+        }
         if imported > 0 {
-            tracing::info!(imported, "event store: migrated events from events.jsonl");
+            tracing::info!(
+                imported,
+                archive = %archive_path.display(),
+                "event store: migrated events from events.jsonl"
+            );
         }
     }
 

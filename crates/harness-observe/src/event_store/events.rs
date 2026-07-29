@@ -107,7 +107,7 @@ impl EventStore {
         let content_col = if filters.include_content {
             "content"
         } else {
-            "NULL as content"
+            "CAST(NULL AS TEXT) as content"
         };
         let mut sql = format!(
             "SELECT id, ts, session_id, run_id, hook, tool, decision, reason, detail, duration_ms, {content_col}, metadata

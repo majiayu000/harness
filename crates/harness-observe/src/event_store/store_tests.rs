@@ -161,6 +161,36 @@ async fn log_and_query_roundtrip() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn migrate_from_jsonl_retries_when_store_already_has_rows() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(store) = open_test_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let existing = make_event("existing", Decision::Pass);
+    store.log(&existing).await?;
+
+    let legacy = make_event("legacy_jsonl", Decision::Warn);
+    let jsonl_path = dir.path().join("events.jsonl");
+    std::fs::write(
+        &jsonl_path,
+        format!("{}\n", serde_json::to_string(&legacy)?),
+    )?;
+
+    store.migrate_from_jsonl().await;
+
+    let results = store.query(&EventFilters::default()).await?;
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|event| event.id == existing.id));
+    assert!(results.iter().any(|event| event.id == legacy.id));
+    assert!(
+        !jsonl_path.exists(),
+        "successful retry should archive JSONL"
+    );
+    store.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn event_metadata_roundtrips() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some(store) = open_test_store(dir.path()).await? else {
@@ -738,6 +768,11 @@ async fn migrate_from_jsonl_imports_existing_events() -> anyhow::Result<()> {
     let results = store.query(&EventFilters::default()).await?;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, event.id);
+    assert!(!jsonl_path.exists(), "legacy JSONL should be archived");
+    assert!(
+        dir.path().join("events.jsonl.migrated").exists(),
+        "legacy JSONL archive should remain available"
+    );
     store.close().await;
     Ok(())
 }
