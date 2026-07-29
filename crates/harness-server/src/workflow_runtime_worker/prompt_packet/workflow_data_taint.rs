@@ -1,7 +1,8 @@
 use anyhow::Context;
 use harness_core::prompts::wrap_external_data;
 use harness_workflow::runtime::{
-    DataProvenance, WorkflowDataProvenance, WorkflowInstance, WORKFLOW_DATA_PROVENANCE_SCHEMA,
+    workflow_data_pointer, DataProvenance, WorkflowDataProvenance, WorkflowInstance,
+    WORKFLOW_DATA_PROVENANCE_SCHEMA,
 };
 use serde_json::{json, Map, Value};
 
@@ -47,21 +48,19 @@ fn render_workflow_data(
 ) -> anyhow::Result<RenderedWorkflowData> {
     let mut data = workflow.data.clone();
     super::remove_duplicated_command_field(&mut data, job_input, "additional_prompt");
-    if let Some(provenance) = &workflow.data_provenance {
-        if provenance.schema != WORKFLOW_DATA_PROVENANCE_SCHEMA {
-            anyhow::bail!(
-                "workflow.data provenance schema `{}` is not supported",
-                provenance.schema
-            );
-        }
-    }
     let mut degradation = Vec::new();
-    let rendered = render_value(
-        "",
-        &data,
-        workflow.data_provenance.as_ref(),
-        &mut degradation,
-    )?;
+    let rendered = match &workflow.data_provenance {
+        Some(provenance) => {
+            if provenance.schema != WORKFLOW_DATA_PROVENANCE_SCHEMA {
+                anyhow::bail!(
+                    "workflow.data provenance schema `{}` is not supported",
+                    provenance.schema
+                );
+            }
+            render_value("", &data, provenance, &mut degradation)?
+        }
+        None => render_legacy_root(&data, &mut degradation)?,
+    };
     let trusted = rendered.trusted.unwrap_or_else(|| json!({}));
     let untrusted = rendered.untrusted.map(|fields| {
         let fenced_field_count = count_fenced_fields(&fields);
@@ -82,10 +81,23 @@ fn render_workflow_data(
 fn render_value(
     pointer: &str,
     value: &Value,
-    provenance: Option<&WorkflowDataProvenance>,
+    provenance: &WorkflowDataProvenance,
     degradation: &mut Vec<Value>,
 ) -> anyhow::Result<RenderedValue> {
-    match provenance.and_then(|provenance| provenance.provenance_for(pointer)) {
+    if empty_container(value) {
+        return Ok(RenderedValue {
+            trusted: Some(value.clone()),
+            untrusted: None,
+        });
+    }
+
+    // A more-specific classification always wins over an inherited container
+    // classification, so mixed objects and arrays must be partitioned first.
+    if provenance.has_descendant_entry(pointer) {
+        return render_descendant_classified_container(pointer, value, provenance, degradation);
+    }
+
+    match provenance.provenance_for(pointer) {
         Some(DataProvenance::Server) => {
             return Ok(RenderedValue {
                 trusted: Some(value.clone()),
@@ -101,40 +113,50 @@ fn render_value(
         None => {}
     }
 
-    if let Some(provenance) = provenance {
-        if provenance.has_descendant_entry(pointer) {
-            return render_descendant_classified_object(pointer, value, provenance, degradation);
-        }
-        anyhow::bail!("unclassified workflow.data field `{pointer}`");
+    if provenance.is_legacy(pointer) {
+        degradation.push(json!({
+            "pointer": pointer,
+            "reason": "legacy_unclassified_workflow_data"
+        }));
+        return Ok(RenderedValue {
+            trusted: None,
+            untrusted: Some(Value::String(fence_untrusted_value(value))),
+        });
     }
 
-    if pointer.is_empty() {
-        return render_legacy_root(value, degradation);
-    }
-    degradation.push(json!({
-        "pointer": pointer,
-        "reason": "legacy_unclassified_workflow_data"
-    }));
-    Ok(RenderedValue {
-        trusted: None,
-        untrusted: Some(Value::String(fence_untrusted_value(value))),
-    })
+    anyhow::bail!("unclassified workflow.data field `{pointer}`");
 }
 
-fn render_descendant_classified_object(
+fn render_descendant_classified_container(
     pointer: &str,
     value: &Value,
     provenance: &WorkflowDataProvenance,
     degradation: &mut Vec<Value>,
 ) -> anyhow::Result<RenderedValue> {
-    let object = value
-        .as_object()
-        .with_context(|| format!("unclassified workflow.data field `{pointer}`"))?;
+    match value {
+        Value::Object(object) => {
+            render_descendant_classified_object(pointer, object, provenance, degradation)
+        }
+        Value::Array(array) => {
+            render_descendant_classified_array(pointer, array, provenance, degradation)
+        }
+        _ => anyhow::bail!(
+            "workflow.data field `{pointer}` has descendant provenance but is not a container"
+        ),
+    }
+}
+
+fn render_descendant_classified_object(
+    pointer: &str,
+    object: &Map<String, Value>,
+    provenance: &WorkflowDataProvenance,
+    degradation: &mut Vec<Value>,
+) -> anyhow::Result<RenderedValue> {
     let mut trusted = Map::new();
     let mut untrusted = Map::new();
     for (key, child) in object {
-        let child_pointer = child_pointer(pointer, key);
-        let rendered = render_value(&child_pointer, child, Some(provenance), degradation)?;
+        let child_pointer = workflow_data_pointer(pointer, key);
+        let rendered = render_value(&child_pointer, child, provenance, degradation)?;
         if let Some(value) = rendered.trusted {
             trusted.insert(key.clone(), value);
         }
@@ -148,6 +170,34 @@ fn render_descendant_classified_object(
     })
 }
 
+fn render_descendant_classified_array(
+    pointer: &str,
+    array: &[Value],
+    provenance: &WorkflowDataProvenance,
+    degradation: &mut Vec<Value>,
+) -> anyhow::Result<RenderedValue> {
+    let mut trusted = vec![Value::Null; array.len()];
+    let mut untrusted = vec![Value::Null; array.len()];
+    let mut has_trusted = false;
+    let mut has_untrusted = false;
+    for (index, child) in array.iter().enumerate() {
+        let child_pointer = workflow_data_pointer(pointer, &index.to_string());
+        let rendered = render_value(&child_pointer, child, provenance, degradation)?;
+        if let Some(value) = rendered.trusted {
+            trusted[index] = value;
+            has_trusted = true;
+        }
+        if let Some(value) = rendered.untrusted {
+            untrusted[index] = value;
+            has_untrusted = true;
+        }
+    }
+    Ok(RenderedValue {
+        trusted: has_trusted.then_some(Value::Array(trusted)),
+        untrusted: has_untrusted.then_some(Value::Array(untrusted)),
+    })
+}
+
 fn render_legacy_root(
     value: &Value,
     degradation: &mut Vec<Value>,
@@ -157,12 +207,12 @@ fn render_legacy_root(
         .context("legacy workflow.data must be a JSON object")?;
     let mut untrusted = Map::new();
     for (key, child) in object {
-        let pointer = child_pointer("", key);
+        let pointer = workflow_data_pointer("", key);
         degradation.push(json!({
             "pointer": pointer,
             "reason": "legacy_unclassified_workflow_data"
         }));
-        untrusted.insert(key.clone(), Value::String(fence_untrusted_value(child)));
+        untrusted.insert(key.to_string(), Value::String(fence_untrusted_value(child)));
     }
     Ok(RenderedValue {
         trusted: Some(json!({})),
@@ -178,16 +228,11 @@ fn object_or_none(object: Map<String, Value>) -> Option<Value> {
     }
 }
 
-fn child_pointer(parent: &str, key: &str) -> String {
-    let escaped = key.replace('~', "~0").replace('/', "~1");
-    if parent.is_empty() {
-        format!("/{escaped}")
-    } else {
-        format!("{parent}/{escaped}")
-    }
+fn empty_container(value: &Value) -> bool {
+    value.as_object().is_some_and(Map::is_empty) || value.as_array().is_some_and(Vec::is_empty)
 }
 
-fn fence_untrusted_value(value: &Value) -> String {
+pub(super) fn fence_untrusted_value(value: &Value) -> String {
     match value {
         Value::String(value) => wrap_external_data(value),
         Value::Null => wrap_external_data("null"),

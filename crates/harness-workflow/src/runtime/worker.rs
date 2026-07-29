@@ -448,28 +448,38 @@ pub(super) fn apply_failure_reason_side_effect(
     {
         return Ok(());
     }
-    if !instance.data.is_object() {
-        instance.data = json!({});
-    }
-    let data = instance
-        .data
-        .as_object_mut()
-        .context("workflow instance data is not an object")?;
+    let mut writes = Vec::new();
     if let Some(reason) = reason {
-        data.insert("failure_reason".to_string(), json!(reason));
+        writes.push(super::WorkflowDataWrite::set(
+            "failure_reason",
+            json!(reason),
+            super::DataProvenance::Agent,
+        ));
         if command.command_type == super::model::WorkflowCommandType::MarkBlocked {
-            data.insert("blocked_reason".to_string(), json!(reason));
+            writes.push(super::WorkflowDataWrite::set(
+                "blocked_reason",
+                json!(reason),
+                super::DataProvenance::Agent,
+            ));
         }
     }
     for field in STOP_STRING_FIELDS {
         if let Some(value) = command_string_field(command, field) {
-            data.insert((*field).to_string(), json!(value));
+            writes.push(super::WorkflowDataWrite::set(
+                *field,
+                json!(value),
+                super::DataProvenance::Agent,
+            ));
         }
     }
     if let Some(last_stop) = command.command.get("last_stop") {
-        data.insert("last_stop".to_string(), last_stop.clone());
+        writes.push(super::WorkflowDataWrite::set(
+            "last_stop",
+            last_stop.clone(),
+            super::DataProvenance::Agent,
+        ));
     }
-    Ok(())
+    instance.apply_data_writes(writes)
 }
 
 const STOP_STRING_FIELDS: &[&str] = &[

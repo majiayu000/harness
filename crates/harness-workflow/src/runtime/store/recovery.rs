@@ -224,7 +224,7 @@ impl WorkflowRuntimeStore {
             &previous_state,
             &plan.target.state,
             &event.id,
-        );
+        )?;
         upsert_instance_tx(&mut tx, &instance).await?;
         tx.commit().await?;
 
@@ -565,21 +565,33 @@ fn persist_operator_recovery_data(
     previous_state: &str,
     state: &str,
     event_id: &str,
-) {
-    if !instance.data.is_object() {
-        instance.data = json!({});
-    }
-    if let Some(data) = instance.data.as_object_mut() {
-        // A successful recovery ends the stop episode. Stop classification and
-        // auto-recovery state must not leak into later terminal history or keep
-        // recovered transcript dependency families pinned.
-        data.remove("auto_recovery");
-        data.remove("last_stop");
-        data.remove("stop_reason_code");
-        data.remove("reason_class");
-        data.remove("error_kind");
-        data.insert(
-            "last_operator_recovery".to_string(),
+) -> anyhow::Result<()> {
+    // A successful recovery ends the stop episode. Stop classification and
+    // auto-recovery state must not leak into later terminal history or keep
+    // recovered transcript dependency families pinned.
+    instance.apply_data_writes([
+        crate::runtime::WorkflowDataWrite::remove(
+            "auto_recovery",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::remove(
+            "last_stop",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::remove(
+            "stop_reason_code",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::remove(
+            "reason_class",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::remove(
+            "error_kind",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::set(
+            "last_operator_recovery",
             json!({
                 "action": action.as_str(),
                 "reason": reason,
@@ -588,8 +600,9 @@ fn persist_operator_recovery_data(
                 "state": state,
                 "event_id": event_id,
             }),
-        );
-    }
+            crate::runtime::DataProvenance::Server,
+        ),
+    ])
 }
 
 fn recovery_dispatch_decision(

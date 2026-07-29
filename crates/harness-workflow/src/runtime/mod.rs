@@ -12,6 +12,7 @@ mod candidate_terminal;
 mod command_record;
 pub mod completion_evidence;
 pub mod data_provenance;
+mod data_write;
 pub mod declarative;
 mod declarative_interpreter;
 mod declarative_pinning;
@@ -69,8 +70,9 @@ pub use candidate_selection::{
     CandidateSelectionRecord, CANDIDATE_SELECTION_RECORD_TYPE, CANDIDATE_SELECTION_SCHEMA,
 };
 pub use data_provenance::{
-    DataProvenance, WorkflowDataProvenance, WORKFLOW_DATA_PROVENANCE_SCHEMA,
+    workflow_data_pointer, DataProvenance, WorkflowDataProvenance, WORKFLOW_DATA_PROVENANCE_SCHEMA,
 };
+pub use data_write::WorkflowDataWrite;
 pub use declarative::{build_declarative_definition, DeclarativeWorkflowDefinition};
 pub use declarative_interpreter::{
     build_declarative_submission_decision, DECLARATIVE_SUBMISSION_DECISION,

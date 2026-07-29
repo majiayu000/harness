@@ -460,14 +460,11 @@ async fn apply_prompt_continuation_side_effect(
             continuation.attempt
         );
     }
-    let data = instance
-        .data
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("prompt task instance data must be a JSON object"))?;
-    data.insert(
-        "continuation".to_string(),
+    instance.set_data_field(
+        "continuation",
         serde_json::to_value(continuation)?,
-    );
+        crate::runtime::DataProvenance::External,
+    )?;
     Ok(PromptContinuationSideEffect::Applied)
 }
 

@@ -63,17 +63,11 @@ impl WorkflowRuntimeStore {
         }
 
         let context = WorkflowOtelTraceContext::new();
-        if !instance.data.is_object() {
-            instance.data = serde_json::json!({});
-        }
-        let data = instance
-            .data
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("workflow instance data is not an object"))?;
-        data.insert(
-            "otel_trace_context".to_string(),
+        instance.set_data_field(
+            "otel_trace_context",
             serde_json::to_value(&context)?,
-        );
+            crate::runtime::DataProvenance::Server,
+        )?;
         instance.version = instance.version.saturating_add(1);
         upsert_instance_tx(&mut tx, &instance).await?;
         tx.commit().await?;
@@ -103,19 +97,17 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(false);
         }
-        if !instance.data.is_object() {
-            instance.data = serde_json::json!({});
-        }
-        let data = instance
-            .data
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("workflow instance data is not an object"))?;
         match auto_recovery {
             Some(value) => {
-                data.insert("auto_recovery".to_string(), value.clone());
+                instance.set_data_field(
+                    "auto_recovery",
+                    value.clone(),
+                    crate::runtime::DataProvenance::Server,
+                )?;
             }
             None => {
-                data.remove("auto_recovery");
+                instance
+                    .remove_data_field("auto_recovery", crate::runtime::DataProvenance::Server)?;
             }
         }
         instance.version = instance.version.saturating_add(1);

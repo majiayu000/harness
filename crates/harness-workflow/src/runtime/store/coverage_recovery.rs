@@ -69,13 +69,11 @@ impl WorkflowRuntimeStore {
             IsolationTrustClass::Trusted
         };
         if current != Some(effective) {
-            let data = instance.data.as_object_mut().ok_or_else(|| {
-                anyhow::anyhow!("workflow `{workflow_id}` data must be an object")
-            })?;
-            data.insert(
-                "author_trust_class".to_string(),
+            instance.set_data_field(
+                "author_trust_class",
                 serde_json::to_value(effective)?,
-            );
+                crate::runtime::DataProvenance::Server,
+            )?;
             instance.version = instance.version.saturating_add(1);
             upsert_instance_tx(&mut tx, &instance).await?;
         }

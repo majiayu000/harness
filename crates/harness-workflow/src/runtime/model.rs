@@ -130,11 +130,6 @@ impl WorkflowInstance {
         self
     }
 
-    pub fn with_data(mut self, data: Value) -> Self {
-        self.data = data;
-        self
-    }
-
     pub fn with_parent(mut self, parent_workflow_id: impl Into<String>) -> Self {
         self.parent_workflow_id = Some(parent_workflow_id.into());
         self

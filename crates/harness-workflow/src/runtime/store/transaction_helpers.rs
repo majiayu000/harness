@@ -253,16 +253,18 @@ fn apply_bind_pr_side_effect(
         .and_then(Value::as_str)
         .context("bind_pr command missing pr_url")?;
 
-    if !instance.data.is_object() {
-        instance.data = json!({});
-    }
-    let data = instance
-        .data
-        .as_object_mut()
-        .context("workflow instance data is not an object")?;
-    data.insert("pr_number".to_string(), json!(pr_number));
-    data.insert("pr_url".to_string(), json!(pr_url));
-    Ok(())
+    instance.apply_data_writes([
+        crate::runtime::WorkflowDataWrite::set(
+            "pr_number",
+            json!(pr_number),
+            crate::runtime::DataProvenance::Agent,
+        ),
+        crate::runtime::WorkflowDataWrite::set(
+            "pr_url",
+            json!(pr_url),
+            crate::runtime::DataProvenance::Agent,
+        ),
+    ])
 }
 
 fn apply_mark_done_side_effect(
@@ -272,13 +274,9 @@ fn apply_mark_done_side_effect(
     let Some(closed_issue_evidence) = command.command.get("closed_issue_evidence").cloned() else {
         return Ok(());
     };
-    if !instance.data.is_object() {
-        instance.data = json!({});
-    }
-    let data = instance
-        .data
-        .as_object_mut()
-        .context("workflow instance data is not an object")?;
-    data.insert("closed_issue_evidence".to_string(), closed_issue_evidence);
-    Ok(())
+    instance.set_data_field(
+        "closed_issue_evidence",
+        closed_issue_evidence,
+        crate::runtime::DataProvenance::Agent,
+    )
 }

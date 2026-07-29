@@ -236,6 +236,13 @@ fn mark_failed_inline_command_persists_failure_reason_into_data() {
         Some("Agent turn timed out after 900s"),
         "MarkFailed must surface its reason as the queryable failure_reason"
     );
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/failure_reason")),
+        Some(super::super::DataProvenance::Agent)
+    );
     assert_eq!(instance.data["error_kind"], "timeout");
     assert_eq!(instance.data["retry_hint"], "Retry after route repair.");
     assert_eq!(instance.data["last_stop"]["runtime_job_id"], "job-1");
@@ -259,6 +266,13 @@ fn mark_blocked_inline_command_persists_stop_metadata_into_data() {
     assert_eq!(
         instance.data["unblock_hint"],
         "Post approval, then call unblock."
+    );
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/blocked_reason")),
+        Some(super::super::DataProvenance::Agent)
     );
     assert_eq!(instance.data["last_stop"]["runtime_job_id"], "job-2");
 }
