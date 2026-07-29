@@ -1,16 +1,18 @@
 use crate::http::AppState;
-use harness_core::agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
-use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
-use harness_core::types::AgentId;
-use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, RuntimeProfile, WorkflowInstance,
+use harness_core::agent::{
+    AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV, AGENT_OUTPUT_SCHEMA_PATH_ENV,
 };
+use harness_core::config::workflow::WorkflowConfig;
+use harness_core::types::AgentId;
+use harness_workflow::runtime::{ActivityArtifact, ActivityResult, RuntimeJob, WorkflowInstance};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::activity_result::activity_result_from_turn_with_workflow;
+use super::activity_result::{
+    activity_result_from_turn_with_workflow, structured_output_correction,
+};
 use super::child_workflow::execute_start_child_workflow;
 use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
@@ -36,8 +38,17 @@ use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
 use super::turn_engine::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
 use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 
-const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 3600;
-const DEFAULT_PR_FEEDBACK_INSPECT_TIMEOUT_SECS: u64 = 3600;
+#[path = "executor/runtime_timeout.rs"]
+mod runtime_timeout;
+use runtime_timeout::runtime_profile_with_timeout_fallback;
+
+#[path = "executor/structured_output.rs"]
+mod structured_output;
+use structured_output::{
+    codex_output_schema_file, structured_output_correction_artifact,
+    structured_output_correction_prompt,
+};
+
 const RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT: &str =
     "runtime_workspace_finalization_warning";
 
@@ -146,129 +157,162 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             let prompt_packet_digest = prompt_packet_digest(&prompt_packet);
             self.record_prompt_packet_prepared(&job, &prompt_packet, &prompt_packet_digest)
                 .await?;
-            let prompt =
-                build_runtime_job_prompt(&prompt_packet, prompt_task_request.prompt_text());
-            record_runtime_prompt_input(
-                self.state,
-                &job,
-                agent_name,
-                &project_root,
-                &activity,
-                execution_phase,
-                &prompt,
-            )
-            .await;
-            let thread_id = self
-                .state
-                .core
-                .server
-                .thread_manager
-                .start_thread(project_root.clone());
-            let turn_id = self.state.core.server.thread_manager.start_turn(
-                &thread_id,
-                prompt.clone(),
-                AgentId::from_str(agent_name),
-            )?;
-            let _runtime_turn_alias_guard = workflow
-                .as_ref()
-                .and_then(|workflow| {
-                    crate::workflow_runtime_submission::runtime_issue_task_handle(workflow)
-                })
-                .map(|submission_id| {
-                    RuntimeTurnAliasGuard::register(
-                        self.state.core.server.clone(),
-                        submission_id.0,
-                        turn_id.clone(),
-                    )
-                });
             let force_code_agent = force_code_agent_for_runtime_turn(
                 job.runtime_kind,
                 resolved_settings.approval_policy.explicit_value(),
             );
-            run_turn_lifecycle_with_options(
-                self.state.core.server.clone(),
-                self.state.notifications.notify_tx.clone(),
-                self.state.notifications.notification_tx.clone(),
-                thread_id.clone(),
-                turn_id.clone(),
-                prompt,
-                agent_name.to_string(),
-                TurnLifecycleOptions {
-                    model: Some(resolved_settings.model.clone()),
-                    reasoning_effort: resolved_settings.reasoning_effort.clone(),
+            let output_schema_file =
+                codex_output_schema_file(force_code_agent, &job, &prompt_packet)?;
+            let mut prompt =
+                build_runtime_job_prompt(&prompt_packet, prompt_task_request.prompt_text());
+            let mut correction_retry = None;
+            for attempt in 0..=1 {
+                record_runtime_prompt_input(
+                    self.state,
+                    &job,
+                    agent_name,
+                    &project_root,
+                    &activity,
                     execution_phase,
-                    sandbox_mode: Some(resolved_settings.sandbox_mode),
-                    approval_policy: resolved_settings
-                        .approval_policy
-                        .explicit_value()
-                        .map(str::to_owned),
-                    timeout_secs: Some(resolved_settings.timeout_secs),
-                    stall_timeout_secs: Some(resolved_settings.stall_timeout_secs),
-                    env_vars: isolation_spawn_env_vars(&job),
-                    // Prefer the stable `codex exec` path for non-interactive turns.
-                    // Approval-gated turns use the app-server adapter because it owns
-                    // the live approval response channel.
-                    force_code_agent,
-                    runtime_usage: runtime_usage_context(
+                    &prompt,
+                )
+                .await;
+                let thread_id = self
+                    .state
+                    .core
+                    .server
+                    .thread_manager
+                    .start_thread(project_root.clone());
+                let turn_id = self.state.core.server.thread_manager.start_turn(
+                    &thread_id,
+                    prompt.clone(),
+                    AgentId::from_str(agent_name),
+                )?;
+                let _runtime_turn_alias_guard = workflow
+                    .as_ref()
+                    .and_then(|workflow| {
+                        crate::workflow_runtime_submission::runtime_issue_task_handle(workflow)
+                    })
+                    .map(|submission_id| {
+                        RuntimeTurnAliasGuard::register(
+                            self.state.core.server.clone(),
+                            submission_id.0,
+                            turn_id.clone(),
+                        )
+                    });
+                let mut env_vars = isolation_spawn_env_vars(&job);
+                if let Some(schema_file) = output_schema_file.as_ref() {
+                    env_vars.insert(
+                        AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
+                        schema_file.path().display().to_string(),
+                    );
+                }
+                run_turn_lifecycle_with_options(
+                    self.state.core.server.clone(),
+                    self.state.notifications.notify_tx.clone(),
+                    self.state.notifications.notification_tx.clone(),
+                    thread_id.clone(),
+                    turn_id.clone(),
+                    prompt.clone(),
+                    agent_name.to_string(),
+                    TurnLifecycleOptions {
+                        model: Some(resolved_settings.model.clone()),
+                        reasoning_effort: resolved_settings.reasoning_effort.clone(),
+                        execution_phase,
+                        sandbox_mode: Some(resolved_settings.sandbox_mode),
+                        approval_policy: resolved_settings
+                            .approval_policy
+                            .explicit_value()
+                            .map(str::to_owned),
+                        timeout_secs: Some(resolved_settings.timeout_secs),
+                        stall_timeout_secs: Some(resolved_settings.stall_timeout_secs),
+                        env_vars,
+                        // Prefer the stable `codex exec` path for non-interactive turns.
+                        // Approval-gated turns use the app-server adapter because it owns
+                        // the live approval response channel.
+                        force_code_agent,
+                        runtime_usage: runtime_usage_context(
+                            self.state,
+                            &job,
+                            workflow.as_ref(),
+                            &runtime_profile,
+                            agent_name,
+                            &source_project_root,
+                        ),
+                    },
+                )
+                .await;
+
+                let turn = self
+                    .state
+                    .core
+                    .server
+                    .thread_manager
+                    .get_turn(&thread_id, &turn_id)
+                    .ok_or_else(|| anyhow::anyhow!("runtime turn disappeared before completion"))?;
+                let mut result = activity_result_from_turn_with_workflow(
+                    &job,
+                    &turn.status,
+                    &turn.items,
+                    &thread_id,
+                    &turn_id,
+                    agent_name,
+                    &project_root,
+                    &prompt_packet_digest,
+                    workflow
+                        .as_ref()
+                        .map(|workflow| workflow.definition_id.as_str()),
+                );
+                if attempt == 0 {
+                    if let Some(correction) = structured_output_correction(&result) {
+                        tracing::warn!(
+                            runtime_job_id = %job.id,
+                            activity = %activity,
+                            outcome = %correction.outcome,
+                            "retrying runtime turn once to correct structured ActivityResult output"
+                        );
+                        prompt =
+                            structured_output_correction_prompt(&prompt, &correction, &turn.items);
+                        correction_retry = Some(correction);
+                        continue;
+                    }
+                }
+                if let Some(correction) = correction_retry.as_ref() {
+                    result = result.with_artifact(structured_output_correction_artifact(
+                        correction,
+                        attempt + 1,
+                    ));
+                }
+                // Agent output can never carry server-reserved evidence artifacts
+                // (GH-1766): strip before the server attaches its own.
+                let result =
+                    harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(
+                        result,
+                    );
+                let result =
+                    super::transcript_durability::attach_runtime_transcript_source(result, &turn)?
+                        .with_artifact(repo_memory_config_artifact(memory_enabled));
+                let result = if let Some(degradation) = repo_memory.degradation.clone() {
+                    result.with_artifact(degradation)
+                } else {
+                    result
+                };
+                let result =
+                    verify_merge_completion_if_needed(self.state, &job, workflow.as_ref(), result)
+                        .await;
+                return Ok(
+                    super::completion_evidence_integration::apply_completion_evidence(
                         self.state,
                         &job,
                         workflow.as_ref(),
-                        &runtime_profile,
-                        agent_name,
-                        &source_project_root,
-                    ),
-                },
-            )
-            .await;
-
-            let turn = self
-                .state
-                .core
-                .server
-                .thread_manager
-                .get_turn(&thread_id, &turn_id)
-                .ok_or_else(|| anyhow::anyhow!("runtime turn disappeared before completion"))?;
-            let result = activity_result_from_turn_with_workflow(
-                &job,
-                &turn.status,
-                &turn.items,
-                &thread_id,
-                &turn_id,
-                agent_name,
-                &project_root,
-                &prompt_packet_digest,
-                workflow
-                    .as_ref()
-                    .map(|workflow| workflow.definition_id.as_str()),
-            );
-            // Agent output can never carry server-reserved evidence artifacts
-            // (GH-1766): strip before the server attaches its own.
-            let result =
-                harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(
-                    result,
+                        &workflow_document.config,
+                        &project_root,
+                        result,
+                    )
+                    .await,
                 );
-            let result =
-                super::transcript_durability::attach_runtime_transcript_source(result, &turn)?
-                    .with_artifact(repo_memory_config_artifact(memory_enabled));
-            let result = if let Some(degradation) = repo_memory.degradation {
-                result.with_artifact(degradation)
-            } else {
-                result
-            };
-            let result =
-                verify_merge_completion_if_needed(self.state, &job, workflow.as_ref(), result)
-                    .await;
-            Ok(
-                super::completion_evidence_integration::apply_completion_evidence(
-                    self.state,
-                    &job,
-                    workflow.as_ref(),
-                    &workflow_document.config,
-                    &project_root,
-                    result,
-                )
-                .await,
-            )
+            }
+            unreachable!("bounded structured-output retry loop always returns")
         }
         .await;
         let finish_result = finish_runtime_workspace(self.state, &runtime_workspace).await;
@@ -421,64 +465,6 @@ fn isolation_spawn_env_vars(job: &RuntimeJob) -> HashMap<String, String> {
     env_vars
 }
 
-fn runtime_profile_with_timeout_fallback(
-    mut profile: RuntimeProfile,
-    workflow_config: &WorkflowConfig,
-    workflow: Option<&WorkflowInstance>,
-    job: &RuntimeJob,
-) -> RuntimeProfile {
-    if profile.timeout_secs.is_none() {
-        profile.timeout_secs = runtime_timeout_fallback(workflow_config, workflow, job);
-    }
-    profile
-}
-
-fn runtime_timeout_fallback(
-    workflow_config: &WorkflowConfig,
-    workflow: Option<&WorkflowInstance>,
-    job: &RuntimeJob,
-) -> Option<u64> {
-    let runtime_dispatch = &workflow_config.runtime_dispatch;
-    let workflow_definition_id = workflow.map(|workflow| workflow.definition_id.as_str());
-    let activity = activity_name(job);
-
-    workflow_definition_id
-        .and_then(|definition_id| {
-            runtime_dispatch
-                .workflow_activity_profiles
-                .get(definition_id)
-                .and_then(|profiles| profiles.get(&activity))
-        })
-        .and_then(profile_timeout)
-        .or_else(|| {
-            runtime_dispatch
-                .activity_profiles
-                .get(&activity)
-                .and_then(profile_timeout)
-        })
-        .or_else(|| {
-            workflow_definition_id.and_then(|definition_id| {
-                runtime_dispatch
-                    .workflow_profiles
-                    .get(definition_id)
-                    .and_then(profile_timeout)
-            })
-        })
-        .or(runtime_dispatch.timeout_secs)
-        .or_else(|| default_runtime_timeout(&activity))
-}
-
-fn profile_timeout(profile: &RuntimeDispatchProfileOverride) -> Option<u64> {
-    profile.timeout_secs
-}
-
-fn default_runtime_timeout(activity: &str) -> Option<u64> {
-    Some(match activity {
-        "inspect_pr_feedback" => DEFAULT_PR_FEEDBACK_INSPECT_TIMEOUT_SECS,
-        _ => DEFAULT_RUNTIME_TURN_TIMEOUT_SECS,
-    })
-}
-
 fn runtime_worker_disabled_result_for_config(
     activity: &str,
     project_root: &Path,
@@ -540,8 +526,11 @@ fn runtime_workspace_finalization_warning_artifact(error: &anyhow::Error) -> Act
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_workflow::runtime::{RuntimeKind, WorkflowSubject};
+    use harness_core::config::workflow::RuntimeDispatchProfileOverride;
+    use harness_workflow::runtime::{RuntimeKind, RuntimeProfile, WorkflowSubject};
     use serde_json::json;
+
+    use super::runtime_timeout::runtime_timeout_fallback;
 
     fn runtime_job(activity: &str) -> RuntimeJob {
         RuntimeJob::pending(

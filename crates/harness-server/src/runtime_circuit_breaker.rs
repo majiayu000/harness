@@ -5,59 +5,9 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum FailureClass {
-    ZeroOutputSpawnFailure,
-    QuotaInteractiveWait,
-    CliMissingFile,
-    WorktreeCollision,
-    StructuredOutputMissing,
-    SandboxPermission,
-    Unclassified,
-}
-
-impl FailureClass {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::ZeroOutputSpawnFailure => "zero-output-spawn-failure",
-            Self::QuotaInteractiveWait => "quota-interactive-wait",
-            Self::CliMissingFile => "cli-missing-file",
-            Self::WorktreeCollision => "worktree-collision",
-            Self::StructuredOutputMissing => "structured-output-missing",
-            Self::SandboxPermission => "sandbox-permission",
-            Self::Unclassified => "unclassified",
-        }
-    }
-}
-
-pub(crate) fn classify_agent_failure(error: &str) -> FailureClass {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("zero_output_spawn_failure")
-        || lower.contains("zero-output spawn failure")
-        || lower.contains("completed without assistant output")
-    {
-        return FailureClass::ZeroOutputSpawnFailure;
-    }
-    if error.contains("Reading additional input")
-        || lower.contains("hit your limit")
-        || lower.contains("hit your usage limit")
-    {
-        return FailureClass::QuotaInteractiveWait;
-    }
-    if error.contains("No such file or directory") {
-        return FailureClass::CliMissingFile;
-    }
-    if error.contains("WorktreeCollision") {
-        return FailureClass::WorktreeCollision;
-    }
-    if lower.contains("no harness-activity-result") {
-        return FailureClass::StructuredOutputMissing;
-    }
-    if lower.contains("sandbox") || lower.contains("permission denied") {
-        return FailureClass::SandboxPermission;
-    }
-    FailureClass::Unclassified
-}
+#[path = "runtime_circuit_breaker/failure_class.rs"]
+mod failure_class;
+pub(crate) use failure_class::{classify_agent_failure, FailureClass};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeferredProfile {
@@ -245,6 +195,9 @@ impl RuntimeCircuitBreakerRegistry {
         now: DateTime<Utc>,
     ) -> Vec<CircuitBreakerEvent> {
         if !self.config.enabled {
+            return Vec::new();
+        }
+        if !class.trips_runtime_profile_breaker() {
             return Vec::new();
         }
         let config = self.config.clone();
@@ -501,6 +454,10 @@ mod tests {
         assert_eq!(
             classify_agent_failure("no harness-activity-result block found"),
             FailureClass::StructuredOutputMissing
+        );
+        assert_eq!(
+            classify_agent_failure("$.error expected string; outcome=invalid_structured_output"),
+            FailureClass::StructuredOutputInvalid
         );
         assert_eq!(
             classify_agent_failure("sandbox denied: permission denied"),
@@ -793,5 +750,25 @@ mod tests {
             outside_window,
         );
         assert_eq!(events[0].kind, CircuitBreakerEventKind::Opened);
+    }
+
+    #[test]
+    fn structured_output_invalid_failures_do_not_open_profile_breaker() {
+        let registry = RuntimeCircuitBreakerRegistry::new(RuntimeCircuitBreakerPolicy::default());
+        let now = Utc::now();
+
+        for index in 0..5 {
+            assert!(registry
+                .record_failure(
+                    "codex",
+                    &format!("structured-job-{index}"),
+                    FailureClass::StructuredOutputInvalid,
+                    now
+                )
+                .is_empty());
+        }
+
+        assert!(registry.defer_open_profiles(now).is_empty());
+        assert!(registry.snapshots(now).is_empty());
     }
 }

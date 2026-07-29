@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 pub(super) struct CapturingAgent {
     pub(super) prompts: Mutex<Vec<String>>,
@@ -14,6 +15,7 @@ impl CapturingAgent {
 
 pub(super) struct RuntimeStreamAgent {
     pub(super) prompts: Mutex<Vec<String>>,
+    pub(super) env_vars: Mutex<Vec<HashMap<String, String>>>,
     pub(super) models: Mutex<Vec<Option<String>>>,
     pub(super) reasoning_efforts: Mutex<Vec<Option<String>>>,
     pub(super) sandbox_modes: Mutex<Vec<Option<SandboxMode>>>,
@@ -25,14 +27,31 @@ pub(super) struct FailingStreamAgent {
     error: String,
 }
 
+pub(super) struct SequencedStreamAgent {
+    pub(super) prompts: Mutex<Vec<String>>,
+    pub(super) env_vars: Mutex<Vec<HashMap<String, String>>>,
+    outputs: Mutex<Vec<String>>,
+}
+
 impl RuntimeStreamAgent {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             prompts: Mutex::new(Vec::new()),
+            env_vars: Mutex::new(Vec::new()),
             models: Mutex::new(Vec::new()),
             reasoning_efforts: Mutex::new(Vec::new()),
             sandbox_modes: Mutex::new(Vec::new()),
             approval_policies: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl SequencedStreamAgent {
+    pub(super) fn new(outputs: Vec<String>) -> Arc<Self> {
+        Arc::new(Self {
+            prompts: Mutex::new(Vec::new()),
+            env_vars: Mutex::new(Vec::new()),
+            outputs: Mutex::new(outputs),
         })
     }
 }
@@ -135,6 +154,7 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
+        self.env_vars.lock().await.push(req.env_vars.clone());
         self.prompts.lock().await.push(req.prompt);
         Ok(successful_agent_response())
     }
@@ -154,6 +174,7 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
+        self.env_vars.lock().await.push(req.env_vars.clone());
         // Probe the runtime-job activity name from the prompt so the fenced
         // result block reports the correct `activity`. The activity is the
         // top `Activity:` line in the prompt packet header. Falling back to
@@ -172,6 +193,49 @@ impl CodeAgent for RuntimeStreamAgent {
         let _ = tx
             .send(StreamItem::ItemCompleted {
                 item: Item::AgentReasoning { content: fenced },
+            })
+            .await;
+        let _ = tx.send(StreamItem::Done).await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CodeAgent for SequencedStreamAgent {
+    fn name(&self) -> &str {
+        "sequenced-stream-agent"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![]
+    }
+
+    async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.env_vars.lock().await.push(req.env_vars.clone());
+        self.prompts.lock().await.push(req.prompt);
+        Ok(successful_agent_response())
+    }
+
+    async fn execute_stream(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.env_vars.lock().await.push(req.env_vars.clone());
+        self.prompts.lock().await.push(req.prompt);
+        let content = self
+            .outputs
+            .lock()
+            .await
+            .drain(..1)
+            .next()
+            .unwrap_or_else(|| {
+                r#"{"activity":"implement_prompt","status":"succeeded","summary":"fallback"}"#
+                    .to_string()
+            });
+        let _ = tx
+            .send(StreamItem::ItemCompleted {
+                item: Item::AgentReasoning { content },
             })
             .await;
         let _ = tx.send(StreamItem::Done).await;

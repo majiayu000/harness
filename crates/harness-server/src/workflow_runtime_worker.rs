@@ -429,10 +429,16 @@ fn runtime_job_is_transcript_preflight_failure(job: &RuntimeJob) -> bool {
 }
 
 fn runtime_job_failure_class(job: &RuntimeJob) -> FailureClass {
-    if runtime_job_activity_result(job)
-        .is_some_and(|result| result.error_kind == Some(ActivityErrorKind::SpawnFailure))
-    {
-        return FailureClass::ZeroOutputSpawnFailure;
+    if let Some(result) = runtime_job_activity_result(job) {
+        if result.error_kind == Some(ActivityErrorKind::SpawnFailure) {
+            return FailureClass::ZeroOutputSpawnFailure;
+        }
+        if crate::workflow_runtime_worker::activity_result::activity_result_envelope_outcome(
+            &result,
+        ) == Some("invalid_structured_output")
+        {
+            return FailureClass::StructuredOutputInvalid;
+        }
     }
     classify_agent_failure(job.error.as_deref().unwrap_or_default())
 }
@@ -708,6 +714,37 @@ mod tests {
         assert_eq!(
             runtime_job_failure_class(&job),
             FailureClass::QuotaInteractiveWait
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_job_failure_class_uses_structured_output_envelope() -> anyhow::Result<()> {
+        let mut job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "implement_issue" }),
+        );
+        let result = ActivityResult::failed(
+            "implement_issue",
+            "Structured activity result was invalid.",
+            "$.error expected string, got object",
+        )
+        .with_error_kind(ActivityErrorKind::Configuration)
+        .with_artifact(harness_workflow::runtime::ActivityArtifact::new(
+            "activity_result_envelope",
+            json!({
+                "outcome": "invalid_structured_output",
+                "extraction_error": "$.error expected string, got object",
+                "extracted_activity": "implement_issue"
+            }),
+        ));
+        job.complete(&result)?;
+
+        assert_eq!(
+            runtime_job_failure_class(&job),
+            FailureClass::StructuredOutputInvalid
         );
         Ok(())
     }

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 pub const AGENT_ISOLATION_TIER_ENV: &str = "HARNESS_AGENT_ISOLATION_TIER";
 pub const AGENT_NETWORK_ALLOWLIST_ENV: &str = "HARNESS_AGENT_NETWORK_ALLOWLIST";
+pub const AGENT_OUTPUT_SCHEMA_PATH_ENV: &str = "HARNESS_AGENT_OUTPUT_SCHEMA_PATH";
 
 /// Core trait for all code agents (Claude Code, Codex, Anthropic API, etc.)
 #[async_trait]

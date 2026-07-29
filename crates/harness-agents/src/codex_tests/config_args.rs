@@ -47,6 +47,30 @@ fn base_args_uses_request_reasoning_effort_sandbox_and_approval_policy() {
 }
 
 #[test]
+fn base_args_passes_output_schema_file_when_configured() {
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+    let request = AgentRequest {
+        prompt: "ping".to_string(),
+        project_root: PathBuf::from("/tmp/project"),
+        env_vars: HashMap::from([(
+            AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
+            "/tmp/activity-result.schema.json".to_string(),
+        )]),
+        ..Default::default()
+    };
+
+    let args: Vec<String> = agent
+        .base_args(&request)
+        .iter()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect();
+
+    assert!(args
+        .windows(2)
+        .any(|window| { window == ["--output-schema", "/tmp/activity-result.schema.json"] }));
+}
+
+#[test]
 fn base_args_configures_read_only_with_network_profile() {
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::DangerFullAccess);
     let request = AgentRequest {

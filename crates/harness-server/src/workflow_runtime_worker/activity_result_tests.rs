@@ -197,6 +197,81 @@ Final result:
 }
 
 #[test]
+fn activity_result_from_turn_parses_raw_schema_constrained_activity_result() {
+    let result = completed_codex_implement_issue_result(vec![Item::AgentReasoning {
+        content: r#"{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":91,"pr_url":"https://github.com/owner/repo/pull/91"}}]}"#
+            .to_string(),
+    }]);
+
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+    assert_eq!(result.summary, "Implementation completed.");
+    assert_eq!(
+        artifact_by_type(&result, "pull_request").artifact["pr_number"],
+        91
+    );
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "accepted");
+    assert_eq!(envelope["extraction_strategy"], "raw_activity_result");
+}
+
+#[test]
+fn activity_result_from_turn_reports_error_object_field_path() {
+    let result = completed_codex_implement_issue_result(vec![Item::AgentReasoning {
+        content: r#"{"activity":"implement_issue","status":"failed","summary":"failed","error":{"message":"boom"},"error_kind":"configuration"}"#
+            .to_string(),
+    }]);
+
+    assert_eq!(result.status, ActivityStatus::Failed);
+    assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("$.error expected string")));
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "invalid_structured_output");
+    assert_eq!(envelope["extraction_strategy"], "raw_activity_result");
+    assert_eq!(envelope["extracted_activity"], "implement_issue");
+}
+
+#[test]
+fn activity_result_from_turn_reports_validation_type_field_path() {
+    let result = completed_codex_implement_issue_result(vec![Item::AgentReasoning {
+        content: r#"```harness-activity-result
+{"activity":"implement_issue","status":"succeeded","summary":"done","validation":[{"command":"cargo test","status":{"passed":true}}]}
+```"#
+            .to_string(),
+    }]);
+
+    assert_eq!(result.status, ActivityStatus::Failed);
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| { error.contains("$.validation[0].status expected string") }));
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "invalid_structured_output");
+    assert_eq!(envelope["extraction_strategy"], "fenced_activity_result");
+}
+
+fn completed_codex_implement_issue_result(items: Vec<Item>) -> ActivityResult {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({"activity": "implement_issue"}),
+    );
+    activity_result_from_turn(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    )
+}
+
+#[test]
 fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
     let job = RuntimeJob::pending(
         "command-1",
@@ -508,7 +583,7 @@ fn activity_result_from_turn_fails_mismatched_structured_activity() {
     assert_eq!(result.summary, "Structured activity result was invalid.");
     assert_eq!(
         result.error.as_deref(),
-        Some("activity result block reported activity `replan_issue`, expected `implement_issue`")
+        Some("activity result JSON reported activity `replan_issue`, expected `implement_issue`")
     );
     assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
     assert!(!result
@@ -570,7 +645,7 @@ Final result:
     assert!(result
         .error
         .as_deref()
-        .is_some_and(|error| error.starts_with("activity result block is invalid JSON:")));
+        .is_some_and(|error| error.starts_with("activity result JSON is invalid:")));
     assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
     assert!(!result
         .artifacts
