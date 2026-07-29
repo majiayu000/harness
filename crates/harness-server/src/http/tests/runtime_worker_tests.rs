@@ -325,10 +325,10 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
     let env_vars = agent.env_vars.lock().await;
     assert_eq!(env_vars.len(), 2);
     assert!(env_vars[0].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
-    assert!(!env_vars[1].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
+    assert!(env_vars[1].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
     assert_eq!(
         agent.sandbox_modes.lock().await[1],
-        Some(SandboxMode::ReadOnly)
+        Some(SandboxMode::ReadOnlyWithNetwork)
     );
     assert_eq!(
         agent.approval_policies.lock().await[1],

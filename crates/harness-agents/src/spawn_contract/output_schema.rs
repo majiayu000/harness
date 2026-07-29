@@ -1,7 +1,6 @@
 use harness_core::error::HarnessError;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-
 const CONTAINER_OUTPUT_SCHEMA_DIR: &str = "/harness-output-schema";
 
 pub(super) fn rewrite_for_container(

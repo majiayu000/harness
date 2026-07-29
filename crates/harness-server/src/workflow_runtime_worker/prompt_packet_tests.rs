@@ -520,7 +520,7 @@ fn activity_result_json_schema_is_codex_strict_compatible() {
     }
     assert_eq!(
         schema["properties"]["signals"]["items"]["properties"]["signal"],
-        true
+        json!({"type": "object"})
     );
 }
 

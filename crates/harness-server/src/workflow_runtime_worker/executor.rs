@@ -152,7 +152,8 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 job.runtime_kind,
                 resolved_settings.approval_policy.explicit_value(),
             );
-            let output_schema_file = codex_output_schema_file(true, &job, &prompt_packet)?;
+            let output_schema_file =
+                codex_output_schema_file(true, &job, &project_root, &prompt_packet)?;
             let mut prompt =
                 build_runtime_job_prompt(&prompt_packet, prompt_task_request.prompt_text());
             let mut correction_retry = None;
@@ -193,9 +194,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     });
                 let mut env_vars = isolation_spawn_env_vars(&job);
                 let correction_only = attempt > 0 && correction_retry.is_some();
-                if correction_only {
-                    env_vars.remove(AGENT_NETWORK_ALLOWLIST_ENV);
-                }
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
                         AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
@@ -215,7 +213,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         reasoning_effort: resolved_settings.reasoning_effort.clone(),
                         execution_phase,
                         sandbox_mode: Some(if correction_only {
-                            harness_core::config::agents::SandboxMode::ReadOnly
+                            harness_core::config::agents::SandboxMode::ReadOnlyWithNetwork
                         } else {
                             resolved_settings.sandbox_mode
                         }),

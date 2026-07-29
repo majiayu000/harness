@@ -11,6 +11,7 @@ pub(super) struct CodexOutputSchemaFile {
 pub(super) fn codex_output_schema_file(
     force_code_agent: bool,
     job: &RuntimeJob,
+    project_root: &std::path::Path,
     prompt_packet: &Value,
 ) -> anyhow::Result<Option<CodexOutputSchemaFile>> {
     if !force_code_agent
@@ -25,8 +26,8 @@ pub(super) fn codex_output_schema_file(
         return Ok(None);
     };
     let directory = tempfile::Builder::new()
-        .prefix("harness-codex-output-schema-")
-        .tempdir()?;
+        .prefix(".harness-codex-output-schema-")
+        .tempdir_in(project_root)?;
     let path = directory.path().join("activity-result-schema.json");
     std::fs::write(&path, serde_json::to_vec_pretty(schema)?)?;
     Ok(Some(CodexOutputSchemaFile {
@@ -142,11 +143,13 @@ mod tests {
     #[test]
     fn codex_output_schema_file_is_readable_until_guard_drops() -> anyhow::Result<()> {
         let job = RuntimeJob::pending("c", RuntimeKind::CodexJsonrpc, "p", json!({}));
-        let directory = tempfile::tempdir()?;
+        let project_root = tempfile::tempdir()?;
         let prompt_packet = json!({"activity_result_schema":{"json_schema":{"type":"object","required":["activity"]}}});
-        let schema_file = codex_output_schema_file(true, &job, &prompt_packet)?.unwrap();
+        let schema_file =
+            codex_output_schema_file(true, &job, project_root.path(), &prompt_packet)?
+                .ok_or_else(|| anyhow::anyhow!("expected codex output schema file"))?;
         let path = schema_file.argument_path.clone();
-        assert!(!path.starts_with(directory.path()));
+        assert!(path.starts_with(project_root.path()));
         let schema: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         assert_eq!(schema["type"], "object");
         drop(schema_file);
