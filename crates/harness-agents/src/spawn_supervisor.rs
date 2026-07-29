@@ -1,5 +1,6 @@
 use crate::spawn_contract::PreparedAgentSpawn;
 use crate::ManagedChild;
+use harness_core::capability::CapabilityToken;
 use harness_core::error::HarnessError;
 use harness_core::run_id::RunIdentity;
 use std::process::Stdio;
@@ -44,6 +45,34 @@ pub(crate) struct SupervisedAgentProcess {
 pub(crate) async fn spawn_agent(
     plan: AgentSpawnPlan<'_>,
 ) -> harness_core::error::Result<SupervisedAgentProcess> {
+    spawn_agent_inner(plan, None).await
+}
+
+pub(crate) async fn spawn_agent_with_capability(
+    plan: AgentSpawnPlan<'_>,
+    capability_token: Option<&CapabilityToken>,
+) -> harness_core::error::Result<SupervisedAgentProcess> {
+    spawn_agent_inner(plan, capability_token).await
+}
+
+pub(crate) fn validate_capability_token(
+    capability_token: Option<&CapabilityToken>,
+) -> harness_core::error::Result<()> {
+    if let Some(token) = capability_token {
+        if token.is_expired() {
+            return Err(HarnessError::AgentExecution(format!(
+                "capability token for subtask {} has expired",
+                token.subtask_index
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn spawn_agent_inner(
+    plan: AgentSpawnPlan<'_>,
+    capability_token: Option<&CapabilityToken>,
+) -> harness_core::error::Result<SupervisedAgentProcess> {
     let AgentSpawnPlan {
         prepared_spawn,
         run_identity,
@@ -68,18 +97,31 @@ pub(crate) async fn spawn_agent(
         cmd.env_remove(key);
     }
 
-    let child = spawn_with_etxtbsy_retry(|| cmd.spawn())
-        .await
-        .map_err(|error| {
-            let mapped = (map_spawn_error)(&error, &prepared_spawn);
-            tracing::error!(
-                agent = native_kind,
-                process = process_label,
-                error_kind = ?error.kind(),
-                "{mapped}"
-            );
-            mapped
-        })?;
+    let mut capability_error = None;
+    let child_result = spawn_with_etxtbsy_retry(|| {
+        if let Err(error) = validate_capability_token(capability_token) {
+            capability_error = Some(error);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "capability token expired before agent spawn",
+            ));
+        }
+        cmd.spawn()
+    })
+    .await;
+    if let Some(error) = capability_error {
+        return Err(error);
+    }
+    let child = child_result.map_err(|error| {
+        let mapped = (map_spawn_error)(&error, &prepared_spawn);
+        tracing::error!(
+            agent = native_kind,
+            process = process_label,
+            error_kind = ?error.kind(),
+            "{mapped}"
+        );
+        mapped
+    })?;
 
     if let Some(pid) = child.id() {
         crate::write_provisional_agent_run_binding(

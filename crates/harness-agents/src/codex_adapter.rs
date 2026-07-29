@@ -14,9 +14,17 @@ use tokio::sync::{mpsc, Mutex};
 type StdoutLines = Lines<BufReader<ChildStdout>>;
 const MAX_PROTOCOL_LINE_PREVIEW: usize = 240;
 mod protocol;
+/// Parse one Codex app-server JSON-RPC line.
+///
+/// ```
+/// use harness_agents::codex_adapter::parse_codex_message;
+///
+/// assert!(parse_codex_message(r#"{"method":"custom/unknown","params":{}}"#).is_some());
+/// ```
+pub use self::protocol::parse_codex_message;
 use self::protocol::{
-    approval_decision_result, notification_payload, parse_codex_message, protocol_line_preview,
-    response_id_matches, thread_id_from_result, thread_start_params, turn_start_params,
+    approval_decision_result, notification_payload, protocol_line_preview, response_id_matches,
+    thread_id_from_result, thread_start_params, turn_start_params,
 };
 #[cfg(test)]
 use self::protocol::{sandbox_mode_value, sandbox_policy_value};
@@ -256,8 +264,7 @@ impl CodexAdapter {
         match tokio::time::timeout(stall_timeout, read).await {
             Ok(result) => result,
             Err(_) => Err(harness_core::error::HarnessError::AgentExecution(format!(
-                "codex app-server {phase} stalled for {}s without stdout",
-                stall_timeout.as_secs()
+                "codex app-server {phase} stalled for {stall_timeout:?} without stdout"
             ))),
         }
     }
@@ -280,8 +287,8 @@ impl CodexAdapter {
         let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
         let prepared_spawn = prepare_app_server_spawn(&self.cli_path, req)?;
         let spawn_project_root = req.project_root.clone();
-        let supervised =
-            crate::spawn_supervisor::spawn_agent(crate::spawn_supervisor::AgentSpawnPlan {
+        let supervised = crate::spawn_supervisor::spawn_agent_with_capability(
+            crate::spawn_supervisor::AgentSpawnPlan {
                 prepared_spawn,
                 run_identity,
                 native_kind: "codex",
@@ -298,8 +305,10 @@ impl CodexAdapter {
                     );
                     harness_core::error::HarnessError::AgentExecution(message)
                 }),
-            })
-            .await?;
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
         let child_workspace = supervised.prepared_spawn.child_workspace.clone();
         let mut child = supervised.child;
 
@@ -320,7 +329,7 @@ impl CodexAdapter {
         state.child_workspace = Some(child_workspace.clone());
         let stall_timeout = app_server_stall_timeout(req);
 
-        let init_id = Self::send_request(
+        let init_id = match Self::send_request(
             state,
             "initialize",
             json!({
@@ -333,80 +342,103 @@ impl CodexAdapter {
                 }
             }),
         )
-        .await?;
+        .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                state.reset_child().await;
+                return Err(error);
+            }
+        };
 
         let mut lines = state.stdout_lines.take().ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(
                 "codex stdout reader not available".into(),
             )
         })?;
-        loop {
-            match Self::read_next_message_with_timeout(&mut lines, stall_timeout, "initialize")
-                .await?
-            {
-                Some(ParsedCodexMessage::Response { id, .. })
-                    if response_id_matches(&id, init_id) =>
+        let protocol_result = async {
+            loop {
+                match Self::read_next_message_with_timeout(&mut lines, stall_timeout, "initialize")
+                    .await?
                 {
-                    break;
-                }
-                Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
-                    tracing::warn!(agent = "codex", "{message}");
-                }
-                Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
-                    return Err(harness_core::error::HarnessError::AgentExecution(message));
-                }
-                Some(_) => {}
-                None => {
-                    return Err(harness_core::error::HarnessError::AgentExecution(
-                        "codex app-server exited during initialize".into(),
-                    ));
+                    Some(ParsedCodexMessage::Response { id, .. })
+                        if response_id_matches(&id, init_id) =>
+                    {
+                        break;
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
+                        tracing::warn!(agent = "codex", "{message}");
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(message));
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            "codex app-server exited during initialize".into(),
+                        ));
+                    }
                 }
             }
-        }
 
-        Self::send_notification(state, "initialized", Value::Null).await?;
+            Self::send_notification(state, "initialized", Value::Null).await?;
 
-        let thread_id_request = Self::send_request(
-            state,
-            "thread/start",
-            thread_start_params(req, &child_workspace),
-        )
-        .await?;
+            let thread_id_request = Self::send_request(
+                state,
+                "thread/start",
+                thread_start_params(req, &child_workspace),
+            )
+            .await?;
 
-        loop {
-            match Self::read_next_message_with_timeout(&mut lines, stall_timeout, "thread/start")
+            loop {
+                match Self::read_next_message_with_timeout(
+                    &mut lines,
+                    stall_timeout,
+                    "thread/start",
+                )
                 .await?
-            {
-                Some(ParsedCodexMessage::ThreadStarted { thread_id }) => {
-                    state.thread_id = Some(thread_id);
-                    break;
-                }
-                Some(ParsedCodexMessage::Response { id, result })
-                    if response_id_matches(&id, thread_id_request) =>
                 {
-                    if let Some(thread_id) = thread_id_from_result(&result) {
+                    Some(ParsedCodexMessage::ThreadStarted { thread_id }) => {
                         state.thread_id = Some(thread_id);
                         break;
                     }
-                }
-                Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
-                    tracing::warn!(agent = "codex", "{message}");
-                }
-                Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
-                    return Err(harness_core::error::HarnessError::AgentExecution(message));
-                }
-                Some(_) => {}
-                None => {
-                    return Err(harness_core::error::HarnessError::AgentExecution(
-                        "codex app-server exited before thread/start completed".into(),
-                    ));
+                    Some(ParsedCodexMessage::Response { id, result })
+                        if response_id_matches(&id, thread_id_request) =>
+                    {
+                        if let Some(thread_id) = thread_id_from_result(&result) {
+                            state.thread_id = Some(thread_id);
+                            break;
+                        }
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
+                        tracing::warn!(agent = "codex", "{message}");
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(message));
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            "codex app-server exited before thread/start completed".into(),
+                        ));
+                    }
                 }
             }
+            Ok(())
         }
+        .await;
 
-        state.stdout_lines = Some(lines);
-
-        Ok(())
+        match protocol_result {
+            Ok(()) => {
+                state.stdout_lines = Some(lines);
+                Ok(())
+            }
+            Err(error) => {
+                drop(lines);
+                state.reset_child().await;
+                Err(error)
+            }
+        }
     }
 
     async fn clear_active_turn_id(&self) {
@@ -426,6 +458,7 @@ impl AgentAdapter for CodexAdapter {
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         let req = self.effective_turn_request(req);
+        crate::spawn_supervisor::validate_capability_token(req.capability_token.as_ref())?;
         crate::cloud_setup::run_setup_phase(&self.cloud, &req.project_root).await?;
         let mut state = self.state.lock().await;
         self.ensure_child(&req, &mut state).await?;
@@ -441,12 +474,16 @@ impl AgentAdapter for CodexAdapter {
             )
         })?;
 
-        Self::send_request(
+        if let Err(error) = Self::send_request(
             &mut state,
             "turn/start",
             turn_start_params(&req, &thread_id, &child_workspace),
         )
-        .await?;
+        .await
+        {
+            state.reset_child().await;
+            return Err(error);
+        }
 
         let mut lines = state.stdout_lines.take().ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(
@@ -459,41 +496,51 @@ impl AgentAdapter for CodexAdapter {
         let mut receiver_closed = false;
         let mut stdout_closed = false;
         let stall_timeout = app_server_stall_timeout(&req);
-        while let Some(message) =
-            Self::read_next_message_with_timeout(&mut lines, stall_timeout, "turn").await?
-        {
-            match message {
-                ParsedCodexMessage::TurnStarted { turn_id } => {
-                    let mut guard = self.state.lock().await;
-                    guard.active_turn_id = Some(turn_id);
-                    drop(guard);
-                    if tx.send(AgentEvent::TurnStarted).await.is_err() {
-                        receiver_closed = true;
-                        break;
+        let read_result = async {
+            while let Some(message) =
+                Self::read_next_message_with_timeout(&mut lines, stall_timeout, "turn").await?
+            {
+                match message {
+                    ParsedCodexMessage::TurnStarted { turn_id } => {
+                        let mut guard = self.state.lock().await;
+                        guard.active_turn_id = Some(turn_id);
+                        drop(guard);
+                        if tx.send(AgentEvent::TurnStarted).await.is_err() {
+                            receiver_closed = true;
+                            break;
+                        }
                     }
-                }
-                ParsedCodexMessage::ThreadStarted { thread_id } => {
-                    self.state.lock().await.thread_id = Some(thread_id);
-                }
-                ParsedCodexMessage::Response { .. } | ParsedCodexMessage::Ignore => {}
-                ParsedCodexMessage::Event(event) => {
-                    let is_terminal = matches!(
-                        event,
-                        AgentEvent::TurnCompleted { .. } | AgentEvent::Error { .. }
-                    );
-                    if is_terminal {
-                        self.clear_active_turn_id().await;
+                    ParsedCodexMessage::ThreadStarted { thread_id } => {
+                        self.state.lock().await.thread_id = Some(thread_id);
                     }
-                    if tx.send(event).await.is_err() {
-                        receiver_closed = true;
-                        break;
-                    }
-                    if is_terminal {
-                        turn_completed = true;
-                        break;
+                    ParsedCodexMessage::Response { .. } | ParsedCodexMessage::Ignore => {}
+                    ParsedCodexMessage::Event(event) => {
+                        let is_terminal = matches!(
+                            event,
+                            AgentEvent::TurnCompleted { .. } | AgentEvent::Error { .. }
+                        );
+                        if is_terminal {
+                            self.clear_active_turn_id().await;
+                        }
+                        if tx.send(event).await.is_err() {
+                            receiver_closed = true;
+                            break;
+                        }
+                        if is_terminal {
+                            turn_completed = true;
+                            break;
+                        }
                     }
                 }
             }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = read_result {
+            drop(lines);
+            let mut state = self.state.lock().await;
+            state.reset_child().await;
+            return Err(error);
         }
         if !turn_completed && !receiver_closed {
             stdout_closed = true;

@@ -2,7 +2,7 @@ use crate::codex::{parse_codex_error_item_message, parse_codex_item, parse_codex
 use harness_core::agent::{AgentEvent, ApprovalDecision, TurnRequest};
 use harness_core::config::agents::SandboxMode;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::Path;
 
 use super::{ParsedCodexMessage, MAX_PROTOCOL_LINE_PREVIEW};
 
@@ -45,7 +45,7 @@ pub(super) fn sandbox_mode_value(mode: Option<SandboxMode>) -> Option<String> {
 
 pub(super) fn sandbox_policy_value(
     mode: Option<SandboxMode>,
-    project_root: &PathBuf,
+    project_root: &Path,
 ) -> Option<Value> {
     mode.map(|value| match value {
         SandboxMode::ReadOnly => json!({ "type": "readOnly" }),
@@ -61,7 +61,7 @@ pub(super) fn sandbox_policy_value(
     })
 }
 
-pub(super) fn thread_start_params(req: &TurnRequest, child_workspace: &PathBuf) -> Value {
+pub(super) fn thread_start_params(req: &TurnRequest, child_workspace: &Path) -> Value {
     json!({
         "cwd": child_workspace,
         "model": req.model,
@@ -74,7 +74,7 @@ pub(super) fn thread_start_params(req: &TurnRequest, child_workspace: &PathBuf) 
 pub(super) fn turn_start_params(
     req: &TurnRequest,
     thread_id: &str,
-    child_workspace: &PathBuf,
+    child_workspace: &Path,
 ) -> Value {
     json!({
         "threadId": thread_id,
@@ -232,7 +232,7 @@ fn parse_app_server_agent_event(
     }
 }
 
-pub(super) fn parse_codex_message(line: &str) -> Option<ParsedCodexMessage> {
+pub fn parse_codex_message(line: &str) -> Option<ParsedCodexMessage> {
     let value: Value = serde_json::from_str(line).ok()?;
 
     if let Some(method) = value.get("method").and_then(Value::as_str) {
