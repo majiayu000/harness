@@ -356,15 +356,27 @@ impl EventStore {
             if line.is_empty() {
                 continue;
             }
-            if let Ok(event) = serde_json::from_str::<Event>(&line) {
-                pending.push(event);
-                if pending.len() >= JSONL_MIGRATION_BATCH_SIZE {
-                    if let Err(e) = self.insert_events(&pending).await {
-                        tracing::warn!("event store: failed to batch insert migrated events: {e}");
-                        return;
+            match serde_json::from_str::<Event>(&line) {
+                Ok(event) => {
+                    pending.push(event);
+                    if pending.len() >= JSONL_MIGRATION_BATCH_SIZE {
+                        if let Err(e) = self.insert_events(&pending).await {
+                            tracing::warn!(
+                                "event store: failed to batch insert migrated events: {e}"
+                            );
+                            return;
+                        }
+                        imported += pending.len();
+                        pending.clear();
                     }
-                    imported += pending.len();
-                    pending.clear();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "event store: invalid events.jsonl record, aborting migration"
+                    );
+                    read_failed = true;
+                    break;
                 }
             }
         }

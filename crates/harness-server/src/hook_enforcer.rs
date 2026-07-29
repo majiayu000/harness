@@ -157,6 +157,7 @@ impl TurnInterceptor for HookEnforcer {
             SessionId::new()
         };
         let mut ev = Event::new(sid, "hook_enforcement", "post_tool_use", decision);
+        ev.run_id = event.run_id.clone();
         ev.detail = Some(format!(
             "tool={} files={} violations={}",
             event.tool_name,
@@ -189,9 +190,11 @@ impl TurnInterceptor for HookEnforcer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::run_id::RunId;
     use harness_core::{types::EventFilters, types::GuardId, types::Language};
     use harness_rules::engine::{Guard, RuleEngine};
     use std::ffi::OsString;
+    use std::str::FromStr;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
@@ -289,6 +292,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: None,
         };
         let result = enforcer.post_tool_use(&event, &project).await;
         assert!(
@@ -321,6 +325,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: None,
         };
         let result = enforcer.post_tool_use(&event, &project).await;
         assert!(
@@ -346,6 +351,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![],
             session_id: None,
+            run_id: None,
         };
         let result = enforcer.post_tool_use(&event, dir.path()).await;
         assert!(result.violation_feedback.is_none());
@@ -364,10 +370,12 @@ mod tests {
         std::fs::create_dir_all(&project)?;
 
         let enforcer = HookEnforcer::new(rules, event_store.clone(), true);
+        let run_id = RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wd")?;
         let event = ToolUseEvent {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: Some(run_id.clone()),
         };
         enforcer.post_tool_use(&event, &project).await;
 
@@ -381,6 +389,7 @@ mod tests {
             "hook_enforcement event must appear in EventStore"
         );
         assert_eq!(logged[0].tool, "post_tool_use");
+        assert_eq!(logged[0].run_id, Some(run_id));
 
         Ok(())
     }
@@ -401,6 +410,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: None,
         };
         let result = enforcer.post_tool_use(&event, dir.path()).await;
         assert!(
@@ -442,6 +452,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: Some(sid.clone()),
+            run_id: None,
         };
 
         // First two blocks: violations returned, circuit still closed.
@@ -483,6 +494,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: None,
         };
 
         let result = enforcer.post_tool_use(&event, &project).await;

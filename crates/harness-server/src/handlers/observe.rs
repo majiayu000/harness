@@ -40,6 +40,7 @@ pub async fn metrics_collect(
     state: &AppState,
     id: Option<serde_json::Value>,
     project_root: PathBuf,
+    run_id: Option<harness_core::run_id::RunId>,
 ) -> RpcResponse {
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 
@@ -61,7 +62,7 @@ pub async fn metrics_collect(
     state
         .observability
         .events
-        .persist_rule_scan(&project_root, &violations)
+        .persist_rule_scan_with_run_id(&project_root, &violations, run_id.as_ref())
         .await;
 
     let evts = match state
@@ -93,6 +94,7 @@ mod tests {
     };
     use harness_rules::engine::Guard;
     use std::path::Path;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     use crate::test_helpers::{tempdir_in_home, HOME_LOCK};
@@ -216,6 +218,7 @@ mod tests {
             &state,
             Some(serde_json::json!(1)),
             project_root.path().to_path_buf(),
+            None,
         )
         .await;
 
@@ -262,6 +265,7 @@ mod tests {
             &state,
             Some(serde_json::json!(1)),
             project_root.path().to_path_buf(),
+            None,
         )
         .await;
 
@@ -288,6 +292,45 @@ mod tests {
             events[0].hook, "rule_scan",
             "anchor event hook must be 'rule_scan'"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_collect_stamps_rule_scan_with_supplied_run_id() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let project_root = tempdir_in_home("metrics-scan-run-id-root-")?;
+        let data_dir = tempfile::tempdir()?;
+        let state = make_test_state(project_root.path(), data_dir.path()).await?;
+        let run_id = harness_core::run_id::RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wd")?;
+
+        let response = metrics_collect(
+            &state,
+            Some(serde_json::json!(1)),
+            project_root.path().to_path_buf(),
+            Some(run_id.clone()),
+        )
+        .await;
+
+        assert!(
+            response.error.is_none(),
+            "metrics_collect should succeed: {:?}",
+            response.error
+        );
+
+        let events = state
+            .observability
+            .events
+            .query(&EventFilters {
+                hook: Some("rule_scan".to_string()),
+                run_id: Some(run_id.clone()),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].run_id, Some(run_id));
         Ok(())
     }
 }

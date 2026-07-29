@@ -165,6 +165,37 @@ async fn policy_events_for_agent_run_filters_only_run_id() -> anyhow::Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn migrate_from_jsonl_keeps_source_on_invalid_record() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let valid = make_event("legacy_jsonl", Decision::Warn);
+    let jsonl_path = dir.path().join("events.jsonl");
+    std::fs::write(
+        &jsonl_path,
+        format!("{}\n{{not-json\n", serde_json::to_string(&valid)?),
+    )?;
+
+    let Some(store) = open_test_store(dir.path()).await? else {
+        return Ok(());
+    };
+
+    assert!(
+        jsonl_path.exists(),
+        "invalid JSONL should stay in place for retry"
+    );
+    assert!(
+        !dir.path().join("events.jsonl.migrated").exists(),
+        "invalid JSONL must not be archived"
+    );
+    let results = store.query(&EventFilters::default()).await?;
+    assert!(
+        results.is_empty(),
+        "valid prefix should not be committed when migration aborts"
+    );
+    store.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn purge_old_events_zero_days_is_noop() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some(store) = open_test_store(dir.path()).await? else {

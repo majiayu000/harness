@@ -93,9 +93,10 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         Method::EventQuery { filters } => {
             Some(handlers::observe::event_query(state, id, filters).await)
         }
-        Method::MetricsCollect { project_root } => {
-            Some(handlers::observe::metrics_collect(state, id, project_root).await)
-        }
+        Method::MetricsCollect {
+            project_root,
+            run_id,
+        } => Some(handlers::observe::metrics_collect(state, id, project_root, run_id).await),
         Method::MetricsQuery { filters } => {
             Some(handlers::observe::metrics_query(state, id, filters).await)
         }

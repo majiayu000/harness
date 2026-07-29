@@ -1,7 +1,8 @@
 use super::EventStore;
 use chrono::Utc;
-use harness_core::types::{
-    AutoFixReport, Decision, Event, EventFilters, Grade, SessionId, Severity, Violation,
+use harness_core::{
+    run_id::RunId,
+    types::{AutoFixReport, Decision, Event, EventFilters, Grade, SessionId, Severity, Violation},
 };
 use std::path::Path;
 
@@ -11,6 +12,16 @@ impl EventStore {
         project_root: &Path,
         violations: &[Violation],
     ) -> SessionId {
+        self.persist_rule_scan_with_run_id(project_root, violations, None)
+            .await
+    }
+
+    pub async fn persist_rule_scan_with_run_id(
+        &self,
+        project_root: &Path,
+        violations: &[Violation],
+        run_id: Option<&RunId>,
+    ) -> SessionId {
         let session_id = SessionId::new();
         let decision = if violations.is_empty() {
             Decision::Pass
@@ -18,11 +29,12 @@ impl EventStore {
             Decision::Warn
         };
         let mut scan_event = Event::new(session_id.clone(), "rule_scan", "RuleEngine", decision);
+        scan_event.run_id = run_id.cloned();
         scan_event.reason = Some(format!("violations={}", violations.len()));
         scan_event.detail = Some(project_root.display().to_string());
 
         let mut events = vec![scan_event];
-        events.extend(violation_events(&session_id, violations));
+        events.extend(violation_events(&session_id, violations, run_id));
         if let Err(e) = self.log_many(&events).await {
             tracing::warn!("failed to log rule scan events: {e}");
         }
@@ -128,7 +140,11 @@ impl EventStore {
     }
 }
 
-fn violation_events(session_id: &SessionId, violations: &[Violation]) -> Vec<Event> {
+fn violation_events(
+    session_id: &SessionId,
+    violations: &[Violation],
+    run_id: Option<&RunId>,
+) -> Vec<Event> {
     violations
         .iter()
         .map(|violation| {
@@ -143,6 +159,7 @@ fn violation_events(session_id: &SessionId, violations: &[Violation]) -> Vec<Eve
                 violation.rule_id.as_str(),
                 decision,
             );
+            event.run_id = run_id.cloned();
             event.reason = Some(violation.message.clone());
             event.detail = Some(if let Some(line) = violation.line {
                 format!("{}:{}", violation.file.display(), line)
