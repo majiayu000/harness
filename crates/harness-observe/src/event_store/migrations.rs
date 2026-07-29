@@ -93,4 +93,11 @@ pub(super) static EVENT_MIGRATIONS: &[Migration] = &[
               CREATE INDEX IF NOT EXISTS idx_events_store_run_id
               ON events (store_key, run_id)",
     },
+    Migration {
+        version: 8,
+        description: "store event timestamps as timestamptz",
+        sql: "ALTER TABLE events
+              ALTER COLUMN ts TYPE TIMESTAMPTZ
+              USING ts::timestamptz",
+    },
 ];

@@ -1,20 +1,22 @@
 use chrono::{DateTime, Utc};
 use harness_core::config::misc::OtelConfig;
 use harness_core::db::{pg_open_pool, PgStoreContext};
-use harness_core::run_id::RunId;
+use harness_core::types::Event;
 #[cfg(test)]
-use harness_core::types::ExternalSignal;
 use harness_core::types::{
-    AutoFixReport, Decision, Event, EventFilters, EventId, Grade, SessionId, Severity, Violation,
+    AutoFixReport, Decision, EventFilters, ExternalSignal, SessionId, Severity, Violation,
 };
 use sqlx::postgres::PgPool;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Mutex;
 
+mod events;
 mod external_signals;
+#[cfg(test)]
+mod hardening_tests;
 mod legacy;
 mod migrations;
+mod policy_logging;
 mod trajectory;
 
 pub use legacy::migrate_legacy_event_store_if_needed;
@@ -167,7 +169,6 @@ impl EventStore {
             return Ok(0);
         }
         let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
-        let cutoff_str = cutoff.to_rfc3339();
         let mut total_deleted: u64 = 0;
 
         loop {
@@ -182,7 +183,7 @@ impl EventStore {
                 )",
             )
             .bind(&self.store_key)
-            .bind(&cutoff_str)
+            .bind(cutoff)
             .execute(&self.pool)
             .await?;
             let batch = result.rows_affected();
@@ -353,7 +354,7 @@ impl EventStore {
                 return;
             }
         };
-        let mut imported = 0usize;
+        let mut pending = Vec::new();
         for line in std::io::BufReader::new(file).lines() {
             let line = match line {
                 Ok(l) => l,
@@ -369,179 +370,17 @@ impl EventStore {
                 continue;
             }
             if let Ok(event) = serde_json::from_str::<Event>(&line) {
-                if let Err(e) = self.insert_event(&event).await {
-                    tracing::warn!("event store: failed to insert migrated event: {e}");
-                } else {
-                    imported += 1;
-                }
+                pending.push(event);
             }
+        }
+        let imported = pending.len();
+        if let Err(e) = self.insert_events(&pending).await {
+            tracing::warn!("event store: failed to batch insert migrated events: {e}");
+            return;
         }
         if imported > 0 {
             tracing::info!(imported, "event store: migrated events from events.jsonl");
         }
-    }
-
-    async fn insert_event(&self, event: &Event) -> anyhow::Result<()> {
-        let decision = serde_json::to_string(&event.decision)?;
-        let decision = decision.trim_matches('"');
-        let ts = event.ts.to_rfc3339();
-        let metadata = match &event.metadata {
-            Some(metadata) => Some(serde_json::to_string(metadata)?),
-            None => None,
-        };
-        sqlx::query(
-            "INSERT INTO events
-                (store_key, id, ts, session_id, run_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-             ON CONFLICT (store_key, id) DO NOTHING",
-        )
-        .bind(&self.store_key)
-        .bind(event.id.as_str())
-        .bind(&ts)
-        .bind(event.session_id.as_str())
-        .bind(event.run_id.as_ref().map(RunId::as_str))
-        .bind(&event.hook)
-        .bind(&event.tool)
-        .bind(decision)
-        .bind(&event.reason)
-        .bind(&event.detail)
-        .bind(event.duration_ms.map(|v| v as i64))
-        .bind(&event.content)
-        .bind(metadata)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn log(&self, event: &Event) -> anyhow::Result<EventId> {
-        self.insert_event(event).await?;
-        let slot = self.otel_pipeline.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pipeline) = slot.as_ref() {
-            pipeline.record_event(event);
-        }
-        Ok(event.id.clone())
-    }
-
-    pub async fn query(&self, filters: &EventFilters) -> anyhow::Result<Vec<Event>> {
-        let content_col = if filters.include_content {
-            "content"
-        } else {
-            "NULL as content"
-        };
-        let mut sql = format!(
-            "SELECT id, ts, session_id, run_id, hook, tool, decision, reason, detail, duration_ms, {content_col}, metadata
-             FROM events WHERE store_key = $1",
-        );
-        let mut param_count = 1usize;
-        if filters.session_id.is_some() {
-            param_count += 1;
-            sql.push_str(&format!(" AND session_id = ${param_count}"));
-        }
-        if filters.run_id.is_some() {
-            param_count += 1;
-            sql.push_str(&format!(" AND run_id = ${param_count}"));
-        }
-        if filters.hook.is_some() {
-            param_count += 1;
-            sql.push_str(&format!(" AND hook = ${param_count}"));
-        }
-        if filters.tool.is_some() {
-            param_count += 1;
-            sql.push_str(&format!(" AND tool = ${param_count}"));
-        }
-        if filters.decision.is_some() {
-            param_count += 1;
-            sql.push_str(&format!(" AND decision = ${param_count}"));
-        }
-        if filters.since.is_some() {
-            param_count += 1;
-            sql.push_str(&format!(" AND ts >= ${param_count}"));
-        }
-        if filters.until.is_some() {
-            param_count += 1;
-            sql.push_str(&format!(" AND ts <= ${param_count}"));
-        }
-
-        sql.push_str(" ORDER BY ts ASC");
-
-        if let Some(limit) = filters.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
-        }
-
-        let mut q = sqlx::query(&sql).bind(&self.store_key);
-
-        if let Some(ref sid) = filters.session_id {
-            q = q.bind(sid.as_str());
-        }
-        if let Some(ref run_id) = filters.run_id {
-            q = q.bind(run_id.as_str());
-        }
-        if let Some(ref hook) = filters.hook {
-            q = q.bind(hook.as_str());
-        }
-        if let Some(ref tool) = filters.tool {
-            q = q.bind(tool.as_str());
-        }
-        if let Some(ref decision) = filters.decision {
-            let d = serde_json::to_string(decision)?;
-            let d = d.trim_matches('"').to_string();
-            q = q.bind(d);
-        }
-        if let Some(ref since) = filters.since {
-            q = q.bind(since.to_rfc3339());
-        }
-        if let Some(ref until) = filters.until {
-            q = q.bind(until.to_rfc3339());
-        }
-
-        let rows = q.fetch_all(&self.pool).await?;
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let event = Self::row_to_event(&row)?;
-            events.push(event);
-        }
-        Ok(events)
-    }
-
-    fn row_to_event(row: &sqlx::postgres::PgRow) -> anyhow::Result<Event> {
-        use sqlx::Row;
-        let id: String = row.try_get("id")?;
-        let ts_str: String = row.try_get("ts")?;
-        let session_id: String = row.try_get("session_id")?;
-        let run_id: Option<String> = row.try_get("run_id")?;
-        let hook: String = row.try_get("hook")?;
-        let tool: String = row.try_get("tool")?;
-        let decision_str: String = row.try_get("decision")?;
-        let reason: Option<String> = row.try_get("reason")?;
-        let detail: Option<String> = row.try_get("detail")?;
-        let content: Option<String> = row.try_get("content")?;
-        let metadata_json: Option<String> = row.try_get("metadata")?;
-        let duration_ms: Option<i64> = row.try_get("duration_ms")?;
-
-        let ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
-            .map_err(|e| anyhow::anyhow!("invalid ts '{ts_str}': {e}"))?
-            .with_timezone(&chrono::Utc);
-
-        let decision: Decision = serde_json::from_str(&format!("\"{decision_str}\""))
-            .map_err(|e| anyhow::anyhow!("invalid decision '{decision_str}': {e}"))?;
-
-        Ok(Event {
-            id: EventId::from_str(&id),
-            ts,
-            session_id: SessionId::from_str(&session_id),
-            run_id: run_id.as_deref().map(RunId::from_str).transpose()?,
-            hook,
-            tool,
-            decision,
-            reason,
-            detail,
-            content,
-            metadata: metadata_json
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()?,
-            duration_ms: duration_ms.map(|v| v as u64),
-        })
     }
 
     pub async fn shutdown(&self) {
@@ -552,148 +391,6 @@ impl EventStore {
             .take();
         if let Some(pipeline) = pipeline {
             pipeline.shutdown().await;
-        }
-    }
-
-    pub async fn persist_rule_scan(
-        &self,
-        project_root: &Path,
-        violations: &[Violation],
-    ) -> SessionId {
-        let session_id = SessionId::new();
-        let decision = if violations.is_empty() {
-            Decision::Pass
-        } else {
-            Decision::Warn
-        };
-        let mut scan_event = Event::new(session_id.clone(), "rule_scan", "RuleEngine", decision);
-        scan_event.reason = Some(format!("violations={}", violations.len()));
-        scan_event.detail = Some(project_root.display().to_string());
-        if let Err(e) = self.log(&scan_event).await {
-            tracing::warn!("failed to log rule_scan event: {e}");
-        }
-
-        self.log_violations_with_session(&session_id, violations)
-            .await;
-        session_id
-    }
-
-    async fn log_violations_with_session(&self, session_id: &SessionId, violations: &[Violation]) {
-        if violations.is_empty() {
-            return;
-        }
-
-        for violation in violations {
-            let decision = match violation.severity {
-                Severity::Critical | Severity::High => Decision::Block,
-                Severity::Medium => Decision::Warn,
-                Severity::Low => Decision::Pass,
-            };
-            let mut event = Event::new(
-                session_id.clone(),
-                "rule_check",
-                violation.rule_id.as_str(),
-                decision,
-            );
-            event.reason = Some(violation.message.clone());
-            event.detail = Some(if let Some(line) = violation.line {
-                format!("{}:{}", violation.file.display(), line)
-            } else {
-                violation.file.display().to_string()
-            });
-            if let Err(e) = self.log(&event).await {
-                tracing::warn!("failed to log rule violation event: {e}");
-            }
-        }
-    }
-
-    pub async fn log_quality_grade(&self, grade: Grade, score: f64) {
-        let decision = match grade {
-            Grade::A | Grade::B => Decision::Pass,
-            Grade::C => Decision::Warn,
-            Grade::D => Decision::Block,
-        };
-        let mut event = Event::new(SessionId::new(), "quality_grade", "QualityGrader", decision);
-        event.detail = Some(format!("grade={grade:?} score={score:.1}"));
-        if let Err(e) = self.log(&event).await {
-            tracing::warn!("failed to log quality_grade event: {e}");
-        }
-    }
-
-    pub async fn log_auto_fix_report(
-        &self,
-        session_id: &SessionId,
-        report: &AutoFixReport,
-        project_root: &std::path::Path,
-    ) {
-        let decision = if report.residual_violations.is_empty() {
-            Decision::Pass
-        } else {
-            Decision::Warn
-        };
-        let mut summary = Event::new(session_id.clone(), "auto_fix", "RuleEngine", decision);
-        summary.reason = Some(format!(
-            "applied={} residual={}",
-            report.fixed_count,
-            report.residual_violations.len()
-        ));
-        summary.detail = Some(project_root.display().to_string());
-        if let Err(e) = self.log(&summary).await {
-            tracing::warn!("failed to log auto_fix event: {e}");
-        }
-
-        for attempt in &report.attempts {
-            let attempt_decision = if attempt.resolved {
-                Decision::Pass
-            } else if attempt.applied {
-                Decision::Warn
-            } else {
-                Decision::Block
-            };
-            let mut evt = Event::new(
-                session_id.clone(),
-                "auto_fix_attempt",
-                attempt.rule_id.as_str(),
-                attempt_decision,
-            );
-            evt.reason = Some(format!(
-                "applied={} resolved={}",
-                attempt.applied, attempt.resolved
-            ));
-            evt.detail = Some(if let Some(line) = attempt.line {
-                format!("{}:{line}", attempt.file.display())
-            } else {
-                attempt.file.display().to_string()
-            });
-            if let Err(e) = self.log(&evt).await {
-                tracing::warn!("failed to log auto_fix_attempt event: {e}");
-            }
-        }
-    }
-
-    pub async fn persist_retry_summary(
-        &self,
-        checked: u32,
-        retried: u32,
-        stuck: u32,
-        skipped: u32,
-    ) {
-        let decision = if stuck > 0 {
-            Decision::Warn
-        } else {
-            Decision::Pass
-        };
-        let mut event = Event::new(
-            SessionId::new(),
-            "periodic_retry:summary",
-            "RetryScheduler",
-            decision,
-        );
-        event.detail = Some(format!(
-            r#"{{"checked":{checked},"retried":{retried},"stuck":{stuck},"skipped":{skipped}}}"#
-        ));
-        if let Err(e) = self.log(&event).await {
-            tracing::warn!("periodic_retry: failed to log summary event: {e}");
         }
     }
 
@@ -741,15 +438,6 @@ impl EventStore {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    pub async fn query_recent(&self, duration: std::time::Duration) -> anyhow::Result<Vec<Event>> {
-        let since = chrono::Utc::now() - chrono::Duration::from_std(duration)?;
-        self.query(&EventFilters {
-            since: Some(since),
-            ..Default::default()
-        })
-        .await
     }
 
     #[cfg(test)]

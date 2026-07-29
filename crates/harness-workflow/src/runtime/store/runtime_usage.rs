@@ -2,6 +2,7 @@ use super::super::model::RuntimeKind;
 use super::WorkflowRuntimeStore;
 use chrono::{DateTime, Utc};
 use harness_observe::usage::UsageMetrics;
+use serde::Serialize;
 
 pub type RuntimeUsageMetrics = UsageMetrics;
 const COST_USD_MICROS_PER_DOLLAR: f64 = 1_000_000.0;
@@ -58,7 +59,7 @@ pub enum RuntimeUsageUpsertOutcome {
     Persisted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeUsageRecord {
     pub id: String,
     pub runtime_job_id: String,
@@ -82,10 +83,20 @@ pub struct RuntimeUsageRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeWorkflowUsage {
     pub metrics: RuntimeUsageMetrics,
     pub cost_usd_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeAgentTelemetry {
+    pub workflow_id: String,
+    pub workflow_state: String,
+    pub terminal: bool,
+    pub agent: String,
+    pub usage: Option<RuntimeWorkflowUsage>,
+    pub usage_records: Vec<RuntimeUsageRecord>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -263,6 +274,62 @@ impl WorkflowRuntimeStore {
         }))
     }
 
+    /// Single durable query path for "what did agent X do in workflow/run Y?"
+    ///
+    /// This returns the workflow outcome from `workflow_instances` plus the
+    /// per-turn usage rows for one persisted runtime agent. Policy-hook events
+    /// remain in `harness_observe::event_store` and can be joined by `run_id`
+    /// with `EventStore::policy_events_for_agent_run` when the caller needs
+    /// guard/hook decisions alongside usage and outcome.
+    pub async fn runtime_agent_telemetry_for_workflow(
+        &self,
+        workflow_id: &str,
+        agent: &str,
+    ) -> anyhow::Result<Option<RuntimeAgentTelemetry>> {
+        let Some(workflow) = self.get_instance(workflow_id).await? else {
+            return Ok(None);
+        };
+        let usage_records = self
+            .runtime_usage_records_for_workflow_agent(workflow_id, agent)
+            .await?;
+        let usage = aggregate_usage_records(&usage_records)?;
+        let terminal = workflow.is_terminal();
+        Ok(Some(RuntimeAgentTelemetry {
+            workflow_id: workflow.id,
+            workflow_state: workflow.state.clone(),
+            terminal,
+            agent: agent.to_string(),
+            usage,
+            usage_records,
+        }))
+    }
+
+    pub async fn runtime_usage_records_for_workflow_agent(
+        &self,
+        workflow_id: &str,
+        agent: &str,
+    ) -> anyhow::Result<Vec<RuntimeUsageRecord>> {
+        let rows: Vec<RuntimeUsageDbRow> = sqlx::query_as(
+            "SELECT
+                id, runtime_job_id, usage_key, command_id, workflow_id, turn_id,
+                runtime_kind, runtime_profile, agent, model, project, task_id,
+                candidate_group_id, candidate_id, candidate_index, candidate_count,
+                input_tokens, output_tokens, cache_read_input_tokens,
+                cache_creation_input_tokens, reported_total_tokens, cost_usd_micros,
+                reported_at, updated_at
+             FROM runtime_usage_events
+             WHERE workflow_id = $1 AND agent = $2
+             ORDER BY reported_at ASC, id ASC",
+        )
+        .bind(workflow_id)
+        .bind(agent)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(runtime_usage_record_from_row)
+            .collect()
+    }
+
     /// Return one durable runtime turn count per workflow for dashboard
     /// distribution metrics. Each persisted usage key represents one turn (or
     /// the runtime job fallback when an adapter does not expose a turn id).
@@ -332,6 +399,55 @@ fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<Runti
 
 fn usage_metrics_are_zero(metrics: &RuntimeUsageMetrics) -> bool {
     metrics.input_tokens == 0 && metrics.output_tokens == 0 && metrics.total_tokens() == 0
+}
+
+fn aggregate_usage_records(
+    records: &[RuntimeUsageRecord],
+) -> anyhow::Result<Option<RuntimeWorkflowUsage>> {
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let mut metrics = RuntimeUsageMetrics::default();
+    let mut reported_total_tokens = 0_u64;
+    let mut cost_usd_micros = 0_u64;
+    for record in records {
+        metrics.input_tokens = checked_add(
+            metrics.input_tokens,
+            record.metrics.input_tokens,
+            "input_tokens",
+        )?;
+        metrics.output_tokens = checked_add(
+            metrics.output_tokens,
+            record.metrics.output_tokens,
+            "output_tokens",
+        )?;
+        metrics.cache_read_input_tokens = checked_add(
+            metrics.cache_read_input_tokens,
+            record.metrics.cache_read_input_tokens,
+            "cache_read_input_tokens",
+        )?;
+        metrics.cache_creation_input_tokens = checked_add(
+            metrics.cache_creation_input_tokens,
+            record.metrics.cache_creation_input_tokens,
+            "cache_creation_input_tokens",
+        )?;
+        reported_total_tokens = checked_add(
+            reported_total_tokens,
+            record.metrics.total_tokens(),
+            "reported_total_tokens",
+        )?;
+        cost_usd_micros = checked_add(cost_usd_micros, record.cost_usd_micros, "cost_usd_micros")?;
+    }
+    metrics.reported_total_tokens = Some(reported_total_tokens);
+    Ok(Some(RuntimeWorkflowUsage {
+        metrics,
+        cost_usd_micros,
+    }))
+}
+
+fn checked_add(left: u64, right: u64, field: &str) -> anyhow::Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| anyhow::anyhow!("{field} aggregate exceeds u64::MAX"))
 }
 
 fn u64_to_i64(value: u64, field: &str) -> anyhow::Result<i64> {

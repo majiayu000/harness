@@ -150,6 +150,63 @@ async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn runtime_agent_telemetry_for_workflow_returns_outcome_and_agent_usage() -> anyhow::Result<()>
+{
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "done",
+        WorkflowSubject::new("issue", "issue:1804"),
+    )
+    .with_id("workflow-1");
+    store.insert_instance_if_absent(&workflow).await?;
+
+    let codex = RuntimeUsageUpsert {
+        cost_usd_micros: 750_000,
+        ..runtime_usage_upsert(RuntimeUsageMetrics {
+            input_tokens: 10,
+            output_tokens: 5,
+            reported_total_tokens: Some(15),
+            ..Default::default()
+        })
+    };
+    let mut claude = codex.clone();
+    claude.runtime_job_id = "runtime-job-2".to_string();
+    claude.turn_id = Some("turn-2".to_string());
+    claude.agent = "claude".to_string();
+    claude.metrics.input_tokens = 99;
+
+    store.upsert_runtime_usage(&codex).await?;
+    store.upsert_runtime_usage(&claude).await?;
+
+    let telemetry = store
+        .runtime_agent_telemetry_for_workflow("workflow-1", "codex")
+        .await?
+        .expect("workflow telemetry should exist");
+
+    assert_eq!(telemetry.workflow_state, "done");
+    assert!(telemetry.terminal);
+    assert_eq!(telemetry.agent, "codex");
+    assert_eq!(telemetry.usage_records.len(), 1);
+    assert_eq!(telemetry.usage_records[0].agent, "codex");
+    let usage = telemetry.usage.expect("codex usage should aggregate");
+    assert_eq!(usage.metrics.input_tokens, 10);
+    assert_eq!(usage.metrics.total_tokens(), 15);
+    assert_eq!(usage.cost_usd_micros, 750_000);
+    assert!(store
+        .runtime_agent_telemetry_for_workflow("missing-workflow", "codex")
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_turn_counts_group_usage_by_workflow() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
