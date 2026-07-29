@@ -52,25 +52,39 @@ fn claude_prompt_helpers_do_not_split_static_only_layers() {
 }
 
 #[test]
-fn agent_request_recovers_layers_from_registered_flattened_prompt_with_runtime_additions() {
+fn agent_request_does_not_infer_layers_from_flattened_prompt() {
     let flattened =
         prompts::implement_from_issue(1471, None, Some("follow the spec")).to_prompt_string();
+    let prompt = format!("Constitution\n\n{flattened}\n\n## Available Skills\n- review");
     let request = AgentRequest {
-        prompt: format!("Constitution\n\n{flattened}\n\n## Available Skills\n- review"),
+        prompt: prompt.clone(),
         project_root: PathBuf::from("/tmp/project"),
         ..AgentRequest::default()
     };
 
-    let Some(system_prompt) = request.claude_system_prompt() else {
-        panic!("registered PromptParts should provide a Claude system prompt");
-    };
-    let main_prompt = request.claude_main_prompt();
+    assert_eq!(request.claude_system_prompt().as_deref(), None);
+    assert_eq!(request.claude_main_prompt(), prompt);
+}
 
-    assert!(system_prompt.contains("Senior Engineer"));
-    assert!(!system_prompt.contains("follow the spec"));
-    assert!(main_prompt.contains("Constitution"));
-    assert!(main_prompt.contains("follow the spec"));
-    assert!(main_prompt.contains("## Available Skills"));
+#[test]
+fn explicit_layers_keep_similar_prompts_test_isolated() {
+    let short_layers = AgentPromptLayers::new("static\n", "context\n", "dynamic\n");
+    let long_layers = AgentPromptLayers::new("static\ncontext\n", "dynamic\n", "runtime\n");
+
+    let short_request =
+        AgentRequest::from_prompt_layers(short_layers, PathBuf::from("/tmp/project"));
+    let long_request = AgentRequest::from_prompt_layers(long_layers, PathBuf::from("/tmp/project"));
+
+    assert_eq!(
+        short_request.claude_system_prompt().as_deref(),
+        Some("static\n")
+    );
+    assert_eq!(short_request.claude_main_prompt(), "context\ndynamic\n");
+    assert_eq!(
+        long_request.claude_system_prompt().as_deref(),
+        Some("static\ncontext\n")
+    );
+    assert_eq!(long_request.claude_main_prompt(), "dynamic\nruntime\n");
 }
 
 #[test]
