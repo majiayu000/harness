@@ -84,8 +84,10 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
         .get_instance(&submission.workflow_id)
         .await?
         .expect("prompt child workflow should exist after submission");
-    child.parent_workflow_id = Some(parent.id.clone());
-    store.upsert_instance(&child).await?;
+    child = store
+        .attach_parent_workflow_if_missing(&child.id, &parent.id)
+        .await?
+        .expect("prompt child workflow should remain persisted");
     store
         .append_event(
             &child.id,
@@ -267,7 +269,8 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
             .await?;
     }
     child.state = "checking".to_string();
-    store.upsert_instance(&child).await?;
+    child.version += 1;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,

@@ -433,7 +433,8 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
         )
         .await?;
     child.state = "failed".to_string();
-    store.upsert_instance(&child).await?;
+    child.version += 1;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
     let mut parent = store
         .get_instance("prompt-task-auto-submit-reopen")
         .await?
