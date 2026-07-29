@@ -67,6 +67,9 @@ fn commands_for_target(
             )]);
         }
         return match state.progress {
+            Some(DeclaredProgressMode::CommandDriven) => anyhow::bail!(
+                "declarative target state '{target}' is command-driven but declares no activity"
+            ),
             Some(DeclaredProgressMode::ExternalWait) => Ok(vec![WorkflowCommand::wait(
                 format!("declarative workflow is waiting in state '{target}'"),
                 dedupe_key,
@@ -75,6 +78,10 @@ fn commands_for_target(
                 WorkflowCommandType::RequestOperatorAttention,
                 dedupe_key,
                 json!({ "state": target }),
+            )]),
+            Some(DeclaredProgressMode::ParentHandoff) => Ok(vec![WorkflowCommand::wait(
+                format!("declarative workflow is waiting for parent handoff in state '{target}'"),
+                dedupe_key,
             )]),
             None => anyhow::bail!("declarative target state '{target}' has no progress driver"),
         };

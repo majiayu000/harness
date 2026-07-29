@@ -120,8 +120,10 @@ pub struct WorkflowActivityPolicy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeclaredProgressMode {
+    CommandDriven,
     ExternalWait,
     OperatorGate,
+    ParentHandoff,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]

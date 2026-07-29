@@ -3,14 +3,14 @@ use super::support::{
     result_stop_reason_code, runtime_blocked_command, runtime_completion_evidence,
     runtime_failed_command,
 };
-use super::{
-    GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
-    QUALITY_GATE_DEFINITION_ID,
-};
 use crate::runtime::model::{
     ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowEvent, WorkflowInstance,
 };
+use crate::runtime::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
+use crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID;
+use crate::runtime::quality_gate::QUALITY_GATE_DEFINITION_ID;
+use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 
