@@ -375,7 +375,7 @@ async fn persist_recovered_workflow(
     final_instance.data = data;
     final_instance.version = existing
         .as_ref()
-        .map_or(0, |value| value.version.saturating_add(1));
+        .map_or(1, |value| value.version.saturating_add(1));
     let mut decision = WorkflowDecision::new(
         &id,
         existing

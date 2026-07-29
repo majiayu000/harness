@@ -1,6 +1,6 @@
 use super::{
-    command_store, insert_decision_record_tx, insert_event_tx_with_id,
-    insert_instance_if_absent_tx,
+    apply_inline_command_side_effect, command_store, insert_decision_record_tx,
+    insert_event_tx_with_id, insert_instance_if_absent_tx,
     runtime_job_state::{cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation},
     select_instance_for_update_tx,
     transition_validation::{validate_transition_with_context, TransitionValidation},
@@ -119,7 +119,7 @@ impl WorkflowRuntimeStore {
                 current: current.map(Box::new),
             });
         }
-        let expected_version = current.as_ref().map_or(0, |instance| instance.version + 1);
+        let expected_version = current.as_ref().map_or(1, |instance| instance.version + 1);
         if transition.final_instance.version != expected_version {
             anyhow::bail!("coverage recovery final instance has an invalid version");
         }
@@ -130,7 +130,8 @@ impl WorkflowRuntimeStore {
                 &transition.decision.observed_state,
             )
         });
-        let validation_context = ValidationContext::new("reconciliation", chrono::Utc::now());
+        let validation_context =
+            ValidationContext::new("reconciliation", chrono::Utc::now()).allow_terminal_reopen();
         match validate_transition_with_context(
             &validation_current,
             transition.decision,
@@ -215,6 +216,7 @@ impl WorkflowRuntimeStore {
         }
 
         let mut command_ids = Vec::new();
+        let mut final_instance = transition.final_instance.clone();
         for command in &transition.decision.commands {
             command_ids.push(
                 command_store::insert_or_reactivate_cancelled_tx(
@@ -230,8 +232,11 @@ impl WorkflowRuntimeStore {
                 )
                 .await?,
             );
+            if !command.requires_runtime_job() {
+                apply_inline_command_side_effect(&mut final_instance, command)?;
+            }
         }
-        upsert_instance_tx(&mut tx, transition.final_instance).await?;
+        upsert_instance_tx(&mut tx, &final_instance).await?;
         tx.commit().await?;
         Ok(WorkflowCoverageRecoveryOutcome::Committed { command_ids })
     }
@@ -267,7 +272,7 @@ mod tests {
         let store_ref = &store;
         let barrier = Arc::new(Barrier::new(2));
         let run = |suffix: &'static str, barrier: Arc<Barrier>| {
-            let final_instance = WorkflowInstance::new(
+            let mut final_instance = WorkflowInstance::new(
                 "github_issue_pr",
                 1,
                 "quality_gate_pending",
@@ -275,6 +280,7 @@ mod tests {
             )
             .with_id("coverage-race")
             .with_data(json!({"winner": suffix}));
+            final_instance.version = 1;
             let fact = RemoteFactSnapshot::new(
                 "github",
                 "owner/repo",

@@ -5,8 +5,8 @@
 //! home; every write here must pass `validate_transition` first.
 
 use super::{
-    command_store, insert_decision_record_tx, insert_event_tx, load_or_insert_initial_instance_tx,
-    to_jsonb_string,
+    apply_inline_command_side_effect, command_store, insert_decision_record_tx, insert_event_tx,
+    load_or_insert_initial_instance_tx, to_jsonb_string,
     transition_validation::{validate_transition, TransitionValidation},
     WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
 };
@@ -96,7 +96,7 @@ impl WorkflowRuntimeStore {
     where
         F: FnOnce(&WorkflowInstance, &WorkflowDecision, &WorkflowEvent) -> TransitionValidation,
     {
-        let final_instance = transition.final_instance;
+        let mut final_instance = transition.final_instance.clone();
         let decision = transition.decision;
         if decision.workflow_id != final_instance.id {
             anyhow::bail!(
@@ -131,7 +131,7 @@ impl WorkflowRuntimeStore {
         if current.version.checked_add(1) != Some(final_instance.version) {
             return Ok(None);
         }
-        ensure_protected_instance_fields_match(&current, final_instance)?;
+        ensure_protected_instance_fields_match(&current, &final_instance)?;
 
         let event = insert_event_tx(
             &mut tx,
@@ -173,9 +173,12 @@ impl WorkflowRuntimeStore {
                 status,
             )
             .await?;
+            if !command.requires_runtime_job() {
+                apply_inline_command_side_effect(&mut final_instance, command)?;
+            }
         }
 
-        let instance_data = to_jsonb_string(final_instance)?;
+        let instance_data = to_jsonb_string(&final_instance)?;
         sqlx::query(
             "INSERT INTO workflow_instances
                 (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)

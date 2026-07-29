@@ -2,9 +2,9 @@ use crate::http::AppState;
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     build_pr_feedback_inspect_decision, build_quality_gate_run_decision, ActivityArtifact,
-    ActivityErrorKind, ActivityResult, DecisionValidator, PrFeedbackInspectDecisionInput,
-    QualityGateDecisionInput, RuntimeJob, WorkflowDecisionRecord, WorkflowDefinition,
-    WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
+    ActivityErrorKind, ActivityResult, PrFeedbackInspectDecisionInput, QualityGateDecisionInput,
+    RuntimeJob, WorkflowCommandStatus, WorkflowDefinition, WorkflowInstance, WorkflowSubject,
+    WorkflowSubmissionDecisionTransition, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
     QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::{json, Value};
@@ -79,8 +79,12 @@ pub(super) async fn execute_start_prompt_task_child_workflow(
 
     if let Some(parent) = parent {
         if child.parent_workflow_id.is_none() {
-            child.parent_workflow_id = Some(parent.id.clone());
-            store.upsert_instance(&child).await?;
+            child = store
+                .attach_parent_workflow_if_missing(&child.id, &parent.id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("prompt task child workflow disappeared during parent attach")
+                })?;
         }
     }
 
@@ -168,7 +172,9 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
             "Quality gate workflow",
         ))
         .await?;
-    let mut child = match store.get_instance(&child_id).await? {
+    let existing_child = store.get_instance(&child_id).await?;
+    let child_was_persisted = existing_child.is_some();
+    let mut child = match existing_child {
         Some(instance) => instance,
         None => WorkflowInstance::new(
             QUALITY_GATE_DEFINITION_ID,
@@ -181,7 +187,14 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
     let child_started_by_command = child_started_by_command(&child, &job.command_id);
     let child_start_event_recorded =
         child_start_event_recorded(store, &child.id, &job.command_id).await?;
-    if child.parent_workflow_id.is_none() {
+    if child.parent_workflow_id.is_none() && child_was_persisted {
+        child = store
+            .attach_parent_workflow_if_missing(&child.id, &parent.id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("quality gate child workflow disappeared during parent attach")
+            })?;
+    } else if child.parent_workflow_id.is_none() {
         child.parent_workflow_id = Some(parent.id.clone());
     }
     merge_json_object(
@@ -228,18 +241,19 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
     }
 
     let child_command_ids = if child.state == "pending" {
-        let event_id = child_event_id_or_append(
-            store,
-            &child.id,
-            "QualityGateRequested",
-            json!({
+        let request_payload = json!({
                 "parent_workflow_id": parent.id.as_str(),
                 "runtime_job_id": job.id.as_str(),
                 "command_id": job.command_id.as_str(),
                 "pr_number": pr_number,
                 "pr_url": pr_url.clone(),
                 "repo": repo,
-            }),
+        });
+        let event_id = child_event_id_or_append(
+            store,
+            &child.id,
+            "QualityGateRequested",
+            request_payload.clone(),
         )
         .await?;
         let existing_record = decision_for_event(store, &child.id, &event_id).await?;
@@ -250,36 +264,7 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
                 validation_commands: &validation_commands,
             },
         );
-        let validation = DecisionValidator::quality_gate().validate(
-            &child,
-            &output.decision,
-            &harness_workflow::runtime::ValidationContext::new(
-                "workflow_runtime_worker",
-                chrono::Utc::now(),
-            ),
-        );
-        let record = if let Some(record) = existing_record {
-            record
-        } else {
-            match validation {
-                Ok(()) => WorkflowDecisionRecord::accepted(output.decision.clone(), Some(event_id)),
-                Err(error) => {
-                    let record = WorkflowDecisionRecord::rejected(
-                        output.decision,
-                        Some(event_id),
-                        error.to_string(),
-                    );
-                    store.record_decision(&record).await?;
-                    return Ok(ActivityResult::failed(
-                        activity_name(job),
-                        "Quality gate child workflow request was rejected.",
-                        error.to_string(),
-                    )
-                    .with_error_kind(ActivityErrorKind::Configuration));
-                }
-            }
-        };
-        if !record.accepted {
+        if let Some(record) = existing_record.as_ref().filter(|record| !record.accepted) {
             return Ok(ActivityResult::failed(
                 activity_name(job),
                 "Quality gate child workflow request was rejected.",
@@ -290,18 +275,51 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
             )
             .with_error_kind(ActivityErrorKind::Configuration));
         }
-        store.record_decision(&record).await?;
-        let mut command_ids = Vec::new();
-        for command in &record.decision.commands {
-            let command_id = store
-                .enqueue_command(&child.id, Some(&record.id), command)
-                .await?;
-            command_ids.push(command_id);
+        let decision = existing_record
+            .as_ref()
+            .map(|record| &record.decision)
+            .unwrap_or(&output.decision);
+        let mut final_child = child.clone();
+        final_child.state = decision.next_state.clone();
+        final_child.version = final_child.version.saturating_add(1);
+        let commit = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &child.id,
+                expected_state: &child.state,
+                expected_version: child.version,
+                create_if_missing: None,
+                event_id: Some(&event_id),
+                new_event_id: None,
+                event_type: "QualityGateRequested",
+                source: "workflow_runtime_worker",
+                payload: request_payload,
+                decision: &output.decision,
+                existing_record: existing_record.as_ref(),
+                rejection_reason: None,
+                final_instance: Some(&final_child),
+                command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
+            })
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "quality gate child workflow state changed before request could be committed"
+                )
+            })?;
+        if !commit.record.accepted {
+            return Ok(ActivityResult::failed(
+                activity_name(job),
+                "Quality gate child workflow request was rejected.",
+                commit
+                    .record
+                    .rejection_reason
+                    .clone()
+                    .unwrap_or_else(|| "decision rejected".to_string()),
+            )
+            .with_error_kind(ActivityErrorKind::Configuration));
         }
-        child.state = record.decision.next_state.clone();
-        child.version = child.version.saturating_add(1);
-        store.upsert_instance(&child).await?;
-        command_ids
+        child = final_child;
+        commit.command_ids
     } else {
         Vec::new()
     };
@@ -369,7 +387,9 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             "PR feedback workflow",
         ))
         .await?;
-    let mut child = match store.get_instance(&child_id).await? {
+    let existing_child = store.get_instance(&child_id).await?;
+    let child_was_persisted = existing_child.is_some();
+    let mut child = match existing_child {
         Some(instance) => instance,
         None => WorkflowInstance::new(
             PR_FEEDBACK_DEFINITION_ID,
@@ -382,7 +402,14 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
     let child_started_by_command = child_started_by_command(&child, &job.command_id);
     let child_start_event_recorded =
         child_start_event_recorded(store, &child.id, &job.command_id).await?;
-    if child.parent_workflow_id.is_none() {
+    if child.parent_workflow_id.is_none() && child_was_persisted {
+        child = store
+            .attach_parent_workflow_if_missing(&child.id, &parent.id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("PR feedback child workflow disappeared during parent attach")
+            })?;
+    } else if child.parent_workflow_id.is_none() {
         child.parent_workflow_id = Some(parent.id.clone());
     }
     child.data = merge_pr_feedback_child_data(
@@ -427,11 +454,7 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
     }
 
     let child_command_ids = if child.state == "pending" {
-        let event_id = child_event_id_or_append(
-            store,
-            &child.id,
-            "PrFeedbackInspectionRequested",
-            json!({
+        let request_payload = json!({
                 "parent_workflow_id": parent.id.as_str(),
                 "runtime_job_id": job.id.as_str(),
                 "command_id": job.command_id.as_str(),
@@ -439,7 +462,12 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
                 "pr_url": pr_url,
                 "issue_number": issue_number,
                 "repo": repo,
-            }),
+        });
+        let event_id = child_event_id_or_append(
+            store,
+            &child.id,
+            "PrFeedbackInspectionRequested",
+            request_payload.clone(),
         )
         .await?;
         let existing_record = decision_for_event(store, &child.id, &event_id).await?;
@@ -470,36 +498,7 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
                 summary: "PR feedback child workflow requested runtime inspection.",
             },
         );
-        let validation = DecisionValidator::pr_feedback().validate(
-            &child,
-            &output.decision,
-            &harness_workflow::runtime::ValidationContext::new(
-                "workflow_runtime_worker",
-                chrono::Utc::now(),
-            ),
-        );
-        let record = if let Some(record) = existing_record {
-            record
-        } else {
-            match validation {
-                Ok(()) => WorkflowDecisionRecord::accepted(output.decision.clone(), Some(event_id)),
-                Err(error) => {
-                    let record = WorkflowDecisionRecord::rejected(
-                        output.decision,
-                        Some(event_id),
-                        error.to_string(),
-                    );
-                    store.record_decision(&record).await?;
-                    return Ok(ActivityResult::failed(
-                        activity_name(job),
-                        "PR feedback child workflow inspection request was rejected.",
-                        error.to_string(),
-                    )
-                    .with_error_kind(ActivityErrorKind::Configuration));
-                }
-            }
-        };
-        if !record.accepted {
+        if let Some(record) = existing_record.as_ref().filter(|record| !record.accepted) {
             return Ok(ActivityResult::failed(
                 activity_name(job),
                 "PR feedback child workflow inspection request was rejected.",
@@ -510,12 +509,52 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             )
             .with_error_kind(ActivityErrorKind::Configuration));
         }
-        store.record_decision(&record).await?;
+        let decision = existing_record
+            .as_ref()
+            .map(|record| &record.decision)
+            .unwrap_or(&output.decision);
+        let mut final_child = child.clone();
+        final_child.state = decision.next_state.clone();
+        final_child.version = final_child.version.saturating_add(1);
+        let commit = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &child.id,
+                expected_state: &child.state,
+                expected_version: child.version,
+                create_if_missing: None,
+                event_id: Some(&event_id),
+                new_event_id: None,
+                event_type: "PrFeedbackInspectionRequested",
+                source: "workflow_runtime_worker",
+                payload: request_payload,
+                decision: &output.decision,
+                existing_record: existing_record.as_ref(),
+                rejection_reason: None,
+                final_instance: Some(&final_child),
+                command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
+            })
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PR feedback child workflow state changed before request could be committed"
+                )
+            })?;
+        if !commit.record.accepted {
+            return Ok(ActivityResult::failed(
+                activity_name(job),
+                "PR feedback child workflow inspection request was rejected.",
+                commit
+                    .record
+                    .rejection_reason
+                    .clone()
+                    .unwrap_or_else(|| "decision rejected".to_string()),
+            )
+            .with_error_kind(ActivityErrorKind::Configuration));
+        }
+        child = final_child;
         let mut command_ids = Vec::new();
-        for command in &record.decision.commands {
-            let command_id = store
-                .enqueue_command(&child.id, Some(&record.id), command)
-                .await?;
+        for command_id in commit.command_ids {
             let command_record = store
                 .get_command(&command_id)
                 .await?
@@ -527,9 +566,6 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             }
             command_ids.push(command_id);
         }
-        child.state = record.decision.next_state.clone();
-        child.version = child.version.saturating_add(1);
-        store.upsert_instance(&child).await?;
         command_ids
     } else {
         Vec::new()

@@ -21,19 +21,62 @@ impl WorkflowRuntimeStore {
 
     pub async fn upsert_instance(&self, instance: &WorkflowInstance) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        if let Some(current) = select_instance_for_update_tx(&mut tx, &instance.id).await? {
-            ensure_public_upsert_preserves_instance_boundary(&current, instance)?;
-            if instance.version < current.version {
-                anyhow::bail!(
-                    "public workflow instance upsert cannot move version backwards from {} to {}",
-                    current.version,
-                    instance.version
-                );
+        let current = match select_instance_for_update_tx(&mut tx, &instance.id).await? {
+            Some(current) => current,
+            None if insert_instance_if_absent_tx(&mut tx, instance).await? => {
+                tx.commit().await?;
+                return Ok(());
             }
+            None => select_instance_for_update_tx(&mut tx, &instance.id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workflow instance `{}` disappeared during guarded public upsert",
+                        instance.id
+                    )
+                })?,
+        };
+        ensure_public_upsert_preserves_instance_boundary(&current, instance)?;
+        if instance.version < current.version {
+            anyhow::bail!(
+                "public workflow instance upsert cannot move version backwards from {} to {}",
+                current.version,
+                instance.version
+            );
         }
         upsert_instance_tx(&mut tx, instance).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn attach_parent_workflow_if_missing(
+        &self,
+        workflow_id: &str,
+        parent_workflow_id: &str,
+    ) -> anyhow::Result<Option<WorkflowInstance>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(mut instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        match instance.parent_workflow_id.as_deref() {
+            Some(existing) if existing == parent_workflow_id => {
+                tx.commit().await?;
+                Ok(Some(instance))
+            }
+            Some(existing) => {
+                anyhow::bail!(
+                    "workflow instance `{workflow_id}` is already attached to parent `{existing}`"
+                );
+            }
+            None => {
+                instance.parent_workflow_id = Some(parent_workflow_id.to_string());
+                instance.version = instance.version.saturating_add(1);
+                upsert_instance_tx(&mut tx, &instance).await?;
+                tx.commit().await?;
+                Ok(Some(instance))
+            }
+        }
     }
 
     pub async fn ensure_otel_trace_context(
