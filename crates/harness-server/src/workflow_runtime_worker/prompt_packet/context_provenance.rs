@@ -28,6 +28,7 @@ use super::{ResolvedRuntimeSettings, REPO_MEMORY_PROMPT_PREAMBLE, RUNTIME_PROMPT
 
 pub(super) const CONTEXT_PROVENANCE_SCHEMA: &str = "harness.runtime.context_provenance.v1";
 const HISTORICAL_PROMPT_PACKET_SCHEMA_V1: &str = "harness.runtime.prompt_packet.v1";
+const HISTORICAL_PROMPT_PACKET_SCHEMA_V2: &str = "harness.runtime.prompt_packet.v2";
 
 /// Closed coverage markers for context Harness cannot observe. Absence of a
 /// manifest entry is never proof that such context did not exist.
@@ -126,7 +127,9 @@ fn prompt_task_request_section(job: &RuntimeJob, task_text: &str) -> anyhow::Res
 pub(super) fn validate_prompt_packet_provenance(packet: &Value) -> anyhow::Result<()> {
     let schema = packet.get("schema").and_then(Value::as_str).unwrap_or("");
     if schema != RUNTIME_PROMPT_PACKET_SCHEMA {
-        if schema == HISTORICAL_PROMPT_PACKET_SCHEMA_V1 {
+        if schema == HISTORICAL_PROMPT_PACKET_SCHEMA_V1
+            || schema == HISTORICAL_PROMPT_PACKET_SCHEMA_V2
+        {
             return Ok(());
         }
         anyhow::bail!("prompt packet schema `{schema}` is not a supported runtime packet schema");

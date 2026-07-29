@@ -84,6 +84,8 @@ pub struct WorkflowInstance {
     pub parent_workflow_id: Option<String>,
     #[serde(default)]
     pub data: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_provenance: Option<super::data_provenance::WorkflowDataProvenance>,
     pub version: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease: Option<WorkflowLease>,
@@ -107,6 +109,7 @@ impl WorkflowInstance {
             subject,
             parent_workflow_id: None,
             data: Value::Object(Default::default()),
+            data_provenance: None,
             version: 0,
             lease: None,
             created_at: now,

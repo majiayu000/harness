@@ -104,7 +104,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     let prompt_event = &events[2];
     assert_eq!(
         prompt_event.event["prompt_packet"]["schema"],
-        "harness.runtime.prompt_packet.v2"
+        "harness.runtime.prompt_packet.v3"
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["context_provenance"]["schema"],
@@ -186,7 +186,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(prompt_artifact.artifact["digest"], prompt_packet_digest);
     assert_eq!(
         prompt_artifact.artifact["schema"],
-        "harness.runtime.prompt_packet.v2"
+        "harness.runtime.prompt_packet.v3"
     );
     let prompts = agent.prompts.lock().await;
     assert_eq!(prompts.len(), 1);
