@@ -11,9 +11,12 @@ pub mod provider_backpressure;
 pub mod registry;
 pub mod scoped_token;
 mod spawn_contract;
+mod spawn_supervisor;
 mod streaming;
 
-use harness_core::run_id::{RunIdentity, AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
+use harness_core::run_id::RunIdentity;
+#[cfg(test)]
+use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
 use harness_core::run_registry::{append_binding_nonblocking, BindingRecord};
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,18 +31,6 @@ pub(crate) fn resolve_agent_run_identity(env_vars: &HashMap<String, String>) -> 
             );
             RunIdentity::mint()
         }
-    }
-}
-
-pub(crate) fn apply_agent_run_identity_env(
-    cmd: &mut tokio::process::Command,
-    identity: &RunIdentity,
-) {
-    cmd.env(AGENT_RUN_ID_ENV, identity.run_id.as_str());
-    if let Some(parent) = &identity.parent {
-        cmd.env(AGENT_RUN_PARENT_ENV, parent.as_str());
-    } else {
-        cmd.env_remove(AGENT_RUN_PARENT_ENV);
     }
 }
 
