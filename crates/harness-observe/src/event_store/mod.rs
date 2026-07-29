@@ -340,6 +340,7 @@ impl EventStore {
         const JSONL_MIGRATION_BATCH_SIZE: usize = 1_000;
         let mut pending = Vec::with_capacity(JSONL_MIGRATION_BATCH_SIZE);
         let mut imported = 0usize;
+        let mut read_failed = false;
         for line in std::io::BufReader::new(file).lines() {
             let line = match line {
                 Ok(l) => l,
@@ -347,6 +348,7 @@ impl EventStore {
                     tracing::warn!(
                         "event store: I/O error reading events.jsonl, aborting migration: {e}"
                     );
+                    read_failed = true;
                     break;
                 }
             };
@@ -365,6 +367,9 @@ impl EventStore {
                     pending.clear();
                 }
             }
+        }
+        if read_failed {
+            return;
         }
         if !pending.is_empty() {
             if let Err(e) = self.insert_events(&pending).await {
