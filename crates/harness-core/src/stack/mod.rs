@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
+pub mod capability_evidence;
 pub mod fingerprint;
 pub mod inventory;
 #[cfg(test)]
