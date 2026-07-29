@@ -46,5 +46,6 @@ regex = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"
+syn = { version = "2", features = ["full"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = "0.26"

@@ -1,6 +1,9 @@
 use anyhow::Context;
 use harness_agents::registry::AgentRegistry;
 use harness_core::{agent::AgentRequest, config::HarnessConfig, prompts, types::ThreadId};
+use harness_protocol::methods::{
+    RpcResponse, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -10,10 +13,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
-const JSONRPC_PARSE_ERROR: i32 = -32700;
-const JSONRPC_INVALID_REQUEST: i32 = -32600;
-const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
-const JSONRPC_INVALID_PARAMS: i32 = -32602;
 
 #[async_trait::async_trait]
 trait PromptExecutor: Send + Sync {
@@ -100,13 +99,10 @@ impl McpServer {
             let request: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(error) => {
-                    let response = jsonrpc_response(
+                    let response = RpcResponse::error(
                         Some(Value::Null),
-                        None,
-                        Some(jsonrpc_error_payload(
-                            JSONRPC_PARSE_ERROR,
-                            format!("parse error: {error}"),
-                        )),
+                        PARSE_ERROR,
+                        format!("parse error: {error}"),
                     );
                     write_json_line(&mut stdout, &response).await?;
                     continue;
@@ -121,23 +117,19 @@ impl McpServer {
         Ok(())
     }
 
-    async fn handle_request(&self, request: Value) -> Option<Value> {
+    async fn handle_request(&self, request: Value) -> Option<RpcResponse> {
         let id = request.get("id").cloned();
         let method = match request.get("method").and_then(Value::as_str) {
             Some(method) => method,
             None => {
-                return jsonrpc_error_response(
-                    id,
-                    JSONRPC_INVALID_REQUEST,
-                    "missing `method` in request",
-                );
+                return rpc_error_response(id, INVALID_REQUEST, "missing `method` in request");
             }
         };
 
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
 
         match method {
-            "initialize" => jsonrpc_success_response(
+            "initialize" => rpc_success_response(
                 id,
                 json!({
                     "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -154,20 +146,20 @@ impl McpServer {
             ),
             "notifications/initialized" => {
                 if id.is_some() {
-                    jsonrpc_success_response(id, json!({}))
+                    rpc_success_response(id, json!({}))
                 } else {
                     None
                 }
             }
-            "ping" => jsonrpc_success_response(id, json!({})),
-            "tools/list" => jsonrpc_success_response(id, json!({ "tools": mcp_tools() })),
+            "ping" => rpc_success_response(id, json!({})),
+            "tools/list" => rpc_success_response(id, json!({ "tools": mcp_tools() })),
             "tools/call" => {
                 let call_params: ToolCallParams = match serde_json::from_value(params) {
                     Ok(value) => value,
                     Err(error) => {
-                        return jsonrpc_error_response(
+                        return rpc_error_response(
                             id,
-                            JSONRPC_INVALID_PARAMS,
+                            INVALID_PARAMS,
                             format!("invalid tools/call params: {error}"),
                         );
                     }
@@ -175,14 +167,10 @@ impl McpServer {
 
                 let arguments = call_params.arguments.unwrap_or_else(|| json!({}));
                 let result = self.call_tool(call_params.name, arguments).await;
-                jsonrpc_success_response(id, result)
+                rpc_success_response(id, result)
             }
             other if other.starts_with("notifications/") => None,
-            _ => jsonrpc_error_response(
-                id,
-                JSONRPC_METHOD_NOT_FOUND,
-                format!("method not found: {method}"),
-            ),
+            _ => rpc_error_response(id, METHOD_NOT_FOUND, format!("method not found: {method}")),
         }
     }
 
@@ -407,46 +395,16 @@ fn resolve_project_root(project_root: Option<PathBuf>) -> anyhow::Result<PathBuf
     }
 }
 
-fn jsonrpc_success_response(id: Option<Value>, result: Value) -> Option<Value> {
-    match id {
-        Some(request_id) => Some(jsonrpc_response(Some(request_id), Some(result), None)),
-        None => None,
-    }
+fn rpc_success_response(id: Option<Value>, result: Value) -> Option<RpcResponse> {
+    id.map(|request_id| RpcResponse::success(Some(request_id), result))
 }
 
-fn jsonrpc_error_response(
+fn rpc_error_response(
     id: Option<Value>,
     code: i32,
     message: impl Into<String>,
-) -> Option<Value> {
-    match id {
-        Some(request_id) => Some(jsonrpc_response(
-            Some(request_id),
-            None,
-            Some(jsonrpc_error_payload(code, message)),
-        )),
-        None => None,
-    }
-}
-
-fn jsonrpc_response(id: Option<Value>, result: Option<Value>, error: Option<Value>) -> Value {
-    let mut response = serde_json::Map::new();
-    response.insert("jsonrpc".to_string(), Value::String("2.0".to_string()));
-    response.insert("id".to_string(), id.unwrap_or(Value::Null));
-    if let Some(result) = result {
-        response.insert("result".to_string(), result);
-    }
-    if let Some(error) = error {
-        response.insert("error".to_string(), error);
-    }
-    Value::Object(response)
-}
-
-fn jsonrpc_error_payload(code: i32, message: impl Into<String>) -> Value {
-    json!({
-        "code": code,
-        "message": message.into(),
-    })
+) -> Option<RpcResponse> {
+    id.map(|request_id| RpcResponse::error(Some(request_id), code, message))
 }
 
 fn tool_success_result(text: String, structured_content: Value) -> Value {
@@ -474,7 +432,10 @@ fn tool_error_result(message: impl Into<String>) -> Value {
     })
 }
 
-async fn write_json_line(stdout: &mut tokio::io::Stdout, value: &Value) -> anyhow::Result<()> {
+async fn write_json_line<T: serde::Serialize>(
+    stdout: &mut tokio::io::Stdout,
+    value: &T,
+) -> anyhow::Result<()> {
     let line = serde_json::to_string(value)?;
     stdout.write_all(line.as_bytes()).await?;
     stdout.write_all(b"\n").await?;
@@ -539,11 +500,10 @@ mod tests {
         })
     }
 
-    fn extract_result(response: Value) -> Value {
+    fn extract_result(response: RpcResponse) -> Value {
         response
-            .get("result")
-            .cloned()
-            .expect("response has result")
+            .result
+            .unwrap_or_else(|| panic!("response has result"))
     }
 
     #[tokio::test]

@@ -163,6 +163,19 @@ The design is intentional:
 | Load rules for an agent to respect | `rule/load` (JSON-RPC) |
 | Record an event from within an agent | `event/log` (JSON-RPC) |
 
+## CLI Local Offline Commands
+
+`harness gc`, `harness rule`, and `harness skill` are explicit local/offline
+commands. They link the domain crates directly and do not submit work through
+the Harness server, so they bypass server authentication, workflow runtime
+concurrency limits, and workflow lifecycle event logging. `harness rule check`
+still attempts to persist scan events to the configured local event store, but
+that is best-effort local observability rather than a server-mediated workflow
+record.
+
+Use the server JSON-RPC methods (`gc/*`, `rule/*`, `skill/*`) when those
+operations must run behind the active server transport and lifecycle boundary.
+
 ## HTTP runtime submission list
 
 `GET /api/workflows/runtime/submissions` returns a paginated envelope, not a raw
