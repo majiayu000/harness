@@ -526,6 +526,32 @@ fn protocol_line_preview_truncates_without_full_count_scan() {
 }
 
 #[tokio::test]
+async fn app_server_read_times_out_when_stdout_stalls() -> anyhow::Result<()> {
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stdout should be piped"))?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let error = CodexAdapter::read_next_message_with_timeout(
+        &mut lines,
+        Some(std::time::Duration::from_millis(50)),
+        "initialize",
+    )
+    .await
+    .expect_err("silent app-server stdout must hit the stall timeout");
+
+    child.kill().await?;
+    child.wait().await?;
+    assert!(format!("{error}").contains("initialize stalled"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn interrupt_noop_when_no_child() {
     let adapter = CodexAdapter::new(PathBuf::from("codex"));
     adapter.interrupt().await.unwrap();
@@ -596,7 +622,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
     let stdin = child.stdin.take().expect("stdin should be piped");
     {
         let mut state = adapter.state.lock().await;
-        state.child = Some(child);
+        state.child = Some(crate::ManagedChild::new(child, "codex app-server test"));
         state.stdin = Some(stdin);
         state.stdout_lines = Some(BufReader::new(stdout).lines());
         state.thread_id = Some("thread-1".into());
@@ -646,7 +672,7 @@ async fn adapter_state_reports_incomplete_child_when_stdout_reader_is_missing() 
     let stdout = child.stdout.take().expect("stdout should be piped");
     let stdin = child.stdin.take().expect("stdin should be piped");
     let mut state = AdapterState::new();
-    state.child = Some(child);
+    state.child = Some(crate::ManagedChild::new(child, "codex app-server test"));
     state.stdin = Some(stdin);
     state.stdout_lines = Some(BufReader::new(stdout).lines());
 
