@@ -380,7 +380,7 @@ async fn persist_recovered_workflow(
         &id,
         existing
             .as_ref()
-            .map_or("missing", |value| value.state.as_str()),
+            .map_or("discovered", |value| value.state.as_str()),
         "recover_github_pr_coverage",
         state,
         "Recovered an authoritative closing pull request from GitHub.",
@@ -388,6 +388,11 @@ async fn persist_recovered_workflow(
     .with_evidence(WorkflowEvidence::new(
         "server_pr_snapshot",
         "GitHub reported an authoritative closing pull request.",
+    ))
+    .with_command(WorkflowCommand::bind_pr(
+        candidate.number,
+        candidate.url.clone(),
+        format!("{}:bind-pr:{}", id, candidate.number),
     ))
     .high_confidence();
     if state == "quality_gate_pending" {
@@ -402,6 +407,28 @@ async fn persist_recovered_workflow(
                 "pr_number": candidate.number,
                 "pr_url": candidate.url,
                 "validation_commands": [],
+            }),
+        ));
+    } else if state == "done" {
+        decision = decision.with_command(WorkflowCommand::new(
+            WorkflowCommandType::MarkDone,
+            format!("{}:done:{}", id, candidate.number),
+            json!({
+                "reason": "GitHub reported the closing pull request as merged.",
+                "repo": repo,
+                "pr_number": candidate.number,
+                "pr_url": candidate.url,
+            }),
+        ));
+    } else if state == "cancelled" {
+        decision = decision.with_command(WorkflowCommand::new(
+            WorkflowCommandType::MarkCancelled,
+            format!("{}:cancelled:{}", id, candidate.number),
+            json!({
+                "reason": "GitHub reported the closing pull request as closed without merge.",
+                "repo": repo,
+                "pr_number": candidate.number,
+                "pr_url": candidate.url,
             }),
         ));
     }
@@ -439,6 +466,15 @@ async fn persist_recovered_workflow(
             .filter(|workflow| runtime_issue_state_is_covered(&workflow.state))
             .map(|workflow| RecoveredWorkflowPersistence::ExistingCoverage(workflow.state))
             .unwrap_or(RecoveredWorkflowPersistence::Rejected)),
+        WorkflowCoverageRecoveryOutcome::Rejected { reason } => {
+            tracing::warn!(
+                workflow_id = %id,
+                issue_number,
+                pr_number = candidate.number,
+                "GitHub coverage recovery rejected by workflow validator: {reason}"
+            );
+            Ok(RecoveredWorkflowPersistence::Rejected)
+        }
     }
 }
 

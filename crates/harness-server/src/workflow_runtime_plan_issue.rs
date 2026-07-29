@@ -1,8 +1,9 @@
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
-    build_plan_issue_decision, DecisionValidator, PlanIssueDecisionInput, PlanIssueWorkflowAction,
-    ValidationContext, WorkflowCommandStatus, WorkflowDecisionRecord, WorkflowDefinition,
-    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    build_plan_issue_decision, PlanIssueDecisionInput, PlanIssueWorkflowAction, WorkflowCommand,
+    WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition,
+    WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    WorkflowSubject,
 };
 use serde_json::json;
 use std::path::Path;
@@ -106,19 +107,12 @@ async fn persist_plan_issue_decision(
         }),
     );
     store.upsert_instance(&instance).await?;
-    let event = store
-        .append_event(
-            &instance.id,
-            "PlanIssueRaised",
-            "workflow_runtime_plan_issue",
-            json!({
-                "task_id": ctx.task_id.as_str(),
-                "issue_number": ctx.issue_number,
-                "repo": ctx.repo,
-                "reason": ctx.plan_issue,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": ctx.task_id.as_str(),
+        "issue_number": ctx.issue_number,
+        "repo": ctx.repo,
+        "reason": ctx.plan_issue,
+    });
 
     let output = build_plan_issue_decision(
         &instance,
@@ -132,42 +126,10 @@ async fn persist_plan_issue_decision(
         },
     );
 
-    let validator = DecisionValidator::github_issue_pr();
-    let validation = validator.validate(
-        &instance,
-        &output.decision,
-        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
-    );
-    let record = match validation {
-        Ok(()) => WorkflowDecisionRecord::accepted(output.decision.clone(), Some(event.id)),
-        Err(error) => {
-            let reason = error.to_string();
-            let record =
-                WorkflowDecisionRecord::rejected(output.decision.clone(), Some(event.id), &reason);
-            store.record_decision(&record).await?;
-            return Ok(PlanIssueRuntimeAction::Block { error: reason });
-        }
-    };
-    store.record_decision(&record).await?;
-    for command in &output.decision.commands {
-        if command.requires_runtime_job() {
-            store
-                .enqueue_command_with_status(
-                    &instance.id,
-                    Some(&record.id),
-                    command,
-                    COMMAND_STATUS_HANDLED_INLINE,
-                )
-                .await?;
-        } else {
-            store
-                .enqueue_command(&instance.id, Some(&record.id), command)
-                .await?;
-        }
-    }
-    instance.state = output.decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let mut final_instance = instance.clone();
+    final_instance.state = output.decision.next_state.clone();
+    final_instance.version = final_instance.version.saturating_add(1);
+    final_instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
         json!({
         "project_id": ctx.project_root.to_string_lossy(),
@@ -178,7 +140,50 @@ async fn persist_plan_issue_decision(
         "last_decision": output.decision.decision,
         }),
     );
-    store.upsert_instance(&instance).await?;
+    let record = store
+        .apply_decision_transition(
+            WorkflowDecisionTransition {
+                expected_state: &instance.state,
+                create_if_missing: None,
+                event_type: "PlanIssueRaised",
+                source: "workflow_runtime_plan_issue",
+                payload: event_payload.clone(),
+                decision: &output.decision,
+                final_instance: &final_instance,
+                command_status: COMMAND_STATUS_HANDLED_INLINE,
+            },
+            "workflow-policy",
+        )
+        .await?;
+    match record {
+        Some(record) if record.accepted => {}
+        Some(record) => {
+            return Ok(PlanIssueRuntimeAction::Block {
+                error: record
+                    .rejection_reason
+                    .unwrap_or_else(|| "plan issue decision rejected".to_string()),
+            });
+        }
+        None => {
+            let reason = "workflow state changed before plan issue transition could be committed"
+                .to_string();
+            let record = store
+                .record_rejected_decision_transition(WorkflowRejectedDecisionTransition {
+                    expected_state: &instance.state,
+                    create_if_missing: None,
+                    event_type: "PlanIssueRaised",
+                    source: "workflow_runtime_plan_issue",
+                    payload: event_payload,
+                    decision: &output.decision,
+                    reason: &reason,
+                })
+                .await?;
+            if record.is_none() {
+                return Ok(fallback_action(ctx));
+            }
+            return Ok(PlanIssueRuntimeAction::Block { error: reason });
+        }
+    }
 
     Ok(match output.action {
         PlanIssueWorkflowAction::RunReplan => PlanIssueRuntimeAction::RunReplan,
@@ -199,42 +204,51 @@ async fn persist_replan_completed(
     let project_id = project_root.to_string_lossy().into_owned();
     let workflow_id =
         harness_workflow::issue_lifecycle::workflow_id(&project_id, repo, issue_number);
-    let mut instance = match store.get_instance(&workflow_id).await? {
-        Some(instance) => instance,
-        None => {
-            let instance = issue_instance(
+    store
+        .upsert_definition(&WorkflowDefinition::new(
+            "github_issue_pr",
+            1,
+            "GitHub issue PR workflow",
+        ))
+        .await?;
+    let (instance, new_instance) = match store.get_instance(&workflow_id).await? {
+        Some(instance) => (instance, false),
+        None => (
+            issue_instance(
                 workflow_id.clone(),
                 project_id.clone(),
                 repo.map(ToOwned::to_owned),
                 issue_number,
                 "replanning",
-            );
-            if store.insert_instance_if_absent(&instance).await? {
-                instance
-            } else {
-                store.get_instance(&workflow_id).await?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "workflow `{workflow_id}` disappeared after replan fallback insert conflict"
-                    )
-                })?
-            }
-        }
+            ),
+            true,
+        ),
     };
-    store
-        .append_event(
-            &instance.id,
-            "ReplanCompleted",
-            "workflow_runtime_plan_issue",
-            json!({
-                "task_id": task_id.as_str(),
-                "issue_number": issue_number,
-                "repo": repo,
-            }),
-        )
-        .await?;
-    instance.state = "implementing".to_string();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let event_payload = json!({
+        "task_id": task_id.as_str(),
+        "issue_number": issue_number,
+        "repo": repo,
+    });
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "replan_completed",
+        "implementing",
+        "replan activity completed and implementation should resume",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        format!("replan-completed:{}:implement", task_id.as_str()),
+    ))
+    .with_evidence(WorkflowEvidence::new(
+        "replan_completed",
+        format!("task_id={}", task_id.as_str()),
+    ))
+    .high_confidence();
+    let mut final_instance = instance.clone();
+    final_instance.state = "implementing".to_string();
+    final_instance.version = final_instance.version.saturating_add(1);
+    final_instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         project_root,
         json!({
         "project_id": project_id,
@@ -244,7 +258,32 @@ async fn persist_replan_completed(
         "last_event": "ReplanCompleted",
         }),
     );
-    store.upsert_instance(&instance).await
+    let record = store
+        .apply_decision_transition(
+            WorkflowDecisionTransition {
+                expected_state: &instance.state,
+                create_if_missing: new_instance.then_some(&instance),
+                event_type: "ReplanCompleted",
+                source: "workflow_runtime_plan_issue",
+                payload: event_payload,
+                decision: &decision,
+                final_instance: &final_instance,
+                command_status: WorkflowCommandStatus::Pending,
+            },
+            "workflow-policy",
+        )
+        .await?;
+    if let Some(record) = record {
+        if !record.accepted {
+            anyhow::bail!(
+                "replan completion transition rejected: {}",
+                record
+                    .rejection_reason
+                    .unwrap_or_else(|| "unknown rejection".to_string())
+            );
+        }
+    }
+    Ok(())
 }
 
 fn fallback_action(ctx: &PlanIssueRuntimeContext<'_>) -> PlanIssueRuntimeAction {

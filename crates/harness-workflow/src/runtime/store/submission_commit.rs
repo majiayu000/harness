@@ -1,11 +1,14 @@
 use super::{
     command_store, insert_decision_record_tx, insert_event_tx_with_id,
-    insert_instance_if_absent_tx, select_instance_for_update_tx, upsert_instance_tx,
-    WorkflowRuntimeStore,
+    insert_instance_if_absent_tx, select_instance_for_update_tx,
+    transition_validation::{validate_transition_with_context, TransitionValidation},
+    upsert_instance_tx, WorkflowRuntimeStore,
 };
 use crate::runtime::{
-    WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowInstance,
+    ValidationContext, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowInstance,
 };
+use chrono::Utc;
 use serde_json::Value;
 
 pub struct WorkflowSubmissionDecisionTransition<'a> {
@@ -131,11 +134,52 @@ impl WorkflowRuntimeStore {
                 }
             },
         };
+        let validate_as_new_transition = record.accepted
+            && transition
+                .existing_record
+                .is_none_or(|_| current.state == record.decision.observed_state);
+        if validate_as_new_transition {
+            let validation_context = if current.is_terminal() {
+                ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen()
+            } else {
+                ValidationContext::new("workflow-policy", Utc::now())
+            };
+            match validate_transition_with_context(&current, &record.decision, &validation_context)
+            {
+                TransitionValidation::Accepted => {}
+                TransitionValidation::Rejected(reason) if transition.existing_record.is_none() => {
+                    let rejected = WorkflowDecisionRecord::rejected(
+                        record.decision.clone(),
+                        record.event_id.clone(),
+                        reason,
+                    );
+                    insert_decision_record_tx(&mut tx, &rejected).await?;
+                    tx.commit().await?;
+                    return Ok(Some(WorkflowSubmissionDecisionCommit {
+                        record: rejected,
+                        command_ids: Vec::new(),
+                    }));
+                }
+                TransitionValidation::Rejected(reason) => {
+                    anyhow::bail!(
+                        "existing workflow submission decision failed validation: {reason}"
+                    );
+                }
+            }
+        }
         insert_decision_record_tx(&mut tx, &record).await?;
 
         let mut command_ids = Vec::new();
         if let Some(final_instance) = transition.final_instance {
             if record.accepted {
+                if final_instance.state != record.decision.next_state {
+                    anyhow::bail!(
+                        "workflow submission decision `{}` validates next state `{}` but final instance state is `{}`",
+                        record.decision.decision,
+                        record.decision.next_state,
+                        final_instance.state
+                    );
+                }
                 if let Some(prompt_payload) = transition.prompt_payload {
                     upsert_prompt_payload_tx(
                         &mut tx,
@@ -279,7 +323,7 @@ mod tests {
             &initial.id,
             "addressing_feedback",
             "address_feedback",
-            "awaiting_feedback",
+            "local_review_gate",
             "review feedback was addressed",
         )
         .with_command(WorkflowCommand::enqueue_activity(
@@ -291,7 +335,7 @@ mod tests {
             "submission-remote-feedback",
         ));
         let mut final_instance = initial.clone();
-        final_instance.state = "awaiting_feedback".to_string();
+        final_instance.state = "local_review_gate".to_string();
         final_instance.version = final_instance.version.saturating_add(1);
         final_instance.data = json!({
             "project_id": "/project-a",
@@ -366,6 +410,67 @@ mod tests {
                 .expect("pending command should remain present")
                 .status,
             WorkflowCommandStatus::Pending
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_commit_rejects_allowlist_violating_transition() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let initial = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "discovered",
+            WorkflowSubject::new("issue", "issue:1784"),
+        )
+        .with_id("submission-validator-bypass")
+        .with_data(json!({"project_id": "/project-a", "issue_number": 1784}));
+        let decision = WorkflowDecision::new(
+            &initial.id,
+            "discovered",
+            "skip_to_merge_gate",
+            "ready_to_merge",
+            "invalid direct promotion",
+        );
+        let mut final_instance = initial.clone();
+        final_instance.state = "ready_to_merge".to_string();
+        final_instance.version = 1;
+
+        let commit = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &initial.id,
+                expected_state: &initial.state,
+                expected_version: initial.version,
+                create_if_missing: Some(&initial),
+                event_id: None,
+                new_event_id: Some("submission-validator-bypass-event"),
+                event_type: "IssueSubmitted",
+                source: "workflow-runtime-test",
+                payload: json!({"task_id": "invalid-submission"}),
+                decision: &decision,
+                existing_record: None,
+                rejection_reason: None,
+                final_instance: Some(&final_instance),
+                command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
+            })
+            .await?
+            .expect("submission decision should be recorded");
+
+        assert!(!commit.record.accepted);
+        assert!(commit.command_ids.is_empty());
+        assert_eq!(
+            store
+                .get_instance(&initial.id)
+                .await?
+                .expect("workflow")
+                .state,
+            "discovered"
         );
         Ok(())
     }

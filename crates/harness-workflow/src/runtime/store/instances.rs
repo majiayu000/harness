@@ -1,7 +1,7 @@
 use super::{
     insert_instance_if_absent_tx,
     instance_helpers::{otel_trace_context_from_data, terminal_state_pairs},
-    select_instance_for_update_tx, to_jsonb_string, upsert_instance_tx, workflow_instance_from_row,
+    select_instance_for_update_tx, upsert_instance_tx, workflow_instance_from_row,
     RuntimeHistoryPruneSummary, WorkflowInstancePage, WorkflowRuntimeStore,
 };
 use crate::runtime::model::WorkflowInstance;
@@ -20,31 +20,19 @@ impl WorkflowRuntimeStore {
     }
 
     pub async fn upsert_instance(&self, instance: &WorkflowInstance) -> anyhow::Result<()> {
-        let data = to_jsonb_string(instance)?;
-        sqlx::query(
-            "INSERT INTO workflow_instances
-                (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
-             ON CONFLICT (id) DO UPDATE SET
-                definition_id = EXCLUDED.definition_id,
-                state = EXCLUDED.state,
-                subject_type = EXCLUDED.subject_type,
-                subject_key = EXCLUDED.subject_key,
-                parent_workflow_id = EXCLUDED.parent_workflow_id,
-                data = EXCLUDED.data,
-                version = EXCLUDED.version,
-                updated_at = CURRENT_TIMESTAMP",
-        )
-        .bind(&instance.id)
-        .bind(&instance.definition_id)
-        .bind(&instance.state)
-        .bind(&instance.subject.subject_type)
-        .bind(&instance.subject.subject_key)
-        .bind(&instance.parent_workflow_id)
-        .bind(&data)
-        .bind(instance.version as i64)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        if let Some(current) = select_instance_for_update_tx(&mut tx, &instance.id).await? {
+            ensure_public_upsert_preserves_instance_boundary(&current, instance)?;
+            if instance.version < current.version {
+                anyhow::bail!(
+                    "public workflow instance upsert cannot move version backwards from {} to {}",
+                    current.version,
+                    instance.version
+                );
+            }
+        }
+        upsert_instance_tx(&mut tx, instance).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -653,5 +641,85 @@ impl WorkflowRuntimeStore {
         rows.into_iter()
             .map(|(data,)| Ok(serde_json::from_str(&data)?))
             .collect()
+    }
+}
+
+fn ensure_public_upsert_preserves_instance_boundary(
+    current: &WorkflowInstance,
+    target: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    let mut changed_fields = Vec::new();
+    if current.definition_id != target.definition_id {
+        changed_fields.push("definition_id");
+    }
+    if current.definition_version != target.definition_version {
+        changed_fields.push("definition_version");
+    }
+    if current.state != target.state {
+        changed_fields.push("state");
+    }
+    if current.subject != target.subject {
+        changed_fields.push("subject");
+    }
+    if current.parent_workflow_id != target.parent_workflow_id {
+        changed_fields.push("parent_workflow_id");
+    }
+    if current.lease != target.lease {
+        changed_fields.push("lease");
+    }
+    if current.created_at != target.created_at {
+        changed_fields.push("created_at");
+    }
+    if !changed_fields.is_empty() {
+        anyhow::bail!(
+            "public workflow instance upsert cannot change protected fields: {}; use a decision commit API",
+            changed_fields.join(", ")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::model::WorkflowSubject;
+    use harness_core::db::resolve_database_url;
+
+    #[tokio::test]
+    async fn public_upsert_rejects_unrecorded_state_change() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let initial = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "discovered",
+            WorkflowSubject::new("issue", "issue:1784"),
+        )
+        .with_id("public-upsert-state-change");
+        store.upsert_instance(&initial).await?;
+
+        let mut target = initial.clone();
+        target.state = "implementing".to_string();
+        target.version = 1;
+        let error = match store.upsert_instance(&target).await {
+            Ok(()) => anyhow::bail!("state change was written without a matching decision"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("public workflow instance upsert cannot change protected fields: state"));
+        assert_eq!(
+            store
+                .get_instance(&initial.id)
+                .await?
+                .expect("workflow")
+                .state,
+            "discovered"
+        );
+        Ok(())
     }
 }

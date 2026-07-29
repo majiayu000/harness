@@ -2,12 +2,14 @@ use super::{
     command_store, insert_decision_record_tx, insert_event_tx_with_id,
     insert_instance_if_absent_tx,
     runtime_job_state::{cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation},
-    select_instance_for_update_tx, upsert_instance_tx, WorkflowRuntimeStore,
+    select_instance_for_update_tx,
+    transition_validation::{validate_transition_with_context, TransitionValidation},
+    upsert_instance_tx, WorkflowRuntimeStore,
 };
 use crate::runtime::remote_facts::upsert_remote_fact_snapshot_tx;
 use crate::runtime::{
-    RemoteFactSnapshot, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowInstance,
+    RemoteFactSnapshot, ValidationContext, WorkflowCommandStatus, WorkflowDecision,
+    WorkflowDecisionRecord, WorkflowInstance,
 };
 use harness_core::config::isolation::IsolationTrustClass;
 use serde_json::Value;
@@ -35,6 +37,9 @@ pub enum WorkflowCoverageRecoveryOutcome {
     },
     Conflict {
         current: Option<Box<WorkflowInstance>>,
+    },
+    Rejected {
+        reason: String,
     },
     StaleRemoteFact,
 }
@@ -92,6 +97,9 @@ impl WorkflowRuntimeStore {
         {
             anyhow::bail!("coverage recovery workflow identifiers do not match");
         }
+        if transition.final_instance.state != transition.decision.next_state {
+            anyhow::bail!("coverage recovery final instance state does not match decision");
+        }
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("workflow_submission:{}", transition.workflow_id))
@@ -115,9 +123,26 @@ impl WorkflowRuntimeStore {
         if transition.final_instance.version != expected_version {
             anyhow::bail!("coverage recovery final instance has an invalid version");
         }
-        if current.is_none()
-            && !insert_instance_if_absent_tx(&mut tx, transition.final_instance).await?
-        {
+
+        let validation_current = current.clone().unwrap_or_else(|| {
+            coverage_recovery_initial_instance(
+                transition.final_instance,
+                &transition.decision.observed_state,
+            )
+        });
+        let validation_context = ValidationContext::new("reconciliation", chrono::Utc::now());
+        match validate_transition_with_context(
+            &validation_current,
+            transition.decision,
+            &validation_context,
+        ) {
+            TransitionValidation::Accepted => {}
+            TransitionValidation::Rejected(reason) => {
+                tx.rollback().await?;
+                return Ok(WorkflowCoverageRecoveryOutcome::Rejected { reason });
+            }
+        }
+        if current.is_none() && !insert_instance_if_absent_tx(&mut tx, &validation_current).await? {
             anyhow::bail!("coverage recovery lost its advisory-locked absent insert");
         }
 
@@ -197,7 +222,11 @@ impl WorkflowRuntimeStore {
                     transition.workflow_id,
                     Some(&record.id),
                     command,
-                    WorkflowCommandStatus::Pending,
+                    if command.requires_runtime_job() {
+                        WorkflowCommandStatus::Pending
+                    } else {
+                        WorkflowCommandStatus::HandledInline
+                    },
                 )
                 .await?,
             );
@@ -206,6 +235,16 @@ impl WorkflowRuntimeStore {
         tx.commit().await?;
         Ok(WorkflowCoverageRecoveryOutcome::Committed { command_ids })
     }
+}
+
+fn coverage_recovery_initial_instance(
+    final_instance: &WorkflowInstance,
+    observed_state: &str,
+) -> WorkflowInstance {
+    let mut initial = final_instance.clone();
+    initial.state = observed_state.to_string();
+    initial.version = 0;
+    initial
 }
 
 #[cfg(test)]
@@ -247,13 +286,18 @@ mod tests {
             );
             let decision = WorkflowDecision::new(
                 "coverage-race",
-                "missing",
-                "recover",
+                "discovered",
+                "recover_github_pr_coverage",
                 "quality_gate_pending",
                 "recover",
             )
-            .with_command(WorkflowCommand::enqueue_activity(
+            .with_evidence(crate::runtime::WorkflowEvidence::new(
+                "server_pr_snapshot",
+                "GitHub reported an authoritative closing pull request.",
+            ))
+            .with_command(WorkflowCommand::start_child_workflow(
                 "quality_gate",
+                "pr:1709",
                 "quality-gate:1709",
             ));
             async move {
@@ -317,7 +361,9 @@ mod tests {
         newer.state = "implementing".to_string();
         newer.version = 1;
         newer.data = json!({"newer": true});
-        store.upsert_instance(&newer).await?;
+        let mut tx = store.pool.begin().await?;
+        upsert_instance_tx(&mut tx, &newer).await?;
+        tx.commit().await?;
 
         let mut stale_final = initial.clone();
         stale_final.state = "pr_open".to_string();
@@ -370,6 +416,80 @@ mod tests {
         );
         assert!(store
             .get_remote_fact_snapshot("github", "owner/repo", "pull_request", 1709)
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coverage_recovery_rejects_allowlist_violating_transition() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+        let initial = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "discovered",
+            WorkflowSubject::new("issue", "issue:1784"),
+        )
+        .with_id("coverage-validator-bypass");
+        store.upsert_instance(&initial).await?;
+        let mut final_instance = initial.clone();
+        final_instance.state = "merging".to_string();
+        final_instance.version = 1;
+        let fact = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            1784,
+            "open",
+            json!({"head": "abc"}),
+            Utc::now(),
+        );
+        let decision = WorkflowDecision::new(
+            &initial.id,
+            "discovered",
+            "recover_github_pr_coverage",
+            "merging",
+            "invalid direct coverage transition",
+        )
+        .with_evidence(crate::runtime::WorkflowEvidence::new(
+            "server_pr_snapshot",
+            "GitHub reported an authoritative closing pull request.",
+        ));
+
+        let outcome = store
+            .commit_coverage_recovery_transition(WorkflowCoverageRecoveryTransition {
+                workflow_id: &initial.id,
+                expected: WorkflowCoverageRecoveryExpected::Present {
+                    state: "discovered",
+                    version: 0,
+                },
+                final_instance: &final_instance,
+                selected_remote_fact: &fact,
+                event_type: "ClosingPrCoverageRecovered",
+                source: "test",
+                payload: json!({}),
+                decision: &decision,
+            })
+            .await?;
+
+        assert!(matches!(
+            outcome,
+            WorkflowCoverageRecoveryOutcome::Rejected { .. }
+        ));
+        assert_eq!(
+            store
+                .get_instance(&initial.id)
+                .await?
+                .expect("workflow")
+                .state,
+            "discovered"
+        );
+        assert!(store
+            .get_remote_fact_snapshot("github", "owner/repo", "pull_request", 1784)
             .await?
             .is_none());
         Ok(())

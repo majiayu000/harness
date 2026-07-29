@@ -419,7 +419,7 @@ async fn transcript_retention_waits_for_every_dependent_workflow_to_finish() -> 
         .await?
         .expect("producer workflow");
     terminal_producer.state = "done".to_string();
-    store.upsert_instance(&terminal_producer).await?;
+    force_upsert_instance_for_test(&store, &terminal_producer).await?;
 
     let dependent = issue_instance("implementing").with_id("transcript-pin-dependent");
     store.upsert_instance(&dependent).await?;
@@ -469,7 +469,7 @@ async fn transcript_retention_waits_for_every_dependent_workflow_to_finish() -> 
 
     let mut terminal_dependent = dependent;
     terminal_dependent.state = "done".to_string();
-    store.upsert_instance(&terminal_dependent).await?;
+    force_upsert_instance_for_test(&store, &terminal_dependent).await?;
     let summary = store
         .prune_terminal_runtime_history(Utc::now() - Duration::days(30), 100)
         .await?;
@@ -505,7 +505,7 @@ async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyho
         .expect("producer completion should commit");
     let mut terminal_producer = producer.clone();
     terminal_producer.state = "done".to_string();
-    store.upsert_instance(&terminal_producer).await?;
+    force_upsert_instance_for_test(&store, &terminal_producer).await?;
 
     let dependent = issue_instance("failed")
         .with_id("missing-pin-dependent")
@@ -576,7 +576,7 @@ async fn lost_transcript_consumer_and_producer_remain_pinned_until_recovery() ->
         .expect("producer completion should commit");
     let mut terminal_producer = producer.clone();
     terminal_producer.state = "done".to_string();
-    store.upsert_instance(&terminal_producer).await?;
+    force_upsert_instance_for_test(&store, &terminal_producer).await?;
 
     let consumer = issue_instance("failed")
         .with_id("lost-family-consumer")

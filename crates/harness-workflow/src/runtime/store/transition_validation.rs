@@ -33,13 +33,19 @@ pub(super) fn validate_transition(
     actor: &str,
     now: DateTime<Utc>,
 ) -> TransitionValidation {
+    validate_transition_with_context(current, decision, &ValidationContext::new(actor, now))
+}
+
+pub(super) fn validate_transition_with_context(
+    current: &WorkflowInstance,
+    decision: &WorkflowDecision,
+    context: &ValidationContext,
+) -> TransitionValidation {
     match validator_for_instance(current) {
-        Ok(Some(validator)) => {
-            match validator.validate(current, decision, &ValidationContext::new(actor, now)) {
-                Ok(()) => TransitionValidation::Accepted,
-                Err(error) => TransitionValidation::Rejected(error.to_string()),
-            }
-        }
+        Ok(Some(validator)) => match validator.validate(current, decision, context) {
+            Ok(()) => TransitionValidation::Accepted,
+            Err(error) => TransitionValidation::Rejected(error.to_string()),
+        },
         Ok(None) => TransitionValidation::Rejected(format!(
             "unknown workflow definition `{}` for decision `{}`",
             current.definition_id, decision.decision

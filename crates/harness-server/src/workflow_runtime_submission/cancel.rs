@@ -129,17 +129,10 @@ async fn cancel_submission_instance(
                 true,
             )
         };
-    let event = store
-        .append_event(
-            &instance.id,
-            event_type,
-            "workflow_runtime_submission",
-            json!({
-                "task_id": correlation_id,
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": correlation_id,
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -158,14 +151,25 @@ async fn cancel_submission_instance(
             store,
             instance,
             decision,
-            event.id,
+            event_type,
+            "workflow_runtime_submission",
+            event_payload,
             None,
             declarative.validator,
             declarative.missing_pin,
         )
         .await?
     } else {
-        commit_runtime_decision(store, instance, decision, event.id, None).await?
+        commit_runtime_decision(
+            store,
+            instance,
+            decision,
+            event_type,
+            "workflow_runtime_submission",
+            event_payload,
+            None,
+        )
+        .await?
     };
     let commands = store.commands_for(&cancelled.id).await?;
     for command in commands {

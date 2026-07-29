@@ -388,19 +388,45 @@ pub(crate) async fn request_pr_feedback_sweep_for_pr(
     store: &WorkflowRuntimeStore,
     ctx: PrFeedbackSweepRuntimeContext<'_>,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
-    let project_id = ctx.project_root.to_string_lossy().into_owned();
-    let instance = pr_scoped_instance(
-        pr_workflow_id(&project_id, ctx.repo, ctx.pr_number),
-        project_id,
-        ctx.repo.map(ToOwned::to_owned),
-        ctx.task_id,
+    let PrRuntimeTarget {
+        instance,
+        new_instance,
+        ..
+    } = load_or_pr_runtime_target(
+        store,
+        ctx.project_root,
+        ctx.repo,
+        None,
         ctx.pr_number,
+        ctx.task_id,
         ctx.pr_url,
         "pr_open",
-    );
-    upsert_github_issue_pr_definition(store).await?;
-    store.upsert_instance(&instance).await?;
-    request_local_review(store, &instance.id).await
+    )
+    .await?;
+
+    match instance.state.as_str() {
+        "pr_open" | "awaiting_feedback" => {}
+        "local_review_gate" => {
+            return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+                workflow_id: instance.id.clone(),
+                task_id: runtime_task_id_from_instance(&instance),
+            });
+        }
+        _ => {
+            return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
+                workflow_id: instance.id,
+                state: instance.state,
+            });
+        }
+    }
+
+    if has_active_local_review_command(store, &instance.id).await? {
+        return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+            workflow_id: instance.id.clone(),
+            task_id: runtime_task_id_from_instance(&instance),
+        });
+    }
+    persist_local_review_request(store, instance, new_instance).await
 }
 
 pub(crate) async fn request_pr_hygiene_repair(
@@ -457,7 +483,9 @@ pub(crate) async fn request_local_review(
     let Some(instance) = store.get_instance(workflow_id).await? else {
         anyhow::bail!("workflow runtime instance `{workflow_id}` was not found");
     };
-    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || instance.state != "pr_open" {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || !matches!(instance.state.as_str(), "pr_open" | "awaiting_feedback")
+    {
         return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
             workflow_id: instance.id,
             state: instance.state,
@@ -470,7 +498,7 @@ pub(crate) async fn request_local_review(
             task_id,
         });
     }
-    persist_local_review_request(store, instance).await
+    persist_local_review_request(store, instance, false).await
 }
 
 pub(crate) async fn request_pr_feedback_sweep(
@@ -534,6 +562,7 @@ async fn request_pr_feedback_sweep_with_failed_child_suppression_secs_and_activi
 async fn persist_local_review_request(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
+    new_instance: bool,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
     let workflow_id = instance.id.clone();
     let task_id = runtime_task_id_from_instance(&instance);
@@ -566,7 +595,7 @@ async fn persist_local_review_request(
     match commit_runtime_decision(
         store,
         instance,
-        false,
+        new_instance,
         output.decision,
         "LocalReviewRequested",
         "workflow_runtime_pr_feedback",

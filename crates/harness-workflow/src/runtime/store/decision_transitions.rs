@@ -10,10 +10,11 @@ use super::{
     transition_validation::{validate_transition, TransitionValidation},
     WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
 };
-#[cfg(test)]
-use crate::runtime::model::WorkflowDecision;
-use crate::runtime::model::{WorkflowDecisionRecord, WorkflowInstance};
+use crate::runtime::model::{
+    WorkflowDecision, WorkflowDecisionRecord, WorkflowEvent, WorkflowInstance,
+};
 use crate::runtime::status::WorkflowCommandStatus;
+use crate::runtime::{DecisionValidator, ValidationContext};
 
 fn ensure_protected_instance_fields_match(
     current: &WorkflowInstance,
@@ -59,6 +60,42 @@ impl WorkflowRuntimeStore {
         transition: WorkflowDecisionTransition<'_>,
         validation_actor: &str,
     ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+        self.apply_decision_transition_inner(transition, |current, decision, event| {
+            validate_transition(current, decision, validation_actor, event.created_at)
+        })
+        .await
+    }
+
+    /// Persist a transition with an explicitly supplied validator.
+    ///
+    /// This is for callers that already resolved a durable definition snapshot
+    /// that the global registry cannot currently resolve. The write still uses
+    /// the same event/decision/command/instance atomic transition funnel.
+    pub async fn apply_decision_transition_with_validator(
+        &self,
+        transition: WorkflowDecisionTransition<'_>,
+        validator: &DecisionValidator,
+        validation_context: ValidationContext,
+    ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+        self.apply_decision_transition_inner(transition, |current, decision, event| {
+            let mut context = validation_context.clone();
+            context.now = event.created_at;
+            match validator.validate(current, decision, &context) {
+                Ok(()) => TransitionValidation::Accepted,
+                Err(error) => TransitionValidation::Rejected(error.to_string()),
+            }
+        })
+        .await
+    }
+
+    async fn apply_decision_transition_inner<F>(
+        &self,
+        transition: WorkflowDecisionTransition<'_>,
+        validate: F,
+    ) -> anyhow::Result<Option<WorkflowDecisionRecord>>
+    where
+        F: FnOnce(&WorkflowInstance, &WorkflowDecision, &WorkflowEvent) -> TransitionValidation,
+    {
         let final_instance = transition.final_instance;
         let decision = transition.decision;
         if decision.workflow_id != final_instance.id {
@@ -108,19 +145,18 @@ impl WorkflowRuntimeStore {
         // GH-1784: this path used to write `final_instance` verbatim after only
         // an expected-state and non-terminality check, so the transition
         // allowlist and required commands/evidence were never consulted.
-        let record =
-            match validate_transition(&current, decision, validation_actor, event.created_at) {
-                TransitionValidation::Accepted => {
-                    WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id))
-                }
-                TransitionValidation::Rejected(reason) => {
-                    let record =
-                        WorkflowDecisionRecord::rejected(decision.clone(), Some(event.id), reason);
-                    insert_decision_record_tx(&mut tx, &record).await?;
-                    tx.commit().await?;
-                    return Ok(Some(record));
-                }
-            };
+        let record = match validate(&current, decision, &event) {
+            TransitionValidation::Accepted => {
+                WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id))
+            }
+            TransitionValidation::Rejected(reason) => {
+                let record =
+                    WorkflowDecisionRecord::rejected(decision.clone(), Some(event.id), reason);
+                insert_decision_record_tx(&mut tx, &record).await?;
+                tx.commit().await?;
+                return Ok(Some(record));
+            }
+        };
         insert_decision_record_tx(&mut tx, &record).await?;
 
         for command in &decision.commands {

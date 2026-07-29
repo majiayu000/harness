@@ -219,7 +219,7 @@ async fn terminal_workflow_wins_dispatch_race() -> anyhow::Result<()> {
     let (mut workflow, command_id, claim) =
         claimed_deferred_test_command(&store, "terminal", "dispatcher-terminal").await?;
     workflow.state = "cancelled".to_string();
-    store.upsert_instance(&workflow).await?;
+    force_upsert_instance_for_test(&store, &workflow).await?;
 
     assert_eq!(
         store
