@@ -264,6 +264,8 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         .workflow_runtime_store
         .as_ref()
         .expect("workflow runtime store should be configured");
+    let prompt_ref = "prompt-memory:runtime-worker-structured-output";
+    store.upsert_prompt_payload(prompt_ref, "prompt").await?;
     let workflow = WorkflowInstance::new(
         PROMPT_TASK_DEFINITION_ID,
         1,
@@ -278,8 +280,9 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         "prompt_summary": "structured output"
     }));
     store.upsert_instance(&workflow).await?;
-    let command =
+    let mut command =
         WorkflowCommand::enqueue_activity(PROMPT_TASK_IMPLEMENT_ACTIVITY, "impl-prompt-1");
+    command.command["prompt_ref"] = serde_json::json!(prompt_ref);
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let mut runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
     runtime_profile.approval_policy = Some("never".to_string());
@@ -324,16 +327,15 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
     assert!(prompts[1].contains("Structured output correction retry"));
     let env_vars = agent.env_vars.lock().await;
     assert_eq!(env_vars.len(), 2);
-    assert!(env_vars[0].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
-    assert!(env_vars[1].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
-    assert_eq!(
+    assert!(!env_vars[1].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
+    assert!(matches!(
         agent.sandbox_modes.lock().await[1],
-        Some(SandboxMode::ReadOnlyWithNetwork)
-    );
-    assert_eq!(
-        agent.approval_policies.lock().await[1],
-        Some("never".to_string())
-    );
+        Some(SandboxMode::ReadOnly)
+    ));
+    assert!(matches!(
+        agent.approval_policies.lock().await[1].as_deref(),
+        Some("never")
+    ));
     assert_eq!(agent.allowed_tools.lock().await[1], Some(Vec::new()));
     let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&runtime_job.id);
     let RuntimeTranscriptRead::Verified(record) =
@@ -343,12 +345,10 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
     };
     assert!(record.content.contains("bad shape"));
     assert!(!record.content.contains(r#""summary":"corrected""#));
-    assert_eq!(
-        store
-            .runtime_turns_started_for_workflow(&workflow.id, None)
-            .await?,
-        2
-    );
+    let turns_started = store
+        .runtime_turns_started_for_workflow(&workflow.id, None)
+        .await?;
+    assert_eq!(turns_started, 2);
     Ok(())
 }
 

@@ -100,9 +100,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         );
         let activity = activity_name(&job);
         let execution_phase = execution_phase_for_runtime_activity(&activity);
-        // Final launch settings are computed once before packet construction
-        // and shared by provenance and agent launch (GH-1732); nothing is
-        // recomputed after `RuntimePromptPrepared` is recorded.
         let resolved_settings = resolve_runtime_settings(
             &runtime_profile,
             job.runtime_kind,
@@ -194,6 +191,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     });
                 let mut env_vars = isolation_spawn_env_vars(&job);
                 let correction_only = attempt > 0 && correction_retry.is_some();
+                if correction_only { env_vars.clear() }
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
                         AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
@@ -213,7 +211,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         reasoning_effort: resolved_settings.reasoning_effort.clone(),
                         execution_phase,
                         sandbox_mode: Some(if correction_only {
-                            harness_core::config::agents::SandboxMode::ReadOnlyWithNetwork
+                            harness_core::config::agents::SandboxMode::ReadOnly
                         } else {
                             resolved_settings.sandbox_mode
                         }),
@@ -229,9 +227,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         stall_timeout_secs: Some(resolved_settings.stall_timeout_secs),
                         env_vars,
                         allowed_tools: correction_only.then(Vec::new),
-                        // Prefer the stable `codex exec` path for non-interactive turns.
-                        // Approval-gated turns use the app-server adapter because it owns
-                        // the live approval response channel.
                         force_code_agent: force_code_agent || correction_only,
                         runtime_usage: runtime_usage_context(
                             self.state,
@@ -303,8 +298,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         attempt + 1,
                     ));
                 }
-                // Agent output can never carry server-reserved evidence artifacts
-                // (GH-1766): strip before the server attaches its own.
                 let result =
                     harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(
                         result,
@@ -557,20 +550,12 @@ mod tests {
             "isolation": {
                 "tier": "container",
                 "trust_class": "non_collaborator",
-                "network_allowlist": ["github.com", " api.anthropic.com ", ""],
+                "network_allowlist": ["github.com", " api.com ", ""],
             }
         });
-
         let env_vars = isolation_spawn_env_vars(&job);
-
-        assert_eq!(
-            env_vars.get(AGENT_ISOLATION_TIER_ENV),
-            Some(&"container".to_string())
-        );
-        assert_eq!(
-            env_vars.get(AGENT_NETWORK_ALLOWLIST_ENV),
-            Some(&"github.com,api.anthropic.com".to_string())
-        );
+        assert_eq!(env_vars[AGENT_ISOLATION_TIER_ENV], "container");
+        assert_eq!(env_vars[AGENT_NETWORK_ALLOWLIST_ENV], "github.com,api.com");
     }
     fn workflow(definition_id: &str) -> WorkflowInstance {
         WorkflowInstance::new(
@@ -580,7 +565,6 @@ mod tests {
             WorkflowSubject::new("issue", "issue-1"),
         )
     }
-
     #[test]
     fn runtime_timeout_fallback_prefers_workflow_activity_profile() {
         let mut config = WorkflowConfig::default();
@@ -611,7 +595,6 @@ mod tests {
                     ..RuntimeDispatchProfileOverride::default()
                 },
             );
-
         assert_eq!(
             runtime_timeout_fallback(
                 &config,
@@ -628,7 +611,6 @@ mod tests {
         config.runtime_dispatch.timeout_secs = Some(900);
         let mut profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
         profile.timeout_secs = Some(42);
-
         let profile = runtime_profile_with_timeout_fallback(
             profile,
             &config,
@@ -642,7 +624,6 @@ mod tests {
     #[test]
     fn runtime_timeout_fallback_has_global_activity_defaults() {
         let config = WorkflowConfig::default();
-
         assert_eq!(
             runtime_timeout_fallback(
                 &config,
@@ -661,7 +642,6 @@ mod tests {
     fn runtime_worker_disabled_result_for_config_cancels_agent_work() {
         let mut config = WorkflowConfig::default();
         config.runtime_worker.enabled = false;
-
         let Some(result) = runtime_worker_disabled_result_for_config(
             "implement_issue",
             Path::new("/tmp/project"),
