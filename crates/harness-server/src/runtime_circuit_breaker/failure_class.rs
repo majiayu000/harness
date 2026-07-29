@@ -9,7 +9,6 @@ pub(crate) enum FailureClass {
     SandboxPermission,
     Unclassified,
 }
-
 impl FailureClass {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -23,12 +22,10 @@ impl FailureClass {
             Self::Unclassified => "unclassified",
         }
     }
-
     pub(crate) fn trips_runtime_profile_breaker(self) -> bool {
         !matches!(self, Self::StructuredOutputInvalid)
     }
 }
-
 pub(crate) fn classify_agent_failure(error: &str) -> FailureClass {
     let lower = error.to_ascii_lowercase();
     if lower.contains("zero_output_spawn_failure")

@@ -21,6 +21,7 @@ pub(super) struct RuntimeStreamAgent {
     pub(super) reasoning_efforts: Mutex<Vec<Option<String>>>,
     pub(super) sandbox_modes: Mutex<Vec<Option<SandboxMode>>>,
     pub(super) approval_policies: Mutex<Vec<Option<String>>>,
+    pub(super) allowed_tools: Mutex<Vec<Option<Vec<String>>>>,
 }
 
 pub(super) struct FailingStreamAgent {
@@ -42,6 +43,7 @@ impl RuntimeStreamAgent {
             reasoning_efforts: Mutex::new(Vec::new()),
             sandbox_modes: Mutex::new(Vec::new()),
             approval_policies: Mutex::new(Vec::new()),
+            allowed_tools: Mutex::new(Vec::new()),
         })
     }
 }
@@ -144,6 +146,10 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
+        self.allowed_tools
+            .lock()
+            .await
+            .push(req.allowed_tools.clone());
         self.env_vars.lock().await.push(req.env_vars.clone());
         self.prompts.lock().await.push(req.prompt);
         Ok(successful_agent_response())
@@ -164,6 +170,10 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
+        self.allowed_tools
+            .lock()
+            .await
+            .push(req.allowed_tools.clone());
         self.env_vars.lock().await.push(req.env_vars.clone());
         let mut outputs = self.outputs.lock().await;
         let content = match (!outputs.is_empty()).then(|| outputs.remove(0)) {

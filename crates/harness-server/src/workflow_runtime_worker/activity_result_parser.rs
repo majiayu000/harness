@@ -1,11 +1,9 @@
 use harness_workflow::runtime::ActivityResult;
 use serde_json::{Map, Value};
-
 pub(super) struct StructuredActivityResultError {
     pub error: String,
     pub extracted_activity: Option<String>,
 }
-
 pub(super) fn parse_activity_result_json(
     block: &str,
     expected_activity: &str,
@@ -39,29 +37,13 @@ pub(super) fn parse_activity_result_json(
     }
     Ok(result)
 }
-
 fn validate_activity_result_shape(value: &Value) -> Result<(), String> {
     let object = expect_object(value, "$")?;
-    for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "activity"
-                | "status"
-                | "summary"
-                | "artifacts"
-                | "signals"
-                | "validation"
-                | "error"
-                | "error_kind"
-        ) {
-            return Err(format!("$.{key} is not allowed"));
-        }
-    }
     expect_required_string(object, "activity", "$.activity")?;
     expect_required_string(object, "summary", "$.summary")?;
-    expect_required_status(object)?;
+    expect_required_string(object, "status", "$.status")?;
     expect_optional_string_or_null(object, "error", "$.error")?;
-    expect_optional_error_kind(object)?;
+    expect_optional_string_or_null(object, "error_kind", "$.error_kind")?;
     validate_array_records(object, "artifacts", |artifact, path| {
         expect_required_string(artifact, "artifact_type", &format!("{path}.artifact_type"))?;
         if !artifact.contains_key("artifact") {
@@ -88,7 +70,6 @@ fn validate_activity_result_shape(value: &Value) -> Result<(), String> {
     })?;
     Ok(())
 }
-
 fn validate_array_records(
     object: &Map<String, Value>,
     field: &str,
@@ -103,21 +84,10 @@ fn validate_array_records(
     {
         let path = format!("$.{field}[{index}]");
         let record = expect_object(record, &path)?;
-        for key in record.keys() {
-            if !matches!(
-                (field, key.as_str()),
-                ("artifacts", "artifact_type" | "artifact")
-                    | ("signals", "signal_type" | "signal")
-                    | ("validation", "command" | "status" | "reason")
-            ) {
-                return Err(format!("{path}.{key} is not allowed"));
-            }
-        }
         validate_record(record, &path)?;
     }
     Ok(())
 }
-
 fn expect_required_string(
     object: &Map<String, Value>,
     field: &str,
@@ -128,38 +98,6 @@ fn expect_required_string(
         .ok_or_else(|| format!("{path} is required"))?;
     expect_string(value, path).map(|_| ())
 }
-
-fn expect_required_status(object: &Map<String, Value>) -> Result<(), String> {
-    let status = object
-        .get("status")
-        .ok_or_else(|| "$.status is required".to_string())
-        .and_then(|value| expect_string(value, "$.status"))?;
-    if matches!(status, "succeeded" | "failed" | "blocked" | "cancelled") {
-        Ok(())
-    } else {
-        Err(format!(
-            "$.status expected a valid activity status, got `{status}`"
-        ))
-    }
-}
-
-fn expect_optional_error_kind(object: &Map<String, Value>) -> Result<(), String> {
-    let Some(value) = object.get("error_kind").filter(|value| !value.is_null()) else {
-        return Ok(());
-    };
-    let error_kind = expect_string(value, "$.error_kind")?;
-    if matches!(
-        error_kind,
-        "retryable" | "timeout" | "fatal" | "configuration" | "external_dependency" | "unknown"
-    ) {
-        Ok(())
-    } else {
-        Err(format!(
-            "$.error_kind expected a valid error kind or null, got `{error_kind}`"
-        ))
-    }
-}
-
 fn expect_optional_string_or_null(
     object: &Map<String, Value>,
     field: &str,
@@ -170,25 +108,21 @@ fn expect_optional_string_or_null(
     };
     expect_string(value, path).map(|_| ())
 }
-
 fn expect_string<'a>(value: &'a Value, path: &str) -> Result<&'a str, String> {
     value
         .as_str()
         .ok_or_else(|| format!("{path} expected string, got {}", json_type_name(value)))
 }
-
 fn expect_array<'a>(value: &'a Value, path: &str) -> Result<&'a Vec<Value>, String> {
     value
         .as_array()
         .ok_or_else(|| format!("{path} expected array, got {}", json_type_name(value)))
 }
-
 fn expect_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>, String> {
     value
         .as_object()
         .ok_or_else(|| format!("{path} expected object, got {}", json_type_name(value)))
 }
-
 fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",

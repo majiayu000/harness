@@ -145,7 +145,7 @@ impl CodexAgent {
         }
 
         args.push(OsString::from("-C"));
-        args.push(req.project_root.as_os_str().to_os_string());
+        args.push(OsString::from("."));
         args.push(OsString::from(req.prompt.clone()));
         args
     }

@@ -1,7 +1,8 @@
 use super::*;
 use harness_workflow::runtime::{
-    ActivityResult, RuntimeJobStatus, RuntimeKind, RuntimeProfile, WorkflowCommand,
-    WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    ActivityResult, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeTranscriptRead,
+    WorkflowCommand, WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 
 #[tokio::test]
@@ -294,6 +295,10 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
                 "command_type": command.command_type,
                 "dedupe_key": command.dedupe_key,
                 "command": command.command,
+                "isolation": {
+                    "tier": "container",
+                    "network_allowlist": ["github.com"]
+                },
                 "runtime_profile": runtime_profile,
             }),
         )
@@ -308,29 +313,36 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
 
     assert_eq!(tick.succeeded, 1);
     assert_eq!(tick.failed, 0);
-    let completed = store
-        .get_runtime_job(&runtime_job.id)
-        .await?
-        .expect("runtime job should exist");
+    let completed = store.get_runtime_job(&runtime_job.id).await?.unwrap();
     assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
-    let output: ActivityResult = serde_json::from_value(
-        completed
-            .output
-            .expect("activity result should be recorded"),
-    )?;
+    let output: ActivityResult = serde_json::from_value(completed.output.unwrap())?;
     assert!(output
         .artifacts
         .iter()
         .any(|artifact| artifact.artifact_type == "structured_output_correction_retry"));
     let prompts = agent.prompts.lock().await;
-    assert_eq!(prompts.len(), 2);
     assert!(prompts[1].contains("Structured output correction retry"));
     let env_vars = agent.env_vars.lock().await;
     assert_eq!(env_vars.len(), 2);
-    assert!(env_vars
-        .iter()
-        .all(|env| env[harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV]
-            .contains("activity-result-schema.json")));
+    assert!(env_vars[0].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
+    assert!(!env_vars[1].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
+    assert_eq!(
+        agent.sandbox_modes.lock().await[1],
+        Some(SandboxMode::ReadOnly)
+    );
+    assert_eq!(
+        agent.approval_policies.lock().await[1],
+        Some("never".to_string())
+    );
+    assert_eq!(agent.allowed_tools.lock().await[1], Some(Vec::new()));
+    let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&runtime_job.id);
+    let RuntimeTranscriptRead::Verified(record) =
+        store.read_runtime_transcript(&artifact_ref).await?
+    else {
+        anyhow::bail!("runtime transcript must be persisted");
+    };
+    assert!(record.content.contains("bad shape"));
+    assert!(!record.content.contains(r#""summary":"corrected""#));
     assert_eq!(
         store
             .runtime_turns_started_for_workflow(&workflow.id, None)

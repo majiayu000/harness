@@ -69,6 +69,7 @@ pub(crate) struct TurnLifecycleOptions {
     pub timeout_secs: Option<u64>,
     pub stall_timeout_secs: Option<u64>,
     pub force_code_agent: bool,
+    pub allowed_tools: Option<Vec<String>>,
     pub env_vars: HashMap<String, String>,
     pub runtime_usage: Option<RuntimeUsageContext>,
 }
@@ -247,7 +248,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             execution_phase: options.execution_phase,
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
-            allowed_tools: None,
+            allowed_tools: options.allowed_tools.clone(),
             context: vec![],
             timeout_secs,
             env_vars: options.env_vars.clone(),
@@ -263,6 +264,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             execution_phase: options.execution_phase,
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
+            allowed_tools: options.allowed_tools.clone(),
             env_vars: options.env_vars.clone(),
             ..Default::default()
         };

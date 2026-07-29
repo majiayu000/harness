@@ -2,15 +2,12 @@ use super::super::activity_result::StructuredOutputCorrection;
 use harness_core::types::Item;
 use harness_workflow::runtime::{ActivityArtifact, RuntimeJob, RuntimeKind, WorkflowRuntimeStore};
 use serde_json::{json, Value};
-
 const CORRECTION_TRANSCRIPT_EXCERPT_LIMIT: usize = 4000;
 const CORRECTION_TRANSCRIPT_SEPARATOR: &str = "\n\n";
-
 pub(super) struct CodexOutputSchemaFile {
-    pub(super) path: std::path::PathBuf,
+    pub(super) argument_path: std::path::PathBuf,
     _directory: tempfile::TempDir,
 }
-
 pub(super) fn codex_output_schema_file(
     force_code_agent: bool,
     job: &RuntimeJob,
@@ -28,16 +25,15 @@ pub(super) fn codex_output_schema_file(
         return Ok(None);
     };
     let directory = tempfile::Builder::new()
-        .prefix(".harness-codex-output-schema-")
+        .prefix("harness-codex-output-schema-")
         .tempdir()?;
     let path = directory.path().join("activity-result-schema.json");
     std::fs::write(&path, serde_json::to_vec_pretty(schema)?)?;
     Ok(Some(CodexOutputSchemaFile {
-        path,
+        argument_path: path,
         _directory: directory,
     }))
 }
-
 pub(super) fn structured_output_correction_prompt(
     original_prompt: &str,
     correction: &StructuredOutputCorrection,
@@ -57,7 +53,6 @@ pub(super) fn structured_output_correction_prompt(
         previous_output_tail(items)
     )
 }
-
 pub(super) async fn reserve_structured_output_correction_turn(
     store: Option<&WorkflowRuntimeStore>,
     job: &RuntimeJob,
@@ -95,7 +90,6 @@ pub(super) async fn reserve_structured_output_correction_turn(
         .await?;
     Ok(true)
 }
-
 pub(super) fn structured_output_correction_artifact(
     correction: &StructuredOutputCorrection,
     attempts: u32,
@@ -105,17 +99,17 @@ pub(super) fn structured_output_correction_artifact(
         json!({"schema":"harness.runtime.structured_output_correction_retry.v1","attempts":attempts,"initial_outcome":correction.outcome,"initial_error":correction.error,"initial_extracted_activity":correction.extracted_activity}),
     )
 }
-
 fn previous_output_tail(items: &[Item]) -> String {
     let mut excerpts = Vec::new();
     let mut used = 0;
-    for content in items
-        .iter()
-        .rev()
-        .filter_map(correction_context_content)
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
-    {
+    for content in items.iter().rev().filter_map(|item| match item {
+        Item::AgentReasoning { content } => Some(content.trim()),
+        Item::Error { message, .. } => Some(message.trim()),
+        _ => None,
+    }) {
+        if content.is_empty() {
+            continue;
+        }
         let separator_len = if excerpts.is_empty() {
             0
         } else {
@@ -125,7 +119,14 @@ fn previous_output_tail(items: &[Item]) -> String {
             break;
         }
         let remaining = CORRECTION_TRANSCRIPT_EXCERPT_LIMIT - used - separator_len;
-        let excerpt = tail_chars(content, remaining);
+        let excerpt = content
+            .chars()
+            .rev()
+            .take(remaining)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
         used += separator_len + excerpt.chars().count();
         excerpts.push(excerpt);
         if used >= CORRECTION_TRANSCRIPT_EXCERPT_LIMIT {
@@ -135,36 +136,17 @@ fn previous_output_tail(items: &[Item]) -> String {
     excerpts.reverse();
     excerpts.join(CORRECTION_TRANSCRIPT_SEPARATOR)
 }
-
-fn correction_context_content(item: &Item) -> Option<&str> {
-    match item {
-        Item::AgentReasoning { content } => Some(content),
-        Item::Error { message, .. } => Some(message),
-        _ => None,
-    }
-}
-
-fn tail_chars(value: &str, limit: usize) -> String {
-    value
-        .chars()
-        .rev()
-        .take(limit)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn codex_output_schema_file_is_readable_until_guard_drops() -> anyhow::Result<()> {
         let job = RuntimeJob::pending("c", RuntimeKind::CodexJsonrpc, "p", json!({}));
+        let directory = tempfile::tempdir()?;
         let prompt_packet = json!({"activity_result_schema":{"json_schema":{"type":"object","required":["activity"]}}});
         let schema_file = codex_output_schema_file(true, &job, &prompt_packet)?.unwrap();
-        let path = schema_file.path.clone();
+        let path = schema_file.argument_path.clone();
+        assert!(!path.starts_with(directory.path()));
         let schema: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         assert_eq!(schema["type"], "object");
         drop(schema_file);
@@ -193,7 +175,6 @@ mod tests {
         assert!(excerpt.contains("LATEST_SENTINEL"));
         assert!(!excerpt.contains("OLD_SENTINEL"));
     }
-
     fn reasoning(content: impl Into<String>) -> Item {
         Item::AgentReasoning {
             content: content.into(),

@@ -298,8 +298,10 @@ pub(super) fn activity_result_schema(
         "json_schema": activity_result_json_schema(&activity),
         "activity_contract": activity_contract.to_prompt_value(),
         "result_type": "ActivityResult",
-        "required_fields": ["activity", "status", "summary"],
-        "optional_fields": ["artifacts", "signals", "validation", "error", "error_kind"],
+        "required_fields": ["activity", "status", "summary", "artifacts", "signals", "validation", "error", "error_kind"],
+        "optional_fields": [],
+        "nullable_fields": ["error", "error_kind", "validation[].reason"],
+        "empty_array_fields_when_absent": ["artifacts", "signals", "validation"],
         "allowed_statuses": ["succeeded", "failed", "blocked", "cancelled"],
         "allowed_error_kinds": ["retryable", "timeout", "fatal", "configuration", "external_dependency", "unknown"],
         "optional_artifacts": {
@@ -347,15 +349,18 @@ pub(super) fn activity_result_schema(
                 }
             ],
             "validation": [
-                {"command": "cargo test", "status": "passed"}
+                {"command": "cargo test", "status": "passed", "reason": null}
             ],
+            "error": null,
+            "error_kind": null,
             "_format_rules": [
                 "`artifacts` MUST be a JSON array of {artifact_type, artifact} objects. Never emit it as a map keyed by artifact name.",
                 "`signals` MUST be a JSON array of {signal_type, signal} objects. Never use `kind` or any other discriminator name.",
-                "`validation` MUST be a JSON array of {command, status} objects. Never emit it as a map.",
+                "`validation` MUST be a JSON array of {command, status, reason} objects. Use reason=null when there is no reason. Never emit it as a map.",
+                "`artifacts`, `signals`, and `validation` are required; use [] when empty. `error` and `error_kind` are required; use null when absent.",
                 "Inside a `workflow_decision` artifact, the next-step activity MUST be expressed as `commands: [{command_type, dedupe_key, command}]` (plural array). Never use a singular `command` field at the artifact level — that field is silently ignored, leaving the workflow stuck in the new state with no follow-up activity enqueued.",
                 "For `command_type: start_child_workflow`, the nested `command` object MUST include `definition_id` and `subject_key`; for GitHub issue workflows use `definition_id: github_issue_pr` and `subject_key: issue:<number>`.",
-                "Omit `artifacts`, `signals`, or `validation` entirely if there is nothing to report — empty arrays or missing fields are both fine."
+                "Do not omit required fields from the ActivityResult JSON."
             ]
         }
     });
@@ -393,7 +398,7 @@ pub(super) fn activity_result_schema(
 }
 
 fn activity_result_json_schema(activity: &str) -> Value {
-    let schema_json = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Harness ActivityResult","type":"object","additionalProperties":false,"required":["activity","status","summary"],"properties":{"activity":{"type":"string"},"status":{"type":"string","enum":["succeeded","failed","blocked","cancelled"]},"summary":{"type":"string","minLength":1},"artifacts":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["artifact_type","artifact"],"properties":{"artifact_type":{"type":"string","minLength":1},"artifact":true}}},"signals":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["signal_type","signal"],"properties":{"signal_type":{"type":"string","minLength":1},"signal":{"type":"object"}}}},"validation":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["command","status"],"properties":{"command":{"type":"string","minLength":1},"status":{"type":"string","minLength":1},"reason":{"type":["string","null"]}}}},"error":{"type":["string","null"]},"error_kind":{"type":["string","null"],"enum":["retryable","timeout","fatal","configuration","external_dependency","unknown",null]}}}"#;
+    let schema_json = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Harness ActivityResult","type":"object","additionalProperties":false,"required":["activity","status","summary","artifacts","signals","validation","error","error_kind"],"properties":{"activity":{"type":"string"},"status":{"type":"string","enum":["succeeded","failed","blocked","cancelled"]},"summary":{"type":"string","minLength":1},"artifacts":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["artifact_type","artifact"],"properties":{"artifact_type":{"type":"string","minLength":1},"artifact":true}}},"signals":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["signal_type","signal"],"properties":{"signal_type":{"type":"string","minLength":1},"signal":true}}},"validation":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["command","status","reason"],"properties":{"command":{"type":"string","minLength":1},"status":{"type":"string","minLength":1},"reason":{"type":["string","null"]}}}},"error":{"type":["string","null"]},"error_kind":{"type":["string","null"],"enum":["retryable","timeout","fatal","configuration","external_dependency","unknown",null]}}}"#;
     let mut schema: Value = match serde_json::from_str(schema_json) {
         Ok(schema) => schema,
         Err(error) => panic!("embedded ActivityResult JSON Schema must be valid: {error}"),

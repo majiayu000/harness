@@ -11,6 +11,7 @@ use crate::scoped_token::{
     CONTAINER_GH_TOKEN_ENV, CONTAINER_GITHUB_TOKEN_ENV, SCOPED_GITHUB_TOKEN_ENV,
 };
 
+mod output_schema;
 mod review_git;
 
 /// Env keys Claude Code uses to detect that it is running nested inside
@@ -115,6 +116,7 @@ impl AgentSpawnContract for ContainerSpawn {
                 harness_core::config::agents::SandboxMode::ReadOnly
                     | harness_core::config::agents::SandboxMode::ReadOnlyWithNetwork
             );
+        let (child_args, output_schema_mount) = output_schema::rewrite_for_container(input.args)?;
         let mut args = vec![OsString::from("run"), OsString::from("--rm")];
         if input.forward_stdin {
             args.push(OsString::from("--interactive"));
@@ -139,6 +141,10 @@ impl AgentSpawnContract for ContainerSpawn {
                     mount.destination.display()
                 )));
             }
+        }
+        if let Some(mount) = &output_schema_mount {
+            args.push(OsString::from("--mount"));
+            args.push(output_schema::mount_arg(mount));
         }
         args.push(OsString::from("--network"));
         args.push(OsString::from(container_network_mode(
@@ -191,7 +197,7 @@ impl AgentSpawnContract for ContainerSpawn {
         }
         args.push(OsString::from(image));
         args.push(container_program(input.program));
-        args.extend(input.args.iter().cloned());
+        args.extend(child_args);
 
         Ok(PreparedAgentSpawn {
             program: PathBuf::from("docker"),
@@ -443,7 +449,15 @@ mod container_spawn_tests {
             AGENT_CONTAINER_IMAGE_ENV.to_string(),
             "example/agent:sha256-test".to_string(),
         );
-        let args = vec![OsString::from("exec"), OsString::from("prompt")];
+        let schema_dir = tempfile::tempdir()?;
+        let schema_path = schema_dir.path().join("activity-result-schema.json");
+        std::fs::write(&schema_path, "{}")?;
+        let args = vec![
+            OsString::from("exec"),
+            OsString::from("--output-schema"),
+            schema_path.as_os_str().to_os_string(),
+            OsString::from("prompt"),
+        ];
         let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
 
         let spawn = ContainerSpawn.prepare(input(
@@ -465,14 +479,17 @@ mod container_spawn_tests {
         )));
         assert!(!args
             .iter()
-            .any(|arg| arg.starts_with("type=bind,") && arg.ends_with(",readonly")));
-        assert!(!args
-            .iter()
             .any(|arg| arg.contains("/Users/") && arg.contains("home")));
         assert!(args.contains(&"--network".to_string()));
         assert!(args.contains(&"none".to_string()));
         assert!(args.contains(&"example/agent:sha256-test".to_string()));
         assert!(args.contains(&"codex".to_string()));
+        assert!(args.contains(&format!(
+            "type=bind,src={},dst=/harness-output-schema,readonly",
+            std::fs::canonicalize(schema_dir.path())?.display()
+        )));
+        assert!(args.contains(&"/harness-output-schema/activity-result-schema.json".to_string()));
+        assert!(!args.contains(&schema_path.display().to_string()));
         Ok(())
     }
 

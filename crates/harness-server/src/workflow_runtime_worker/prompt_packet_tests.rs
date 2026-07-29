@@ -496,6 +496,35 @@ fn prompt_task_packet_describes_disjunctive_completion_evidence_contract() {
 }
 
 #[test]
+fn activity_result_json_schema_is_codex_strict_compatible() {
+    let schema = activity_result_json_schema("implement_prompt");
+    assert_eq!(
+        schema["required"],
+        json!([
+            "activity",
+            "status",
+            "summary",
+            "artifacts",
+            "signals",
+            "validation",
+            "error",
+            "error_kind"
+        ])
+    );
+    for (field, required) in [
+        ("artifacts", json!(["artifact_type", "artifact"])),
+        ("signals", json!(["signal_type", "signal"])),
+        ("validation", json!(["command", "status", "reason"])),
+    ] {
+        assert_eq!(schema["properties"][field]["items"]["required"], required);
+    }
+    assert_eq!(
+        schema["properties"]["signals"]["items"]["properties"]["signal"],
+        true
+    );
+}
+
+#[test]
 fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     let job = RuntimeJob::pending(
         "command-continue",

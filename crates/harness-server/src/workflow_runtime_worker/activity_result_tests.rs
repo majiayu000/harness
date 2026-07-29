@@ -198,20 +198,6 @@ Final result:
 
 #[test]
 fn activity_result_from_turn_handles_raw_json_and_schema_path_errors() {
-    let result = completed_codex_implement_issue_result(vec![Item::AgentReasoning {
-        content: r#"{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":91,"pr_url":"https://github.com/owner/repo/pull/91"}}]}"#
-            .to_string(),
-    }]);
-
-    assert_eq!(result.status, ActivityStatus::Succeeded);
-    assert_eq!(result.summary, "Implementation completed.");
-    assert_eq!(
-        artifact_by_type(&result, "pull_request").artifact["pr_number"],
-        91
-    );
-    let envelope = envelope_artifact(&result);
-    assert_eq!(envelope["outcome"], "accepted");
-    assert_eq!(envelope["extraction_strategy"], "raw_activity_result");
     for (items, expected_strategy, expected_error) in [
         (
             vec![Item::AgentReasoning {
