@@ -472,6 +472,50 @@ async fn workflow_runtime_cancel_endpoint_cancels_issue_workflow() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test]
+async fn workflow_runtime_mutations_share_store_unavailable_contract() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_read_only_route_test_state(dir.path()).await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/merge",
+            post(task_mutation_routes::merge_workflow_runtime),
+        )
+        .route(
+            "/api/workflows/runtime/cancel",
+            post(task_mutation_routes::cancel_workflow_runtime),
+        )
+        .with_state(state);
+
+    for route in [
+        "/api/workflows/runtime/merge",
+        "/api/workflows/runtime/cancel",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "workflow_id": "missing-store" }).to_string(),
+                    ))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await?;
+        assert_eq!(body["error"], "workflow runtime store unavailable");
+    }
+
+    Ok(())
+}
+
 #[rustfmt::skip]
 #[tokio::test]
 async fn workflow_runtime_recovery_endpoints_cover_contract() -> anyhow::Result<()> {

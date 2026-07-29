@@ -443,12 +443,9 @@ async fn create_task_with_prompt_requires_workflow_runtime_store() -> anyhow::Re
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let resp = response_json(response).await?;
-    assert_eq!(
-        resp["error"],
-        "workflow runtime store is required for submissions"
-    );
+    assert_eq!(resp["error"], "workflow runtime store unavailable");
     assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
 }
@@ -598,12 +595,9 @@ async fn create_task_with_issue_requires_workflow_runtime_store() -> anyhow::Res
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let resp = response_json(response).await?;
-    assert_eq!(
-        resp["error"],
-        "workflow runtime store is required for submissions"
-    );
+    assert_eq!(resp["error"], "workflow runtime store unavailable");
     assert_eq!(state.core.tasks.count(), before_count);
 
     Ok(())
