@@ -12,7 +12,6 @@
 //! is applied identically by construction.
 
 use crate::claude::ClaudeCodeAgent;
-use crate::claude_adapter::ClaudeAdapter;
 use crate::codex::CodexAgent;
 use crate::codex_adapter::CodexAdapter;
 use crate::provider_backpressure::ProviderBackpressureGate;
@@ -129,32 +128,14 @@ pub fn registry_from_config(
     let mut registry = AgentRegistry::new(&config.default_agent);
     registry.set_complexity_preferences(config.complexity_preferred_agents.clone());
 
-    // One gate instance shared by the agent and its adapter: backpressure is a
-    // per-provider limit, so two gates would allow twice the configured
-    // concurrency.
-    let claude_gate =
-        ProviderBackpressureGate::from_claude_config(&config.claude.provider_backpressure);
     registry.register(
         "claude",
         Arc::new(claude_agent_from_config_with_gate(
             config,
             sandbox_mode,
-            claude_gate.clone(),
+            ProviderBackpressureGate::from_claude_config(&config.claude.provider_backpressure),
         )),
     );
-    registry
-        .register_adapter_with_strategy(
-            "claude",
-            Arc::new(
-                ClaudeAdapter::new(
-                    config.claude.cli_path.clone(),
-                    config.claude.default_model.clone(),
-                )
-                .with_provider_backpressure_gate(claude_gate),
-            ),
-            AdapterExecutionStrategy::ControlOnly,
-        )
-        .map_err(|error| anyhow::anyhow!("failed to attach the claude adapter: {error}"))?;
 
     registry.register(
         "codex",
@@ -307,9 +288,9 @@ mod tests {
         names.sort_unstable();
         assert!(names.contains(&"claude"));
         assert!(names.contains(&"codex"));
-        assert_eq!(
-            registry.adapter_strategy("claude"),
-            Some(AdapterExecutionStrategy::ControlOnly)
+        assert!(
+            registry.get_adapter("claude").is_none(),
+            "GH-1786 removed the unreachable ClaudeAdapter; claude has no adapter"
         );
         assert_eq!(
             registry.adapter_strategy("codex"),

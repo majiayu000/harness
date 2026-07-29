@@ -169,7 +169,6 @@ impl CodeAgent for ClaudeCodeAgent {
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         // Check token expiry before spawning.
-        // See also: claude_adapter.rs — both files must stay in sync on this check.
         if let Some(ref token) = req.capability_token {
             if token.is_expired() {
                 return Err(harness_core::error::HarnessError::AgentExecution(format!(
@@ -183,7 +182,6 @@ impl CodeAgent for ClaudeCodeAgent {
         let base_args = self.base_args(&req);
 
         // Narrow sandbox write paths to token scope when present.
-        // See also: claude_adapter.rs — both files must stay in sync on this conversion.
         let sandbox_mode = self.effective_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
             SandboxSpec::new(sandbox_mode, &req.project_root)
