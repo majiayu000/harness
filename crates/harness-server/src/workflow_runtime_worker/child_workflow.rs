@@ -70,7 +70,9 @@ pub(super) async fn execute_start_child_workflow(
             "GitHub issue PR workflow",
         ))
         .await?;
-    let mut child = match store.get_instance(&child_id).await? {
+    let existing_child = store.get_instance(&child_id).await?;
+    let child_was_persisted = existing_child.is_some();
+    let mut child = match existing_child {
         Some(instance) => instance,
         None => WorkflowInstance::new(
             "github_issue_pr",
@@ -85,7 +87,16 @@ pub(super) async fn execute_start_child_workflow(
         child_start_event_recorded(store, &child.id, &job.command_id).await?;
     if child.parent_workflow_id.is_none() {
         if let Some(parent) = parent {
-            child.parent_workflow_id = Some(parent.id.clone());
+            if child_was_persisted {
+                child = store
+                    .attach_parent_workflow_if_missing(&child.id, &parent.id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("issue child workflow disappeared during parent attach")
+                    })?;
+            } else {
+                child.parent_workflow_id = Some(parent.id.clone());
+            }
         }
     }
     child.data = merge_child_issue_data(
