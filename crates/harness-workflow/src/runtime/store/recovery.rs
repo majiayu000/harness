@@ -4,7 +4,8 @@ use super::runtime_job_state::{
 };
 use super::{
     apply_inline_command_side_effect, command_store, insert_decision_record_tx, insert_event_tx,
-    select_instance_for_update_tx, upsert_instance_tx, WorkflowInstance, WorkflowRuntimeStore,
+    select_instance_for_update_tx, upsert_instance_tx, workflow_instance_from_persisted_json,
+    WorkflowInstance, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
@@ -246,7 +247,7 @@ fn recovery_command_status(command: &WorkflowCommand) -> WorkflowCommandStatus {
 #[rustfmt::skip]
 async fn select_instance_tx(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, workflow_id: &str) -> anyhow::Result<Option<WorkflowInstance>> {
     let row: Option<(String,)> = sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1").bind(workflow_id).fetch_optional(&mut **tx).await?;
-    row.map(|(data,)| serde_json::from_str(&data)).transpose().map_err(Into::into)
+    row.map(|(data,)| workflow_instance_from_persisted_json(&data)).transpose()
 }
 
 #[rustfmt::skip]

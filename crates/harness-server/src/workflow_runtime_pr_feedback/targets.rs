@@ -104,14 +104,17 @@ pub(super) fn issue_instance(
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id)
-    .with_data(crate::workflow_runtime_policy::merge_runtime_retry_policy(
-        Path::new(&project_id),
-        json!({
-            "project_id": project_id,
-            "repo": repo,
-            "issue_number": issue_number,
-        }),
-    ))
+    .with_classified_data(
+        crate::workflow_runtime_policy::merge_runtime_retry_policy(
+            Path::new(&project_id),
+            json!({
+                "project_id": project_id,
+                "repo": repo,
+                "issue_number": issue_number,
+            }),
+        ),
+        DataProvenance::Server,
+    )
 }
 
 pub(super) fn pr_scoped_instance(
@@ -140,7 +143,7 @@ pub(super) fn pr_scoped_instance(
         WorkflowSubject::new("pr", format!("pr:{pr_number}")),
     )
     .with_id(workflow_id)
-    .with_data(data)
+    .with_data_field_provenance(data, pr_runtime_field_provenance)
 }
 
 pub(super) fn pr_workflow_id(project_id: &str, repo: Option<&str>, pr_number: u64) -> String {

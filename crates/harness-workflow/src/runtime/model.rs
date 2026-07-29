@@ -109,7 +109,7 @@ impl WorkflowInstance {
             subject,
             parent_workflow_id: None,
             data: Value::Object(Default::default()),
-            data_provenance: None,
+            data_provenance: Some(Default::default()),
             version: 0,
             lease: None,
             created_at: now,

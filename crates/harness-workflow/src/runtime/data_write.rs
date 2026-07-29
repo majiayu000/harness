@@ -39,10 +39,10 @@ impl WorkflowDataWrite {
 
 impl WorkflowInstance {
     /// Preserve the historical builder API while making its legacy boundary
-    /// durable. Callers that know the source should prefer
-    /// `with_classified_data` or `apply_data_writes`.
+    /// explicit. This method does not create a migration boundary: only rows
+    /// loaded from durable storage can be grandfathered as legacy data.
+    /// Production callers must classify the value before persistence.
     pub fn with_data(mut self, data: Value) -> Self {
-        self.data_provenance = Some(WorkflowDataProvenance::migrated_from(&data));
         self.data = data;
         self
     }
@@ -54,13 +54,54 @@ impl WorkflowInstance {
 
     pub fn replace_classified_data(&mut self, data: Value, provenance: DataProvenance) {
         self.data = data;
-        self.data_provenance = Some(WorkflowDataProvenance::new().with_entry("", provenance));
+        let mut sidecar = WorkflowDataProvenance::new().with_entry("", provenance);
+        sidecar
+            .refresh_value_digests(&self.data)
+            .expect("serializing serde_json::Value cannot fail");
+        self.data_provenance = Some(sidecar);
+    }
+
+    pub fn replace_data_with_field_provenance(
+        &mut self,
+        data: Value,
+        mut provenance_for: impl FnMut(&str) -> DataProvenance,
+    ) -> anyhow::Result<()> {
+        let object = data
+            .as_object()
+            .context("workflow instance data must be a JSON object")?;
+        let mut provenance = WorkflowDataProvenance::new();
+        for field in object.keys() {
+            provenance.classify(
+                workflow_data_pointer("", field),
+                provenance_for(field.as_str()),
+            );
+        }
+        provenance.refresh_value_digests(&data)?;
+        provenance.validate_persisted_data(&data)?;
+        self.data = data;
+        self.data_provenance = Some(provenance);
+        Ok(())
+    }
+
+    pub fn with_data_field_provenance(
+        mut self,
+        data: Value,
+        provenance_for: impl FnMut(&str) -> DataProvenance,
+    ) -> Self {
+        self.replace_data_with_field_provenance(data, provenance_for)
+            .expect("workflow field provenance requires JSON object data");
+        self
     }
 
     pub fn apply_data_writes(
         &mut self,
         writes: impl IntoIterator<Item = WorkflowDataWrite>,
     ) -> anyhow::Result<()> {
+        let mut provenance = self
+            .data_provenance
+            .clone()
+            .context("workflow.data writes require a provenance sidecar")?;
+        provenance.validate_persisted_data(&self.data)?;
         let mut data = self.data.clone();
         if data.is_null() {
             data = Value::Object(Map::new());
@@ -68,17 +109,6 @@ impl WorkflowInstance {
         let object = data
             .as_object_mut()
             .context("workflow instance data must be a JSON object")?;
-        let mut provenance = self
-            .data_provenance
-            .clone()
-            .unwrap_or_else(|| WorkflowDataProvenance::migrated_from(&self.data));
-        if provenance.schema != super::data_provenance::WORKFLOW_DATA_PROVENANCE_SCHEMA {
-            anyhow::bail!(
-                "workflow.data provenance schema `{}` is not supported",
-                provenance.schema
-            );
-        }
-
         for write in writes {
             validate_field_name(&write.field)?;
             let pointer = workflow_data_pointer("", &write.field);
@@ -88,11 +118,14 @@ impl WorkflowInstance {
                 }
                 None => {
                     object.remove(&write.field);
+                    provenance.remove_classification(&pointer);
+                    continue;
                 }
             }
             provenance.classify(pointer, write.provenance);
         }
 
+        provenance.refresh_value_digests(&data)?;
         self.data = data;
         self.data_provenance = Some(provenance);
         Ok(())
@@ -140,7 +173,12 @@ mod tests {
 
     #[test]
     fn first_classified_write_migrates_legacy_fields_atomically() {
-        let mut workflow = instance().with_data(json!({"historical": "value"}));
+        let data = json!({"historical": "value"});
+        let mut workflow = instance().with_data(data.clone());
+        workflow.data_provenance = Some(
+            WorkflowDataProvenance::migrated_from_persisted_data(&data)
+                .expect("persisted migration"),
+        );
         workflow
             .set_data_field(
                 "continuation",
@@ -160,7 +198,8 @@ mod tests {
 
     #[test]
     fn rejected_batch_does_not_change_data_or_sidecar() {
-        let mut workflow = instance().with_data(json!("not-an-object"));
+        let mut workflow =
+            instance().with_classified_data(json!("not-an-object"), DataProvenance::Server);
         let before = workflow.clone();
         let error = workflow
             .set_data_field("field", json!(true), DataProvenance::Server)
@@ -168,5 +207,20 @@ mod tests {
 
         assert!(error.to_string().contains("must be a JSON object"));
         assert_eq!(workflow, before);
+    }
+
+    #[test]
+    fn raw_overwrite_of_classified_field_is_rejected() {
+        let mut workflow =
+            instance().with_classified_data(json!({"field": "before"}), DataProvenance::Server);
+        workflow.data["field"] = json!("after");
+
+        let error = workflow
+            .set_data_field("other", json!(true), DataProvenance::Server)
+            .expect_err("raw mutation must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("changed outside the classified write API"));
     }
 }

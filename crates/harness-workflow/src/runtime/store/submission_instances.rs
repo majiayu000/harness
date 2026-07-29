@@ -1,7 +1,7 @@
 use super::instance_helpers::terminal_task_status_rows;
 use super::{
-    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubmissionHourlyDone,
-    WorkflowSubmissionMetrics, WorkflowSubmissionProjectMetrics,
+    workflow_instance_from_persisted_json, WorkflowInstance, WorkflowRuntimeStore,
+    WorkflowSubmissionHourlyDone, WorkflowSubmissionMetrics, WorkflowSubmissionProjectMetrics,
 };
 use crate::runtime::declarative_pinning::DECLARATIVE_DEFINITION_METADATA_KIND;
 use chrono::{DateTime, Utc};
@@ -164,7 +164,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .collect()
     }
 

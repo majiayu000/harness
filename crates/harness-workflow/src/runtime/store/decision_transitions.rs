@@ -8,7 +8,8 @@ use super::{
     command_store, insert_decision_record_tx, insert_event_tx, load_or_insert_initial_instance_tx,
     to_jsonb_string,
     transition_validation::{validate_transition, TransitionValidation},
-    WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    validate_instance_for_persistence, WorkflowDecisionTransition,
+    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
 };
 #[cfg(test)]
 use crate::runtime::model::WorkflowDecision;
@@ -77,6 +78,7 @@ impl WorkflowRuntimeStore {
                 final_instance.state
             );
         }
+        validate_instance_for_persistence(final_instance)?;
         let mut tx = self.pool.begin().await?;
         let Some(current) = load_or_insert_initial_instance_tx(
             &mut tx,

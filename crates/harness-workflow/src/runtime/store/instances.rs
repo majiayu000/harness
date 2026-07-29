@@ -1,8 +1,10 @@
 use super::{
     insert_instance_if_absent_tx,
     instance_helpers::{otel_trace_context_from_data, terminal_state_pairs},
-    select_instance_for_update_tx, to_jsonb_string, upsert_instance_tx, workflow_instance_from_row,
-    RuntimeHistoryPruneSummary, WorkflowInstancePage, WorkflowRuntimeStore,
+    select_instance_for_update_tx, to_jsonb_string, upsert_instance_tx,
+    validate_instance_for_persistence, workflow_instance_from_persisted_json,
+    workflow_instance_from_row, RuntimeHistoryPruneSummary, WorkflowInstancePage,
+    WorkflowRuntimeStore,
 };
 use crate::runtime::model::WorkflowInstance;
 use crate::runtime::WorkflowOtelTraceContext;
@@ -20,6 +22,7 @@ impl WorkflowRuntimeStore {
     }
 
     pub async fn upsert_instance(&self, instance: &WorkflowInstance) -> anyhow::Result<()> {
+        validate_instance_for_persistence(instance)?;
         let data = to_jsonb_string(instance)?;
         sqlx::query(
             "INSERT INTO workflow_instances
@@ -125,9 +128,8 @@ impl WorkflowRuntimeStore {
                 .bind(workflow_id)
                 .fetch_optional(&self.pool)
                 .await?;
-        row.map(|(data,)| serde_json::from_str(&data))
+        row.map(|(data,)| workflow_instance_from_persisted_json(&data))
             .transpose()
-            .map_err(Into::into)
     }
 
     pub async fn get_instance_by_task_id(
@@ -162,9 +164,8 @@ impl WorkflowRuntimeStore {
         .bind(submission_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(data,)| serde_json::from_str(&data))
+        row.map(|(data,)| workflow_instance_from_persisted_json(&data))
             .transpose()
-            .map_err(Into::into)
     }
 
     pub async fn get_instance_by_pr(
@@ -195,9 +196,8 @@ impl WorkflowRuntimeStore {
         .bind(pr_number)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(data,)| serde_json::from_str(&data))
+        row.map(|(data,)| workflow_instance_from_persisted_json(&data))
             .transpose()
-            .map_err(Into::into)
     }
 
     pub async fn list_instances_by_state(
@@ -220,7 +220,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .collect()
     }
 
@@ -267,7 +267,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .collect()
     }
 
@@ -551,7 +551,7 @@ impl WorkflowRuntimeStore {
         .await?;
         let instances = rows
             .into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(WorkflowInstancePage {
             instances,
@@ -581,7 +581,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .collect()
     }
 
@@ -606,7 +606,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .collect()
     }
 
@@ -643,7 +643,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .collect()
     }
 }

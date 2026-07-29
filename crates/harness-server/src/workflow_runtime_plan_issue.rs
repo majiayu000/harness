@@ -1,8 +1,8 @@
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
-    build_plan_issue_decision, DecisionValidator, PlanIssueDecisionInput, PlanIssueWorkflowAction,
-    ValidationContext, WorkflowCommandStatus, WorkflowDecisionRecord, WorkflowDefinition,
-    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    build_plan_issue_decision, DataProvenance, DecisionValidator, PlanIssueDecisionInput,
+    PlanIssueWorkflowAction, ValidationContext, WorkflowCommandStatus, WorkflowDecisionRecord,
+    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
 };
 use serde_json::json;
 use std::path::Path;
@@ -95,7 +95,7 @@ async fn persist_plan_issue_decision(
             "implementing",
         ),
     };
-    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
         json!({
         "project_id": project_id,
@@ -105,6 +105,7 @@ async fn persist_plan_issue_decision(
         "plan_concern": ctx.plan_issue,
         }),
     );
+    replace_plan_issue_data(&mut instance, data)?;
     store.upsert_instance(&instance).await?;
     let event = store
         .append_event(
@@ -167,7 +168,7 @@ async fn persist_plan_issue_decision(
     }
     instance.state = output.decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
-    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
         json!({
         "project_id": ctx.project_root.to_string_lossy(),
@@ -178,6 +179,7 @@ async fn persist_plan_issue_decision(
         "last_decision": output.decision.decision,
         }),
     );
+    replace_plan_issue_data(&mut instance, data)?;
     store.upsert_instance(&instance).await?;
 
     Ok(match output.action {
@@ -234,7 +236,7 @@ async fn persist_replan_completed(
         .await?;
     instance.state = "implementing".to_string();
     instance.version = instance.version.saturating_add(1);
-    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+    let data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         project_root,
         json!({
         "project_id": project_id,
@@ -244,6 +246,7 @@ async fn persist_replan_completed(
         "last_event": "ReplanCompleted",
         }),
     );
+    replace_plan_issue_data(&mut instance, data)?;
     store.upsert_instance(&instance).await
 }
 
@@ -286,14 +289,27 @@ fn issue_instance(
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id)
-    .with_data(crate::workflow_runtime_policy::merge_runtime_retry_policy(
-        Path::new(&project_id),
-        json!({
-            "project_id": project_id,
-            "repo": repo,
-            "issue_number": issue_number,
-        }),
-    ))
+    .with_classified_data(
+        crate::workflow_runtime_policy::merge_runtime_retry_policy(
+            Path::new(&project_id),
+            json!({
+                "project_id": project_id,
+                "repo": repo,
+                "issue_number": issue_number,
+            }),
+        ),
+        DataProvenance::Server,
+    )
+}
+
+fn replace_plan_issue_data(
+    instance: &mut WorkflowInstance,
+    data: serde_json::Value,
+) -> anyhow::Result<()> {
+    instance.replace_data_with_field_provenance(data, |field| match field {
+        "plan_concern" => DataProvenance::Agent,
+        _ => DataProvenance::Server,
+    })
 }
 
 #[cfg(test)]

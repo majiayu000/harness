@@ -1,7 +1,8 @@
 use super::{
-    depends_on_strings, insert_author_trust_class, merge_last_decision, optional_string_field,
-    string_field, IssueSubmissionRuntimeContext, PromptSubmissionRuntimeContext,
-    WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
+    classify_submission_data, depends_on_strings, insert_author_trust_class, merge_last_decision,
+    optional_string_field, string_field, IssueSubmissionRuntimeContext,
+    PromptSubmissionRuntimeContext, WorkflowSubmissionRuntimeRecord,
+    EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
 use super::{
     prompt_memory::{cache_prompt_submission_prompt, remove_prompt_submission_prompt},
@@ -57,8 +58,15 @@ pub(super) async fn apply_decision(
             DecisionValidator::github_issue_pr().validate(&instance, &decision, &validation_context)
         {
             let reason = error.to_string();
-            let rejected_instance = new_instance
-                .then(|| rejected_submission_instance(instance.clone(), accepted_data, &reason));
+            let rejected_instance = if new_instance {
+                Some(rejected_submission_instance(
+                    instance.clone(),
+                    accepted_data,
+                    &reason,
+                )?)
+            } else {
+                None
+            };
             let outcome = store
                 .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
                     workflow_id: &instance.id,
@@ -98,7 +106,7 @@ pub(super) async fn apply_decision(
         committed_decision,
         accepted_data,
         preserves_applied_instance(&instance, existing_record.as_ref()),
-    );
+    )?;
     let outcome = store
         .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
             workflow_id: &instance.id,
@@ -169,8 +177,15 @@ pub(super) async fn apply_prompt_decision(
             DecisionValidator::prompt_task().validate(&instance, &decision, &validation_context)
         {
             let reason = error.to_string();
-            let rejected_instance = new_instance
-                .then(|| rejected_submission_instance(instance.clone(), accepted_data, &reason));
+            let rejected_instance = if new_instance {
+                Some(rejected_submission_instance(
+                    instance.clone(),
+                    accepted_data,
+                    &reason,
+                )?)
+            } else {
+                None
+            };
             let outcome = store
                 .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
                     workflow_id: &instance.id,
@@ -211,7 +226,7 @@ pub(super) async fn apply_prompt_decision(
         committed_decision,
         accepted_data,
         preserves_applied_instance(&instance, existing_record.as_ref()),
-    );
+    )?;
     let final_prompt_ref = optional_string_field(&final_instance.data, "prompt_ref");
     let prompt_payload_commits = final_prompt_ref.as_deref() == Some(prompt_ref.as_str());
     let previous_prompt_ref = optional_string_field(&instance.data, "prompt_ref");
@@ -335,21 +350,22 @@ fn accepted_submission_instance(
     decision: &WorkflowDecision,
     accepted_data: serde_json::Value,
     preserve_current: bool,
-) -> WorkflowInstance {
+) -> anyhow::Result<WorkflowInstance> {
     if preserve_current {
-        return instance;
+        return Ok(instance);
     }
     instance.state = decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(accepted_data, &decision.decision);
-    instance
+    let data = merge_last_decision(accepted_data, &decision.decision);
+    classify_submission_data(&mut instance, data)?;
+    Ok(instance)
 }
 
 fn rejected_submission_instance(
     mut instance: WorkflowInstance,
     mut rejected_data: serde_json::Value,
     reason: &str,
-) -> WorkflowInstance {
+) -> anyhow::Result<WorkflowInstance> {
     instance.state = "failed".to_string();
     instance.version = instance.version.saturating_add(1);
     if let Some(data) = rejected_data.as_object_mut() {
@@ -359,8 +375,9 @@ fn rejected_submission_instance(
             json!(chrono::Utc::now().to_rfc3339()),
         );
     }
-    instance.data = merge_last_decision(rejected_data, "submission_rejected");
-    instance
+    let data = merge_last_decision(rejected_data, "submission_rejected");
+    classify_submission_data(&mut instance, data)?;
+    Ok(instance)
 }
 
 fn preserves_applied_instance(

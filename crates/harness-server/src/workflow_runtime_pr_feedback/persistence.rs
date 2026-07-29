@@ -671,7 +671,8 @@ pub(super) async fn commit_runtime_decision(
     let mut final_instance = instance.clone();
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = merge_last_decision(accepted_data, &decision.decision);
+    let data = merge_last_decision(accepted_data, &decision.decision);
+    replace_pr_runtime_data(&mut final_instance, data)?;
     let create_if_missing = new_instance.then_some(&instance);
     let record = store
         .apply_decision_transition(

@@ -113,13 +113,21 @@ pub(super) async fn apply_loaded_runtime_workflow_transition(
 
     instance.state = decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
-    instance.data = merge_runtime_reconciliation_data(
-        instance.data,
+    let data = merge_runtime_reconciliation_data(
+        std::mem::take(&mut instance.data),
         decision_name,
         target_state,
         reason,
         candidate,
     );
+    instance.replace_data_with_field_provenance(data, |field| match field {
+        "external_issue_state"
+        | "external_pr_state"
+        | "pr_number"
+        | "pr_url"
+        | "reconciliation_reason" => harness_workflow::runtime::DataProvenance::External,
+        _ => harness_workflow::runtime::DataProvenance::Server,
+    })?;
     let record = runtime_store
         .apply_decision_transition(
             WorkflowDecisionTransition {

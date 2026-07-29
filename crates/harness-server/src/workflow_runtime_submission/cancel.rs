@@ -1,8 +1,9 @@
 use harness_core::config::workflow::{WorkflowActivityPolicy, WorkflowDefinitionPolicy};
 use harness_workflow::runtime::{
-    build_declarative_definition, resolve_declarative_definition, DecisionValidator,
-    DeclarativeDefinitionResolution, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
-    WorkflowDecision, WorkflowInstance, WorkflowRuntimeStore, PROMPT_TASK_DEFINITION_ID,
+    build_declarative_definition, resolve_declarative_definition, DataProvenance,
+    DecisionValidator, DeclarativeDefinitionResolution, WorkflowCommand, WorkflowCommandStatus,
+    WorkflowCommandType, WorkflowDecision, WorkflowInstance, WorkflowRuntimeStore,
+    PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -11,7 +12,7 @@ use std::fmt;
 use super::prompt_memory::remove_prompt_submission_prompt_durable;
 use super::{
     commit_runtime_decision, commit_runtime_decision_with_validator, optional_string_field,
-    runtime_issue_task_handle, set_data_bool, GITHUB_ISSUE_PR_DEFINITION_ID,
+    runtime_issue_task_handle, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 
 struct DeclarativeCancellation {
@@ -185,7 +186,7 @@ async fn cancel_submission_instance(
                 .await?;
         }
     }
-    cancelled.data = set_data_bool(cancelled.data, "cancelled", true);
+    cancelled.set_data_field("cancelled", json!(true), DataProvenance::Server)?;
     store.upsert_instance(&cancelled).await?;
     if remove_prompt {
         remove_prompt_submission_prompt_durable(

@@ -1,7 +1,9 @@
 use super::*;
 use crate::runtime::model::{WorkflowCommandType, WorkflowSubject};
+use crate::runtime::{DataProvenance, PromptContinuationPolicy};
 use harness_core::db::resolve_database_url;
 use serde_json::json;
+use std::collections::BTreeSet;
 
 fn pin_error_instance(id: &str) -> WorkflowInstance {
     WorkflowInstance::new(
@@ -34,6 +36,38 @@ fn pin_safety_decision(instance: &WorkflowInstance) -> WorkflowDecision {
         "pin:operator",
         json!({ "reason": "pinned definition is unavailable" }),
     ))
+}
+
+#[test]
+fn completion_continuation_is_persisted_as_agent_data() -> anyhow::Result<()> {
+    let policy = PromptContinuationPolicy {
+        max_attempts: 3,
+        attempt_delay_secs: 0,
+        active_states: BTreeSet::from(["In Progress".to_string()]),
+        no_progress_limit: 2,
+    };
+    let continuation = PromptContinuationState::initial(&policy);
+    let mut instance = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "continuation-agent"),
+    )
+    .with_classified_data(
+        json!({ "prompt_ref": "prompt-ref" }),
+        DataProvenance::Server,
+    );
+
+    persist_prompt_continuation(&mut instance, continuation)?;
+
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|sidecar| sidecar.provenance_for("/continuation")),
+        Some(DataProvenance::Agent)
+    );
+    Ok(())
 }
 
 #[tokio::test]

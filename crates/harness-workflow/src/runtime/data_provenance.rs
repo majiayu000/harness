@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const WORKFLOW_DATA_PROVENANCE_SCHEMA: &str = "harness.workflow.data_provenance.v1";
@@ -32,6 +33,14 @@ pub struct WorkflowDataProvenance {
     pub legacy_entries: BTreeSet<String>,
     #[serde(default)]
     pub entries: BTreeMap<String, DataProvenance>,
+    /// Hashes of the values covered by `entries` and `legacy_entries`.
+    ///
+    /// The durable store validates these before every instance write. This
+    /// makes an in-memory `workflow.data` mutation that bypasses the
+    /// provenance-bearing API fail closed even when it overwrites an already
+    /// classified pointer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub value_digests: BTreeMap<String, String>,
 }
 
 impl Default for WorkflowDataProvenance {
@@ -47,10 +56,11 @@ impl WorkflowDataProvenance {
             migrated_at: Some(Utc::now()),
             legacy_entries: BTreeSet::new(),
             entries: BTreeMap::new(),
+            value_digests: BTreeMap::new(),
         }
     }
 
-    pub fn migrated_from(data: &Value) -> Self {
+    pub(crate) fn migrated_from_persisted_data(data: &Value) -> anyhow::Result<Self> {
         let mut provenance = Self::new();
         match data {
             Value::Object(object) => {
@@ -63,7 +73,8 @@ impl WorkflowDataProvenance {
             }
             _ => {}
         }
-        provenance
+        provenance.refresh_value_digests(data)?;
+        Ok(provenance)
     }
 
     pub fn with_entry(mut self, pointer: impl Into<String>, provenance: DataProvenance) -> Self {
@@ -82,7 +93,23 @@ impl WorkflowDataProvenance {
             .retain(|entry, _| !entry.starts_with(&descendant_prefix));
         self.legacy_entries
             .retain(|entry| entry != &pointer && !entry.starts_with(&descendant_prefix));
+        self.value_digests
+            .retain(|entry, _| entry != &pointer && !entry.starts_with(&descendant_prefix));
         self.entries.insert(pointer.clone(), provenance);
+    }
+
+    pub(crate) fn remove_classification(&mut self, pointer: &str) {
+        let descendant_prefix = if pointer.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{pointer}/")
+        };
+        self.entries
+            .retain(|entry, _| entry != pointer && !entry.starts_with(&descendant_prefix));
+        self.legacy_entries
+            .retain(|entry| entry != pointer && !entry.starts_with(&descendant_prefix));
+        self.value_digests
+            .retain(|entry, _| entry != pointer && !entry.starts_with(&descendant_prefix));
     }
 
     pub fn provenance_for(&self, pointer: &str) -> Option<DataProvenance> {
@@ -105,6 +132,96 @@ impl WorkflowDataProvenance {
                 .iter()
                 .any(|entry| entry.starts_with(&prefix))
     }
+
+    pub(crate) fn refresh_value_digests(&mut self, data: &Value) -> anyhow::Result<()> {
+        self.value_digests.clear();
+        for pointer in self
+            .entries
+            .keys()
+            .chain(self.legacy_entries.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let value = data.pointer(&pointer).ok_or_else(|| {
+                anyhow::anyhow!("workflow.data provenance pointer `{pointer}` does not exist")
+            })?;
+            self.value_digests
+                .insert(pointer, workflow_data_digest(value)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_persisted_data(&self, data: &Value) -> anyhow::Result<()> {
+        if self.schema != WORKFLOW_DATA_PROVENANCE_SCHEMA {
+            anyhow::bail!(
+                "workflow.data provenance schema `{}` is not supported",
+                self.schema
+            );
+        }
+        for pointer in self.entries.keys().chain(self.legacy_entries.iter()) {
+            let value = data.pointer(pointer).ok_or_else(|| {
+                anyhow::anyhow!("workflow.data provenance pointer `{pointer}` does not exist")
+            })?;
+            let expected = self.value_digests.get(pointer).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workflow.data provenance pointer `{pointer}` has no durable value digest"
+                )
+            })?;
+            let actual = workflow_data_digest(value)?;
+            if actual != *expected {
+                anyhow::bail!(
+                    "workflow.data pointer `{pointer}` changed outside the classified write API"
+                );
+            }
+        }
+        validate_value_coverage("", data, self)
+    }
+}
+
+fn validate_value_coverage(
+    pointer: &str,
+    value: &Value,
+    provenance: &WorkflowDataProvenance,
+) -> anyhow::Result<()> {
+    let covered = provenance.provenance_for(pointer).is_some() || provenance.is_legacy(pointer);
+    if covered && !provenance.has_descendant_entry(pointer) {
+        return Ok(());
+    }
+    if pointer.is_empty() && value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(());
+    }
+    if covered || provenance.has_descendant_entry(pointer) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    validate_value_coverage(
+                        &workflow_data_pointer(pointer, key),
+                        child,
+                        provenance,
+                    )?;
+                }
+                return Ok(());
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    validate_value_coverage(
+                        &workflow_data_pointer(pointer, &index.to_string()),
+                        child,
+                        provenance,
+                    )?;
+                }
+                return Ok(());
+            }
+            _ if covered => return Ok(()),
+            _ => {}
+        }
+    }
+    anyhow::bail!("unclassified workflow.data field `{pointer}`")
+}
+
+fn workflow_data_digest(value: &Value) -> anyhow::Result<String> {
+    let encoded = serde_json::to_vec(value)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
 }
 
 fn default_schema() -> String {
@@ -157,10 +274,16 @@ mod tests {
 
     #[test]
     fn migration_boundary_survives_more_specific_classified_writes() {
-        let mut provenance = WorkflowDataProvenance::migrated_from(
+        let mut provenance = WorkflowDataProvenance::migrated_from_persisted_data(
             &serde_json::json!({"snapshot": {"body": "old"}}),
-        );
+        )
+        .expect("migration boundary");
         provenance.classify("/snapshot/head_oid", DataProvenance::Server);
+        provenance
+            .refresh_value_digests(&serde_json::json!({
+                "snapshot": {"body": "old", "head_oid": "abc"}
+            }))
+            .expect("digest refresh");
 
         assert!(provenance.is_legacy("/snapshot/body"));
         assert_eq!(

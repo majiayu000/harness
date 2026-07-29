@@ -232,7 +232,7 @@ impl super::store::WorkflowRuntimeStore {
         now: DateTime<Utc>,
         backoff: DispatchBackoffPolicy,
     ) -> anyhow::Result<DeferClaimedCommandOutcome> {
-        use super::{WorkflowCommandStatus, WorkflowInstance};
+        use super::WorkflowCommandStatus;
 
         let generation = i64::try_from(dispatch_claim_generation)
             .map_err(|_| anyhow::anyhow!("dispatch claim generation exceeds PostgreSQL BIGINT"))?;
@@ -252,7 +252,7 @@ impl super::store::WorkflowRuntimeStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let workflow = workflow_data
-            .map(|(data,)| serde_json::from_str::<WorkflowInstance>(&data))
+            .map(|(data,)| super::store::workflow_instance_from_persisted_json(&data))
             .transpose()?;
         let row: Option<ClaimedCommandRow> = sqlx::query_as(
             "SELECT workflow_id, status, dispatch_owner, dispatch_lease_expires_at,

@@ -94,9 +94,8 @@ pub(super) async fn select_instance_for_update_tx(
             .bind(workflow_id)
             .fetch_optional(&mut **tx)
             .await?;
-    row.map(|(data,)| serde_json::from_str(&data))
+    row.map(|(data,)| workflow_instance_from_persisted_json(&data))
         .transpose()
-        .map_err(Into::into)
 }
 
 pub(in crate::runtime) async fn insert_event_tx(
@@ -170,6 +169,7 @@ pub(super) async fn insert_instance_if_absent_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<bool> {
+    validate_instance_for_persistence(instance)?;
     let data = to_jsonb_string(instance)?;
     let result = sqlx::query(
         "INSERT INTO workflow_instances
@@ -194,6 +194,7 @@ pub(super) async fn upsert_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<()> {
+    validate_instance_for_persistence(instance)?;
     let data = to_jsonb_string(instance)?;
     sqlx::query(
         "INSERT INTO workflow_instances

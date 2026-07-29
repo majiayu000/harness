@@ -228,14 +228,23 @@ async fn recover_runtime_pr_binding_from_bind_pr_command(
     };
 
     if !workflow.data.is_object() {
-        workflow.data = serde_json::json!({});
+        workflow.replace_classified_data(
+            serde_json::json!({}),
+            harness_workflow::runtime::DataProvenance::Server,
+        );
     }
-    let data = workflow
-        .data
-        .as_object_mut()
-        .context("workflow runtime instance data is not an object")?;
-    data.insert("pr_number".to_string(), serde_json::json!(pr_number));
-    data.insert("pr_url".to_string(), serde_json::json!(pr_url));
+    workflow.apply_data_writes([
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "pr_number",
+            serde_json::json!(pr_number),
+            harness_workflow::runtime::DataProvenance::Agent,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "pr_url",
+            serde_json::json!(pr_url),
+            harness_workflow::runtime::DataProvenance::Agent,
+        ),
+    ])?;
     workflow.version = workflow.version.saturating_add(1);
     store.upsert_instance(&workflow).await?;
     tracing::info!(

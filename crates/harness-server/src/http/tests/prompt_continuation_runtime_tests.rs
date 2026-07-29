@@ -1,6 +1,6 @@
 use super::*;
 use harness_workflow::runtime::{
-    RuntimeKind, RuntimeProfile, WorkflowCommandType, WorkflowRuntimeStore,
+    DataProvenance, RuntimeKind, RuntimeProfile, WorkflowCommandType, WorkflowRuntimeStore,
     PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 use serde_json::{json, Value};
@@ -218,6 +218,39 @@ async fn prompt_continuation_runtime_reaches_second_agent_turn_with_attempt_cont
         .as_ref()
         .expect("workflow runtime store should be configured");
     let workflow_id = submit_continuation_prompt(&state, &project_root, "TEAM-123", 3).await?;
+    let submitted = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("new prompt submission should be committed");
+    let submitted_provenance = submitted
+        .data_provenance
+        .as_ref()
+        .expect("new prompt submission must persist provenance");
+    for field in submitted
+        .data
+        .as_object()
+        .expect("prompt submission data should be an object")
+        .keys()
+    {
+        assert!(
+            submitted_provenance
+                .provenance_for(&format!("/{field}"))
+                .is_some(),
+            "new submission field `{field}` must have explicit provenance"
+        );
+    }
+    assert_eq!(
+        submitted_provenance.provenance_for("/project_id"),
+        Some(DataProvenance::Server)
+    );
+    assert_eq!(
+        submitted_provenance.provenance_for("/external_id"),
+        Some(DataProvenance::External)
+    );
+    assert_eq!(
+        submitted_provenance.provenance_for("/continuation"),
+        Some(DataProvenance::External)
+    );
 
     dispatch_and_run_prompt_attempt(&state, &workflow_id).await?;
     let after_first = store
@@ -229,6 +262,14 @@ async fn prompt_continuation_runtime_reaches_second_agent_turn_with_attempt_cont
     assert_eq!(
         after_first.data["continuation"]["last_external_state"],
         "In Progress"
+    );
+    assert_eq!(
+        after_first
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/continuation")),
+        Some(DataProvenance::Agent),
+        "runtime completion must persist agent-authored continuation state as Agent"
     );
 
     dispatch_and_run_prompt_attempt(&state, &workflow_id).await?;

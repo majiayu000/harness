@@ -460,12 +460,19 @@ async fn apply_prompt_continuation_side_effect(
             continuation.attempt
         );
     }
+    persist_prompt_continuation(instance, continuation)?;
+    Ok(PromptContinuationSideEffect::Applied)
+}
+
+fn persist_prompt_continuation(
+    instance: &mut WorkflowInstance,
+    continuation: PromptContinuationState,
+) -> anyhow::Result<()> {
     instance.set_data_field(
         "continuation",
         serde_json::to_value(continuation)?,
-        crate::runtime::DataProvenance::External,
-    )?;
-    Ok(PromptContinuationSideEffect::Applied)
+        crate::runtime::DataProvenance::Agent,
+    )
 }
 
 async fn require_durable_continuation_replay(

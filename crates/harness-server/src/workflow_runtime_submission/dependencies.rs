@@ -1,10 +1,10 @@
 use super::TaskId;
 use harness_workflow::runtime::{
     activity_result_value_has_closed_issue_evidence, build_issue_submission_decision,
-    build_prompt_submission_decision, value_has_closed_issue_evidence,
+    build_prompt_submission_decision, value_has_closed_issue_evidence, DataProvenance,
     IssueSubmissionDecisionInput, PromptSubmissionDecisionInput, SubmissionMode, WorkflowCommand,
-    WorkflowCommandType, WorkflowDecision, WorkflowEvent, WorkflowInstance, WorkflowRuntimeStore,
-    RUNTIME_JOB_COMPLETED_EVENT,
+    WorkflowCommandType, WorkflowDataWrite, WorkflowDecision, WorkflowEvent, WorkflowInstance,
+    WorkflowRuntimeStore, RUNTIME_JOB_COMPLETED_EVENT,
 };
 use serde_json::json;
 
@@ -12,8 +12,7 @@ use super::prompt_memory::remove_prompt_submission_prompt_durable;
 use super::{
     commit_runtime_decision, depends_on_strings, issue_submission_fields,
     lookup_prompt_submission_prompt_durable, optional_string_field, prompt_submission_fields,
-    set_data_bool, set_data_string, task_ids_from_data, GITHUB_ISSUE_PR_DEFINITION_ID,
-    PROMPT_TASK_DEFINITION_ID,
+    task_ids_from_data, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,7 +306,7 @@ pub(crate) async fn release_ready_prompt_dependencies(
 
 async fn release_issue_after_dependencies(
     store: &WorkflowRuntimeStore,
-    instance: WorkflowInstance,
+    mut instance: WorkflowInstance,
     depends_on: &[TaskId],
 ) -> anyhow::Result<()> {
     let fields = issue_submission_fields(&instance)?;
@@ -344,14 +343,14 @@ async fn release_issue_after_dependencies(
             }),
         )
         .await?;
-    let data = set_data_bool(instance.data.clone(), "dependencies_blocked", false);
-    commit_runtime_decision(store, instance, output.decision, event.id, Some(data)).await?;
+    instance.set_data_field("dependencies_blocked", json!(false), DataProvenance::Server)?;
+    commit_runtime_decision(store, instance, output.decision, event.id, None).await?;
     Ok(())
 }
 
 async fn fail_issue_for_dependency(
     store: &WorkflowRuntimeStore,
-    instance: WorkflowInstance,
+    mut instance: WorkflowInstance,
     dependency_id: &TaskId,
     dependency_status: &str,
 ) -> anyhow::Result<()> {
@@ -387,22 +386,25 @@ async fn fail_issue_for_dependency(
         }),
     ))
     .high_confidence();
-    let data = set_data_string(
-        set_data_string(
-            instance.data.clone(),
+    instance.apply_data_writes([
+        WorkflowDataWrite::set(
             "dependency_failure_task_id",
-            dependency_id.as_str(),
+            json!(dependency_id.as_str()),
+            DataProvenance::Server,
         ),
-        "dependency_failure_status",
-        dependency_status,
-    );
-    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+        WorkflowDataWrite::set(
+            "dependency_failure_status",
+            json!(dependency_status),
+            DataProvenance::Server,
+        ),
+    ])?;
+    commit_runtime_decision(store, instance, decision, event.id, None).await?;
     Ok(())
 }
 
 async fn release_prompt_after_dependencies(
     store: &WorkflowRuntimeStore,
-    instance: WorkflowInstance,
+    mut instance: WorkflowInstance,
     depends_on: &[TaskId],
 ) -> anyhow::Result<PromptDependencyReleaseOutcome> {
     let fields = prompt_submission_fields(&instance)?;
@@ -436,14 +438,14 @@ async fn release_prompt_after_dependencies(
             }),
         )
         .await?;
-    let data = set_data_bool(instance.data.clone(), "dependencies_blocked", false);
-    commit_runtime_decision(store, instance, output.decision, event.id, Some(data)).await?;
+    instance.set_data_field("dependencies_blocked", json!(false), DataProvenance::Server)?;
+    commit_runtime_decision(store, instance, output.decision, event.id, None).await?;
     Ok(PromptDependencyReleaseOutcome::Released)
 }
 
 async fn fail_prompt_for_dependency(
     store: &WorkflowRuntimeStore,
-    instance: WorkflowInstance,
+    mut instance: WorkflowInstance,
     dependency_id: &TaskId,
     dependency_status: &str,
 ) -> anyhow::Result<()> {
@@ -480,23 +482,26 @@ async fn fail_prompt_for_dependency(
         }),
     ))
     .high_confidence();
-    let data = set_data_string(
-        set_data_string(
-            instance.data.clone(),
+    instance.apply_data_writes([
+        WorkflowDataWrite::set(
             "dependency_failure_task_id",
-            dependency_id.as_str(),
+            json!(dependency_id.as_str()),
+            DataProvenance::Server,
         ),
-        "dependency_failure_status",
-        dependency_status,
-    );
-    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+        WorkflowDataWrite::set(
+            "dependency_failure_status",
+            json!(dependency_status),
+            DataProvenance::Server,
+        ),
+    ])?;
+    commit_runtime_decision(store, instance, decision, event.id, None).await?;
     remove_prompt_submission_prompt_durable(store, prompt_ref.as_deref()).await?;
     Ok(())
 }
 
 async fn fail_prompt_for_missing_prompt(
     store: &WorkflowRuntimeStore,
-    instance: WorkflowInstance,
+    mut instance: WorkflowInstance,
     fields: &super::PromptSubmissionFields,
 ) -> anyhow::Result<()> {
     let event = store
@@ -527,11 +532,11 @@ async fn fail_prompt_for_missing_prompt(
         }),
     ))
     .high_confidence();
-    let data = set_data_string(
-        instance.data.clone(),
+    instance.set_data_field(
         "failure_reason",
-        "prompt unavailable",
-    );
-    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+        json!("prompt unavailable"),
+        DataProvenance::Server,
+    )?;
+    commit_runtime_decision(store, instance, decision, event.id, None).await?;
     Ok(())
 }
