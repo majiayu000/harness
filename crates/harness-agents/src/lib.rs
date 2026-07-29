@@ -9,6 +9,7 @@ pub mod codex_adapter;
 pub mod compress_model;
 pub mod provider_backpressure;
 pub mod registry;
+pub mod runtime_fingerprint;
 pub mod scoped_token;
 mod spawn_contract;
 mod spawn_supervisor;
