@@ -1,4 +1,4 @@
-use crate::claude_adapter::{
+use crate::claude_stream_json::{
     parse_stream_json_events, parse_stream_json_result_failure, parse_stream_json_usage,
 };
 use crate::streaming::send_stream_item;

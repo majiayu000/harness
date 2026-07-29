@@ -83,8 +83,8 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 
 - Claude CLI `-p` takes its prompt as the NEXT token: `claude -p <PROMPT> [other flags...]`
 - The prompt MUST immediately follow `-p`. Placing it at the end of the arg list causes "Input must be provided" errors
-- Both `claude.rs` (CodeAgent) and `claude_adapter.rs` (AgentAdapter) spawn Claude CLI — changes to CLI arg construction MUST be applied to BOTH files
-- After modifying either adapter's arg construction, verify with: `cargo test --package harness-agents` (86 tests)
+- `claude.rs` (CodeAgent) is the only Claude CLI spawn path — the `ClaudeAdapter` turn path was removed as unreachable (GH-1786); the shared stream-json line parsers live in `claude_stream_json.rs`
+- After modifying CLI arg construction, verify with: `cargo test --package harness-agents`
 
 ## Server Operation
 

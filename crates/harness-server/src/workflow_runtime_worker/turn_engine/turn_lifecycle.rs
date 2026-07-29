@@ -149,9 +149,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     };
 
     // Register as live adapter (RAII guard for cleanup on turn exit).
-    // Adapters may be control-only (Claude: interrupt/steer/approval side
-    // channel only) or turn-executing (Codex: App Server JSON-RPC owns the
-    // full turn). The strategy is selected at agent registration time.
+    // Adapters may be control-only (interrupt/steer/approval side channel
+    // only) or turn-executing (Codex: App Server JSON-RPC owns the full
+    // turn). The strategy is selected at agent registration time.
     let _adapter_guard = adapter_opt.as_ref().map(|adapter_arc| {
         server
             .thread_manager
