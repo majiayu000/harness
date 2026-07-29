@@ -287,7 +287,7 @@ impl CodexAdapter {
         let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
         let prepared_spawn = prepare_app_server_spawn(&self.cli_path, req)?;
         let spawn_project_root = req.project_root.clone();
-        let supervised = crate::spawn_supervisor::spawn_agent_with_capability(
+        let supervised = crate::spawn_supervisor::spawn_agent(
             crate::spawn_supervisor::AgentSpawnPlan {
                 prepared_spawn,
                 run_identity,
@@ -555,12 +555,15 @@ impl AgentAdapter for CodexAdapter {
             ));
         }
 
-        self.state.lock().await.stdout_lines = Some(lines);
         if receiver_closed {
+            drop(lines);
+            let mut state = self.state.lock().await;
+            state.reset_child().await;
             return Err(harness_core::error::HarnessError::AgentExecution(
                 "codex event receiver closed before turn/completed".into(),
             ));
         }
+        self.state.lock().await.stdout_lines = Some(lines);
         Ok(())
     }
 
@@ -628,3 +631,7 @@ impl AgentAdapter for CodexAdapter {
 #[cfg(test)]
 #[path = "codex_adapter_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codex_adapter_receiver_tests.rs"]
+mod receiver_tests;

@@ -44,33 +44,6 @@ pub(crate) struct SupervisedAgentProcess {
 
 pub(crate) async fn spawn_agent(
     plan: AgentSpawnPlan<'_>,
-) -> harness_core::error::Result<SupervisedAgentProcess> {
-    spawn_agent_inner(plan, None).await
-}
-
-pub(crate) async fn spawn_agent_with_capability(
-    plan: AgentSpawnPlan<'_>,
-    capability_token: Option<&CapabilityToken>,
-) -> harness_core::error::Result<SupervisedAgentProcess> {
-    spawn_agent_inner(plan, capability_token).await
-}
-
-pub(crate) fn validate_capability_token(
-    capability_token: Option<&CapabilityToken>,
-) -> harness_core::error::Result<()> {
-    if let Some(token) = capability_token {
-        if token.is_expired() {
-            return Err(HarnessError::AgentExecution(format!(
-                "capability token for subtask {} has expired",
-                token.subtask_index
-            )));
-        }
-    }
-    Ok(())
-}
-
-async fn spawn_agent_inner(
-    plan: AgentSpawnPlan<'_>,
     capability_token: Option<&CapabilityToken>,
 ) -> harness_core::error::Result<SupervisedAgentProcess> {
     let AgentSpawnPlan {
@@ -97,31 +70,25 @@ async fn spawn_agent_inner(
         cmd.env_remove(key);
     }
 
-    let mut capability_error = None;
-    let child_result = spawn_with_etxtbsy_retry(|| {
-        if let Err(error) = validate_capability_token(capability_token) {
-            capability_error = Some(error);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "capability token expired before agent spawn",
-            ));
+    let child = match spawn_with_etxtbsy_retry(
+        || validate_capability_token(capability_token),
+        || cmd.spawn(),
+    )
+    .await
+    {
+        Ok(child) => child,
+        Err(SpawnAttemptError::Authorization(error)) => return Err(error),
+        Err(SpawnAttemptError::Io(error)) => {
+            let mapped = (map_spawn_error)(&error, &prepared_spawn);
+            tracing::error!(
+                agent = native_kind,
+                process = process_label,
+                error_kind = ?error.kind(),
+                "{mapped}"
+            );
+            return Err(mapped);
         }
-        cmd.spawn()
-    })
-    .await;
-    if let Some(error) = capability_error {
-        return Err(error);
-    }
-    let child = child_result.map_err(|error| {
-        let mapped = (map_spawn_error)(&error, &prepared_spawn);
-        tracing::error!(
-            agent = native_kind,
-            process = process_label,
-            error_kind = ?error.kind(),
-            "{mapped}"
-        );
-        mapped
-    })?;
+    };
 
     if let Some(pid) = child.id() {
         crate::write_provisional_agent_run_binding(
@@ -138,14 +105,47 @@ async fn spawn_agent_inner(
     })
 }
 
-async fn spawn_with_etxtbsy_retry<F, T>(mut spawn: F) -> std::io::Result<T>
+pub(crate) fn validate_capability_token(
+    capability_token: Option<&CapabilityToken>,
+) -> harness_core::error::Result<()> {
+    if let Some(token) = capability_token {
+        if token.is_expired() {
+            return Err(HarnessError::AgentExecution(format!(
+                "capability token for subtask {} has expired",
+                token.subtask_index
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum SpawnAttemptError {
+    Authorization(HarnessError),
+    Io(std::io::Error),
+}
+
+fn authorized_spawn<A, F, T>(authorize: &mut A, spawn: &mut F) -> Result<T, SpawnAttemptError>
 where
+    A: FnMut() -> harness_core::error::Result<()>,
     F: FnMut() -> std::io::Result<T>,
 {
-    match spawn() {
-        Err(error) if is_etxtbsy(&error) => {
+    authorize().map_err(SpawnAttemptError::Authorization)?;
+    spawn().map_err(SpawnAttemptError::Io)
+}
+
+async fn spawn_with_etxtbsy_retry<A, F, T>(
+    mut authorize: A,
+    mut spawn: F,
+) -> Result<T, SpawnAttemptError>
+where
+    A: FnMut() -> harness_core::error::Result<()>,
+    F: FnMut() -> std::io::Result<T>,
+{
+    match authorized_spawn(&mut authorize, &mut spawn) {
+        Err(SpawnAttemptError::Io(error)) if is_etxtbsy(&error) => {
             tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
-            spawn()
+            authorized_spawn(&mut authorize, &mut spawn)
         }
         result => result,
     }
@@ -164,14 +164,17 @@ mod tests {
     async fn spawn_retry_retries_once_for_etxtbsy() {
         let attempts = AtomicUsize::new(0);
 
-        let result = spawn_with_etxtbsy_retry(|| {
-            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-            if attempt == 0 {
-                Err(std::io::Error::from_raw_os_error(26))
-            } else {
-                Ok("spawned")
-            }
-        })
+        let result = spawn_with_etxtbsy_retry(
+            || Ok(()),
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(std::io::Error::from_raw_os_error(26))
+                } else {
+                    Ok("spawned")
+                }
+            },
+        )
         .await
         .expect("ETXTBSY retry should use the second spawn result");
 
@@ -183,14 +186,50 @@ mod tests {
     async fn spawn_retry_does_not_retry_other_errors() {
         let attempts = AtomicUsize::new(0);
 
-        let error = spawn_with_etxtbsy_retry(|| -> std::io::Result<()> {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            Err(std::io::Error::from_raw_os_error(2))
-        })
+        let error = spawn_with_etxtbsy_retry(
+            || Ok(()),
+            || -> std::io::Result<()> {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::from_raw_os_error(2))
+            },
+        )
         .await
         .expect_err("non-ETXTBSY errors must not be retried");
 
-        assert_eq!(error.raw_os_error(), Some(2));
+        assert!(matches!(
+            error,
+            SpawnAttemptError::Io(error) if error.raw_os_error() == Some(2)
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn token_expiring_during_etxtbsy_delay_blocks_second_spawn() {
+        let attempts = AtomicUsize::new(0);
+        let authorization_checks = AtomicUsize::new(0);
+        let mut token = CapabilityToken::new(9, Vec::new(), std::time::Duration::from_secs(60));
+
+        let error = spawn_with_etxtbsy_retry(
+            || {
+                if authorization_checks.fetch_add(1, Ordering::SeqCst) == 1 {
+                    token.expires_at = std::time::SystemTime::UNIX_EPOCH;
+                }
+                validate_capability_token(Some(&token))
+            },
+            || -> std::io::Result<()> {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::from_raw_os_error(26))
+            },
+        )
+        .await
+        .expect_err("expiry during retry delay must block the second spawn attempt");
+
+        assert!(matches!(
+            error,
+            SpawnAttemptError::Authorization(HarnessError::AgentExecution(message))
+                if message.contains("subtask 9 has expired")
+        ));
+        assert_eq!(authorization_checks.load(Ordering::SeqCst), 2);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

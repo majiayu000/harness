@@ -218,8 +218,8 @@ impl CodeAgent for ClaudeCodeAgent {
             .await?;
 
         let spawn_project_root = req.project_root.clone();
-        let supervised =
-            crate::spawn_supervisor::spawn_agent(crate::spawn_supervisor::AgentSpawnPlan {
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
                 prepared_spawn,
                 run_identity,
                 native_kind: "claude-code",
@@ -234,8 +234,10 @@ impl CodeAgent for ClaudeCodeAgent {
                     );
                     harness_core::error::HarnessError::AgentExecution(message)
                 }),
-            })
-            .await?;
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
         let mut child = supervised.child;
 
         let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
@@ -346,8 +348,8 @@ impl CodeAgent for ClaudeCodeAgent {
         );
 
         let spawn_project_root = req.project_root.clone();
-        let supervised =
-            crate::spawn_supervisor::spawn_agent(crate::spawn_supervisor::AgentSpawnPlan {
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
                 prepared_spawn,
                 run_identity,
                 native_kind: "claude-code",
@@ -362,8 +364,10 @@ impl CodeAgent for ClaudeCodeAgent {
                     );
                     harness_core::error::HarnessError::AgentExecution(message)
                 }),
-            })
-            .await?;
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
         let mut child = supervised.child;
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));

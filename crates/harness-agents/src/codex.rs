@@ -265,6 +265,7 @@ impl CodexAgent {
                     harness_core::error::HarnessError::AgentExecution(message)
                 }),
             },
+            None,
         )
         .await?;
         let mut child = supervised.child;
@@ -444,8 +445,8 @@ impl CodeAgent for CodexAgent {
             "execute",
         );
         let spawn_error_req = req.clone();
-        let supervised =
-            crate::spawn_supervisor::spawn_agent(crate::spawn_supervisor::AgentSpawnPlan {
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
                 prepared_spawn,
                 run_identity,
                 native_kind: "codex",
@@ -461,8 +462,10 @@ impl CodeAgent for CodexAgent {
                         "execute",
                     ))
                 }),
-            })
-            .await?;
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
         let mut child = supervised.child;
         let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
         let output = child.wait_with_output(&limits).await.map_err(|err| {
@@ -552,8 +555,8 @@ impl CodeAgent for CodexAgent {
             "execute_stream",
         );
         let spawn_error_req = req.clone();
-        let supervised =
-            crate::spawn_supervisor::spawn_agent(crate::spawn_supervisor::AgentSpawnPlan {
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
                 prepared_spawn,
                 run_identity,
                 native_kind: "codex",
@@ -569,8 +572,10 @@ impl CodeAgent for CodexAgent {
                         "execute_stream",
                     ))
                 }),
-            })
-            .await?;
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
         let mut child = supervised.child;
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
