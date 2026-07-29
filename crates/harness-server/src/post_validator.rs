@@ -112,16 +112,14 @@ impl PostExecutionValidator {
     ) -> Result<(), String> {
         let (repo, pr_number) = parse_github_pr_url(pr_url)
             .ok_or_else(|| format!("Could not parse GitHub PR URL: {pr_url}"))?;
-        let client = reqwest::Client::new();
-        let mut request = client
-            .get(format!(
-                "https://api.github.com/repos/{repo}/pulls/{pr_number}"
-            ))
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::USER_AGENT, "harness-server");
-        if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
-            request = request.bearer_auth(token);
-        }
+        let client = crate::github_client::github_request();
+        let request = crate::github_client::apply_github_headers(
+            client.get(format!(
+                "{}/repos/{repo}/pulls/{pr_number}",
+                crate::github_client::github_api_base_url()
+            )),
+            github_token,
+        );
 
         let result = timeout(Duration::from_secs(timeout_secs), request.send()).await;
         match result {
