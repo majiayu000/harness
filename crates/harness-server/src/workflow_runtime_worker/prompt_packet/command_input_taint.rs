@@ -97,10 +97,24 @@ fn field_origin(field: &str, value: &Value) -> Option<CommandInputOrigin> {
         field if field.starts_with("external_") || field.starts_with("user_") => {
             Some(CommandInputOrigin::External)
         }
-        field if value.is_string() && !trusted_string_field(field) => {
+        field if traversable_container_field(field) => None,
+        field if contains_string(value) && !trusted_string_field(field) => {
             Some(CommandInputOrigin::External)
         }
         _ => None,
+    }
+}
+
+fn traversable_container_field(field: &str) -> bool {
+    matches!(field, "command" | "continuation")
+}
+
+fn contains_string(value: &Value) -> bool {
+    match value {
+        Value::String(_) => true,
+        Value::Array(items) => items.iter().any(contains_string),
+        Value::Object(object) => object.values().any(contains_string),
+        _ => false,
     }
 }
 
@@ -287,5 +301,36 @@ mod tests {
             .pointer("/external_fields/command/continuation/last_external_state")
             .and_then(Value::as_str)
             .is_some_and(|value| value.starts_with("<external_data>\n")));
+    }
+
+    #[test]
+    fn duplicate_eval_verify_commands_are_removed_from_trusted_input() {
+        let control_text = "cargo test -p harness-server prompt_packet";
+        let rendered = render_command_input(&json!({
+            "activity": "implement_issue",
+            "command": {
+                "eval": {
+                    "verify_commands": [control_text],
+                    "timeout_secs": 900
+                },
+                "validation_commands": [control_text]
+            }
+        }))
+        .expect("partition");
+
+        let trusted = rendered.trusted.to_string();
+        assert!(
+            !trusted.contains(control_text),
+            "duplicated control text must not remain trusted"
+        );
+        let untrusted = rendered.untrusted.expect("untrusted eval commands");
+        assert!(untrusted
+            .pointer("/external_fields/command/eval")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains(control_text)));
+        assert!(untrusted
+            .pointer("/external_fields/command/validation_commands")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains(control_text)));
     }
 }
