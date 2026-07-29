@@ -45,13 +45,9 @@ use runtime_timeout::runtime_profile_with_timeout_fallback;
 #[path = "executor/structured_output.rs"]
 mod structured_output;
 use structured_output::{
-    codex_output_schema_file, structured_output_correction_artifact,
-    structured_output_correction_prompt,
+    codex_output_schema_file, reserve_structured_output_correction_turn,
+    structured_output_correction_artifact, structured_output_correction_prompt,
 };
-
-const RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT: &str =
-    "runtime_workspace_finalization_warning";
-
 pub(super) struct ServerRuntimeJobExecutor<'a> {
     pub(super) state: &'a Arc<AppState>,
 }
@@ -161,8 +157,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 job.runtime_kind,
                 resolved_settings.approval_policy.explicit_value(),
             );
-            let output_schema_file =
-                codex_output_schema_file(force_code_agent, &job, &prompt_packet)?;
+            let output_schema_file = codex_output_schema_file(force_code_agent, &job, &prompt_packet)?;
             let mut prompt =
                 build_runtime_job_prompt(&prompt_packet, prompt_task_request.prompt_text());
             let mut correction_retry = None;
@@ -204,7 +199,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
                         AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
-                        schema_file.path().display().to_string(),
+                        schema_file.path.display().to_string(),
                     );
                 }
                 run_turn_lifecycle_with_options(
@@ -265,16 +260,34 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 );
                 if attempt == 0 {
                     if let Some(correction) = structured_output_correction(&result) {
-                        tracing::warn!(
-                            runtime_job_id = %job.id,
-                            activity = %activity,
-                            outcome = %correction.outcome,
-                            "retrying runtime turn once to correct structured ActivityResult output"
-                        );
-                        prompt =
-                            structured_output_correction_prompt(&prompt, &correction, &turn.items);
-                        correction_retry = Some(correction);
-                        continue;
+                        let retry_budget_available = reserve_structured_output_correction_turn(
+                            self.state.core.workflow_runtime_store.as_deref(),
+                            &job,
+                            resolved_settings.max_turns,
+                            attempt + 2,
+                        )
+                        .await?;
+                        if retry_budget_available {
+                            tracing::warn!(
+                                runtime_job_id = %job.id,
+                                activity = %activity,
+                                outcome = %correction.outcome,
+                                "retrying runtime turn once to correct structured ActivityResult output"
+                            );
+                            prompt = structured_output_correction_prompt(
+                                &prompt,
+                                &correction,
+                                &turn.items,
+                            );
+                            correction_retry = Some(correction);
+                            continue;
+                        } else {
+                            tracing::warn!(
+                                runtime_job_id = %job.id,
+                                activity = %activity,
+                                "skipping structured output correction retry because runtime max_turns is exhausted"
+                            );
+                        }
                     }
                 }
                 if let Some(correction) = correction_retry.as_ref() {
@@ -518,7 +531,7 @@ fn activity_result_failed_by_runtime_workspace_finalization(
 
 fn runtime_workspace_finalization_warning_artifact(error: &anyhow::Error) -> ActivityArtifact {
     ActivityArtifact::new(
-        RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT,
+        "runtime_workspace_finalization_warning",
         json!({ "error": error.to_string() }),
     )
 }
@@ -691,17 +704,11 @@ mod tests {
             ActivityResult::succeeded("implement_issue", "Created a pull request.").with_artifact(
                 ActivityArtifact::new("pull_request", json!({ "pr_number": 42 })),
             );
-
-        let result = match combine_activity_result_with_runtime_workspace_finalization(
+        let result = combine_activity_result_with_runtime_workspace_finalization(
             Ok(result),
             Err(anyhow::anyhow!("after_run hook failed")),
-        ) {
-            Ok(result) => result,
-            Err(error) => panic!(
-                "finalization failure should be returned as a failed activity result: {error}"
-            ),
-        };
-
+        )
+        .expect("finalization failure should be returned as a failed activity result");
         assert_eq!(result.activity, "implement_issue");
         assert_eq!(
             result.status,
@@ -723,12 +730,10 @@ mod tests {
             .artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "pull_request"));
-        let Some(warning) = result.artifacts.iter().find(|artifact| {
-            artifact.artifact_type == RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT
-        }) else {
-            panic!("finalization failure should preserve a diagnostic warning artifact");
-        };
-        assert_eq!(warning.artifact["error"], "after_run hook failed");
+        assert!(result.artifacts.iter().any(|artifact| {
+            artifact.artifact_type == "runtime_workspace_finalization_warning"
+                && artifact.artifact["error"] == "after_run hook failed"
+        }));
     }
 
     #[test]
@@ -743,15 +748,11 @@ mod tests {
             "activity_result_parse_error",
             json!({ "field": "status" }),
         ));
-
-        let result = match combine_activity_result_with_runtime_workspace_finalization(
+        let result = combine_activity_result_with_runtime_workspace_finalization(
             Ok(result),
             Err(anyhow::anyhow!("after_run hook failed")),
-        ) {
-            Ok(result) => result,
-            Err(error) => panic!("failed activity result should be preserved: {error}"),
-        };
-
+        )
+        .expect("failed activity result should be preserved");
         assert_eq!(result.activity, "address_pr_feedback");
         assert_eq!(
             result.status,
@@ -767,12 +768,10 @@ mod tests {
             .artifacts
             .iter()
             .any(|artifact| artifact.artifact_type == "activity_result_parse_error"));
-        let Some(warning) = result.artifacts.iter().find(|artifact| {
-            artifact.artifact_type == RUNTIME_WORKSPACE_FINALIZATION_WARNING_ARTIFACT
-        }) else {
-            panic!("finalization failure should preserve a diagnostic warning artifact");
-        };
-        assert_eq!(warning.artifact["error"], "after_run hook failed");
+        assert!(result.artifacts.iter().any(|artifact| {
+            artifact.artifact_type == "runtime_workspace_finalization_warning"
+                && artifact.artifact["error"] == "after_run hook failed"
+        }));
     }
 
     #[test]

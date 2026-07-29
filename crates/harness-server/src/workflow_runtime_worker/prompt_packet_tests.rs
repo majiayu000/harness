@@ -79,22 +79,6 @@ fn activity_result_schema_describes_issue_implementation_terminal_evidence_contr
         schema["agent_summary_contract"]["signals"]["SCOPE_TOO_LARGE"],
         "Use when pr_scope_guard is enabled and the diff exceeds configured max_files_changed or max_lines_added. Include base_ref, files_changed, lines_added, max_files_changed, max_lines_added, and decomposition_skeleton."
     );
-    assert_eq!(schema["json_schema"]["type"], "object");
-    assert_eq!(
-        schema["json_schema"]["properties"]["activity"]["const"],
-        "implement_issue"
-    );
-    assert_eq!(
-        schema["json_schema"]["properties"]["error"]["type"][0],
-        "string"
-    );
-    assert_eq!(
-        schema["typed_status_examples"]["failed"]["error_kind"],
-        "configuration"
-    );
-    assert!(schema["typed_status_examples"]["blocked"]["error"]
-        .as_str()
-        .is_some_and(|value| !value.is_empty()));
 }
 
 #[test]

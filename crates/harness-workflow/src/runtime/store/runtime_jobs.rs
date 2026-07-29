@@ -28,6 +28,82 @@ impl WorkflowRuntimeStore {
         Ok(event)
     }
 
+    pub async fn reserve_runtime_turn_started_for_workflow(
+        &self,
+        workflow_id: &str,
+        runtime_job_id: &str,
+        max_turns: u32,
+        payload: Value,
+    ) -> anyhow::Result<Option<RuntimeEvent>> {
+        let mut tx = self.pool.begin().await?;
+        let command_workflow_id: Option<(String,)> = sqlx::query_as(
+            "SELECT command.workflow_id
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             WHERE job.id = $1",
+        )
+        .bind(runtime_job_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((command_workflow_id,)) = command_workflow_id else {
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        };
+        if command_workflow_id != workflow_id {
+            anyhow::bail!(
+                "runtime job {runtime_job_id} belongs to workflow {command_workflow_id}, not {workflow_id}"
+            );
+        }
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("runtime_turn_budget:{workflow_id}"))
+            .execute(&mut *tx)
+            .await?;
+        if let Some(reservation_key) = payload.get("reservation_key").and_then(Value::as_str) {
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT data::text
+                 FROM runtime_events
+                 WHERE runtime_job_id = $1
+                   AND event_type = 'RuntimeTurnStarted'
+                   AND data #>> '{event,reservation_key}' = $2
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+            )
+            .bind(runtime_job_id)
+            .bind(reservation_key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((data,)) = existing {
+                tx.commit().await?;
+                return Ok(Some(serde_json::from_str(&data)?));
+            }
+        }
+        let (turns_started,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)
+             FROM runtime_events AS event
+             JOIN runtime_jobs AS job ON job.id = event.runtime_job_id
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             WHERE command.workflow_id = $1
+               AND event.event_type = 'RuntimeTurnStarted'",
+        )
+        .bind(workflow_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if turns_started >= i64::from(max_turns) {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let event = runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            "RuntimeTurnStarted",
+            payload,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(event))
+    }
+
     pub async fn runtime_events_for(
         &self,
         runtime_job_id: &str,

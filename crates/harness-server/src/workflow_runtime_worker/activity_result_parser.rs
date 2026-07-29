@@ -42,96 +42,78 @@ pub(super) fn parse_activity_result_json(
 
 fn validate_activity_result_shape(value: &Value) -> Result<(), String> {
     let object = expect_object(value, "$")?;
-    reject_unknown_fields(
-        object,
-        "$",
-        &[
-            "activity",
-            "status",
-            "summary",
-            "artifacts",
-            "signals",
-            "validation",
-            "error",
-            "error_kind",
-        ],
-    )?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "activity"
+                | "status"
+                | "summary"
+                | "artifacts"
+                | "signals"
+                | "validation"
+                | "error"
+                | "error_kind"
+        ) {
+            return Err(format!("$.{key} is not allowed"));
+        }
+    }
     expect_required_string(object, "activity", "$.activity")?;
     expect_required_string(object, "summary", "$.summary")?;
-    expect_required_string_enum(
-        object,
-        "status",
-        "$.status",
-        &["succeeded", "failed", "blocked", "cancelled"],
-    )?;
+    expect_required_status(object)?;
     expect_optional_string_or_null(object, "error", "$.error")?;
-    expect_optional_string_enum_or_null(
-        object,
-        "error_kind",
-        "$.error_kind",
-        &[
-            "retryable",
-            "timeout",
-            "fatal",
-            "configuration",
-            "external_dependency",
-            "unknown",
-        ],
-    )?;
-    validate_artifacts(object)?;
-    validate_signals(object)?;
-    validate_validation(object)?;
-    Ok(())
-}
-
-fn validate_artifacts(object: &Map<String, Value>) -> Result<(), String> {
-    let Some(value) = object.get("artifacts") else {
-        return Ok(());
-    };
-    let artifacts = expect_array(value, "$.artifacts")?;
-    for (index, artifact) in artifacts.iter().enumerate() {
-        let path = format!("$.artifacts[{index}]");
-        let artifact = expect_object(artifact, &path)?;
-        reject_unknown_fields(artifact, &path, &["artifact_type", "artifact"])?;
+    expect_optional_error_kind(object)?;
+    validate_array_records(object, "artifacts", |artifact, path| {
         expect_required_string(artifact, "artifact_type", &format!("{path}.artifact_type"))?;
         if !artifact.contains_key("artifact") {
             return Err(format!("{path}.artifact is required"));
         }
-    }
-    Ok(())
-}
-
-fn validate_signals(object: &Map<String, Value>) -> Result<(), String> {
-    let Some(value) = object.get("signals") else {
-        return Ok(());
-    };
-    let signals = expect_array(value, "$.signals")?;
-    for (index, signal) in signals.iter().enumerate() {
-        let path = format!("$.signals[{index}]");
-        let signal = expect_object(signal, &path)?;
-        reject_unknown_fields(signal, &path, &["signal_type", "signal"])?;
+        Ok(())
+    })?;
+    validate_array_records(object, "signals", |signal, path| {
         expect_required_string(signal, "signal_type", &format!("{path}.signal_type"))?;
         let payload_path = format!("{path}.signal");
-        let payload = signal
-            .get("signal")
-            .ok_or_else(|| format!("{payload_path} is required"))?;
-        expect_object(payload, &payload_path)?;
-    }
-    Ok(())
-}
-
-fn validate_validation(object: &Map<String, Value>) -> Result<(), String> {
-    let Some(value) = object.get("validation") else {
-        return Ok(());
-    };
-    let records = expect_array(value, "$.validation")?;
-    for (index, record) in records.iter().enumerate() {
-        let path = format!("$.validation[{index}]");
-        let record = expect_object(record, &path)?;
-        reject_unknown_fields(record, &path, &["command", "status", "reason"])?;
+        expect_object(
+            signal
+                .get("signal")
+                .ok_or_else(|| format!("{payload_path} is required"))?,
+            &payload_path,
+        )?;
+        Ok(())
+    })?;
+    validate_array_records(object, "validation", |record, path| {
         expect_required_string(record, "command", &format!("{path}.command"))?;
         expect_required_string(record, "status", &format!("{path}.status"))?;
         expect_optional_string_or_null(record, "reason", &format!("{path}.reason"))?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn validate_array_records(
+    object: &Map<String, Value>,
+    field: &str,
+    mut validate_record: impl FnMut(&Map<String, Value>, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    for (index, record) in expect_array(value, &format!("$.{field}"))?
+        .iter()
+        .enumerate()
+    {
+        let path = format!("$.{field}[{index}]");
+        let record = expect_object(record, &path)?;
+        for key in record.keys() {
+            if !matches!(
+                (field, key.as_str()),
+                ("artifacts", "artifact_type" | "artifact")
+                    | ("signals", "signal_type" | "signal")
+                    | ("validation", "command" | "status" | "reason")
+            ) {
+                return Err(format!("{path}.{key} is not allowed"));
+            }
+        }
+        validate_record(record, &path)?;
     }
     Ok(())
 }
@@ -147,45 +129,33 @@ fn expect_required_string(
     expect_string(value, path).map(|_| ())
 }
 
-fn expect_required_string_enum(
-    object: &Map<String, Value>,
-    field: &str,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let value = object
-        .get(field)
-        .ok_or_else(|| format!("{path} is required"))?;
-    let value = expect_string(value, path)?;
-    if allowed.contains(&value) {
+fn expect_required_status(object: &Map<String, Value>) -> Result<(), String> {
+    let status = object
+        .get("status")
+        .ok_or_else(|| "$.status is required".to_string())
+        .and_then(|value| expect_string(value, "$.status"))?;
+    if matches!(status, "succeeded" | "failed" | "blocked" | "cancelled") {
         Ok(())
     } else {
         Err(format!(
-            "{path} expected one of [{}], got `{value}`",
-            allowed.join(", ")
+            "$.status expected a valid activity status, got `{status}`"
         ))
     }
 }
 
-fn expect_optional_string_enum_or_null(
-    object: &Map<String, Value>,
-    field: &str,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let Some(value) = object.get(field) else {
+fn expect_optional_error_kind(object: &Map<String, Value>) -> Result<(), String> {
+    let Some(value) = object.get("error_kind").filter(|value| !value.is_null()) else {
         return Ok(());
     };
-    if value.is_null() {
-        return Ok(());
-    }
-    let value = expect_string(value, path)?;
-    if allowed.contains(&value) {
+    let error_kind = expect_string(value, "$.error_kind")?;
+    if matches!(
+        error_kind,
+        "retryable" | "timeout" | "fatal" | "configuration" | "external_dependency" | "unknown"
+    ) {
         Ok(())
     } else {
         Err(format!(
-            "{path} expected one of [{}] or null, got `{value}`",
-            allowed.join(", ")
+            "$.error_kind expected a valid error kind or null, got `{error_kind}`"
         ))
     }
 }
@@ -195,12 +165,9 @@ fn expect_optional_string_or_null(
     field: &str,
     path: &str,
 ) -> Result<(), String> {
-    let Some(value) = object.get(field) else {
+    let Some(value) = object.get(field).filter(|value| !value.is_null()) else {
         return Ok(());
     };
-    if value.is_null() {
-        return Ok(());
-    }
     expect_string(value, path).map(|_| ())
 }
 
@@ -220,19 +187,6 @@ fn expect_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Val
     value
         .as_object()
         .ok_or_else(|| format!("{path} expected object, got {}", json_type_name(value)))
-}
-
-fn reject_unknown_fields(
-    object: &Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    for key in object.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(format!("{path}.{key} is not allowed"));
-        }
-    }
-    Ok(())
 }
 
 fn json_type_name(value: &Value) -> &'static str {

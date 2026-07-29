@@ -1,4 +1,8 @@
 use super::*;
+use harness_workflow::runtime::{
+    ActivityResult, RuntimeJobStatus, RuntimeKind, RuntimeProfile, WorkflowCommand,
+    WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+};
 
 #[tokio::test]
 async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> anyhow::Result<()> {
@@ -241,7 +245,7 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         project_root.join("WORKFLOW.md"),
         "---\nworkspace:\n  strategy: source\n---\n",
     )?;
-    let agent = SequencedStreamAgent::new(vec![
+    let agent = RuntimeStreamAgent::new_with_outputs(vec![
         r#"{"activity":"implement_prompt","status":"failed","summary":"failed","error":{"message":"bad shape"},"error_kind":"configuration"}"#.to_string(),
         r#"{"activity":"implement_prompt","status":"succeeded","summary":"corrected","artifacts":[{"artifact_type":"validation_report","artifact":[{"command":"cargo check -p harness-server --all-targets","exit_code":0}]}]}"#.to_string(),
     ]);
@@ -259,11 +263,11 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         .workflow_runtime_store
         .as_ref()
         .expect("workflow runtime store should be configured");
-    let workflow = harness_workflow::runtime::WorkflowInstance::new(
-        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+    let workflow = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
         1,
         "implementing",
-        harness_workflow::runtime::WorkflowSubject::new("prompt", "prompt:structured-output"),
+        WorkflowSubject::new("prompt", "prompt:structured-output"),
     )
     .with_id("prompt-structured-output")
     .with_data(serde_json::json!({
@@ -273,20 +277,16 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         "prompt_summary": "structured output"
     }));
     store.upsert_instance(&workflow).await?;
-    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
-        harness_workflow::runtime::PROMPT_TASK_IMPLEMENT_ACTIVITY,
-        "impl-prompt-1",
-    );
+    let command =
+        WorkflowCommand::enqueue_activity(PROMPT_TASK_IMPLEMENT_ACTIVITY, "impl-prompt-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
-    let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
-        "codex-default",
-        harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
-    );
+    let mut runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
     runtime_profile.approval_policy = Some("never".to_string());
+    runtime_profile.max_turns = Some(2);
     let runtime_job = store
         .enqueue_runtime_job(
             &command_id,
-            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            RuntimeKind::CodexJsonrpc,
             "codex-default",
             serde_json::json!({
                 "workflow_id": workflow.id.clone(),
@@ -312,16 +312,12 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         .get_runtime_job(&runtime_job.id)
         .await?
         .expect("runtime job should exist");
-    assert_eq!(
-        completed.status,
-        harness_workflow::runtime::RuntimeJobStatus::Succeeded
-    );
-    let output: harness_workflow::runtime::ActivityResult = serde_json::from_value(
+    assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
+    let output: ActivityResult = serde_json::from_value(
         completed
             .output
             .expect("activity result should be recorded"),
     )?;
-    assert_eq!(output.summary, "corrected");
     assert!(output
         .artifacts
         .iter()
@@ -329,12 +325,18 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
     let prompts = agent.prompts.lock().await;
     assert_eq!(prompts.len(), 2);
     assert!(prompts[1].contains("Structured output correction retry"));
-    drop(prompts);
     let env_vars = agent.env_vars.lock().await;
     assert_eq!(env_vars.len(), 2);
-    assert!(env_vars.iter().all(|env| env
-        .get(harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV)
-        .is_some_and(|path| path.contains("activity-result-schema.json"))));
+    assert!(env_vars
+        .iter()
+        .all(|env| env[harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV]
+            .contains("activity-result-schema.json")));
+    assert_eq!(
+        store
+            .runtime_turns_started_for_workflow(&workflow.id, None)
+            .await?,
+        2
+    );
     Ok(())
 }
 

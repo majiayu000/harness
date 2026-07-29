@@ -198,6 +198,19 @@ impl RuntimeCircuitBreakerRegistry {
             return Vec::new();
         }
         if !class.trips_runtime_profile_breaker() {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match inner.get_mut(profile) {
+                Some(ProfileBreaker::HalfOpen {
+                    probe_runtime_job_id,
+                    ..
+                }) if probe_runtime_job_id.as_deref() == Some(runtime_job_id) => {
+                    *probe_runtime_job_id = None;
+                }
+                _ => {}
+            }
             return Vec::new();
         }
         let config = self.config.clone();

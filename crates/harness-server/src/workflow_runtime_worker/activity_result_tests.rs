@@ -197,7 +197,7 @@ Final result:
 }
 
 #[test]
-fn activity_result_from_turn_parses_raw_schema_constrained_activity_result() {
+fn activity_result_from_turn_handles_raw_json_and_schema_path_errors() {
     let result = completed_codex_implement_issue_result(vec![Item::AgentReasoning {
         content: r#"{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":91,"pr_url":"https://github.com/owner/repo/pull/91"}}]}"#
             .to_string(),
@@ -212,44 +212,36 @@ fn activity_result_from_turn_parses_raw_schema_constrained_activity_result() {
     let envelope = envelope_artifact(&result);
     assert_eq!(envelope["outcome"], "accepted");
     assert_eq!(envelope["extraction_strategy"], "raw_activity_result");
-}
-
-#[test]
-fn activity_result_from_turn_reports_error_object_field_path() {
-    let result = completed_codex_implement_issue_result(vec![Item::AgentReasoning {
-        content: r#"{"activity":"implement_issue","status":"failed","summary":"failed","error":{"message":"boom"},"error_kind":"configuration"}"#
-            .to_string(),
-    }]);
-
-    assert_eq!(result.status, ActivityStatus::Failed);
-    assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
-    assert!(result
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("$.error expected string")));
-    let envelope = envelope_artifact(&result);
-    assert_eq!(envelope["outcome"], "invalid_structured_output");
-    assert_eq!(envelope["extraction_strategy"], "raw_activity_result");
-    assert_eq!(envelope["extracted_activity"], "implement_issue");
-}
-
-#[test]
-fn activity_result_from_turn_reports_validation_type_field_path() {
-    let result = completed_codex_implement_issue_result(vec![Item::AgentReasoning {
-        content: r#"```harness-activity-result
+    for (items, expected_strategy, expected_error) in [
+        (
+            vec![Item::AgentReasoning {
+                content: r#"{"activity":"implement_issue","status":"failed","summary":"failed","error":{"message":"boom"},"error_kind":"configuration"}"#.to_string(),
+            }],
+            "raw_activity_result",
+            "$.error expected string",
+        ),
+        (
+            vec![Item::AgentReasoning {
+                content: r#"```harness-activity-result
 {"activity":"implement_issue","status":"succeeded","summary":"done","validation":[{"command":"cargo test","status":{"passed":true}}]}
-```"#
-            .to_string(),
-    }]);
-
-    assert_eq!(result.status, ActivityStatus::Failed);
-    assert!(result
-        .error
-        .as_deref()
-        .is_some_and(|error| { error.contains("$.validation[0].status expected string") }));
-    let envelope = envelope_artifact(&result);
-    assert_eq!(envelope["outcome"], "invalid_structured_output");
-    assert_eq!(envelope["extraction_strategy"], "fenced_activity_result");
+```"#.to_string(),
+            }],
+            "fenced_activity_result",
+            "$.validation[0].status expected string",
+        ),
+    ] {
+        let result = completed_codex_implement_issue_result(items);
+        assert_eq!(result.status, ActivityStatus::Failed);
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(expected_error)));
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "invalid_structured_output");
+        assert_eq!(envelope["extraction_strategy"], expected_strategy);
+        assert_eq!(envelope["extracted_activity"], "implement_issue");
+    }
 }
 
 fn completed_codex_implement_issue_result(items: Vec<Item>) -> ActivityResult {
