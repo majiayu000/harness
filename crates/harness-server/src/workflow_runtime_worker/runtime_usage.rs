@@ -24,6 +24,7 @@ pub(super) fn runtime_usage_context(
         runtime_job_id: job.id.clone(),
         command_id: job.command_id.clone(),
         workflow_id,
+        agent_run_id: None,
         runtime_kind: job.runtime_kind,
         runtime_profile: job.runtime_profile.clone(),
         agent: agent_name.to_string(),

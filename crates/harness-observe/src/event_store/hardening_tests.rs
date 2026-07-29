@@ -1,85 +1,7 @@
+use super::store_tests::open_test_store;
 use super::*;
-use harness_core::db::{pg_open_pool, resolve_database_url};
 use harness_core::run_id::RunId;
-use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-use tokio::sync::OnceCell;
-
-static DB_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
-
-fn db_semaphore() -> Arc<tokio::sync::Semaphore> {
-    DB_SEMAPHORE
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
-}
-
-async fn db_tests_enabled() -> bool {
-    if resolve_database_url(None).is_err() {
-        return false;
-    }
-
-    *DB_AVAILABLE
-        .get_or_init(|| async {
-            let Ok(database_url) = resolve_database_url(None) else {
-                return false;
-            };
-            match tokio::time::timeout(Duration::from_secs(2), pg_open_pool(&database_url)).await {
-                Ok(Ok(pool)) => {
-                    pool.close().await;
-                    true
-                }
-                _ => false,
-            }
-        })
-        .await
-}
-
-fn is_db_unavailable(err: &anyhow::Error) -> bool {
-    let msg = format!("{:#}", err);
-    msg.contains("pool timed out while waiting for an open connection")
-        || msg.contains("EMAXCONNSESSION")
-        || msg.contains("SSLRequest")
-        || msg.contains("terminating connection due to administrator command")
-}
-
-struct TestStore {
-    inner: EventStore,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl TestStore {
-    async fn close(self) {
-        self.inner.close().await;
-    }
-}
-
-impl std::ops::Deref for TestStore {
-    type Target = EventStore;
-    fn deref(&self) -> &EventStore {
-        &self.inner
-    }
-}
-
-async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
-    if !db_tests_enabled().await {
-        return Ok(None);
-    }
-    let permit = db_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|_| anyhow::anyhow!("database test semaphore closed"))?;
-    match EventStore::new(data_dir).await {
-        Ok(inner) => Ok(Some(TestStore {
-            inner,
-            _permit: permit,
-        })),
-        Err(err) if is_db_unavailable(&err) => Ok(None),
-        Err(err) => Err(err),
-    }
-}
 
 fn make_event(hook: &str, decision: Decision) -> Event {
     Event::new(SessionId::new(), hook, "Edit", decision)
@@ -214,7 +136,7 @@ async fn query_rejects_unrepresentable_limit_before_sql_execution() -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn policy_events_for_agent_run_filters_run_and_tool() -> anyhow::Result<()> {
+async fn policy_events_for_agent_run_filters_only_run_id() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some(store) = open_test_store(dir.path()).await? else {
         return Ok(());
@@ -223,16 +145,21 @@ async fn policy_events_for_agent_run_filters_run_and_tool() -> anyhow::Result<()
     let mut matching = make_event("policy", Decision::Pass);
     matching.run_id = Some(run_id.clone());
     matching.tool = "codex".to_string();
-    let mut other_tool = make_event("policy", Decision::Pass);
-    other_tool.run_id = Some(run_id.clone());
-    other_tool.tool = "claude".to_string();
-    store.log_many(&[matching, other_tool]).await?;
+    let mut same_agent_other_tool = make_event("policy", Decision::Pass);
+    same_agent_other_tool.run_id = Some(run_id.clone());
+    same_agent_other_tool.tool = "rule_id".to_string();
+    let mut other_run = make_event("policy", Decision::Pass);
+    other_run.run_id = Some(RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6we")?);
+    store
+        .log_many(&[matching, same_agent_other_tool, other_run])
+        .await?;
 
-    let events = store.policy_events_for_agent_run(&run_id, "codex").await?;
+    let events = store.policy_events_for_agent_run(&run_id).await?;
 
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].tool, "codex");
-    assert_eq!(events[0].run_id.as_ref(), Some(&run_id));
+    assert_eq!(events.len(), 2);
+    assert!(events
+        .iter()
+        .all(|event| event.run_id.as_ref() == Some(&run_id)));
     store.close().await;
     Ok(())
 }

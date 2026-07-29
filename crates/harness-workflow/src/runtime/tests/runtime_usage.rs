@@ -3,6 +3,8 @@ use crate::runtime::{
     cost_usd_from_micros, cost_usd_to_micros, RuntimeUsageMetrics, RuntimeUsageUpsert,
     RuntimeUsageUpsertOutcome,
 };
+use harness_core::run_id::RunId;
+use std::str::FromStr;
 
 #[tokio::test]
 async fn runtime_usage_upsert_skips_zero_placeholders() -> anyhow::Result<()> {
@@ -195,6 +197,13 @@ async fn runtime_agent_telemetry_for_workflow_returns_outcome_and_agent_usage() 
     assert_eq!(telemetry.agent, "codex");
     assert_eq!(telemetry.usage_records.len(), 1);
     assert_eq!(telemetry.usage_records[0].agent, "codex");
+    assert_eq!(
+        telemetry.usage_records[0]
+            .agent_run_id
+            .as_ref()
+            .map(RunId::as_str),
+        Some("ar-01j1qb3c9r7v5m2k8x4tznq6wd")
+    );
     let usage = telemetry.usage.expect("codex usage should aggregate");
     assert_eq!(usage.metrics.input_tokens, 10);
     assert_eq!(usage.metrics.total_tokens(), 15);
@@ -241,6 +250,7 @@ fn runtime_usage_upsert(metrics: RuntimeUsageMetrics) -> RuntimeUsageUpsert {
         command_id: "command-1".to_string(),
         workflow_id: "workflow-1".to_string(),
         turn_id: Some("turn-1".to_string()),
+        agent_run_id: Some(RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wd").unwrap()),
         runtime_kind: RuntimeKind::CodexExec,
         runtime_profile: "codex-default".to_string(),
         agent: "codex".to_string(),

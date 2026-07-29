@@ -62,13 +62,13 @@ fn is_db_unavailable(err: &anyhow::Error) -> bool {
     // log_with_unreachable_otel_endpoint_still_persists_event.
 }
 
-struct TestStore {
+pub(super) struct TestStore {
     inner: EventStore,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl TestStore {
-    async fn close(self) {
+    pub(super) async fn close(self) {
         self.inner.close().await;
     }
 }
@@ -80,7 +80,7 @@ impl std::ops::Deref for TestStore {
     }
 }
 
-async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
+pub(super) async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
     if !db_tests_enabled().await {
         return Ok(None);
     }

@@ -5,6 +5,7 @@ use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
 use harness_core::config::agents::SandboxMode;
 use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::error::HarnessError;
+use harness_core::run_id::RunIdentity;
 use harness_core::types::{ExecutionPhase, TurnId};
 use harness_protocol::notifications::{Notification, RpcNotification};
 use std::collections::HashMap;
@@ -80,7 +81,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     turn_id: TurnId,
     prompt: String,
     agent_name: String,
-    options: TurnLifecycleOptions,
+    mut options: TurnLifecycleOptions,
 ) {
     let Some(project_root) = server
         .thread_manager
@@ -93,6 +94,16 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         );
         return;
     };
+    match RunIdentity::ensure_env_vars(&mut options.env_vars) {
+        Ok(identity) => {
+            if let Some(context) = options.runtime_usage.as_mut() {
+                context.agent_run_id = Some(identity.run_id);
+            }
+        }
+        Err(err) => {
+            tracing::warn!("failed to prepare agent run identity for runtime turn: {err}");
+        }
+    }
 
     let Some(agent) = server.agent_registry.get(&agent_name) else {
         let msg = format!("agent `{agent_name}` not found in registry");

@@ -1,4 +1,5 @@
 use harness_core::agent::StreamItem;
+use harness_core::run_id::RunId;
 use harness_core::types::{ThreadId, TokenUsage, TurnId, TurnStatus};
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use harness_workflow::runtime::{
@@ -13,6 +14,7 @@ pub(crate) struct RuntimeUsageContext {
     pub(crate) runtime_job_id: String,
     pub(crate) command_id: String,
     pub(crate) workflow_id: String,
+    pub(crate) agent_run_id: Option<RunId>,
     pub(crate) runtime_kind: RuntimeKind,
     pub(crate) runtime_profile: String,
     pub(crate) agent: String,
@@ -59,6 +61,7 @@ impl RuntimeUsageContext {
                 command_id: self.command_id.clone(),
                 workflow_id: self.workflow_id.clone(),
                 turn_id: Some(turn_id.as_str().to_string()),
+                agent_run_id: self.agent_run_id.clone(),
                 runtime_kind: self.runtime_kind,
                 runtime_profile: self.runtime_profile.clone(),
                 agent: self.agent.clone(),
@@ -260,6 +263,7 @@ mod tests {
         types::{AgentId, TokenUsage},
     };
     use harness_workflow::runtime::{RuntimeKind, WorkflowRuntimeStore};
+    use std::str::FromStr;
 
     #[tokio::test]
     async fn workflow_runtime_worker_token_usage_persists_runtime_usage() -> anyhow::Result<()> {
@@ -284,6 +288,7 @@ mod tests {
             runtime_job_id: "runtime-job-1".to_string(),
             command_id: "command-1".to_string(),
             workflow_id: "workflow-1".to_string(),
+            agent_run_id: Some(RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wd")?),
             runtime_kind: RuntimeKind::CodexExec,
             runtime_profile: "codex-default".to_string(),
             agent: "codex".to_string(),
@@ -327,6 +332,10 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].runtime_job_id, "runtime-job-1");
+        assert_eq!(
+            records[0].agent_run_id.as_ref().map(RunId::as_str),
+            Some("ar-01j1qb3c9r7v5m2k8x4tznq6wd")
+        );
         assert_eq!(records[0].metrics.input_tokens, 11);
         assert_eq!(records[0].metrics.output_tokens, 7);
         assert_eq!(records[0].metrics.total_tokens(), 20);

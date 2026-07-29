@@ -337,7 +337,9 @@ impl EventStore {
                 return;
             }
         };
-        let mut pending = Vec::new();
+        const JSONL_MIGRATION_BATCH_SIZE: usize = 1_000;
+        let mut pending = Vec::with_capacity(JSONL_MIGRATION_BATCH_SIZE);
+        let mut imported = 0usize;
         for line in std::io::BufReader::new(file).lines() {
             let line = match line {
                 Ok(l) => l,
@@ -354,12 +356,22 @@ impl EventStore {
             }
             if let Ok(event) = serde_json::from_str::<Event>(&line) {
                 pending.push(event);
+                if pending.len() >= JSONL_MIGRATION_BATCH_SIZE {
+                    if let Err(e) = self.insert_events(&pending).await {
+                        tracing::warn!("event store: failed to batch insert migrated events: {e}");
+                        return;
+                    }
+                    imported += pending.len();
+                    pending.clear();
+                }
             }
         }
-        let imported = pending.len();
-        if let Err(e) = self.insert_events(&pending).await {
-            tracing::warn!("event store: failed to batch insert migrated events: {e}");
-            return;
+        if !pending.is_empty() {
+            if let Err(e) = self.insert_events(&pending).await {
+                tracing::warn!("event store: failed to batch insert migrated events: {e}");
+                return;
+            }
+            imported += pending.len();
         }
         if let Err(e) = std::fs::rename(&path, &archive_path) {
             tracing::warn!(

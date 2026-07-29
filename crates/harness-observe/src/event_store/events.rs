@@ -196,14 +196,9 @@ impl EventStore {
         .await
     }
 
-    pub async fn policy_events_for_agent_run(
-        &self,
-        run_id: &RunId,
-        agent_tool: &str,
-    ) -> anyhow::Result<Vec<Event>> {
+    pub async fn policy_events_for_agent_run(&self, run_id: &RunId) -> anyhow::Result<Vec<Event>> {
         self.query(&EventFilters {
             run_id: Some(run_id.clone()),
-            tool: Some(agent_tool.to_string()),
             ..Default::default()
         })
         .await
