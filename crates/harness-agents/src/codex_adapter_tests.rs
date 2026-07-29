@@ -20,6 +20,16 @@ fn test_turn_request(project_root: PathBuf) -> TurnRequest {
     }
 }
 
+#[cfg(unix)]
+fn write_app_server_stub(dir: &std::path::Path, body: &str) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("codex-app-server-stub");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\nsleep 60\n"))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
 #[test]
 fn parse_no_jsonrpc_thread_started_notification() {
     let line = r#"{"method":"thread/started","params":{"thread":{"id":"thread-1"}}}"#;
@@ -503,7 +513,7 @@ fn sandbox_policy_value_preserves_network_for_read_only_with_network() {
     assert_eq!(
         sandbox_policy_value(
             Some(SandboxMode::ReadOnlyWithNetwork),
-            &PathBuf::from("/tmp/project")
+            std::path::Path::new("/tmp/project")
         ),
         Some(json!({
             "type": "readOnly",
@@ -523,6 +533,127 @@ fn protocol_line_preview_truncates_without_full_count_scan() {
         protocol_line_preview(&format!("{}y", "x".repeat(MAX_PROTOCOL_LINE_PREVIEW))),
         format!("{}...", "x".repeat(MAX_PROTOCOL_LINE_PREVIEW))
     );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn app_server_read_times_out_when_stdout_stalls() -> anyhow::Result<()> {
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stdout should be piped"))?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let error = CodexAdapter::read_next_message_with_timeout(
+        &mut lines,
+        Some(std::time::Duration::from_millis(50)),
+        "initialize",
+    )
+    .await
+    .expect_err("silent app-server stdout must hit the stall timeout");
+
+    child.kill().await?;
+    child.wait().await?;
+    assert!(format!("{error}").contains("initialize stalled for 50ms"));
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn app_server_protocol_failures_reset_and_reap_child() -> anyhow::Result<()> {
+    let scenarios = [
+        ("", "initialize stalled"),
+        (
+            r#"printf '%s\n' '{"method":"error","params":{"message":"init failed"}}'"#,
+            "init failed",
+        ),
+        (
+            r#"printf '%s\n' '{"id":1,"result":{}}'"#,
+            "thread/start stalled",
+        ),
+        (
+            concat!(
+                r#"printf '%s\n' '{"id":1,"result":{}}'"#,
+                "\n",
+                r#"printf '%s\n' '{"method":"error","params":{"message":"thread failed"}}'"#,
+            ),
+            "thread failed",
+        ),
+        (
+            concat!(
+                r#"printf '%s\n' '{"id":1,"result":{}}'"#,
+                "\n",
+                r#"printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}'"#,
+            ),
+            "turn stalled",
+        ),
+        (
+            concat!(
+                r#"printf '%s\n' '{"id":1,"result":{}}'"#,
+                "\n",
+                r#"printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}'"#,
+                "\n",
+                r#"printf '%s\n' 'not-json'"#,
+            ),
+            "invalid JSON-RPC",
+        ),
+    ];
+
+    for (body, expected) in scenarios {
+        let dir = tempfile::tempdir()?;
+        let adapter = CodexAdapter::new(write_app_server_stub(dir.path(), body)?);
+        let mut request = test_turn_request(dir.path().to_path_buf());
+        request.timeout_secs = Some(if expected.contains("stalled") { 3 } else { 10 });
+        let (tx, _rx) = mpsc::channel(4);
+
+        let error = adapter.start_turn(request, tx).await.expect_err(expected);
+        assert!(format!("{error}").contains(expected), "{expected}: {error}");
+        let state = adapter.state.lock().await;
+        assert!(state.child.is_none(), "{expected}: child was not reaped");
+        assert!(state.stdin.is_none());
+        assert!(state.stdout_lines.is_none());
+        assert!(state.thread_id.is_none());
+        assert!(state.active_turn_id.is_none());
+        assert!(state.child_workspace.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn expired_capability_token_never_spawns_app_server() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let marker = dir.path().join("spawned");
+    let adapter = CodexAdapter::new(write_app_server_stub(
+        dir.path(),
+        r#"printf spawned > "$SPAWN_MARKER""#,
+    )?);
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request
+        .env_vars
+        .insert("SPAWN_MARKER".into(), marker.display().to_string());
+    let mut token = harness_core::capability::CapabilityToken::new(
+        7,
+        vec![dir.path().to_path_buf()],
+        std::time::Duration::from_secs(60),
+    );
+    token.expires_at = std::time::SystemTime::UNIX_EPOCH;
+    request.capability_token = Some(token);
+    request.timeout_secs = Some(1);
+    let (tx, _rx) = mpsc::channel(4);
+
+    let error = adapter
+        .start_turn(request, tx)
+        .await
+        .expect_err("expired token must fail before spawn");
+    assert!(format!("{error}").contains("subtask 7 has expired"));
+    assert!(!marker.exists(), "expired token spawned the app-server");
+    assert!(adapter.state.lock().await.child.is_none());
+    Ok(())
 }
 
 #[tokio::test]
@@ -596,7 +727,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
     let stdin = child.stdin.take().expect("stdin should be piped");
     {
         let mut state = adapter.state.lock().await;
-        state.child = Some(child);
+        state.child = Some(crate::ManagedChild::new(child, "codex app-server test"));
         state.stdin = Some(stdin);
         state.stdout_lines = Some(BufReader::new(stdout).lines());
         state.thread_id = Some("thread-1".into());
@@ -636,6 +767,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn adapter_state_reports_incomplete_child_when_stdout_reader_is_missing() {
     let mut child = tokio::process::Command::new("sleep")
         .arg("60")
@@ -646,7 +778,7 @@ async fn adapter_state_reports_incomplete_child_when_stdout_reader_is_missing() 
     let stdout = child.stdout.take().expect("stdout should be piped");
     let stdin = child.stdin.take().expect("stdin should be piped");
     let mut state = AdapterState::new();
-    state.child = Some(child);
+    state.child = Some(crate::ManagedChild::new(child, "codex app-server test"));
     state.stdin = Some(stdin);
     state.stdout_lines = Some(BufReader::new(stdout).lines());
 
