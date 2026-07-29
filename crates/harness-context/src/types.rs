@@ -222,18 +222,7 @@ impl Estimator for BytesDivFourEstimator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComposeMode {
-    Shadow,
-    Enforce,
     Preview,
-}
-
-impl From<harness_core::config::misc::ContextMode> for ComposeMode {
-    fn from(value: harness_core::config::misc::ContextMode) -> Self {
-        match value {
-            harness_core::config::misc::ContextMode::Shadow => Self::Shadow,
-            harness_core::config::misc::ContextMode::Enforce => Self::Enforce,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -281,7 +270,7 @@ pub struct ComposeConfig {
 impl Default for ComposeConfig {
     fn default() -> Self {
         Self {
-            mode: ComposeMode::Shadow,
+            mode: ComposeMode::Preview,
             budget_tokens: 24_000,
             reserved_headroom: 0.20,
             provider_timeout_ms: 2_000,
@@ -293,7 +282,7 @@ impl Default for ComposeConfig {
 impl From<&harness_core::config::misc::ContextConfig> for ComposeConfig {
     fn from(value: &harness_core::config::misc::ContextConfig) -> Self {
         Self {
-            mode: value.mode.into(),
+            mode: ComposeMode::Preview,
             budget_tokens: value.budget_tokens,
             reserved_headroom: value.reserved_headroom,
             provider_timeout_ms: value.provider_timeout_ms,

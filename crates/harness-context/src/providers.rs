@@ -143,7 +143,7 @@ impl ExecPlanProvider {
 
 impl ContextProvider for ExecPlanProvider {
     fn id(&self) -> ProviderId {
-        ProviderId::new("contract")
+        ProviderId::new("exec-plan")
     }
 
     fn propose(&self, req: &ComposeRequest) -> Result<Vec<ContextItem>, ProviderError> {

@@ -13,7 +13,6 @@ workspace = true
 harness-core = { workspace = true }
 harness-rules = { workspace = true }
 harness-skills = { workspace = true }
-harness-gc = { workspace = true }
 harness-exec = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -643,10 +643,11 @@ fn provider_precedence(provider_id: &ProviderId) -> u8 {
     match provider_id.as_str() {
         "rules" => 0,
         "contract" => 1,
-        "skills" => 2,
-        "brief" => 3,
-        "gc-drafts" => 4,
-        "supplied" => 5,
-        _ => 6,
+        "exec-plan" => 2,
+        "skills" => 3,
+        "brief" => 4,
+        "gc-drafts" => 5,
+        "supplied" => 6,
+        _ => 7,
     }
 }
