@@ -29,7 +29,12 @@ async fn cancelled_recovered_quality_gate_is_reactivated_after_terminal_job() ->
     )
     .await?;
     let workflow_id = workflow_id(&project_id, Some(REPO), issue_number);
-    let command = store.commands_for(&workflow_id).await?.remove(0);
+    let command = store
+        .commands_for(&workflow_id)
+        .await?
+        .into_iter()
+        .find(|record| record.command.requires_runtime_job())
+        .ok_or_else(|| anyhow::anyhow!("quality gate command was not queued"))?;
     store
         .enqueue_runtime_job_for_pending_command(
             &command.id,
