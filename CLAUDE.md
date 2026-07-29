@@ -102,6 +102,6 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 
 - RS-03 exempt: `fn main()` scope, `Mutex::lock().unwrap()`, `RwLock::{read,write}().unwrap()`
 - RS-13: only flag functions returning `()` or `Result<()>` — typed returns are transformers, not action functions
-- U-16 exempt: `**/prompts/parsing.rs` → 1100-line limit, `**/harness-server/src/http/misc_routes.rs` → 1200-line limit, `**/harness-cli/src/commands.rs` → 1700-line limit (oversized files pending split), `**/task_runner/spawn.rs` → 850-line limit and `**/task_executor/triage_pipeline.rs` → 1400-line limit (both pending GH-1434 deletion). Stale exemptions removed 2026-07-25 after splits landed: dispatch.rs, services/execution.rs (537 actual), task_runner/store.rs (82), workflow runtime store.rs (290), workflow_runtime_pr_feedback.rs (607), webhook.rs (335)
+- U-16 exempt: `**/prompts/parsing.rs` → 1100-line limit, `**/harness-cli/src/commands.rs` → 1700-line limit (oversized files pending split), `**/task_runner/spawn.rs` → 850-line limit and `**/task_executor/triage_pipeline.rs` → 1400-line limit (both pending GH-1434 deletion). Stale exemptions removed 2026-07-25 after splits landed: dispatch.rs, services/execution.rs (537 actual), task_runner/store.rs (82), workflow runtime store.rs (290), workflow_runtime_pr_feedback.rs (607), webhook.rs (335)
 - L1 exempt: new files matching `src/**/{mod,lib,main}.rs` (standard Rust module files)
 - gh/git guard: CLAUDE.md rule is semantic (agent prompts only); bash guard should not double-block `cargo test` subprocesses

@@ -17,23 +17,29 @@ use axum::{
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub(crate) mod auth;
+pub(crate) mod auth_routes;
 pub(crate) mod auto_merge;
 pub(crate) mod background;
 pub(crate) mod builders;
 pub(crate) mod github_intake_status;
+pub(crate) mod github_webhook_routes;
+pub(crate) mod health_routes;
 pub(crate) mod http_router;
 pub(crate) mod init;
-pub(crate) mod misc_routes;
+pub(crate) mod intake_status_routes;
 mod orphan_reaper;
 pub(crate) mod pr_hygiene_background;
 pub(crate) mod rate_limit;
+pub(crate) mod rpc_routes;
 mod runtime_retention;
 pub(crate) mod runtime_submission_routes;
+pub(crate) mod signal_routes;
 pub(crate) mod sse_routes;
 pub(crate) mod state;
 pub(crate) mod task_mutation_routes;
 pub(crate) mod task_query_routes;
 pub(crate) mod task_routes;
+pub(crate) mod workflow_routes;
 mod workflow_watchdog;
 
 #[cfg(test)]
@@ -53,13 +59,6 @@ pub use state::{
     AppState, ConcurrencyServices, CoreServices, EngineServices,
     GitHubTokenDispatchCounterSnapshot, GitHubTokenDispatchMetric, IntakeServices,
     NotificationServices, ObservabilityServices,
-};
-
-// Handler re-exports — moved to focused submodules, kept accessible via `crate::http::`.
-pub(crate) use misc_routes::{
-    get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
-    get_workflow_runtime_tree, github_webhook, handle_rpc, health_check, ingest_signal,
-    intake_status, password_reset, project_queue_stats, reset_runtime_circuit_breaker,
 };
 
 /// Extract the PR number from a GitHub PR URL.

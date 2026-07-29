@@ -7,11 +7,21 @@ use axum::{
 use std::sync::Arc;
 
 use super::{
-    auth, get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
-    get_workflow_runtime_tree, github_webhook, handle_rpc, health_check, ingest_signal,
-    intake_status, password_reset, project_queue_stats, reset_runtime_circuit_breaker,
-    runtime_submission_routes, sse_routes, state::AppState, task_mutation_routes,
-    task_query_routes, task_routes,
+    auth,
+    auth_routes::password_reset,
+    github_webhook_routes::github_webhook,
+    health_routes::{health_check, project_queue_stats, reset_runtime_circuit_breaker},
+    intake_status_routes::intake_status,
+    rpc_routes::handle_rpc,
+    runtime_submission_routes,
+    signal_routes::ingest_signal,
+    sse_routes,
+    state::AppState,
+    task_mutation_routes, task_query_routes, task_routes,
+    workflow_routes::{
+        get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
+        get_workflow_runtime_tree,
+    },
 };
 
 const MAX_RUNTIME_TRANSCRIPT_BODY_BYTES: usize = 64 * 1024 * 1024;
