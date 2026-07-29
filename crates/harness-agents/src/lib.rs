@@ -1,8 +1,8 @@
 pub mod anthropic_api;
 pub mod builder;
 pub mod claude;
-pub mod claude_adapter;
 mod claude_stream;
+pub mod claude_stream_json;
 mod cloud_setup;
 pub mod codex;
 pub mod codex_adapter;
