@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn nonterminal_inspecting_child_suppresses_duplicate_feedback_sweep() -> anyhow::Result<()> {
+async fn completed_inspecting_child_does_not_block_next_feedback_sweep() -> anyhow::Result<()> {
     let Ok(database_url) = resolve_database_url(None) else {
         return Ok(());
     };
@@ -38,13 +38,13 @@ async fn nonterminal_inspecting_child_suppresses_duplicate_feedback_sweep() -> a
     store.upsert_instance(&child).await?;
 
     assert!(
-        has_active_pr_feedback_command(
+        !has_active_pr_feedback_command(
             &store,
             &workflow_id,
             DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
         )
         .await?,
-        "a persisted nonterminal inspecting child should suppress duplicate sweeps even without an active command"
+        "an inspecting child with no active command should not suppress future sweeps"
     );
 
     let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
@@ -69,7 +69,7 @@ async fn nonterminal_inspecting_child_suppresses_duplicate_feedback_sweep() -> a
             DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
         )
         .await?,
-        "an inspecting child with an active command should still suppress duplicate sweeps"
+        "an inspecting child with a pending command should still suppress duplicate sweeps"
     );
     Ok(())
 }
@@ -433,7 +433,7 @@ fn failed_child_suppression_cutoff_handles_oversized_windows() {
 }
 
 #[tokio::test]
-async fn nonterminal_pending_child_suppresses_duplicate_feedback_sweep() -> anyhow::Result<()> {
+async fn orphan_pending_child_does_not_block_next_feedback_sweep() -> anyhow::Result<()> {
     let Ok(database_url) = resolve_database_url(None) else {
         return Ok(());
     };
@@ -478,13 +478,13 @@ async fn nonterminal_pending_child_suppresses_duplicate_feedback_sweep() -> anyh
     store.upsert_instance(&child).await?;
 
     assert!(
-        has_active_pr_feedback_command(
+        !has_active_pr_feedback_command(
             &store,
             &workflow_id,
             DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
         )
         .await?,
-        "a persisted nonterminal pending child should suppress duplicate sweeps even without an active inspection command"
+        "a pending child without an active inspection command should not suppress future sweeps"
     );
 
     let child_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
@@ -512,19 +512,19 @@ async fn nonterminal_pending_child_suppresses_duplicate_feedback_sweep() -> anyh
         )
         .await?;
     assert!(
-        has_active_pr_feedback_command(
+        !has_active_pr_feedback_command(
             &store,
             &workflow_id,
             DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
         )
         .await?,
-        "a pending child with a completed inspection command should remain fail-closed until recovery resolves the child"
+        "a pending child with no active inspection command should stop suppressing sweeps"
     );
 
     let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
     assert_eq!(
         outcome,
-        PrFeedbackSweepRequestOutcome::ActiveCommandExists {
+        PrFeedbackSweepRequestOutcome::Requested {
             workflow_id: workflow_id.clone(),
             task_id: "task-1".to_string(),
         }
