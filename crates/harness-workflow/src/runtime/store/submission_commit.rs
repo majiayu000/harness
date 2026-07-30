@@ -8,7 +8,7 @@ use super::{
 };
 use crate::runtime::{
     ValidationContext, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowInstance,
+    WorkflowInstance, WorkflowTerminalState,
 };
 use chrono::Utc;
 use serde_json::Value;
@@ -90,7 +90,9 @@ impl WorkflowRuntimeStore {
 
         let mut tx = self.pool.begin().await?;
         lock_submission_tx(&mut tx, transition.workflow_id).await?;
-        let Some(current) = load_submission_instance_tx(&mut tx, &transition).await? else {
+        let Some((current, created_for_submission)) =
+            load_submission_instance_tx(&mut tx, &transition).await?
+        else {
             return Ok(None);
         };
         if current.state != transition.expected_state
@@ -98,11 +100,44 @@ impl WorkflowRuntimeStore {
         {
             return Ok(None);
         }
+        let replays_applied_instance = match transition
+            .existing_record
+            .filter(|record| record.accepted)
+        {
+            Some(record) if current.state == record.decision.observed_state => false,
+            Some(record) if current.state == record.decision.next_state => true,
+            Some(record) => {
+                anyhow::bail!(
+                    "stale workflow submission replay `{}` observed current state `{}` outside decision transition `{} -> {}`",
+                    record.id,
+                    current.state,
+                    record.decision.observed_state,
+                    record.decision.next_state
+                );
+            }
+            None => false,
+        };
         if let Some(final_instance) = transition.final_instance {
             ensure_protected_instance_fields_match(&current, final_instance)?;
-            let replays_applied_instance = transition.existing_record.is_some_and(|record| {
-                record.accepted && current.state == record.decision.next_state
-            });
+            let rejected_final = transition.rejection_reason.is_some()
+                || transition
+                    .existing_record
+                    .is_some_and(|record| !record.accepted);
+            if rejected_final {
+                if !created_for_submission
+                    || transition.existing_record.is_some()
+                    || transition.rejection_reason.is_none()
+                {
+                    anyhow::bail!(
+                        "rejected workflow submission final instance is only allowed for a newly created submission"
+                    );
+                }
+                if final_instance.terminal_state() != Some(WorkflowTerminalState::Failed) {
+                    anyhow::bail!(
+                        "rejected workflow submission final instance must use the definition-specific failed terminal state"
+                    );
+                }
+            }
             let expected_final_version = if replays_applied_instance {
                 current.version
             } else {
@@ -255,9 +290,9 @@ async fn lock_submission_tx(
 async fn load_submission_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     transition: &WorkflowSubmissionDecisionTransition<'_>,
-) -> anyhow::Result<Option<WorkflowInstance>> {
+) -> anyhow::Result<Option<(WorkflowInstance, bool)>> {
     if let Some(current) = select_instance_for_update_tx(tx, transition.workflow_id).await? {
-        return Ok(Some(current));
+        return Ok(Some((current, false)));
     }
 
     let Some(initial) = transition.create_if_missing else {
@@ -275,9 +310,11 @@ async fn load_submission_instance_tx(
         return Ok(None);
     }
     if insert_instance_if_absent_tx(tx, initial).await? {
-        return Ok(Some(initial.clone()));
+        return Ok(Some((initial.clone(), true)));
     }
-    select_instance_for_update_tx(tx, transition.workflow_id).await
+    Ok(select_instance_for_update_tx(tx, transition.workflow_id)
+        .await?
+        .map(|instance| (instance, false)))
 }
 
 async fn upsert_prompt_payload_tx(
@@ -352,6 +389,7 @@ mod tests {
         store: &WorkflowRuntimeStore,
         current: &WorkflowInstance,
         decision: &WorkflowDecision,
+        create_if_missing: Option<&WorkflowInstance>,
         existing_record: Option<&WorkflowDecisionRecord>,
         rejection_reason: Option<&str>,
         final_instance: &WorkflowInstance,
@@ -361,7 +399,7 @@ mod tests {
                 workflow_id: &current.id,
                 expected_state: &current.state,
                 expected_version: current.version,
-                create_if_missing: None,
+                create_if_missing,
                 event_id: existing_record.and_then(|record| record.event_id.as_deref()),
                 new_event_id: existing_record
                     .is_none()
@@ -400,9 +438,16 @@ mod tests {
 
         let mut substituted = final_instance.clone();
         substituted.definition_version = 2;
-        let error =
-            invalid_submission_final_error(&store, &initial, &decision, None, None, &substituted)
-                .await;
+        let error = invalid_submission_final_error(
+            &store,
+            &initial,
+            &decision,
+            None,
+            None,
+            None,
+            &substituted,
+        )
+        .await;
         assert!(error.to_string().contains("definition_version"));
 
         let mut invalid_version = final_instance;
@@ -411,6 +456,7 @@ mod tests {
             &store,
             &initial,
             &decision,
+            None,
             None,
             None,
             &invalid_version,
@@ -430,7 +476,6 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
         let initial = submission_test_instance("submission-rejected-identity-version");
-        store.upsert_instance(&initial).await?;
         let decision = submission_test_decision(&initial);
         let mut final_instance = initial.clone();
         final_instance.state = "failed".to_string();
@@ -442,6 +487,7 @@ mod tests {
             &store,
             &initial,
             &decision,
+            Some(&initial),
             None,
             Some("rejected"),
             &substituted,
@@ -455,13 +501,14 @@ mod tests {
             &store,
             &initial,
             &decision,
+            Some(&initial),
             None,
             Some("rejected"),
             &invalid_version,
         )
         .await;
         assert!(error.to_string().contains("expected `1`"));
-        assert_eq!(store.get_instance(&initial.id).await?, Some(initial));
+        assert!(store.get_instance(&initial.id).await?.is_none());
         Ok(())
     }
 
@@ -505,6 +552,7 @@ mod tests {
             &store,
             &final_instance,
             &decision,
+            None,
             Some(&first_commit.record),
             None,
             &substituted,
@@ -518,6 +566,7 @@ mod tests {
             &store,
             &final_instance,
             &decision,
+            None,
             Some(&first_commit.record),
             None,
             &advanced_version,

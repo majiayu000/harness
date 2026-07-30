@@ -248,3 +248,156 @@ impl WorkflowRuntimeStore {
 #[cfg(test)]
 #[path = "decision_transitions_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod submission_guard_tests {
+    use super::*;
+    use crate::runtime::{WorkflowCommand, WorkflowSubject, WorkflowSubmissionDecisionTransition};
+    use harness_core::db::resolve_database_url;
+    use serde_json::json;
+
+    fn instance(id: &str, state: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            state,
+            WorkflowSubject::new("pr", "1845"),
+        )
+        .with_id(id)
+    }
+
+    fn accepted_decision(instance: &WorkflowInstance) -> WorkflowDecision {
+        WorkflowDecision::new(
+            &instance.id,
+            "addressing_feedback",
+            "address_feedback",
+            "local_review_gate",
+            "feedback addressed",
+        )
+        .with_command(WorkflowCommand::enqueue_activity(
+            "run_local_review",
+            format!("{}-review", instance.id),
+        ))
+    }
+
+    async fn seed_accepted_record(
+        store: &WorkflowRuntimeStore,
+        decision: &WorkflowDecision,
+    ) -> anyhow::Result<WorkflowDecisionRecord> {
+        let mut tx = store.pool.begin().await?;
+        let event = insert_event_tx(
+            &mut tx,
+            &decision.workflow_id,
+            "IssueSubmitted",
+            "workflow-runtime-test",
+            json!({}),
+        )
+        .await?;
+        let record = WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id));
+        insert_decision_record_tx(&mut tx, &record).await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    #[tokio::test]
+    async fn accepted_submission_replay_rejects_unrelated_and_terminal_current_states(
+    ) -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+        for (suffix, state) in [("unrelated", "planning"), ("terminal", "done")] {
+            let current = instance(&format!("stale-replay-{suffix}"), state);
+            store.upsert_instance(&current).await?;
+            let decision = accepted_decision(&current);
+            let record = seed_accepted_record(&store, &decision).await?;
+            let mut final_instance = current.clone();
+            final_instance.state = decision.next_state.clone();
+            final_instance.version = 1;
+
+            let result = store
+                .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                    workflow_id: &current.id,
+                    expected_state: &current.state,
+                    expected_version: current.version,
+                    create_if_missing: None,
+                    event_id: record.event_id.as_deref(),
+                    new_event_id: None,
+                    event_type: "IssueSubmitted",
+                    source: "workflow-runtime-test",
+                    payload: json!({}),
+                    decision: &decision,
+                    existing_record: Some(&record),
+                    rejection_reason: None,
+                    final_instance: Some(&final_instance),
+                    command_status: WorkflowCommandStatus::Pending,
+                    prompt_payload: None,
+                })
+                .await;
+
+            let error = match result {
+                Ok(_) => panic!("stale accepted replay should fail"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("stale workflow submission replay"));
+            assert_eq!(store.get_instance(&current.id).await?, Some(current));
+            assert_eq!(store.events_for(&decision.workflow_id).await?.len(), 1);
+            assert_eq!(store.decisions_for(&decision.workflow_id).await?.len(), 1);
+            assert!(store.commands_for(&decision.workflow_id).await?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_new_submission_requires_failed_terminal_state() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+        for final_state in ["ready_to_merge", "done"] {
+            let initial = instance(
+                &format!("rejected-final-{final_state}"),
+                "addressing_feedback",
+            );
+            let decision = accepted_decision(&initial);
+            let mut final_instance = initial.clone();
+            final_instance.state = final_state.to_string();
+            final_instance.version = 1;
+
+            let result = store
+                .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                    workflow_id: &initial.id,
+                    expected_state: &initial.state,
+                    expected_version: initial.version,
+                    create_if_missing: Some(&initial),
+                    event_id: None,
+                    new_event_id: Some(&format!("rejected-final-{final_state}-event")),
+                    event_type: "IssueSubmitted",
+                    source: "workflow-runtime-test",
+                    payload: json!({}),
+                    decision: &decision,
+                    existing_record: None,
+                    rejection_reason: Some("rejected"),
+                    final_instance: Some(&final_instance),
+                    command_status: WorkflowCommandStatus::Pending,
+                    prompt_payload: None,
+                })
+                .await;
+
+            let error = match result {
+                Ok(_) => panic!("non-failed rejected final state should fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("failed terminal state"));
+            assert!(store.get_instance(&initial.id).await?.is_none());
+            assert!(store.events_for(&initial.id).await?.is_empty());
+            assert!(store.decisions_for(&initial.id).await?.is_empty());
+            assert!(store.commands_for(&initial.id).await?.is_empty());
+        }
+        Ok(())
+    }
+}
