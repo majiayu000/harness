@@ -548,7 +548,8 @@ async fn list_instances_by_parent_uses_store_updated_at() -> anyhow::Result<()> 
     store.upsert_instance(&parent).await?;
     store.upsert_instance(&child).await?;
 
-    let row_updated_at = Utc::now() - Duration::hours(2);
+    let row_updated_at =
+        DateTime::parse_from_rfc3339("2026-07-30T15:50:07.844135Z")?.with_timezone(&Utc);
     sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
         .bind(&child.id)
         .bind(row_updated_at)

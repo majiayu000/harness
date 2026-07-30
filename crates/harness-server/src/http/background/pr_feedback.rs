@@ -104,6 +104,11 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick(
         let request_outcome = if workflow.state == "pr_open" {
             crate::workflow_runtime_pr_feedback::request_local_review(store, &workflow.id).await?
         } else {
+            let refreshed = refresh_pr_feedback_sweep_remote_fact(state, store, &workflow).await?;
+            if !refreshed {
+                tick.skipped += 1;
+                continue;
+            }
             crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep(store, &workflow.id)
                 .await?
         };
@@ -123,6 +128,63 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick(
         }
     }
     Ok(tick)
+}
+
+async fn refresh_pr_feedback_sweep_remote_fact(
+    state: &Arc<AppState>,
+    store: &WorkflowRuntimeStore,
+    workflow: &WorkflowInstance,
+) -> anyhow::Result<bool> {
+    let Some(target) = pr_feedback_snapshot_target_from_workflow(workflow)? else {
+        tracing::warn!(
+            workflow_id = %workflow.id,
+            "workflow runtime PR feedback sweep skipped because the PR snapshot target is incomplete"
+        );
+        return Ok(false);
+    };
+    let snapshot = fetch_github_pr_snapshot(
+        &target,
+        state.core.server.config.server.github_token.as_deref(),
+    )
+    .await?;
+    let remote_fact = snapshot.remote_fact_snapshot()?;
+    store.upsert_remote_fact_snapshot(&remote_fact).await?;
+    Ok(true)
+}
+
+fn pr_feedback_snapshot_target_from_workflow(
+    workflow: &WorkflowInstance,
+) -> anyhow::Result<Option<GitHubPrSnapshotTarget>> {
+    let Some(pr_number) = workflow
+        .data
+        .get("pr_number")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return Ok(None);
+    };
+    let repo = workflow
+        .data
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            workflow
+                .data
+                .get("pr_url")
+                .and_then(serde_json::Value::as_str)
+                .and_then(harness_core::prompts::parse_github_pr_url)
+                .map(|(owner, repo, _)| format!("{owner}/{repo}"))
+        });
+    let Some(repo) = repo else {
+        return Ok(None);
+    };
+    let mut target = GitHubPrSnapshotTarget::new(repo, pr_number)?;
+    if let Some(expected_base_ref) = expected_base_ref_from_workflow_data(&workflow.data) {
+        target = target.with_expected_base_ref(expected_base_ref);
+    }
+    Ok(Some(target))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

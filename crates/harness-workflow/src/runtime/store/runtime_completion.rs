@@ -17,7 +17,8 @@ use crate::runtime::state_registry::{
 };
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
-use serde_json::Value;
+use anyhow::Context;
+use serde_json::{json, Value};
 
 pub(super) fn validator_for_instance(
     instance: &WorkflowInstance,
@@ -337,12 +338,81 @@ async fn persist_runtime_completion_decision_tx(
                 apply_inline_command_side_effect(&mut instance, followup)?;
             }
         }
+        apply_runtime_completion_data_side_effect(&mut instance, &record.decision, event)?;
         instance.state = record.decision.next_state.clone();
         instance.version = instance.version.saturating_add(1);
         upsert_instance_tx(tx, &instance).await?;
     }
 
     Ok(record)
+}
+
+fn apply_runtime_completion_data_side_effect(
+    instance: &mut WorkflowInstance,
+    decision: &WorkflowDecision,
+    event: &WorkflowEvent,
+) -> anyhow::Result<()> {
+    if instance.definition_id != crate::runtime::PR_FEEDBACK_DEFINITION_ID
+        || instance.state != "inspecting"
+        || decision.observed_state != "inspecting"
+        || !matches!(
+            decision.next_state.as_str(),
+            "feedback_found" | "no_actionable_feedback" | "ready_to_merge"
+        )
+    {
+        return Ok(());
+    }
+    let Some(snapshot) = pr_feedback_snapshot_from_completion_event(event) else {
+        return Ok(());
+    };
+    let mut facts_for_hash = snapshot.clone();
+    if let Some(object) = facts_for_hash.as_object_mut() {
+        object.remove("observed_at");
+    }
+    let fact_hash = crate::runtime::stable_remote_fact_hash(&facts_for_hash);
+    let activity_at = ["updated_at", "updatedAt"].into_iter().find_map(|field| {
+        snapshot
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    });
+    if !instance.data.is_object() {
+        instance.data = json!({});
+    }
+    let data = instance
+        .data
+        .as_object_mut()
+        .context("workflow instance data is not an object")?;
+    data.insert("remote_fact_hash".to_string(), json!(fact_hash));
+    if let Some(activity_at) = activity_at {
+        data.insert("remote_fact_activity_at".to_string(), json!(activity_at));
+    } else {
+        data.remove("remote_fact_activity_at");
+    }
+    Ok(())
+}
+
+fn pr_feedback_snapshot_from_completion_event(event: &WorkflowEvent) -> Option<&Value> {
+    let result = event.event.get("activity_result")?;
+    if result.get("activity").and_then(Value::as_str)
+        != Some(crate::runtime::PR_FEEDBACK_INSPECT_ACTIVITY)
+    {
+        return None;
+    }
+    result
+        .get("artifacts")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|artifact| {
+            matches!(
+                artifact.get("artifact_type").and_then(Value::as_str),
+                Some(crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT)
+                    | Some(crate::runtime::PR_FEEDBACK_SNAPSHOT_ARTIFACT)
+            )
+        })
+        .and_then(|artifact| artifact.get("artifact"))
 }
 
 fn is_definition_pin_safety_decision(
