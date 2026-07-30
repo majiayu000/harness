@@ -9,7 +9,6 @@ src/handlers/operator_monitor.rs::WorktreeSummary
 src/handlers/operator_monitor/activity.rs::RuntimeWorkflowCounts
 src/handlers/operator_monitor/activity.rs::SourceActivity
 src/handlers/operator_monitor/driverless_progress.rs::DriverlessProgressEvidence
-src/handlers/preflight.rs::PreflightResult
 src/handlers/projects.rs::RegisterProjectRequest
 src/handlers/reconcile.rs::ReconcileParams
 src/handlers/runtime_hosts.rs::CompleteRuntimeJobRequest
@@ -18,11 +17,6 @@ src/handlers/runtime_hosts/lease.rs::ClaimRuntimeJobRequest
 src/handlers/runtime_hosts/lease.rs::RenewRuntimeJobLeaseRequest
 src/handlers/runtime_project_cache.rs::SyncProjectItem
 src/handlers/runtime_project_cache.rs::SyncWatchedProjectsRequest
-src/handlers/skills.rs::GovernanceTransition
-src/handlers/skills.rs::GovernanceView
-src/handlers/skills.rs::StaleEntry
-src/handlers/token_usage.rs::HourModelBucket
-src/handlers/token_usage.rs::UsageBucket
 src/handlers/usage_monitor.rs::ActiveCount
 src/handlers/usage_monitor.rs::AgentInvocation
 src/handlers/usage_monitor.rs::CostConfig
@@ -92,7 +86,3 @@ src/workflow_runtime_submission/runtime_state.rs::SchedulerOwnerKind
 src/workflow_runtime_submission/runtime_state.rs::TaskSchedulerState
 src/workflow_runtime_submission/runtime_state.rs::TaskSummary
 src/workflow_runtime_submission/runtime_state.rs::TaskWorkflowSummary
-src/workflow_runtime_worker/activity_contract.rs::ActivityContract
-src/workflow_runtime_worker/prompt_packet/context_provenance.rs::ContextProvenance
-src/workflow_runtime_worker/prompt_packet/context_provenance.rs::ContextProvenanceEntry
-src/workflow_runtime_worker/prompt_packet/context_provenance.rs::MemoryEntryMetadata

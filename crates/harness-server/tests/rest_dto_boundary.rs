@@ -309,19 +309,8 @@ impl Visit<'_> for RestUseSiteVisitor<'_> {
             for arg in &call.args {
                 self.collect_json_payload_expr_refs(arg);
             }
-        } else if is_serde_to_value_call(&call.func) {
-            for arg in &call.args {
-                let refs = infer_expr_type_refs(arg, &self.local_types, self.type_index);
-                self.add_refs(&refs);
-            }
         }
         visit::visit_expr_call(self, call);
-    }
-
-    fn visit_expr_macro(&mut self, expr: &syn::ExprMacro) {
-        if is_json_macro_path(&expr.mac.path) {
-            self.collect_macro_local_refs(&expr.mac.tokens.to_string());
-        }
     }
 
     fn visit_expr_match(&mut self, expr: &syn::ExprMatch) {
@@ -363,24 +352,64 @@ impl RestUseSiteVisitor<'_> {
     }
 
     fn collect_json_payload_expr_refs(&mut self, expr: &syn::Expr) {
-        if let syn::Expr::Macro(expr_macro) = expr {
-            if is_json_macro_path(&expr_macro.mac.path) {
-                self.collect_macro_local_refs(&expr_macro.mac.tokens.to_string());
-                return;
-            }
-        }
         let refs = infer_expr_type_refs(expr, &self.local_types, self.type_index);
         self.add_refs(&refs);
+        RestPayloadVisitor { parent: self }.visit_expr(expr);
     }
 
     fn collect_macro_local_refs(&mut self, tokens: &str) {
-        let matched_refs = tokens
-            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-            .filter_map(|token| self.local_types.get(token))
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut matched_refs = Vec::new();
+        for token in tokens.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
+            if let Some(refs) = self.local_types.get(token) {
+                matched_refs.extend(refs.iter().cloned());
+            } else if token.starts_with(|ch: char| ch.is_ascii_uppercase()) {
+                matched_refs.push(TypeRef {
+                    path: vec![token.to_string()],
+                    name: token.to_string(),
+                });
+            }
+        }
         self.add_refs(&matched_refs);
+    }
+}
+
+struct RestPayloadVisitor<'a, 'b> {
+    parent: &'b mut RestUseSiteVisitor<'a>,
+}
+
+impl Visit<'_> for RestPayloadVisitor<'_, '_> {
+    fn visit_expr_call(&mut self, call: &syn::ExprCall) {
+        if is_serde_to_value_call(&call.func) {
+            for arg in &call.args {
+                let refs =
+                    infer_expr_type_refs(arg, &self.parent.local_types, self.parent.type_index);
+                self.parent.add_refs(&refs);
+            }
+        }
+        visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_macro(&mut self, expr: &syn::ExprMacro) {
+        if is_json_macro_path(&expr.mac.path) {
+            self.parent
+                .collect_macro_local_refs(&expr.mac.tokens.to_string());
+        }
+    }
+
+    fn visit_expr_path(&mut self, expr: &syn::ExprPath) {
+        let refs = infer_expr_type_refs(
+            &syn::Expr::Path(expr.clone()),
+            &self.parent.local_types,
+            self.parent.type_index,
+        );
+        self.parent.add_refs(&refs);
+    }
+
+    fn visit_expr_struct(&mut self, expr: &syn::ExprStruct) {
+        if let Some(type_ref) = type_ref_from_path(&expr.path) {
+            self.parent.add_refs(&[type_ref]);
+        }
+        visit::visit_expr_struct(self, expr);
     }
 }
 
@@ -656,39 +685,18 @@ fn pat_type_refs(pat: &syn::Pat) -> Option<Vec<TypeRef>> {
 }
 
 fn pat_binding_idents(pat: &syn::Pat) -> Vec<String> {
-    let mut idents = Vec::new();
-    collect_pat_binding_idents(pat, &mut idents);
-    idents
+    let mut visitor = PatBindingVisitor { idents: Vec::new() };
+    visitor.visit_pat(pat);
+    visitor.idents
 }
 
-fn collect_pat_binding_idents(pat: &syn::Pat, idents: &mut Vec<String>) {
-    match pat {
-        syn::Pat::Ident(pat_ident) => idents.push(pat_ident.ident.to_string()),
-        syn::Pat::Reference(pat_reference) => {
-            collect_pat_binding_idents(&pat_reference.pat, idents)
-        }
-        syn::Pat::Slice(pat_slice) => {
-            for pat in &pat_slice.elems {
-                collect_pat_binding_idents(pat, idents);
-            }
-        }
-        syn::Pat::Struct(pat_struct) => {
-            for field in &pat_struct.fields {
-                collect_pat_binding_idents(&field.pat, idents);
-            }
-        }
-        syn::Pat::Tuple(pat_tuple) => {
-            for pat in &pat_tuple.elems {
-                collect_pat_binding_idents(pat, idents);
-            }
-        }
-        syn::Pat::TupleStruct(pat_tuple_struct) => {
-            for pat in &pat_tuple_struct.elems {
-                collect_pat_binding_idents(pat, idents);
-            }
-        }
-        syn::Pat::Type(pat_type) => collect_pat_binding_idents(&pat_type.pat, idents),
-        _ => {}
+struct PatBindingVisitor {
+    idents: Vec<String>,
+}
+
+impl Visit<'_> for PatBindingVisitor {
+    fn visit_pat_ident(&mut self, pat: &syn::PatIdent) {
+        self.idents.push(pat.ident.to_string());
     }
 }
 
