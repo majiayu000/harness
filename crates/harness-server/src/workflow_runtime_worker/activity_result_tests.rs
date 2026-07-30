@@ -141,19 +141,21 @@ fn activity_result_from_turn_parses_structured_activity_result_block() {
             "activity": "implement_issue"
         }),
     );
+    let final_result = r#"{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"workflow_decision","artifact":{"encoding":"harness.runtime.json_payload.v1","json":"{\"workflow_id\":\"wf-1\",\"observed_state\":\"implementing\",\"decision\":\"continue\",\"next_state\":\"implementing\",\"reason\":\"needs review\",\"confidence\":\"high\",\"commands\":[{\"command_type\":\"enqueue_activity\",\"dedupe_key\":\"wf-1:review\",\"command\":{\"activity\":\"run_local_review\",\"note\":\"nested payload\"}}]}"}},{"artifact_type":"no_change_rationale","artifact":{"encoding":"harness.runtime.json_payload.v1","json":"\"No changes were needed\""}}],"signals":[{"signal_type":"external_state","signal":{"encoding":"harness.runtime.json_payload.v1","json":"{\"state\":\"Done\",\"subject\":{\"issue_number\":1756}}"}}],"validation":[],"error":null,"error_kind":null}"#;
     let items = vec![Item::AgentReasoning {
-        content: r#"Work completed.
+        content: format!(
+            r#"Work completed.
 
 ```harness-activity-result
-{"activity":"implement_issue","status":"succeeded","summary":"stale summary","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":66,"pr_url":"https://github.com/owner/repo/pull/66"}}]}
+{{"activity":"implement_issue","status":"succeeded","summary":"stale summary","artifacts":[{{"artifact_type":"pull_request","artifact":{{"pr_number":66,"pr_url":"https://github.com/owner/repo/pull/66"}}}}]}}
 ```
 
 Final result:
 
 ```harness-activity-result
-{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":77,"pr_url":"https://github.com/owner/repo/pull/77"}}]}
+{final_result}
 ```"#
-            .to_string(),
+        ),
     }];
 
     let result = activity_result_from_turn(
@@ -170,12 +172,21 @@ Final result:
     assert_eq!(result.activity, "implement_issue");
     assert_eq!(result.status, ActivityStatus::Succeeded);
     assert_eq!(result.summary, "Implementation completed.");
-    let pr_artifact = artifact_by_type(&result, "pull_request");
-    assert_eq!(pr_artifact.artifact["pr_number"], 77);
+    let decision = artifact_by_type(&result, "workflow_decision");
     assert_eq!(
-        pr_artifact.artifact["pr_url"],
-        "https://github.com/owner/repo/pull/77"
+        decision.artifact["commands"][0]["command"]["activity"],
+        "run_local_review"
     );
+    let no_change = artifact_by_type(&result, "no_change_rationale");
+    assert_eq!(no_change.artifact, json!("No changes were needed"));
+    let Some(external_state) = result
+        .signals
+        .iter()
+        .find(|signal| signal.signal_type == "external_state")
+    else {
+        panic!("encoded signal payload should round-trip");
+    };
+    assert_eq!(external_state.signal["subject"]["issue_number"], 1756);
     let prompt_artifact = artifact_by_type(&result, "runtime_prompt_packet");
     assert_eq!(prompt_artifact.artifact["digest"], "digest-1");
     let turn_artifact = artifact_by_type(&result, "runtime_turn");

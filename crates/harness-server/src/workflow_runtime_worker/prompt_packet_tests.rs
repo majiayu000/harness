@@ -499,29 +499,12 @@ fn prompt_task_packet_describes_disjunctive_completion_evidence_contract() {
 fn activity_result_json_schema_is_codex_strict_compatible() {
     let schema = activity_result_json_schema("implement_prompt");
     assert_eq!(
-        schema["required"],
-        json!([
-            "activity",
-            "status",
-            "summary",
-            "artifacts",
-            "signals",
-            "validation",
-            "error",
-            "error_kind"
-        ])
-    );
-    for (field, required) in [
-        ("artifacts", json!(["artifact_type", "artifact"])),
-        ("signals", json!(["signal_type", "signal"])),
-        ("validation", json!(["command", "status", "reason"])),
-    ] {
-        assert_eq!(schema["properties"][field]["items"]["required"], required);
-    }
-    assert_eq!(
         schema["properties"]["signals"]["items"]["properties"]["signal"],
-        json!({"type": "object"})
+        json!({"$ref": "#/$defs/json_payload"})
     );
+    #[rustfmt::skip]
+    fn walk(schema: &Value) { if schema.get("type") == Some(&json!("object")) || schema.get("type").and_then(Value::as_array).is_some_and(|items| items.contains(&json!("object"))) { assert_eq!(schema.get("additionalProperties"), Some(&Value::Bool(false))); let properties = schema["properties"].as_object().unwrap_or_else(|| panic!("object schema must declare properties")); let required = schema["required"].as_array().unwrap_or_else(|| panic!("object schema must declare required")); assert_eq!(required.len(), properties.len()); assert!(properties.keys().all(|key| required.contains(&json!(key)))); } match schema { Value::Array(items) => items.iter().for_each(walk), Value::Object(object) => object.values().for_each(walk), _ => {} } }
+    walk(&schema);
 }
 
 #[test]

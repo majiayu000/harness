@@ -206,27 +206,20 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert!(prompts[0].contains("activity_result_schema"));
     assert!(prompts[0].contains("required_structured_output"));
     drop(prompts);
-    let models = agent.models.lock().await;
     assert_eq!(
-        models.as_slice(),
+        agent.models.lock().await.as_slice(),
         &[Some("configured-codex-model".to_string())]
     );
-    drop(models);
-    let reasoning_efforts = agent.reasoning_efforts.lock().await;
     assert_eq!(
-        reasoning_efforts.as_slice(),
+        agent.reasoning_efforts.lock().await.as_slice(),
         &[Some("configured-codex-effort".to_string())]
     );
-    drop(reasoning_efforts);
-    let sandbox_modes = agent.sandbox_modes.lock().await;
     assert_eq!(
-        sandbox_modes.as_slice(),
+        agent.sandbox_modes.lock().await.as_slice(),
         &[Some(SandboxMode::WorkspaceWrite)]
     );
-    drop(sandbox_modes);
-    let approval_policies = agent.approval_policies.lock().await;
     assert_eq!(
-        approval_policies.as_slice(),
+        agent.approval_policies.lock().await.as_slice(),
         &[Some("on-request".to_string())]
     );
     Ok(())

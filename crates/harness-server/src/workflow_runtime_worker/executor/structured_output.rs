@@ -140,14 +140,13 @@ fn previous_output_tail(items: &[Item]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[rustfmt::skip]
     #[test]
     fn codex_output_schema_file_is_readable_until_guard_drops() -> anyhow::Result<()> {
         let job = RuntimeJob::pending("c", RuntimeKind::CodexJsonrpc, "p", json!({}));
         let project_root = tempfile::tempdir()?;
         let prompt_packet = json!({"activity_result_schema":{"json_schema":{"type":"object","required":["activity"]}}});
-        let schema_file =
-            codex_output_schema_file(true, &job, project_root.path(), &prompt_packet)?
-                .ok_or_else(|| anyhow::anyhow!("expected codex output schema file"))?;
+        let schema_file = codex_output_schema_file(true, &job, project_root.path(), &prompt_packet)?.ok_or_else(|| anyhow::anyhow!("expected codex output schema file"))?;
         let path = schema_file.argument_path.clone();
         assert!(path.starts_with(project_root.path()));
         let schema: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
@@ -156,22 +155,11 @@ mod tests {
         assert!(!path.exists());
         Ok(())
     }
+    #[rustfmt::skip]
     #[test]
     fn previous_output_tail_keeps_recent_relevant_bounded_context() {
-        assert_eq!(
-            previous_output_tail(&[
-                reasoning("first"),
-                Item::Error {
-                    code: 1,
-                    message: "last error".to_string(),
-                },
-            ]),
-            "first\n\nlast error"
-        );
-        let latest = format!(
-            "{}LATEST_SENTINEL",
-            "x".repeat(CORRECTION_TRANSCRIPT_EXCERPT_LIMIT + 1000)
-        );
+        assert_eq!(previous_output_tail(&[reasoning("first"), Item::Error { code: 1, message: "last error".to_string() }]), "first\n\nlast error");
+        let latest = format!("{}LATEST_SENTINEL", "x".repeat(CORRECTION_TRANSCRIPT_EXCERPT_LIMIT + 1000));
         let items = vec![reasoning("OLD_SENTINEL".repeat(1000)), reasoning(latest)];
         let excerpt = previous_output_tail(&items);
         assert!(excerpt.chars().count() <= CORRECTION_TRANSCRIPT_EXCERPT_LIMIT);

@@ -1,5 +1,6 @@
 use harness_workflow::runtime::ActivityResult;
 use serde_json::{Map, Value};
+const JSON_PAYLOAD_ENCODING: &str = "harness.runtime.json_payload.v1";
 pub(super) struct StructuredActivityResultError {
     pub error: String,
     pub extracted_activity: Option<String>,
@@ -8,7 +9,7 @@ pub(super) fn parse_activity_result_json(
     block: &str,
     expected_activity: &str,
 ) -> Result<ActivityResult, StructuredActivityResultError> {
-    let value: Value =
+    let mut value: Value =
         serde_json::from_str(block).map_err(|error| StructuredActivityResultError {
             error: format!("activity result JSON is invalid: {error}"),
             extracted_activity: None,
@@ -17,6 +18,12 @@ pub(super) fn parse_activity_result_json(
         .get("activity")
         .and_then(Value::as_str)
         .map(str::to_string);
+    normalize_strict_output_payloads(&mut value).map_err(|error| {
+        StructuredActivityResultError {
+            error,
+            extracted_activity: extracted_activity.clone(),
+        }
+    })?;
     validate_activity_result_shape(&value).map_err(|error| StructuredActivityResultError {
         error,
         extracted_activity: extracted_activity.clone(),
@@ -36,6 +43,43 @@ pub(super) fn parse_activity_result_json(
         });
     }
     Ok(result)
+}
+fn normalize_strict_output_payloads(value: &mut Value) -> Result<(), String> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+    normalize_payload_records(object, "artifacts", "artifact")?;
+    normalize_payload_records(object, "signals", "signal")
+}
+fn normalize_payload_records(
+    object: &mut Map<String, Value>,
+    array_field: &str,
+    payload_field: &str,
+) -> Result<(), String> {
+    let Some(Value::Array(records)) = object.get_mut(array_field) else {
+        return Ok(());
+    };
+    for (index, record) in records.iter_mut().enumerate() {
+        let path = format!("$.{array_field}[{index}].{payload_field}");
+        let record = record
+            .as_object_mut()
+            .ok_or_else(|| format!("$.{array_field}[{index}] expected object"))?;
+        let Some(payload) = record.get_mut(payload_field) else {
+            continue;
+        };
+        let Some(payload_object) = payload.as_object() else {
+            continue;
+        };
+        if payload_object.get("encoding").and_then(Value::as_str) == Some(JSON_PAYLOAD_ENCODING) {
+            let json = payload_object
+                .get("json")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{path}.json is required"))?;
+            *payload = serde_json::from_str(json)
+                .map_err(|error| format!("{path}.json is not valid JSON: {error}"))?;
+        }
+    }
+    Ok(())
 }
 fn validate_activity_result_shape(value: &Value) -> Result<(), String> {
     let object = expect_object(value, "$")?;
