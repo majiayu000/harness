@@ -383,3 +383,76 @@ async fn runtime_pr_feedback_sweep_skips_active_driver_without_spending_work_lim
     assert_eq!(store.commands_for(&older_pr_open.id).await?.len(), 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_pr_feedback_sweep_caps_remote_refresh_failures() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    use crate::workspace::test_support::{async_env_lock, ScopedEnvVar};
+
+    let _env_guard = async_env_lock().lock().await;
+    let (graphql_url, received) =
+        spawn_graphql_stub_responses(vec![(200, "{}".to_string()), (200, "{}".to_string())])
+            .await?;
+    let _graphql_guard = ScopedEnvVar::set("HARNESS_GITHUB_GRAPHQL_URL", &graphql_url);
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-refresh-cap");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\npr_feedback:\n  enabled: true\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+
+    for issue_number in [230_u64, 231] {
+        let workflow = harness_workflow::runtime::WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "awaiting_feedback",
+            harness_workflow::runtime::WorkflowSubject::new(
+                "issue",
+                format!("issue:{issue_number}"),
+            ),
+        )
+        .with_id(format!("issue-{issue_number}-refresh-failure"))
+        .with_data(serde_json::json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": issue_number,
+            "pr_number": issue_number,
+            "pr_url": format!("https://github.com/owner/repo/pull/{issue_number}"),
+            "task_id": format!("runtime-task-{issue_number}"),
+        }));
+        store.upsert_instance(&workflow).await?;
+    }
+
+    let mut cursor = 0;
+    let tick =
+        super::background::run_runtime_pr_feedback_sweep_tick_with_cursor(&state, 1, &mut cursor)
+            .await?;
+
+    assert_eq!(tick.requested, 0);
+    assert_eq!(tick.rejected, 1);
+    assert_eq!(tick.remote_refresh_attempts, 1);
+    assert_eq!(received.lock().await.len(), 1);
+
+    let next_tick =
+        super::background::run_runtime_pr_feedback_sweep_tick_with_cursor(&state, 1, &mut cursor)
+            .await?;
+    assert_eq!(next_tick.rejected, 1);
+    assert_eq!(next_tick.remote_refresh_attempts, 1);
+    assert_eq!(
+        received.lock().await.len(),
+        2,
+        "the rotating cursor must advance to the next remote candidate"
+    );
+    Ok(())
+}

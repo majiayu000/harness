@@ -104,6 +104,8 @@ pub(super) async fn persist_pr_feedback_sweep_request(
         .get("issue_number")
         .and_then(|value| value.as_u64());
     let repo = optional_string_field(&instance.data, "repo");
+    let expected_base_ref =
+        crate::http::auto_merge::expected_base_ref_from_workflow_data(&instance.data);
     let accepted_data = instance.data.clone();
     let sweep_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let remote_fact_activity_at = latest_pr_fact
@@ -117,6 +119,7 @@ pub(super) async fn persist_pr_feedback_sweep_request(
             pr_url: pr_url.as_deref(),
             issue_number,
             repo: repo.as_deref(),
+            expected_base_ref: expected_base_ref.as_deref(),
             remote_fact_hash: latest_pr_fact.map(|fact| fact.fact_hash.as_str()),
             remote_fact_activity_at: remote_fact_activity_at.as_deref(),
             summary: "Runtime workflow requested a PR feedback sweep.",

@@ -5,6 +5,7 @@ pub(in crate::http) struct RuntimePrFeedbackSweepTick {
     pub requested: usize,
     pub auto_merge_requested: usize,
     pub active_command_exists: usize,
+    pub remote_refresh_attempts: usize,
     pub skipped: usize,
     pub rejected: usize,
 }
@@ -19,23 +20,42 @@ impl RuntimePrFeedbackSweepTick {
     }
 }
 
+#[cfg(test)]
 pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick(
     state: &Arc<AppState>,
     limit: usize,
 ) -> anyhow::Result<RuntimePrFeedbackSweepTick> {
+    let mut cursor = 0;
+    run_runtime_pr_feedback_sweep_tick_with_cursor(state, limit, &mut cursor).await
+}
+
+pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick_with_cursor(
+    state: &Arc<AppState>,
+    limit: usize,
+    cursor: &mut usize,
+) -> anyhow::Result<RuntimePrFeedbackSweepTick> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(RuntimePrFeedbackSweepTick::default());
     };
-    let workflows = store
+    let mut workflows = store
         .list_instances_by_definition(
             harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
             None,
             None,
         )
         .await?;
+    if workflows.is_empty() {
+        *cursor = 0;
+        return Ok(RuntimePrFeedbackSweepTick::default());
+    }
+    let workflow_count = workflows.len();
+    let start = *cursor % workflow_count;
+    workflows.rotate_left(start);
     let mut tick = RuntimePrFeedbackSweepTick::default();
     let work_limit = limit.max(1);
-    for mut workflow in workflows {
+    let remote_refresh_limit = limit.max(1);
+    for (offset, mut workflow) in workflows.into_iter().enumerate() {
+        *cursor = (start + offset + 1) % workflow_count;
         if !matches!(
             workflow.state.as_str(),
             "pr_open" | "awaiting_feedback" | "ready_to_merge"
@@ -87,6 +107,7 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick(
             continue;
         }
         if tick.requested + tick.auto_merge_requested >= work_limit {
+            *cursor = (start + offset) % workflow_count;
             break;
         }
 
@@ -112,6 +133,11 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick(
                 tick.active_command_exists += 1;
                 continue;
             }
+            if tick.remote_refresh_attempts >= remote_refresh_limit {
+                *cursor = (start + offset) % workflow_count;
+                break;
+            }
+            tick.remote_refresh_attempts += 1;
             let refreshed = match refresh_pr_feedback_sweep_remote_fact(state, store, &workflow)
                 .await
             {
@@ -339,6 +365,7 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
 
     let weak_state = Arc::downgrade(state);
     tokio::spawn(async move {
+        let mut remote_refresh_cursor = 0;
         loop {
             let state = match weak_state.upgrade() {
                 Some(state) => state,
@@ -359,11 +386,18 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
             };
             let interval =
                 std::time::Duration::from_secs(workflow_cfg.pr_feedback.sweep_interval_secs.max(1));
-            match run_runtime_pr_feedback_sweep_tick(&state, 128).await {
+            match run_runtime_pr_feedback_sweep_tick_with_cursor(
+                &state,
+                128,
+                &mut remote_refresh_cursor,
+            )
+            .await
+            {
                 Ok(tick) if tick.touched_anything() => {
                     tracing::info!(
                         requested = tick.requested,
                         active_command_exists = tick.active_command_exists,
+                        remote_refresh_attempts = tick.remote_refresh_attempts,
                         skipped = tick.skipped,
                         rejected = tick.rejected,
                         "workflow runtime PR feedback sweeper tick complete"

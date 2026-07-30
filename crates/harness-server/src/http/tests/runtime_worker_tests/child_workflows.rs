@@ -239,6 +239,7 @@ async fn runtime_job_worker_starts_pr_feedback_child_workflow_without_agent_turn
         "issue_number": 226,
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
+        "expected_base_ref": "release",
         "task_id": "runtime-task-226",
     }));
     store.upsert_instance(&parent).await?;
@@ -253,6 +254,7 @@ async fn runtime_job_worker_starts_pr_feedback_child_workflow_without_agent_turn
             "issue_number": 226,
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
+            "expected_base_ref": "release",
         }),
     );
     let command_id = store.enqueue_command(&parent.id, None, &command).await?;
@@ -301,12 +303,17 @@ async fn runtime_job_worker_starts_pr_feedback_child_workflow_without_agent_turn
         Some("issue-pr-feedback-parent")
     );
     assert_eq!(child.data["pr_number"], 77);
+    assert_eq!(child.data["expected_base_ref"], "release");
     assert_eq!(child.data["started_by_runtime_job_id"], runtime_job.id);
     let child_commands = store.commands_for(&child.id).await?;
     assert_eq!(child_commands.len(), 1);
     assert_eq!(
         child_commands[0].command.activity_name(),
         Some(harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY)
+    );
+    assert_eq!(
+        child_commands[0].command.command["expected_base_ref"],
+        "release"
     );
     Ok(())
 }

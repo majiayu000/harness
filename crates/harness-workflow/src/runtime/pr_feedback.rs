@@ -60,6 +60,7 @@ pub struct PrFeedbackSweepDecisionInput<'a> {
     pub pr_url: Option<&'a str>,
     pub issue_number: Option<u64>,
     pub repo: Option<&'a str>,
+    pub expected_base_ref: Option<&'a str>,
     pub remote_fact_hash: Option<&'a str>,
     pub remote_fact_activity_at: Option<&'a str>,
     pub summary: &'a str,
@@ -110,6 +111,7 @@ pub struct PrFeedbackInspectDecisionInput<'a> {
     pub pr_url: Option<&'a str>,
     pub issue_number: Option<u64>,
     pub repo: Option<&'a str>,
+    pub expected_base_ref: Option<&'a str>,
     pub parent_workflow_id: Option<&'a str>,
     pub summary: &'a str,
 }
@@ -353,6 +355,7 @@ pub fn build_pr_feedback_sweep_decision(
             "pr_url": input.pr_url,
             "issue_number": input.issue_number,
             "repo": input.repo,
+            "expected_base_ref": input.expected_base_ref,
             "remote_fact_hash": input.remote_fact_hash,
             "remote_fact_activity_at": input.remote_fact_activity_at,
         }),
@@ -425,6 +428,7 @@ pub fn build_pr_feedback_inspect_decision(
             "pr_url": input.pr_url,
             "issue_number": input.issue_number,
             "repo": input.repo,
+            "expected_base_ref": input.expected_base_ref,
             "parent_workflow_id": input.parent_workflow_id,
         }),
     ))
