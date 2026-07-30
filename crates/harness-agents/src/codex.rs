@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 #[path = "codex_exec_parser.rs"]
 mod codex_exec_parser;
@@ -225,27 +224,6 @@ impl CodexAgent {
         let use_stdin_prompt = review_uses_stdin_prompt(&req);
         let (prepared_spawn, run_identity) = self.prepare_review_spawn(&req)?;
 
-        let mut cmd = Command::new(&prepared_spawn.program);
-        cmd.args(&prepared_spawn.args)
-            .current_dir(&prepared_spawn.current_dir)
-            .stdin(if use_stdin_prompt {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        crate::set_process_group(&mut cmd);
-        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-
-        if self.cloud.enabled {
-            for key in &self.cloud.setup_secret_env {
-                cmd.env_remove(key);
-            }
-        }
-
         tracing::debug!(
             agent = "codex",
             mode = "review",
@@ -256,33 +234,47 @@ impl CodexAgent {
             has_stdin_instructions = use_stdin_prompt,
             "codex review spawn prepared"
         );
-        let mut child = cmd.spawn().map_err(|error| {
-            let message = format!(
-                "failed to run codex review: {error}; mode=review; program={}; current_dir={}; sandbox_engine={:?}; arg_count={}",
-                prepared_spawn.program.display(),
-                prepared_spawn.current_dir.display(),
-                prepared_spawn.sandbox_engine,
-                prepared_spawn.args.len()
-            );
-            let message =
-                crate::classify_missing_workspace_spawn_failure(&error, &req.project_root, message);
-            tracing::error!(agent = "codex", mode = "review", error_kind = ?error.kind(), "{message}");
-            harness_core::error::HarnessError::AgentExecution(message)
-        })?;
-        if let Some(pid) = child.id() {
-            crate::write_provisional_agent_run_binding(
-                &run_identity,
-                "codex",
-                pid,
-                &prepared_spawn.current_dir,
-            );
-        }
+        let spawn_project_root = req.project_root.clone();
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
+                prepared_spawn,
+                run_identity,
+                native_kind: "codex",
+                process_label: "codex review",
+                stdio: crate::spawn_supervisor::AgentStdio::piped_output(
+                    if use_stdin_prompt {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    },
+                ),
+                extra_env_removals: cloud_setup_env_removals(&self.cloud),
+                map_spawn_error: Box::new(move |error, spawn| {
+                    let message = format!(
+                        "failed to run codex review: {error}; mode=review; program={}; current_dir={}; sandbox_engine={:?}; arg_count={}",
+                        spawn.program.display(),
+                        spawn.current_dir.display(),
+                        spawn.sandbox_engine,
+                        spawn.args.len()
+                    );
+                    let message = crate::classify_missing_workspace_spawn_failure(
+                        error,
+                        &spawn_project_root,
+                        message,
+                    );
+                    harness_core::error::HarnessError::AgentExecution(message)
+                }),
+            },
+            None,
+        )
+        .await?;
+        let mut child = supervised.child;
 
         if use_stdin_prompt {
             let Some(instructions) = req.instructions.as_deref() else {
                 unreachable!("review stdin prompt requires instructions");
             };
-            let Some(mut stdin) = child.stdin.take() else {
+            let Some(mut stdin) = child.inner_mut().stdin.take() else {
                 return Err(harness_core::error::HarnessError::AgentExecution(
                     "failed to open stdin for codex review instructions".to_string(),
                 ));
@@ -297,7 +289,6 @@ impl CodexAgent {
                 })?;
         }
 
-        let mut child = crate::ManagedChild::new(child, "codex review");
         let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
         let output = child.wait_with_output(&limits).await.map_err(|error| {
             harness_core::error::HarnessError::AgentExecution(format!(
@@ -341,6 +332,14 @@ fn review_uses_stdin_prompt(req: &CodexReviewRequest) -> bool {
 
 fn review_uses_config_instructions(req: &CodexReviewRequest) -> bool {
     req.instructions.is_some() && !review_uses_stdin_prompt(req)
+}
+
+fn cloud_setup_env_removals(cloud: &CodexCloudConfig) -> Vec<String> {
+    if cloud.enabled {
+        cloud.setup_secret_env.clone()
+    } else {
+        Vec::new()
+    }
 }
 
 fn codex_structured_error_from_stdout(stdout: &str) -> Option<String> {
@@ -438,23 +437,6 @@ impl CodeAgent for CodexAgent {
                 forward_stdin: false,
             })?;
 
-        let mut cmd = Command::new(&prepared_spawn.program);
-        cmd.args(&prepared_spawn.args)
-            .current_dir(&prepared_spawn.current_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        crate::set_process_group(&mut cmd);
-        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-
-        if self.cloud.enabled {
-            for key in &self.cloud.setup_secret_env {
-                cmd.env_remove(key);
-            }
-        }
-
         log_codex_spawn_attempt(
             &prepared_spawn.program,
             prepared_spawn.args.len(),
@@ -462,31 +444,29 @@ impl CodeAgent for CodexAgent {
             prepared_spawn.sandbox_engine,
             "execute",
         );
-        let child = cmd.spawn().map_err(|err| {
-            let message = codex_spawn_failure_message(
-                &err,
-                &prepared_spawn.program,
-                &req,
-                prepared_spawn.sandbox_engine,
-                "execute",
-            );
-            tracing::error!(
-                agent = "codex",
-                mode = "execute",
-                error_kind = ?err.kind(),
-                "{message}"
-            );
-            harness_core::error::HarnessError::AgentExecution(message)
-        })?;
-        if let Some(pid) = child.id() {
-            crate::write_provisional_agent_run_binding(
-                &run_identity,
-                "codex",
-                pid,
-                &prepared_spawn.current_dir,
-            );
-        }
-        let mut child = crate::ManagedChild::new(child, "codex execute");
+        let spawn_error_req = req.clone();
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
+                prepared_spawn,
+                run_identity,
+                native_kind: "codex",
+                process_label: "codex execute",
+                stdio: crate::spawn_supervisor::AgentStdio::piped_output(Stdio::null()),
+                extra_env_removals: cloud_setup_env_removals(&self.cloud),
+                map_spawn_error: Box::new(move |error, spawn| {
+                    harness_core::error::HarnessError::AgentExecution(codex_spawn_failure_message(
+                        error,
+                        &spawn.program,
+                        &spawn_error_req,
+                        spawn.sandbox_engine,
+                        "execute",
+                    ))
+                }),
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
+        let mut child = supervised.child;
         let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
         let output = child.wait_with_output(&limits).await.map_err(|err| {
             harness_core::error::HarnessError::AgentExecution(format!(
@@ -567,23 +547,6 @@ impl CodeAgent for CodexAgent {
                 forward_stdin: false,
             })?;
 
-        let mut cmd = Command::new(&prepared_spawn.program);
-        cmd.args(&prepared_spawn.args)
-            .current_dir(&prepared_spawn.current_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        crate::set_process_group(&mut cmd);
-        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-
-        if self.cloud.enabled {
-            for key in &self.cloud.setup_secret_env {
-                cmd.env_remove(key);
-            }
-        }
-
         log_codex_spawn_attempt(
             &prepared_spawn.program,
             prepared_spawn.args.len(),
@@ -591,31 +554,29 @@ impl CodeAgent for CodexAgent {
             prepared_spawn.sandbox_engine,
             "execute_stream",
         );
-        let child = cmd.spawn().map_err(|error| {
-            let message = codex_spawn_failure_message(
-                &error,
-                &prepared_spawn.program,
-                &req,
-                prepared_spawn.sandbox_engine,
-                "execute_stream",
-            );
-            tracing::error!(
-                agent = "codex",
-                mode = "execute_stream",
-                error_kind = ?error.kind(),
-                "{message}"
-            );
-            harness_core::error::HarnessError::AgentExecution(message)
-        })?;
-        if let Some(pid) = child.id() {
-            crate::write_provisional_agent_run_binding(
-                &run_identity,
-                "codex",
-                pid,
-                &prepared_spawn.current_dir,
-            );
-        }
-        let mut child = crate::ManagedChild::new(child, "codex execute_stream");
+        let spawn_error_req = req.clone();
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
+                prepared_spawn,
+                run_identity,
+                native_kind: "codex",
+                process_label: "codex execute_stream",
+                stdio: crate::spawn_supervisor::AgentStdio::piped_output(Stdio::null()),
+                extra_env_removals: cloud_setup_env_removals(&self.cloud),
+                map_spawn_error: Box::new(move |error, spawn| {
+                    harness_core::error::HarnessError::AgentExecution(codex_spawn_failure_message(
+                        error,
+                        &spawn.program,
+                        &spawn_error_req,
+                        spawn.sandbox_engine,
+                        "execute_stream",
+                    ))
+                }),
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
+        let mut child = supervised.child;
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;

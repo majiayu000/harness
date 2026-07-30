@@ -20,7 +20,6 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 
 pub struct ClaudeCodeAgent {
@@ -209,17 +208,6 @@ impl CodeAgent for ClaudeCodeAgent {
             "spawning claude agent"
         );
 
-        let mut cmd = Command::new(&prepared_spawn.program);
-        cmd.args(&prepared_spawn.args)
-            .current_dir(&prepared_spawn.current_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        crate::set_process_group(&mut cmd);
-        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-
         let _provider_permit = self
             .provider_gate
             .acquire(
@@ -229,38 +217,28 @@ impl CodeAgent for ClaudeCodeAgent {
             )
             .await?;
 
-        let spawn_result = cmd.spawn();
-        let child = match spawn_result {
-            Ok(child) => child,
-            Err(ref error) if error.raw_os_error() == Some(26) => {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                cmd.spawn().map_err(|error| {
+        let spawn_project_root = req.project_root.clone();
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
+                prepared_spawn,
+                run_identity,
+                native_kind: "claude-code",
+                process_label: "claude execute",
+                stdio: crate::spawn_supervisor::AgentStdio::piped_output(Stdio::null()),
+                extra_env_removals: Vec::new(),
+                map_spawn_error: Box::new(move |error, _spawn| {
                     let message = crate::classify_missing_workspace_spawn_failure(
-                        &error,
-                        &req.project_root,
+                        error,
+                        &spawn_project_root,
                         format!("failed to run claude: {error}"),
                     );
                     harness_core::error::HarnessError::AgentExecution(message)
-                })?
-            }
-            Err(error) => {
-                let message = crate::classify_missing_workspace_spawn_failure(
-                    &error,
-                    &req.project_root,
-                    format!("failed to run claude: {error}"),
-                );
-                return Err(harness_core::error::HarnessError::AgentExecution(message));
-            }
-        };
-        if let Some(pid) = child.id() {
-            crate::write_provisional_agent_run_binding(
-                &run_identity,
-                "claude-code",
-                pid,
-                &prepared_spawn.current_dir,
-            );
-        }
-        let mut child = crate::ManagedChild::new(child, "claude execute");
+                }),
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
+        let mut child = supervised.child;
 
         let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
         let output = child.wait_with_output(&limits).await.map_err(|e| {
@@ -369,51 +347,28 @@ impl CodeAgent for ClaudeCodeAgent {
             "claude execute_stream admitted by provider gate"
         );
 
-        let mut cmd = Command::new(&prepared_spawn.program);
-        cmd.args(&prepared_spawn.args)
-            .current_dir(&prepared_spawn.current_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        crate::set_process_group(&mut cmd);
-        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-
-        // ETXTBSY (error 26) occurs on Linux when a security scanner or indexer
-        // briefly opens the executable for writing after it is written. Retry once.
-        let spawn_result = cmd.spawn();
-        let child = match spawn_result {
-            Ok(child) => child,
-            Err(ref e) if e.raw_os_error() == Some(26) => {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                cmd.spawn().map_err(|error| {
+        let spawn_project_root = req.project_root.clone();
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
+                prepared_spawn,
+                run_identity,
+                native_kind: "claude-code",
+                process_label: "claude execute_stream",
+                stdio: crate::spawn_supervisor::AgentStdio::piped_output(Stdio::null()),
+                extra_env_removals: Vec::new(),
+                map_spawn_error: Box::new(move |error, _spawn| {
                     let message = crate::classify_missing_workspace_spawn_failure(
-                        &error,
-                        &req.project_root,
+                        error,
+                        &spawn_project_root,
                         format!("failed to run claude: {error}"),
                     );
                     harness_core::error::HarnessError::AgentExecution(message)
-                })?
-            }
-            Err(error) => {
-                let message = crate::classify_missing_workspace_spawn_failure(
-                    &error,
-                    &req.project_root,
-                    format!("failed to run claude: {error}"),
-                );
-                return Err(harness_core::error::HarnessError::AgentExecution(message));
-            }
-        };
-        if let Some(pid) = child.id() {
-            crate::write_provisional_agent_run_binding(
-                &run_identity,
-                "claude-code",
-                pid,
-                &prepared_spawn.current_dir,
-            );
-        }
-        let mut child = crate::ManagedChild::new(child, "claude execute_stream");
+                }),
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
+        let mut child = supervised.child;
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;
