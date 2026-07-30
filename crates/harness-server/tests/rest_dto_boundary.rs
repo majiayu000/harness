@@ -78,9 +78,12 @@ const LEGACY_SERVER_LOCAL_REST_DTOS: &[&str] = &[
     "src/http/workflow_routes.rs::IssueWorkflowByIssueQuery",
     "src/http/workflow_routes.rs::IssueWorkflowByPrQuery",
     "src/http/workflow_routes.rs::ProjectWorkflowByProjectQuery",
+    "src/runtime_hosts.rs::RuntimeHostInfo",
+    "src/runtime_hosts.rs::RuntimeHostLifecycle",
+    "src/runtime_hosts.rs::TaskClaimResult",
+    "src/runtime_project_cache.rs::HostProjectCacheSnapshot",
+    "src/runtime_project_cache.rs::WatchedProject",
     "src/workflow_runtime_submission/runtime_request.rs::CreateTaskRequest",
-    "src/workflow_runtime_worker/data_helpers.rs::PromptTaskRequest",
-    "src/workflow_runtime_worker/runtime_execution_queue.rs::RuntimeExecutionQueueRequest",
 ];
 
 #[test]
@@ -142,10 +145,18 @@ fn collect_rest_dtos(manifest_dir: &Path, dir: &Path, discovered: &mut Vec<Strin
 }
 
 fn is_rest_dto_candidate(path_str: &str, name: &str, attrs: &[syn::Attribute]) -> bool {
-    let is_route_module =
-        path_str.starts_with("src/http/") || path_str.starts_with("src/handlers/");
+    if !has_serde_derive(attrs) {
+        return false;
+    }
     let has_wire_name = name.ends_with("Request") || name.ends_with("Response");
-    has_wire_name || (is_route_module && has_serde_derive(attrs))
+    has_wire_name || is_rest_boundary_module(path_str)
+}
+
+fn is_rest_boundary_module(path_str: &str) -> bool {
+    path_str.starts_with("src/http/")
+        || path_str.starts_with("src/handlers/")
+        || path_str == "src/runtime_hosts.rs"
+        || path_str == "src/runtime_project_cache.rs"
 }
 
 fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {

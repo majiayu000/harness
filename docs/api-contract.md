@@ -174,7 +174,10 @@ that is best-effort local observability rather than a server-mediated workflow
 record.
 
 Use the server JSON-RPC methods (`gc/*`, `rule/*`, `skill/*`) when those
-operations must run behind the active server transport and lifecycle boundary.
+operations must run behind the active server transport, authentication, and
+shared server state. These methods do not generally create workflow runtime
+submissions or lifecycle records; only method-specific handlers that explicitly
+enqueue workflow work participate in the workflow runtime lifecycle.
 
 ## HTTP runtime submission list
 
