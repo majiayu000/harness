@@ -213,7 +213,10 @@ pub fn protective_control_diff(
     after: &[AgentStackProtectionControl],
 ) -> Vec<AgentStackProtectionControlDiff> {
     let before_ids = component_ids(before);
-    let after_by_id = by_component_id(after);
+    let after_controls = aggregate_controls(after);
+    let after_by_id = by_component_id(&after_controls);
+    let replacement_use_counts =
+        replacement_use_counts(before, &after_controls, &before_ids, &after_by_id);
     let mut facts = Vec::new();
 
     for before_control in before {
@@ -221,13 +224,15 @@ pub fn protective_control_diff(
             continue;
         }
         let component_id = before_control.component.component_id().as_str();
-        match after_by_id.get(component_id) {
-            Some(after_controls) => {
-                for after_control in after_controls {
-                    compare_existing(before_control, after_control, &mut facts);
-                }
-            }
-            None => compare_removed(before_control, after, &before_ids, &mut facts),
+        match after_by_id.get(component_id).copied() {
+            Some(after_control) => compare_existing(before_control, after_control, &mut facts),
+            None => compare_removed(
+                before_control,
+                &after_controls,
+                &before_ids,
+                &replacement_use_counts,
+                &mut facts,
+            ),
         }
     }
 
@@ -295,25 +300,54 @@ fn compare_removed(
     before: &AgentStackProtectionControl,
     after: &[AgentStackProtectionControl],
     before_ids: &BTreeSet<String>,
+    replacement_use_counts: &BTreeMap<String, usize>,
     facts: &mut Vec<AgentStackProtectionControlDiff>,
 ) {
     let mut same_integrity =
         replacement_candidates(after, before, before_ids, CandidateMode::SameIntegrity);
-    if let Some(candidate) = same_integrity.pop() {
+    if same_integrity.len() == 1 {
+        let candidate = same_integrity.remove(0);
         facts.push(AgentStackProtectionControlDiff::new(
             AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
             before.roles.clone(),
             Some(before),
             Some(candidate),
-            AgentStackProtectionConfidence::Medium,
+            rename_confidence(before, candidate),
             AgentStackProtectionControlReason::PossibleRename,
         ));
         compare_existing(before, candidate, facts);
         return;
     }
+    if !same_integrity.is_empty() {
+        facts.push(AgentStackProtectionControlDiff::new(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            Some(before),
+            None,
+            min_confidence(before.confidence, AgentStackProtectionConfidence::Medium),
+            AgentStackProtectionControlReason::PossibleRename,
+        ));
+        return;
+    }
 
     let equivalent = replacement_candidates(after, before, before_ids, CandidateMode::Equivalent);
     if equivalent.len() == 1 {
+        let candidate = equivalent[0];
+        let use_count = replacement_use_counts
+            .get(candidate.component.component_id().as_str())
+            .copied()
+            .unwrap_or(0);
+        if use_count == 1 {
+            return;
+        }
+        facts.push(AgentStackProtectionControlDiff::new(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            Some(before),
+            Some(candidate),
+            min_confidence(before.confidence, candidate.confidence),
+            AgentStackProtectionControlReason::AmbiguousReplacement,
+        ));
         return;
     }
     if let Some(candidate) = equivalent.first() {
@@ -383,7 +417,7 @@ fn equivalent_replacement(
     before: &AgentStackProtectionControl,
     after: &AgentStackProtectionControl,
 ) -> bool {
-    confidence_at_least(after.confidence, before.confidence)
+    after.confidence.strength() >= before.confidence.strength()
         && weak_equivalent_replacement(before, after)
 }
 
@@ -391,7 +425,8 @@ fn weak_equivalent_replacement(
     before: &AgentStackProtectionControl,
     after: &AgentStackProtectionControl,
 ) -> bool {
-    roles_include(after.roles(), before.roles())
+    after.enabled != Some(false)
+        && roles_include(after.roles(), before.roles())
         && (before.enabled != Some(true) || after.enabled == Some(true))
         && scope_at_least(after.scope, before.scope)
         && (before.failure_mode != Some(AgentStackProtectionFailureMode::FailClosed)
@@ -422,15 +457,66 @@ fn same_integrity(
 
 fn by_component_id(
     controls: &[AgentStackProtectionControl],
-) -> BTreeMap<String, Vec<&AgentStackProtectionControl>> {
-    let mut by_id = BTreeMap::new();
+) -> BTreeMap<String, &AgentStackProtectionControl> {
+    controls
+        .iter()
+        .map(|control| {
+            (
+                control.component.component_id().as_str().to_owned(),
+                control,
+            )
+        })
+        .collect()
+}
+
+fn aggregate_controls(
+    controls: &[AgentStackProtectionControl],
+) -> Vec<AgentStackProtectionControl> {
+    let mut by_id = BTreeMap::<String, AgentStackProtectionControl>::new();
     for control in controls {
+        let component_id = control.component.component_id().as_str().to_owned();
         by_id
-            .entry(control.component.component_id().as_str().to_owned())
-            .or_insert_with(Vec::new)
-            .push(control);
+            .entry(component_id)
+            .and_modify(|existing| merge_control(existing, control))
+            .or_insert_with(|| control.clone());
     }
-    by_id
+    by_id.into_values().collect()
+}
+
+fn merge_control(
+    existing: &mut AgentStackProtectionControl,
+    control: &AgentStackProtectionControl,
+) {
+    existing.roles = merged_roles(existing.roles(), control.roles());
+    existing.enabled = merged_after_enabled(existing.enabled, control.enabled);
+    existing.scope = stronger_scope(existing.scope, control.scope);
+    existing.failure_mode = stronger_failure_mode(existing.failure_mode, control.failure_mode);
+    existing.confidence = min_confidence(existing.confidence, control.confidence);
+}
+
+fn replacement_use_counts(
+    before: &[AgentStackProtectionControl],
+    after: &[AgentStackProtectionControl],
+    before_ids: &BTreeSet<String>,
+    after_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for before_control in before {
+        if before_control.roles.is_empty() || before_control.enabled == Some(false) {
+            continue;
+        }
+        if after_by_id.contains_key(before_control.component.component_id().as_str()) {
+            continue;
+        }
+        for candidate in
+            replacement_candidates(after, before_control, before_ids, CandidateMode::Equivalent)
+        {
+            *counts
+                .entry(candidate.component.component_id().as_str().to_owned())
+                .or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 fn component_ids(controls: &[AgentStackProtectionControl]) -> BTreeSet<String> {
@@ -453,6 +539,52 @@ fn sorted_roles(
     }
     sorted.sort_by_key(AgentStackProtectionRole::as_str);
     Ok(sorted)
+}
+
+fn merged_roles(
+    left: &[AgentStackProtectionRole],
+    right: &[AgentStackProtectionRole],
+) -> Vec<AgentStackProtectionRole> {
+    let mut roles = left.to_vec();
+    for role in right {
+        if !roles.contains(role) {
+            roles.push(*role);
+        }
+    }
+    roles.sort_by_key(AgentStackProtectionRole::as_str);
+    roles
+}
+
+fn merged_after_enabled(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+fn stronger_scope(
+    left: Option<AgentStackProtectionScope>,
+    right: Option<AgentStackProtectionScope>,
+) -> Option<AgentStackProtectionScope> {
+    match (left, right) {
+        (Some(left), Some(right)) if right.strength() > left.strength() => Some(right),
+        (Some(scope), _) | (None, Some(scope)) => Some(scope),
+        (None, None) => None,
+    }
+}
+
+fn stronger_failure_mode(
+    left: Option<AgentStackProtectionFailureMode>,
+    right: Option<AgentStackProtectionFailureMode>,
+) -> Option<AgentStackProtectionFailureMode> {
+    if matches!(left, Some(AgentStackProtectionFailureMode::FailClosed))
+        || matches!(right, Some(AgentStackProtectionFailureMode::FailClosed))
+    {
+        Some(AgentStackProtectionFailureMode::FailClosed)
+    } else {
+        left.or(right)
+    }
 }
 
 fn role_overlap(left: &[AgentStackProtectionRole], right: &[AgentStackProtectionRole]) -> bool {
@@ -486,11 +618,14 @@ fn min_confidence(
     }
 }
 
-fn confidence_at_least(
-    left: AgentStackProtectionConfidence,
-    right: AgentStackProtectionConfidence,
-) -> bool {
-    left.strength() >= right.strength()
+fn rename_confidence(
+    before: &AgentStackProtectionControl,
+    after: &AgentStackProtectionControl,
+) -> AgentStackProtectionConfidence {
+    min_confidence(
+        min_confidence(before.confidence, after.confidence),
+        AgentStackProtectionConfidence::Medium,
+    )
 }
 
 fn fact_sort_key(fact: &AgentStackProtectionControlDiff) -> (&str, &'static str) {

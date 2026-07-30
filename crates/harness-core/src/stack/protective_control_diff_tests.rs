@@ -1,7 +1,25 @@
 use super::*;
+use AgentStackProtectionFailureMode as Mode;
+use AgentStackProtectionScope as Scope;
 
 const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const ACTIVE_REQUIRED: ControlState =
+    ControlState(Some(true), Some(Scope::Required), Some(Mode::FailClosed));
+const ACTIVE_COMPREHENSIVE: ControlState = ControlState(
+    Some(true),
+    Some(Scope::Comprehensive),
+    Some(Mode::FailClosed),
+);
+const DISABLED_PARTIAL_OPEN: ControlState =
+    ControlState(Some(false), Some(Scope::Partial), Some(Mode::FailOpen));
+const DISABLED_REQUIRED: ControlState =
+    ControlState(Some(false), Some(Scope::Required), Some(Mode::FailClosed));
+const UNKNOWN_REQUIRED: ControlState =
+    ControlState(None, Some(Scope::Required), Some(Mode::FailClosed));
+
+#[derive(Clone, Copy)]
+struct ControlState(Option<bool>, Option<Scope>, Option<Mode>);
 
 fn source(locator: &str) -> AgentStackSource {
     match AgentStackSource::new(AgentStackSourceScope::Repository, locator) {
@@ -47,28 +65,43 @@ fn control_with_confidence(
     roles: &[AgentStackProtectionRole],
     confidence: AgentStackProtectionConfidence,
 ) -> AgentStackProtectionControl {
-    match AgentStackProtectionControl::new(
-        component(kind, locator, Some(HASH_A)),
+    configured_control(
+        kind,
+        locator,
+        Some(HASH_A),
+        roles,
+        confidence,
+        ACTIVE_REQUIRED,
+    )
+}
+
+fn configured_control(
+    kind: AgentStackComponentKind,
+    locator: &str,
+    integrity: Option<&str>,
+    roles: &[AgentStackProtectionRole],
+    confidence: AgentStackProtectionConfidence,
+    state: ControlState,
+) -> AgentStackProtectionControl {
+    let mut control = match AgentStackProtectionControl::new(
+        component(kind, locator, integrity),
         roles.iter().copied(),
         confidence,
     ) {
-        Ok(control) => control
-            .with_enabled(true)
-            .with_scope(AgentStackProtectionScope::Required)
-            .with_failure_mode(AgentStackProtectionFailureMode::FailClosed),
+        Ok(control) => control,
         Err(error) => panic!("valid protection control: {error}"),
+    };
+    let ControlState(enabled, scope, failure_mode) = state;
+    if let Some(enabled) = enabled {
+        control = control.with_enabled(enabled);
     }
-}
-
-#[test]
-fn protective_control_diff_defines_all_protection_roles() {
-    assert_eq!(
-        AgentStackProtectionRole::ALL
-            .iter()
-            .map(AgentStackProtectionRole::as_str)
-            .collect::<Vec<_>>(),
-        ["policy", "hook", "validation", "sandboxing", "check"]
-    );
+    if let Some(scope) = scope {
+        control = control.with_scope(scope);
+    }
+    if let Some(failure_mode) = failure_mode {
+        control = control.with_failure_mode(failure_mode);
+    }
+    control
 }
 
 #[test]
@@ -118,21 +151,14 @@ fn protective_control_diff_reports_relaxed_existing_controls() {
             AgentStackProtectionRole::Check,
         ],
     )];
-    let relaxed = match AgentStackProtectionControl::new(
-        component(
-            AgentStackComponentKind::Validation,
-            ".github/workflows/ci.yml",
-            Some(HASH_B),
-        ),
-        [AgentStackProtectionRole::Validation],
+    let relaxed = configured_control(
+        AgentStackComponentKind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_B),
+        &[AgentStackProtectionRole::Validation],
         AgentStackProtectionConfidence::High,
-    ) {
-        Ok(control) => control
-            .with_enabled(false)
-            .with_scope(AgentStackProtectionScope::Partial)
-            .with_failure_mode(AgentStackProtectionFailureMode::FailOpen),
-        Err(error) => panic!("valid control: {error}"),
-    };
+        DISABLED_PARTIAL_OPEN,
+    );
     let after = [relaxed];
     let facts = protective_control_diff(&before, &after);
     assert_eq!(
@@ -197,21 +223,14 @@ fn protective_control_diff_suppresses_equivalent_replacement() {
         ".githooks/pre-push",
         &[AgentStackProtectionRole::Hook],
     )];
-    let replacement = match AgentStackProtectionControl::new(
-        component(
-            AgentStackComponentKind::Hook,
-            ".harness/guards/pre-push.sh",
-            Some(HASH_B),
-        ),
-        [AgentStackProtectionRole::Hook],
+    let replacement = configured_control(
+        AgentStackComponentKind::Hook,
+        ".harness/guards/pre-push.sh",
+        Some(HASH_B),
+        &[AgentStackProtectionRole::Hook],
         AgentStackProtectionConfidence::High,
-    ) {
-        Ok(control) => control
-            .with_enabled(true)
-            .with_scope(AgentStackProtectionScope::Comprehensive)
-            .with_failure_mode(AgentStackProtectionFailureMode::FailClosed),
-        Err(error) => panic!("valid replacement: {error}"),
-    };
+        ACTIVE_COMPREHENSIVE,
+    );
     let after = [replacement];
     let facts = protective_control_diff(&before, &after);
     assert!(
@@ -227,21 +246,14 @@ fn protective_control_diff_reports_weakened_rename_state() {
         ".githooks/pre-push",
         &[AgentStackProtectionRole::Hook],
     )];
-    let renamed = match AgentStackProtectionControl::new(
-        component(
-            AgentStackComponentKind::Hook,
-            ".harness/guards/pre-push.sh",
-            Some(HASH_A),
-        ),
-        [AgentStackProtectionRole::Hook],
+    let renamed = configured_control(
+        AgentStackComponentKind::Hook,
+        ".harness/guards/pre-push.sh",
+        Some(HASH_A),
+        &[AgentStackProtectionRole::Hook],
         AgentStackProtectionConfidence::High,
-    ) {
-        Ok(control) => control
-            .with_enabled(false)
-            .with_scope(AgentStackProtectionScope::Partial)
-            .with_failure_mode(AgentStackProtectionFailureMode::FailOpen),
-        Err(error) => panic!("valid renamed control: {error}"),
-    };
+        DISABLED_PARTIAL_OPEN,
+    );
     let after = [renamed];
 
     let facts = protective_control_diff(&before, &after);
@@ -314,21 +326,14 @@ fn protective_control_diff_keeps_low_confidence_replacements_ambiguous() {
         ".githooks/pre-commit",
         &[AgentStackProtectionRole::Hook],
     )];
-    let replacement = match AgentStackProtectionControl::new(
-        component(
-            AgentStackComponentKind::Hook,
-            ".harness/guards/pre-commit.sh",
-            Some(HASH_B),
-        ),
-        [AgentStackProtectionRole::Hook],
+    let replacement = configured_control(
+        AgentStackComponentKind::Hook,
+        ".harness/guards/pre-commit.sh",
+        Some(HASH_B),
+        &[AgentStackProtectionRole::Hook],
         AgentStackProtectionConfidence::Low,
-    ) {
-        Ok(control) => control
-            .with_enabled(true)
-            .with_scope(AgentStackProtectionScope::Required)
-            .with_failure_mode(AgentStackProtectionFailureMode::FailClosed),
-        Err(error) => panic!("valid low-confidence replacement: {error}"),
-    };
+        ACTIVE_REQUIRED,
+    );
     let after = [replacement];
 
     let facts = protective_control_diff(&before, &after);
@@ -346,32 +351,146 @@ fn protective_control_diff_keeps_low_confidence_replacements_ambiguous() {
 }
 
 #[test]
-fn protective_control_diff_compares_all_duplicate_after_component_ids() {
+fn protective_control_diff_aggregates_split_duplicate_after_roles() {
     let before = [control(
-        AgentStackComponentKind::Validation,
-        ".github/workflows/ci.yml",
-        &[AgentStackProtectionRole::Validation],
+        AgentStackComponentKind::Policy,
+        "rules/protect.toml",
+        &[
+            AgentStackProtectionRole::Policy,
+            AgentStackProtectionRole::Validation,
+        ],
     )];
-    let enabled = control(
-        AgentStackComponentKind::Validation,
-        ".github/workflows/ci.yml",
-        &[AgentStackProtectionRole::Validation],
-    );
-    let disabled = control(
-        AgentStackComponentKind::Validation,
-        ".github/workflows/ci.yml",
-        &[AgentStackProtectionRole::Validation],
-    )
-    .with_enabled(false);
-    let first_order = [enabled.clone(), disabled.clone()];
-    let second_order = [disabled, enabled];
+    let after = [
+        control(
+            AgentStackComponentKind::Policy,
+            "rules/protect.toml",
+            &[AgentStackProtectionRole::Policy],
+        ),
+        control(
+            AgentStackComponentKind::Policy,
+            "rules/protect.toml",
+            &[AgentStackProtectionRole::Validation],
+        ),
+    ];
 
-    for after in [&first_order, &second_order] {
-        let facts = protective_control_diff(&before, after);
-        assert_eq!(facts.len(), 1);
-        assert_eq!(
-            facts[0].reason(),
-            AgentStackProtectionControlReason::ExplicitlyDisabled
-        );
-    }
+    let facts = protective_control_diff(&before, &after);
+
+    assert!(
+        facts.is_empty(),
+        "duplicate reports for one component should be combined before diffing"
+    );
+}
+
+#[test]
+fn protective_control_diff_rejects_disabled_unknown_state_replacement() {
+    let before = [configured_control(
+        AgentStackComponentKind::Hook,
+        ".githooks/pre-commit",
+        Some(HASH_A),
+        &[AgentStackProtectionRole::Hook],
+        AgentStackProtectionConfidence::High,
+        UNKNOWN_REQUIRED,
+    )];
+    let replacement = configured_control(
+        AgentStackComponentKind::Hook,
+        ".harness/guards/pre-commit.sh",
+        Some(HASH_B),
+        &[AgentStackProtectionRole::Hook],
+        AgentStackProtectionConfidence::High,
+        DISABLED_REQUIRED,
+    );
+    let after = [replacement];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].kind(), AgentStackProtectionDiffKind::Removed);
+}
+
+#[test]
+fn protective_control_diff_caps_rename_evidence_at_source_confidence() {
+    let before = [control_with_confidence(
+        AgentStackComponentKind::Policy,
+        "rules/protect.toml",
+        &[AgentStackProtectionRole::Policy],
+        AgentStackProtectionConfidence::Low,
+    )];
+    let after = [control(
+        AgentStackComponentKind::Policy,
+        "rules/renamed.toml",
+        &[AgentStackProtectionRole::Policy],
+    )];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(facts.len(), 1);
+    assert_eq!(
+        facts[0].reason(),
+        AgentStackProtectionControlReason::PossibleRename
+    );
+    assert_eq!(facts[0].confidence(), AgentStackProtectionConfidence::Low);
+}
+
+#[test]
+fn protective_control_diff_keeps_multi_candidate_renames_ambiguous() {
+    let before = [control(
+        AgentStackComponentKind::Policy,
+        "rules/protect.toml",
+        &[AgentStackProtectionRole::Policy],
+    )];
+    let after = [
+        control(
+            AgentStackComponentKind::Policy,
+            "rules/renamed-a.toml",
+            &[AgentStackProtectionRole::Policy],
+        ),
+        control(
+            AgentStackComponentKind::Policy,
+            "rules/renamed-b.toml",
+            &[AgentStackProtectionRole::Policy],
+        )
+        .with_enabled(false),
+    ];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(facts.len(), 1);
+    assert_eq!(
+        facts[0].reason(),
+        AgentStackProtectionControlReason::PossibleRename
+    );
+    assert!(facts[0].after().is_none());
+}
+
+#[test]
+fn protective_control_diff_reports_many_to_one_replacements_as_ambiguous() {
+    let before = [
+        control(
+            AgentStackComponentKind::Hook,
+            ".githooks/pre-commit",
+            &[AgentStackProtectionRole::Hook],
+        ),
+        control(
+            AgentStackComponentKind::Hook,
+            ".githooks/pre-push",
+            &[AgentStackProtectionRole::Hook],
+        ),
+    ];
+    let replacement = configured_control(
+        AgentStackComponentKind::Hook,
+        ".harness/guards/git-hooks.sh",
+        Some(HASH_B),
+        &[AgentStackProtectionRole::Hook],
+        AgentStackProtectionConfidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let after = [replacement];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(facts.len(), 2);
+    assert!(facts.iter().all(|fact| {
+        fact.reason() == AgentStackProtectionControlReason::AmbiguousReplacement
+            && fact.kind() == AgentStackProtectionDiffKind::AmbiguousReviewEvidence
+    }));
 }
