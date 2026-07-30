@@ -16,7 +16,7 @@ use crate::runtime::model::{
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::{DecisionValidator, ValidationContext};
 
-fn ensure_protected_instance_fields_match(
+pub(super) fn ensure_protected_instance_fields_match(
     current: &WorkflowInstance,
     final_instance: &WorkflowInstance,
 ) -> anyhow::Result<()> {

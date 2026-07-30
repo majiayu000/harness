@@ -1,6 +1,7 @@
 use super::{
-    apply_inline_command_side_effect, command_store, insert_decision_record_tx,
-    insert_event_tx_with_id, insert_instance_if_absent_tx,
+    apply_inline_command_side_effect, command_store,
+    decision_transitions::ensure_protected_instance_fields_match,
+    insert_decision_record_tx, insert_event_tx_with_id, insert_instance_if_absent_tx,
     runtime_job_state::{cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation},
     select_instance_for_update_tx,
     transition_validation::{validate_transition_with_context, TransitionValidation},
@@ -119,7 +120,18 @@ impl WorkflowRuntimeStore {
                 current: current.map(Box::new),
             });
         }
-        let expected_version = current.as_ref().map_or(1, |instance| instance.version + 1);
+        if let Some(current) = current.as_ref() {
+            ensure_protected_instance_fields_match(current, transition.final_instance)?;
+        }
+        let expected_version = match current.as_ref() {
+            Some(instance) => instance.version.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "coverage recovery workflow `{}` current version cannot advance",
+                    transition.workflow_id
+                )
+            })?,
+            None => 1,
+        };
         if transition.final_instance.version != expected_version {
             anyhow::bail!("coverage recovery final instance has an invalid version");
         }
@@ -261,6 +273,96 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::Barrier;
+
+    async fn invalid_coverage_final_error(
+        store: &WorkflowRuntimeStore,
+        initial: &WorkflowInstance,
+        final_instance: &WorkflowInstance,
+        fact: &RemoteFactSnapshot,
+        decision: &WorkflowDecision,
+    ) -> anyhow::Error {
+        match store
+            .commit_coverage_recovery_transition(WorkflowCoverageRecoveryTransition {
+                workflow_id: &initial.id,
+                expected: WorkflowCoverageRecoveryExpected::Present {
+                    state: &initial.state,
+                    version: initial.version,
+                },
+                final_instance,
+                selected_remote_fact: fact,
+                event_type: "ClosingPrCoverageRecovered",
+                source: "workflow-runtime-test",
+                payload: json!({}),
+                decision,
+            })
+            .await
+        {
+            Ok(_) => panic!("invalid coverage final instance should fail"),
+            Err(error) => error,
+        }
+    }
+
+    #[tokio::test]
+    async fn coverage_recovery_rejects_identity_substitution_and_invalid_version(
+    ) -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+        let initial = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "discovered",
+            WorkflowSubject::new("issue", "issue:1845"),
+        )
+        .with_id("coverage-recovery-identity-version")
+        .with_parent("parent-workflow");
+        store.upsert_instance(&initial).await?;
+        let fact = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            1845,
+            "open",
+            json!({"head": "abc"}),
+            Utc::now(),
+        );
+        let decision = WorkflowDecision::new(
+            &initial.id,
+            "discovered",
+            "recover_github_pr_coverage",
+            "quality_gate_pending",
+            "recover",
+        )
+        .with_evidence(crate::runtime::WorkflowEvidence::new(
+            "server_pr_snapshot",
+            "GitHub reported an authoritative closing pull request.",
+        ))
+        .with_command(WorkflowCommand::start_child_workflow(
+            "quality_gate",
+            "pr:1845",
+            "quality-gate:1845",
+        ));
+        let mut final_instance = initial.clone();
+        final_instance.state = decision.next_state.clone();
+        final_instance.version = 1;
+
+        let mut substituted = final_instance.clone();
+        substituted.definition_id = "prompt_task".to_string();
+        let error =
+            invalid_coverage_final_error(&store, &initial, &substituted, &fact, &decision).await;
+        assert!(error.to_string().contains("definition_id"));
+
+        let mut invalid_version = final_instance;
+        invalid_version.version = 9;
+        let error =
+            invalid_coverage_final_error(&store, &initial, &invalid_version, &fact, &decision)
+                .await;
+        assert!(error.to_string().contains("invalid version"));
+        assert_eq!(store.get_instance(&initial.id).await?, Some(initial));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn concurrent_recovery_attempts_have_one_atomic_winner() -> anyhow::Result<()> {
