@@ -672,7 +672,9 @@ mod trust_tests {
             "pending",
             harness_workflow::runtime::WorkflowSubject::new("pr", "pr:1"),
         )
-        .with_data(json!({"author_trust_class": "non_collaborator"}));
+        .with_data_field_provenance(json!({"author_trust_class": "non_collaborator"}), |_| {
+            harness_workflow::runtime::DataProvenance::Server
+        });
         inherit_author_trust_class(&mut child, &json!({"author_trust_class": "trusted"}))?;
         assert_eq!(child.data["author_trust_class"], "non_collaborator");
         Ok(())
