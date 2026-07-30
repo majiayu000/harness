@@ -62,6 +62,7 @@ closed_enum!(AgentStackProtectionControlReason {
     FailureModeRelaxed => "failure_mode_relaxed",
     PossibleRename => "possible_rename",
     AmbiguousReplacement => "ambiguous_replacement",
+    ConflictingDuplicateReport => "conflicting_duplicate_report",
 });
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -212,11 +213,15 @@ pub fn protective_control_diff(
     before: &[AgentStackProtectionControl],
     after: &[AgentStackProtectionControl],
 ) -> Vec<AgentStackProtectionControlDiff> {
-    let before_ids = component_ids(before);
+    let before_by_id = by_component_id(before);
     let after_controls = aggregate_controls(after);
-    let after_by_id = by_component_id(&after_controls);
-    let replacement_use_counts =
-        replacement_use_counts(before, &after_controls, &before_ids, &after_by_id);
+    let after_by_id = by_component_id(&after_controls.controls);
+    let replacement_use_counts = replacement_use_counts(
+        before,
+        &after_controls.controls,
+        &before_by_id,
+        &after_by_id,
+    );
     let mut facts = Vec::new();
 
     for before_control in before {
@@ -225,11 +230,18 @@ pub fn protective_control_diff(
         }
         let component_id = before_control.component.component_id().as_str();
         match after_by_id.get(component_id).copied() {
-            Some(after_control) => compare_existing(before_control, after_control, &mut facts),
+            Some(after_control) => compare_existing(
+                before_control,
+                after_control,
+                after_controls
+                    .conflicting_component_ids
+                    .contains(component_id),
+                &mut facts,
+            ),
             None => compare_removed(
                 before_control,
-                &after_controls,
-                &before_ids,
+                &after_controls.controls,
+                &before_by_id,
                 &replacement_use_counts,
                 &mut facts,
             ),
@@ -247,10 +259,11 @@ pub fn protective_control_diff(
 fn compare_existing(
     before: &AgentStackProtectionControl,
     after: &AgentStackProtectionControl,
+    has_conflicting_duplicate_state: bool,
     facts: &mut Vec<AgentStackProtectionControlDiff>,
 ) {
     let confidence = min_confidence(before.confidence, after.confidence);
-    if before.enabled == Some(true) && after.enabled == Some(false) {
+    if before.enabled != Some(false) && after.enabled == Some(false) {
         facts.push(AgentStackProtectionControlDiff::new(
             AgentStackProtectionDiffKind::Disabled,
             before.roles.clone(),
@@ -294,17 +307,27 @@ fn compare_existing(
             AgentStackProtectionControlReason::FailureModeRelaxed,
         ));
     }
+    if has_conflicting_duplicate_state {
+        facts.push(AgentStackProtectionControlDiff::new(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            Some(before),
+            Some(after),
+            confidence,
+            AgentStackProtectionControlReason::ConflictingDuplicateReport,
+        ));
+    }
 }
 
 fn compare_removed(
     before: &AgentStackProtectionControl,
     after: &[AgentStackProtectionControl],
-    before_ids: &BTreeSet<String>,
+    before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     replacement_use_counts: &BTreeMap<String, usize>,
     facts: &mut Vec<AgentStackProtectionControlDiff>,
 ) {
     let mut same_integrity =
-        replacement_candidates(after, before, before_ids, CandidateMode::SameIntegrity);
+        replacement_candidates(after, before, before_by_id, CandidateMode::SameIntegrity);
     if same_integrity.len() == 1 {
         let candidate = same_integrity.remove(0);
         facts.push(AgentStackProtectionControlDiff::new(
@@ -315,7 +338,7 @@ fn compare_removed(
             rename_confidence(before, candidate),
             AgentStackProtectionControlReason::PossibleRename,
         ));
-        compare_existing(before, candidate, facts);
+        compare_existing(before, candidate, false, facts);
         return;
     }
     if !same_integrity.is_empty() {
@@ -330,7 +353,7 @@ fn compare_removed(
         return;
     }
 
-    let equivalent = replacement_candidates(after, before, before_ids, CandidateMode::Equivalent);
+    let equivalent = replacement_candidates(after, before, before_by_id, CandidateMode::Equivalent);
     if equivalent.len() == 1 {
         let candidate = equivalent[0];
         let use_count = replacement_use_counts
@@ -363,7 +386,7 @@ fn compare_removed(
     }
 
     let weak_equivalent =
-        replacement_candidates(after, before, before_ids, CandidateMode::WeakEquivalent);
+        replacement_candidates(after, before, before_by_id, CandidateMode::WeakEquivalent);
     if let Some(candidate) = weak_equivalent.first() {
         facts.push(AgentStackProtectionControlDiff::new(
             AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
@@ -396,12 +419,12 @@ enum CandidateMode {
 fn replacement_candidates<'a>(
     after: &'a [AgentStackProtectionControl],
     before: &AgentStackProtectionControl,
-    before_ids: &BTreeSet<String>,
+    before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     mode: CandidateMode,
 ) -> Vec<&'a AgentStackProtectionControl> {
     let mut candidates = after
         .iter()
-        .filter(|candidate| !before_ids.contains(candidate.component.component_id().as_str()))
+        .filter(|candidate| candidate_is_new_protection(candidate, before, before_by_id))
         .filter(|candidate| role_overlap(before.roles(), candidate.roles()))
         .filter(|candidate| match mode {
             CandidateMode::SameIntegrity => same_integrity(before, candidate),
@@ -411,6 +434,22 @@ fn replacement_candidates<'a>(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| candidate.component.component_id().as_str());
     candidates
+}
+
+fn candidate_is_new_protection(
+    candidate: &AgentStackProtectionControl,
+    removed: &AgentStackProtectionControl,
+    before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
+) -> bool {
+    match before_by_id
+        .get(candidate.component.component_id().as_str())
+        .copied()
+    {
+        Some(previous) => {
+            previous.enabled == Some(false) || !role_overlap(previous.roles(), removed.roles())
+        }
+        None => true,
+    }
 }
 
 fn equivalent_replacement(
@@ -469,18 +508,42 @@ fn by_component_id(
         .collect()
 }
 
-fn aggregate_controls(
-    controls: &[AgentStackProtectionControl],
-) -> Vec<AgentStackProtectionControl> {
+struct AggregatedControls {
+    controls: Vec<AgentStackProtectionControl>,
+    conflicting_component_ids: BTreeSet<String>,
+}
+
+fn aggregate_controls(controls: &[AgentStackProtectionControl]) -> AggregatedControls {
     let mut by_id = BTreeMap::<String, AgentStackProtectionControl>::new();
+    let mut conflicting_component_ids = BTreeSet::new();
     for control in controls {
         let component_id = control.component.component_id().as_str().to_owned();
-        by_id
-            .entry(component_id)
-            .and_modify(|existing| merge_control(existing, control))
-            .or_insert_with(|| control.clone());
+        if let Some(existing) = by_id.get_mut(&component_id) {
+            if duplicate_state_conflicts(existing, control) {
+                conflicting_component_ids.insert(component_id);
+            }
+            merge_control(existing, control);
+        } else {
+            by_id.insert(component_id, control.clone());
+        }
     }
-    by_id.into_values().collect()
+    AggregatedControls {
+        controls: by_id.into_values().collect(),
+        conflicting_component_ids,
+    }
+}
+
+fn duplicate_state_conflicts(
+    left: &AgentStackProtectionControl,
+    right: &AgentStackProtectionControl,
+) -> bool {
+    conflicting_values(left.enabled, right.enabled)
+        || conflicting_values(left.scope, right.scope)
+        || conflicting_values(left.failure_mode, right.failure_mode)
+}
+
+fn conflicting_values<T: Eq>(left: Option<T>, right: Option<T>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left != right)
 }
 
 fn merge_control(
@@ -497,7 +560,7 @@ fn merge_control(
 fn replacement_use_counts(
     before: &[AgentStackProtectionControl],
     after: &[AgentStackProtectionControl],
-    before_ids: &BTreeSet<String>,
+    before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     after_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
 ) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
@@ -508,22 +571,17 @@ fn replacement_use_counts(
         if after_by_id.contains_key(before_control.component.component_id().as_str()) {
             continue;
         }
-        for candidate in
-            replacement_candidates(after, before_control, before_ids, CandidateMode::Equivalent)
-        {
-            *counts
-                .entry(candidate.component.component_id().as_str().to_owned())
-                .or_insert(0) += 1;
+        let mut used_ids = BTreeSet::new();
+        for mode in [CandidateMode::SameIntegrity, CandidateMode::Equivalent] {
+            for candidate in replacement_candidates(after, before_control, before_by_id, mode) {
+                used_ids.insert(candidate.component.component_id().as_str().to_owned());
+            }
+        }
+        for component_id in used_ids {
+            *counts.entry(component_id).or_insert(0) += 1;
         }
     }
     counts
-}
-
-fn component_ids(controls: &[AgentStackProtectionControl]) -> BTreeSet<String> {
-    controls
-        .iter()
-        .map(|control| control.component.component_id().as_str().to_owned())
-        .collect()
 }
 
 fn sorted_roles(
