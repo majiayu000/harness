@@ -1,7 +1,7 @@
 use super::store::WorkflowRuntimeStore;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -65,6 +65,31 @@ pub fn stable_remote_fact_hash(facts: &Value) -> String {
         serde_json::to_vec(&canonical).expect("serde_json::Value serialization cannot fail");
     let digest = Sha256::digest(encoded);
     format!("sha256:{digest:x}")
+}
+
+pub fn stable_pr_snapshot_fact_hash_input(snapshot: &Value) -> Value {
+    let mut stable = snapshot.clone();
+    if let Some(object) = stable.as_object_mut() {
+        object.remove("observed_at");
+        object.insert(
+            "statusCheckRollup".to_string(),
+            json!({
+                "state": object
+                    .get("status_check_rollup_state")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "contexts": object
+                    .get("status_check_contexts")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "contexts_complete": object
+                    .get("status_check_contexts_complete")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }),
+        );
+    }
+    stable
 }
 
 pub fn remote_fact_command_dedupe_key(activity: &str, fact_hash: &str) -> String {

@@ -1,8 +1,8 @@
 use anyhow::Context;
 use chrono::{SecondsFormat, Utc};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, RemoteFactSnapshot,
-    PR_FEEDBACK_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
+    stable_pr_snapshot_fact_hash_input, ActivityArtifact, ActivityErrorKind, ActivityResult,
+    ActivitySignal, RemoteFactSnapshot, PR_FEEDBACK_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -175,7 +175,7 @@ impl GitHubPrSnapshotArtifacts {
                 .as_str()
                 .to_string()
         });
-        let facts_for_hash = stable_pr_fact_hash_input(&self.normalized_snapshot);
+        let facts_for_hash = stable_pr_snapshot_fact_hash_input(&self.normalized_snapshot);
         let mut snapshot = RemoteFactSnapshot::new(
             "github",
             repo,
@@ -576,31 +576,6 @@ pub(crate) fn pr_readiness_for_snapshot(snapshot: &Value) -> PrReadiness {
         return PrReadiness::WaitingForMergeability;
     }
     PrReadiness::NeedsFeedbackRepair
-}
-
-fn stable_pr_fact_hash_input(snapshot: &Value) -> Value {
-    let mut stable = snapshot.clone();
-    if let Some(object) = stable.as_object_mut() {
-        object.remove("observed_at");
-        object.insert(
-            "statusCheckRollup".to_string(),
-            json!({
-                "state": object
-                    .get("status_check_rollup_state")
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                "contexts": object
-                    .get("status_check_contexts")
-                    .cloned()
-                    .unwrap_or_else(|| json!([])),
-                "contexts_complete": object
-                    .get("status_check_contexts_complete")
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            }),
-        );
-    }
-    stable
 }
 
 fn snapshot_allows_ready(snapshot: &Value) -> bool {

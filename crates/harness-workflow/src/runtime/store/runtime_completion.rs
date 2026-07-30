@@ -365,10 +365,7 @@ fn apply_runtime_completion_data_side_effect(
     let Some(snapshot) = pr_feedback_snapshot_from_completion_event(event) else {
         return Ok(());
     };
-    let mut facts_for_hash = snapshot.clone();
-    if let Some(object) = facts_for_hash.as_object_mut() {
-        object.remove("observed_at");
-    }
+    let facts_for_hash = crate::runtime::stable_pr_snapshot_fact_hash_input(snapshot);
     let fact_hash = crate::runtime::stable_remote_fact_hash(&facts_for_hash);
     let activity_at = ["updated_at", "updatedAt"].into_iter().find_map(|field| {
         snapshot

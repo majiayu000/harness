@@ -449,15 +449,36 @@ async fn runtime_worker_stamps_pr_feedback_child_with_inspected_remote_fact() ->
         "head_oid": "post-inspection-head",
         "review_decision": "REVIEW_REQUIRED",
         "status_check_rollup_state": "SUCCESS",
+        "statusCheckRollup": {
+            "state": "SUCCESS",
+            "contexts": {
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "nodes": [{
+                    "__typename": "CheckRun",
+                    "id": "CR_completed",
+                    "databaseId": 101,
+                    "name": "Test",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+                }]
+            }
+        },
+        "status_check_contexts": [{
+            "type": "check_run",
+            "id": "CR_completed",
+            "database_id": 101,
+            "name": "Test",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "details_url": "https://github.com/owner/repo/actions/runs/101"
+        }],
+        "status_check_contexts_complete": true,
         "merge_state_status": "CLEAN",
         "active_unresolved_review_threads_count": 0,
         "review_threads_complete": true,
     });
-    let mut expected_hash_input = snapshot.clone();
-    expected_hash_input
-        .as_object_mut()
-        .expect("snapshot should be an object")
-        .remove("observed_at");
+    let expected_hash_input = crate::runtime::stable_pr_snapshot_fact_hash_input(&snapshot);
     let expected_fact_hash = crate::runtime::stable_remote_fact_hash(&expected_hash_input);
     let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
     let executor = StaticRuntimeExecutor {
