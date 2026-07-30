@@ -2,8 +2,11 @@ use super::super::model::RuntimeKind;
 use super::WorkflowRuntimeStore;
 use chrono::{DateTime, Utc};
 use harness_core::run_id::RunId;
+use harness_core::types::Event;
+use harness_observe::event_store::EventStore;
 use harness_observe::usage::UsageMetrics;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 pub type RuntimeUsageMetrics = UsageMetrics;
@@ -93,7 +96,7 @@ pub struct RuntimeWorkflowUsage {
     pub cost_usd_micros: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RuntimeAgentTelemetry {
     pub workflow_id: String,
     pub workflow_state: String,
@@ -101,6 +104,7 @@ pub struct RuntimeAgentTelemetry {
     pub agent: String,
     pub usage: Option<RuntimeWorkflowUsage>,
     pub usage_records: Vec<RuntimeUsageRecord>,
+    pub policy_events: Vec<Event>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -284,14 +288,13 @@ impl WorkflowRuntimeStore {
     /// Single durable query path for "what did agent X do in workflow/run Y?"
     ///
     /// This returns the workflow outcome from `workflow_instances` plus the
-    /// per-turn usage rows for one persisted runtime agent. Policy-hook events
-    /// remain in `harness_observe::event_store` and can be joined by each
-    /// record's `agent_run_id` with `EventStore::policy_events_for_agent_run`
-    /// when the caller needs guard/hook decisions alongside usage and outcome.
+    /// per-turn usage rows for one persisted runtime agent plus policy-hook
+    /// events linked by the persisted runtime usage `agent_run_id`.
     pub async fn runtime_agent_telemetry_for_workflow(
         &self,
         workflow_id: &str,
         agent: &str,
+        event_store: &EventStore,
     ) -> anyhow::Result<Option<RuntimeAgentTelemetry>> {
         let Some(workflow) = self.get_instance(workflow_id).await? else {
             return Ok(None);
@@ -299,6 +302,7 @@ impl WorkflowRuntimeStore {
         let usage_records = self
             .runtime_usage_records_for_workflow_agent(workflow_id, agent)
             .await?;
+        let policy_events = policy_events_for_usage_records(event_store, &usage_records).await?;
         let usage = aggregate_usage_records(&usage_records)?;
         let terminal = workflow.is_terminal();
         Ok(Some(RuntimeAgentTelemetry {
@@ -308,6 +312,7 @@ impl WorkflowRuntimeStore {
             agent: agent.to_string(),
             usage,
             usage_records,
+            policy_events,
         }))
     }
 
@@ -356,6 +361,29 @@ impl WorkflowRuntimeStore {
             })
             .collect()
     }
+}
+
+async fn policy_events_for_usage_records(
+    event_store: &EventStore,
+    usage_records: &[RuntimeUsageRecord],
+) -> anyhow::Result<Vec<Event>> {
+    let mut seen_run_ids = HashSet::new();
+    let mut policy_events = Vec::new();
+    for run_id in usage_records
+        .iter()
+        .filter_map(|record| record.agent_run_id.as_ref())
+    {
+        if !seen_run_ids.insert(run_id.as_str().to_string()) {
+            continue;
+        }
+        policy_events.extend(event_store.policy_events_for_agent_run(run_id).await?);
+    }
+    policy_events.sort_by(|left, right| {
+        left.ts
+            .cmp(&right.ts)
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
+    Ok(policy_events)
 }
 
 fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<RuntimeUsageRecord> {

@@ -4,6 +4,8 @@ use crate::runtime::{
     RuntimeUsageUpsertOutcome,
 };
 use harness_core::run_id::RunId;
+use harness_core::types::{Decision, Event, SessionId};
+use harness_observe::event_store::EventStore;
 use std::str::FromStr;
 
 #[tokio::test]
@@ -160,6 +162,7 @@ async fn runtime_agent_telemetry_for_workflow_returns_outcome_and_agent_usage() 
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let event_store = EventStore::new(&dir.path().join("event_store")).await?;
     let workflow = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
@@ -186,9 +189,34 @@ async fn runtime_agent_telemetry_for_workflow_returns_outcome_and_agent_usage() 
 
     store.upsert_runtime_usage(&codex).await?;
     store.upsert_runtime_usage(&claude).await?;
+    let run_id = RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wd")?;
+    let mut tool_policy_event = Event::new(
+        SessionId::from_str("session-1"),
+        "PostToolUse",
+        "Bash",
+        Decision::Pass,
+    );
+    tool_policy_event.run_id = Some(run_id.clone());
+    let mut rule_policy_event = Event::new(
+        SessionId::from_str("session-1"),
+        "rule_check",
+        "policy.allowed_cmd",
+        Decision::Warn,
+    );
+    rule_policy_event.run_id = Some(run_id.clone());
+    let mut other_run_policy_event = Event::new(
+        SessionId::from_str("session-2"),
+        "PostToolUse",
+        "Bash",
+        Decision::Pass,
+    );
+    other_run_policy_event.run_id = Some(RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6we")?);
+    event_store
+        .log_many(&[tool_policy_event, rule_policy_event, other_run_policy_event])
+        .await?;
 
     let telemetry = store
-        .runtime_agent_telemetry_for_workflow("workflow-1", "codex")
+        .runtime_agent_telemetry_for_workflow("workflow-1", "codex", &event_store)
         .await?
         .expect("workflow telemetry should exist");
 
@@ -204,14 +232,28 @@ async fn runtime_agent_telemetry_for_workflow_returns_outcome_and_agent_usage() 
             .map(RunId::as_str),
         Some("ar-01j1qb3c9r7v5m2k8x4tznq6wd")
     );
+    assert_eq!(telemetry.policy_events.len(), 2);
+    assert!(telemetry
+        .policy_events
+        .iter()
+        .all(|event| event.run_id.as_ref() == Some(&run_id)));
+    assert!(telemetry
+        .policy_events
+        .iter()
+        .any(|event| event.tool == "Bash"));
+    assert!(telemetry
+        .policy_events
+        .iter()
+        .any(|event| event.tool == "policy.allowed_cmd"));
     let usage = telemetry.usage.expect("codex usage should aggregate");
     assert_eq!(usage.metrics.input_tokens, 10);
     assert_eq!(usage.metrics.total_tokens(), 15);
     assert_eq!(usage.cost_usd_micros, 750_000);
     assert!(store
-        .runtime_agent_telemetry_for_workflow("missing-workflow", "codex")
+        .runtime_agent_telemetry_for_workflow("missing-workflow", "codex", &event_store)
         .await?
         .is_none());
+    event_store.close().await;
     Ok(())
 }
 

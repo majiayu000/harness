@@ -546,11 +546,10 @@ ownership:
 
 The event store is the policy-hook store, not the source of truth for full
 agent turns. To answer "what did agent X do in workflow/run Y", query
-`WorkflowRuntimeStore::runtime_agent_telemetry_for_workflow(workflow_id, agent)`
-for workflow outcome plus per-turn usage. If policy-hook decisions are needed
-for the same agent process, join each usage record's `agent_run_id` with
-`EventStore::policy_events_for_agent_run(agent_run_id)`. `signals.jsonl`
-remains an append-only external-signal input and is not the runtime usage path.
+`WorkflowRuntimeStore::runtime_agent_telemetry_for_workflow(workflow_id, agent, event_store)`
+for workflow outcome, per-turn usage, and policy-hook events joined by each
+usage record's `agent_run_id`. `signals.jsonl` remains an append-only
+external-signal input and is not the runtime usage path.
 
 ### `[concurrency]`
 
