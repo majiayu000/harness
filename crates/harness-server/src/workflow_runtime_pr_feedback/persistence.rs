@@ -93,6 +93,7 @@ pub(super) async fn persist_pr_detected(
 pub(super) async fn persist_pr_feedback_sweep_request(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
+    latest_pr_fact: Option<&ObservedPrFact>,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
     let workflow_id = instance.id.clone();
     let task_id = runtime_task_id_from_instance(&instance);
@@ -105,6 +106,9 @@ pub(super) async fn persist_pr_feedback_sweep_request(
     let repo = optional_string_field(&instance.data, "repo");
     let accepted_data = instance.data.clone();
     let sweep_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let remote_fact_activity_at = latest_pr_fact
+        .and_then(|fact| fact.activity_at)
+        .map(|activity_at| activity_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     let output = build_pr_feedback_sweep_decision(
         &instance,
         PrFeedbackSweepDecisionInput {
@@ -113,6 +117,8 @@ pub(super) async fn persist_pr_feedback_sweep_request(
             pr_url: pr_url.as_deref(),
             issue_number,
             repo: repo.as_deref(),
+            remote_fact_hash: latest_pr_fact.map(|fact| fact.fact_hash.as_str()),
+            remote_fact_activity_at: remote_fact_activity_at.as_deref(),
             summary: "Runtime workflow requested a PR feedback sweep.",
         },
     );

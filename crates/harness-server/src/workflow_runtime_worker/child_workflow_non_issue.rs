@@ -357,6 +357,10 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
         .get("pr_url")
         .and_then(Value::as_str)
         .or_else(|| parent.data.get("pr_url").and_then(Value::as_str));
+    let remote_fact_hash = command.get("remote_fact_hash").and_then(Value::as_str);
+    let remote_fact_activity_at = command
+        .get("remote_fact_activity_at")
+        .and_then(Value::as_str);
     let issue_number = command
         .get("issue_number")
         .and_then(Value::as_u64)
@@ -396,6 +400,8 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             parent_workflow_id: parent.id.as_str(),
             runtime_job_id: job.id.as_str(),
             command_id: job.command_id.as_str(),
+            remote_fact_hash,
+            remote_fact_activity_at,
         },
     );
     let inherited_trust = inherit_author_trust_class(&mut child.data, &parent.data)?;

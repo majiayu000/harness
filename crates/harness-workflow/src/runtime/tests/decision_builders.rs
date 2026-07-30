@@ -526,6 +526,8 @@ fn pr_feedback_sweep_decision_starts_child_workflow() {
             pr_url: Some("https://github.com/owner/repo/pull/77"),
             issue_number: Some(123),
             repo: Some("owner/repo"),
+            remote_fact_hash: Some("sha256:pr-fact"),
+            remote_fact_activity_at: Some("2026-06-10T00:00:00Z"),
             summary: "Runtime workflow requested a PR feedback sweep.",
         },
     );
@@ -547,6 +549,14 @@ fn pr_feedback_sweep_decision_starts_child_workflow() {
         PR_FEEDBACK_INSPECT_ACTIVITY
     );
     assert_eq!(output.decision.commands[0].command["pr_number"], 77);
+    assert_eq!(
+        output.decision.commands[0].command["remote_fact_hash"],
+        "sha256:pr-fact"
+    );
+    assert_eq!(
+        output.decision.commands[0].command["remote_fact_activity_at"],
+        "2026-06-10T00:00:00Z"
+    );
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,

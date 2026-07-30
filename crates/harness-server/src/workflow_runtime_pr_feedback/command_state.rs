@@ -35,6 +35,7 @@ pub(super) async fn has_active_pr_feedback_command(
         workflow_id,
         failed_child_suppression_secs,
         None,
+        None,
     )
     .await
 }
@@ -43,6 +44,7 @@ pub(super) async fn has_active_pr_feedback_command_with_activity(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
     failed_child_suppression_secs: u64,
+    latest_pr_fact_hash: Option<&str>,
     latest_pr_activity_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<bool> {
     let parent_has_active_command =
@@ -86,9 +88,12 @@ pub(super) async fn has_active_pr_feedback_command_with_activity(
             return Ok(true);
         }
         if handoff_child_pr_feedback_state_suppresses_duplicate_sweep(&instance.state)
+            && !child_handoff_fact_changed(&instance.data, latest_pr_fact_hash)
             && child_state_suppression_still_applies(
                 instance.updated_at,
+                &instance.data,
                 failed_child_suppression_secs,
+                latest_pr_fact_hash,
                 latest_pr_activity_at,
             )
         {
@@ -119,14 +124,44 @@ fn handoff_child_pr_feedback_state_suppresses_duplicate_sweep(state: &str) -> bo
 
 fn child_state_suppression_still_applies(
     child_updated_at: chrono::DateTime<chrono::Utc>,
+    child_data: &serde_json::Value,
     suppression_secs: u64,
+    latest_pr_fact_hash: Option<&str>,
     latest_pr_activity_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
+    if child_handoff_fact_changed(child_data, latest_pr_fact_hash) {
+        return false;
+    }
+    if child_handoff_fact_unchanged(child_data, latest_pr_fact_hash) {
+        return true;
+    }
     let Some(cutoff) = failed_child_suppression_cutoff(suppression_secs) else {
         return false;
     };
     child_updated_at >= cutoff
         && failed_child_suppression_still_applies(child_updated_at, latest_pr_activity_at)
+}
+
+fn child_handoff_fact_changed(
+    child_data: &serde_json::Value,
+    latest_pr_fact_hash: Option<&str>,
+) -> bool {
+    let Some(latest_pr_fact_hash) = latest_pr_fact_hash else {
+        return false;
+    };
+    optional_string_field(child_data, "remote_fact_hash")
+        .as_deref()
+        .is_some_and(|child_fact_hash| child_fact_hash != latest_pr_fact_hash)
+}
+
+fn child_handoff_fact_unchanged(
+    child_data: &serde_json::Value,
+    latest_pr_fact_hash: Option<&str>,
+) -> bool {
+    let Some(latest_pr_fact_hash) = latest_pr_fact_hash else {
+        return false;
+    };
+    optional_string_field(child_data, "remote_fact_hash").as_deref() == Some(latest_pr_fact_hash)
 }
 
 pub(super) async fn has_active_child_pr_feedback_command(
@@ -154,7 +189,9 @@ mod tests {
 
         assert!(!child_state_suppression_still_applies(
             child_updated_at,
+            &json!({}),
             DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            None,
             Some(newer_pr_activity_at),
         ));
     }
@@ -163,7 +200,9 @@ mod tests {
     fn child_state_suppression_respects_disabled_window() {
         assert!(!child_state_suppression_still_applies(
             chrono::Utc::now(),
+            &json!({}),
             0,
+            None,
             None,
         ));
     }
@@ -174,7 +213,9 @@ mod tests {
 
         assert!(!child_state_suppression_still_applies(
             child_updated_at,
+            &json!({}),
             DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            None,
             None,
         ));
     }
@@ -183,7 +224,46 @@ mod tests {
     fn child_state_suppression_applies_without_newer_activity() {
         assert!(child_state_suppression_still_applies(
             chrono::Utc::now(),
+            &json!({}),
             DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn child_state_suppression_ignores_stale_remote_fact_hash() {
+        assert!(child_handoff_fact_changed(
+            &json!({ "remote_fact_hash": "sha256:old" }),
+            Some("sha256:new"),
+        ));
+        assert!(!child_state_suppression_still_applies(
+            chrono::Utc::now(),
+            &json!({ "remote_fact_hash": "sha256:old" }),
+            DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            Some("sha256:new"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn child_state_suppression_keeps_same_remote_fact_hash() {
+        assert!(child_state_suppression_still_applies(
+            chrono::Utc::now() - chrono::Duration::hours(25),
+            &json!({ "remote_fact_hash": "sha256:same" }),
+            DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+            Some("sha256:same"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn child_state_suppression_keeps_same_remote_fact_hash_when_cooldown_disabled() {
+        assert!(child_state_suppression_still_applies(
+            chrono::Utc::now() - chrono::Duration::hours(25),
+            &json!({ "remote_fact_hash": "sha256:same" }),
+            0,
+            Some("sha256:same"),
             None,
         ));
     }

@@ -171,6 +171,7 @@ async fn fetch_github_pr_snapshot_value(
               merged
               url
               title
+              updatedAt
               baseRefName
               headRefName
               headRefOid
@@ -285,6 +286,7 @@ fn normalize_github_pr_snapshot(
     let pr_number = value_u64(pr.get("number")).context("GitHub PR snapshot missing number")?;
     let pr_url = value_string(pr.get("url")).context("GitHub PR snapshot missing url")?;
     let state = value_string(pr.get("state"));
+    let updated_at = value_string(pr.get("updatedAt"));
     let merged = pr.get("merged").and_then(Value::as_bool).or_else(|| {
         state
             .as_deref()
@@ -323,6 +325,8 @@ fn normalize_github_pr_snapshot(
         "merged": merged,
         "pr_url": pr_url,
         "url": pr_url,
+        "updated_at": updated_at,
+        "updatedAt": updated_at,
         "title": title,
         "base_ref": base_ref,
         "baseRefName": base_ref,
