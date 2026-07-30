@@ -212,17 +212,22 @@ pub fn protective_control_diff(
     before: &[AgentStackProtectionControl],
     after: &[AgentStackProtectionControl],
 ) -> Vec<AgentStackProtectionControlDiff> {
+    let before_ids = component_ids(before);
     let after_by_id = by_component_id(after);
     let mut facts = Vec::new();
 
     for before_control in before {
-        if before_control.roles.is_empty() {
+        if before_control.roles.is_empty() || before_control.enabled == Some(false) {
             continue;
         }
         let component_id = before_control.component.component_id().as_str();
-        match after_by_id.get(component_id).copied() {
-            Some(after_control) => compare_existing(before_control, after_control, &mut facts),
-            None => compare_removed(before_control, after, &mut facts),
+        match after_by_id.get(component_id) {
+            Some(after_controls) => {
+                for after_control in after_controls {
+                    compare_existing(before_control, after_control, &mut facts);
+                }
+            }
+            None => compare_removed(before_control, after, &before_ids, &mut facts),
         }
     }
 
@@ -289,9 +294,11 @@ fn compare_existing(
 fn compare_removed(
     before: &AgentStackProtectionControl,
     after: &[AgentStackProtectionControl],
+    before_ids: &BTreeSet<String>,
     facts: &mut Vec<AgentStackProtectionControlDiff>,
 ) {
-    let mut same_integrity = replacement_candidates(after, before, CandidateMode::SameIntegrity);
+    let mut same_integrity =
+        replacement_candidates(after, before, before_ids, CandidateMode::SameIntegrity);
     if let Some(candidate) = same_integrity.pop() {
         facts.push(AgentStackProtectionControlDiff::new(
             AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
@@ -301,10 +308,11 @@ fn compare_removed(
             AgentStackProtectionConfidence::Medium,
             AgentStackProtectionControlReason::PossibleRename,
         ));
+        compare_existing(before, candidate, facts);
         return;
     }
 
-    let equivalent = replacement_candidates(after, before, CandidateMode::Equivalent);
+    let equivalent = replacement_candidates(after, before, before_ids, CandidateMode::Equivalent);
     if equivalent.len() == 1 {
         return;
     }
@@ -315,6 +323,20 @@ fn compare_removed(
             Some(before),
             Some(candidate),
             AgentStackProtectionConfidence::Low,
+            AgentStackProtectionControlReason::AmbiguousReplacement,
+        ));
+        return;
+    }
+
+    let weak_equivalent =
+        replacement_candidates(after, before, before_ids, CandidateMode::WeakEquivalent);
+    if let Some(candidate) = weak_equivalent.first() {
+        facts.push(AgentStackProtectionControlDiff::new(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            Some(before),
+            Some(candidate),
+            min_confidence(before.confidence, candidate.confidence),
             AgentStackProtectionControlReason::AmbiguousReplacement,
         ));
         return;
@@ -334,19 +356,23 @@ fn compare_removed(
 enum CandidateMode {
     SameIntegrity,
     Equivalent,
+    WeakEquivalent,
 }
 
 fn replacement_candidates<'a>(
     after: &'a [AgentStackProtectionControl],
     before: &AgentStackProtectionControl,
+    before_ids: &BTreeSet<String>,
     mode: CandidateMode,
 ) -> Vec<&'a AgentStackProtectionControl> {
     let mut candidates = after
         .iter()
+        .filter(|candidate| !before_ids.contains(candidate.component.component_id().as_str()))
         .filter(|candidate| role_overlap(before.roles(), candidate.roles()))
         .filter(|candidate| match mode {
             CandidateMode::SameIntegrity => same_integrity(before, candidate),
             CandidateMode::Equivalent => equivalent_replacement(before, candidate),
+            CandidateMode::WeakEquivalent => weak_equivalent_replacement(before, candidate),
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| candidate.component.component_id().as_str());
@@ -354,6 +380,14 @@ fn replacement_candidates<'a>(
 }
 
 fn equivalent_replacement(
+    before: &AgentStackProtectionControl,
+    after: &AgentStackProtectionControl,
+) -> bool {
+    confidence_at_least(after.confidence, before.confidence)
+        && weak_equivalent_replacement(before, after)
+}
+
+fn weak_equivalent_replacement(
     before: &AgentStackProtectionControl,
     after: &AgentStackProtectionControl,
 ) -> bool {
@@ -388,14 +422,22 @@ fn same_integrity(
 
 fn by_component_id(
     controls: &[AgentStackProtectionControl],
-) -> BTreeMap<String, &AgentStackProtectionControl> {
+) -> BTreeMap<String, Vec<&AgentStackProtectionControl>> {
     let mut by_id = BTreeMap::new();
     for control in controls {
         by_id
             .entry(control.component.component_id().as_str().to_owned())
-            .or_insert(control);
+            .or_insert_with(Vec::new)
+            .push(control);
     }
     by_id
+}
+
+fn component_ids(controls: &[AgentStackProtectionControl]) -> BTreeSet<String> {
+    controls
+        .iter()
+        .map(|control| control.component.component_id().as_str().to_owned())
+        .collect()
 }
 
 fn sorted_roles(
@@ -442,6 +484,13 @@ fn min_confidence(
         (2, _) | (_, 2) => Confidence::Medium,
         _ => Confidence::High,
     }
+}
+
+fn confidence_at_least(
+    left: AgentStackProtectionConfidence,
+    right: AgentStackProtectionConfidence,
+) -> bool {
+    left.strength() >= right.strength()
 }
 
 fn fact_sort_key(fact: &AgentStackProtectionControlDiff) -> (&str, &'static str) {
