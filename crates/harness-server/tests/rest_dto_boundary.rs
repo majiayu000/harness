@@ -5,26 +5,81 @@ use std::{
 
 const LEGACY_SERVER_LOCAL_REST_DTOS: &[&str] = &[
     "src/github_pr_snapshot.rs::GitHubPrSnapshotGraphQlResponse",
+    "src/handlers/cross_review.rs::CrossReviewResult",
+    "src/handlers/operator_monitor.rs::FailureGroup",
+    "src/handlers/operator_monitor.rs::LegacyQueueCounts",
+    "src/handlers/operator_monitor.rs::OperatorAction",
+    "src/handlers/operator_monitor.rs::OperatorActivity",
+    "src/handlers/operator_monitor.rs::OperatorHealth",
+    "src/handlers/operator_monitor.rs::OperatorMonitorPayload",
+    "src/handlers/operator_monitor.rs::StuckWorkflow",
+    "src/handlers/operator_monitor.rs::WorktreeSummary",
+    "src/handlers/operator_monitor/activity.rs::RuntimeWorkflowCounts",
+    "src/handlers/operator_monitor/activity.rs::SourceActivity",
+    "src/handlers/operator_monitor/driverless_progress.rs::DriverlessProgressEvidence",
+    "src/handlers/preflight.rs::PreflightResult",
     "src/handlers/projects.rs::RegisterProjectRequest",
+    "src/handlers/reconcile.rs::ReconcileParams",
     "src/handlers/runtime_hosts.rs::CompleteRuntimeJobRequest",
     "src/handlers/runtime_hosts.rs::RegisterRuntimeHostRequest",
     "src/handlers/runtime_hosts/lease.rs::ClaimRuntimeJobRequest",
     "src/handlers/runtime_hosts/lease.rs::RenewRuntimeJobLeaseRequest",
+    "src/handlers/runtime_project_cache.rs::SyncProjectItem",
     "src/handlers/runtime_project_cache.rs::SyncWatchedProjectsRequest",
+    "src/handlers/skills.rs::GovernanceTransition",
+    "src/handlers/skills.rs::GovernanceView",
+    "src/handlers/skills.rs::StaleEntry",
+    "src/handlers/token_usage.rs::HourModelBucket",
+    "src/handlers/token_usage.rs::UsageBucket",
+    "src/handlers/usage_monitor.rs::ActiveCount",
+    "src/handlers/usage_monitor.rs::AgentInvocation",
+    "src/handlers/usage_monitor.rs::CostConfig",
+    "src/handlers/usage_monitor.rs::ModelPrice",
+    "src/handlers/usage_monitor.rs::UsageDiagnostics",
+    "src/handlers/usage_monitor.rs::UsageMonitorQuery",
     "src/handlers/usage_monitor.rs::UsageMonitorResponse",
+    "src/handlers/usage_monitor.rs::UsageSummary",
+    "src/handlers/usage_monitor.rs::UsageWindow",
+    "src/handlers/usage_monitor_aggregate.rs::UsageGroup",
+    "src/handlers/usage_monitor_candidate.rs::CandidateUsageAttribution",
+    "src/handlers/usage_monitor_candidate.rs::CandidateUsageGroup",
+    "src/handlers/usage_monitor_candidate.rs::CandidateUsageRow",
+    "src/handlers/usage_monitor_local_usage.rs::CcstatsSessionRow",
+    "src/handlers/usage_monitor_local_usage.rs::LocalUsageModelSummary",
+    "src/handlers/usage_monitor_local_usage.rs::LocalUsageSourceSummary",
+    "src/handlers/usage_monitor_process.rs::AgentProcess",
     "src/handlers/worktrees.rs::WorktreeResponse",
     "src/http/auth_routes.rs::PasswordResetRequest",
+    "src/http/background/auto_recovery.rs::AutoRecoveryState",
+    "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreeDetail",
+    "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreePagination",
+    "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreeQuery",
     "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreeResponse",
+    "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreeSummary",
+    "src/http/misc_routes_runtime_tree_nodes.rs::WorkflowRuntimeCommandNode",
+    "src/http/misc_routes_runtime_tree_nodes.rs::WorkflowRuntimeJobNode",
+    "src/http/misc_routes_runtime_tree_nodes.rs::WorkflowRuntimeTreeNode",
+    "src/http/misc_routes_runtime_tree_nodes.rs::WorkflowRuntimeTreeProjection",
     "src/http/runtime_submission_routes.rs::ApprovalResponse",
+    "src/http/runtime_submission_routes.rs::RuntimeSubmissionArtifact",
+    "src/http/runtime_submission_routes.rs::RuntimeSubmissionPrompt",
     "src/http/signal_routes.rs::IngestSignalRequest",
+    "src/http/state.rs::GitHubTokenDispatchCounterSnapshot",
     "src/http/task_mutation_routes.rs::RuntimeTranscriptReconstructionRequest",
     "src/http/task_mutation_routes.rs::WorkflowRuntimeCancelRequest",
     "src/http/task_mutation_routes.rs::WorkflowRuntimeMergeRequest",
     "src/http/task_mutation_routes.rs::WorkflowRuntimeRecoveryRouteRequest",
+    "src/http/task_query_routes.rs::RuntimeSubmissionListCounts",
+    "src/http/task_query_routes.rs::RuntimeSubmissionListPage",
+    "src/http/task_query_routes.rs::RuntimeSubmissionListParams",
     "src/http/task_query_routes.rs::RuntimeSubmissionListResponse",
     "src/http/task_query_routes.rs::RuntimeSubmissionSummaryResponse",
     "src/http/task_query_routes/detail.rs::RuntimeTaskResponse",
+    "src/http/workflow_routes.rs::IssueWorkflowByIssueQuery",
+    "src/http/workflow_routes.rs::IssueWorkflowByPrQuery",
+    "src/http/workflow_routes.rs::ProjectWorkflowByProjectQuery",
     "src/workflow_runtime_submission/runtime_request.rs::CreateTaskRequest",
+    "src/workflow_runtime_worker/data_helpers.rs::PromptTaskRequest",
     "src/workflow_runtime_worker/runtime_execution_queue.rs::RuntimeExecutionQueueRequest",
 ];
 
@@ -69,18 +124,28 @@ fn collect_rest_dtos(manifest_dir: &Path, dir: &Path, discovered: &mut Vec<Strin
             syn::parse_file(&source).unwrap_or_else(|error| panic!("parse {path_str}: {error}"));
 
         for item in file.items {
-            let syn::Item::Struct(item_struct) = item else {
-                continue;
+            let (name, attrs) = match item {
+                syn::Item::Struct(item_struct) => {
+                    (item_struct.ident.to_string(), item_struct.attrs)
+                }
+                syn::Item::Enum(item_enum) => (item_enum.ident.to_string(), item_enum.attrs),
+                _ => continue,
             };
-            if is_cfg_test(&item_struct.attrs) {
+            if is_cfg_test(&attrs) {
                 continue;
             }
-            let name = item_struct.ident.to_string();
-            if name.ends_with("Request") || name.ends_with("Response") {
+            if is_rest_dto_candidate(&path_str, &name, &attrs) {
                 discovered.push(format!("{path_str}::{name}"));
             }
         }
     }
+}
+
+fn is_rest_dto_candidate(path_str: &str, name: &str, attrs: &[syn::Attribute]) -> bool {
+    let is_route_module =
+        path_str.starts_with("src/http/") || path_str.starts_with("src/handlers/");
+    let has_wire_name = name.ends_with("Request") || name.ends_with("Response");
+    has_wire_name || (is_route_module && has_serde_derive(attrs))
 }
 
 fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
@@ -94,6 +159,20 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
                 .to_string()
                 .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
                 .any(|token| token == "test")
+    })
+}
+
+fn has_serde_derive(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let syn::Meta::List(list) = &attr.meta else {
+            return false;
+        };
+        attr.path().is_ident("derive")
+            && list
+                .tokens
+                .to_string()
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .any(|token| matches!(token, "Serialize" | "Deserialize"))
     })
 }
 
