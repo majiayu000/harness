@@ -327,6 +327,10 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
     assert!(prompts[1].contains("Structured output correction retry"));
     let env_vars = agent.env_vars.lock().await;
     assert_eq!(env_vars.len(), 2);
+    assert_eq!(
+        env_vars[1][harness_core::agent::AGENT_ISOLATION_TIER_ENV],
+        "container"
+    );
     assert!(!env_vars[1].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
     assert!(matches!(
         agent.sandbox_modes.lock().await[1],

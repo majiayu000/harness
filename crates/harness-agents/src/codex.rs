@@ -125,6 +125,9 @@ impl CodexAgent {
             OsString::from("-c"),
             OsString::from(format!("model_reasoning_effort=\"{}\"", reasoning_effort)),
         ];
+        if let Some([]) = req.allowed_tools.as_deref() {
+            args.push(OsString::from("--ignore-user-config"));
+        }
         push_codex_sandbox_args(&mut args, sandbox_mode);
         if let Some(approval_policy) = req.approval_policy.as_deref() {
             push_codex_approval_policy_args(&mut args, approval_policy);

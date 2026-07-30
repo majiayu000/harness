@@ -2,7 +2,6 @@ use harness_core::error::HarnessError;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 const CONTAINER_OUTPUT_SCHEMA_DIR: &str = "/harness-output-schema";
-
 pub(super) fn rewrite_for_container(
     args: &[OsString],
 ) -> Result<(Vec<OsString>, Option<PathBuf>), HarnessError> {
@@ -18,14 +17,12 @@ pub(super) fn rewrite_for_container(
     }
     Ok((child_args, mount))
 }
-
 pub(super) fn mount_arg(source: &Path) -> OsString {
     OsString::from(format!(
         "type=bind,src={},dst={CONTAINER_OUTPUT_SCHEMA_DIR},readonly",
         source.display()
     ))
 }
-
 fn child_schema_path(
     host_path: &Path,
     mount: &mut Option<PathBuf>,

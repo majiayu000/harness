@@ -1,5 +1,4 @@
 use super::*;
-
 type RuntimeEventSummaryRow = (
     String,
     i64,
@@ -27,7 +26,6 @@ impl WorkflowRuntimeStore {
         tx.commit().await?;
         Ok(event)
     }
-
     pub async fn reserve_runtime_turn_started_for_workflow(
         &self,
         workflow_id: &str,
@@ -53,7 +51,6 @@ impl WorkflowRuntimeStore {
                 "runtime job {runtime_job_id} belongs to workflow {command_workflow_id}, not {workflow_id}"
             );
         }
-
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("runtime_turn_budget:{workflow_id}"))
             .execute(&mut *tx)
@@ -92,7 +89,6 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(None);
         }
-
         let event = runtime_job_leases::append_runtime_event_tx(
             &mut tx,
             runtime_job_id,
@@ -103,7 +99,6 @@ impl WorkflowRuntimeStore {
         tx.commit().await?;
         Ok(Some(event))
     }
-
     pub async fn runtime_events_for(
         &self,
         runtime_job_id: &str,

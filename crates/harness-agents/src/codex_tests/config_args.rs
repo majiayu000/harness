@@ -146,4 +146,5 @@ fn deny_all_allowed_tools_keeps_configured_sandbox_mode() {
     assert!(args
         .windows(2)
         .any(|window| window == ["-s", "danger-full-access"]));
+    assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
 }

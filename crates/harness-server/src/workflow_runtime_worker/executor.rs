@@ -191,7 +191,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     });
                 let mut env_vars = isolation_spawn_env_vars(&job);
                 let correction_only = attempt > 0 && correction_retry.is_some();
-                if correction_only { env_vars.clear() }
+                if correction_only { env_vars.retain(|key, _| key == AGENT_ISOLATION_TIER_ENV); }
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
                         AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),

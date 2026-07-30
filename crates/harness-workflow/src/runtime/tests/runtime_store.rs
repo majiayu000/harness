@@ -1,5 +1,4 @@
 use super::*;
-
 #[tokio::test]
 async fn runtime_turn_reservation_is_atomic_and_replay_safe() -> anyhow::Result<()> {
     if harness_core::db::resolve_test_database_url(None).is_err() {
