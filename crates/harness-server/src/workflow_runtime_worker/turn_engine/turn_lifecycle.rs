@@ -94,7 +94,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         );
         return;
     };
-    match RunIdentity::ensure_env_vars(&mut options.env_vars) {
+    match RunIdentity::mint_nested_env_vars(&mut options.env_vars) {
         Ok(identity) => {
             if let Some(context) = options.runtime_usage.as_mut() {
                 context.agent_run_id = Some(identity.run_id);
@@ -128,6 +128,16 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         .await;
         return;
     };
+    if let Some(context) = options.runtime_usage.as_ref() {
+        if let Err(error) = context.persist_agent_run_start(&turn_id).await {
+            tracing::error!(
+                runtime_job_id = %context.runtime_job_id,
+                command_id = %context.command_id,
+                workflow_id = %context.workflow_id,
+                "failed to persist workflow runtime agent run start: {error}"
+            );
+        }
+    }
 
     // RAII guard: ensures the adapter is deregistered when the turn scope exits,
     // even if the task is cancelled before reaching the end of this function.

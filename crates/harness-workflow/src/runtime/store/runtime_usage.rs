@@ -144,6 +144,17 @@ impl WorkflowRuntimeStore {
         if usage_metrics_are_zero(&usage.metrics) && usage.cost_usd_micros == 0 {
             return Ok(RuntimeUsageUpsertOutcome::SkippedZeroUsage);
         }
+        self.upsert_runtime_usage_row(usage).await?;
+        Ok(RuntimeUsageUpsertOutcome::Persisted)
+    }
+
+    /// Persist the workflow turn to agent-run mapping at turn start, even when
+    /// the agent never reports nonzero token usage.
+    pub async fn upsert_runtime_agent_run(&self, usage: &RuntimeUsageUpsert) -> anyhow::Result<()> {
+        self.upsert_runtime_usage_row(usage).await
+    }
+
+    async fn upsert_runtime_usage_row(&self, usage: &RuntimeUsageUpsert) -> anyhow::Result<()> {
         let usage_key = usage.usage_key();
         let id = format!("runtime_usage:{}:{usage_key}", usage.runtime_job_id);
         sqlx::query(
@@ -218,7 +229,7 @@ impl WorkflowRuntimeStore {
         .bind(usage.reported_at)
         .execute(&self.pool)
         .await?;
-        Ok(RuntimeUsageUpsertOutcome::Persisted)
+        Ok(())
     }
 
     pub async fn runtime_usage_between(

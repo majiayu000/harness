@@ -162,6 +162,18 @@ impl RunIdentity {
         Ok(identity)
     }
 
+    pub fn mint_nested_env_vars(
+        env_vars: &mut HashMap<String, String>,
+    ) -> Result<Self, RunIdParseError> {
+        let parent = Self::from_env_vars(env_vars)?.map(|identity| identity.run_id);
+        let identity = Self {
+            run_id: RunId::new(),
+            parent,
+        };
+        identity.write_env_vars(env_vars);
+        Ok(identity)
+    }
+
     pub fn mint_nested() -> Result<Self, RunIdParseError> {
         let parent = Self::from_env()?.map(|identity| identity.run_id);
         Ok(Self {
@@ -357,5 +369,42 @@ mod run_id_tests {
             Some(value) => unsafe { std::env::set_var(AGENT_RUN_PARENT_ENV, value) },
             None => unsafe { std::env::remove_var(AGENT_RUN_PARENT_ENV) },
         }
+    }
+
+    #[test]
+    fn run_id_mint_nested_env_vars_uses_request_or_process_id_as_parent(
+    ) -> Result<(), RunIdParseError> {
+        let _guard = env_lock().lock().unwrap();
+        let original_id = std::env::var(AGENT_RUN_ID_ENV).ok();
+        let original_parent = std::env::var(AGENT_RUN_PARENT_ENV).ok();
+        unsafe { std::env::set_var(AGENT_RUN_ID_ENV, "ar-01j1qb3c9r7v5m2k8x4tznq6wd") };
+        unsafe { std::env::remove_var(AGENT_RUN_PARENT_ENV) };
+        let mut env_vars = HashMap::new();
+
+        let identity = RunIdentity::mint_nested_env_vars(&mut env_vars)?;
+
+        assert_ne!(identity.run_id.as_str(), "ar-01j1qb3c9r7v5m2k8x4tznq6wd");
+        assert_eq!(
+            identity.parent.as_ref().map(RunId::as_str),
+            Some("ar-01j1qb3c9r7v5m2k8x4tznq6wd")
+        );
+        assert_eq!(
+            env_vars.get(AGENT_RUN_ID_ENV).map(String::as_str),
+            Some(identity.run_id.as_str())
+        );
+        assert_eq!(
+            env_vars.get(AGENT_RUN_PARENT_ENV).map(String::as_str),
+            Some("ar-01j1qb3c9r7v5m2k8x4tznq6wd")
+        );
+
+        match original_id {
+            Some(value) => unsafe { std::env::set_var(AGENT_RUN_ID_ENV, value) },
+            None => unsafe { std::env::remove_var(AGENT_RUN_ID_ENV) },
+        }
+        match original_parent {
+            Some(value) => unsafe { std::env::set_var(AGENT_RUN_PARENT_ENV, value) },
+            None => unsafe { std::env::remove_var(AGENT_RUN_PARENT_ENV) },
+        }
+        Ok(())
     }
 }

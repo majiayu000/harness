@@ -29,7 +29,7 @@ impl EventStore {
             Decision::Warn
         };
         let mut scan_event = Event::new(session_id.clone(), "rule_scan", "RuleEngine", decision);
-        scan_event.run_id = run_id.cloned();
+        apply_explicit_run_id(&mut scan_event, run_id);
         scan_event.reason = Some(format!("violations={}", violations.len()));
         scan_event.detail = Some(project_root.display().to_string());
 
@@ -159,7 +159,7 @@ fn violation_events(
                 violation.rule_id.as_str(),
                 decision,
             );
-            event.run_id = run_id.cloned();
+            apply_explicit_run_id(&mut event, run_id);
             event.reason = Some(violation.message.clone());
             event.detail = Some(if let Some(line) = violation.line {
                 format!("{}:{}", violation.file.display(), line)
@@ -169,4 +169,41 @@ fn violation_events(
             event
         })
         .collect()
+}
+
+fn apply_explicit_run_id(event: &mut Event, run_id: Option<&RunId>) {
+    if let Some(run_id) = run_id {
+        event.run_id = Some(run_id.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn absent_explicit_run_id_preserves_existing_event_identity() -> anyhow::Result<()> {
+        let inherited = RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wd")?;
+        let mut event = Event::new(SessionId::new(), "rule_scan", "RuleEngine", Decision::Pass);
+        event.run_id = Some(inherited.clone());
+
+        apply_explicit_run_id(&mut event, None);
+
+        assert_eq!(event.run_id.as_ref(), Some(&inherited));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_run_id_overrides_existing_event_identity() -> anyhow::Result<()> {
+        let inherited = RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wd")?;
+        let explicit = RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6we")?;
+        let mut event = Event::new(SessionId::new(), "rule_scan", "RuleEngine", Decision::Pass);
+        event.run_id = Some(inherited);
+
+        apply_explicit_run_id(&mut event, Some(&explicit));
+
+        assert_eq!(event.run_id.as_ref(), Some(&explicit));
+        Ok(())
+    }
 }

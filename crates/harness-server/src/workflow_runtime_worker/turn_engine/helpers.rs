@@ -49,6 +49,31 @@ impl std::fmt::Debug for RuntimeUsageContext {
 }
 
 impl RuntimeUsageContext {
+    pub(crate) async fn persist_agent_run_start(&self, turn_id: &TurnId) -> anyhow::Result<()> {
+        self.store
+            .upsert_runtime_agent_run(&RuntimeUsageUpsert {
+                runtime_job_id: self.runtime_job_id.clone(),
+                command_id: self.command_id.clone(),
+                workflow_id: self.workflow_id.clone(),
+                turn_id: Some(turn_id.as_str().to_string()),
+                agent_run_id: self.agent_run_id.clone(),
+                runtime_kind: self.runtime_kind,
+                runtime_profile: self.runtime_profile.clone(),
+                agent: self.agent.clone(),
+                model: self.model.clone(),
+                project: self.project.clone(),
+                task_id: self.task_id.clone(),
+                candidate_group_id: self.candidate_group_id.clone(),
+                candidate_id: self.candidate_id.clone(),
+                candidate_index: self.candidate_index,
+                candidate_count: self.candidate_count,
+                metrics: RuntimeUsageMetrics::default(),
+                cost_usd_micros: 0,
+                reported_at: chrono::Utc::now(),
+            })
+            .await
+    }
+
     async fn persist_token_usage(
         &self,
         turn_id: &TurnId,

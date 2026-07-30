@@ -253,6 +253,46 @@ async fn runtime_agent_telemetry_for_workflow_returns_outcome_and_agent_usage() 
         .runtime_agent_telemetry_for_workflow("missing-workflow", "codex", &event_store)
         .await?
         .is_none());
+    let zero_workflow = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "blocked",
+        WorkflowSubject::new("issue", "issue:1805"),
+    )
+    .with_id("workflow-zero");
+    store.insert_instance_if_absent(&zero_workflow).await?;
+    let zero_run_id = RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wf")?;
+    store
+        .upsert_runtime_agent_run(&RuntimeUsageUpsert {
+            runtime_job_id: "runtime-job-zero".to_string(),
+            workflow_id: "workflow-zero".to_string(),
+            turn_id: Some("turn-zero".to_string()),
+            agent_run_id: Some(zero_run_id.clone()),
+            ..runtime_usage_upsert(RuntimeUsageMetrics::default())
+        })
+        .await?;
+    let mut zero_usage_policy_event = Event::new(
+        SessionId::from_str("session-zero"),
+        "rule_check",
+        "zero_usage_policy",
+        Decision::Block,
+    );
+    zero_usage_policy_event.run_id = Some(zero_run_id);
+    event_store.log(&zero_usage_policy_event).await?;
+    let zero_telemetry = store
+        .runtime_agent_telemetry_for_workflow("workflow-zero", "codex", &event_store)
+        .await?
+        .expect("zero-usage workflow telemetry should exist");
+    assert_eq!(zero_telemetry.usage_records.len(), 1);
+    assert_eq!(
+        zero_telemetry
+            .usage
+            .expect("zero usage should aggregate")
+            .metrics
+            .total_tokens(),
+        0
+    );
+    assert_eq!(zero_telemetry.policy_events.len(), 1);
     event_store.close().await;
     Ok(())
 }
