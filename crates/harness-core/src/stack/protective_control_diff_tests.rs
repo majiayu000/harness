@@ -7,7 +7,6 @@ use AgentStackProtectionDiffKind as DiffKind;
 use AgentStackProtectionFailureMode as Mode;
 use AgentStackProtectionRole as Role;
 use AgentStackProtectionScope as Scope;
-
 const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ACTIVE_REQUIRED: ControlState =
@@ -23,17 +22,14 @@ const DISABLED_REQUIRED: ControlState =
     ControlState(Some(false), Some(Scope::Required), Some(Mode::FailClosed));
 const UNKNOWN_REQUIRED: ControlState =
     ControlState(None, Some(Scope::Required), Some(Mode::FailClosed));
-
 #[derive(Clone, Copy)]
 struct ControlState(Option<bool>, Option<Scope>, Option<Mode>);
-
 fn source(locator: &str) -> AgentStackSource {
     match AgentStackSource::new(AgentStackSourceScope::Repository, locator) {
         Ok(source) => source,
         Err(error) => panic!("valid source: {error}"),
     }
 }
-
 fn component(kind: Kind, locator: &str, integrity: Option<&str>) -> AgentStackComponent {
     let component = match AgentStackComponent::new(
         kind,
@@ -52,11 +48,9 @@ fn component(kind: Kind, locator: &str, integrity: Option<&str>) -> AgentStackCo
     });
     component.with_integrity(integrity)
 }
-
 fn control(kind: Kind, locator: &str, roles: &[Role]) -> AgentStackProtectionControl {
     control_with_confidence(kind, locator, roles, Confidence::High)
 }
-
 fn control_with_confidence(
     kind: Kind,
     locator: &str,
@@ -72,7 +66,6 @@ fn control_with_confidence(
         ACTIVE_REQUIRED,
     )
 }
-
 fn configured_control(
     kind: Kind,
     locator: &str,
@@ -101,7 +94,6 @@ fn configured_control(
     }
     control
 }
-
 fn configured_hook(
     locator: &str,
     integrity: Option<&str>,
@@ -117,15 +109,12 @@ fn configured_hook(
         state,
     )
 }
-
 fn kinds(facts: &[Diff]) -> Vec<DiffKind> {
     facts.iter().map(Diff::kind).collect()
 }
-
 fn reasons(facts: &[Diff]) -> Vec<Reason> {
     facts.iter().map(Diff::reason).collect()
 }
-
 #[test]
 fn protective_control_diff_ignores_benign_hook_removal_without_role_evidence() {
     let before = [control(Kind::Hook, ".githooks/pre-commit", &[])];
@@ -135,7 +124,6 @@ fn protective_control_diff_ignores_benign_hook_removal_without_role_evidence() {
         "hook kind alone must not imply protection"
     );
 }
-
 #[test]
 fn protective_control_diff_reports_protective_policy_removal() {
     let before = [control(Kind::Policy, "rules/protect.toml", &[Role::Policy])];
@@ -150,7 +138,6 @@ fn protective_control_diff_reports_protective_policy_removal() {
     assert_eq!(before.source_locator(), "rules/protect.toml");
     assert!(facts[0].after().is_none());
 }
-
 #[test]
 fn protective_control_diff_reports_relaxed_existing_controls() {
     let before = [control(
@@ -187,7 +174,6 @@ fn protective_control_diff_reports_relaxed_existing_controls() {
         .iter()
         .any(|fact| fact.reason() == Reason::ScopeLevelReduced));
 }
-
 #[test]
 fn protective_control_diff_treats_rename_as_review_evidence() {
     let before = [control(Kind::Policy, "rules/protect.toml", &[Role::Policy])];
@@ -202,7 +188,6 @@ fn protective_control_diff_treats_rename_as_review_evidence() {
     };
     assert_eq!(after.source_locator(), "rules/renamed.toml");
 }
-
 #[test]
 fn protective_control_diff_suppresses_equivalent_replacement() {
     let before = [control(Kind::Hook, ".githooks/pre-push", &[Role::Hook])];
@@ -219,7 +204,6 @@ fn protective_control_diff_suppresses_equivalent_replacement() {
         "same role with equal-or-stronger state is not a weakening fact"
     );
 }
-
 #[test]
 fn protective_control_diff_reports_weakened_rename_state() {
     let before = [control(Kind::Hook, ".githooks/pre-push", &[Role::Hook])];
@@ -230,9 +214,7 @@ fn protective_control_diff_reports_weakened_rename_state() {
         DISABLED_PARTIAL_OPEN,
     );
     let after = [renamed];
-
     let facts = protective_control_diff(&before, &after);
-
     assert_eq!(
         reasons(&facts),
         [
@@ -243,7 +225,6 @@ fn protective_control_diff_reports_weakened_rename_state() {
         ]
     );
 }
-
 #[test]
 fn protective_control_diff_excludes_unchanged_controls_from_rename_candidates() {
     let removed = control(Kind::Policy, "rules/deleted.toml", &[Role::Policy]);
@@ -251,27 +232,21 @@ fn protective_control_diff_excludes_unchanged_controls_from_rename_candidates() 
     let retained_after = control(Kind::Policy, "rules/retained.toml", &[Role::Policy]);
     let before = [removed, retained_before];
     let after = [retained_after];
-
     let facts = protective_control_diff(&before, &after);
-
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].kind(), DiffKind::Removed);
     assert_eq!(facts[0].reason(), Reason::RemovedWithoutEquivalent);
 }
-
 #[test]
 fn protective_control_diff_ignores_removed_controls_already_disabled() {
     let before =
         [control(Kind::Policy, "rules/disabled.toml", &[Role::Policy]).with_enabled(false)];
-
     let facts = protective_control_diff(&before, &[]);
-
     assert!(
         facts.is_empty(),
         "removing an explicitly disabled control is not a weakening"
     );
 }
-
 #[test]
 fn protective_control_diff_keeps_low_confidence_replacements_ambiguous() {
     let before = [control(Kind::Hook, ".githooks/pre-commit", &[Role::Hook])];
@@ -284,15 +259,12 @@ fn protective_control_diff_keeps_low_confidence_replacements_ambiguous() {
         ACTIVE_REQUIRED,
     );
     let after = [replacement];
-
     let facts = protective_control_diff(&before, &after);
-
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].kind(), DiffKind::AmbiguousReviewEvidence);
     assert_eq!(facts[0].reason(), Reason::AmbiguousReplacement);
     assert_eq!(facts[0].confidence(), Confidence::Low);
 }
-
 #[test]
 fn protective_control_diff_aggregates_split_duplicate_after_roles() {
     let before = [control(
@@ -304,15 +276,12 @@ fn protective_control_diff_aggregates_split_duplicate_after_roles() {
         control(Kind::Policy, "rules/protect.toml", &[Role::Policy]),
         control(Kind::Policy, "rules/protect.toml", &[Role::Validation]),
     ];
-
     let facts = protective_control_diff(&before, &after);
-
     assert!(
         facts.is_empty(),
         "duplicate reports for one component should be combined before diffing"
     );
 }
-
 #[test]
 fn protective_control_diff_rejects_disabled_unknown_state_replacement() {
     let before = [configured_hook(
@@ -328,13 +297,10 @@ fn protective_control_diff_rejects_disabled_unknown_state_replacement() {
         DISABLED_REQUIRED,
     );
     let after = [replacement];
-
     let facts = protective_control_diff(&before, &after);
-
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].kind(), DiffKind::Removed);
 }
-
 #[test]
 fn protective_control_diff_caps_rename_evidence_at_source_confidence() {
     let before = [control_with_confidence(
@@ -344,14 +310,11 @@ fn protective_control_diff_caps_rename_evidence_at_source_confidence() {
         Confidence::Low,
     )];
     let after = [control(Kind::Policy, "rules/renamed.toml", &[Role::Policy])];
-
     let facts = protective_control_diff(&before, &after);
-
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].reason(), Reason::PossibleRename);
     assert_eq!(facts[0].confidence(), Confidence::Low);
 }
-
 #[test]
 fn protective_control_diff_keeps_multi_candidate_renames_ambiguous() {
     let before = [control(Kind::Policy, "rules/protect.toml", &[Role::Policy])];
@@ -359,14 +322,11 @@ fn protective_control_diff_keeps_multi_candidate_renames_ambiguous() {
         control(Kind::Policy, "rules/renamed-a.toml", &[Role::Policy]),
         control(Kind::Policy, "rules/renamed-b.toml", &[Role::Policy]).with_enabled(false),
     ];
-
     let facts = protective_control_diff(&before, &after);
-
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].reason(), Reason::PossibleRename);
     assert!(facts[0].after().is_none());
 }
-
 #[test]
 fn protective_control_diff_reports_many_to_one_replacements_as_ambiguous() {
     let before = [
@@ -382,47 +342,55 @@ fn protective_control_diff_reports_many_to_one_replacements_as_ambiguous() {
         ACTIVE_REQUIRED,
     );
     let after = [replacement];
-
     let facts = protective_control_diff(&before, &after);
-
     assert_eq!(facts.len(), 2);
     assert!(facts.iter().all(|fact| {
         fact.reason() == Reason::AmbiguousReplacement
             && fact.kind() == DiffKind::AmbiguousReviewEvidence
     }));
 }
-
 #[test]
+#[rustfmt::skip]
 fn protective_control_diff_handles_review_edge_cases() {
-    let before = [configured_hook(
-        ".githooks/pre-commit",
-        Some(HASH_A),
-        Confidence::High,
-        UNKNOWN_REQUIRED,
-    )];
+    let before = [configured_hook(".githooks/pre-commit", Some(HASH_A), Confidence::High, UNKNOWN_REQUIRED)];
     let after = [before[0].clone().with_enabled(false)];
     assert_eq!(
         reasons(&protective_control_diff(&before, &after)),
         [Reason::ExplicitlyDisabled]
     );
-
     let before = [
         control(Kind::Hook, ".githooks/pre-commit", &[Role::Hook]),
-        configured_hook(
-            ".githooks/pre-push",
-            Some(HASH_B),
-            Confidence::Medium,
-            ACTIVE_REQUIRED,
-        ),
+        configured_hook(".githooks/pre-push", Some(HASH_B), Confidence::Medium, ACTIVE_REQUIRED),
     ];
-    let after = [configured_hook(
-        ".harness/guards/git-hooks.sh",
-        Some(HASH_A),
-        Confidence::Medium,
-        ACTIVE_REQUIRED,
-    )];
+    let after = [configured_hook(".harness/guards/git-hooks.sh", Some(HASH_A), Confidence::Medium, ACTIVE_REQUIRED)];
     assert_eq!(
         reasons(&protective_control_diff(&before, &after)),
         [Reason::PossibleRename, Reason::AmbiguousReplacement]
     );
+    let before = [control(Kind::Hook, ".githooks/pre-merge", &[Role::Hook])];
+    let after = [
+        configured_hook(".harness/guards/pre-merge.sh", Some(HASH_A), Confidence::High, ACTIVE_REQUIRED),
+        configured_hook(".harness/guards/pre-merge.sh", Some(HASH_B), Confidence::High, ACTIVE_REQUIRED),
+    ];
+    assert_eq!(
+        reasons(&protective_control_diff(&before, &after)),
+        [Reason::ConflictingDuplicateReport]
+    );
+    let removed = control(Kind::Hook, ".githooks/pre-receive", &[Role::Hook]);
+    let retained_before = configured_hook(".harness/guards/git-hooks.sh", Some(HASH_B), Confidence::High, ControlState(Some(true), Some(Scope::Advisory), Some(Mode::FailOpen)));
+    let retained_after = configured_hook(".harness/guards/git-hooks.sh", Some(HASH_B), Confidence::High, ACTIVE_REQUIRED);
+    assert!(protective_control_diff(&[removed, retained_before], &[retained_after]).is_empty());
+    let before = [
+        control(Kind::Hook, ".githooks/pre-rebase", &[Role::Hook]),
+        configured_hook(".harness/guards/rebase.sh", Some(HASH_B), Confidence::High, ACTIVE_REQUIRED),
+        configured_hook(".harness/guards/rebase.sh", Some(HASH_B), Confidence::High, DISABLED_REQUIRED),
+    ];
+    let after = [configured_hook(".harness/guards/rebase.sh", Some(HASH_B), Confidence::High, ACTIVE_REQUIRED)];
+    let facts = protective_control_diff(&before, &after);
+    assert!(facts.iter().any(|fact| {
+        fact.reason() == Reason::ConflictingDuplicateReport
+            && fact
+                .before()
+                .is_some_and(|before| before.source_locator() == ".githooks/pre-rebase")
+    }));
 }

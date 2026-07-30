@@ -4,7 +4,6 @@ use super::{
 };
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
-
 pub(super) fn validate_source_locator(
     scope: AgentStackSourceScope,
     locator: &str,
@@ -20,7 +19,6 @@ pub(super) fn validate_source_locator(
         | AgentStackSourceScope::Runner => validate_logical_locator(scope, locator),
     }
 }
-
 fn validate_portable_path(value: &str) -> Result<(), AgentStackComponentError> {
     let drive_prefixed = value
         .as_bytes()
@@ -40,7 +38,6 @@ fn validate_portable_path(value: &str) -> Result<(), AgentStackComponentError> {
         Ok(())
     }
 }
-
 fn validate_user_global_locator(locator: &str) -> Result<(), AgentStackComponentError> {
     validate_portable_path(locator)?;
     let mut segments = locator.split('/');
@@ -61,7 +58,6 @@ fn validate_user_global_locator(locator: &str) -> Result<(), AgentStackComponent
     }
     reject_reserved_segments(locator)
 }
-
 fn validate_logical_locator(
     scope: AgentStackSourceScope,
     locator: &str,
@@ -86,11 +82,9 @@ fn validate_logical_locator(
     }
     reject_reserved_segments(locator)
 }
-
 pub(super) fn valid_logical_segments(value: &str) -> bool {
     !value.is_empty() && value.split('/').all(valid_logical_segment)
 }
-
 fn valid_logical_segment(segment: &str) -> bool {
     segment
         .as_bytes()
@@ -102,7 +96,6 @@ fn valid_logical_segment(segment: &str) -> bool {
         && !is_reserved(segment)
         && !is_uuid_shaped(segment)
 }
-
 fn validate_configured_user_key(key: &str) -> Result<(), AgentStackComponentError> {
     if is_snake_case(key) && !is_reserved(key) && !is_uuid_shaped(key) {
         Ok(())
@@ -110,7 +103,6 @@ fn validate_configured_user_key(key: &str) -> Result<(), AgentStackComponentErro
         Err(AgentStackComponentError::InvalidSourceLocator)
     }
 }
-
 pub(super) fn is_snake_case(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('_')
@@ -120,7 +112,6 @@ pub(super) fn is_snake_case(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
-
 fn reject_reserved_segments(value: &str) -> Result<(), AgentStackComponentError> {
     if value.split('/').any(is_reserved) {
         Err(AgentStackComponentError::InvalidSourceLocator)
@@ -128,18 +119,15 @@ fn reject_reserved_segments(value: &str) -> Result<(), AgentStackComponentError>
         Ok(())
     }
 }
-
 #[rustfmt::skip]
 pub(super) fn is_reserved(value: &str) -> bool {
     ["unknown", "unknown-component", "unknown_component", "missing", "null", "none"]
         .iter()
         .any(|reserved| value.eq_ignore_ascii_case(reserved))
 }
-
 pub(super) fn is_uuid_shaped(value: &str) -> bool {
     Uuid::parse_str(value).is_ok()
 }
-
 pub fn resolve_xdg_config_harness_root(
     xdg_config_home: Option<&Path>,
     home: Option<&Path>,
@@ -153,7 +141,6 @@ pub fn resolve_xdg_config_harness_root(
     };
     normalize_absolute_path(&root)
 }
-
 pub fn select_user_global_root(
     source: &Path,
     home_harness: Option<&Path>,
@@ -200,7 +187,6 @@ pub fn select_user_global_root(
     }
     Err(AgentStackComponentError::UntypedDiscoverySource)
 }
-
 fn user_root_result(
     root: AgentStackUserGlobalRoot,
     locator: String,
@@ -208,7 +194,6 @@ fn user_root_result(
     validate_user_global_locator(&locator)?;
     Ok((root, AgentStackSourceLocator(locator)))
 }
-
 pub(super) fn relative_portable_path(
     root: &Path,
     source: &Path,
@@ -216,7 +201,6 @@ pub(super) fn relative_portable_path(
     relative_portable_path_if_within(root, source)?
         .ok_or(AgentStackComponentError::SourceOutsideRoot)
 }
-
 fn relative_portable_path_if_within(
     root: &Path,
     source: &Path,
@@ -232,7 +216,6 @@ fn relative_portable_path_if_within(
     validate_portable_path(&relative)?;
     Ok(Some(relative))
 }
-
 fn normalize_absolute_path(path: &Path) -> Result<PathBuf, AgentStackComponentError> {
     let key = absolute_path_key(path, true)?;
     let mut result = PathBuf::new();
@@ -247,13 +230,11 @@ fn normalize_absolute_path(path: &Path) -> Result<PathBuf, AgentStackComponentEr
     }
     Ok(result)
 }
-
 #[derive(Debug, PartialEq, Eq)]
 struct AbsolutePathKey {
     drive: Option<u8>,
     segments: Vec<String>,
 }
-
 fn absolute_path_key(
     path: &Path,
     resolve_parent: bool,
@@ -300,18 +281,15 @@ fn absolute_path_key(
     }
     Ok(AbsolutePathKey { drive, segments })
 }
-
 fn drives_match(left: Option<u8>, right: Option<u8>) -> bool {
     left.map(|drive| drive.to_ascii_uppercase()) == right.map(|drive| drive.to_ascii_uppercase())
 }
-
 #[rustfmt::skip]
 fn root_key_matches<T: PartialEq>(
     root_drive: Option<u8>, root: &[T], source_drive: Option<u8>, source: &[T],
 ) -> bool {
     drives_match(root_drive, source_drive) && source.starts_with(root)
 }
-
 #[cfg(test)]
 #[rustfmt::skip]
 pub(super) fn root_keys_match_for_test(
