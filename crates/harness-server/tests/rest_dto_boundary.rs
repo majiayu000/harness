@@ -4,6 +4,7 @@ use std::{
 };
 
 const LEGACY_SERVER_LOCAL_REST_DTOS: &[&str] = &[
+    "src/github_pr_snapshot.rs::GitHubPrSnapshotGraphQlResponse",
     "src/handlers/projects.rs::RegisterProjectRequest",
     "src/handlers/runtime_hosts.rs::CompleteRuntimeJobRequest",
     "src/handlers/runtime_hosts.rs::RegisterRuntimeHostRequest",
@@ -23,6 +24,8 @@ const LEGACY_SERVER_LOCAL_REST_DTOS: &[&str] = &[
     "src/http/task_query_routes.rs::RuntimeSubmissionListResponse",
     "src/http/task_query_routes.rs::RuntimeSubmissionSummaryResponse",
     "src/http/task_query_routes/detail.rs::RuntimeTaskResponse",
+    "src/workflow_runtime_submission/runtime_request.rs::CreateTaskRequest",
+    "src/workflow_runtime_worker/runtime_execution_queue.rs::RuntimeExecutionQueueRequest",
 ];
 
 #[test]
@@ -30,13 +33,7 @@ fn new_rest_dtos_are_not_added_in_server_modules() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut discovered = Vec::new();
 
-    for relative_root in ["src/http", "src/handlers"] {
-        collect_rest_dtos(
-            &manifest_dir,
-            &manifest_dir.join(relative_root),
-            &mut discovered,
-        );
-    }
+    collect_rest_dtos(&manifest_dir, &manifest_dir.join("src"), &mut discovered);
 
     discovered.sort();
     let mut expected = LEGACY_SERVER_LOCAL_REST_DTOS.to_vec();
@@ -65,21 +62,39 @@ fn collect_rest_dtos(manifest_dir: &Path, dir: &Path, discovered: &mut Vec<Strin
             continue;
         }
         let relative_path = path.strip_prefix(manifest_dir).unwrap_or(&path);
-        let source = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", relative_path.display()));
-        let file = syn::parse_file(&source)
-            .unwrap_or_else(|error| panic!("parse {}: {error}", relative_path.display()));
+        let path_str = relative_path.to_string_lossy().replace('\\', "/");
+        let source =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path_str}: {error}"));
+        let file =
+            syn::parse_file(&source).unwrap_or_else(|error| panic!("parse {path_str}: {error}"));
 
         for item in file.items {
             let syn::Item::Struct(item_struct) = item else {
                 continue;
             };
+            if is_cfg_test(&item_struct.attrs) {
+                continue;
+            }
             let name = item_struct.ident.to_string();
             if name.ends_with("Request") || name.ends_with("Response") {
-                discovered.push(format!("{}::{name}", relative_path.display()));
+                discovered.push(format!("{path_str}::{name}"));
             }
         }
     }
+}
+
+fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let syn::Meta::List(list) = &attr.meta else {
+            return false;
+        };
+        attr.path().is_ident("cfg")
+            && list
+                .tokens
+                .to_string()
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .any(|token| token == "test")
+    })
 }
 
 fn is_production_rust_file(path: &Path) -> bool {
