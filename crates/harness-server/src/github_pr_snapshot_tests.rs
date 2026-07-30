@@ -160,6 +160,58 @@ fn pr_remote_fact_hash_ignores_observed_at() -> anyhow::Result<()> {
 }
 
 #[test]
+fn pr_remote_fact_hash_tracks_check_run_identity() -> anyhow::Result<()> {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let mut first_pr = ready_pr();
+    first_pr["statusCheckRollup"] = json!({
+        "state": "FAILURE",
+        "contexts": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "__typename": "CheckRun",
+                "id": "CR_first",
+                "databaseId": 101,
+                "name": "Test",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+            }]
+        }
+    });
+    let mut second_pr = first_pr.clone();
+    second_pr["statusCheckRollup"]["contexts"]["nodes"][0]["id"] = json!("CR_second");
+    second_pr["statusCheckRollup"]["contexts"]["nodes"][0]["databaseId"] = json!(102);
+    second_pr["statusCheckRollup"]["contexts"]["nodes"][0]["detailsUrl"] =
+        json!("https://github.com/owner/repo/actions/runs/102");
+
+    let first = normalize_github_pr_snapshot(&target, &first_pr)?;
+    let second = normalize_github_pr_snapshot(&target, &second_pr)?;
+
+    assert_eq!(first["status_check_contexts"][0]["id"], "CR_first");
+    assert_eq!(second["status_check_contexts"][0]["id"], "CR_second");
+    let first = GitHubPrSnapshotArtifacts {
+        raw_pr: first_pr,
+        normalized_snapshot: first,
+    }
+    .remote_fact_snapshot()?;
+    let second = GitHubPrSnapshotArtifacts {
+        raw_pr: second_pr,
+        normalized_snapshot: second,
+    }
+    .remote_fact_snapshot()?;
+    assert_ne!(first.fact_hash, second.fact_hash);
+    Ok(())
+}
+
+#[test]
+fn github_pr_snapshot_query_requests_check_run_identity() {
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("contexts(first: 100)"));
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("... on CheckRun"));
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("databaseId"));
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("... on StatusContext"));
+}
+
+#[test]
 fn ready_pr_emits_pr_ready_to_merge_signal() {
     let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
     let snapshot = normalize_github_pr_snapshot(&target, &ready_pr()).unwrap();

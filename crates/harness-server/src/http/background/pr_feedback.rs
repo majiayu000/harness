@@ -5,7 +5,7 @@ pub(in crate::http) struct RuntimePrFeedbackSweepTick {
     pub requested: usize,
     pub auto_merge_requested: usize,
     pub active_command_exists: usize,
-    pub remote_refresh_attempts: usize,
+    pub remote_request_attempts: usize,
     pub skipped: usize,
     pub rejected: usize,
 }
@@ -53,7 +53,7 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick_with_cursor(
     workflows.rotate_left(start);
     let mut tick = RuntimePrFeedbackSweepTick::default();
     let work_limit = limit.max(1);
-    let remote_refresh_limit = limit.max(1);
+    let remote_request_limit = limit.max(1);
     for (offset, mut workflow) in workflows.into_iter().enumerate() {
         *cursor = (start + offset + 1) % workflow_count;
         if !matches!(
@@ -112,6 +112,11 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick_with_cursor(
         }
 
         if workflow.state == "ready_to_merge" {
+            if tick.remote_request_attempts >= remote_request_limit {
+                *cursor = (start + offset) % workflow_count;
+                break;
+            }
+            tick.remote_request_attempts += 1;
             match request_auto_merge_if_enabled(state, store, &workflow).await? {
                 AutoMergeRequestOutcome::Requested => tick.auto_merge_requested += 1,
                 AutoMergeRequestOutcome::Disabled => tick.skipped += 1,
@@ -133,11 +138,11 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick_with_cursor(
                 tick.active_command_exists += 1;
                 continue;
             }
-            if tick.remote_refresh_attempts >= remote_refresh_limit {
+            if tick.remote_request_attempts >= remote_request_limit {
                 *cursor = (start + offset) % workflow_count;
                 break;
             }
-            tick.remote_refresh_attempts += 1;
+            tick.remote_request_attempts += 1;
             let refreshed = match refresh_pr_feedback_sweep_remote_fact(state, store, &workflow)
                 .await
             {
@@ -397,7 +402,7 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
                     tracing::info!(
                         requested = tick.requested,
                         active_command_exists = tick.active_command_exists,
-                        remote_refresh_attempts = tick.remote_refresh_attempts,
+                        remote_request_attempts = tick.remote_request_attempts,
                         skipped = tick.skipped,
                         rejected = tick.rejected,
                         "workflow runtime PR feedback sweeper tick complete"

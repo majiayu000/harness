@@ -11,6 +11,97 @@ use std::time::Duration;
 const SERVER_PR_SNAPSHOT_SCHEMA: &str = "harness.github.pr_snapshot.v1";
 pub(crate) const GITHUB_PR_SNAPSHOT_ARTIFACT: &str = "github_pr_snapshot";
 pub(crate) const SERVER_PR_SNAPSHOT_ERROR_ARTIFACT: &str = "server_pr_snapshot_error";
+const GITHUB_PR_SNAPSHOT_QUERY: &str = r#"
+    query HarnessPrSnapshot($owner: String!, $repo: String!, $pr: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $pr) {
+          number
+          state
+          merged
+          url
+          title
+          updatedAt
+          baseRefName
+          headRefName
+          headRefOid
+          mergeCommit {
+            oid
+          }
+          isDraft
+          mergeStateStatus
+          reviewDecision
+          statusCheckRollup {
+            state
+            contexts(first: 100) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                __typename
+                ... on CheckRun {
+                  id
+                  databaseId
+                  name
+                  status
+                  conclusion
+                  detailsUrl
+                }
+                ... on StatusContext {
+                  id
+                  context
+                  state
+                  targetUrl
+                }
+              }
+            }
+          }
+          reviewThreads(first: 100) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              id
+              path
+              line
+              isResolved
+              isOutdated
+              comments(first: 5) {
+                nodes {
+                  author { login }
+                  body
+                  publishedAt
+                }
+              }
+            }
+          }
+          files(first: 100) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              path
+              additions
+              deletions
+              changeType
+            }
+          }
+          closingIssuesReferences(first: 20) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              number
+              url
+            }
+          }
+        }
+      }
+    }
+"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitHubPrSnapshotTarget {
@@ -162,78 +253,9 @@ async fn fetch_github_pr_snapshot_value(
         .repo_slug
         .split_once('/')
         .context("validated repo slug should contain owner and repo")?;
-    let query = r#"
-        query HarnessPrSnapshot($owner: String!, $repo: String!, $pr: Int!) {
-          repository(owner: $owner, name: $repo) {
-            pullRequest(number: $pr) {
-              number
-              state
-              merged
-              url
-              title
-              updatedAt
-              baseRefName
-              headRefName
-              headRefOid
-              mergeCommit {
-                oid
-              }
-              isDraft
-              mergeStateStatus
-              reviewDecision
-              statusCheckRollup {
-                state
-              }
-              reviewThreads(first: 100) {
-                pageInfo {
-                  hasNextPage
-                  endCursor
-                }
-                nodes {
-                  id
-                  path
-                  line
-                  isResolved
-                  isOutdated
-                  comments(first: 5) {
-                    nodes {
-                      author { login }
-                      body
-                      publishedAt
-                    }
-                  }
-                }
-              }
-              files(first: 100) {
-                pageInfo {
-                  hasNextPage
-                  endCursor
-                }
-                nodes {
-                  path
-                  additions
-                  deletions
-                  changeType
-                }
-              }
-              closingIssuesReferences(first: 20) {
-                pageInfo {
-                  hasNextPage
-                  endCursor
-                }
-                nodes {
-                  number
-                  url
-                }
-              }
-            }
-          }
-        }
-    "#;
-
     let request = crate::github_client::apply_github_headers(
         client.post(graphql_url).json(&json!({
-            "query": query,
+            "query": GITHUB_PR_SNAPSHOT_QUERY,
             "variables": {
                 "owner": owner,
                 "repo": repo,
@@ -307,6 +329,11 @@ fn normalize_github_pr_snapshot(
         .get("statusCheckRollup")
         .and_then(|rollup| rollup.get("state"))
         .and_then(|value| value_string(Some(value)));
+    let status_check_contexts = status_check_contexts(pr);
+    let status_check_contexts_complete = !pr
+        .pointer("/statusCheckRollup/contexts/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let active_threads = active_unresolved_review_threads(pr);
     let changed_files = changed_files(pr);
     let closing_issues = closing_issues(pr);
@@ -346,6 +373,8 @@ fn normalize_github_pr_snapshot(
         "status_check_rollup_state": status_check_rollup_state,
         "statusCheckRollupState": status_check_rollup_state,
         "statusCheckRollup": pr.get("statusCheckRollup").cloned().unwrap_or(Value::Null),
+        "status_check_contexts": status_check_contexts,
+        "status_check_contexts_complete": status_check_contexts_complete,
         "active_unresolved_review_threads": active_threads,
         "active_unresolved_review_threads_count": active_threads.len(),
         "review_threads_complete": review_threads_complete,
@@ -407,6 +436,47 @@ fn closing_issues(pr: &Value) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn status_check_contexts(pr: &Value) -> Vec<Value> {
+    let mut contexts = pr
+        .pointer("/statusCheckRollup/contexts/nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(
+            |context| match value_string(context.get("__typename"))?.as_str() {
+                "CheckRun" => Some(json!({
+                    "type": "check_run",
+                    "id": value_string(context.get("id")),
+                    "database_id": value_u64(context.get("databaseId")),
+                    "name": value_string(context.get("name")),
+                    "status": value_string(context.get("status")),
+                    "conclusion": value_string(context.get("conclusion")),
+                    "details_url": value_string(context.get("detailsUrl")),
+                })),
+                "StatusContext" => Some(json!({
+                    "type": "status_context",
+                    "id": value_string(context.get("id")),
+                    "context": value_string(context.get("context")),
+                    "state": value_string(context.get("state")),
+                    "target_url": value_string(context.get("targetUrl")),
+                })),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    contexts.sort_by_key(status_check_context_sort_key);
+    contexts
+}
+
+fn status_check_context_sort_key(context: &Value) -> String {
+    let context_type = value_string(context.get("type")).unwrap_or_default();
+    let id = value_string(context.get("id")).unwrap_or_default();
+    let name = value_string(context.get("name"))
+        .or_else(|| value_string(context.get("context")))
+        .unwrap_or_default();
+    format!("{context_type}\0{id}\0{name}")
 }
 
 fn connection_nodes<'a>(pr: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
@@ -512,6 +582,23 @@ fn stable_pr_fact_hash_input(snapshot: &Value) -> Value {
     let mut stable = snapshot.clone();
     if let Some(object) = stable.as_object_mut() {
         object.remove("observed_at");
+        object.insert(
+            "statusCheckRollup".to_string(),
+            json!({
+                "state": object
+                    .get("status_check_rollup_state")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "contexts": object
+                    .get("status_check_contexts")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "contexts_complete": object
+                    .get("status_check_contexts_complete")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }),
+        );
     }
     stable
 }

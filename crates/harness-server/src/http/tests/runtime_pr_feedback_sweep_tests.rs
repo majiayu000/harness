@@ -441,18 +441,99 @@ async fn runtime_pr_feedback_sweep_caps_remote_refresh_failures() -> anyhow::Res
 
     assert_eq!(tick.requested, 0);
     assert_eq!(tick.rejected, 1);
-    assert_eq!(tick.remote_refresh_attempts, 1);
+    assert_eq!(tick.remote_request_attempts, 1);
     assert_eq!(received.lock().await.len(), 1);
 
     let next_tick =
         super::background::run_runtime_pr_feedback_sweep_tick_with_cursor(&state, 1, &mut cursor)
             .await?;
     assert_eq!(next_tick.rejected, 1);
-    assert_eq!(next_tick.remote_refresh_attempts, 1);
+    assert_eq!(next_tick.remote_request_attempts, 1);
     assert_eq!(
         received.lock().await.len(),
         2,
         "the rotating cursor must advance to the next remote candidate"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_pr_feedback_sweep_caps_auto_merge_remote_probes() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    use crate::workspace::test_support::{async_env_lock, ScopedEnvVar};
+
+    let _env_guard = async_env_lock().lock().await;
+    let response_body = serde_json::json!({
+        "data": {
+            "repository": {
+                "pullRequest": graphql_pr("not-ready-head", "2026-07-31T00:00:00Z")
+            }
+        }
+    })
+    .to_string();
+    let (graphql_url, received) =
+        spawn_graphql_stub_responses(vec![(200, response_body.clone()), (200, response_body)])
+            .await?;
+    let _graphql_guard = ScopedEnvVar::set("HARNESS_GITHUB_GRAPHQL_URL", &graphql_url);
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-auto-merge-probe-cap");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\npr_feedback:\n  enabled: true\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    let mut github = harness_core::config::intake::GitHubIntakeConfig::default();
+    github.repo = "owner/repo".to_string();
+    github.auto_merge.enabled = true;
+    config.intake.github = Some(github);
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+
+    for issue_number in [232_u64, 233] {
+        let workflow = harness_workflow::runtime::WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "ready_to_merge",
+            harness_workflow::runtime::WorkflowSubject::new(
+                "issue",
+                format!("issue:{issue_number}"),
+            ),
+        )
+        .with_id(format!("issue-{issue_number}-auto-merge-not-ready"))
+        .with_data(serde_json::json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": issue_number,
+            "pr_number": issue_number,
+            "pr_url": format!("https://github.com/owner/repo/pull/{issue_number}"),
+            "task_id": format!("runtime-task-{issue_number}"),
+        }));
+        store.upsert_instance(&workflow).await?;
+    }
+
+    let mut cursor = 0;
+    let tick =
+        super::background::run_runtime_pr_feedback_sweep_tick_with_cursor(&state, 1, &mut cursor)
+            .await?;
+
+    assert_eq!(tick.auto_merge_requested, 0);
+    assert_eq!(tick.skipped, 1);
+    assert_eq!(tick.remote_request_attempts, 1);
+    assert_eq!(received.lock().await.len(), 1);
     Ok(())
 }
