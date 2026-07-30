@@ -316,6 +316,83 @@ async fn fetches_all_status_check_context_pages() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn caps_status_check_context_pages_and_marks_snapshot_incomplete() -> anyhow::Result<()> {
+    let mut first_pr = ready_pr();
+    first_pr["statusCheckRollup"] = json!({
+        "id": "SCR_rollup",
+        "state": "FAILURE",
+        "contexts": {
+            "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"},
+            "nodes": [{
+                "__typename": "CheckRun",
+                "id": "CR_1",
+                "databaseId": 101,
+                "name": "Test 1",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+            }]
+        }
+    });
+    let mut responses = vec![json!({
+        "data": {
+            "repository": {
+                "pullRequest": first_pr
+            }
+        }
+    })
+    .to_string()];
+    for page in 2..=4 {
+        responses.push(
+            json!({
+                "data": {
+                    "node": {
+                        "contexts": {
+                            "pageInfo": {
+                                "hasNextPage": true,
+                                "endCursor": format!("cursor-{page}")
+                            },
+                            "nodes": [{
+                                "__typename": "CheckRun",
+                                "id": format!("CR_{page}"),
+                                "databaseId": 100 + page,
+                                "name": format!("Test {page}"),
+                                "status": "COMPLETED",
+                                "conclusion": "FAILURE",
+                                "detailsUrl": format!(
+                                    "https://github.com/owner/repo/actions/runs/{}",
+                                    100 + page
+                                )
+                            }]
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+    }
+    let (graphql_url, received) = spawn_graphql_responses(responses).await?;
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+
+    let artifacts =
+        fetch_github_pr_snapshot_with_client(&reqwest::Client::new(), &target, None, &graphql_url)
+            .await?;
+
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts_complete"],
+        false
+    );
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts"]
+            .as_array()
+            .map(Vec::len),
+        Some(4)
+    );
+    assert_eq!(received.lock().await.len(), 4);
+    Ok(())
+}
+
 #[test]
 fn ready_pr_emits_pr_ready_to_merge_signal() {
     let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();

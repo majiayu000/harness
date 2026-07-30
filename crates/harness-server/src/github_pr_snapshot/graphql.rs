@@ -129,6 +129,8 @@ const GITHUB_PR_CHECK_CONTEXTS_QUERY: &str = r#"
     }
 "#;
 
+const GITHUB_PR_CHECK_CONTEXT_MAX_ADDITIONAL_PAGES: usize = 3;
+
 #[derive(Debug, Deserialize)]
 struct GitHubPrSnapshotGraphQlResponse {
     data: Option<Value>,
@@ -212,7 +214,10 @@ async fn fetch_remaining_status_check_contexts(
         .context("GitHub PR snapshot paginated check contexts are missing rollup id")?;
     let mut seen_cursors = HashSet::new();
 
-    while has_more_status_check_contexts(pr) {
+    for _ in 0..GITHUB_PR_CHECK_CONTEXT_MAX_ADDITIONAL_PAGES {
+        if !has_more_status_check_contexts(pr) {
+            break;
+        }
         let cursor = pr
             .pointer("/statusCheckRollup/contexts/pageInfo/endCursor")
             .and_then(|value| value_string(Some(value)))
