@@ -88,7 +88,7 @@ pub(super) async fn has_active_pr_feedback_command_with_activity(
             return Ok(true);
         }
         if handoff_child_pr_feedback_state_suppresses_duplicate_sweep(&instance.state)
-            && !child_handoff_fact_changed(&instance.data, latest_pr_fact_hash)
+            && !child_remote_fact_changed(&instance.data, latest_pr_fact_hash)
             && child_state_suppression_still_applies(
                 instance.updated_at,
                 &instance.data,
@@ -103,7 +103,9 @@ pub(super) async fn has_active_pr_feedback_command_with_activity(
             && has_recent_failed_child_pr_feedback_command(
                 store,
                 &instance.id,
+                &instance.data,
                 failed_child_suppression_secs,
+                latest_pr_fact_hash,
                 latest_pr_activity_at,
             )
             .await?
@@ -129,10 +131,10 @@ fn child_state_suppression_still_applies(
     latest_pr_fact_hash: Option<&str>,
     latest_pr_activity_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
-    if child_handoff_fact_changed(child_data, latest_pr_fact_hash) {
+    if child_remote_fact_changed(child_data, latest_pr_fact_hash) {
         return false;
     }
-    if child_handoff_fact_unchanged(child_data, latest_pr_fact_hash) {
+    if child_remote_fact_unchanged(child_data, latest_pr_fact_hash) {
         return true;
     }
     let Some(cutoff) = failed_child_suppression_cutoff(suppression_secs) else {
@@ -142,7 +144,7 @@ fn child_state_suppression_still_applies(
         && failed_child_suppression_still_applies(child_updated_at, latest_pr_activity_at)
 }
 
-fn child_handoff_fact_changed(
+fn child_remote_fact_changed(
     child_data: &serde_json::Value,
     latest_pr_fact_hash: Option<&str>,
 ) -> bool {
@@ -154,7 +156,7 @@ fn child_handoff_fact_changed(
         .is_some_and(|child_fact_hash| child_fact_hash != latest_pr_fact_hash)
 }
 
-fn child_handoff_fact_unchanged(
+fn child_remote_fact_unchanged(
     child_data: &serde_json::Value,
     latest_pr_fact_hash: Option<&str>,
 ) -> bool {
@@ -233,7 +235,7 @@ mod tests {
 
     #[test]
     fn child_state_suppression_ignores_stale_remote_fact_hash() {
-        assert!(child_handoff_fact_changed(
+        assert!(child_remote_fact_changed(
             &json!({ "remote_fact_hash": "sha256:old" }),
             Some("sha256:new"),
         ));
@@ -272,9 +274,14 @@ mod tests {
 pub(super) async fn has_recent_failed_child_pr_feedback_command(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
+    child_data: &serde_json::Value,
     suppression_secs: u64,
+    latest_pr_fact_hash: Option<&str>,
     latest_pr_activity_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<bool> {
+    if child_remote_fact_changed(child_data, latest_pr_fact_hash) {
+        return Ok(false);
+    }
     let Some(cutoff) = failed_child_suppression_cutoff(suppression_secs) else {
         return Ok(false);
     };

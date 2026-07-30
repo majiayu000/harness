@@ -104,7 +104,20 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick(
         let request_outcome = if workflow.state == "pr_open" {
             crate::workflow_runtime_pr_feedback::request_local_review(store, &workflow.id).await?
         } else {
-            let refreshed = refresh_pr_feedback_sweep_remote_fact(state, store, &workflow).await?;
+            let refreshed = match refresh_pr_feedback_sweep_remote_fact(state, store, &workflow)
+                .await
+            {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    tracing::warn!(
+                        workflow_id = %workflow.id,
+                        error = %error,
+                        "workflow runtime PR feedback sweep skipped workflow after PR fact refresh failure"
+                    );
+                    tick.rejected += 1;
+                    continue;
+                }
+            };
             if !refreshed {
                 tick.skipped += 1;
                 continue;

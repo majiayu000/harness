@@ -51,6 +51,12 @@ fn graphql_pr(head_oid: &str, updated_at: &str) -> serde_json::Value {
 async fn spawn_graphql_stub(
     response_body: String,
 ) -> anyhow::Result<(String, Arc<tokio::sync::Mutex<Vec<String>>>)> {
+    spawn_graphql_stub_responses(vec![(200, response_body)]).await
+}
+
+async fn spawn_graphql_stub_responses(
+    responses: Vec<(u16, String)>,
+) -> anyhow::Result<(String, Arc<tokio::sync::Mutex<Vec<String>>>)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -58,22 +64,25 @@ async fn spawn_graphql_stub(
     let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let received_server = Arc::clone(&received);
     tokio::spawn(async move {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let mut buf = [0_u8; 16_384];
-        let Ok(read) = socket.read(&mut buf).await else {
-            return;
-        };
-        received_server
-            .lock()
-            .await
-            .push(String::from_utf8_lossy(&buf[..read]).into_owned());
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
-            response_body.len()
-        );
-        let _ = socket.write_all(response.as_bytes()).await;
+        for (status, response_body) in responses {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 16_384];
+            let Ok(read) = socket.read(&mut buf).await else {
+                return;
+            };
+            received_server
+                .lock()
+                .await
+                .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+            let reason = if status == 200 { "OK" } else { "ERROR" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
     });
     Ok((format!("http://{addr}"), received))
 }
@@ -142,7 +151,7 @@ async fn runtime_pr_feedback_sweep_refreshes_remote_fact_before_child_suppressio
         "remote_fact_activity_at": "2026-07-30T00:00:00Z",
     }));
     store.upsert_instance(&child).await?;
-    let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 10).await?;
+    let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 2).await?;
 
     assert_eq!(tick.requested, 1);
     assert_eq!(tick.active_command_exists, 0);
@@ -165,5 +174,100 @@ async fn runtime_pr_feedback_sweep_refreshes_remote_fact_before_child_suppressio
         commands[0].command.command["remote_fact_activity_at"],
         fresh_updated_at
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_pr_feedback_sweep_continues_after_refresh_failure() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    use crate::workspace::test_support::{async_env_lock, ScopedEnvVar};
+
+    let _env_guard = async_env_lock().lock().await;
+    let fresh_updated_at = "2026-07-31T00:00:00Z";
+    let success_body = serde_json::json!({
+        "data": {
+            "repository": {
+                "pullRequest": graphql_pr("fresh-head", fresh_updated_at)
+            }
+        }
+    })
+    .to_string();
+    let (graphql_url, received) =
+        spawn_graphql_stub_responses(vec![(500, "unavailable".to_string()), (200, success_body)])
+            .await?;
+    let _graphql_guard = ScopedEnvVar::set("HARNESS_GITHUB_GRAPHQL_URL", &graphql_url);
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-feedback-refresh-continues");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\npr_feedback:\n  enabled: true\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let later_workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "awaiting_feedback",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
+    )
+    .with_id("issue-227-feedback-refresh-success")
+    .with_data(serde_json::json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "owner/repo",
+        "issue_number": 227,
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-227",
+    }));
+    store.upsert_instance(&later_workflow).await?;
+    let failing_workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "awaiting_feedback",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
+    )
+    .with_id("issue-226-feedback-refresh-fails")
+    .with_data(serde_json::json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "owner/repo",
+        "issue_number": 226,
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-226",
+    }));
+    store.upsert_instance(&failing_workflow).await?;
+    let later_updated_at =
+        chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:01Z")?.with_timezone(&chrono::Utc);
+    let failing_updated_at =
+        chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:02Z")?.with_timezone(&chrono::Utc);
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
+        .bind(&later_workflow.id)
+        .bind(later_updated_at)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
+        .bind(&failing_workflow.id)
+        .bind(failing_updated_at)
+        .execute(store.pool())
+        .await?;
+
+    let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 2).await?;
+
+    assert_eq!(tick.requested, 1);
+    assert_eq!(tick.rejected, 1);
+    assert_eq!(tick.active_command_exists, 0);
+    assert_eq!(tick.skipped, 0);
+    assert_eq!(received.lock().await.len(), 2);
+    assert_eq!(store.commands_for(&later_workflow.id).await?.len(), 1);
+    assert!(store.commands_for(&failing_workflow.id).await?.is_empty());
     Ok(())
 }

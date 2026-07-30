@@ -523,7 +523,7 @@ async fn latest_observed_pr_fact_for_instance(
     store: &WorkflowRuntimeStore,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<Option<ObservedPrFact>> {
-    let Some(repo) = optional_string_field(&instance.data, "repo") else {
+    let Some(repo) = pr_repo_for_fact_lookup(&instance.data) else {
         return Ok(None);
     };
     let Some(pr_number) = instance
@@ -541,6 +541,15 @@ async fn latest_observed_pr_fact_for_instance(
             fact_hash: snapshot.fact_hash.clone(),
             activity_at: observed_pr_fact_activity_at(&snapshot),
         }))
+}
+
+fn pr_repo_for_fact_lookup(data: &serde_json::Value) -> Option<String> {
+    optional_string_field(data, "repo").or_else(|| {
+        optional_string_field(data, "pr_url").and_then(|pr_url| {
+            harness_core::prompts::parse_github_pr_url(pr_url.trim())
+                .map(|(owner, repo, _)| format!("{owner}/{repo}"))
+        })
+    })
 }
 
 fn observed_pr_fact_activity_at(

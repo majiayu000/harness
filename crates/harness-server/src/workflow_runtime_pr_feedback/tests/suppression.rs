@@ -408,6 +408,177 @@ async fn completed_waiting_pr_feedback_child_allows_sweep_after_newer_observed_p
 }
 
 #[tokio::test]
+async fn completed_waiting_pr_feedback_child_uses_pr_url_for_observed_fact_lookup(
+) -> anyhow::Result<()> {
+    let Some((dir, store)) = open_suppression_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    upsert_github_issue_pr_definition(&store).await?;
+    let parent = issue_instance(
+        workflow_id.clone(),
+        project_root.to_string_lossy().into_owned(),
+        None,
+        123,
+        "awaiting_feedback",
+    )
+    .with_data(json!({
+        "project_id": project_root.to_string_lossy(),
+        "issue_number": 123,
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "task-1",
+    }));
+    store.upsert_instance(&parent).await?;
+    let start_child = WorkflowCommand::start_child_workflow(
+        PR_FEEDBACK_DEFINITION_ID,
+        "pr:77",
+        "start-pr-feedback-child-77",
+    );
+    let start_child_id = store
+        .enqueue_command(&workflow_id, None, &start_child)
+        .await?;
+    store
+        .mark_command_status(&start_child_id, WorkflowCommandStatus::Completed)
+        .await?;
+    let child = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "no_actionable_feedback",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child-url-derived-fact")
+    .with_parent(workflow_id.clone())
+    .with_data(json!({
+        "remote_fact_hash": "sha256:old",
+        "remote_fact_activity_at": "2026-07-30T00:00:00Z",
+    }));
+    store.upsert_instance(&child).await?;
+    let observed_fact_at = chrono::Utc::now();
+    let snapshot = RemoteFactSnapshot::new(
+        "github",
+        "owner/repo",
+        "pull_request",
+        77,
+        "needs_feedback_repair",
+        json!({
+            "head_oid": "new-head",
+            "review_decision": "CHANGES_REQUESTED",
+            "updated_at": observed_fact_at.to_rfc3339(),
+        }),
+        observed_fact_at,
+    );
+    store.upsert_remote_fact_snapshot(&snapshot).await?;
+
+    let command_count = store.commands_for(&workflow_id).await?.len();
+    let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
+
+    assert_eq!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested {
+            workflow_id: workflow_id.clone(),
+            task_id: "task-1".to_string(),
+        }
+    );
+    assert_eq!(
+        store.commands_for(&workflow_id).await?.len(),
+        command_count + 1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_pr_feedback_child_allows_sweep_after_changed_observed_fact() -> anyhow::Result<()> {
+    let Some((dir, store)) = open_suppression_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    upsert_github_issue_pr_definition(&store).await?;
+    let parent = issue_instance(
+        workflow_id.clone(),
+        project_root.to_string_lossy().into_owned(),
+        Some("owner/repo".to_string()),
+        123,
+        "awaiting_feedback",
+    )
+    .with_data(json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "owner/repo",
+        "issue_number": 123,
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "task-1",
+    }));
+    store.upsert_instance(&parent).await?;
+    let child = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "failed",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child-failed-changed-fact")
+    .with_parent(workflow_id.clone())
+    .with_data(json!({
+        "remote_fact_hash": "sha256:old",
+        "remote_fact_activity_at": "2026-07-30T00:00:00Z",
+    }));
+    store.upsert_instance(&child).await?;
+    let child_command =
+        WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
+    let child_command_id = store
+        .enqueue_command(&child.id, None, &child_command)
+        .await?;
+    store
+        .mark_command_status(&child_command_id, WorkflowCommandStatus::Failed)
+        .await?;
+    let observed_fact_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let snapshot = RemoteFactSnapshot::new(
+        "github",
+        "owner/repo",
+        "pull_request",
+        77,
+        "needs_feedback_repair",
+        json!({
+            "head_oid": "same-head",
+            "review_decision": "CHANGES_REQUESTED",
+            "status_check_rollup": "FAILURE",
+            "updated_at": observed_fact_at.to_rfc3339(),
+        }),
+        observed_fact_at,
+    );
+    store.upsert_remote_fact_snapshot(&snapshot).await?;
+
+    let command_count = store.commands_for(&workflow_id).await?.len();
+    let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
+
+    assert_eq!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested {
+            workflow_id: workflow_id.clone(),
+            task_id: "task-1".to_string(),
+        }
+    );
+    assert_eq!(
+        store.commands_for(&workflow_id).await?.len(),
+        command_count + 1,
+        "a changed observed fact should bypass failed child cooldown even when updated_at is older"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn explicit_pr_feedback_request_starts_local_review_before_remote_suppression(
 ) -> anyhow::Result<()> {
     let Some((dir, store)) = open_suppression_store().await? else {
