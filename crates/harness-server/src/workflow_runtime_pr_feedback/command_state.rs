@@ -80,9 +80,7 @@ pub(super) async fn has_active_pr_feedback_command_with_activity(
         .into_iter()
         .filter(|instance| instance.definition_id == PR_FEEDBACK_DEFINITION_ID)
     {
-        if matches!(instance.state.as_str(), "pending" | "inspecting")
-            && has_active_child_pr_feedback_command(store, &instance.id).await?
-        {
+        if child_pr_feedback_state_suppresses_duplicate_sweep(&instance.state) {
             return Ok(true);
         }
         if matches!(instance.state.as_str(), "failed" | "blocked")
@@ -99,6 +97,13 @@ pub(super) async fn has_active_pr_feedback_command_with_activity(
     }
 
     Ok(false)
+}
+
+fn child_pr_feedback_state_suppresses_duplicate_sweep(state: &str) -> bool {
+    matches!(
+        state,
+        "pending" | "inspecting" | "feedback_found" | "no_actionable_feedback" | "ready_to_merge"
+    )
 }
 
 pub(super) async fn has_recent_failed_child_pr_feedback_command(
@@ -147,18 +152,4 @@ pub(super) fn failed_child_suppression_cutoff(
             .and_then(|duration| now.checked_sub_signed(duration))
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
     )
-}
-
-pub(super) async fn has_active_child_pr_feedback_command(
-    store: &WorkflowRuntimeStore,
-    workflow_id: &str,
-) -> anyhow::Result<bool> {
-    Ok(store
-        .commands_for(workflow_id)
-        .await?
-        .into_iter()
-        .any(|record| {
-            is_active_pr_feedback_command_status(record.status)
-                && record.command.activity_name() == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
-        }))
 }
