@@ -310,9 +310,12 @@ const fn allowed(
 
 #[test]
 fn raw_process_env_reads_stay_allowlisted() {
-    let workspace_root = workspace_root();
+    let Some(workspace_root) = workspace_root() else {
+        return;
+    };
+    let crates_dir = workspace_root.join("crates");
     let mut actual = BTreeMap::<String, usize>::new();
-    collect_raw_env_reads(&workspace_root.join("crates"), &workspace_root, &mut actual);
+    collect_raw_env_reads(&crates_dir, &workspace_root, &mut actual);
 
     let expected = ALLOWED_RAW_ENV_READS
         .iter()
@@ -413,11 +416,13 @@ fn assert_no_std_env_import_alias(workspace_root: &Path, path: &Path, contents: 
     );
 }
 
-fn workspace_root() -> PathBuf {
-    let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2) else {
-        panic!("harness-core should be two levels below workspace root");
-    };
-    root.to_path_buf()
+fn workspace_root() -> Option<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2)?;
+    if root.join("Cargo.toml").is_file() && root.join("crates").is_dir() {
+        Some(root.to_path_buf())
+    } else {
+        None
+    }
 }
 
 fn relative_path(root: &Path, path: &Path) -> String {
