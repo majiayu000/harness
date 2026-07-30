@@ -1,5 +1,39 @@
 use super::*;
 
+async fn spawn_graphql_responses(
+    responses: Vec<String>,
+) -> anyhow::Result<(String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let received_server = std::sync::Arc::clone(&received);
+    tokio::spawn(async move {
+        for response_body in responses {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 32_768];
+            let Ok(read) = socket.read(&mut buf).await else {
+                return;
+            };
+            received_server
+                .lock()
+                .await
+                .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok((format!("http://{addr}"), received))
+}
+
 fn ready_pr() -> Value {
     json!({
         "number": 77,
@@ -209,6 +243,77 @@ fn github_pr_snapshot_query_requests_check_run_identity() {
     assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("... on CheckRun"));
     assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("databaseId"));
     assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("... on StatusContext"));
+}
+
+#[tokio::test]
+async fn fetches_all_status_check_context_pages() -> anyhow::Result<()> {
+    let mut first_pr = ready_pr();
+    first_pr["statusCheckRollup"] = json!({
+        "id": "SCR_rollup",
+        "state": "FAILURE",
+        "contexts": {
+            "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"},
+            "nodes": [{
+                "__typename": "CheckRun",
+                "id": "CR_first",
+                "databaseId": 101,
+                "name": "Test 1",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+            }]
+        }
+    });
+    let responses = vec![
+        json!({
+            "data": {
+                "repository": {
+                    "pullRequest": first_pr
+                }
+            }
+        })
+        .to_string(),
+        json!({
+            "data": {
+                "node": {
+                    "contexts": {
+                        "pageInfo": {"hasNextPage": false, "endCursor": "cursor-2"},
+                        "nodes": [{
+                            "__typename": "CheckRun",
+                            "id": "CR_second",
+                            "databaseId": 102,
+                            "name": "Test 2",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE",
+                            "detailsUrl": "https://github.com/owner/repo/actions/runs/102"
+                        }]
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ];
+    let (graphql_url, received) = spawn_graphql_responses(responses).await?;
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+
+    let artifacts =
+        fetch_github_pr_snapshot_with_client(&reqwest::Client::new(), &target, None, &graphql_url)
+            .await?;
+
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts_complete"],
+        true
+    );
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let received = received.lock().await;
+    assert_eq!(received.len(), 2);
+    assert!(received[1].contains(r#""after":"cursor-1""#));
+    Ok(())
 }
 
 #[test]

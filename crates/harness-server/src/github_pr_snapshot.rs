@@ -4,104 +4,16 @@ use harness_workflow::runtime::{
     stable_pr_snapshot_fact_hash_input, ActivityArtifact, ActivityErrorKind, ActivityResult,
     ActivitySignal, RemoteFactSnapshot, PR_FEEDBACK_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::Duration;
+
+mod graphql;
+use graphql::fetch_github_pr_snapshot_value;
+#[cfg(test)]
+use graphql::GITHUB_PR_SNAPSHOT_QUERY;
 
 const SERVER_PR_SNAPSHOT_SCHEMA: &str = "harness.github.pr_snapshot.v1";
 pub(crate) const GITHUB_PR_SNAPSHOT_ARTIFACT: &str = "github_pr_snapshot";
 pub(crate) const SERVER_PR_SNAPSHOT_ERROR_ARTIFACT: &str = "server_pr_snapshot_error";
-const GITHUB_PR_SNAPSHOT_QUERY: &str = r#"
-    query HarnessPrSnapshot($owner: String!, $repo: String!, $pr: Int!) {
-      repository(owner: $owner, name: $repo) {
-        pullRequest(number: $pr) {
-          number
-          state
-          merged
-          url
-          title
-          updatedAt
-          baseRefName
-          headRefName
-          headRefOid
-          mergeCommit {
-            oid
-          }
-          isDraft
-          mergeStateStatus
-          reviewDecision
-          statusCheckRollup {
-            state
-            contexts(first: 100) {
-              pageInfo {
-                hasNextPage
-                endCursor
-              }
-              nodes {
-                __typename
-                ... on CheckRun {
-                  id
-                  databaseId
-                  name
-                  status
-                  conclusion
-                  detailsUrl
-                }
-                ... on StatusContext {
-                  id
-                  context
-                  state
-                  targetUrl
-                }
-              }
-            }
-          }
-          reviewThreads(first: 100) {
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            nodes {
-              id
-              path
-              line
-              isResolved
-              isOutdated
-              comments(first: 5) {
-                nodes {
-                  author { login }
-                  body
-                  publishedAt
-                }
-              }
-            }
-          }
-          files(first: 100) {
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            nodes {
-              path
-              additions
-              deletions
-              changeType
-            }
-          }
-          closingIssuesReferences(first: 20) {
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            nodes {
-              number
-              url
-            }
-          }
-        }
-      }
-    }
-"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitHubPrSnapshotTarget {
@@ -243,58 +155,11 @@ pub(crate) async fn fetch_github_pr_snapshot_with_client(
     })
 }
 
-async fn fetch_github_pr_snapshot_value(
-    client: &reqwest::Client,
-    target: &GitHubPrSnapshotTarget,
-    github_token: Option<&str>,
-    graphql_url: &str,
-) -> anyhow::Result<Value> {
-    let (owner, repo) = target
-        .repo_slug
-        .split_once('/')
-        .context("validated repo slug should contain owner and repo")?;
-    let request = crate::github_client::apply_github_headers(
-        client.post(graphql_url).json(&json!({
-            "query": GITHUB_PR_SNAPSHOT_QUERY,
-            "variables": {
-                "owner": owner,
-                "repo": repo,
-                "pr": target.pr_number as i64,
-            }
-        })),
-        github_token,
-    );
-
-    let response = tokio::time::timeout(Duration::from_secs(15), request.send()).await??;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("GitHub PR snapshot query failed with status {status}: {body}");
-    }
-    let parsed: GitHubPrSnapshotGraphQlResponse =
-        serde_json::from_str(&body).context("GitHub PR snapshot response was invalid JSON")?;
-    if let Some(errors) = parsed.errors.filter(|errors| !errors_is_empty(errors)) {
-        anyhow::bail!("GitHub PR snapshot query returned errors: {errors}");
-    }
-    parsed
-        .data
-        .and_then(|data| data.get("repository").cloned())
-        .and_then(|repository| repository.get("pullRequest").cloned())
-        .filter(|pr| !pr.is_null())
-        .ok_or_else(|| anyhow::anyhow!("GitHub PR snapshot query returned no PR data"))
-}
-
 pub(crate) fn github_graphql_url() -> String {
     std::env::var("HARNESS_GITHUB_GRAPHQL_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(crate::github_client::graphql_url)
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubPrSnapshotGraphQlResponse {
-    data: Option<Value>,
-    errors: Option<Value>,
 }
 
 pub(crate) fn errors_is_empty(errors: &Value) -> bool {
