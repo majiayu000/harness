@@ -60,6 +60,7 @@ closed_enum!(AgentStackProtectionControlReason {
     FailureModeRelaxed => "failure_mode_relaxed",
     PossibleRename => "possible_rename",
     AmbiguousReplacement => "ambiguous_replacement",
+    ConfidenceReduced => "confidence_reduced",
     ConflictingDuplicateReport => "conflicting_duplicate_report",
 });
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -67,11 +68,6 @@ pub enum AgentStackProtectionControlError {
     #[error("the protection role list contains a duplicate")]
     DuplicateRole,
 }
-/// Typed evidence that one Agent Stack component carries protection behavior.
-///
-/// A component is treated as protection-bearing only when explicit roles are
-/// supplied. This prevents hook or policy filenames from becoming protection
-/// claims on their own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentStackProtectionControl {
     component: AgentStackComponent,
@@ -188,11 +184,6 @@ impl AgentStackProtectionControlDiff {
     pub fn confidence(&self) -> AgentStackProtectionConfidence { self.confidence }
     pub fn reason(&self) -> AgentStackProtectionControlReason { self.reason }
 }
-/// Emit weakening evidence for explicit protection-bearing controls.
-///
-/// The detector is intentionally evidence-driven: entries with no protection
-/// roles are ignored, renamed controls become review evidence, and equivalent
-/// replacements suppress removal facts.
 pub fn protective_control_diff(
     before: &[AgentStackProtectionControl],
     after: &[AgentStackProtectionControl],
@@ -223,6 +214,9 @@ pub fn protective_control_diff(
             Some(after_control) => compare_existing(
                 before_control,
                 after_control,
+                &after_controls.controls,
+                &before_by_id,
+                &before_controls.conflicting_component_ids,
                 has_before_conflict
                     || after_controls
                         .conflicting_component_ids
@@ -253,10 +247,23 @@ pub fn protective_control_diff(
 fn compare_existing(
     before: &AgentStackProtectionControl,
     after: &AgentStackProtectionControl,
+    after_controls: &[AgentStackProtectionControl],
+    before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
+    before_conflicting_component_ids: &BTreeSet<String>,
     has_conflicting_duplicate_state: bool,
     facts: &mut Vec<AgentStackProtectionControlDiff>,
 ) {
     let confidence = min_confidence(before.confidence, after.confidence);
+    if after.confidence.strength() < before.confidence.strength() {
+        facts.push(AgentStackProtectionControlDiff::new(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            Some(before),
+            Some(after),
+            confidence,
+            AgentStackProtectionControlReason::ConfidenceReduced,
+        ));
+    }
     if before.enabled != Some(false) && after.enabled == Some(false) {
         facts.push(AgentStackProtectionControlDiff::new(
             AgentStackProtectionDiffKind::Disabled,
@@ -267,7 +274,13 @@ fn compare_existing(
             AgentStackProtectionControlReason::ExplicitlyDisabled,
         ));
     }
-    let missing_roles = missing_roles(before.roles(), after.roles());
+    let missing_roles = missing_roles_without_replacements(
+        before,
+        missing_roles(before.roles(), after.roles()),
+        after_controls,
+        before_by_id,
+        before_conflicting_component_ids,
+    );
     if !missing_roles.is_empty() {
         facts.push(AgentStackProtectionControlDiff::new(
             AgentStackProtectionDiffKind::ScopeReduced,
@@ -278,7 +291,16 @@ fn compare_existing(
             AgentStackProtectionControlReason::RoleSetReduced,
         ));
     }
-    if matches!((before.scope, after.scope), (Some(left), Some(right)) if right.strength() < left.strength())
+    if before.scope.is_some() && after.scope.is_none() {
+        facts.push(AgentStackProtectionControlDiff::new(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            Some(before),
+            Some(after),
+            confidence,
+            AgentStackProtectionControlReason::ScopeLevelReduced,
+        ));
+    } else if matches!((before.scope, after.scope), (Some(left), Some(right)) if right.strength() < left.strength())
     {
         facts.push(AgentStackProtectionControlDiff::new(
             AgentStackProtectionDiffKind::ScopeReduced,
@@ -336,7 +358,15 @@ fn compare_removed(
             rename_confidence(before, candidate),
             AgentStackProtectionControlReason::PossibleRename,
         ));
-        compare_existing(before, candidate, false, facts);
+        compare_existing(
+            before,
+            candidate,
+            after,
+            before_by_id,
+            before_conflicting_component_ids,
+            false,
+            facts,
+        );
         return;
     }
     if !same_integrity.is_empty() {
@@ -467,11 +497,21 @@ fn candidate_is_new_protection(
     match before_by_id.get(component_id).copied() {
         Some(_) if matches!(mode, CandidateMode::SameIntegrity) => false,
         Some(_) if before_conflicting_component_ids.contains(component_id) => true,
-        Some(previous) => {
-            previous.enabled == Some(false) || !weak_equivalent_replacement(removed, previous)
-        }
+        Some(previous) => match mode {
+            CandidateMode::SameIntegrity => false,
+            CandidateMode::Equivalent => !equivalent_replacement(removed, previous),
+            CandidateMode::WeakEquivalent => !weak_equivalent_replacement(removed, previous),
+        },
         None => true,
     }
+}
+#[rustfmt::skip]
+fn missing_roles_without_replacements(before: &AgentStackProtectionControl, missing_roles: Vec<AgentStackProtectionRole>, after: &[AgentStackProtectionControl], before_by_id: &BTreeMap<String, &AgentStackProtectionControl>, before_conflicting_component_ids: &BTreeSet<String>) -> Vec<AgentStackProtectionRole> {
+    missing_roles.into_iter().filter(|role| {
+        let mut probe = before.clone();
+        probe.roles = vec![*role];
+        replacement_candidates(after, &probe, before_by_id, before_conflicting_component_ids, CandidateMode::Equivalent).is_empty()
+    }).collect()
 }
 fn equivalent_replacement(
     before: &AgentStackProtectionControl,

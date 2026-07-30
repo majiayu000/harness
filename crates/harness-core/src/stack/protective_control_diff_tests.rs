@@ -51,20 +51,9 @@ fn component(kind: Kind, locator: &str, integrity: Option<&str>) -> AgentStackCo
 fn control(kind: Kind, locator: &str, roles: &[Role]) -> AgentStackProtectionControl {
     control_with_confidence(kind, locator, roles, Confidence::High)
 }
-fn control_with_confidence(
-    kind: Kind,
-    locator: &str,
-    roles: &[Role],
-    confidence: Confidence,
-) -> AgentStackProtectionControl {
-    configured_control(
-        kind,
-        locator,
-        Some(HASH_A),
-        roles,
-        confidence,
-        ACTIVE_REQUIRED,
-    )
+#[rustfmt::skip]
+fn control_with_confidence(kind: Kind, locator: &str, roles: &[Role], confidence: Confidence) -> AgentStackProtectionControl {
+    configured_control(kind, locator, Some(HASH_A), roles, confidence, ACTIVE_REQUIRED)
 }
 fn configured_control(
     kind: Kind,
@@ -94,20 +83,9 @@ fn configured_control(
     }
     control
 }
-fn configured_hook(
-    locator: &str,
-    integrity: Option<&str>,
-    confidence: Confidence,
-    state: ControlState,
-) -> AgentStackProtectionControl {
-    configured_control(
-        Kind::Hook,
-        locator,
-        integrity,
-        &[Role::Hook],
-        confidence,
-        state,
-    )
+#[rustfmt::skip]
+fn configured_hook(locator: &str, integrity: Option<&str>, confidence: Confidence, state: ControlState) -> AgentStackProtectionControl {
+    configured_control(Kind::Hook, locator, integrity, &[Role::Hook], confidence, state)
 }
 fn kinds(facts: &[Diff]) -> Vec<DiffKind> {
     facts.iter().map(Diff::kind).collect()
@@ -365,7 +343,7 @@ fn protective_control_diff_handles_review_edge_cases() {
     let after = [configured_hook(".harness/guards/git-hooks.sh", Some(HASH_A), Confidence::Medium, ACTIVE_REQUIRED)];
     assert_eq!(
         reasons(&protective_control_diff(&before, &after)),
-        [Reason::PossibleRename, Reason::AmbiguousReplacement]
+        [Reason::ConfidenceReduced, Reason::PossibleRename, Reason::AmbiguousReplacement]
     );
     let before = [control(Kind::Hook, ".githooks/pre-merge", &[Role::Hook])];
     let after = [
@@ -393,4 +371,20 @@ fn protective_control_diff_handles_review_edge_cases() {
                 .before()
                 .is_some_and(|before| before.source_locator() == ".githooks/pre-rebase")
     }));
+    let removed = control(Kind::Hook, ".githooks/pre-confidence", &[Role::Hook]);
+    let retained_before = control_with_confidence(Kind::Hook, ".harness/guards/confidence.sh", &[Role::Hook], Confidence::Low);
+    let retained_after = control(Kind::Hook, ".harness/guards/confidence.sh", &[Role::Hook]);
+    assert!(protective_control_diff(&[removed, retained_before], &[retained_after]).is_empty());
+    let before = [control(Kind::Hook, ".githooks/pre-confidence-drop", &[Role::Hook])];
+    let after = [control_with_confidence(Kind::Hook, ".githooks/pre-confidence-drop", &[Role::Hook], Confidence::Low)];
+    assert_eq!(reasons(&protective_control_diff(&before, &after)), [Reason::ConfidenceReduced]);
+    let before = [configured_hook(".githooks/pre-scope", Some(HASH_A), Confidence::High, ACTIVE_REQUIRED)];
+    let after = [configured_hook(".githooks/pre-scope", Some(HASH_A), Confidence::High, ControlState(Some(true), None, Some(Mode::FailClosed)))];
+    assert_eq!(reasons(&protective_control_diff(&before, &after)), [Reason::ScopeLevelReduced]);
+    let before = [configured_control(Kind::Validation, ".github/workflows/ci.yml", Some(HASH_A), &[Role::Validation, Role::Check], Confidence::High, ACTIVE_REQUIRED)];
+    let after = [
+        configured_control(Kind::Validation, ".github/workflows/ci.yml", Some(HASH_A), &[Role::Validation], Confidence::High, ACTIVE_REQUIRED),
+        configured_control(Kind::Validation, ".github/workflows/checks.yml", Some(HASH_B), &[Role::Check], Confidence::High, ACTIVE_REQUIRED),
+    ];
+    assert!(protective_control_diff(&before, &after).is_empty());
 }
