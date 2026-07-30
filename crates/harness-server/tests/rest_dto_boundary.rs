@@ -1,101 +1,37 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
+use syn::visit::{self, Visit};
 
-const LEGACY_SERVER_LOCAL_REST_DTOS: &[&str] = &[
-    "src/github_pr_snapshot.rs::GitHubPrSnapshotGraphQlResponse",
-    "src/handlers/cross_review.rs::CrossReviewResult",
-    "src/handlers/operator_monitor.rs::FailureGroup",
-    "src/handlers/operator_monitor.rs::LegacyQueueCounts",
-    "src/handlers/operator_monitor.rs::OperatorAction",
-    "src/handlers/operator_monitor.rs::OperatorActivity",
-    "src/handlers/operator_monitor.rs::OperatorHealth",
-    "src/handlers/operator_monitor.rs::OperatorMonitorPayload",
-    "src/handlers/operator_monitor.rs::StuckWorkflow",
-    "src/handlers/operator_monitor.rs::WorktreeSummary",
-    "src/handlers/operator_monitor/activity.rs::RuntimeWorkflowCounts",
-    "src/handlers/operator_monitor/activity.rs::SourceActivity",
-    "src/handlers/operator_monitor/driverless_progress.rs::DriverlessProgressEvidence",
-    "src/handlers/preflight.rs::PreflightResult",
-    "src/handlers/projects.rs::RegisterProjectRequest",
-    "src/handlers/reconcile.rs::ReconcileParams",
-    "src/handlers/runtime_hosts.rs::CompleteRuntimeJobRequest",
-    "src/handlers/runtime_hosts.rs::RegisterRuntimeHostRequest",
-    "src/handlers/runtime_hosts/lease.rs::ClaimRuntimeJobRequest",
-    "src/handlers/runtime_hosts/lease.rs::RenewRuntimeJobLeaseRequest",
-    "src/handlers/runtime_project_cache.rs::SyncProjectItem",
-    "src/handlers/runtime_project_cache.rs::SyncWatchedProjectsRequest",
-    "src/handlers/skills.rs::GovernanceTransition",
-    "src/handlers/skills.rs::GovernanceView",
-    "src/handlers/skills.rs::StaleEntry",
-    "src/handlers/token_usage.rs::HourModelBucket",
-    "src/handlers/token_usage.rs::UsageBucket",
-    "src/handlers/usage_monitor.rs::ActiveCount",
-    "src/handlers/usage_monitor.rs::AgentInvocation",
-    "src/handlers/usage_monitor.rs::CostConfig",
-    "src/handlers/usage_monitor.rs::ModelPrice",
-    "src/handlers/usage_monitor.rs::UsageDiagnostics",
-    "src/handlers/usage_monitor.rs::UsageMonitorQuery",
-    "src/handlers/usage_monitor.rs::UsageMonitorResponse",
-    "src/handlers/usage_monitor.rs::UsageSummary",
-    "src/handlers/usage_monitor.rs::UsageWindow",
-    "src/handlers/usage_monitor_aggregate.rs::UsageGroup",
-    "src/handlers/usage_monitor_candidate.rs::CandidateUsageAttribution",
-    "src/handlers/usage_monitor_candidate.rs::CandidateUsageGroup",
-    "src/handlers/usage_monitor_candidate.rs::CandidateUsageRow",
-    "src/handlers/usage_monitor_local_usage.rs::CcstatsSessionRow",
-    "src/handlers/usage_monitor_local_usage.rs::LocalUsageModelSummary",
-    "src/handlers/usage_monitor_local_usage.rs::LocalUsageSourceSummary",
-    "src/handlers/usage_monitor_process.rs::AgentProcess",
-    "src/handlers/worktrees.rs::WorktreeResponse",
-    "src/http/auth_routes.rs::PasswordResetRequest",
-    "src/http/background/auto_recovery.rs::AutoRecoveryState",
-    "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreeDetail",
-    "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreePagination",
-    "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreeQuery",
-    "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreeResponse",
-    "src/http/misc_routes_runtime_tree.rs::WorkflowRuntimeTreeSummary",
-    "src/http/misc_routes_runtime_tree_nodes.rs::WorkflowRuntimeCommandNode",
-    "src/http/misc_routes_runtime_tree_nodes.rs::WorkflowRuntimeJobNode",
-    "src/http/misc_routes_runtime_tree_nodes.rs::WorkflowRuntimeTreeNode",
-    "src/http/misc_routes_runtime_tree_nodes.rs::WorkflowRuntimeTreeProjection",
-    "src/http/runtime_submission_routes.rs::ApprovalResponse",
-    "src/http/runtime_submission_routes.rs::RuntimeSubmissionArtifact",
-    "src/http/runtime_submission_routes.rs::RuntimeSubmissionPrompt",
-    "src/http/signal_routes.rs::IngestSignalRequest",
-    "src/http/state.rs::GitHubTokenDispatchCounterSnapshot",
-    "src/http/task_mutation_routes.rs::RuntimeTranscriptReconstructionRequest",
-    "src/http/task_mutation_routes.rs::WorkflowRuntimeCancelRequest",
-    "src/http/task_mutation_routes.rs::WorkflowRuntimeMergeRequest",
-    "src/http/task_mutation_routes.rs::WorkflowRuntimeRecoveryRouteRequest",
-    "src/http/task_query_routes.rs::RuntimeSubmissionListCounts",
-    "src/http/task_query_routes.rs::RuntimeSubmissionListPage",
-    "src/http/task_query_routes.rs::RuntimeSubmissionListParams",
-    "src/http/task_query_routes.rs::RuntimeSubmissionListResponse",
-    "src/http/task_query_routes.rs::RuntimeSubmissionSummaryResponse",
-    "src/http/task_query_routes/detail.rs::RuntimeTaskResponse",
-    "src/http/workflow_routes.rs::IssueWorkflowByIssueQuery",
-    "src/http/workflow_routes.rs::IssueWorkflowByPrQuery",
-    "src/http/workflow_routes.rs::ProjectWorkflowByProjectQuery",
-    "src/runtime_hosts.rs::RuntimeHostInfo",
-    "src/runtime_hosts.rs::RuntimeHostLifecycle",
-    "src/runtime_hosts.rs::TaskClaimResult",
-    "src/runtime_project_cache.rs::HostProjectCacheSnapshot",
-    "src/runtime_project_cache.rs::WatchedProject",
-    "src/workflow_runtime_submission/runtime_request.rs::CreateTaskRequest",
-];
+const LEGACY_SERVER_LOCAL_REST_DTOS: &str =
+    include_str!("fixtures/rest_dto_boundary_allowlist.txt");
 
 #[test]
 fn new_rest_dtos_are_not_added_in_server_modules() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut discovered = Vec::new();
+    let sources = load_sources(&manifest_dir);
+    let type_index = TypeIndex::new(&sources);
+    let mut direct_use_sites = BTreeSet::new();
 
-    collect_rest_dtos(&manifest_dir, &manifest_dir.join("src"), &mut discovered);
+    for source in &sources {
+        let imports = collect_imports(&source.syntax, &type_index);
+        RestUseSiteVisitor {
+            source,
+            imports: &imports,
+            type_index: &type_index,
+            local_types: BTreeMap::new(),
+            discovered: &mut direct_use_sites,
+        }
+        .visit_file(&source.syntax);
+    }
 
-    discovered.sort();
-    let mut expected = LEGACY_SERVER_LOCAL_REST_DTOS.to_vec();
-    expected.sort();
+    let discovered = expand_transitive_rest_dtos(direct_use_sites, &type_index);
+    let expected = LEGACY_SERVER_LOCAL_REST_DTOS
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
 
     assert_eq!(
         discovered, expected,
@@ -103,7 +39,371 @@ fn new_rest_dtos_are_not_added_in_server_modules() {
     );
 }
 
-fn collect_rest_dtos(manifest_dir: &Path, dir: &Path, discovered: &mut Vec<String>) {
+#[derive(Clone)]
+struct SourceFile {
+    path_str: String,
+    syntax: syn::File,
+}
+
+#[derive(Clone, Debug)]
+struct SerdeTypeDef {
+    path_str: String,
+    field_refs: Vec<TypeRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TypeRef {
+    path: Vec<String>,
+    name: String,
+}
+
+struct TypeIndex {
+    by_key: BTreeMap<String, SerdeTypeDef>,
+    by_name: BTreeMap<String, BTreeSet<String>>,
+    return_refs_by_name: BTreeMap<String, Vec<TypeRef>>,
+}
+
+impl TypeIndex {
+    fn new(sources: &[SourceFile]) -> Self {
+        let mut by_key = BTreeMap::new();
+        for source in sources {
+            SerdeTypeDefVisitor {
+                path_str: &source.path_str,
+                by_key: &mut by_key,
+            }
+            .visit_file(&source.syntax);
+        }
+
+        let mut by_name = BTreeMap::<String, BTreeSet<String>>::new();
+        for key in by_key.keys() {
+            if let Some(name) = key.rsplit("::").next() {
+                by_name
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(key.clone());
+            }
+        }
+
+        let mut returns = BTreeMap::<String, Option<Vec<TypeRef>>>::new();
+        for source in sources {
+            ReturnRefVisitor {
+                return_refs_by_name: &mut returns,
+            }
+            .visit_file(&source.syntax);
+        }
+        let return_refs_by_name = returns
+            .into_iter()
+            .filter_map(|(name, refs)| refs.map(|refs| (name, refs)))
+            .collect();
+
+        Self {
+            by_key,
+            by_name,
+            return_refs_by_name,
+        }
+    }
+
+    fn resolve(
+        &self,
+        type_ref: &TypeRef,
+        current_path: &str,
+        imports: &BTreeMap<String, String>,
+    ) -> Option<String> {
+        if type_ref.path.is_empty() || is_external_path(&type_ref.path) {
+            return None;
+        }
+        if type_ref.path.len() == 1 {
+            let local_key = format!("{current_path}::{}", type_ref.name);
+            if self.by_key.contains_key(&local_key) {
+                return Some(local_key);
+            }
+            if let Some(imported_key) = imports.get(&type_ref.name) {
+                return Some(imported_key.clone());
+            }
+            return self.unique_name_key(&type_ref.name);
+        }
+        if type_ref
+            .path
+            .first()
+            .is_some_and(|segment| segment == "crate")
+        {
+            return self.resolve_crate_path(&type_ref.path);
+        }
+        if let Some(relative_key) = self.resolve_relative_path(current_path, &type_ref.path) {
+            return Some(relative_key);
+        }
+        self.unique_name_key(&type_ref.name)
+    }
+
+    fn unique_name_key(&self, name: &str) -> Option<String> {
+        let keys = self.by_name.get(name)?;
+        (keys.len() == 1).then(|| keys.iter().next().unwrap().clone())
+    }
+
+    fn resolve_crate_path(&self, path: &[String]) -> Option<String> {
+        let module_segments = path.get(1..path.len().saturating_sub(1))?;
+        let name = path.last()?;
+        module_file_candidates("src", module_segments)
+            .into_iter()
+            .map(|file_path| format!("{file_path}::{name}"))
+            .find(|key| self.by_key.contains_key(key))
+    }
+
+    fn resolve_relative_path(&self, current_path: &str, path: &[String]) -> Option<String> {
+        let module_segments = path.get(..path.len().saturating_sub(1))?;
+        let name = path.last()?;
+        let current_module_root = current_module_root(current_path)?;
+        module_file_candidates(&current_module_root, module_segments)
+            .into_iter()
+            .map(|file_path| format!("{file_path}::{name}"))
+            .find(|key| self.by_key.contains_key(key))
+    }
+}
+
+struct SerdeTypeDefVisitor<'a> {
+    path_str: &'a str,
+    by_key: &'a mut BTreeMap<String, SerdeTypeDef>,
+}
+
+impl Visit<'_> for SerdeTypeDefVisitor<'_> {
+    fn visit_item_struct(&mut self, item: &syn::ItemStruct) {
+        if is_cfg_test(&item.attrs) {
+            return;
+        }
+        if has_serde_derive(&item.attrs) {
+            let name = item.ident.to_string();
+            let key = format!("{}::{name}", self.path_str);
+            self.by_key.insert(
+                key,
+                SerdeTypeDef {
+                    path_str: self.path_str.to_string(),
+                    field_refs: field_type_refs(&item.fields),
+                },
+            );
+        }
+    }
+
+    fn visit_item_enum(&mut self, item: &syn::ItemEnum) {
+        if is_cfg_test(&item.attrs) {
+            return;
+        }
+        if has_serde_derive(&item.attrs) {
+            let name = item.ident.to_string();
+            let key = format!("{}::{name}", self.path_str);
+            self.by_key.insert(
+                key,
+                SerdeTypeDef {
+                    path_str: self.path_str.to_string(),
+                    field_refs: item
+                        .variants
+                        .iter()
+                        .flat_map(|variant| field_type_refs(&variant.fields))
+                        .collect(),
+                },
+            );
+        }
+    }
+
+    fn visit_item_mod(&mut self, item: &syn::ItemMod) {
+        if !is_cfg_test(&item.attrs) {
+            visit::visit_item_mod(self, item);
+        }
+    }
+}
+
+struct ReturnRefVisitor<'a> {
+    return_refs_by_name: &'a mut BTreeMap<String, Option<Vec<TypeRef>>>,
+}
+
+impl Visit<'_> for ReturnRefVisitor<'_> {
+    fn visit_item_fn(&mut self, item: &syn::ItemFn) {
+        if !is_cfg_test(&item.attrs) {
+            record_return_refs(
+                item.sig.ident.to_string(),
+                &item.sig.output,
+                self.return_refs_by_name,
+            );
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &syn::ImplItemFn) {
+        if !is_cfg_test(&item.attrs) {
+            record_return_refs(
+                item.sig.ident.to_string(),
+                &item.sig.output,
+                self.return_refs_by_name,
+            );
+        }
+    }
+
+    fn visit_item_mod(&mut self, item: &syn::ItemMod) {
+        if !is_cfg_test(&item.attrs) {
+            visit::visit_item_mod(self, item);
+        }
+    }
+}
+
+struct RestUseSiteVisitor<'a> {
+    source: &'a SourceFile,
+    imports: &'a BTreeMap<String, String>,
+    type_index: &'a TypeIndex,
+    local_types: BTreeMap<String, Vec<TypeRef>>,
+    discovered: &'a mut BTreeSet<String>,
+}
+
+impl Visit<'_> for RestUseSiteVisitor<'_> {
+    fn visit_item_fn(&mut self, item: &syn::ItemFn) {
+        if is_cfg_test(&item.attrs) {
+            return;
+        }
+        let previous = std::mem::take(&mut self.local_types);
+        self.visit_signature(&item.sig);
+        self.visit_block(&item.block);
+        self.local_types = previous;
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &syn::ImplItemFn) {
+        if is_cfg_test(&item.attrs) {
+            return;
+        }
+        let previous = std::mem::take(&mut self.local_types);
+        self.visit_signature(&item.sig);
+        self.visit_block(&item.block);
+        self.local_types = previous;
+    }
+
+    fn visit_signature(&mut self, signature: &syn::Signature) {
+        for input in &signature.inputs {
+            if let syn::FnArg::Typed(input) = input {
+                let refs = collect_rest_wrapper_type_refs(&input.ty);
+                self.add_refs(&refs);
+                for ident in pat_binding_idents(&input.pat) {
+                    self.local_types.insert(ident, refs.clone());
+                }
+            }
+        }
+        if let syn::ReturnType::Type(_, ty) = &signature.output {
+            self.add_refs(&collect_rest_wrapper_type_refs(ty));
+        }
+    }
+
+    fn visit_local(&mut self, local: &syn::Local) {
+        if let Some(init) = &local.init {
+            self.visit_expr(&init.expr);
+            let refs = infer_expr_type_refs(&init.expr, &self.local_types, self.type_index);
+            if !refs.is_empty() {
+                for ident in pat_binding_idents(&local.pat) {
+                    self.local_types.insert(ident, refs.clone());
+                }
+            }
+        }
+        if let Some(refs) = pat_type_refs(&local.pat) {
+            for ident in pat_binding_idents(&local.pat) {
+                self.local_types.insert(ident, refs.clone());
+            }
+        }
+    }
+
+    fn visit_expr_call(&mut self, call: &syn::ExprCall) {
+        if expr_path_last_ident(&call.func).as_deref() == Some("Json") {
+            for arg in &call.args {
+                self.collect_json_payload_expr_refs(arg);
+            }
+        } else if is_serde_to_value_call(&call.func) {
+            for arg in &call.args {
+                let refs = infer_expr_type_refs(arg, &self.local_types, self.type_index);
+                self.add_refs(&refs);
+            }
+        }
+        visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_macro(&mut self, expr: &syn::ExprMacro) {
+        if is_json_macro_path(&expr.mac.path) {
+            self.collect_macro_local_refs(&expr.mac.tokens.to_string());
+        }
+    }
+
+    fn visit_expr_match(&mut self, expr: &syn::ExprMatch) {
+        self.visit_expr(&expr.expr);
+        let matched_refs = infer_expr_type_refs(&expr.expr, &self.local_types, self.type_index);
+        let previous = self.local_types.clone();
+        for arm in &expr.arms {
+            self.local_types = previous.clone();
+            if !matched_refs.is_empty() {
+                for ident in pat_binding_idents(&arm.pat) {
+                    self.local_types.insert(ident, matched_refs.clone());
+                }
+            }
+            if let Some((_, guard)) = &arm.guard {
+                self.visit_expr(guard);
+            }
+            self.visit_expr(&arm.body);
+        }
+        self.local_types = previous;
+    }
+
+    fn visit_item_mod(&mut self, item: &syn::ItemMod) {
+        if !is_cfg_test(&item.attrs) {
+            visit::visit_item_mod(self, item);
+        }
+    }
+}
+
+impl RestUseSiteVisitor<'_> {
+    fn add_refs(&mut self, refs: &[TypeRef]) {
+        for type_ref in refs {
+            if let Some(key) =
+                self.type_index
+                    .resolve(type_ref, &self.source.path_str, self.imports)
+            {
+                self.discovered.insert(key);
+            }
+        }
+    }
+
+    fn collect_json_payload_expr_refs(&mut self, expr: &syn::Expr) {
+        if let syn::Expr::Macro(expr_macro) = expr {
+            if is_json_macro_path(&expr_macro.mac.path) {
+                self.collect_macro_local_refs(&expr_macro.mac.tokens.to_string());
+                return;
+            }
+        }
+        let refs = infer_expr_type_refs(expr, &self.local_types, self.type_index);
+        self.add_refs(&refs);
+    }
+
+    fn collect_macro_local_refs(&mut self, tokens: &str) {
+        let matched_refs = tokens
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .filter_map(|token| self.local_types.get(token))
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.add_refs(&matched_refs);
+    }
+}
+
+fn load_sources(manifest_dir: &Path) -> Vec<SourceFile> {
+    let mut paths = Vec::new();
+    collect_rust_source_paths(&manifest_dir.join("src"), &mut paths);
+    paths.sort();
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let relative_path = path.strip_prefix(manifest_dir).unwrap_or(&path);
+            let path_str = relative_path.to_string_lossy().replace('\\', "/");
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {path_str}: {error}"));
+            let syntax = syn::parse_file(&source)
+                .unwrap_or_else(|error| panic!("parse {path_str}: {error}"));
+            SourceFile { path_str, syntax }
+        })
+        .collect()
+}
+
+fn collect_rust_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
     {
         let entry =
@@ -113,77 +413,371 @@ fn collect_rest_dtos(manifest_dir: &Path, dir: &Path, discovered: &mut Vec<Strin
             if path.file_name().is_some_and(|name| name == "tests") {
                 continue;
             }
-            collect_rest_dtos(manifest_dir, &path, discovered);
-            continue;
+            collect_rust_source_paths(&path, paths);
+        } else if is_production_rust_file(&path) {
+            paths.push(path);
         }
-        if !is_production_rust_file(&path) {
-            continue;
-        }
-        let relative_path = path.strip_prefix(manifest_dir).unwrap_or(&path);
-        let path_str = relative_path.to_string_lossy().replace('\\', "/");
-        let source =
-            fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path_str}: {error}"));
-        let file =
-            syn::parse_file(&source).unwrap_or_else(|error| panic!("parse {path_str}: {error}"));
+    }
+}
 
-        for item in file.items {
-            let (name, attrs) = match item {
-                syn::Item::Struct(item_struct) => {
-                    (item_struct.ident.to_string(), item_struct.attrs)
+fn collect_imports(syntax: &syn::File, type_index: &TypeIndex) -> BTreeMap<String, String> {
+    let mut imports = BTreeMap::new();
+    for item in &syntax.items {
+        if let syn::Item::Use(item_use) = item {
+            collect_use_tree(Vec::new(), &item_use.tree, type_index, &mut imports);
+        }
+    }
+    imports
+}
+
+fn collect_use_tree(
+    mut prefix: Vec<String>,
+    tree: &syn::UseTree,
+    type_index: &TypeIndex,
+    imports: &mut BTreeMap<String, String>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            collect_use_tree(prefix, &path.tree, type_index, imports);
+        }
+        syn::UseTree::Name(name) => {
+            let visible = name.ident.to_string();
+            prefix.push(visible.clone());
+            record_import(visible, prefix, type_index, imports);
+        }
+        syn::UseTree::Rename(rename) => {
+            let visible = rename.rename.to_string();
+            prefix.push(rename.ident.to_string());
+            record_import(visible, prefix, type_index, imports);
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_use_tree(prefix.clone(), item, type_index, imports);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
+
+fn record_import(
+    visible: String,
+    path: Vec<String>,
+    type_index: &TypeIndex,
+    imports: &mut BTreeMap<String, String>,
+) {
+    if path.first().is_some_and(|segment| segment == "crate") {
+        if let Some(key) = type_index.resolve_crate_path(&path) {
+            imports.insert(visible, key);
+        }
+    }
+}
+
+fn record_return_refs(
+    name: String,
+    output: &syn::ReturnType,
+    return_refs_by_name: &mut BTreeMap<String, Option<Vec<TypeRef>>>,
+) {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return;
+    };
+    let refs = collect_type_refs(ty);
+    if refs.is_empty() {
+        return;
+    }
+    match return_refs_by_name.entry(name) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(Some(refs));
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            if entry.get().as_ref() != Some(&refs) {
+                entry.insert(None);
+            }
+        }
+    }
+}
+
+fn infer_expr_type_refs(
+    expr: &syn::Expr,
+    local_types: &BTreeMap<String, Vec<TypeRef>>,
+    type_index: &TypeIndex,
+) -> Vec<TypeRef> {
+    match expr {
+        syn::Expr::Path(expr_path) if expr_path.path.segments.len() == 1 => {
+            let name = expr_path.path.segments[0].ident.to_string();
+            local_types.get(&name).cloned().unwrap_or_default()
+        }
+        syn::Expr::Path(expr_path) => type_ref_from_path(&expr_path.path).into_iter().collect(),
+        syn::Expr::Struct(expr_struct) => {
+            type_ref_from_path(&expr_struct.path).into_iter().collect()
+        }
+        syn::Expr::Reference(expr_reference) => {
+            infer_expr_type_refs(&expr_reference.expr, local_types, type_index)
+        }
+        syn::Expr::Paren(expr_paren) => {
+            infer_expr_type_refs(&expr_paren.expr, local_types, type_index)
+        }
+        syn::Expr::Group(expr_group) => {
+            infer_expr_type_refs(&expr_group.expr, local_types, type_index)
+        }
+        syn::Expr::Try(expr_try) => infer_expr_type_refs(&expr_try.expr, local_types, type_index),
+        syn::Expr::Await(expr_await) => {
+            infer_expr_type_refs(&expr_await.base, local_types, type_index)
+        }
+        syn::Expr::Call(call) => expr_path_last_ident(&call.func)
+            .and_then(|name| type_index.return_refs_by_name.get(&name).cloned())
+            .unwrap_or_default(),
+        syn::Expr::MethodCall(method_call) => {
+            let method_name = method_call.method.to_string();
+            if matches!(
+                method_name.as_str(),
+                "expect" | "unwrap" | "unwrap_or" | "unwrap_or_else"
+            ) {
+                let receiver_refs =
+                    infer_expr_type_refs(&method_call.receiver, local_types, type_index);
+                if !receiver_refs.is_empty() {
+                    return receiver_refs;
                 }
-                syn::Item::Enum(item_enum) => (item_enum.ident.to_string(), item_enum.attrs),
-                _ => continue,
-            };
-            if is_cfg_test(&attrs) {
-                continue;
             }
-            if is_rest_dto_candidate(&path_str, &name, &attrs) {
-                discovered.push(format!("{path_str}::{name}"));
+            type_index
+                .return_refs_by_name
+                .get(&method_name)
+                .cloned()
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn expand_transitive_rest_dtos(
+    direct_use_sites: BTreeSet<String>,
+    type_index: &TypeIndex,
+) -> BTreeSet<String> {
+    let mut discovered = BTreeSet::new();
+    let mut stack = direct_use_sites.into_iter().collect::<Vec<_>>();
+
+    while let Some(key) = stack.pop() {
+        if !discovered.insert(key.clone()) {
+            continue;
+        }
+        let Some(type_def) = type_index.by_key.get(&key) else {
+            continue;
+        };
+        for field_ref in &type_def.field_refs {
+            if let Some(field_key) =
+                type_index.resolve(field_ref, &type_def.path_str, &BTreeMap::new())
+            {
+                stack.push(field_key);
             }
         }
     }
+
+    discovered
 }
 
-fn is_rest_dto_candidate(path_str: &str, name: &str, attrs: &[syn::Attribute]) -> bool {
-    if !has_serde_derive(attrs) {
-        return false;
+fn collect_rest_wrapper_type_refs(ty: &syn::Type) -> Vec<TypeRef> {
+    let mut visitor = RestWrapperTypeVisitor { refs: Vec::new() };
+    visitor.visit_type(ty);
+    visitor.refs
+}
+
+struct RestWrapperTypeVisitor {
+    refs: Vec<TypeRef>,
+}
+
+impl Visit<'_> for RestWrapperTypeVisitor {
+    fn visit_type_path(&mut self, type_path: &syn::TypePath) {
+        for segment in &type_path.path.segments {
+            if matches!(
+                segment.ident.to_string().as_str(),
+                "Form" | "Json" | "Path" | "Query"
+            ) {
+                self.refs
+                    .extend(collect_type_refs_from_arguments(&segment.arguments));
+            }
+        }
+        visit::visit_type_path(self, type_path);
     }
-    let has_wire_name = name.ends_with("Request") || name.ends_with("Response");
-    has_wire_name || is_rest_boundary_module(path_str)
 }
 
-fn is_rest_boundary_module(path_str: &str) -> bool {
-    path_str.starts_with("src/http/")
-        || path_str.starts_with("src/handlers/")
-        || path_str == "src/runtime_hosts.rs"
-        || path_str == "src/runtime_project_cache.rs"
+fn collect_type_refs(ty: &syn::Type) -> Vec<TypeRef> {
+    let mut visitor = TypeRefVisitor { refs: Vec::new() };
+    visitor.visit_type(ty);
+    visitor.refs
 }
 
-fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        let syn::Meta::List(list) = &attr.meta else {
-            return false;
-        };
-        attr.path().is_ident("cfg")
-            && list
-                .tokens
-                .to_string()
-                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-                .any(|token| token == "test")
+struct TypeRefVisitor {
+    refs: Vec<TypeRef>,
+}
+
+impl Visit<'_> for TypeRefVisitor {
+    fn visit_type_path(&mut self, type_path: &syn::TypePath) {
+        if let Some(type_ref) = type_ref_from_path(&type_path.path) {
+            self.refs.push(type_ref);
+        }
+        visit::visit_type_path(self, type_path);
+    }
+}
+
+fn collect_type_refs_from_arguments(arguments: &syn::PathArguments) -> Vec<TypeRef> {
+    let mut refs = Vec::new();
+    if let syn::PathArguments::AngleBracketed(args) = arguments {
+        for arg in &args.args {
+            if let syn::GenericArgument::Type(ty) = arg {
+                refs.extend(collect_type_refs(ty));
+            }
+        }
+    }
+    refs
+}
+
+fn field_type_refs(fields: &syn::Fields) -> Vec<TypeRef> {
+    fields
+        .iter()
+        .flat_map(|field| collect_type_refs(&field.ty))
+        .collect()
+}
+
+fn type_ref_from_path(path: &syn::Path) -> Option<TypeRef> {
+    let path = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let name = path.last()?.clone();
+    Some(TypeRef { path, name })
+}
+
+fn pat_type_refs(pat: &syn::Pat) -> Option<Vec<TypeRef>> {
+    match pat {
+        syn::Pat::Type(pat_type) => Some(collect_type_refs(&pat_type.ty)),
+        _ => None,
+    }
+}
+
+fn pat_binding_idents(pat: &syn::Pat) -> Vec<String> {
+    let mut idents = Vec::new();
+    collect_pat_binding_idents(pat, &mut idents);
+    idents
+}
+
+fn collect_pat_binding_idents(pat: &syn::Pat, idents: &mut Vec<String>) {
+    match pat {
+        syn::Pat::Ident(pat_ident) => idents.push(pat_ident.ident.to_string()),
+        syn::Pat::Reference(pat_reference) => {
+            collect_pat_binding_idents(&pat_reference.pat, idents)
+        }
+        syn::Pat::Slice(pat_slice) => {
+            for pat in &pat_slice.elems {
+                collect_pat_binding_idents(pat, idents);
+            }
+        }
+        syn::Pat::Struct(pat_struct) => {
+            for field in &pat_struct.fields {
+                collect_pat_binding_idents(&field.pat, idents);
+            }
+        }
+        syn::Pat::Tuple(pat_tuple) => {
+            for pat in &pat_tuple.elems {
+                collect_pat_binding_idents(pat, idents);
+            }
+        }
+        syn::Pat::TupleStruct(pat_tuple_struct) => {
+            for pat in &pat_tuple_struct.elems {
+                collect_pat_binding_idents(pat, idents);
+            }
+        }
+        syn::Pat::Type(pat_type) => collect_pat_binding_idents(&pat_type.pat, idents),
+        _ => {}
+    }
+}
+
+fn expr_path_last_ident(expr: &syn::Expr) -> Option<String> {
+    let syn::Expr::Path(expr_path) = expr else {
+        return None;
+    };
+    expr_path
+        .path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+}
+
+fn is_json_macro_path(path: &syn::Path) -> bool {
+    path.segments
+        .last()
+        .is_some_and(|segment| segment.ident == "json")
+}
+
+fn is_serde_to_value_call(expr: &syn::Expr) -> bool {
+    let syn::Expr::Path(expr_path) = expr else {
+        return false;
+    };
+    expr_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "to_value")
+        && expr_path
+            .path
+            .segments
+            .iter()
+            .any(|segment| segment.ident == "serde_json")
+}
+
+fn module_file_candidates(root: &str, module_segments: &[String]) -> Vec<String> {
+    if module_segments.is_empty() {
+        return vec![root.to_string()];
+    }
+    let module_path = module_segments.join("/");
+    vec![
+        format!("{root}/{module_path}.rs"),
+        format!("{root}/{module_path}/mod.rs"),
+    ]
+}
+
+fn current_module_root(current_path: &str) -> Option<String> {
+    if let Some(path) = current_path.strip_suffix("/mod.rs") {
+        return Some(path.to_string());
+    }
+    current_path.strip_suffix(".rs").map(ToOwned::to_owned)
+}
+
+const EXTERNAL_PATH_ROOTS: &str = "anyhow axum chrono harness_agents harness_core harness_exec harness_gc harness_protocol harness_rules harness_skills harness_workflow serde_json sqlx std tokio uuid";
+
+fn is_external_path(path: &[String]) -> bool {
+    path.first().is_some_and(|root| {
+        EXTERNAL_PATH_ROOTS
+            .split_whitespace()
+            .any(|external| external == root)
     })
 }
 
+fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attr_tokens_contain(attrs, "cfg", |token| token == "test")
+}
+
 fn has_serde_derive(attrs: &[syn::Attribute]) -> bool {
+    attr_tokens_contain(attrs, "derive", |token| {
+        matches!(token, "Serialize" | "Deserialize")
+    })
+}
+
+fn attr_tokens_contain(
+    attrs: &[syn::Attribute],
+    attr_name: &str,
+    accepts: impl Fn(&str) -> bool,
+) -> bool {
     attrs.iter().any(|attr| {
         let syn::Meta::List(list) = &attr.meta else {
             return false;
         };
-        attr.path().is_ident("derive")
+        attr.path().is_ident(attr_name)
             && list
                 .tokens
                 .to_string()
                 .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-                .any(|token| matches!(token, "Serialize" | "Deserialize"))
+                .any(&accepts)
     })
 }
 
