@@ -45,6 +45,7 @@ src/http/misc_routes_runtime_tree_nodes.rs::WorkflowRuntimeTreeProjection
 src/http/runtime_submission_routes.rs::ApprovalResponse
 src/http/runtime_submission_routes.rs::RuntimeSubmissionArtifact
 src/http/runtime_submission_routes.rs::RuntimeSubmissionPrompt
+src/http/signal_routes.rs::IngestSignalRequest
 src/http/task_mutation_routes.rs::RuntimeTranscriptReconstructionRequest
 src/http/task_mutation_routes.rs::WorkflowRuntimeCancelRequest
 src/http/task_mutation_routes.rs::WorkflowRuntimeMergeRequest
@@ -79,7 +80,6 @@ src/workflow_runtime_submission/runtime_models.rs::TaskStatus
 src/workflow_runtime_submission/runtime_models.rs::TaskTerminalClassification
 src/workflow_runtime_submission/runtime_models.rs::TaskTerminalInfo
 src/workflow_runtime_submission/runtime_request.rs::CreateTaskRequest
-src/workflow_runtime_submission/runtime_request.rs::SystemTaskInput
 src/workflow_runtime_submission/runtime_state.rs::SchedulerAuthorityState
 src/workflow_runtime_submission/runtime_state.rs::SchedulerOwner
 src/workflow_runtime_submission/runtime_state.rs::SchedulerOwnerKind

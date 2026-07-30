@@ -5,6 +5,10 @@ use std::{
 };
 use syn::visit::{self, Visit};
 
+#[path = "rest_dto_boundary/syntax.rs"]
+mod syntax;
+use syntax::*;
+
 const LEGACY_SERVER_LOCAL_REST_DTOS: &str =
     include_str!("fixtures/rest_dto_boundary_allowlist.txt");
 
@@ -22,6 +26,7 @@ fn new_rest_dtos_are_not_added_in_server_modules() {
             imports: &imports,
             type_index: &type_index,
             local_types: BTreeMap::new(),
+            raw_body_bindings: BTreeSet::new(),
             discovered: &mut direct_use_sites,
         }
         .visit_file(&source.syntax);
@@ -248,6 +253,7 @@ struct RestUseSiteVisitor<'a> {
     imports: &'a BTreeMap<String, String>,
     type_index: &'a TypeIndex,
     local_types: BTreeMap<String, Vec<TypeRef>>,
+    raw_body_bindings: BTreeSet<String>,
     discovered: &'a mut BTreeSet<String>,
 }
 
@@ -256,20 +262,24 @@ impl Visit<'_> for RestUseSiteVisitor<'_> {
         if is_cfg_test(&item.attrs) {
             return;
         }
-        let previous = std::mem::take(&mut self.local_types);
+        let previous_local_types = std::mem::take(&mut self.local_types);
+        let previous_raw_body_bindings = std::mem::take(&mut self.raw_body_bindings);
         self.visit_signature(&item.sig);
         self.visit_block(&item.block);
-        self.local_types = previous;
+        self.local_types = previous_local_types;
+        self.raw_body_bindings = previous_raw_body_bindings;
     }
 
     fn visit_impl_item_fn(&mut self, item: &syn::ImplItemFn) {
         if is_cfg_test(&item.attrs) {
             return;
         }
-        let previous = std::mem::take(&mut self.local_types);
+        let previous_local_types = std::mem::take(&mut self.local_types);
+        let previous_raw_body_bindings = std::mem::take(&mut self.raw_body_bindings);
         self.visit_signature(&item.sig);
         self.visit_block(&item.block);
-        self.local_types = previous;
+        self.local_types = previous_local_types;
+        self.raw_body_bindings = previous_raw_body_bindings;
     }
 
     fn visit_signature(&mut self, signature: &syn::Signature) {
@@ -280,6 +290,10 @@ impl Visit<'_> for RestUseSiteVisitor<'_> {
                 for ident in pat_binding_idents(&input.pat) {
                     self.local_types.insert(ident, refs.clone());
                 }
+                if is_raw_body_type(&input.ty) {
+                    self.raw_body_bindings
+                        .extend(pat_binding_idents(&input.pat));
+                }
             }
         }
         if let syn::ReturnType::Type(_, ty) = &signature.output {
@@ -288,8 +302,14 @@ impl Visit<'_> for RestUseSiteVisitor<'_> {
     }
 
     fn visit_local(&mut self, local: &syn::Local) {
+        let annotated_refs = pat_type_refs(&local.pat);
         if let Some(init) = &local.init {
             self.visit_expr(&init.expr);
+            if expr_contains_raw_body_from_slice_call(&init.expr, &self.raw_body_bindings) {
+                if let Some(refs) = &annotated_refs {
+                    self.add_refs(refs);
+                }
+            }
             let refs = infer_expr_type_refs(&init.expr, &self.local_types, self.type_index);
             if !refs.is_empty() {
                 for ident in pat_binding_idents(&local.pat) {
@@ -297,7 +317,7 @@ impl Visit<'_> for RestUseSiteVisitor<'_> {
                 }
             }
         }
-        if let Some(refs) = pat_type_refs(&local.pat) {
+        if let Some(refs) = annotated_refs {
             for ident in pat_binding_idents(&local.pat) {
                 self.local_types.insert(ident, refs.clone());
             }
@@ -310,6 +330,10 @@ impl Visit<'_> for RestUseSiteVisitor<'_> {
                 self.collect_json_payload_expr_refs(arg);
             }
         }
+        self.add_refs(&collect_raw_body_from_slice_type_refs(
+            call,
+            &self.raw_body_bindings,
+        ));
         visit::visit_expr_call(self, call);
     }
 
@@ -658,143 +682,4 @@ fn collect_type_refs_from_arguments(arguments: &syn::PathArguments) -> Vec<TypeR
         }
     }
     refs
-}
-
-fn field_type_refs(fields: &syn::Fields) -> Vec<TypeRef> {
-    fields
-        .iter()
-        .flat_map(|field| collect_type_refs(&field.ty))
-        .collect()
-}
-
-fn type_ref_from_path(path: &syn::Path) -> Option<TypeRef> {
-    let path = path
-        .segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .collect::<Vec<_>>();
-    let name = path.last()?.clone();
-    Some(TypeRef { path, name })
-}
-
-fn pat_type_refs(pat: &syn::Pat) -> Option<Vec<TypeRef>> {
-    match pat {
-        syn::Pat::Type(pat_type) => Some(collect_type_refs(&pat_type.ty)),
-        _ => None,
-    }
-}
-
-fn pat_binding_idents(pat: &syn::Pat) -> Vec<String> {
-    let mut visitor = PatBindingVisitor { idents: Vec::new() };
-    visitor.visit_pat(pat);
-    visitor.idents
-}
-
-struct PatBindingVisitor {
-    idents: Vec<String>,
-}
-
-impl Visit<'_> for PatBindingVisitor {
-    fn visit_pat_ident(&mut self, pat: &syn::PatIdent) {
-        self.idents.push(pat.ident.to_string());
-    }
-}
-
-fn expr_path_last_ident(expr: &syn::Expr) -> Option<String> {
-    let syn::Expr::Path(expr_path) = expr else {
-        return None;
-    };
-    expr_path
-        .path
-        .segments
-        .last()
-        .map(|segment| segment.ident.to_string())
-}
-
-fn is_json_macro_path(path: &syn::Path) -> bool {
-    path.segments
-        .last()
-        .is_some_and(|segment| segment.ident == "json")
-}
-
-fn is_serde_to_value_call(expr: &syn::Expr) -> bool {
-    let syn::Expr::Path(expr_path) = expr else {
-        return false;
-    };
-    expr_path
-        .path
-        .segments
-        .last()
-        .is_some_and(|segment| segment.ident == "to_value")
-        && expr_path
-            .path
-            .segments
-            .iter()
-            .any(|segment| segment.ident == "serde_json")
-}
-
-fn module_file_candidates(root: &str, module_segments: &[String]) -> Vec<String> {
-    if module_segments.is_empty() {
-        return vec![root.to_string()];
-    }
-    let module_path = module_segments.join("/");
-    vec![
-        format!("{root}/{module_path}.rs"),
-        format!("{root}/{module_path}/mod.rs"),
-    ]
-}
-
-fn current_module_root(current_path: &str) -> Option<String> {
-    if let Some(path) = current_path.strip_suffix("/mod.rs") {
-        return Some(path.to_string());
-    }
-    current_path.strip_suffix(".rs").map(ToOwned::to_owned)
-}
-
-const EXTERNAL_PATH_ROOTS: &str = "anyhow axum chrono harness_agents harness_core harness_exec harness_gc harness_protocol harness_rules harness_skills harness_workflow serde_json sqlx std tokio uuid";
-
-fn is_external_path(path: &[String]) -> bool {
-    path.first().is_some_and(|root| {
-        EXTERNAL_PATH_ROOTS
-            .split_whitespace()
-            .any(|external| external == root)
-    })
-}
-
-fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attr_tokens_contain(attrs, "cfg", |token| token == "test")
-}
-
-fn has_serde_derive(attrs: &[syn::Attribute]) -> bool {
-    attr_tokens_contain(attrs, "derive", |token| {
-        matches!(token, "Serialize" | "Deserialize")
-    })
-}
-
-fn attr_tokens_contain(
-    attrs: &[syn::Attribute],
-    attr_name: &str,
-    accepts: impl Fn(&str) -> bool,
-) -> bool {
-    attrs.iter().any(|attr| {
-        let syn::Meta::List(list) = &attr.meta else {
-            return false;
-        };
-        attr.path().is_ident(attr_name)
-            && list
-                .tokens
-                .to_string()
-                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-                .any(&accepts)
-    })
-}
-
-fn is_production_rust_file(path: &Path) -> bool {
-    if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-        return false;
-    }
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    !name.ends_with("_tests.rs") && !name.starts_with("tests_") && name != "test_fixtures.rs"
 }
