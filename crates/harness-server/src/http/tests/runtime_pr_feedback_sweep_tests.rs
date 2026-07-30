@@ -271,3 +271,115 @@ async fn runtime_pr_feedback_sweep_continues_after_refresh_failure() -> anyhow::
     assert!(store.commands_for(&failing_workflow.id).await?.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_pr_feedback_sweep_skips_active_driver_without_spending_work_limit(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    use crate::workspace::test_support::{async_env_lock, ScopedEnvVar};
+
+    let _env_guard = async_env_lock().lock().await;
+    let response_body = serde_json::json!({
+        "data": {
+            "repository": {
+                "pullRequest": graphql_pr("unused-head", "2026-07-31T00:00:00Z")
+            }
+        }
+    })
+    .to_string();
+    let (graphql_url, received) = spawn_graphql_stub(response_body).await?;
+    let _graphql_guard = ScopedEnvVar::set("HARNESS_GITHUB_GRAPHQL_URL", &graphql_url);
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-active-feedback-driver");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\npr_feedback:\n  enabled: true\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+
+    let older_pr_open = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "pr_open",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:228"),
+    )
+    .with_id("issue-228-pr-open")
+    .with_data(serde_json::json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "owner/repo",
+        "issue_number": 228,
+        "pr_number": 78,
+        "pr_url": "https://github.com/owner/repo/pull/78",
+        "task_id": "runtime-task-228",
+    }));
+    store.upsert_instance(&older_pr_open).await?;
+
+    let newer_awaiting_feedback = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "awaiting_feedback",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:229"),
+    )
+    .with_id("issue-229-active-feedback-driver")
+    .with_data(serde_json::json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "owner/repo",
+        "issue_number": 229,
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-229",
+    }));
+    store.upsert_instance(&newer_awaiting_feedback).await?;
+    let child = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "inspecting",
+        harness_workflow::runtime::WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("issue-229-active-feedback-driver-child")
+    .with_parent(newer_awaiting_feedback.id.clone());
+    store.upsert_instance(&child).await?;
+    let inspect = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+        "issue-229-active-inspection",
+    );
+    store.enqueue_command(&child.id, None, &inspect).await?;
+
+    let older_updated_at =
+        chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:01Z")?.with_timezone(&chrono::Utc);
+    let newer_updated_at =
+        chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:02Z")?.with_timezone(&chrono::Utc);
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
+        .bind(&older_pr_open.id)
+        .bind(older_updated_at)
+        .execute(store.pool())
+        .await?;
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
+        .bind(&newer_awaiting_feedback.id)
+        .bind(newer_updated_at)
+        .execute(store.pool())
+        .await?;
+
+    let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 1).await?;
+
+    assert_eq!(tick.requested, 1);
+    assert_eq!(tick.active_command_exists, 1);
+    assert_eq!(tick.skipped, 0);
+    assert_eq!(tick.rejected, 0);
+    assert!(
+        received.lock().await.is_empty(),
+        "an active feedback driver must suppress the remote refresh"
+    );
+    assert_eq!(store.commands_for(&older_pr_open.id).await?.len(), 1);
+    Ok(())
+}

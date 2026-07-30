@@ -34,7 +34,7 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick(
         )
         .await?;
     let mut tick = RuntimePrFeedbackSweepTick::default();
-    let mut considered_candidates = 0usize;
+    let work_limit = limit.max(1);
     for mut workflow in workflows {
         if !matches!(
             workflow.state.as_str(),
@@ -86,10 +86,9 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick(
             tick.skipped += 1;
             continue;
         }
-        if considered_candidates >= limit.max(1) {
+        if tick.requested + tick.auto_merge_requested >= work_limit {
             break;
         }
-        considered_candidates += 1;
 
         if workflow.state == "ready_to_merge" {
             match request_auto_merge_if_enabled(state, store, &workflow).await? {
@@ -104,6 +103,15 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick(
         let request_outcome = if workflow.state == "pr_open" {
             crate::workflow_runtime_pr_feedback::request_local_review(store, &workflow.id).await?
         } else {
+            if crate::workflow_runtime_pr_feedback::pr_feedback_driver_command_is_active(
+                store,
+                &workflow.id,
+            )
+            .await?
+            {
+                tick.active_command_exists += 1;
+                continue;
+            }
             let refreshed = match refresh_pr_feedback_sweep_remote_fact(state, store, &workflow)
                 .await
             {

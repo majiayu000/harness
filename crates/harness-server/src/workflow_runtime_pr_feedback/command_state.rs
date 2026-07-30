@@ -47,28 +47,7 @@ pub(super) async fn has_active_pr_feedback_command_with_activity(
     latest_pr_fact_hash: Option<&str>,
     latest_pr_activity_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<bool> {
-    let parent_has_active_command =
-        store
-            .commands_for(workflow_id)
-            .await?
-            .into_iter()
-            .any(|record| {
-                is_active_pr_feedback_command_status(record.status)
-                    && matches!(
-                        record.command.activity_name(),
-                        Some("sweep_pr_feedback" | "address_pr_feedback")
-                    )
-                    || is_active_pr_feedback_command_status(record.status)
-                        && record.command.command_type
-                            == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
-                        && record
-                            .command
-                            .command
-                            .get("definition_id")
-                            .and_then(|value| value.as_str())
-                            == Some(PR_FEEDBACK_DEFINITION_ID)
-            });
-    if parent_has_active_command {
+    if parent_has_active_pr_feedback_driver_command(store, workflow_id).await? {
         return Ok(true);
     }
 
@@ -115,6 +94,52 @@ pub(super) async fn has_active_pr_feedback_command_with_activity(
     }
 
     Ok(false)
+}
+
+pub(super) async fn has_active_pr_feedback_driver_command(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
+    if parent_has_active_pr_feedback_driver_command(store, workflow_id).await? {
+        return Ok(true);
+    }
+    for instance in store
+        .list_instances_by_parent(workflow_id, None)
+        .await?
+        .into_iter()
+        .filter(|instance| instance.definition_id == PR_FEEDBACK_DEFINITION_ID)
+    {
+        if matches!(instance.state.as_str(), "pending" | "inspecting")
+            && has_active_child_pr_feedback_command(store, &instance.id).await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn parent_has_active_pr_feedback_driver_command(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(store
+        .commands_for(workflow_id)
+        .await?
+        .into_iter()
+        .any(|record| {
+            is_active_pr_feedback_command_status(record.status)
+                && (matches!(
+                    record.command.activity_name(),
+                    Some("sweep_pr_feedback" | "address_pr_feedback")
+                ) || record.command.command_type
+                    == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
+                    && record
+                        .command
+                        .command
+                        .get("definition_id")
+                        .and_then(|value| value.as_str())
+                        == Some(PR_FEEDBACK_DEFINITION_ID))
+        }))
 }
 
 fn handoff_child_pr_feedback_state_suppresses_duplicate_sweep(state: &str) -> bool {

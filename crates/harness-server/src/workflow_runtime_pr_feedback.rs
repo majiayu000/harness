@@ -494,6 +494,13 @@ pub(crate) async fn request_pr_feedback_sweep(
     .await
 }
 
+pub(crate) async fn pr_feedback_driver_command_is_active(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+) -> anyhow::Result<bool> {
+    command_state::has_active_pr_feedback_driver_command(store, workflow_id).await
+}
+
 pub(crate) async fn request_pr_feedback_sweep_with_failed_child_suppression_secs(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
