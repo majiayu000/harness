@@ -533,6 +533,42 @@ async fn aged_wait_listing_filters_by_age_and_terminal_state() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn list_instances_by_parent_uses_store_updated_at() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let parent = project_issue_instance("/project-a", 305, "awaiting_feedback");
+    let mut child = quality_gate_instance("checking")
+        .with_id("parent-row-timestamp-child")
+        .with_parent(&parent.id);
+    child.updated_at = Utc::now() - Duration::days(7);
+    store.upsert_instance(&parent).await?;
+    store.upsert_instance(&child).await?;
+
+    let row_updated_at =
+        DateTime::parse_from_rfc3339("2026-07-30T15:50:07.844135Z")?.with_timezone(&Utc);
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
+        .bind(&child.id)
+        .bind(row_updated_at)
+        .execute(store.pool())
+        .await?;
+
+    let loaded = store
+        .list_instances_by_parent(&parent.id, None)
+        .await?
+        .into_iter()
+        .find(|instance| instance.id == child.id)
+        .expect("child should be listed by parent");
+
+    assert_eq!(loaded.updated_at, row_updated_at);
+    assert_ne!(loaded.updated_at, child.updated_at);
+    Ok(())
+}
+
+#[tokio::test]
 async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

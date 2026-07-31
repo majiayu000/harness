@@ -469,6 +469,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
             pr_url: Some("https://github.com/owner/repo/pull/77"),
             issue_number: Some(226),
             repo: Some("owner/repo"),
+            expected_base_ref: None,
             parent_workflow_id: Some(parent.id.as_str()),
             summary: "test pr feedback replay",
         },

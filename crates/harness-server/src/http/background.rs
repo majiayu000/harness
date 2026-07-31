@@ -30,9 +30,11 @@ use runtime_profiles::{
 const RUNTIME_WORKFLOW_CONFIG_RETRY_SECS: u64 = 30;
 
 pub(super) use auto_recovery::spawn_auto_recovery;
-#[cfg(test)]
-pub(super) use pr_feedback::run_runtime_pr_feedback_sweep_tick;
 pub(super) use pr_feedback::spawn_runtime_pr_feedback_sweeper;
+#[cfg(test)]
+pub(super) use pr_feedback::{
+    run_runtime_pr_feedback_sweep_tick, run_runtime_pr_feedback_sweep_tick_with_cursor,
+};
 #[cfg(test)]
 pub(super) use runtime_command_dispatch::run_runtime_command_dispatch_tick;
 pub(super) use runtime_command_dispatch::{

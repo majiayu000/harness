@@ -395,6 +395,124 @@ async fn runtime_worker_propagates_pr_feedback_child_completion_to_parent() -> a
 }
 
 #[tokio::test]
+async fn runtime_worker_stamps_pr_feedback_child_with_inspected_remote_fact() -> anyhow::Result<()>
+{
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let parent = issue_instance("awaiting_feedback")
+        .with_id("issue-parent-pr-feedback-fact-stamp")
+        .with_data(json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "runtime-task-77",
+        }));
+    store.upsert_instance(&parent).await?;
+    let child = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "inspecting",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child-fact-stamp")
+    .with_parent(parent.id.clone())
+    .with_data(json!({
+        "remote_fact_hash": "sha256:pre-inspection",
+        "remote_fact_activity_at": "2026-07-30T00:00:00Z",
+    }));
+    store.upsert_instance(&child).await?;
+    let command =
+        WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
+    let command_id = store.enqueue_command(&child.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": PR_FEEDBACK_INSPECT_ACTIVITY }),
+        )
+        .await?;
+    let snapshot = json!({
+        "schema": "harness.github.pr_snapshot.v1",
+        "snapshot_source": "server_github_graphql",
+        "observed_at": "2026-07-31T00:00:05Z",
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "state": "OPEN",
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "url": "https://github.com/owner/repo/pull/77",
+        "updated_at": "2026-07-31T00:00:00Z",
+        "updatedAt": "2026-07-31T00:00:00Z",
+        "head_oid": "post-inspection-head",
+        "review_decision": "REVIEW_REQUIRED",
+        "status_check_rollup_state": "SUCCESS",
+        "statusCheckRollup": {
+            "state": "SUCCESS",
+            "contexts": {
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "nodes": [{
+                    "__typename": "CheckRun",
+                    "id": "CR_completed",
+                    "databaseId": 101,
+                    "name": "Test",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+                }]
+            }
+        },
+        "status_check_contexts": [{
+            "type": "check_run",
+            "id": "CR_completed",
+            "database_id": 101,
+            "name": "Test",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "details_url": "https://github.com/owner/repo/actions/runs/101"
+        }],
+        "status_check_contexts_complete": true,
+        "merge_state_status": "CLEAN",
+        "active_unresolved_review_threads_count": 0,
+        "review_threads_complete": true,
+    });
+    let expected_hash_input = crate::runtime::stable_pr_snapshot_fact_hash_input(&snapshot);
+    let expected_fact_hash = crate::runtime::stable_remote_fact_hash(&expected_hash_input);
+    let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
+    let executor = StaticRuntimeExecutor {
+        result: ActivityResult::succeeded(
+            PR_FEEDBACK_INSPECT_ACTIVITY,
+            "PR feedback child found no actionable feedback.",
+        )
+        .with_artifact(ActivityArtifact::new(
+            crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+            snapshot,
+        ))
+        .with_signal(ActivitySignal::new("NoFeedbackFound", json!({}))),
+    };
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("worker should claim and complete one job");
+
+    assert_eq!(completed.id, job.id);
+    let child_after = store
+        .get_instance(&child.id)
+        .await?
+        .expect("child workflow should exist");
+    assert_eq!(child_after.state, "no_actionable_feedback");
+    assert_eq!(child_after.data["remote_fact_hash"], expected_fact_hash);
+    assert_eq!(
+        child_after.data["remote_fact_activity_at"],
+        "2026-07-31T00:00:00Z"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_store_commits_parent_completion_event_decision_and_command() -> anyhow::Result<()>
 {
     if resolve_database_url(None).is_err() {
