@@ -118,8 +118,11 @@ failure, then validates, in order:
 1. exact outer version and closed subject;
 2. matching typed payload and exact inner version;
 3. the ASC-001 component, subject/kind agreement, an empty capability list,
-   and a canonical runtime-role locator whose decoded suffix equals the runtime
-   payload kind;
+   and the subject-specific source binding: a canonical runtime-role locator
+   whose decoded suffix equals the runtime payload kind, or a strict
+   `McpToolSource::parse` that peels and re-derives the configured-server and
+   tool suffixes, reconstructs the server component ID, and requires it plus
+   the exact decoded tool name to equal the MCP payload;
 4. exact B-003 observation, trust, selection, and freshness values;
 5. payload-local ordering and impossible-state invariants; and
 6. ASC-001 integrity wire shape, plus the subject-specific invariant that a
@@ -323,14 +326,20 @@ On Unix:
   absolute-path `execve` call from the direct workspace `libc` dependency with
   the fixed arguments and no shell;
 - only exact `EACCES` from that call advances to the next same-basename
-  candidate; `ENOEXEC` and every other error are terminal `spawn_failed`;
-- absolute and qualified commands never fallback; and
+  candidate;
+- exact first `ETXTBSY` waits the adapter's fixed 150 milliseconds, repeats
+  opened-target authorization plus the full retained-handle hash and path
+  strong-identity checkpoint, and retries the same absolute candidate once;
+  identity change stops without retry, while second `ETXTBSY`, `ENOEXEC`, and
+  every other retry/error are terminal `spawn_failed`;
+- absolute and qualified commands may use that one same-candidate `ETXTBSY`
+  retry but never search or fallback to another path; and
 - the first successful exec becomes the selected executable.
 
 The implementation must not call `execvp`: POSIX `ENOEXEC` fallback may invoke
-`/bin/sh`, which violates the no-shell boundary. Every observed bare-name
-candidate adds one ordered `RuntimeResolutionAttempt` with at most 64 entries.
-Its digest is:
+`/bin/sh`, which violates the no-shell boundary. Every observed Unix candidate
+adds one ordered `RuntimeResolutionAttempt`; absolute and qualified commands
+have exactly one, while a bare name has at most 64. Its digest is:
 
 ```text
 SHA-256(
@@ -342,9 +351,13 @@ SHA-256(
 ```
 
 The tags, counts, and exact units are encoded identically to
-`configured_command_digest`. The closed `RuntimeResolutionAttemptOutcome` is
-exactly `Absent`, `NotRegular`, `NotExecutable`, `InspectionFailed`,
-`InspectionTarget`, `AuthorizationUnavailable`, `ExecEacces`, `ExecFailed`, or
+`configured_command_digest`. Each attempt also carries a closed
+`RuntimeExecSequence`: `None`, `Single`, or
+`EtxtbsyThenCheckpointAfter150Ms`. The closed
+`RuntimeResolutionAttemptOutcome` is exactly `Absent`, `NotRegular`,
+`NotExecutable`, `InspectionFailed`, `InspectionTarget`,
+`AuthorizationUnavailable`, `RetryNotAuthorized`,
+`RetryAuthorizationUnavailable`, `ExecEacces`, `ExecFailed`, or
 `ExecStarted`. Attempts preserve PATH order and duplicates; they are never
 sorted.
 
@@ -362,6 +375,22 @@ yields `bare_eacces_exhausted`; reaching the bound without a terminal outcome
 yields `candidate_limit_exceeded` with exactly 64 attempts. Outcomes after a
 terminal, multiple terminals, wrong source/failure pairs, or more than 64
 entries fail parsing.
+
+`RuntimeExecSequence::None` is required for skips, inspection-only, and initial
+authorization-unavailable outcomes. `Single` is required for an ordinary exec
+outcome. `EtxtbsyThenCheckpointAfter150Ms` is legal only after the first direct
+exec returned raw errno `ETXTBSY`; it requires the 150-millisecond monotonic
+delay and the repeated authorization/hash/path-identity checkpoint. If that
+checkpoint changes authorization, `RetryNotAuthorized` requires
+`probe_not_authorized` with exact `ResolvedTargetRepository` reason, while
+`RetryAuthorizationUnavailable` requires
+`target_authorization_unavailable`; either forbids the second exec, fallback,
+and selected identity. `InspectionFailed` with `identity_changed` likewise
+forbids the second exec. Only `ExecEacces` for a bare name, `ExecFailed`, or
+`ExecStarted` proves that the second exec was attempted. A second `ETXTBSY` is
+`ExecFailed`. Absolute and qualified commands reject `ExecEacces` and represent
+terminal `EACCES` as `ExecFailed`. Cancellation during the delay emits no
+envelope and starts no child. No other errno, retry count, or delay is accepted.
 
 Failed candidates contribute no final executable identity. Repository-owned
 bare commands stop after the first statically eligible successful inspection,
@@ -422,6 +451,23 @@ exhaustive `LocalExecutableRuntimeKind::environment_policy()` returns exactly:
 | `claude_code` | `ANTHROPIC_API_KEY` | `unset` or `redacted` | excluded |
 | `claude_code` | `CLAUDE_CONFIG_DIR` | `unset` or exact-value SHA-256 | excluded |
 | all three | `PATH` | domain-separated digest plus resolution outcome | exposed only as sanitized launch `PATH` |
+
+Present `PATH` and `CLAUDE_CONFIG_DIR` evidence uses the same exact OS-unit
+encoding helper as B-004 but separate frozen domains:
+
+```text
+SHA-256(domain || platform_tag || unit_count_be || exact_units)
+```
+
+The domains are exactly
+`b"harness_runtime_environment_path_v0_1\0"` and
+`b"harness_runtime_environment_claude_config_dir_v0_1\0"`.
+`platform_tag` is `b"unix\0"` or `b"windows\0"`; the count is fixed-width
+`u64` big-endian. Unix counts raw `OsStr` bytes and appends them unchanged.
+Windows counts original UTF-16 code units and appends each little-endian `u16`.
+There is no UTF-8 conversion, normalization, case folding, separator rewrite,
+or path parsing before hashing. `Unset` has no digest; a present empty value
+hashes the zero-unit encoding and remains distinct.
 
 No other ordinary key enters evidence or the version child. There is no public
 `RuntimeEnvironmentDeclaration`, classification builder, automatic public
@@ -681,6 +727,8 @@ The private state machine has these contexts:
 - `Schema`: an object whose keys may be JSON Schema keywords;
 - `SchemaMap`: values under `$defs`, `definitions`, `properties`,
   `patternProperties`, and `dependentSchemas` are schemas;
+- `StringSetMap`: every object value under `dependentRequired` must be an array
+  of strings and is sorted by canonical string bytes without deduplication;
 - `SchemaArrayOrdered`: `prefixItems` and legacy array-form `items` traverse
   elements as schemas but preserve array order;
 - `SchemaArraySet`: `allOf`, `anyOf`, and `oneOf` traverse elements as schemas
@@ -695,9 +743,13 @@ always enter `InstanceData`. Known single-schema locations such as `not`,
 `if`, `then`, `else`, `contains`, `propertyNames`, `additionalProperties`,
 `unevaluatedItems`, and `unevaluatedProperties` enter `Schema`. At `items`, an
 object or boolean enters `Schema`, an array enters `SchemaArrayOrdered`, and
-any other value is a typed malformed-schema error. Unknown and vendor-extension
+any other value is a typed malformed-schema error. `additionalItems` enters
+`Schema` only when the same object has legacy array-form `items`; when `items`
+is absent, object-form, or boolean, `additionalItems` enters `InstanceData`.
+`dependentRequired` enters `StringSetMap`; a non-object, non-array property
+value, or non-string array element fails typed. Unknown and vendor-extension
 values enter `InstanceData`. Object members are sorted in all contexts, but an
-array is sorted only at the six closed B-013 locations.
+array is sorted only at the seven closed B-013 keyword families.
 
 Set sorting uses canonical JSON bytes after child traversal and does not silently
 remove duplicates. Ordered arrays retain their exact order. Tests specifically
@@ -723,14 +775,14 @@ owns user-facing collection commands. This is B-016.
 | B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch`; `fingerprint_digest_is_separate_from_component_integrity`; `failure_payload_changes_fingerprint_digest_without_fabricating_integrity`; `component_integrity_preserves_exact_source_bytes_or_absence` |
 | B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
 | B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
-| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_fallback`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `runtime_resolution_attempts_round_trip_all_outcomes`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
-| B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
+| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `etxtbsy_retries_same_candidate_once_after_150_ms`; `etxtbsy_checkpoint_rechecks_authorization_hash_and_path_identity`; `etxtbsy_checkpoint_authorization_change_prevents_second_exec`; `etxtbsy_checkpoint_rejects_configuration_source_reason`; `etxtbsy_checkpoint_unavailable_authorization_prevents_second_exec`; `second_etxtbsy_is_terminal`; `etxtbsy_sequence_rejects_wrong_errno_delay_count_and_outcome`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_search_fallback`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `runtime_resolution_attempts_round_trip_all_outcomes_and_exec_sequences`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
+| B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; independent fixed vectors freeze PATH and `CLAUDE_CONFIG_DIR` domains, platform tags, big-endian counts, Unix raw bytes, Windows UTF-16LE, absent/empty distinction, and non-UTF-8 Unix values; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
 | B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
 | B-007 | Unix `ordinary_timeout_reaps_root_and_verifies_original_group`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_requires_empty_original_group`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; Windows `containment_unavailable_prevents_spawn` |
 | B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
 | B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `both_streams_are_parsed_before_selection`; `same_version_on_both_streams_is_ambiguous`; `valid_version_with_nonblank_other_stream_is_unparseable`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; exact-limit and limit-plus-one tool-name/description fixtures |
-| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `object_form_items_traverses_nested_schema`; `object_form_items_required_and_one_of_reorder_canonically`; `legacy_array_items_preserves_tuple_order`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
+| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `object_form_items_traverses_nested_schema`; `object_form_items_required_and_one_of_reorder_canonically`; `legacy_array_items_preserves_tuple_order`; `legacy_additional_items_traverses_schema_context`; `additional_items_without_legacy_array_items_remains_instance_data`; `dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
 
 All failure tests assert the absence of a version fact and the absence of raw

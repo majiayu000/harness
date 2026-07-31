@@ -147,14 +147,24 @@ facts in snapshots or through a CLI.
    `path_resolution/candidate_limit_exceeded`. After inspection and the pre-spawn
    checkpoint, a direct no-shell `execve` primitive attempts the absolute
    candidate with fixed B-002 arguments. Only an exact `EACCES` result may
-   discard that candidate and continue to the next same-basename entry.
-   `ENOEXEC` is terminal `spawn_failed` and never invokes `/bin/sh`; every
-   other spawn error is terminal. Absolute and qualified commands never
-   fallback. Ordered attempt evidence retains only domain-separated candidate
+   discard that bare-name candidate and continue to the next same-basename
+   entry. An exact first `ETXTBSY` waits 150 milliseconds, repeats target
+   authorization plus the full retained-handle/path identity checkpoint, and
+   retries that same absolute candidate exactly once to mirror the adapter.
+   Identity change prevents retry; a second `ETXTBSY` is terminal
+   `spawn_failed`. `ENOEXEC` is terminal `spawn_failed` and never invokes
+   `/bin/sh`; every other spawn error is terminal. Absolute and qualified
+   commands may perform the one same-candidate `ETXTBSY` retry but never search
+   or fallback to another candidate. Ordered attempt evidence retains only
+   domain-separated candidate
    path digests and the closed outcomes defined by B-008. Candidate digests use
    `"harness_runtime_resolution_candidate_v0_1\0"` followed by the same exact
    platform tag, `u64` big-endian unit count, and OS units as the configured
-   command digest. The first successful exec is the selected executable;
+   command digest. It also records the closed exec sequence `none`, `single`,
+   or `etxtbsy_then_checkpoint_after_150_ms`; the checkpoint sequence is legal
+   only when the first direct exec returned exact `ETXTBSY` and does not imply
+   that authorization allowed a second exec. The first successful exec is the
+   selected executable;
    exhausting only `EACCES` candidates is `bare_eacces_exhausted`, while no
    inspectable candidate is `path_not_found`. Resolution never invokes
    `which`, a package manager, or an arbitrary candidate command.
@@ -279,6 +289,17 @@ facts in snapshots or through a CLI.
     | `claude_code` | `CLAUDE_CONFIG_DIR` | `unset` or SHA-256 | excluded |
     | all three | `PATH` | domain-separated SHA-256 plus resolution outcome | exposed as the sanitized B-004 value |
 
+    Present `PATH` and `CLAUDE_CONFIG_DIR` values use:
+    `SHA-256(domain || platform_tag || unit_count_be || exact_units)`.
+    Their domains are exactly
+    `b"harness_runtime_environment_path_v0_1\0"` and
+    `b"harness_runtime_environment_claude_config_dir_v0_1\0"`.
+    `platform_tag`, count, and units use the exact B-004 encoding: `b"unix\0"`
+    plus raw Unix bytes counted as bytes, or `b"windows\0"` plus original
+    UTF-16 units counted by `u64` big-endian and serialized as little-endian
+    `u16`. No normalization occurs. Unset is a distinct enum state and has no
+    digest; present empty hashes the zero-unit encoding.
+
     Undeclared keys are ignored and can never enter evidence or the child.
     Setup-secret exclusion runs first and can remove even a listed policy key.
     Before duplicate, `PATH`, policy, or setup-secret matching, Unix compares
@@ -323,10 +344,12 @@ facts in snapshots or through a CLI.
     boolean, array, string, number, or null fails typed before canonicalization
     or digest construction. Boolean schemas remain legal only at schema-valued
     child positions. Within that object, canonicalization is context-aware.
-    JSON object member order is canonicalized lexicographically. Only arrays at the closed
-    order-insensitive schema-keyword locations `required`, `type`, `enum`,
-    `allOf`, `anyOf`, and `oneOf` are sorted, and schema-valued children are
-    traversed as schemas. Ordered schema locations such as `prefixItems`, all
+    JSON object member order is canonicalized lexicographically. Only arrays at
+    the closed order-insensitive schema-keyword locations `required`, `type`,
+    `enum`, `allOf`, `anyOf`, `oneOf`, and each property value beneath
+    `dependentRequired` are sorted, and schema-valued children are traversed as
+    schemas. `additionalItems` is a schema-valued child when the legacy array
+    form of `items` is used. Ordered schema locations such as `prefixItems`, all
     unknown/vendor-extension arrays, and instance-valued annotations including
     `default`, `const`, `examples`, and `example` preserve array order at every
     depth. A key named `enum`, `required`, or `oneOf` inside annotation data is
@@ -411,9 +434,11 @@ facts in snapshots or through a CLI.
 
 ### Unix Bare-Name Attempt Vocabulary
 
-`RuntimeResolutionAttempt` exists only for Unix bare-name resolution and is
-ordered exactly like the first at most 64 sanitized `PATH` entries. It contains
-a candidate digest and one closed outcome:
+`RuntimeResolutionAttempt` exists for every Unix candidate. Absolute and
+qualified commands have exactly one entry; bare-name entries are ordered
+exactly like the first at most 64 sanitized `PATH` entries. It contains a
+candidate digest, one closed exec sequence (`none`, `single`, or
+`etxtbsy_then_checkpoint_after_150_ms`), and one closed outcome:
 
 | Outcome | Meaning |
 | --- | --- |
@@ -423,6 +448,8 @@ a candidate digest and one closed outcome:
 | `inspection_failed` | Open or later inspection failed; this is terminal and requires the matching B-008 identity failure. |
 | `inspection_target` | Configuration-source or resolved-target repository policy retained this first authorized inspection identity and stopped without exec. |
 | `authorization_unavailable` | Final-target repository/worktree classification could not be proven; this is terminal and requires `target_authorization_unavailable`. |
+| `retry_not_authorized` | After first exec returned `ETXTBSY`, the repeated checkpoint classified the target as repository-owned; requires `probe_not_authorized` with exact reason `resolved_target_repository` and forbids a second exec. |
+| `retry_authorization_unavailable` | After first exec returned `ETXTBSY`, the repeated checkpoint could not prove target authorization; requires `target_authorization_unavailable` and forbids a second exec. |
 | `exec_eacces` | Direct `execve` returned exact `EACCES`; final identity is discarded and search continues. |
 | `exec_failed` | Direct `execve` returned another terminal error; requires `spawn_failed` and no selected/executed claim. |
 | `exec_started` | Direct `execve` succeeded; this is the sole terminal selected executable. |
@@ -432,11 +459,25 @@ a terminal outcome, any exec outcome after identity-only authorization,
 multiple terminal outcomes, `inspection_target` without
 `probe_not_authorized` and its closed source-or-target reason,
 `authorization_unavailable` without `target_authorization_unavailable`,
+`retry_not_authorized` without `probe_not_authorized` carrying exact reason
+`resolved_target_repository`,
+`retry_authorization_unavailable` without
+`target_authorization_unavailable`,
 `exec_failed` without `spawn_failed`, `exec_started` with a spawn failure, or
 `bare_eacces_exhausted` unless the final non-skipped attempt is `exec_eacces`
 and no final executable identity exists. `candidate_limit_exceeded` requires
 exactly 64 nonterminal attempts. `path_not_found` permits only skipped outcomes
-and no inspection or selected identity.
+and no inspection or selected identity. `none` is required for outcomes that
+terminate before any direct exec; an initial `inspection_failed` uses `none`.
+`single` is required for an ordinary one-exec outcome.
+`etxtbsy_then_checkpoint_after_150_ms` requires an exact first `ETXTBSY` and a
+repeated authorization/identity checkpoint. It permits
+`retry_not_authorized`, `retry_authorization_unavailable`, or
+`inspection_failed` without a second exec, and `exec_eacces` for a bare name,
+`exec_failed`, or `exec_started` only after the second exec. It is rejected for
+every initial skip, inspection-only, or authorization-unavailable outcome.
+Absolute/qualified attempts reject `exec_eacces`, because their `EACCES` is
+terminal `exec_failed`.
 
 ## Acceptance Criteria
 
@@ -472,10 +513,12 @@ and no inspection or selected identity.
       platforms cover an absent command, duplicate basenames, spaces, literal
       shell metacharacters, one absolute selected probe path, and no unrelated
       executable. Unix bare-name fixtures prove exact `EACCES` fallback to a
-      later same-basename candidate, terminal `ENOEXEC` without `/bin/sh`,
-      terminal non-`EACCES` errors, and no fallback for absolute or qualified
-      commands. Injected open denial is `open_failed`, mutually exclusive with
-      handle-based failures, and never leaks OS diagnostics.
+      later same-basename candidate, one exact 150-millisecond `ETXTBSY` retry
+      with a fresh authorization/identity checkpoint, terminal second
+      `ETXTBSY`, terminal `ENOEXEC` without `/bin/sh`, terminal other errors,
+      and no search fallback for absolute or qualified commands. Injected open
+      denial is `open_failed`, mutually exclusive with handle-based failures,
+      and never leaks OS diagnostics.
 - [ ] Unix attempt fixtures round-trip every closed outcome, reject illegal
       source/outcome/failure/terminal combinations, preserve duplicate PATH
       entries and order, cover exactly 64 candidates and candidate 65, and
@@ -526,7 +569,10 @@ and no inspection or selected identity.
       cannot be declared or exposed, raw-value and raw-PATH absence, setup
       secrets override the closed policy, Unix comparison remains
       case-sensitive, and Windows canonical comparison rejects `Path`/`PATH`
-      collisions and non-ASCII keys.
+      collisions and non-ASCII keys. Independent hard-coded PATH and
+      `CLAUDE_CONFIG_DIR` vectors freeze both exact domains, platform tags,
+      `u64` counts, Unix raw bytes, Windows UTF-16LE units, absent versus empty,
+      and non-UTF-8 Unix input.
 - [ ] MCP fixtures prove exact stable configuration-key binding, distinct
       server IDs for distinct keys, injective typed source derivation for
       multiple exact UTF-8 tool names on one server, rejection of arbitrary
@@ -540,7 +586,8 @@ and no inspection or selected identity.
       `const`, `examples`, and `example` remain digest-sensitive even when an
       annotation object contains a schema-keyword-shaped key; object/boolean
       `items` traverses schema context while legacy array `items` preserves
-      order.
+      order and `additionalItems` remains schema context; every
+      `dependentRequired` property array is a canonical string set.
 - [ ] Duplicate JSON keys and malformed raw schemas fail typed before digesting,
       and public API/call-site audit proves no generic serializable or
       `serde_json::Value` evidence constructor exists.
