@@ -451,9 +451,14 @@ The configured child working-directory spelling uses the same helper with
 domain
 `b"harness_runtime_working_directory_v0_1\0"` and enters the payload as
 `working_directory_digest`. After the isolation and sandbox gates, Linux v0.1
-first proves `pidfd_open`, `pidfd_send_signal`, `/proc` membership enumeration,
-and the kill-isolated observation protocol are available, reserves the
-runtime-independent owner, and starts the active deadline. macOS, other Unix,
+reserves the runtime-independent owner, uses one reserved slot for owner-side
+`pidfd_open(getpid(), 0)` plus `pidfd_send_signal(..., 0)`, closes that test
+pidfd, and only then creates the capability child. Any self-preflight syscall
+failure returns no-envelope `ContainmentUnavailable(PidfdUnavailable)` before
+cwd observation; it cannot be reported as a capability-child registration
+failure. Under the already-started active deadline, the capability child then
+proves `/proc` membership enumeration, tagged ptrace guarding, and the
+kill-isolated observation protocol are available. macOS, other Unix,
 and Windows return typed no-envelope producer error
 `ContainmentUnavailable(UnsupportedPlatform)` before cwd observation. On
 supported Linux, an observation subprocess opens the directory once with
@@ -690,10 +695,11 @@ only Linux `x86_64` (`EM_X86_64`, `ELFCLASS64`, little-endian) and Linux
 `aarch64` (`EM_AARCH64`, `ELFCLASS64`, little-endian); another build target
 fails the pre-observation capability gate. Checked arithmetic must prove
 `e_phoff + e_phnum * e_phentsize` is within the retained file, and every
-program header is scanned to reject `PT_INTERP`. Other header fields are not
-authorization signals; a later kernel load error remains `spawn_failed`.
-Exact `#!`, dynamic or structurally malformed ELF, wrong-machine ELF, and every
-non-ELF/binfmt format emit
+program header is scanned to reject `PT_INTERP`, any `PT_LOAD` with both
+`PF_W` and `PF_X`, and missing, duplicate, or `PF_X` `PT_GNU_STACK`. Other header fields are
+not authorization signals; a later kernel load error remains `spawn_failed`.
+Exact `#!`, dynamic, writable-executable, executable-stack, or structurally
+malformed ELF, wrong-machine ELF, and every non-ELF/binfmt format emit
 `InterpreterAuthorizationUnavailable` before this attempt's target creation; no
 header bytes, interpreter path, or raw prefix are serialized. If accepted
 bytes become a script after this check,
@@ -799,8 +805,9 @@ configured command, candidate paths, and raw search text are never serialized.
 The supported native-binary probe child receives the exact sanitized child
 `PATH` from the launch context. A shebang launcher fails before child
 environment construction can select an interpreter, and the post-exec guard
-prevents an accepted target from using PATH or cwd for a later image or
-executable mapping. Other environment keys follow only the closed policy below.
+prevents an accepted target from using PATH or cwd for a later image,
+executable mapping, or write path to existing executable memory. Other
+environment keys follow only the closed policy below.
 This implements B-004, B-005, and the PATH portion of B-010.
 
 ## Closed Environment Policy
@@ -929,7 +936,12 @@ surplus is protocol-invalid descriptor mismatch. A concrete registration
 failure observed before deadline has precedence over a later deadline; a
 deadline error is used only when no concrete syscall failure was observed.
 Cancellation returns no visible result and drives the same owner rollback. The
-capability probe cannot waive this per-child ordering. For the initial
+capability probe cannot waive this per-child ordering. The owner-side
+self-pidfd preflight precedes the initial capability fork; consequently,
+unsupported or policy-blocked `pidfd_open`/`pidfd_send_signal` maps to
+`ContainmentUnavailable(PidfdUnavailable)`, while any per-child `pidfd_open`
+failure after that successful preflight maps to
+`ChildRegistrationUnavailable { role, PidfdOpen }`. For the initial
 capability role only, `ENOSYS`, seccomp `EPERM`/`EACCES`, or unsupported-flag
 `EINVAL` from the validated descriptor-isolation syscall emits
 `DescriptorIsolationUnavailable`; after the child is reaped, that status maps
@@ -1043,7 +1055,29 @@ execution, the owner rejects closed `RuntimeTransitiveExecutionClass`:
 - `ProcessCreation`: `fork`, `vfork`, `clone`, or `clone3`;
 - `ImageExecution`: `execve` or `execveat`;
 - `ExecutableMapping`: `mmap`/`mmap2`, `mprotect`, or `pkey_mprotect` requesting
-  `PROT_EXEC`, or `shmat` requesting `SHM_EXEC`.
+  `PROT_EXEC`, or `shmat` requesting `SHM_EXEC`;
+- `ExecutableImageMutation`: `ptrace`, `process_vm_writev`, `userfaultfd`,
+  `io_uring_setup`, `pidfd_getfd`, `recvmsg`, `recvmmsg`, `prctl`, every
+  `personality` argument other than the side-effect-free exact
+  `0xffff_ffff` query,
+  `creat`, or `open`/`openat`/`open_by_handle_at`/`openat2` whose flags request
+  `O_WRONLY`, `O_RDWR`, or `O_TRUNC`.
+
+The fixed-size `open_how` prefix used by `openat2` is copied from the stopped
+single-threaded target with one bounded `process_vm_readv`; an unreadable
+pointer, a size smaller than the flags field, nonzero unknown tail bytes, or
+unknown/conflicting flag bits is `ExecutionVerificationUnavailable`. It is
+never resumed as a read-only open. Descriptor isolation proves that the target
+inherits no writable memory fd or Unix socket. Denying every later
+write-capable open blocks `/proc/self/mem`, `/proc/thread-self/mem`, numeric
+proc aliases, and mount aliases without parsing an attacker-controlled
+pathname. Denying `recvmsg`/`recvmmsg` and `pidfd_getfd` prevents later
+`SCM_RIGHTS` or remote-fd acquisition; denying `prctl` prevents the target from
+loosening external ptrace access. `io_uring_setup` is denied so asynchronous
+open/write cannot bypass syscall-entry classification. The classifier requires
+exactly one non-executable `PT_GNU_STACK` and rejects W+X `PT_LOAD`; denying
+`personality` changes prevents `READ_IMPLIES_EXEC` from converting a
+`PROT_READ` mmap/mprotect request into an executable mapping.
 
 The closed trace state begins `AwaitInitialExecExit`: after the already verified
 `PTRACE_EVENT_EXEC`, exactly one tagged syscall-exit stop for that authorized
@@ -1062,9 +1096,12 @@ or reap does not complete, the normative lifecycle-cleanup failure is appended
 and the owner retains the stopped obligation. Missing,
 surplus, untagged, out-of-order, or unreadable syscall stops return no-envelope
 `ExecutionVerificationUnavailable` and run the same cleanup. This guard means
-the initial current-architecture static ELF is the only process image and
-executable mapping allowed to run; PATH/cwd helper launches, dynamic loading,
-JIT mappings, processes, and threads are deliberately unsupported in v0.1.
+the admitted initial current-architecture static ELF and kernel-provided
+immutable vDSO are the only executable mappings allowed to run, and target
+code cannot gain a write path to either. PATH/cwd helper launches, dynamic
+loading, JIT mappings, writable executable segments, executable stacks,
+asynchronous syscall submission, processes, and threads are deliberately
+unsupported in v0.1.
 
 The retained strong identity is device/inode from handle metadata on Unix and
 volume serial plus 128-bit `FILE_ID_INFO` from the opened handle on Windows.
@@ -1193,12 +1230,20 @@ during cancellation.
 Immediately after owner readiness and before the observation subprocess that
 opens the cwd, one private monotonic
 `RUNTIME_FINGERPRINT_PROBE_DEADLINE = Duration::from_millis(5_000)` starts.
-Under that deadline, the owner runs one bounded system-only capability helper:
-successful `DescriptorsReady` isolation plus `pidfd_open` and signal zero,
+Under that deadline, the owner first spends one reserved pidfd slot on
+`pidfd_open(getpid(), 0)` and `pidfd_send_signal(self_pidfd, 0, NULL, 0)`,
+then closes the test descriptor. Any failure returns
+`ContainmentUnavailable(PidfdUnavailable)` before the capability-child fork
+and before cwd access. Only after this succeeds does the owner run one bounded
+system-only capability helper: successful `DescriptorsReady` isolation,
 owner-side `PTRACE_SEIZE`/`PTRACE_INTERRUPT` plus
 `PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD` installation, tagged
 `PTRACE_SYSCALL` entry/exit stops with exact `PTRACE_GET_SYSCALL_INFO`, and strong `/proc`
-process/group/image enumeration. The helper is atomically pidfd-owned like
+process/group/image enumeration. The helper also issues a write-capable
+`openat` for `/proc/self/mem`; the owner must classify its entry as
+`ExecutableImageMutation` and kill/reap the helper without executing that
+open. This is a guard capability assertion, not target evidence. The helper is
+atomically pidfd-owned like
 every observation helper and is reaped before cwd access. Unsupported mandatory
 containment returns no-envelope `ContainmentUnavailable` with one closed
 reason; unavailable tagged syscall stops or syscall-info decoding use
@@ -1269,9 +1314,11 @@ Every terminal path reaps any target helper it created. If no anchor has ever
 been created, candidate-local no-anchor facts remain valid. If an earlier
 attempt created the probe-level anchor, even a later pre-anchor classifier or
 candidate-limit terminal must prove that only that live anchor remains, request
-its exit, and reap it before publishing. Group-verification, termination, or
-reap failure appends the canonical lifecycle-cleanup evidence and retains exact
-ownership without changing the terminal attempt. A zero exit and valid output is only a
+its exit, and reap it before publishing. Termination or reap failure appends
+the canonical lifecycle-cleanup evidence and retains exact ownership without
+changing the terminal attempt. Membership-helper timeout, cleanup-incomplete,
+or protocol failure instead returns the corresponding no-envelope observation
+error. A zero exit and valid output is only a
 provisional success until that check passes and the anchor is then exited and
 reaped. If another anchored-group member remains, the producer records
 `version_probe/lingering_process_group`,
@@ -1290,15 +1337,17 @@ and returns the applicable observation producer error while retaining any
 unreaped ownership. Observation-helper cleanup instead returns one of the
 producer errors above and never creates a partial envelope.
 If all operations complete, the envelope carries only the triggering
-`version_probe` failure. If an operation fails or the deadline expires, the
-envelope also carries the applicable closed `lifecycle_cleanup` failure:
+`version_probe` failure. A membership-helper timeout, cleanup-incomplete
+ownership, malformed response, or unexpected exit returns its typed
+no-envelope observation error. For failures in the remaining envelope-capable
+operations, the envelope also carries the applicable closed
+`lifecycle_cleanup` failure:
 
 | Cleanup kind | Trigger |
 | --- | --- |
 | `termination_failed` | signalling an exact root, non-anchor member, or post-empty-group anchor pidfd failed |
-| `output_drain_failed` | bounded drain did not complete before read handles were closed |
 | `reap_failed` | root or anchor reap failed or was not verified |
-| `group_verification_failed` | the owner could not verify that only its live anchor remained |
+| `output_drain_failed` | bounded drain did not complete before read handles were closed |
 
 Original trigger failures sort before cleanup failures. Any cleanup failure
 closes parent read handles, omits version and any terminated/reaped or
@@ -1364,13 +1413,13 @@ normative: phase ranks are `PathResolution = 0`, `Identity = 1`,
 `VersionProbe = 2`, and `LifecycleCleanup = 3`; kind rank is the zero-based row
 ordinal inside its phase. Producers sort by that exact pair and reject
 duplicates; parsers reject unknown or noncanonical input. In particular, the
-cleanup ranks are `TerminationFailed = 0`, `ReapFailed = 1`,
-`OutputDrainFailed = 2`, and `GroupVerificationFailed = 3`.
+cleanup ranks are `TerminationFailed = 0`, `ReapFailed = 1`, and
+`OutputDrainFailed = 2`.
 
 The closed `RuntimeFingerprintProduceError` additionally contains
 `ContainmentUnavailable` with closed platform/owner/capability reasons
-(including `DescriptorIsolationUnavailable`, `PostExecGuardUnavailable`, and
-`OwnerCapacityExhausted`),
+(including `DescriptorIsolationUnavailable`, `PidfdUnavailable`,
+`PostExecGuardUnavailable`, and `OwnerCapacityExhausted`),
 `LaunchInputLimitExceeded { kind }`,
 `OwnerResourceCapacityExceeded { kind }` with closed kind `Pidfds` or
 `NonPidfdFds`,
@@ -1680,6 +1729,14 @@ Cross-cutting mandatory tests additionally include
 `post_exec_guard_denies_process_creation_before_kernel_entry`,
 `post_exec_guard_denies_image_execution_before_kernel_entry`,
 `post_exec_guard_denies_executable_mapping_before_kernel_entry`,
+`post_exec_guard_denies_executable_image_mutation_before_kernel_entry`,
+`proc_self_mem_write_open_is_denied_without_path_matching`,
+`post_exec_guard_denies_scm_rights_and_pidfd_getfd_acquisition`,
+`post_exec_guard_denies_prctl_and_personality_changes`,
+`post_exec_guard_allows_exact_personality_query`,
+`read_implies_exec_cannot_upgrade_mmap_or_mprotect`,
+`post_exec_guard_decodes_openat2_flags_and_fails_closed`,
+`elf_wx_load_and_executable_stack_are_rejected_before_anchor`,
 `post_exec_guard_accepts_initial_exec_exit_then_alternates_entry_exit`,
 `post_exec_guard_allows_exit_entry_to_terminate_without_exit_stop`,
 `post_exec_guard_rejects_signal_event_wrong_arch_and_wrong_op_stops`,
@@ -1690,11 +1747,15 @@ Cross-cutting mandatory tests additionally include
 `descriptor_ready_child_has_exact_role_allowlist`,
 `stalled_child_retains_no_foreign_owner_fd`,
 `every_owned_child_role_waits_for_registry_commit_before_go`,
+`owner_self_pidfd_preflight_precedes_capability_child`,
+`owner_self_pidfd_failure_is_preobservation_containment_unavailable`,
 `pidfd_registration_failure_runs_no_child_work_and_reaps_or_retains`,
 `ascii_blank_is_exactly_empty_or_ht_lf_cr_space`,
 `vt_ff_nul_nbsp_are_nonblank_with_invalid_utf8_precedence`,
 `stable_key_and_tool_name_blank_predicate_is_exact`,
 `multiple_cleanup_failures_follow_normative_rank`,
+`membership_verification_failure_is_observation_error_without_envelope`,
+`lifecycle_cleanup_vocabulary_excludes_group_verification`,
 `serde_json_raw_value_feature_is_direct`,
 `raw_number_lexemes_1_1point0_1e0_are_distinct`, and
 `long_and_malformed_number_boundaries_are_typed`.
@@ -1784,8 +1845,9 @@ descriptor ledgers, bounded launch/environment/setup-secret counting before
 hashing/splitting/joining, allocation-free post-fork work, descriptor ownership,
 `fchdir` ordering and error staging, `FD_CLOEXEC` script rejection, ptrace-stop ordering,
 stopped-image identity/hash validation under kernel write denial,
-post-exec syscall-stop denial of process creation, image execution, and
-executable mappings,
+W+X/executable-stack rejection, post-exec syscall-stop denial of process
+creation, image execution, executable mappings, and existing executable-image
+mutation,
 non-anchor-only signalling, anchor exit ordering, argument/environment pointers, NUL validation, error
 propagation, proof that authorization cannot fall back to a pathname, and proof
 that `ENOEXEC` never starts a shell. Because the repository

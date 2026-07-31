@@ -43,18 +43,32 @@ PR branch only; do not create a replacement implementation PR or force-push.
       foreign descriptors, emits a closed descriptor bootstrap status, and waits behind a
       pre-fork start gate until `pidfd_open` and registry commit succeed; closed
       rollback states prove no workload ran before `GO`.
+      Before the capability-child fork, owner-side
+      `pidfd_open(getpid(), 0)` plus signal-zero preflight must succeed and the
+      test pidfd is closed; any failure is pre-observation no-envelope
+      `pidfd_unavailable`, while later per-child pidfd failures retain the
+      child-registration stage.
       The capability gate also proves `PTRACE_O_TRACESYSGOOD`, tagged
       `PTRACE_SYSCALL` entry/exit stops, and exact x86_64/aarch64
       `PTRACE_GET_SYSCALL_INFO` through owner-side
       `PTRACE_SEIZE/PTRACE_INTERRUPT`; the target pre-exec remains the only
       `PTRACE_TRACEME` caller. Actual target-call `ENOSYS`/`EPERM`/`EINVAL` is
       candidate-local handle-execution failure, not a ptrace-containment
-      decision. After the verified initial static exec, the owner denies
-      fork/vfork/clone/clone3, execve/execveat, and new executable mmap/mprotect/
-      shmat at syscall entry before kernel execution; denial is closed failure
-      evidence without a version, while an unverifiable stop is no-envelope.
+      decision. The ELF classifier also rejects W+X `PT_LOAD` and missing,
+      duplicate, or executable `PT_GNU_STACK`. After the verified initial static exec, the owner denies
+      fork/vfork/clone/clone3, execve/execveat, new executable mmap/mprotect/
+      shmat, `ptrace`, `process_vm_writev`, `userfaultfd`, `io_uring_setup`,
+      `pidfd_getfd`, `recvmsg`/`recvmmsg`, `prctl`, every non-query
+      `personality`, and every write-capable or truncating open-family request at syscall
+      entry before kernel execution. A capability fixture proves a
+      `/proc/self/mem` write-open, received `SCM_RIGHTS`, remote-fd
+      duplication, external-ptrace authorization, and `READ_IMPLIES_EXEC`
+      changes are denied without pathname trust; exact
+      `personality(0xffff_ffff)` is the sole allowed query and completes a
+      normal entry/exit transition; denial is closed failure evidence without a version, while an unverifiable
+      `openat2` payload or syscall stop is no-envelope.
 - [ ] `SP1733-T3` — Owner: boundary contract worker. Dependencies: SP1733-T1 and SP1733-T2. Covers: B-002 and B-016. Done when: a `#[cfg(test)]`-only exhaustive workflow `RuntimeKind` mapping proves the three local kinds map one-to-one, `AnthropicApi`/`RemoteHost` are not local executables, and no non-host isolation can be interpreted as a host fingerprint subject; production call-site audit proves there is no snapshot, server, workflow-runtime, task-runner, `CodeAgent`, `AgentAdapter`, CLI, HTTP, persistence, or migration consumer; and the implementation diff matches the fourteen authorized paths exactly with no lockfile change. Verify: `cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib` plus the manifest and `rg` audits described below.
-- [ ] `SP1733-T4` — Owner: verification and handoff owner. Dependencies: SP1733-T1 through SP1733-T3. Covers: B-001 through B-016. Done when: formatting, focused/package/workspace tests, clippy, file-size/manifest/API/call-site audits, current-head independent review, Gemini, and ruleset approval all pass; every #1862 thread and valid #1859 finding is re-evaluated on the exact head. Verification must prove owner exclusivity across target/anchor fork, parent-side ptrace control, wait/reap, and helper spawn, with only the audited target pre-exec `PTRACE_TRACEME` exception; owner-atomic helper registration at every cancellation boundary; distinct typed no-envelope timeout, cleanup-incomplete, and protocol-invalid paths through post-reap and active/cleanup group-membership checks; 64-member, 65-member, larger, and continuous-churn membership behavior; no in-process blocking worker or negative-PGID signal; anchor exclusion plus typed anchor shutdown failure; static `ET_EXEC` and static-PIE success; direct/env/race-introduced shebang, `PT_INTERP`, wrong-machine, malformed-header, and non-ELF/binfmt rejection before loader/interpreter execution; missing and surplus `PTRACE_EVENT_EXEC`, abnormal trace transition, and pre-resume deadline each produce no envelope and kill/reap without resume; successful native exec reaches a verified pre-first-instruction ptrace stop and matches hash/image identity under kernel write denial before resume; macOS/other-Unix/Windows fail before cwd observation; retained cwd/target handles survive pathname replacement; repository targets never execute; and Draft 2020-12 versus Draft-07 fixtures preserve their distinct `contentSchema`, dependency, items, and extension semantics. All previous digest vectors, output/executable limits, `ETXTBSY`, cleanup, schema counting, duplicate-key, source binding, annotation, and fail-closed assertions remain unweakened; the call-site audit must prove only the owner invokes target/anchor fork, parent-side ptrace controls, and wait/reap, while only the target's audited pre-exec closure invokes `PTRACE_TRACEME`. The original PR may close GH-1733 only after all gates pass. Verify: run every command and audit in Required Verification on one current implementation head, then collect fresh PR-gate evidence.
+- [ ] `SP1733-T4` — Owner: verification and handoff owner. Dependencies: SP1733-T1 through SP1733-T3. Covers: B-001 through B-016. Done when: formatting, focused/package/workspace tests, clippy, file-size/manifest/API/call-site audits, current-head independent review, Gemini, and ruleset approval all pass; every #1862 thread and valid #1859 finding is re-evaluated on the exact head. Verification must prove owner exclusivity across target/anchor fork, parent-side ptrace control, wait/reap, and helper spawn, with only the audited target pre-exec `PTRACE_TRACEME` exception; owner-atomic helper registration at every cancellation boundary; owner-side self-pidfd preflight before the capability child; distinct typed no-envelope timeout, cleanup-incomplete, and protocol-invalid paths through post-reap and active/cleanup group-membership checks; 64-member, 65-member, larger, and continuous-churn membership behavior; no in-process blocking worker or negative-PGID signal; anchor exclusion plus typed anchor shutdown failure; static `ET_EXEC` and static-PIE success; direct/env/race-introduced shebang, `PT_INTERP`, W+X `PT_LOAD`, executable `PT_GNU_STACK`, wrong-machine, malformed-header, and non-ELF/binfmt rejection before loader/interpreter execution; missing and surplus `PTRACE_EVENT_EXEC`, abnormal trace transition, and pre-resume deadline each produce no envelope and kill/reap without resume; successful native exec reaches a verified pre-first-instruction ptrace stop, matches hash/image identity under kernel write denial, and cannot gain a write path to executable memory before resume; macOS/other-Unix/Windows fail before cwd observation; retained cwd/target handles survive pathname replacement; repository targets never execute; and Draft 2020-12 versus Draft-07 fixtures preserve their distinct `contentSchema`, dependency, items, and extension semantics. All previous digest vectors, output/executable limits, `ETXTBSY`, cleanup, schema counting, duplicate-key, source binding, annotation, and fail-closed assertions remain unweakened; the call-site audit must prove only the owner invokes target/anchor fork, parent-side ptrace controls, and wait/reap, while only the target's audited pre-exec closure invokes `PTRACE_TRACEME`. The original PR may close GH-1733 only after all gates pass. Verify: run every command and audit in Required Verification on one current implementation head, then collect fresh PR-gate evidence.
       The exact-head matrix must additionally cover: 4,096/4,097-byte base
       locators, 8,259/8,260-byte derived locators, and 2,097,152/2,097,153-byte
       raw envelopes before allocation; raw number forms `1`, `1.0`, `1e0`,
@@ -149,8 +163,9 @@ of silently expanding scope.
       revalidation, handoff, and reap ownership; retained cwd/target descriptors
       and `fchdir`; final-target authorization; `FD_CLOEXEC` shebang rejection;
       ptrace exec-stop/first-instruction ordering and hash/image validation under
-      kernel write denial; post-exec syscall-stop denial of process/image/
-      executable-mapping transitions; retained-handle pre-exec; non-anchor-only signalling
+      kernel write denial; W+X/executable-stack rejection; post-exec
+      syscall-stop denial of process/image/executable-mapping and existing-
+      executable-mutation transitions; retained-handle pre-exec; non-anchor-only signalling
       and typed anchor exit/termination/reap ordering;
       argument/environment pointer ownership; NUL validation; stage-tagged
       errno propagation; released-PGID exclusion; and proof that `ENOEXEC`
@@ -245,9 +260,10 @@ of silently expanding scope.
   This closes hard-link ambiguity but does not claim
   bind-mount alias exclusion. This checkpoint correlation is not
   path-history attestation. A bounded classifier accepts only
-  current-architecture static ELF without `PT_INTERP`; exact leading `#!`,
-  dynamic/malformed ELF, wrong-architecture ELF, and every non-ELF/binfmt
-  format fail
+  current-architecture static ELF without `PT_INTERP` or W+X `PT_LOAD` and
+  with exactly one non-executable `PT_GNU_STACK`; exact leading `#!`, dynamic/writable-executable/
+  executable-stack/malformed ELF, wrong-architecture ELF, and every
+  non-ELF/binfmt format fail
   `interpreter_authorization_unavailable` before any interpreter, anchor, or
   target; a late shebang is blocked by `FD_CLOEXEC` `execveat`. Supported native
   Linux binaries stop at `PTRACE_EVENT_EXEC` before their first instruction and
@@ -288,8 +304,9 @@ of silently expanding scope.
   containment. Cleanup enumerates and revalidates exact non-anchor pidfds and
   signals each individually; it never uses a negative PGID, and the anchor
   exits only after the group is proven empty. Any helper/root/member setup,
-  termination, drain, reap, or verification failure is typed and leaves
-  ownership with the pre-existing owner. Cancellation uses the same owner
+  termination, drain, or reap failure is typed and leaves ownership with the
+  pre-existing owner; membership verification failure is specifically a
+  no-envelope observation error. Cancellation uses the same owner
   without evidence; macOS, other Unix, and Windows record
   `containment_unavailable` before cwd observation.
 - MCP server identity is derived from a typed exact stable configuration-entry

@@ -263,9 +263,11 @@ facts in snapshots or through a CLI.
    magic, `EI_VERSION` and `e_version` `EV_CURRENT`, ELF64 header size 64,
    program-header entry size 56, `ET_EXEC` or `ET_DYN`, a nonzero
    non-extended program-header count below `PN_XNUM`, overflow-safe in-file
-   program-header bounds, and no `PT_INTERP`; other build targets fail the
-   capability gate before observation. Scripts, dynamic or structurally
-   malformed ELF, wrong-machine ELF, and every other format fail
+   program-header bounds, no `PT_INTERP`, no `PT_LOAD` carrying both `PF_W`
+   and `PF_X`, and exactly one non-executable `PT_GNU_STACK`; other build targets fail the
+   capability gate before observation. Scripts, dynamic, writable-executable,
+   executable-stack, or structurally malformed ELF, wrong-machine ELF, and
+   every other format fail
    `interpreter_authorization_unavailable` before anchor creation so neither an
    ELF loader nor `binfmt_misc` interpreter can run. Linux then keeps
    `FD_CLOEXEC` on the retained authorized handle, maps it collision-safely to
@@ -358,8 +360,10 @@ facts in snapshots or through a CLI.
    another key. Because script execution delegates to an interpreter whose own
    target and transitive launch behavior are not bound by the inspected file
    identity, v0.1 accepts only a current-architecture static ELF with no
-   `PT_INTERP`. Exact leading `#!`, dynamic/malformed ELF, and any non-ELF
-   format fail closed with
+   `PT_INTERP` or W+X `PT_LOAD` and with exactly one non-executable
+   `PT_GNU_STACK`. Exact leading
+   `#!`, dynamic/writable-executable/executable-stack/malformed ELF, and any
+   non-ELF format fail closed with
    `version_probe/interpreter_authorization_unavailable` after target
    authorization but before this attempt's target creation. It never invokes a
    interpreter or loader and never searches child `PATH` for one. If accepted
@@ -385,8 +389,8 @@ facts in snapshots or through a CLI.
    and a later bare Unix lookup returns `path_unusable`.
    For an accepted static target, sanitized PATH remains evidence and the sole
    child environment value, but the B-007 post-exec guard prevents it or the
-   retained working directory from selecting any later process image or new
-   executable mapping.
+   retained working directory from selecting any later process image, new
+   executable mapping, or write path to existing executable memory.
 6. **B-006:** Executable identity comes from one opened regular-file handle,
    not separate path-based metadata and content reads. Size and SHA-256 cover
    the bytes read from that handle. Unix first rejects a path already known to
@@ -471,10 +475,12 @@ facts in snapshots or through a CLI.
    under kernel write denial prove that no changed target or interpreter
    instruction ran before validation and that the resumed executable bytes
    equal the recorded digest. Resume occurs only under the B-007 syscall-stop
-   guard: every later process-creation or image-execution syscall, and every
-   request for a new executable mapping, is stopped before kernel execution and
-   fails closed. Thus an allowed static target cannot use PATH, cwd, `dlopen`,
-   or a child process to execute repository/worktree native code.
+   guard: every later process-creation or image-execution syscall, every
+   request for a new executable mapping, and every closed existing-image
+   mutation syscall is stopped before kernel execution and fails closed. Thus
+   an allowed static target cannot use PATH, cwd, `dlopen`, `/proc/self/mem`,
+   asynchronous I/O submission, or a child process to execute
+   repository/worktree code.
 7. **B-007:** A version probe has one lifecycle covering authorization, spawn,
    concurrent stdout/stderr reads, exit, timeout, cleanup, and root reap.
    Authorization is the conjunction of configuration-source policy and opened
@@ -558,7 +564,8 @@ facts in snapshots or through a CLI.
    records `version_probe/timeout`. Cleanup receives its own separate
    five-second deadline.
 
-   Linux v0.1 requires descriptor-table isolation, `pidfd_open`,
+   Linux v0.1 requires descriptor-table isolation, a successful owner-side
+   `pidfd_open(getpid(), 0)` plus `pidfd_send_signal(..., 0)` preflight,
    `pidfd_send_signal`, parent-child ptrace with `PTRACE_O_TRACEEXEC` and
    `PTRACE_O_TRACESYSGOOD`, exact `PTRACE_GET_SYSCALL_INFO` inspection at
    syscall-entry stops, and strong `/proc`
@@ -570,6 +577,13 @@ facts in snapshots or through a CLI.
    The ready owner thread is the sole target/anchor fork,
    parent-side ptrace-control, wait/reap, and observation-helper-spawn owner;
    the target's audited pre-exec `PTRACE_TRACEME` call is the sole exception.
+   Before creating that capability child, the owner performs the self-pidfd
+   preflight without touching cwd or another filesystem path and closes the
+   test pidfd. Any syscall failure is the typed no-envelope
+   `containment_unavailable/pidfd_unavailable`; it can never become a
+   capability-child `child_registration_unavailable`. After a successful
+   preflight, an individual child's later `pidfd_open` resource or registration
+   failure remains `child_registration_unavailable/pidfd_open`.
    The pre-observation capability child is instead traced only by owner-side
    `PTRACE_SEIZE/PTRACE_INTERRUPT`; it never calls `PTRACE_TRACEME`.
    Before every capability/observation/membership helper, anchor, initial
@@ -602,9 +616,21 @@ facts in snapshots or through a CLI.
    After the verified initial `PTRACE_EVENT_EXEC`, the owner resumes only with
    `PTRACE_SYSCALL` and classifies each entry stop before the syscall executes.
    The closed denied classes are `process_creation` (`fork`, `vfork`, `clone`,
-   `clone3`), `image_execution` (`execve`, `execveat`), and
+   `clone3`), `image_execution` (`execve`, `execveat`),
    `executable_mapping` (`mmap`/`mmap2`/`mprotect`/`pkey_mprotect` requesting
-   `PROT_EXEC`, or `shmat` requesting `SHM_EXEC`). A denied entry is never
+   `PROT_EXEC`, or `shmat` requesting `SHM_EXEC`), and
+   `executable_image_mutation`. The last class covers `ptrace`,
+   `process_vm_writev`, `userfaultfd`, `io_uring_setup`, `pidfd_getfd`,
+   `recvmsg`, `recvmmsg`, `prctl`, every non-query `personality`, `creat`, and
+   `open`/`openat`/`open_by_handle_at`/`openat2` whose decoded flags request
+   `O_WRONLY`, `O_RDWR`, or `O_TRUNC`; an unreadable or noncanonical
+   `openat2` `open_how` is execution-verification unavailable rather than
+   allowed. Because the frozen target descriptor table contains no pre-opened
+   writable memory fd or Unix socket, this blocks `/proc/self/mem` and alias
+   write-open paths, received `SCM_RIGHTS`, remote-fd duplication,
+   external-ptrace authorization, and `READ_IMPLIES_EXEC` changes without
+   trusting pathname inspection. The sole allowed `personality` form is the
+   side-effect-free exact `0xffff_ffff` query. A denied entry is never
    executed: the owner records `version_probe/transitive_execution_denied` with
    only that closed class and starts exact stopped-target cleanup.
    Termination/reap failure is represented independently by the normative
@@ -674,10 +700,13 @@ facts in snapshots or through a CLI.
    root reap where still needed, and anchored membership verification under one
    fixed five-second monotonic cleanup deadline. If all
    complete, only the triggering probe failure is recorded. If signalling,
-   drain, reap, or verification fails or the deadline expires, the applicable
-   closed `lifecycle_cleanup` failure is also recorded, read handles are closed,
-   and the already-reserved runtime-independent cleanup owner retains sole
-   ownership before the API returns. That owner emits an `error`, retains
+   drain, or reap fails or the deadline expires during one of those operations,
+   the applicable closed `lifecycle_cleanup` failure is also recorded, read
+   handles are closed, and the already-reserved runtime-independent cleanup
+   owner retains sole ownership before the API returns. Membership-verification
+   timeout, cleanup-incomplete, malformed response, or unexpected helper exit
+   instead returns its closed no-envelope observation error with the same
+   retained ownership. That owner emits an `error`, retains
    ownership, and continues exact-pidfd signalling, reaping, and original-group
    verification; it never silently abandons a child. The separate producer
    error path gives the same ownership guarantee for observation helpers. A
@@ -923,8 +952,10 @@ The table order below is normative. Phase ranks are `path_resolution = 0`,
 `identity = 1`, `version_probe = 2`, and `lifecycle_cleanup = 3`; within each
 phase, kind rank is the zero-based row order shown. Producers serialize failures
 by `(phase_rank, kind_rank)` and parsers reject any other order. Thus concurrent
-cleanup failures are always `termination_failed`, `reap_failed`,
-`output_drain_failed`, then `group_verification_failed` when present.
+cleanup failures are always `termination_failed`, `reap_failed`, then
+`output_drain_failed` when present. Membership-verification failures are the
+typed no-envelope observation errors defined in B-006 and never enter this
+list.
 
 | Phase | Kind | Meaning |
 | --- | --- | --- |
@@ -940,11 +971,11 @@ cleanup failures are always `termination_failed`, `reap_failed`,
 | `identity` | `identity_changed` | Path strong identity, retained-handle size/content digest, or an already observed link count changed across checkpoints. |
 | `version_probe` | `probe_not_authorized` | Configuration-source or resolved-target repository policy forbids executing this inspected target; the closed reason identifies which and no child was started. |
 | `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary or could not prove single-link ownership; the closed reason is `boundary_unprovable`, `link_count_unprovable`, `unlinked_target`, or `multiple_hard_links`. No target instruction ran. Initial/pre-spawn failure permits no target exec; retry failure requires exactly one prior retained-handle exec returning `ETXTBSY`, that helper reaped, and no second helper or exec. |
-| `version_probe` | `interpreter_authorization_unavailable` | The retained executable was not a current-architecture static ELF without `PT_INTERP`, or exact retained-handle exec-time `ENOENT`/`ENOTDIR` showed that a late interpreter contract could not be satisfied. No target, loader, or interpreter instruction ran; a late-race setup helper is reaped. |
+| `version_probe` | `interpreter_authorization_unavailable` | The retained executable was not a current-architecture static ELF without `PT_INTERP` or W+X `PT_LOAD` and with exactly one non-executable `PT_GNU_STACK`, or exact retained-handle exec-time `ENOENT`/`ENOTDIR` showed that a late interpreter contract could not be satisfied. No target, loader, or interpreter instruction ran; a late-race setup helper is reaped. |
 | `version_probe` | `handle_execution_unavailable` | Mandatory ptrace containment passed, but the candidate's fully frozen fd-10 `execveat(AT_EMPTY_PATH)` returned exact `ENOSYS`, `EPERM`, or `EINVAL`; every created target helper was reaped and no target instruction ran. |
 | `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join, working-directory entry, or pre-exec ptrace stop/options setup failed; the closed setup stage identifies which, every created helper was reaped, and target handle exec was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
-| `version_probe` | `transitive_execution_denied` | After the verified initial static image began under syscall-stop supervision, it attempted closed class `process_creation`, `image_execution`, or `executable_mapping`; the denied syscall never executed, stopped-target cleanup began, cleanup outcome is independent, and no version fact was emitted. |
+| `version_probe` | `transitive_execution_denied` | After the verified initial static image began under syscall-stop supervision, it attempted closed class `process_creation`, `image_execution`, `executable_mapping`, or `executable_image_mutation`; the denied syscall never executed, stopped-target cleanup began, cleanup outcome is independent, and no version fact was emitted. |
 | `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
 | `version_probe` | `lingering_process_group` | The root exited but a non-anchor member remained in the anchored Unix process group; version success was suppressed and cleanup started. |
 | `version_probe` | `timeout` | The probe deadline expired; cleanup outcome is represented independently. |
@@ -959,7 +990,6 @@ cleanup failures are always `termination_failed`, `reap_failed`,
 | `lifecycle_cleanup` | `termination_failed` | Signalling an exact root, non-anchor member, or post-empty-group anchor pidfd failed before cleanup ownership was transferred. Observation-helper failures are producer errors and never enter an envelope. |
 | `lifecycle_cleanup` | `reap_failed` | Root or anchor reap failed or was not verified before cleanup ownership was transferred. Observation-helper failures are producer errors and never enter an envelope. |
 | `lifecycle_cleanup` | `output_drain_failed` | Bounded drain did not complete before read handles were closed and ownership was transferred. |
-| `lifecycle_cleanup` | `group_verification_failed` | The owner could not verify that only its live anchor remained before ownership was retained; this never represents the whole descendant tree. |
 
 ### Unix Bare-Name Attempt Vocabulary
 
@@ -1152,11 +1182,24 @@ terminal `exec_failed`.
       controller, wait/reap, and observation-helper-spawn authority; the
       target pre-exec closure's audited `PTRACE_TRACEME` is the sole exception.
       After verified initial exec, syscall-entry fixtures prove `fork`, `vfork`,
-      `clone`, `clone3`, `execve`, `execveat`, executable `mmap`/`mprotect`, and
-      executable `shmat` are stopped before kernel execution, yield the exact
-      closed transitive-denial class, execute no second-image/child/mapping
-      marker, and suppress version. Missing/untagged/unreadable syscall stops
-      return no envelope and cleanup the target.
+      `clone`, `clone3`, `execve`, `execveat`, executable `mmap`/`mprotect`,
+      executable `shmat`, `ptrace`, `process_vm_writev`, `userfaultfd`,
+      `io_uring_setup`, `pidfd_getfd`, `recvmsg`/`recvmmsg`, `prctl`,
+      non-query `personality`, and write-capable/truncating open-family requests are
+      stopped before kernel execution, yield the exact closed
+      transitive-denial class, execute no second-image/child/mapping/mutation
+      marker, and suppress version. Exact `/proc/self/mem`, thread-self,
+      numeric-pid, and mount-alias write opens are denied without pathname
+      parsing; read-only opens remain legal. Received `SCM_RIGHTS`, remote-fd
+      duplication, external-ptrace authorization, and both mmap and mprotect
+      `READ_IMPLIES_EXEC` attempts are denied. The exact
+      `personality(0xffff_ffff)` query is resumed, returns through the ordinary
+      entry/exit trace transition, and does not produce denial evidence; every
+      other argument is denied. Exact and extended `openat2`
+      payloads are decoded, while short, unreadable, unknown-tail, and
+      unknown/conflicting-flag payloads return no-envelope execution
+      verification failure. Missing/untagged/unreadable syscall stops return no
+      envelope and cleanup the target.
       A static aux-vector fixture proves each direct-exec attempt records
       `linux_fd_cloexec_execveat_empty_path_fd_10`, observes exact
       `AT_EXECFN = "/dev/fd/10"`, cannot reopen fd 10 after exec, and does not
@@ -1164,8 +1207,9 @@ terminal `exec_failed`.
       `EACCES` followed by a second-candidate pre-anchor classifier rejection
       preserves both attempt records and applies the no-child invariant only
       to the second attempt. It also proves the pre-existing probe anchor exits
-      and is reaped; injected group-verification, termination, and reap failures
-      append independent lifecycle-cleanup evidence and retain ownership.
+      and is reaped; injected termination and reap failures append independent
+      lifecycle-cleanup evidence and retain ownership, while membership-helper
+      timeout/protocol failure returns its typed no-envelope observation error.
       The owner opens the
       declared child directory once, fixed working-directory spelling/identity
       digests enter the payload, both initial and retry helpers `fchdir` that
@@ -1177,8 +1221,9 @@ terminal `exec_failed`.
 - [ ] Linux executable-format fixtures prove static `ET_EXEC` and static-PIE
       `ET_DYN` success for the exact native machine tuple. Direct and
       `#!/usr/bin/env` shebangs, `PT_INTERP`, same-class/endianness
-      wrong-machine ELF, wrong header version/size, extended or out-of-bounds
-      program headers, and non-ELF/binfmt inputs yield
+      wrong-machine ELF, wrong header version/size, W+X `PT_LOAD`, missing,
+      duplicate, or executable `PT_GNU_STACK`, extended or out-of-bounds program headers, and
+      non-ELF/binfmt inputs yield
       `interpreter_authorization_unavailable` before anchor, target, loader, or
       interpreter creation. Neither sanitized `PATH` nor a setup-only secret
       named `NPM_ACCESS` can select or reach an interpreter. A supported static
@@ -1247,11 +1292,12 @@ terminal `exec_failed`.
       checkpoint, while the separate cleanup deadline starts at failure;
       ordinary supported-Linux cleanup finishes helper/root/anchored-group
       handling within five seconds; injected
-      initial and post-`ETXTBSY` group-join, termination, reap, drain, and
-      group-verification
+      initial and post-`ETXTBSY` group-join, termination, reap, and drain
       failures, including post-empty-group anchor termination/reap failure,
-      produce canonical `lifecycle_cleanup` evidence and transfer
-      ownership without a version; an escaped `setsid` pipe holder cannot yield
+      produce canonical `lifecycle_cleanup` evidence and transfer ownership
+      without a version; membership verification timeout/protocol failure
+      instead returns the closed no-envelope observation error; an escaped
+      `setsid` pipe holder cannot yield
       whole-tree-empty evidence or block the API past the cleanup deadline;
       a zero-exit child that leaves a same-group marker process records
       `lingering_process_group`, suppresses version success, and runs the same
@@ -1275,7 +1321,10 @@ terminal `exec_failed`.
       `/proc/<pid>/fd` at `DESCRIPTORS_READY` and find exactly the role allowlist;
       foreign-fd markers prove a stalled helper retains no other owner's gate,
       output, or control fd and cannot delay its EOF or bounded rollback.
-      Start-gate fault injection covers every observation stage, anchor, initial
+      Owner-side self-pidfd fixtures cover successful preflight and each
+      `pidfd_open`/signal-zero failure, prove the test descriptor closes, and
+      require `pidfd_unavailable` before the capability-child fork or cwd
+      observation. Start-gate fault injection covers every observation stage, anchor, initial
       target, and retry target: bootstrap unavailable, post-capability isolation
       failure, missing READY until deadline, cancellation, and forced
       `pidfd_open`/registry/gate-release failure. None runs a child marker or
@@ -1286,8 +1335,8 @@ terminal `exec_failed`.
       registration stage.
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
       sanitized bounded facts, rejection of unknown values, and a fixed vector
-      that orders simultaneous cleanup kinds as termination, reap, output-drain,
-      then group-verification regardless of observation order.
+      that orders simultaneous cleanup kinds as termination, reap, then
+      output-drain regardless of observation order.
 - [ ] Version fixtures cover exact current Codex and Claude product lines,
       stdout/stderr selection, prerelease/build case preservation, CRLF/LF,
       rejected `v`/`V`, leading/trailing text, extra dependency versions,
