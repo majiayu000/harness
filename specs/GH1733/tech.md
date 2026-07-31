@@ -63,7 +63,7 @@ Keep the public modules `harness_core::stack::fingerprint` and
 before adding the remediation:
 
 - `stack/fingerprint.rs` is the public facade for envelope construction,
-  parsing, validation, and canonical payload digesting.
+  parsing, validation, and canonical fingerprint hashing.
 - `stack/fingerprint/model.rs` owns the closed subjects, payloads, runtime
   kinds, environment facts, version facts, failure vocabulary, and typed
   errors.
@@ -99,6 +99,7 @@ AgentStackFingerprintEnvelope
   subject: AgentRuntime | McpTool
   component: AgentStackComponent
   payload: RuntimeExecutableFingerprintPayload | McpToolFingerprintPayload
+  fingerprint_digest: Sha256Digest
 ```
 
 The payload variants have fixed inner schema versions
@@ -116,7 +117,10 @@ failure, then validates, in order:
 3. the ASC-001 component, subject/kind agreement, and an empty capability list;
 4. exact B-003 observation, trust, selection, and freshness values;
 5. payload-local ordering and impossible-state invariants; and
-6. component integrity equality with the recomputed canonical payload digest.
+6. ASC-001 integrity wire shape, plus the subject-specific invariant that a
+   derived MCP tool component has no integrity; and
+7. equality between `fingerprint_digest` and the recomputed canonical
+   fingerprint digest.
 
 An `agent_runtime` envelope cannot contain an MCP payload, and vice versa.
 Constructors always emit an empty component capability list, and parsing
@@ -126,12 +130,17 @@ Expected probe failures are valid runtime envelopes only when their failure and
 missing-fact matrix is valid. Invalid producer input returns a typed error and
 does not construct an envelope. This implements B-001, B-014, and B-015.
 
-Canonical payload hashing uses a domain-separated object containing the exact
-inner schema version and every typed payload field. JSON object keys are sorted
-lexicographically and typed collections use their specified stable order. The
-hash excludes the outer component, observation timestamp, run identity, raw
-diagnostics, and secret values. The resulting `Sha256Digest` is installed as
-the component integrity only after validation, avoiding self-reference.
+Canonical fingerprint hashing uses a domain-separated object containing the
+exact subject, inner schema version, and every typed payload field. JSON object
+keys are sorted lexicographically and typed collections use their specified
+stable order. The hash excludes the outer component, observation timestamp, run
+identity, raw diagnostics, and secret values. The resulting `Sha256Digest` is
+stored only in `fingerprint_digest`. It never replaces ASC-001 component
+integrity, which remains evidence about exact component source bytes or is
+absent. The envelope parser cannot attest which bytes a producer hashed because
+wire input carries no source bytes; exact-byte correspondence is established
+only by typed producer construction and its tests. This avoids self-reference
+while preserving the two distinct claims.
 
 ## Closed Local Runtime Identity
 
@@ -144,11 +153,18 @@ Add a closed `LocalExecutableRuntimeKind` with exactly:
 | `claude_code` | `--version` | `<VERSION> (Claude Code)` |
 
 The public configured-runtime constructor takes this enum, a validated
-`AgentStackSource`, and exactly one `PathBuf`. It has no arbitrary `new(String,
-...)`, arbitrary argument vector, shell string, alias parser, or pre-encoding
-hook. `anthropic_api` and `remote_host` have no conversion. Fixed version
-arguments and output grammars are private data derived exhaustively from the
-enum.
+`ConfiguredRuntimeSource`, the existing
+`harness_core::config::isolation::IsolationTier`, and exactly one `PathBuf`.
+An exhaustive match accepts only `Host`; `Container` and `Microvm` return a
+typed producer-input error before PATH resolution, file access, or process
+creation.
+Their configured CLI path names a command inside another execution boundary,
+not the host executable that would actually be launched, so host
+fingerprinting would be false evidence. The constructor has no arbitrary
+`new(String, ...)`, arbitrary argument vector, shell string, alias parser, or
+pre-encoding hook. `anthropic_api` and `remote_host` have no conversion. Fixed
+version arguments and output grammars are private data derived exhaustively
+from the enum, and successful v0.1 payloads record `execution_isolation: host`.
 
 `configured_runtime_executables_from_agents_config` produces the two distinct
 Codex roles and the Claude role with explicit persisted source bindings. It
@@ -169,23 +185,36 @@ direction, adds no runtime consumer, and covers B-002 and B-016.
 
 Observation and ownership remain separate at both producer boundaries.
 
-For runtimes, `ConfiguredRuntimeExecutable` retains its caller-supplied
-validated source verbatim. The emitted component is `agent_runtime` with that
-source. For MCP tools, the constructor accepts an existing validated
-`mcp_server` component, a separately validated stable tool source, the exact
-advertised tool name, optional exact description, and input schema. It requires
-the server and tool ownership scopes to agree and derives the tool component ID
-only through `AgentStackComponentId::from_source(McpTool, tool_source)`.
-Server identity in the payload is the exact validated server component ID, not
-an arbitrary display string.
+For runtimes, a closed `ConfiguredRuntimeSource` retains the caller's validated
+`AgentStackSource` plus optional exact source bytes. Its constructors are
+`without_canonical_bytes(source)` and `from_exact_source_bytes(source, bytes)`;
+the latter computes ASC-001 integrity internally, and there is no bare-digest
+setter. `ConfiguredRuntimeExecutable` emits an `agent_runtime` component with
+that source and either the exact-byte integrity or absence. Executable and
+payload digests never overwrite it. For MCP tools, the constructor accepts an
+existing validated `mcp_server` component, the exact advertised tool name,
+optional exact description, and raw input-schema JSON. It accepts no separate
+tool source.
+
+A private typed `McpToolSource::derive` mapping preserves the server source
+scope and appends
+`harness_mcp_tool_v0_1/u<byte_length>_<lowercase_utf8_hex>` to the server
+locator. The exact UTF-8 byte length and lowercase hexadecimal bytes make the
+mapping reversible, injective, case-sensitive, and distinct for every tool on
+one server. Callers cannot provide or pre-encode this locator. Server identity
+in the payload is the exact validated server component ID, not an arbitrary
+display string. Because this binding is derived structured identity rather
+than canonical raw source bytes, the tool component integrity is absent.
 
 Both components use `runner_observed`, `runner_observed`, `observed`, and
-`fresh`, while retaining the supplied scope and locator. Blank tool names,
-wrong server kind, mismatched or untyped ownership, UUID/display/per-observation
-source locators, and duplicate component identity fail before hashing. No
-`stable_logical_segment` or equivalent encoder may turn invalid input into a
-valid source. Fixtures cover every ASC-001 source scope and freeze the component
-ID before and after runner observation. This implements B-003 and B-011.
+`fresh`, while retaining the supplied or derived scope and locator. Blank tool
+names, wrong server kind, generated per-observation server identity,
+UUID/display ownership, malformed derived locators, caller-supplied encodings,
+and duplicate component identity fail before hashing. No
+`stable_logical_segment` or caller-facing encoder may turn invalid input into a
+valid source. Fixtures cover every ASC-001 source scope, multiple exact tool
+names on one server, and component IDs before and after runner observation.
+This implements B-003 and B-011.
 
 Tool name and description are copied as exact UTF-8 strings. The producer does
 not call `trim`, `split_whitespace`, Unicode normalization, case conversion, or
@@ -199,6 +228,12 @@ Rust toolchain behavior used by the adapter. The input carries a typed
 `RuntimeLaunchContext`: platform, configured child working directory,
 sanitized child `PATH`, and every platform search base that the resolver needs
 but must not infer.
+
+The first operation exhaustively matches the existing `IsolationTier`. Any
+non-host tier returns its typed producer-input error before the resolver
+observes PATH or other launch context, opens a file, or attempts a process.
+This ordering is a tested privacy and evidence boundary, not merely an
+unsupported branch later in the probe.
 
 On Unix:
 
@@ -288,29 +323,45 @@ Path, mtime, extension, or a weaker optional metadata field is not a fallback.
 If the opened handle cannot provide the specified strong identity, the producer
 records `identity/metadata_unavailable` before version attribution.
 `path_unusable` remains exclusive to resolution. Immediately before spawn and
-again after the child is reaped, the producer opens the resolved path and
-compares that identity with the retained handle. A symlink is identified by the
-opened target, not by mixing link metadata with target bytes.
+again after the child is reaped, one blocking checkpoint re-reads and re-hashes
+the retained handle and opens the resolved path to compare strong identity.
+All three retained-handle size and digest observations must match, and both
+later path identities must equal the retained handle. A symlink is identified
+by the opened target, not by mixing link metadata with target bytes.
 
-If either comparison fails or the identity changes, the envelope records
+If any size, digest, or strong-identity comparison fails, the envelope records
 `identity/identity_changed`, emits no version fact, and does not associate the
 version output with the inspected executable digest. A pre-spawn mismatch
-prevents the probe; a post-spawn mismatch discards the candidate version. The
-record may retain only facts explicitly identified as coming from the opened
-handle. It cannot claim that pathname execution is race-free: the checks are a
-TOCTOU detector and provenance boundary, not cryptographic attestation. This
-implements B-006 and its non-goal.
+prevents the probe; a post-reap mismatch discards the candidate version. The
+successful correlation is explicitly named `checkpoint_consistent_path`. It
+cannot claim pathname execution is race-free or that the executed bytes equal
+the digest: mutation and restoration entirely between checkpoints remains a
+residual TOCTOU gap. This implements B-006 and its non-goal.
 
 ## Supervised Version Probe
 
-`probe.rs` reuses and tightens the crate's `ManagedChild` supervision instead
-of introducing an unmanaged child type. On Unix the command has null stdin,
-piped stdout/stderr, `kill_on_drop(true)`, and a dedicated process group created
-before exec. Every explicit termination path signals the negative process-group
-ID, awaits the root child, and verifies the group is empty. Drop/cancellation
-must synchronously signal the process group before handing root reaping and
-group-drain verification to an owned cleanup task; root-only `kill_on_drop` is
+`probe.rs` owns a fingerprint-specific `RuntimeFingerprintProbeSupervisor`
+instead of treating the existing `ManagedChild` drop path as completion
+evidence. On Unix the command has null stdin, piped stdout/stderr, and a
+dedicated process group created before exec. The supervisor owns the lifecycle
+before spawn. Every explicit timeout, overflow, read-error, or failure return
+signals the negative process-group ID, drains both pipes, awaits the root child,
+and verifies the group is empty before returning; root-only `kill_on_drop` is
 not counted as containment.
+
+Caller cancellation synchronously signals the process group and transfers the
+root handle and group verification to a fingerprint-specific,
+runtime-independent cleanup owner. The owner must survive immediate shutdown
+of the Tokio runtime that hosted the cancelled future. A private nonzero
+`RUNTIME_FINGERPRINT_CLEANUP_DEADLINE` is fixed at five seconds and measured
+from cancellation with a monotonic clock. Reaping the root and observing an
+empty group within that deadline is normal completion. If the deadline expires,
+the owner emits an `error`, keeps ownership, and continues signalling,
+reaping, and group-empty verification until cleanup completes; it never
+detaches or silently abandons the child. Cancellation emits no envelope. If
+transferring to the cleanup thread fails, the drop path performs synchronous
+blocking termination and reap. Tests cannot use the existing detached Tokio
+`ManagedChild` reaper as proof of completion.
 
 The current non-Unix `ManagedChild` has no descendant containment. Windows v0.1
 therefore records `version_probe/containment_unavailable` before spawning and
@@ -321,14 +372,16 @@ then resume, which is outside this packet. A later schema revision may authorize
 that surface.
 
 The collector reads both pipes concurrently in fixed-size chunks while one
-counter enforces `max_output_bytes` across both buffers. It never calls
-`Command::output` or `wait_with_output`. If the next bytes would cross the
-combined limit, a bounded prefix only is retained for diagnostics outside the
-canonical payload, the process group is terminated, both pipes are drained to
-EOF after termination, and the root child is awaited. Timeout and read-error
-paths use the same terminate/drain/wait sequence. Root exit is not completion
-until both pipes close and remaining descendants covered by the process group
-are cleaned up. No lifecycle failure can produce a version fact.
+counter enforces an inclusive `max_output_bytes` across both buffers. It reads
+at most the remaining capacity plus one sentinel byte and never calls
+`Command::output` or `wait_with_output`. Exactly the configured maximum is
+legal; observing byte `max_output_bytes + 1` records
+`output_limit_exceeded`. A bounded prefix only is retained for diagnostics
+outside the canonical payload, the process group is terminated, both pipes are
+drained to EOF after termination, and the root child is awaited. Timeout and
+read-error paths use the same terminate/drain/wait sequence. Root exit is not
+completion until both pipes close and remaining descendants covered by the
+process group are cleaned up. No lifecycle failure can produce a version fact.
 
 The canonical failure record contains only closed enums and compatible bounded
 details: an exit code, byte limit, or timeout milliseconds where applicable.
@@ -347,6 +400,7 @@ The result-state matrix is fail closed:
 | containment unavailable | stable identity may remain; no child was spawned and version is absent |
 | spawn/lifecycle/exit/output failure | stable identity may remain; version is absent |
 | `identity_changed` after exit | candidate output/version is discarded |
+| caller cancellation | no envelope; deadline-governed cleanup ownership survives Tokio shutdown and is never abandoned |
 | success | stable identity, zero exit, two exact output digests, selected stream, one normalized version, and no failures |
 
 This implements B-007, B-008, and B-015.
@@ -367,23 +421,32 @@ and suffix case are retained. A leading `v`/`V`, surrounding whitespace, extra
 line, dependency/runtime suffix, or partial token match is rejected rather than
 guessed.
 
-Exactly one stream may contain the matching product line and the other must be
-ASCII blank. Matching product lines on both streams with different versions
-yield `ambiguous_version`; a blank pair yields `empty_output`; any other
-nonblank shape yields `unparseable_version`; invalid UTF-8 yields
-`invalid_utf8`. Nonzero and signal exits are not parsed into success. The
-payload records the selected stream plus both exact digests only on success.
-Changing a product output grammar requires a new schema grammar revision, not
-a heuristic first-token fallback. This implements B-009.
+Both complete streams are parsed independently before selection:
+
+| Stdout | Stderr | Result |
+| --- | --- | --- |
+| matching product line | ASCII blank | select stdout |
+| ASCII blank | matching product line | select stderr |
+| matching product line | matching product line | `ambiguous_version`, even when the version text is equal |
+| matching product line | nonblank invalid | `unparseable_version` |
+| nonblank invalid | matching product line | `unparseable_version` |
+| ASCII blank | ASCII blank | `empty_output` |
+| any other nonblank combination | any | `unparseable_version` |
+
+Invalid UTF-8 yields `invalid_utf8`. Nonzero and signal exits are not parsed
+into success. The payload records the selected stream plus both exact digests
+only on success. Changing a product output grammar requires a new schema
+grammar revision, not a heuristic first-token fallback. This implements B-009.
 
 ## Context-Aware MCP Schema Canonicalization
 
-`McpInputSchema::from_json_str` uses a duplicate-detecting serde visitor rather
-than first decoding to `serde_json::Value`, because the latter can overwrite an
-earlier duplicate key. Malformed JSON and duplicate-object-key errors remain
-typed and occur before canonicalization or digesting. `from_serializable`
-starts from an already typed Rust value and shares the same canonical state
-machine after serialization.
+`McpInputSchema` exposes only `from_json_str` and `from_json_slice`. Both start
+from raw JSON and use a duplicate-detecting serde visitor rather than first
+decoding to `serde_json::Value`, because the latter can overwrite an earlier
+duplicate key. Malformed JSON and duplicate-object-key errors remain typed and
+occur before canonicalization or digesting. There is no public
+`from_serializable`, `serde_json::Value`, or typed-map evidence constructor:
+after ordinary decoding, original duplicate-key absence cannot be attested.
 
 The private state machine has these contexts:
 
@@ -427,24 +490,28 @@ owns user-facing collection commands. This is B-016.
 
 | Product behavior | Required verification |
 | --- | --- |
-| B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_integrity_mismatch`; `payload_digest_is_canonical_and_component_free` |
-| B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
-| B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `mcp_tool_requires_typed_matching_server_and_tool_ownership` |
+| B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch`; `fingerprint_digest_is_separate_from_component_integrity`; `failure_payload_changes_fingerprint_digest_without_fabricating_integrity`; `component_integrity_preserves_exact_source_bytes_or_absence` |
+| B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
+| B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `caller_cannot_supply_preencoded_mcp_tool_source` |
 | B-004 | Unix `bare_path_resolution_uses_child_cwd_and_first_path_candidate`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable`; `resolver_spawns_only_the_selected_absolute_path` |
 | B-005, B-010 | `setup_secret_env_is_absent_from_probe_and_facts`; `typed_runtime_environment_records_set_unset_digest_and_redacted`; `environment_rejects_duplicates_invalid_keys_and_setup_conflicts` |
-| B-006 | `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed` |
-| B-007 | Unix `timeout_kills_reaps_and_drains_probe_group`; `cancellation_signals_group_before_owned_reap`; `dual_stream_limit_is_combined_and_bounded`; Windows `containment_unavailable_prevents_spawn` |
+| B-006 | `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
+| B-007 | Unix `explicit_timeout_awaits_group_reap`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_terminates_and_reaps`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; Windows `containment_unavailable_prevents_spawn` |
 | B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
-| B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
+| B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `both_streams_are_parsed_before_selection`; `same_version_on_both_streams_is_ambiguous`; `valid_version_with_nonblank_other_stream_is_unparseable`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions` |
-| B-013 | `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `duplicate_json_keys_fail_before_digest` |
+| B-013 | `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `raw_schema_rejects_duplicate_keys`; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
 
 All failure tests assert the absence of a version fact and the absence of raw
 path, PATH, output, environment, and OS-diagnostic text from serialized
-evidence. Lifecycle tests retain child PIDs/process-group IDs and verify that
-they are gone after the API returns. PATH tests create multiple same-basename
-candidates, a directory containing spaces, and literal shell metacharacters.
+evidence. Explicit lifecycle-result tests retain child PIDs/process-group IDs
+and verify that they are gone when the API returns. Cancellation tests drop the
+hosting Tokio runtime immediately, then verify root reap and group emptiness
+within the same five-second cleanup deadline. A separate injected slow-cleanup
+fixture proves deadline expiry emits an error, retains ownership, and continues
+cleanup. PATH tests create multiple same-basename candidates, a directory
+containing spaces, and literal shell metacharacters.
 The qualified `/usr/bin/env`-style child-execution fixture is Unix-only;
 Windows tests stop before spawn with `containment_unavailable`. Schema expected
 digests are fixed independent vectors rather than values generated by the

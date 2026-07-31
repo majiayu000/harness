@@ -64,7 +64,10 @@ facts in snapshots or through a CLI.
    `runtime-executable-fingerprint/v0.1`; the MCP payload declares
    `mcp-tool-fingerprint/v0.1`. Public serialization and parsing consume this
    envelope, reject missing or unknown versions, subjects, and fields, and
-   cannot pair a subject with the other payload type. The v0.1 component
+   cannot pair a subject with the other payload type. Each envelope also has a
+   required `fingerprint_digest` over its versioned subject and canonical
+   payload. This digest is separate from ASC-001 `component.integrity`, whose
+   meaning remains SHA-256 of exact source bytes or absence. The v0.1 component
    capability list is always empty because this evidence does not infer
    capabilities; constructors emit an empty list and parsers reject a nonempty
    one. No exported schema constant exists without a corresponding wire field
@@ -81,6 +84,10 @@ facts in snapshots or through a CLI.
    public command vector. The same mapping owns a whole-output version grammar:
    both Codex kinds accept only `codex-cli <VERSION>`, and Claude Code accepts
    only `<VERSION> (Claude Code)`, apart from one optional final line ending.
+   Runtime producer input also carries a closed execution isolation value. v0.1
+   accepts only `host`; `container` and `microvm` fail typed before PATH
+   resolution, file access, or process creation because their configured CLI
+   path does not identify the host executable actually launched.
 3. **B-003:** Every producer accepts or derives a validated ASC-001 source from
    persisted ownership information. Repository-, user-global-, admin-, system-,
    and runtime-owned runtime or MCP components retain that source scope and
@@ -126,30 +133,41 @@ facts in snapshots or through a CLI.
    successful contained spawn. On a platform where contained spawn is
    available, a bad image or access error is `spawn_failed`, not a fabricated
    `not_executable`; Windows v0.1 reaches `containment_unavailable` before that
-   attempt. The producer enforces the configured byte
-   ceiling before and during reading, performs potentially blocking file
-   hashing outside the async executor, and does not allocate the declared
-   maximum eagerly. Before spawn and after child completion it checks that the
-   resolved path still identifies the opened file using device/inode on Unix
-   or volume serial plus 128-bit file ID on Windows. If that strong identity is
-   unavailable, observation fails typed rather than falling back to path,
-   timestamps, extension, or a parsed PE header. A detected replacement or an
-   inability to link version output to the inspected identity is explicit;
-   version facts are not attributed to the digest. This is local observation,
-   not a claim that path execution is race-free or cryptographically attested.
+   attempt. The producer enforces the configured byte ceiling before and during
+   reading, performs potentially blocking file hashing outside the async
+   executor, and does not allocate the declared maximum eagerly. The retained
+   handle is re-read and re-hashed immediately before spawn and after the child
+   is reaped; all three size and digest observations must match. At both later
+   checkpoints the resolved path must still identify that handle using
+   device/inode on Unix or volume serial plus 128-bit file ID on Windows. If
+   strong identity is unavailable, observation fails typed rather than falling
+   back to path, timestamps, extension, or a parsed PE header. Replacement,
+   in-place content change, or inability to correlate version output with the
+   inspected checkpoints emits `identity_changed` and discards version
+   evidence. The correlation is named `checkpoint_consistent_path`: mutation
+   and restoration entirely between checkpoints remains a residual TOCTOU gap,
+   so it is not proof that the executed bytes equal the digest.
 7. **B-007:** A version probe has one lifecycle covering spawn, concurrent
    stdout/stderr reads, exit, timeout, and reap. Stdout and stderr are drained
-   incrementally under one hard combined byte limit. The producer spawns only
+   incrementally under one inclusive hard combined byte limit: exactly
+   `max_output_bytes` is allowed, while observing byte `max_output_bytes + 1`
+   terminates the probe with `output_limit_exceeded`. The producer spawns only
    after descendant containment is established: a dedicated process group on
    Unix, or an equivalent pre-spawn containment primitive on another platform.
-   Reaching the output limit, reaching the timeout, dropping/cancelling the
-   future, or encountering a read failure terminates the containment unit,
-   reaps the root, and verifies that the unit is empty. `kill_on_drop` of only
-   the root is not sufficient evidence. On Windows v0.1, where the existing
-   launcher cannot atomically assign a Job Object before execution, the
-   producer records `containment_unavailable` without spawning. Output is never
-   fully buffered and then truncated. Limit, timeout, or containment evidence
-   contains no success-shaped version fact.
+   Explicit timeout, overflow, or read-failure returns await containment
+   termination, root reap, and empty-unit verification. Caller cancellation
+   synchronously signals the containment unit and transfers child ownership to
+   a fingerprint-specific cleanup owner that does not depend on the cancelled
+   future or Tokio runtime. The owner uses a fixed five-second cleanup
+   verification deadline. Root reap plus empty containment within that deadline
+   is normal completion; crossing it emits an `error`, retains ownership, and
+   continues kill/reap/empty-unit verification rather than silently abandoning
+   the child. Cancellation emits no fingerprint. `kill_on_drop` of only the
+   root and the existing detached `ManagedChild` reaper are not completion
+   evidence. On Windows v0.1, where the existing launcher cannot atomically
+   assign a Job Object before execution, the producer records
+   `containment_unavailable` without spawning. Output is never fully buffered
+   and then truncated.
 8. **B-008:** Probe incompleteness is represented by closed typed phase and
    kind values, not caller-defined strings. The v0.1 vocabulary is the table
    below. A failure record contains bounded, redacted structured facts only,
@@ -162,14 +180,14 @@ facts in snapshots or through a CLI.
    three numeric core components, no invalid leading zero, and optional
    prerelease/build suffix; its byte spelling and suffix case are preserved.
    No leading `v`/`V`, token scan, first-token fallback, dependency-version
-   filter, surrounding whitespace, or extra nonblank line is accepted. Exactly
-   one of stdout or stderr may contain the matching product line and the other
-   must be ASCII blank; two matching streams with different versions record
-   `ambiguous_version`. The exact bounded stdout and stderr byte digests and
-   selected stream are retained. Successful but blank output records
-   `empty_output`; nonblank output that does not fully match records
-   `unparseable_version`. None may yield `failures = []` or fabricate a
-   normalized value.
+   filter, surrounding whitespace, or extra nonblank line is accepted. Both
+   complete bounded streams are parsed independently before stream selection.
+   Exactly one may match while the other is ASCII blank. Two matching streams,
+   even with the same version, are `ambiguous_version`; one match plus nonblank
+   invalid output or any other nonblank mismatch is `unparseable_version`; two
+   blank streams are `empty_output`. The exact bounded stdout and stderr byte
+   digests and selected stream are retained only on success. No failure may
+   yield `failures = []` or fabricate a normalized value.
 10. **B-010:** Runtime environment evidence uses an explicit typed allowlist of
     behavior-affecting keys for each supported runtime. Keys are unique and
     sorted; missing values are `unset`; allowed non-secret values are represented
@@ -181,14 +199,18 @@ facts in snapshots or through a CLI.
     platform-specific search input used by B-004 are represented only by
     domain-separated digests plus the resolution outcome, never as raw paths or
     directory content.
-11. **B-011:** An MCP tool producer requires a validated stable tool source and
-    exact server/tool identities. The source describes component ownership;
-    runner observation describes who obtained the advertised contract. A
-    repository- or user-configured MCP server therefore does not become a
-    `runner:mcp_tool:*` component merely because the runner queried it. Tool
-    identity is derived through ASC-001 component-ID construction, and blank,
-    generated per-observation, UUID/display-alias, or ownership-free source
-    identities fail closed.
+11. **B-011:** An MCP tool producer requires a validated MCP server component
+    and exact advertised tool name; callers cannot supply a separate or
+    pre-encoded tool source. A typed v0.1 mapping preserves the server source
+    scope and derives the tool locator as
+    `<server_locator>/harness_mcp_tool_v0_1/u<byte_length>_<lowercase_utf8_hex>`.
+    The length-prefixed exact UTF-8 encoding is reversible, injective, and
+    case-sensitive, so multiple tools from one server cannot collide. Runner
+    observation describes who obtained the contract and never changes ownership
+    scope. The derived structured tool binding has no canonical raw source bytes,
+    so ASC-001 component integrity is absent. Blank names, wrong server kind,
+    generated per-observation server identity, UUID/display-alias ownership,
+    malformed derived locators, and caller-supplied encodings fail closed.
 12. **B-012:** MCP tool name and optional description are fingerprinted exactly
     as advertised in their UTF-8 string values. The producer does not trim,
     collapse, case-fold, Unicode-normalize, or otherwise rewrite whitespace or
@@ -203,25 +225,30 @@ facts in snapshots or through a CLI.
     unknown/vendor-extension arrays, and instance-valued annotations including
     `default`, `const`, `examples`, and `example` preserve array order at every
     depth. A key named `enum`, `required`, or `oneOf` inside annotation data is
-    ordinary instance data and does not activate schema sorting. Duplicate JSON
-    object keys are rejected before canonicalization rather than overwritten.
-14. **B-014:** Canonical fingerprint digests cover the exact payload schema
-    version and every behavior-affecting typed fact, with lexicographic object
-    keys and stable collection ordering. They exclude timestamps, run IDs,
-    localized diagnostics, raw secret values, and the outer ASC-001 component
-    to avoid self-reference. The resulting lowercase SHA-256 is the component
-    integrity. Reordering JSON object members or a B-013 order-insensitive set
-    leaves the digest unchanged; changing source-independent runtime facts,
-    exact MCP description text, an ordered annotation, or a failure kind changes
-    it. Aggregate ordering and stack IDs remain ASC-005 responsibilities.
+    ordinary instance data and does not activate schema sorting. Public evidence
+    construction accepts only raw JSON text or bytes through a duplicate-aware
+    parser. It exposes no `serde_json::Value`, generic serializable, or typed-map
+    constructor that could claim duplicate-free original input after an
+    ordinary decoder overwrote a key.
+14. **B-014:** The envelope `fingerprint_digest` covers the exact subject,
+    payload schema version, and every behavior-affecting typed payload fact,
+    with lexicographic object keys and stable collection ordering. It excludes
+    timestamps, run IDs, localized diagnostics, raw secret values, and the
+    outer ASC-001 component to avoid self-reference. ASC-001 component integrity
+    independently preserves exact-source-byte evidence when one exists and is
+    absent otherwise; payload or failure changes never fabricate or overwrite
+    it. Reordering JSON object members or a B-013 order-insensitive set leaves
+    the fingerprint digest unchanged; changing runtime facts, exact MCP
+    description text, an ordered annotation, or a failure kind changes it.
+    Aggregate ordering and stack IDs remain ASC-005 responsibilities.
 15. **B-015:** Invalid producer inputs, invalid source evidence, unsupported
-    runtime kinds, malformed schema JSON, and impossible envelope combinations
-    return typed errors and emit no fingerprint. Expected observation failures
-    such as a missing executable or unavailable version are successful evidence
-    records only when they contain the applicable B-008 failure and omit every
-    unsupported fact. Missing data remains absent; no empty digest, sentinel
-    path, placeholder version, runner-owned alias, or warning-only fallback is
-    substituted.
+    runtime kinds, non-host isolation, malformed schema JSON, and impossible
+    envelope combinations return typed errors and emit no fingerprint. Expected
+    observation failures such as a missing executable or unavailable version
+    are successful evidence records only when they contain the applicable B-008
+    failure and omit every unsupported fact. Missing data remains absent; no
+    empty digest, sentinel path, placeholder version, runner-owned alias,
+    fingerprint-as-integrity substitution, or warning-only fallback is used.
 16. **B-016:** This issue exposes deterministic producer APIs in
     `harness-core` and `harness-agents` plus contract tests. It does not invoke
     them from `CodeAgent`, `AgentAdapter`, the workflow runtime, task runner,
@@ -241,29 +268,32 @@ facts in snapshots or through a CLI.
 | `identity` | `not_executable` | Unix handle mode bits do not permit execution; Windows does not infer this fact from an extension or header. |
 | `identity` | `executable_too_large` | The byte ceiling was exceeded before or during hashing. |
 | `identity` | `read_failed` | The opened executable could not be read completely. |
-| `identity` | `identity_changed` | Path identity did not remain linked to the opened handle across the probe. |
+| `identity` | `identity_changed` | Path strong identity or retained-handle size/content digest changed across checkpoints. |
 | `version_probe` | `containment_unavailable` | Required descendant containment could not be established before spawn, so no child was started. |
 | `version_probe` | `spawn_failed` | The selected command could not be spawned. |
 | `version_probe` | `timeout` | The lifecycle deadline expired and the child was terminated and reaped. |
-| `version_probe` | `output_limit_exceeded` | Combined stdout/stderr crossed the hard byte limit and the child was terminated and reaped. |
+| `version_probe` | `output_limit_exceeded` | Combined stdout/stderr exceeded the inclusive hard byte limit and the child was terminated and reaped. |
 | `version_probe` | `output_read_failed` | Either output pipe failed before a complete bounded result was obtained. |
 | `version_probe` | `nonzero_exit` | The child exited with a nonzero code. |
 | `version_probe` | `terminated_by_signal` | The child terminated without an exit code. |
 | `version_probe` | `invalid_utf8` | Bounded output was not valid UTF-8. |
 | `version_probe` | `empty_output` | Exit was successful but both streams were blank. |
 | `version_probe` | `unparseable_version` | Nonblank output did not exactly match the selected runtime's whole-output grammar. |
-| `version_probe` | `ambiguous_version` | Stdout and stderr each matched the selected grammar but yielded different `VERSION` values. |
+| `version_probe` | `ambiguous_version` | Stdout and stderr each matched the selected grammar, so the selected stream was not unique. |
 
 ## Acceptance Criteria
 
 - [ ] Public positive and negative fixtures round-trip both strict B-001
       envelope subjects and reject version, subject, payload, and unknown-field
-      mismatches, including a component with any nonempty capability list.
+      mismatches, including a component with any nonempty capability list;
+      fixtures prove fingerprint digest is separate from ASC-001 integrity and
+      failure changes never fabricate or overwrite exact-source-byte integrity.
 - [ ] Runtime APIs accept only the closed typed local-executable kind, use fixed
       version arguments, and cannot launder arbitrary strings, UUIDs, display
       aliases, or pre-encoded hex into component identity; an exhaustive
       mapping test covers every workflow `RuntimeKind` without reversing the
-      crate dependency direction.
+      crate dependency direction. Container and microVM inputs fail before any
+      host resolution, file access, or process creation.
 - [ ] Source fixtures prove repository-, user-, admin-, system-, runtime-, and
       genuinely runner-owned runtime/MCP components keep identical component
       IDs when observation strengthens to `runner_observed`.
@@ -280,30 +310,40 @@ facts in snapshots or through a CLI.
 - [ ] Identity fixtures prove handle-based metadata/hash consistency, before-
       and during-read size limits, nonblocking async execution, Unix mode-bit
       checks, Windows strong file-ID checks without a fabricated executable
-      claim, and explicit `identity_changed` evidence when the selected path is
-      replaced between inspection and probe.
+      claim, pre-spawn/post-reap retained-handle rehashing, and explicit
+      `identity_changed` evidence for path replacement or in-place rewrite.
 - [ ] Lifecycle fixtures use hanging and unbounded dual-stream children to
-      prove Unix timeout, cancellation, and combined output-limit paths kill the
-      process group, reap the root, and leave the group empty without unbounded
-      allocation or a version fact; Windows v0.1 proves
-      `containment_unavailable` is emitted before any child starts.
+      prove Unix explicit timeout and output-limit paths await group termination
+      and root reap; exact combined limit succeeds and limit-plus-one fails;
+      cancellation transfers ownership to a runtime-independent reaper that
+      survives immediate Tokio shutdown, normally completes within the fixed
+      five-second verification deadline, retains ownership and emits an error
+      while continuing cleanup if that deadline is crossed, and emits no
+      evidence; Windows v0.1 proves `containment_unavailable` is emitted before
+      any child starts.
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
       sanitized bounded facts, and rejection of unknown values.
 - [ ] Version fixtures cover exact current Codex and Claude product lines,
       stdout/stderr selection, prerelease/build case preservation, CRLF/LF,
       rejected `v`/`V`, leading/trailing text, extra dependency versions,
       nonzero and signalled exit, invalid UTF-8, successful blank output,
-      unparseable output, and conflicting matching streams.
+      one valid stream plus nonblank invalid output, same/different versions on
+      both matching streams, unparseable output, and conflicting matching
+      streams.
 - [ ] Environment fixtures prove declared set/unset/digest/redacted behavior,
       raw-value and raw-PATH absence, duplicate/invalid-key rejection, separate
       probe exposure, and unconditional exclusion of every setup-secret key.
-- [ ] MCP fixtures prove stable ownership, exact tool/description sensitivity,
-      and distinct absence, empty, spaces, tabs, and newline descriptions.
+- [ ] MCP fixtures prove stable ownership, injective typed source derivation for
+      multiple exact UTF-8 tool names on one server, rejection of caller-supplied
+      encoded sources, absent component integrity, exact tool/description
+      sensitivity, and distinct absence, empty, spaces, tabs, and newlines.
 - [ ] Schema fixtures prove object-key and approved set reordering stability;
       ordered `prefixItems`, vendor arrays, and nested arrays under `default`,
       `const`, `examples`, and `example` remain digest-sensitive even when an
       annotation object contains a schema-keyword-shaped key.
-- [ ] Duplicate JSON keys and malformed schemas fail typed before digesting.
+- [ ] Duplicate JSON keys and malformed raw schemas fail typed before digesting,
+      and public API/call-site audit proves no generic serializable or
+      `serde_json::Value` evidence constructor exists.
 - [ ] Focused and package suites pass with
       `cargo check -p harness-agents -p harness-core --all-targets`,
       `cargo test -p harness-core fingerprint`, and
@@ -325,7 +365,7 @@ facts in snapshots or through a CLI.
 | Compatibility / migration | Covered by B-001, B-002, and B-016; this is additive producer-only code with no persisted or existing public wire migration. |
 | Degradation / fallback | Covered by B-008, B-009, and B-015; unavailable data becomes typed failure evidence, never a placeholder success. |
 | Evidence and audit integrity | Covered by B-003 and B-006 through B-015; ownership, observer, bytes, version, schema, failures, and redaction remain distinguishable. |
-| Cancellation / interruption / partial completion | Covered by B-007 and B-015; cancellation reaps children and cannot publish a success-shaped partial probe. |
+| Cancellation / interruption / partial completion | Covered by B-007 and B-015; cancellation signals containment, transfers cleanup to a runtime-independent deadline-governed owner, and cannot publish partial evidence. |
 
 ## Edge Cases
 
@@ -334,8 +374,8 @@ facts in snapshots or through a CLI.
 - On Unix, an npm-style launcher uses `#!/usr/bin/env node` and the interpreter
   is found only through the sanitized child `PATH`.
 - A setup-only secret has a harmless-looking name such as `NPM_ACCESS`.
-- The executable is a symlink, is replaced during hashing, or is replaced and
-  restored around the version probe.
+- The executable is a symlink, is replaced, is overwritten in place, or is
+  changed and restored between observation checkpoints.
 - A regular file grows past the byte limit after its first metadata read.
 - A probe hangs, forks, closes only one stream, floods both streams, exits by
   signal, succeeds with blank output, or emits conflicting versions.
@@ -345,6 +385,8 @@ facts in snapshots or through a CLI.
 - A schema annotation contains `{ "enum": [1, 2] }` as ordinary default data.
 - `prefixItems` or a vendor extension differs only by array order.
 - An MCP tool is advertised by a runner but owned by repository configuration.
+- One MCP server advertises two exact tool names that differ only by case,
+  Unicode bytes, slash placement, or a prefix of the other name.
 - A caller attempts to use a UUID, display label, or arbitrary string as a
   runtime kind or source locator.
 
