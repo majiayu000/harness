@@ -82,10 +82,12 @@ pub(crate) async fn cancel_submission_by_workflow_id(
 
 async fn cancel_submission_instance(
     store: &WorkflowRuntimeStore,
-    instance: WorkflowInstance,
+    mut instance: WorkflowInstance,
     correlation_id: &str,
 ) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
     if instance.is_terminal() {
+        let (decision_name, remove_prompt) = cancellation_cleanup_policy(&instance);
+        finish_cancellation_cleanup(store, &mut instance, decision_name, remove_prompt).await?;
         return Ok(RuntimeSubmissionCancelOutcome::AlreadyTerminal(instance));
     }
     let is_prompt = instance.definition_id == PROMPT_TASK_DEFINITION_ID;
@@ -171,7 +173,39 @@ async fn cancel_submission_instance(
         )
         .await?
     };
+    let cleaned =
+        finish_cancellation_cleanup(store, &mut cancelled, decision_name, remove_prompt).await?;
+    if !cleaned {
+        return Err(RuntimeSubmissionCancelError::Store(anyhow::anyhow!(
+            "runtime submission cancellation did not persist a MarkCancelled command"
+        )));
+    }
+    Ok(RuntimeSubmissionCancelOutcome::Cancelled(cancelled))
+}
+
+fn cancellation_cleanup_policy(instance: &WorkflowInstance) -> (&'static str, bool) {
+    if instance.definition_id == PROMPT_TASK_DEFINITION_ID {
+        ("cancel_prompt_submission", true)
+    } else if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID {
+        ("cancel_issue_submission", false)
+    } else {
+        ("cancel_declarative_submission", true)
+    }
+}
+
+async fn finish_cancellation_cleanup(
+    store: &WorkflowRuntimeStore,
+    cancelled: &mut WorkflowInstance,
+    decision_name: &str,
+    remove_prompt: bool,
+) -> Result<bool, RuntimeSubmissionCancelError> {
     let commands = store.commands_for(&cancelled.id).await?;
+    if !commands
+        .iter()
+        .any(|command| command.command.command_type == WorkflowCommandType::MarkCancelled)
+    {
+        return Ok(false);
+    }
     for command in commands {
         if matches!(
             command.status,
@@ -189,8 +223,8 @@ async fn cancel_submission_instance(
                 .await?;
         }
     }
-    cancelled.data = set_data_bool(cancelled.data, "cancelled", true);
-    store.upsert_instance(&cancelled).await?;
+    cancelled.data = set_data_bool(std::mem::take(&mut cancelled.data), "cancelled", true);
+    store.upsert_instance(cancelled).await?;
     if remove_prompt {
         remove_prompt_submission_prompt_durable(
             store,
@@ -198,7 +232,7 @@ async fn cancel_submission_instance(
         )
         .await?;
     }
-    Ok(RuntimeSubmissionCancelOutcome::Cancelled(cancelled))
+    Ok(true)
 }
 
 async fn resolve_declarative_cancellation(
@@ -297,4 +331,82 @@ fn cancelled_state(
                 instance.id
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use harness_core::db::resolve_database_url;
+    use harness_workflow::runtime::{
+        RuntimeJobStatus, RuntimeKind, WorkflowCommandStatus, WorkflowSubject,
+    };
+
+    #[tokio::test]
+    async fn terminal_cancellation_retry_finishes_command_and_job_cleanup() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let database_url = resolve_database_url(None)?;
+        let store =
+            WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+        let workflow = WorkflowInstance::new(
+            PROMPT_TASK_DEFINITION_ID,
+            1,
+            "cancelled",
+            WorkflowSubject::new("prompt", "retry-cancellation-cleanup"),
+        )
+        .with_id("retry-cancellation-cleanup");
+        store.upsert_instance(&workflow).await?;
+
+        let activity = WorkflowCommand::enqueue_activity(
+            "implement_prompt",
+            "retry-cancellation-cleanup-activity",
+        );
+        let activity_command_id = store.enqueue_command(&workflow.id, None, &activity).await?;
+        let runtime_job = store
+            .enqueue_runtime_job(
+                &activity_command_id,
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({"activity": "implement_prompt"}),
+            )
+            .await?;
+        let Some(running_job) = store
+            .claim_next_runtime_job("retry-cleanup", Utc::now() + Duration::minutes(5))
+            .await?
+        else {
+            anyhow::bail!("runtime job should be running before cancellation retry");
+        };
+        assert_eq!(running_job.id, runtime_job.id);
+
+        let cancellation = WorkflowCommand::new(
+            WorkflowCommandType::MarkCancelled,
+            "retry-cancellation-cleanup-marker",
+            json!({}),
+        );
+        store
+            .enqueue_command(&workflow.id, None, &cancellation)
+            .await?;
+
+        let outcome = cancel_submission_by_workflow_id(&store, &workflow.id).await?;
+        assert!(matches!(
+            outcome,
+            RuntimeSubmissionCancelOutcome::AlreadyTerminal(_)
+        ));
+        let Some(activity_command) = store.get_command(&activity_command_id).await? else {
+            anyhow::bail!("activity command should remain queryable");
+        };
+        assert_eq!(activity_command.status, WorkflowCommandStatus::Cancelled);
+        let Some(cancelled_job) = store.get_runtime_job(&runtime_job.id).await? else {
+            anyhow::bail!("runtime job should remain queryable");
+        };
+        assert_eq!(cancelled_job.status, RuntimeJobStatus::Cancelled);
+        let Some(updated) = store.get_instance(&workflow.id).await? else {
+            anyhow::bail!("cancelled workflow should remain queryable");
+        };
+        assert_eq!(updated.data["cancelled"], true);
+        Ok(())
+    }
 }
