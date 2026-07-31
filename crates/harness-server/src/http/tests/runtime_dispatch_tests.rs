@@ -31,7 +31,7 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
         "repo": "owner/repo",
         "issue_number": 123,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -127,7 +127,7 @@ async fn runtime_command_dispatch_tick_honors_prompt_execution_policy() -> anyho
             "priority": 1,
         }
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
         "implement_prompt",
         "prompt-policy-implement",
@@ -212,7 +212,7 @@ async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fall
         "issue_number": 126,
         "author_trust_class": "non_collaborator",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-126");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -407,7 +407,7 @@ async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> any
         "repo": "owner/repo",
         "issue_number": 124,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-124");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -537,7 +537,7 @@ async fn runtime_command_dispatch_tick_retries_non_workflow_config_errors() -> a
         "repo": "owner/repo",
         "issue_number": 125,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-125");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -603,7 +603,7 @@ async fn runtime_pr_feedback_sweep_tick_enqueues_runtime_command() -> anyhow::Re
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-226",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
 
     let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 10).await?;
 
@@ -663,7 +663,7 @@ async fn runtime_pr_feedback_sweep_recovers_pr_binding_from_bind_pr_command() ->
         "issue_number": 230,
         "task_id": "runtime-task-230",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let bind_pr = harness_workflow::runtime::WorkflowCommand::bind_pr(
         80,
         "https://github.com/owner/repo/pull/80",
@@ -740,7 +740,7 @@ async fn runtime_pr_feedback_sweep_limit_ignores_skipped_workflows() -> anyhow::
         "pr_url": "https://github.com/owner/repo/pull/78",
         "task_id": "runtime-task-227",
     }));
-    store.upsert_instance(&valid_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &valid_workflow).await?;
     let skipped_workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
         1,
@@ -754,7 +754,7 @@ async fn runtime_pr_feedback_sweep_limit_ignores_skipped_workflows() -> anyhow::
         "issue_number": 228,
         "task_id": "runtime-task-228",
     }));
-    store.upsert_instance(&skipped_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &skipped_workflow).await?;
 
     let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 1).await?;
 
@@ -799,7 +799,7 @@ async fn runtime_pr_feedback_sweep_respects_project_runtime_policy() -> anyhow::
         "pr_url": "https://github.com/owner/repo/pull/79",
         "task_id": "runtime-task-229",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
 
     let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 10).await?;
 
@@ -853,7 +853,7 @@ async fn runtime_command_dispatch_tick_uses_command_project_policy_when_server_r
         "repo": "owner/repo",
         "issue_number": 224,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-224");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -913,7 +913,7 @@ async fn runtime_command_dispatch_tick_defers_disabled_policy_without_agent_metr
         "repo": "owner/repo",
         "issue_number": 225,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-225");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;

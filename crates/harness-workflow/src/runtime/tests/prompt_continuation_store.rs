@@ -24,7 +24,7 @@ async fn prompt_continuation_completion_persists_context_and_dedupes_attempt_com
         "prompt_ref": "prompt-ref-store",
         "continuation": PromptContinuationState::initial(&policy),
     }));
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let result = ActivityResult::succeeded(
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
         "Created the implementation branch.",
@@ -117,7 +117,7 @@ async fn settled_prompt_missing_completion_evidence_persists_observed_context(
         "prompt_ref": "prompt-ref-missing-evidence",
         "continuation": PromptContinuationState::initial(&policy),
     }));
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let result = ActivityResult::succeeded(
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
         "External work settled without completion evidence.",
@@ -186,7 +186,7 @@ async fn single_shot_prompt_missing_completion_evidence_still_commits() -> anyho
     )
     .with_id("prompt-single-shot-missing-evidence")
     .with_data(json!({ "prompt_ref": "prompt-ref-single-shot" }));
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let result = ActivityResult::succeeded(
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
         "Single-shot work omitted completion evidence.",

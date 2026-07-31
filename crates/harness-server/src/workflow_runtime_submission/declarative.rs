@@ -185,6 +185,17 @@ async fn persist_new_submission(
         })?;
         return existing_submission(store, instance, definition).await;
     };
+    if !outcome.record.accepted {
+        anyhow::bail!(
+            "declarative workflow submission '{}' was rejected during atomic commit: {}",
+            workflow_id,
+            outcome
+                .record
+                .rejection_reason
+                .as_deref()
+                .unwrap_or("decision rejected")
+        );
+    }
     super::prompt_memory::cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
     Ok(WorkflowSubmissionRuntimeRecord {
         workflow_id,

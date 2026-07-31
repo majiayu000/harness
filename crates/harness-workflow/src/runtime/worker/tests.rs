@@ -60,7 +60,7 @@ async fn enqueue_test_runtime_job(
         WorkflowSubject::new("issue", format!("issue:{key}")),
     )
     .with_id(format!("runtime-worker-test-{key}"));
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
     let activity = input
         .get("activity")
         .and_then(serde_json::Value::as_str)

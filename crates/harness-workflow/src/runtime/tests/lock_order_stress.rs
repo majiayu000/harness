@@ -65,7 +65,7 @@ async fn event_writer_locks_instance_before_sequence_advisory() -> anyhow::Resul
         Arc::new(WorkflowRuntimeStore::open(&dir.path().join("event-lock-order.db")).await?);
 
     let workflow = issue_instance("implementing").with_id("event-lock-order");
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
 
     let mut blocker = store.pool().begin().await?;
     let (blocker_backend,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
@@ -209,7 +209,7 @@ async fn dispatch_and_completion_form_an_observable_parent_first_wait_chain() ->
         .await?;
     drop(dispatch_connection);
     let workflow = issue_instance("implementing").with_id("lock-order-observable-chain");
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
     let command =
         WorkflowCommand::enqueue_activity("implement_issue", "lock-order-observable-command");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -369,7 +369,7 @@ async fn recovery_and_lease_revoke_lock_runtime_jobs_in_global_id_order() -> any
     let revoke_store = Arc::new(WorkflowRuntimeStore::open(&database_path).await?);
     let workflow = project_issue_instance("/lock-order-project", 1830, "blocked")
         .with_id("recovery-job-order");
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
 
     let mut jobs_by_command = std::collections::BTreeMap::new();
     for suffix in ["first", "second"] {
@@ -449,7 +449,7 @@ async fn recovery_and_lease_revoke_lock_runtime_jobs_in_global_id_order() -> any
             "runtime_job_id": controlled_job_ids[0]
         }
     }));
-    store.upsert_instance(&stopped).await?;
+    store.force_upsert_instance_for_test(&stopped).await?;
     let gate_key = format!("runtime_job_recovery_order_gate:{}", controlled_job_ids[0]);
 
     sqlx::query(

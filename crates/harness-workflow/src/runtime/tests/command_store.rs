@@ -7,7 +7,7 @@ async fn runtime_store_can_insert_non_pending_command_atomically() -> anyhow::Re
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "scheduled");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let command =
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-inline");
     let command_id = store
@@ -39,7 +39,7 @@ async fn runtime_store_non_pending_status_updates_existing_pending_command() -> 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "scheduled");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let command =
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement-inline");
     let pending_id = store.enqueue_command(&instance.id, None, &command).await?;
@@ -73,7 +73,7 @@ async fn runtime_store_dedupe_status_update_does_not_regress_dispatched_command(
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "replanning");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-dispatched");
     let command_id = store.enqueue_command(&instance.id, None, &command).await?;
     let outcome = store
@@ -113,7 +113,7 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 1567, "blocked");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
 
     let pending_id = store
         .enqueue_command(
@@ -143,7 +143,7 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
             "runtime_job_id": runtime_job_id
         },
     }));
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
 
     let outcome = recover(
         &store,
@@ -206,7 +206,7 @@ async fn runtime_recovery_unblocks_legacy_blocked_without_stop_metadata() -> any
     if resolve_database_url(None).is_err() { return Ok(()); }
     let dir = tempfile::tempdir()?; let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let legacy = project_issue_instance("/project-a", 1693, "blocked").with_data(json!({"project_id": "/project-a", "issue_number": 1693, "blocked_reason": "legacy blocked row without structured stop metadata", "source": "github"}));
-    store.upsert_instance(&legacy).await?; let workflow = recovered_workflow(recover(&store, &legacy.id, super::WorkflowRuntimeRecoveryAction::Unblock).await?, "legacy unblock")?; assert_eq!(workflow.state, "implementing"); assert_eq!(workflow.data["blocked_reason"], legacy.data["blocked_reason"]); assert!(workflow.data.get("last_stop").is_none()); assert_operator_recovery_audit(&store, &legacy.id, "WorkflowRuntimeUnblocked", "unblock", "blocked", "implementing").await?;
+    store.force_upsert_instance_for_test(&legacy).await?; let workflow = recovered_workflow(recover(&store, &legacy.id, super::WorkflowRuntimeRecoveryAction::Unblock).await?, "legacy unblock")?; assert_eq!(workflow.state, "implementing"); assert_eq!(workflow.data["blocked_reason"], legacy.data["blocked_reason"]); assert!(workflow.data.get("last_stop").is_none()); assert_operator_recovery_audit(&store, &legacy.id, "WorkflowRuntimeUnblocked", "unblock", "blocked", "implementing").await?;
     let commands = store.commands_for(&legacy.id).await?; assert_eq!(commands.len(), 1); assert_eq!(commands[0].status, WorkflowCommandStatus::Pending); let command = &commands[0].command; assert_eq!(command.command_type, WorkflowCommandType::EnqueueActivity); assert_eq!(command.activity_name(), Some("implement_issue")); assert_eq!(command.command["project_id"], "/project-a"); assert_eq!(command.command["issue_number"], 1693); assert_eq!(command.command["dispatch_gate"]["reason"], "operator_workflow_runtime_unblock"); assert!(command.command["additional_prompt"].as_str().is_some_and(|prompt| prompt.contains("Recovery reason: operator fixed transient failure"))); Ok(())
 }
 
@@ -214,8 +214,8 @@ async fn runtime_recovery_unblocks_legacy_blocked_without_stop_metadata() -> any
 #[tokio::test]
 async fn runtime_recovery_legacy_fallback_requires_absent_or_null_last_stop() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() { return Ok(()); } let dir = tempfile::tempdir()?; let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?; use super::WorkflowRuntimeRecoveryAction::{Retry, Unblock};
-    for (issue_number, state, action, last_stop) in [(1710, "blocked", Unblock, None), (1711, "blocked", Unblock, Some(json!(null))), (1712, "failed", Retry, None), (1713, "failed", Retry, Some(json!(null)))] { let mut data = json!({"project_id": "/project-a", "issue_number": issue_number, "source": "github"}); if let Some(last_stop) = last_stop { data["last_stop"] = last_stop; } let original = project_issue_instance("/project-a", issue_number, state).with_data(data); store.upsert_instance(&original).await?; let workflow = recovered_workflow(recover(&store, &original.id, action).await?, "legacy absent/null recovery")?; assert_eq!(workflow.state, "implementing"); assert!(workflow.data.get("last_stop").is_none()); let commands = store.commands_for(&original.id).await?; assert_eq!(commands.len(), 1); assert_eq!(commands[0].command.activity_name(), Some("implement_issue")); }
-    for (issue_number, state, action, last_stop) in [(1720, "blocked", Unblock, json!({})), (1721, "blocked", Unblock, json!({"event_id": 123})), (1722, "blocked", Unblock, json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null})), (1723, "failed", Retry, json!({})), (1724, "failed", Retry, json!({"event_id": 123})), (1725, "failed", Retry, json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null}))] { let original = project_issue_instance("/project-a", issue_number, state).with_data(json!({"project_id": "/project-a", "issue_number": issue_number, "source": "github", "last_stop": last_stop})); store.upsert_instance(&original).await?; let outcome = recover(&store, &original.id, action).await?; assert!(matches!(outcome, super::WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity { activity: None, .. })); assert_recovery_left_workflow_unchanged(&store, &original).await?; }
+    for (issue_number, state, action, last_stop) in [(1710, "blocked", Unblock, None), (1711, "blocked", Unblock, Some(json!(null))), (1712, "failed", Retry, None), (1713, "failed", Retry, Some(json!(null)))] { let mut data = json!({"project_id": "/project-a", "issue_number": issue_number, "source": "github"}); if let Some(last_stop) = last_stop { data["last_stop"] = last_stop; } let original = project_issue_instance("/project-a", issue_number, state).with_data(data); store.force_upsert_instance_for_test(&original).await?; let workflow = recovered_workflow(recover(&store, &original.id, action).await?, "legacy absent/null recovery")?; assert_eq!(workflow.state, "implementing"); assert!(workflow.data.get("last_stop").is_none()); let commands = store.commands_for(&original.id).await?; assert_eq!(commands.len(), 1); assert_eq!(commands[0].command.activity_name(), Some("implement_issue")); }
+    for (issue_number, state, action, last_stop) in [(1720, "blocked", Unblock, json!({})), (1721, "blocked", Unblock, json!({"event_id": 123})), (1722, "blocked", Unblock, json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null})), (1723, "failed", Retry, json!({})), (1724, "failed", Retry, json!({"event_id": 123})), (1725, "failed", Retry, json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null}))] { let original = project_issue_instance("/project-a", issue_number, state).with_data(json!({"project_id": "/project-a", "issue_number": issue_number, "source": "github", "last_stop": last_stop})); store.force_upsert_instance_for_test(&original).await?; let outcome = recover(&store, &original.id, action).await?; assert!(matches!(outcome, super::WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity { activity: None, .. })); assert_recovery_left_workflow_unchanged(&store, &original).await?; }
     Ok(())
 }
 
@@ -333,7 +333,7 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
 
     for (issue_number, state, action, data, field) in malformed_stop_metadata_cases() {
         let malformed = project_issue_instance("/project-a", issue_number, state).with_data(data);
-        store.upsert_instance(&malformed).await?;
+        store.force_upsert_instance_for_test(&malformed).await?;
         let err = recover(
             &store,
             &malformed.id,
@@ -354,7 +354,7 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
         "issue_number": 1698,
         "failure_reason": "legacy failed row without structured stop metadata",
     }));
-    store.upsert_instance(&legacy).await?;
+    store.force_upsert_instance_for_test(&legacy).await?;
     let outcome = recover(
         &store,
         &legacy.id,
@@ -376,7 +376,7 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
             "error_kind": "timeout"
         },
     }));
-    store.upsert_instance(&unsupported).await?;
+    store.force_upsert_instance_for_test(&unsupported).await?;
     let outcome = recover(
         &store,
         &unsupported.id,
@@ -402,7 +402,7 @@ async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::
     instance.data["stop_reason_code"] = json!("runtime_transcript_lost");
     instance.data["reason_class"] = json!("terminal");
     instance.data["last_stop"]["stop_reason_code"] = json!("runtime_transcript_lost");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
 
     let recovered = recovered_workflow(
         recover(
@@ -429,7 +429,7 @@ async fn runtime_recovery_locks_instance_before_waiting_on_command() -> anyhow::
     let dir = tempfile::tempdir()?;
     let store = Arc::new(WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?);
     let instance = project_issue_instance("/project-a", 1568, "blocked");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let original_command =
         WorkflowCommand::enqueue_activity("implement_issue", "stale-dispatched-1568");
     let (stale_command_id, runtime_job_id) =
@@ -441,7 +441,7 @@ async fn runtime_recovery_locks_instance_before_waiting_on_command() -> anyhow::
             "runtime_job_id": runtime_job_id
         },
     }));
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
 
     let mut command_tx = store.pool().begin().await?;
     sqlx::query("SELECT id FROM workflow_commands WHERE id = $1 FOR UPDATE")
@@ -592,7 +592,7 @@ async fn store_stopped_failed_command(
     command: &WorkflowCommand,
 ) -> anyhow::Result<WorkflowInstance> {
     let instance = project_issue_instance("/project-a", issue_number, "failed");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let (_command_id, runtime_job_id) =
         enqueue_original_runtime_job(store, &instance.id, command).await?;
     let instance = instance.with_data(json!({
@@ -604,7 +604,7 @@ async fn store_stopped_failed_command(
             "error_kind": "timeout"
         }
     }));
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     Ok(instance)
 }
 
@@ -672,7 +672,7 @@ async fn runtime_store_pending_command_enqueue_is_idempotent_across_concurrent_c
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "replanning");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-idempotent");
     let command_id = store.enqueue_command(&instance.id, None, &command).await?;
 
@@ -745,7 +745,7 @@ async fn runtime_store_claims_pending_commands_with_dispatch_lease() -> anyhow::
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "replanning");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-lease");
     let command_id = store.enqueue_command(&instance.id, None, &command).await?;
 

@@ -189,7 +189,7 @@ async fn persistent_pr_lifecycle_persist_failure_preserves_existing_workflow() -
         "issue_number": 123,
         "marker": "real",
     }));
-    store.upsert_instance(&existing).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &existing).await?;
     let _guard =
         set_pr_lifecycle_persist_test_failures(task_id.as_str(), PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS);
 
@@ -562,7 +562,7 @@ async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> any
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
-    store.upsert_instance(&issue_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &issue_workflow).await?;
 
     record_pr_feedback(
         Some(&store),
@@ -673,7 +673,7 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &instance).await?;
 
     let outcome = request_local_review(&store, &workflow_id).await?;
     assert_eq!(
@@ -724,4 +724,5 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
     Ok(())
 }
 
+mod restart_suppression;
 mod suppression;

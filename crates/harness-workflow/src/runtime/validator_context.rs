@@ -12,6 +12,7 @@ impl ValidationContext {
             wait_available: true,
             allow_terminal_reopen: false,
             allow_missing_pinned_cancel: false,
+            allow_definition_pin_safety_decision: false,
             active_dedupe_keys: BTreeSet::new(),
         }
     }
@@ -43,6 +44,11 @@ impl ValidationContext {
 
     pub fn allow_missing_pinned_cancel(mut self) -> Self {
         self.allow_missing_pinned_cancel = true;
+        self
+    }
+
+    pub fn allow_definition_pin_safety_decision(mut self) -> Self {
+        self.allow_definition_pin_safety_decision = true;
         self
     }
 }
