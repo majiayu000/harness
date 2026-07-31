@@ -75,7 +75,7 @@ Lifecycle status per spec directory. Generated 2026-07-29 from GitHub issue stat
 | [GH1716](./GH1716) | #1716 | implemented (issue closed) |
 | [GH1717](./GH1717) | #1717 | implemented (issue closed) |
 | [GH1730](./GH1730) | #1730 | implemented (issue closed) |
-| [GH1731](./GH1731) | #1731 | open |
+| [GH1731](./GH1731) | #1731 | implemented (issue closed) |
 | [GH1732](./GH1732) | #1732 | open |
 | [GH1765](./GH1765) | #1765 | open |
 | [GH1766](./GH1766) | #1766 | implemented (issue closed) |
