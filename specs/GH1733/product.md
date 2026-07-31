@@ -84,10 +84,18 @@ facts in snapshots or through a CLI.
    public command vector. The same mapping owns a whole-output version grammar:
    both Codex kinds accept only `codex-cli <VERSION>`, and Claude Code accepts
    only `<VERSION> (Claude Code)`, apart from one optional final line ending.
-   Runtime producer input also carries a closed execution isolation value. v0.1
-   accepts only `host`; `container` and `microvm` fail typed before PATH
-   resolution, file access, or process creation because their configured CLI
-   path does not identify the host executable actually launched.
+   Runtime producer input also carries the existing closed execution isolation
+   value and the adapter's effective `SandboxSpec`. v0.1 accepts only `host`
+   plus the exact passthrough sandbox state
+   `DangerFullAccess` with `allowed_write_paths = None`; its payload records the
+   closed fact `sandbox_policy = danger_full_access_unrestricted`.
+   `container` and `microvm` retain their typed unsupported-isolation errors.
+   `ReadOnly`, `ReadOnlyWithNetwork`, `WorkspaceWrite`, or any narrowed
+   allowed-write-path state fails separately with
+   `sandbox_parity_unavailable`. Both gates precede PATH resolution,
+   working-directory or executable access, and process creation. v0.1 never
+   runs an unrestricted version child for an adapter launch that would be
+   restricted.
 3. **B-003:** Every producer accepts or derives a validated ASC-001 source from
    persisted ownership information. Repository-, user-global-, admin-, system-,
    and runtime-owned runtime or MCP components retain their source scope and
@@ -121,7 +129,12 @@ facts in snapshots or through a CLI.
    `EACCES` fallback but deliberately rejects `ENOEXEC` shell fallback. On
    Unix, a qualified relative path and
    relative or empty `PATH` entries are resolved from the declared child
-   working directory. Every payload includes
+   working directory. Every payload records one closed `command_form`:
+   `unix_bare`, `unix_absolute`, `unix_qualified`, `windows_bare`,
+   `windows_absolute`, or `windows_qualified`; strict parsing uses it to
+   distinguish search skips from failures of a configured path.
+
+   Every payload includes
    `configured_command_digest = SHA-256("harness_runtime_configured_command_v0_1\0" || platform_tag || unit_count_be || exact_units)`.
    `platform_tag` is exactly `b"unix\0"` or `b"windows\0"`;
    `unit_count_be` is an unsigned fixed-width `u64` in big-endian order.
@@ -129,7 +142,29 @@ facts in snapshots or through a CLI.
    original UTF-16 code units serialized little-endian, and the count is UTF-16
    units rather than bytes. There is no UTF-8,
    case, separator, dot-segment, symlink, or absolute-path normalization, and
-   the raw command is never serialized.
+   the raw command is never serialized. The configured child working-directory
+   spelling is hashed independently with domain
+   `"harness_runtime_working_directory_v0_1\0"` and the same platform tag,
+   count, and exact-unit framing. On Unix, after isolation and sandbox
+   validation but before executable resolution, the producer opens that
+   directory once, requires directory handle metadata, retains the handle for
+   child `fchdir`, and records
+   `working_directory_identity_digest =
+   SHA-256("harness_runtime_working_directory_identity_v0_1\0" ||
+   u64be(device) || u64be(inode))`. Open or metadata failure is typed
+   `working_directory_unavailable` and emits no fingerprint; the raw path,
+   device, and inode are never serialized.
+
+   Every Unix candidate is a private closed reference: `absolute(path)` or
+   `working_directory_relative(path)`. Qualified relative commands and
+   relative or empty `PATH` entries produce the latter. Their preliminary
+   observation, authoritative open, and both later checkpoint reopens use
+   `fstatat`/`openat` (or exact handle-relative equivalents) against the same
+   retained working-directory handle; they never reconstruct and access an
+   absolute pathname. For evidence only, the candidate digest uses the lexical
+   candidate spelling joined to the configured working-directory spelling;
+   that string is never used for access, and the separate directory-identity
+   digest binds which retained directory supplied the target.
 
    On Windows, a bare name follows the frozen v0.1 search
    order and `.exe` completion rules using explicit launch-context inputs; it
@@ -152,8 +187,14 @@ facts in snapshots or through a CLI.
    Unix bare-name execution uses a frozen Harness search algorithm rather than
    delegating to `execvp`: candidates keep the exact basename and sanitized
    `PATH` order and at most 64 entries are observed. Missing, non-regular, or
-   mode-ineligible candidates are skipped without execution; failure to open an
-   otherwise selected candidate is `identity/open_failed` and stops. Reaching
+   mode-ineligible candidates are skipped without execution only for
+   `unix_bare`. For `unix_absolute` or `unix_qualified`, an existing
+   non-regular or mode-ineligible candidate is terminal
+   `identity/not_regular_file` or `identity/not_executable`. Exact `ENOENT` or
+   `ENOTDIR` from either preliminary observation or the authoritative open is
+   `absent`: a bare search continues, while an absolute or qualified command
+   ends as `path_not_found`. Every other open failure is
+   `identity/open_failed` and stops. Reaching
    entry 65 before a terminal outcome is
    `path_resolution/candidate_limit_exceeded`. After inspection and the pre-spawn
    checkpoint, a direct no-shell handle-exec primitive (`fexecve` or an exact
@@ -230,8 +271,10 @@ facts in snapshots or through a CLI.
    executor, and does not allocate the declared maximum eagerly. The retained
    handle is re-read and re-hashed immediately before spawn and after the child
    is reaped; all three size and digest observations must match. At both later
-   checkpoints the resolved path is reopened with the same Unix
-   `O_RDONLY | O_CLOEXEC | O_NONBLOCK` classification as the initial open,
+   checkpoints the private candidate reference is reopened with the same Unix
+   `O_RDONLY | O_CLOEXEC | O_NONBLOCK` classification as the initial open:
+   absolute references use `open`, and working-directory-relative references
+   use `openat` against the retained directory handle,
    rejects a race-swapped non-regular target from handle metadata without
    blocking, and must still identify the retained handle using
    device/inode on Unix or volume serial plus 128-bit file ID on Windows. If
@@ -298,8 +341,10 @@ facts in snapshots or through a CLI.
    no-path retained-handle exec primitive, `handle_execution_unavailable` is
    recorded before anchor or target creation.
    Failure to establish the anchor group or failure of either
-   the initial or post-`ETXTBSY` target helper's pre-exec group join is
-   `supervision_setup_failed`; every created helper is reaped, the affected
+   the initial or post-`ETXTBSY` target helper's pre-exec group join or
+   retained-working-directory `fchdir` is `supervision_setup_failed` with the
+   closed `setup_stage` `group_join` or `working_directory_enter`; anchor
+   failure uses `anchor_setup`. Every created helper is reaped, the affected
    target handle exec is not attempted, and its errno is never treated as a
    target-exec error or PATH fallback signal. On Windows, where the existing launcher cannot atomically
    assign a Job Object before execution, `containment_unavailable` is recorded
@@ -403,19 +448,29 @@ facts in snapshots or through a CLI.
     encodings fail closed. This contract binds identity to the exact stable
     configuration key; it does not claim historical proof that a caller kept
     the same key across observations.
-12. **B-012:** MCP tool name, optional description, required `inputSchema`, and
-    optional `outputSchema` are fingerprinted exactly as advertised. Absence of
-    `outputSchema` remains distinct from any present schema. Both schemas use
+12. **B-012:** MCP tool name, optional description, optional `annotations`,
+    required `inputSchema`, and optional `outputSchema` are fingerprinted as
+    advertised. Absence of `outputSchema` remains distinct from any present
+    schema. Both schemas use
     the same duplicate-aware, object-root, bounded canonicalization contract in
-    B-013. Tool text is retained in its exact UTF-8 string value; the producer
+    B-013. `annotations` accepts only absent or a raw JSON object through the
+    same duplicate-aware parser; absent and `{}` remain distinct. Its object
+    keys canonicalize, while all values use `InstanceData`, so exact booleans
+    such as `readOnlyHint`, `destructiveHint`, `idempotentHint`, and
+    `openWorldHint`, exact title/vendor values, and array order affect the
+    digest without populating the empty ASC capability list. Tool text is
+    retained in its exact UTF-8 string value; the producer
     does not trim,
     collapse, case-fold, Unicode-normalize, or otherwise rewrite whitespace or
     punctuation. `None`, an empty description, a single space, repeated spaces,
     tabs, and newlines remain distinct payload facts and produce distinct
     digests when their exact advertised values differ. v0.1 permits a nonblank
     tool name of at most 1,024 UTF-8 bytes and a description of at most 65,536
-    UTF-8 bytes; exact limits are allowed and limit-plus-one fails typed before
-    fingerprint construction.
+    UTF-8 bytes. Annotation limits are fixed independently at 65,536 raw bytes,
+    49,152 canonical bytes, depth 32, 4,096 JSON nodes, 32,768 cumulative
+    decoded-string UTF-8 bytes, and 1,024 entries in one object or array. Exact
+    limits are allowed and limit-plus-one fails typed before fingerprint
+    construction.
 13. **B-013:** Every present MCP input or output schema must have a JSON object
     at its root; a root boolean, array, string, number, or null fails typed
     before canonicalization or digest construction. Boolean schemas remain
@@ -425,8 +480,10 @@ facts in snapshots or through a CLI.
     the closed order-insensitive schema-keyword locations `required`, `type`,
     `enum`, `allOf`, `anyOf`, `oneOf`, and each property value beneath
     `dependentRequired` are sorted, and schema-valued children are traversed as
-    schemas. `additionalItems` is a schema-valued child when the legacy array
-    form of `items` is used. Ordered schema locations such as `prefixItems`, all
+    schemas. Under legacy `dependencies`, each object or boolean property value
+    enters schema context and each array property value must be a string set;
+    other shapes fail typed. `additionalItems` is a schema-valued child when
+    the legacy array form of `items` is used. Ordered schema locations such as `prefixItems`, all
     unknown/vendor-extension arrays, and instance-valued annotations including
     `default`, `const`, `examples`, and `example` preserve array order at every
     depth. A key named `enum`, `required`, or `oneOf` inside annotation data is
@@ -439,14 +496,22 @@ facts in snapshots or through a CLI.
     array-form `items` traverses schemas while retaining tuple order.
 
     Resource limits are fixed by v0.1 and are not caller-adjustable. For each
-    present schema, raw schema bytes and canonical bytes are each at most
-    1,048,576; nesting depth at most
-    64; total JSON nodes and cumulative decoded string bytes at most 65,536 and
-    1,048,576 respectively; and any single object or array at most 4,096
-    entries. Exact limits are valid. Raw size is checked before parsing; the
-    duplicate-aware visitor counts depth, nodes, strings, and container entries;
-    canonicalization and set sorting recheck depth, nodes, and canonical-byte
-    budget. A limit-plus-one condition returns a closed typed limit error,
+    present schema: raw bytes are at most 1,048,576; canonical bytes at most
+    786,432; nesting depth at most 64; total JSON nodes at most 65,536;
+    cumulative decoded-string UTF-8 bytes at most 524,288; and any single
+    object or array at most 4,096 entries. Exact limits are valid.
+
+    Depth is the number of JSON value nodes on a root-to-value path, with the
+    root at depth 1. Every JSON value, including the root, object member value,
+    and array element, counts as one node; object keys are not nodes. Decoded
+    string bytes count each object key and string value after JSON unescaping,
+    once per occurrence. Container entries count direct object members or array
+    elements. On entering a value the visitor checks depth, then increments and
+    checks nodes; before accepting a member/element it increments and checks
+    that container's entries; after decoding a key or string value it adds and
+    checks its UTF-8 bytes. Raw size is checked first; canonical-byte budget is
+    checked only after duplicate-aware parse and structural budgets succeed.
+    A limit-plus-one condition returns its exact closed typed limit error,
     emits no digest or envelope, and cannot panic or overflow the stack.
 14. **B-014:** The envelope `fingerprint_digest` covers the exact subject,
     payload schema version, and every behavior-affecting typed payload fact.
@@ -516,7 +581,7 @@ facts in snapshots or through a CLI.
 | `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary, so no child was started. |
 | `version_probe` | `containment_unavailable` | Required pre-spawn process supervision could not be established, so no child was started; the name does not claim non-escapable containment on supported platforms. |
 | `version_probe` | `handle_execution_unavailable` | A Unix platform with process-group supervision cannot execute the retained authorized handle without reopening its pathname, so no anchor or target child was started. |
-| `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join failed; every created helper was reaped and the affected target handle exec was never attempted. |
+| `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join/working-directory entry failed; the closed setup stage identifies which, every created helper was reaped, and the affected target handle exec was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
 | `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
 | `version_probe` | `lingering_process_group` | The root exited but a non-anchor member remained in the anchored Unix process group; version success was suppressed and cleanup started. |
@@ -536,22 +601,24 @@ facts in snapshots or through a CLI.
 
 ### Unix Bare-Name Attempt Vocabulary
 
-`RuntimeResolutionAttempt` exists for every Unix candidate. Absolute and
-qualified commands have exactly one entry; bare-name entries are ordered
-exactly like the first at most 64 sanitized `PATH` entries. It contains a
-candidate digest, one closed exec sequence (`none`, `single`, or
+`RuntimeResolutionAttempt` exists for every Unix candidate. The payload's
+closed `command_form` makes absolute and qualified commands distinguishable
+from a single-entry bare search. Absolute and qualified commands have exactly
+one entry; bare-name entries are ordered exactly like the first at most 64
+sanitized `PATH` entries. Each attempt contains a candidate digest, one closed
+exec sequence (`none`, `single`, or
 `etxtbsy_then_checkpoint_after_150_ms`), and one closed outcome:
 
 | Outcome | Meaning |
 | --- | --- |
-| `absent` | Candidate open returned exact not-found/not-a-directory semantics; search continues. |
-| `not_regular` | Opened candidate is not a regular file; search continues without a global identity failure. |
-| `not_executable` | Opened candidate lacks required mode bits; search continues without a global identity failure. |
+| `absent` | Preliminary observation or authoritative open returned exact `ENOENT`/`ENOTDIR`; a bare search continues, while the sole absolute/qualified attempt terminates as `path_not_found`. |
+| `not_regular` | Opened candidate is not a regular file; a bare search skips without a global identity failure, while an absolute/qualified attempt is terminal and requires `identity/not_regular_file`. |
+| `not_executable` | Opened candidate lacks required mode bits; a bare search skips without a global identity failure, while an absolute/qualified attempt is terminal and requires `identity/not_executable`. |
 | `inspection_failed` | Open or later inspection failed; this is terminal and requires the matching B-008 identity failure. |
 | `inspection_target` | Configuration-source or resolved-target repository policy retained this first authorized inspection identity and stopped without exec. |
 | `authorization_unavailable` | Final-target repository/worktree classification could not be proven; this is terminal and requires `target_authorization_unavailable`. |
 | `handle_execution_unavailable` | No safe retained-handle exec primitive exists; this is terminal, uses no exec sequence, and requires the matching version-probe failure. |
-| `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join failed, every created helper was reaped, and the affected target never attempted handle exec; this is terminal and requires the matching version-probe failure. |
+| `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join/working-directory entry failed, every created helper was reaped, and the affected target never attempted handle exec; this is terminal and requires the matching version-probe failure and exact setup stage. |
 | `retry_not_authorized` | After first exec returned `ETXTBSY`, the repeated checkpoint classified the target as repository-owned; requires `probe_not_authorized` with exact reason `resolved_target_repository` and forbids a second exec. |
 | `retry_authorization_unavailable` | After first exec returned `ETXTBSY`, the repeated checkpoint could not prove target authorization; requires `target_authorization_unavailable` and forbids a second exec. |
 | `exec_eacces` | Direct retained-handle exec returned exact `EACCES`; final identity is discarded and search continues. |
@@ -574,8 +641,12 @@ multiple terminal outcomes, `inspection_target` without
 `exec_failed` without `spawn_failed`, `exec_started` with a spawn failure, or
 `bare_eacces_exhausted` unless the final non-skipped attempt is `exec_eacces`
 and no final executable identity exists. `candidate_limit_exceeded` requires
-exactly 64 nonterminal attempts. `path_not_found` permits only skipped outcomes
-and no inspection or selected identity. `none` is required for outcomes that
+`unix_bare` and exactly 64 nonterminal attempts. For `unix_bare`,
+`path_not_found` permits only skipped `absent`, `not_regular`, and
+`not_executable` outcomes and no identity failure. For `unix_absolute` or
+`unix_qualified`, it permits exactly one `absent`; a sole `not_regular` or
+`not_executable` is terminal and requires its matching identity failure.
+`none` is required for outcomes that
 terminate before any direct exec; an initial `inspection_failed` or
 `handle_execution_unavailable` uses `none`.
 An initial `supervision_setup_failed` requires `none`; `single` is required for
@@ -584,8 +655,9 @@ an ordinary one-exec outcome.
 repeated authorization/identity checkpoint. It permits
 `retry_not_authorized`, `retry_authorization_unavailable`, or
 `inspection_failed` without a second helper, and
-`supervision_setup_failed` when the second helper's group join fails before its
-target handle exec; `exec_eacces` for a bare name, `exec_failed`, or `exec_started` proves
+`supervision_setup_failed` when the second helper's group join or retained
+working-directory entry fails before target handle exec; `exec_eacces` for a
+bare name, `exec_failed`, or `exec_started` proves
 the second target exec was attempted. It is rejected for every initial skip,
 inspection-only, or authorization-unavailable outcome.
 Absolute/qualified attempts reject `exec_eacces`, because their `EACCES` is
@@ -603,7 +675,10 @@ terminal `exec_failed`.
       aliases, or pre-encoded hex into component identity; an exhaustive
       mapping test covers every workflow `RuntimeKind` without reversing the
       crate dependency direction. Container and microVM inputs fail before any
-      host resolution, file access, or process creation.
+      host resolution, file access, or process creation. Restricted sandbox
+      modes and any allowed-write-path narrowing fail
+      `sandbox_parity_unavailable` at the same boundary; only the exact
+      passthrough sandbox state is serialized.
 - [ ] Source fixtures prove repository-, user-, admin-, system-, runtime-, and
       genuinely runner-owned runtime/MCP components keep identical component
       IDs when observation strengthens to `runner_observed`; repository-owned
@@ -630,7 +705,11 @@ terminal `exec_failed`.
       `ETXTBSY`, terminal `ENOEXEC` without `/bin/sh`, terminal other errors,
       and no search fallback for absolute or qualified commands. Injected open
       denial is `open_failed`, mutually exclusive with handle-based failures,
-      and never leaks OS diagnostics.
+      and never leaks OS diagnostics. Exact `ENOENT`/`ENOTDIR` during open
+      remains `absent`; bare search continues, while an absolute/qualified sole
+      candidate becomes `path_not_found`. Existing non-regular or
+      mode-ineligible absolute/qualified paths retain their matching identity
+      failure instead of masquerading as not found.
 - [ ] Unix bare-name PATH-unset fixtures return `path_unusable` without
       observing a default search path, while absolute and qualified commands
       remain representable; Windows conformance compares the frozen resolver
@@ -656,7 +735,14 @@ terminal `exec_failed`.
       and parent PATH.
 - [ ] Unix launch fixtures prove bare, qualified, and absolute probes pass the
       retained authorized handle to the no-path exec primitive while preserving
-      the exact configured command bytes as `argv[0]`.
+      the exact configured command bytes as `argv[0]`. The parent opens the
+      declared child directory once, fixed working-directory spelling/identity
+      digests enter the payload, both initial and retry helpers `fchdir` that
+      retained handle, and injected `fchdir` failure is stage-tagged, reaped,
+      and cannot exec or PATH-fallback. Replacing the configured cwd pathname
+      after that open proves qualified and relative-PATH observation, initial
+      open, both checkpoints, and initial/retry helpers all remain anchored to
+      the same retained directory identity.
 - [ ] A Unix interpreter-launcher fixture proves that sanitized child `PATH` is
       identical for resolution and child execution, while a setup-only secret
       named `NPM_ACCESS` is absent from the child and from serialized facts.
@@ -721,7 +807,9 @@ terminal `exec_failed`.
       server/tool suffix parsing, absent tool component integrity, exact
       tool/description sensitivity, and distinct absence, empty, spaces, tabs,
       and newlines; exact 1,024-byte and rejected 1,025-byte stable keys are
-      checked before locator expansion.
+      checked before locator expansion. Absent, empty, standard-hint, title,
+      vendor-value, and ordered-array annotation fixtures remain distinct under
+      the bounded raw-object contract without inferring ASC capabilities.
 - [ ] Schema fixtures cover required `inputSchema` and absent, present,
       malformed, non-object, exact-limit, and limit-plus-one `outputSchema`;
       reject every non-object root before canonicalization and
@@ -733,14 +821,17 @@ terminal `exec_failed`.
       order and `additionalItems` remains schema context; every
       `dependentRequired` property array is a canonical string set; nested
       `contentSchema.required` and `contentSchema.oneOf` canonicalize in schema
-      context.
+      context; legacy `dependencies` object/boolean values enter schema context
+      and its string-array values are canonical sets.
 - [ ] Duplicate JSON keys and malformed raw schemas fail typed before digesting,
       and public API/call-site audit proves no generic serializable or
       `serde_json::Value` evidence constructor exists.
-- [ ] Tool-name, description, raw-schema, depth, node, decoded-string,
-      per-container, and canonical-byte limit fixtures cover exact limits and
-      limit-plus-one; deep/wide hostile input fails typed without a digest,
-      envelope, panic, unbounded allocation, or stack overflow.
+- [ ] Tool-name, description, annotation, raw-schema, depth, node,
+      decoded-string, per-container, and canonical-byte limit fixtures cover
+      exact limits and limit-plus-one. Independent fixtures pin root depth one,
+      value-only node counts, decoded object-key plus string-value bytes, and
+      direct container entries; deep/wide hostile input fails typed without a
+      digest, envelope, panic, unbounded allocation, or stack overflow.
 - [ ] Independent digest fixtures freeze the exact B-014 domain, all three
       `u64` frames, canonical string escaping, raw JSON number-token
       preservation, both normative framing vectors, and one complete valid
