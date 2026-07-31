@@ -3,7 +3,7 @@ use harness_workflow::runtime::{
     build_declarative_definition, resolve_declarative_definition, DecisionValidator,
     DeclarativeDefinitionResolution, WorkflowCancellationCleanupOutcome, WorkflowCommand,
     WorkflowCommandType, WorkflowDecision, WorkflowInstance, WorkflowRuntimeStore,
-    PROMPT_TASK_DEFINITION_ID,
+    WorkflowTerminalState, PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -87,8 +87,10 @@ async fn cancel_submission_instance(
     correlation_id: &str,
 ) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
     if instance.is_terminal() {
-        let (decision_name, remove_prompt) = cancellation_cleanup_policy(&instance);
-        finish_cancellation_cleanup(store, &mut instance, decision_name, remove_prompt).await?;
+        if instance.terminal_state() == Some(WorkflowTerminalState::Cancelled) {
+            let (decision_name, remove_prompt) = cancellation_cleanup_policy(&instance);
+            finish_cancellation_cleanup(store, &mut instance, decision_name, remove_prompt).await?;
+        }
         return Ok(RuntimeSubmissionCancelOutcome::AlreadyTerminal(instance));
     }
     let is_prompt = instance.definition_id == PROMPT_TASK_DEFINITION_ID;
@@ -428,6 +430,20 @@ mod tests {
             anyhow::bail!("reopened workflow command should remain queryable");
         };
         assert_eq!(reopened_command.status, WorkflowCommandStatus::Pending);
+
+        let mut completed = reopened;
+        completed.state = "done".to_string();
+        completed.version += 1;
+        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &completed).await?;
+        let outcome = cancel_submission_by_workflow_id(&store, &workflow.id).await?;
+        assert!(matches!(
+            outcome,
+            RuntimeSubmissionCancelOutcome::AlreadyTerminal(_)
+        ));
+        let Some(completed_command) = store.get_command(&reopened_command_id).await? else {
+            anyhow::bail!("completed generation command should remain queryable");
+        };
+        assert_eq!(completed_command.status, WorkflowCommandStatus::Pending);
         Ok(())
     }
 }
