@@ -724,4 +724,5 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
     Ok(())
 }
 
+mod restart_suppression;
 mod suppression;

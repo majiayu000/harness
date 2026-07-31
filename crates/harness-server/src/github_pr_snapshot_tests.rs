@@ -1,5 +1,39 @@
 use super::*;
 
+async fn spawn_graphql_responses(
+    responses: Vec<String>,
+) -> anyhow::Result<(String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let received_server = std::sync::Arc::clone(&received);
+    tokio::spawn(async move {
+        for response_body in responses {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 32_768];
+            let Ok(read) = socket.read(&mut buf).await else {
+                return;
+            };
+            received_server
+                .lock()
+                .await
+                .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok((format!("http://{addr}"), received))
+}
+
 fn ready_pr() -> Value {
     json!({
         "number": 77,
@@ -156,6 +190,206 @@ fn pr_remote_fact_hash_ignores_observed_at() -> anyhow::Result<()> {
 
     assert_eq!(left.fact_hash, right.fact_hash);
     assert_ne!(left.facts["observed_at"], right.facts["observed_at"]);
+    Ok(())
+}
+
+#[test]
+fn pr_remote_fact_hash_tracks_check_run_identity() -> anyhow::Result<()> {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let mut first_pr = ready_pr();
+    first_pr["statusCheckRollup"] = json!({
+        "state": "FAILURE",
+        "contexts": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "__typename": "CheckRun",
+                "id": "CR_first",
+                "databaseId": 101,
+                "name": "Test",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+            }]
+        }
+    });
+    let mut second_pr = first_pr.clone();
+    second_pr["statusCheckRollup"]["contexts"]["nodes"][0]["id"] = json!("CR_second");
+    second_pr["statusCheckRollup"]["contexts"]["nodes"][0]["databaseId"] = json!(102);
+    second_pr["statusCheckRollup"]["contexts"]["nodes"][0]["detailsUrl"] =
+        json!("https://github.com/owner/repo/actions/runs/102");
+
+    let first = normalize_github_pr_snapshot(&target, &first_pr)?;
+    let second = normalize_github_pr_snapshot(&target, &second_pr)?;
+
+    assert_eq!(first["status_check_contexts"][0]["id"], "CR_first");
+    assert_eq!(second["status_check_contexts"][0]["id"], "CR_second");
+    let first = GitHubPrSnapshotArtifacts {
+        raw_pr: first_pr,
+        normalized_snapshot: first,
+    }
+    .remote_fact_snapshot()?;
+    let second = GitHubPrSnapshotArtifacts {
+        raw_pr: second_pr,
+        normalized_snapshot: second,
+    }
+    .remote_fact_snapshot()?;
+    assert_ne!(first.fact_hash, second.fact_hash);
+    Ok(())
+}
+
+#[test]
+fn github_pr_snapshot_query_requests_check_run_identity() {
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("contexts(first: 100)"));
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("... on CheckRun"));
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("databaseId"));
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("... on StatusContext"));
+}
+
+#[tokio::test]
+async fn fetches_all_status_check_context_pages() -> anyhow::Result<()> {
+    let mut first_pr = ready_pr();
+    first_pr["statusCheckRollup"] = json!({
+        "id": "SCR_rollup",
+        "state": "FAILURE",
+        "contexts": {
+            "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"},
+            "nodes": [{
+                "__typename": "CheckRun",
+                "id": "CR_first",
+                "databaseId": 101,
+                "name": "Test 1",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+            }]
+        }
+    });
+    let responses = vec![
+        json!({
+            "data": {
+                "repository": {
+                    "pullRequest": first_pr
+                }
+            }
+        })
+        .to_string(),
+        json!({
+            "data": {
+                "node": {
+                    "contexts": {
+                        "pageInfo": {"hasNextPage": false, "endCursor": "cursor-2"},
+                        "nodes": [{
+                            "__typename": "CheckRun",
+                            "id": "CR_second",
+                            "databaseId": 102,
+                            "name": "Test 2",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE",
+                            "detailsUrl": "https://github.com/owner/repo/actions/runs/102"
+                        }]
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ];
+    let (graphql_url, received) = spawn_graphql_responses(responses).await?;
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+
+    let artifacts =
+        fetch_github_pr_snapshot_with_client(&reqwest::Client::new(), &target, None, &graphql_url)
+            .await?;
+
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts_complete"],
+        true
+    );
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let received = received.lock().await;
+    assert_eq!(received.len(), 2);
+    assert!(received[1].contains(r#""after":"cursor-1""#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn caps_status_check_context_pages_and_marks_snapshot_incomplete() -> anyhow::Result<()> {
+    let mut first_pr = ready_pr();
+    first_pr["statusCheckRollup"] = json!({
+        "id": "SCR_rollup",
+        "state": "FAILURE",
+        "contexts": {
+            "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"},
+            "nodes": [{
+                "__typename": "CheckRun",
+                "id": "CR_1",
+                "databaseId": 101,
+                "name": "Test 1",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+            }]
+        }
+    });
+    let mut responses = vec![json!({
+        "data": {
+            "repository": {
+                "pullRequest": first_pr
+            }
+        }
+    })
+    .to_string()];
+    for page in 2..=4 {
+        responses.push(
+            json!({
+                "data": {
+                    "node": {
+                        "contexts": {
+                            "pageInfo": {
+                                "hasNextPage": true,
+                                "endCursor": format!("cursor-{page}")
+                            },
+                            "nodes": [{
+                                "__typename": "CheckRun",
+                                "id": format!("CR_{page}"),
+                                "databaseId": 100 + page,
+                                "name": format!("Test {page}"),
+                                "status": "COMPLETED",
+                                "conclusion": "FAILURE",
+                                "detailsUrl": format!(
+                                    "https://github.com/owner/repo/actions/runs/{}",
+                                    100 + page
+                                )
+                            }]
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+    }
+    let (graphql_url, received) = spawn_graphql_responses(responses).await?;
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+
+    let artifacts =
+        fetch_github_pr_snapshot_with_client(&reqwest::Client::new(), &target, None, &graphql_url)
+            .await?;
+
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts_complete"],
+        false
+    );
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts"]
+            .as_array()
+            .map(Vec::len),
+        Some(4)
+    );
+    assert_eq!(received.lock().await.len(), 4);
     Ok(())
 }
 

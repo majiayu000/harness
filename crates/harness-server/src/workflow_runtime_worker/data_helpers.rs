@@ -225,9 +225,12 @@ pub(super) struct PrFeedbackChildData<'a> {
     pub issue_number: Option<u64>,
     pub pr_number: u64,
     pub pr_url: Option<&'a str>,
+    pub expected_base_ref: Option<&'a str>,
     pub parent_workflow_id: &'a str,
     pub runtime_job_id: &'a str,
     pub command_id: &'a str,
+    pub remote_fact_hash: Option<&'a str>,
+    pub remote_fact_activity_at: Option<&'a str>,
 }
 
 pub(super) fn merge_pr_feedback_child_data(
@@ -243,6 +246,18 @@ pub(super) fn merge_pr_feedback_child_data(
         object.insert("issue_number".to_string(), json!(input.issue_number));
         object.insert("pr_number".to_string(), json!(input.pr_number));
         object.insert("pr_url".to_string(), json!(input.pr_url));
+        object.insert(
+            "expected_base_ref".to_string(),
+            json!(input.expected_base_ref),
+        );
+        object.insert(
+            "remote_fact_hash".to_string(),
+            json!(input.remote_fact_hash),
+        );
+        object.insert(
+            "remote_fact_activity_at".to_string(),
+            json!(input.remote_fact_activity_at),
+        );
         object.insert(
             "parent_workflow_id".to_string(),
             json!(input.parent_workflow_id),
@@ -390,6 +405,30 @@ mod tests {
         );
 
         assert_eq!(activity_name(&job), "start_child_workflow");
+    }
+
+    #[test]
+    fn pr_feedback_child_data_preserves_remote_fact_metadata() {
+        let data = merge_pr_feedback_child_data(
+            json!({}),
+            PrFeedbackChildData {
+                project_id: "/project",
+                repo: Some("owner/repo"),
+                issue_number: Some(123),
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77"),
+                expected_base_ref: Some("release"),
+                parent_workflow_id: "parent",
+                runtime_job_id: "runtime-job",
+                command_id: "command",
+                remote_fact_hash: Some("sha256:fact"),
+                remote_fact_activity_at: Some("2026-06-10T00:00:00Z"),
+            },
+        );
+
+        assert_eq!(data["remote_fact_hash"], "sha256:fact");
+        assert_eq!(data["remote_fact_activity_at"], "2026-06-10T00:00:00Z");
+        assert_eq!(data["expected_base_ref"], "release");
     }
 
     #[tokio::test]

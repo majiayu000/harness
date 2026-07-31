@@ -603,8 +603,8 @@ impl WorkflowRuntimeStore {
         limit: Option<i64>,
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
         let limit = limit.map(|value| value.clamp(1, 500));
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data::text FROM workflow_instances
+        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT data::text, updated_at FROM workflow_instances
              WHERE parent_workflow_id = $1
              ORDER BY updated_at DESC
              LIMIT COALESCE($2, 2147483647)",
@@ -614,7 +614,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
             .collect()
     }
 
