@@ -357,6 +357,18 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
         .get("pr_url")
         .and_then(Value::as_str)
         .or_else(|| parent.data.get("pr_url").and_then(Value::as_str));
+    let remote_fact_hash = command.get("remote_fact_hash").and_then(Value::as_str);
+    let remote_fact_activity_at = command
+        .get("remote_fact_activity_at")
+        .and_then(Value::as_str);
+    let expected_base_ref = ["expected_base_ref", "target_base_ref", "base_ref"]
+        .into_iter()
+        .find_map(|field| {
+            command
+                .get(field)
+                .and_then(Value::as_str)
+                .or_else(|| parent.data.get(field).and_then(Value::as_str))
+        });
     let issue_number = command
         .get("issue_number")
         .and_then(Value::as_u64)
@@ -393,9 +405,12 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             issue_number,
             pr_number,
             pr_url,
+            expected_base_ref,
             parent_workflow_id: parent.id.as_str(),
             runtime_job_id: job.id.as_str(),
             command_id: job.command_id.as_str(),
+            remote_fact_hash,
+            remote_fact_activity_at,
         },
     );
     let inherited_trust = inherit_author_trust_class(&mut child.data, &parent.data)?;
@@ -439,6 +454,7 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
                 "pr_url": pr_url,
                 "issue_number": issue_number,
                 "repo": repo,
+                "expected_base_ref": expected_base_ref,
             }),
         )
         .await?;
@@ -466,6 +482,7 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
                 pr_url,
                 issue_number,
                 repo,
+                expected_base_ref,
                 parent_workflow_id: Some(parent.id.as_str()),
                 summary: "PR feedback child workflow requested runtime inspection.",
             },
