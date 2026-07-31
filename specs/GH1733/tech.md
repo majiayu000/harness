@@ -87,9 +87,9 @@ the typical target is 200-400 lines. `stack/mod.rs` and `harness-agents/lib.rs`
 only expose the two facades. The one authorized server-file change is a
 `#[cfg(test)]` contract test described below; it adds no production import,
 mapping, call site, or consumer. `harness-agents` adds a direct dependency on
-the already pinned workspace `libc` solely for Unix no-shell process-group and
-retained-handle exec primitives. This adds no package/version and must not
-change `Cargo.lock`.
+the already pinned workspace `libc` solely for Linux no-shell process-group,
+pidfd, ptrace exec-stop, and `execveat(AT_EMPTY_PATH)` primitives. This adds no
+package/version and must not change `Cargo.lock`.
 
 ## Strict Fingerprint Envelope
 
@@ -357,10 +357,17 @@ command is never serialized and the value never becomes ASC-001 integrity.
 The configured child working-directory spelling uses the same helper with
 domain
 `b"harness_runtime_working_directory_v0_1\0"` and enters the payload as
-`working_directory_digest`. On Unix, after the isolation and sandbox gates but
-before executable resolution, the producer opens the directory once with
-`O_RDONLY | O_DIRECTORY | O_CLOEXEC`, requires authoritative directory handle
-metadata, and retains that descriptor for every target helper. It records
+`working_directory_digest`. After the isolation and sandbox gates, Linux v0.1
+first proves `pidfd_open`, `pidfd_send_signal`, `/proc` membership enumeration,
+and the kill-isolated observation protocol are available, reserves the
+runtime-independent owner, and starts the active deadline. macOS, other Unix,
+and Windows return typed no-envelope producer error
+`ContainmentUnavailable(UnsupportedPlatform)` before cwd observation. On
+supported Linux, an observation subprocess opens the directory once with
+`O_RDONLY | O_DIRECTORY | O_CLOEXEC`, returns the descriptor over the private
+fixed-frame socket using `SCM_RIGHTS`, and the parent retains it for every later
+observation and target helper. Authoritative directory handle metadata is
+required. It records
 
 ```text
 SHA-256(
@@ -415,14 +422,19 @@ On Unix:
 - every other failure to open an otherwise statically eligible candidate stops
   with `identity/open_failed`, because skipping an unreadable execute-only
   candidate could select a different executable than the adapter;
-- after handle inspection and the pre-spawn checkpoint, `probe.rs` uses
-  `fexecve` or an exact no-path equivalent from the direct workspace `libc`
-  dependency on the retained authorized handle, with fixed arguments and no
-  shell; `argv[0]` retains the exact original configured command `OsStr` units
-  used by the adapter;
-- path-based `execve` after authorization is forbidden; a Unix platform on
-  which process-group supervision is otherwise available but no supported
-  retained-handle exec primitive exists records
+- after handle inspection and the pre-spawn checkpoint, `probe.rs` keeps
+  `FD_CLOEXEC` on the retained authorized handle and uses direct
+  `execveat(..., AT_EMPTY_PATH)` from the existing workspace `libc` dependency
+  under a `PTRACE_O_TRACEEXEC` parent trace, with fixed arguments and no shell;
+  interpreter-script exec fails before interpreter execution because the script
+  descriptor closes on exec; a successful native exec stops at
+  `PTRACE_EVENT_EXEC` before its first instruction, and only matching stopped-
+  image strong identity plus a retained-handle re-hash under kernel write denial
+  allows resume; `argv[0]` retains the exact original configured command
+  `OsStr` units used by the adapter;
+- path-based `execve` after authorization is forbidden; a Linux platform on
+  which process-group supervision is otherwise available but no verified
+  traced retained-handle `execveat(AT_EMPTY_PATH)` primitive exists records
   `handle_execution_unavailable` before anchor or target creation and never
   falls back to the pathname;
 - only exact `EACCES` from that call advances to the next same-basename
@@ -458,9 +470,21 @@ The tags, counts, and exact units are encoded identically to
 `EtxtbsyThenCheckpointAfter150Ms`. The closed
 `RuntimeResolutionAttemptOutcome` is exactly `Absent`, `NotRegular`,
 `NotExecutable`, `InspectionFailed`, `InspectionTarget`,
-`AuthorizationUnavailable`, `HandleExecutionUnavailable`, `RetryNotAuthorized`,
+`AuthorizationUnavailable`, `InterpreterAuthorizationUnavailable`,
+`HandleExecutionUnavailable`, `RetryNotAuthorized`,
 `RetryAuthorizationUnavailable`, `SupervisionSetupFailed`, `ExecEacces`,
-`ExecFailed`, or `ExecStarted`. `SupervisionSetupFailed` is terminal, requires
+`ExecVerificationFailed`, `ExecFailed`, or `ExecStarted`.
+`InterpreterAuthorizationUnavailable` is terminal, requires
+`version_probe/interpreter_authorization_unavailable`, and uses
+`RuntimeExecSequence::None` when the bounded pre-anchor classifier observes a
+script, dynamic or malformed ELF, wrong-architecture ELF, or any other
+unsupported format, or `Single` / `EtxtbsyThenCheckpointAfter150Ms` for exact
+exec-time `ENOENT`; every form proves no target/loader/interpreter instruction
+ran and any setup helper was reaped. `ExecVerificationFailed` requires
+`identity/identity_changed`, uses `Single` or the retry sequence, and proves the
+exec-stopped child was killed/reaped without resume.
+`SupervisionSetupFailed` is
+terminal, requires
 the matching version-probe failure, uses `RuntimeExecSequence::None` for initial
 anchor/target setup or `EtxtbsyThenCheckpointAfter150Ms` for the second helper
 after an exact first `ETXTBSY`, and proves every created helper was reaped before
@@ -485,7 +509,13 @@ identity failure. `InspectionTarget` is permitted only with
 `probe_not_authorized` and one closed configuration-source or resolved-target
 repository reason, and forbids all exec outcomes. `AuthorizationUnavailable`
 requires exactly `target_authorization_unavailable`, is terminal, and forbids
-exec, fallback, or selected identity. `HandleExecutionUnavailable` requires
+exec, fallback, or selected identity. `InterpreterAuthorizationUnavailable`
+requires exactly the matching failure and its sequence distinguishes
+pre-observed shebang from exact exec-time `ENOENT`; both forbid fallback and
+selected identity. `ExecVerificationFailed` requires `identity_changed`,
+forbids resume/fallback/selected identity, and proves the stopped child was
+reaped.
+`HandleExecutionUnavailable` requires
 exactly `handle_execution_unavailable`, is terminal, uses `None`, and forbids
 anchor/target creation, path fallback, and selected identity. `ExecFailed`
 requires `spawn_failed`; `ExecStarted` forbids a spawn failure and is the only
@@ -497,10 +527,11 @@ terminal, multiple terminals, wrong source/failure pairs, or more than 64
 entries fail parsing. A Windows command form forbids Unix attempt evidence.
 
 `RuntimeExecSequence::None` is required for skips, inspection-only,
+pre-observed unsupported-format interpreter-authorization-unavailable,
 handle-execution-unavailable, initial authorization-unavailable, and initial
-supervision-setup-failed outcomes.
-`Single` is required for an ordinary exec
-outcome. `EtxtbsyThenCheckpointAfter150Ms` is legal only after the first direct
+supervision-setup-failed outcomes. `Single` is required for an ordinary exec
+outcome, exact exec-time interpreter failure, or exec-verification failure.
+`EtxtbsyThenCheckpointAfter150Ms` is legal only after the first direct
 exec returned raw errno `ETXTBSY`; it requires the 150-millisecond monotonic
 delay and the repeated authorization/hash/path-identity checkpoint. If that
 checkpoint changes authorization, `RetryNotAuthorized` requires
@@ -511,7 +542,8 @@ and selected identity. `InspectionFailed` with `identity_changed` likewise
 forbids the second helper. `SupervisionSetupFailed` is also legal in this
 sequence when the second helper is reaped after group join fails and before
 target handle exec; it cannot fall back. Only `ExecEacces` for a bare name,
-`ExecFailed`, or `ExecStarted` proves that the second target exec was attempted.
+`InterpreterAuthorizationUnavailable`, `ExecVerificationFailed`, `ExecFailed`,
+or `ExecStarted` proves that the second target exec was attempted.
 A second `ETXTBSY` is
 `ExecFailed`. Absolute and qualified commands reject `ExecEacces` and represent
 terminal `EACCES` as `ExecFailed`. Cancellation during the delay emits no
@@ -525,27 +557,53 @@ eligible source whose opened target is inside a repository/worktree boundary.
 An earlier open or identity failure wins and no authorization failure is
 appended. Exact `ENOENT`/`ENOTDIR` has precedence over `open_failed` as defined
 above. Unavailable target authorization also stops without exec or fallback.
-Fault-injection tests freeze these paths without requiring CI to mount a
-`noexec` filesystem.
+After target authorization, the observation helper runs a bounded executable
+classifier over the retained handle. It requires exact ELF magic, the current
+architecture's frozen machine/class/endianness tuple, `EI_VERSION` and
+`e_version` equal to `EV_CURRENT`, exact ELF64 `e_ehsize = 64` and
+`e_phentsize = 56`, `ET_EXEC` or `ET_DYN`, and `e_phnum` in
+`1..PN_XNUM` (extended program-header counts are unsupported). v0.1 supports
+only Linux `x86_64` (`EM_X86_64`, `ELFCLASS64`, little-endian) and Linux
+`aarch64` (`EM_AARCH64`, `ELFCLASS64`, little-endian); another build target
+fails the pre-observation capability gate. Checked arithmetic must prove
+`e_phoff + e_phnum * e_phentsize` is within the retained file, and every
+program header is scanned to reject `PT_INTERP`. Other header fields are not
+authorization signals; a later kernel load error remains `spawn_failed`.
+Exact `#!`, dynamic or structurally malformed ELF, wrong-machine ELF, and every
+non-ELF/binfmt format emit
+`InterpreterAuthorizationUnavailable` before anchor or target creation; no
+header bytes, interpreter path, or raw prefix are serialized. If accepted
+bytes become a script after this check,
+`FD_CLOEXEC` retained-handle `execveat(AT_EMPTY_PATH)` fails before interpreter
+execution; exact exec-time `ENOENT` is the same terminal interpreter failure,
+not PATH fallback. This is intentionally conservative because script execution
+or dynamic loading delegates to another executable that this packet does not
+authorize. Fault-injection tests freeze these paths without a `noexec`
+filesystem.
 
 All `CString` argument and environment storage and pointer arrays are built and
-NUL-validated in the parent. The audited Unix pre-exec closure receives the
-retained working-directory descriptor and a retained-handle exec descriptor
-prepared without close-on-exec only where the platform requires that for
-interpreter handling. It uses only async-signal-safe `setpgid`, `fchdir`,
-descriptor close, and retained-handle exec; it never allocates, logs, locks,
-resolves, or reopens a pathname after fork. It joins the anchored group, enters
-the exact retained working directory with `fchdir`, closes the directory and
-other unrelated descriptors, then handle-execs. Its stage-tagged error pipe
-distinguishes group-join, working-directory-entry, and target handle-exec
-failure. A failed `setpgid` or `fchdir` produces
+NUL-validated in the parent. The audited Linux pre-exec closure receives the
+retained working-directory and `FD_CLOEXEC` executable descriptors. It uses
+only async-signal-safe `ptrace(PTRACE_TRACEME)`, `raise(SIGSTOP)`, `setpgid`,
+`fchdir`, descriptor close, and `execveat(AT_EMPTY_PATH)`; it never allocates,
+logs, locks,
+resolves, or reopens a pathname after fork. It first joins the anchored group
+and enters the exact retained working directory, then requests tracing and
+stops. Only after the parent installs `PTRACE_O_TRACEEXEC` does it close
+unrelated descriptors and call `execveat`. Its stage-tagged error pipe
+distinguishes group-join, working-directory-entry, trace-setup, and target
+handle-exec failure. A failed `setpgid`, `fchdir`, ptrace request, stop, or
+option install produces
 `supervision_setup_failed`, and the parent reaps that helper before emitting
-evidence; its closed `RuntimeSupervisionSetupStage` is `GroupJoin` or
-`WorkingDirectoryEnter` (`AnchorSetup` is reserved for anchor failure).
+evidence; its closed `RuntimeSupervisionSetupStage` is `GroupJoin`,
+`WorkingDirectoryEnter`, or `TraceSetup` (`AnchorSetup` is reserved for anchor
+failure). `TraceSetup` covers `PTRACE_TRACEME`, the initial stop, and parent
+`PTRACE_O_TRACEEXEC` installation, all before target exec.
 Successful handle exec never returns. A failed target call returns its
 captured errno through the distinct exec channel, so only exact target
-`EACCES` reaches the fallback branch and a setup errno or `ENOEXEC` cannot reach
-a fallback or shell execution path.
+`EACCES` reaches the fallback branch, exact `ENOENT` maps to terminal
+interpreter authorization unavailable, and a setup errno or `ENOEXEC` cannot
+reach a fallback or shell execution path.
 
 On Windows, v0.1 independently freezes this bare-name resolver: explicit child
 `PATH`, current executable directory, system directory, Windows directory,
@@ -604,10 +662,11 @@ Child `PATH` retains the separate B-010 environment digest. On every platform,
 effective search inputs are represented only by their frozen SHA-256 fields,
 ordered attempt evidence, and resolution outcome; directory contents,
 configured command, candidate paths, and raw search text are never serialized.
-The probe child receives the exact sanitized child `PATH` from the launch
-context so a qualified `#!/usr/bin/env node` launcher uses the declared
-interpreter search. Other environment keys follow only the closed policy below.
-This implements B-004 and the PATH portion of B-010.
+The supported native-binary probe child receives the exact sanitized child
+`PATH` from the launch context. A shebang launcher fails before child
+environment construction can select an interpreter. Other environment keys
+follow only the closed policy below. This implements B-004, B-005, and the PATH
+portion of B-010.
 
 ## Closed Environment Policy
 
@@ -661,9 +720,49 @@ never enter the envelope. These rules implement B-005 and B-010.
 
 ## Handle-Based Executable Observation and TOCTOU Policy
 
-After resolution, one blocking inspection closure opens the selected target
-once and operates on that file handle. On Unix it first uses path metadata only
-to skip a target already known to be non-regular, then calls `libc::open` with
+After owner readiness and active-deadline start, each potentially blocking
+filesystem operation runs in a dedicated Linux observation subprocess. This
+includes cwd open/metadata, candidate `fstatat`/`openat`, final-target boundary
+classification, retained-handle read/hash, exec-stop re-hash/image
+classification, and both path/hash checkpoints. No such operation runs through `spawn_blocking`, a
+Tokio worker, or the owner thread. The ready owner is the sole helper spawner:
+inside one synchronous, non-cancellable critical section it creates the helper,
+opens its pidfd, records reap ownership, and only then exposes the client lease,
+response channel, or transferred descriptor. No await or fallible ownership
+handoff exists between creation and registration. The helper uses only preallocated
+fixed-size frames, bounded buffers, raw syscalls, and an allocation-free,
+non-panicking SHA-256 state; retained descriptors cross the private Unix socket
+with `SCM_RIGHTS`. Protocol truncation, surplus fields, descriptor-count
+mismatch, or a payload above its fixed bound fails typed.
+
+Every observation reply is bounded by its closed stage budget.
+`CapabilityCheck`, `WorkingDirectory`, `Candidate`, `TargetAuthorization`,
+`SourceHash`, `PreSpawnCheckpoint`, `ExecStopCheckpoint`,
+`PostReapCheckpoint`, and `GroupMembership` use the one active deadline;
+`CleanupMembership` uses the separate cleanup deadline. If the applicable
+deadline expires, the owner closes IPC and signals/reaps the exact helper pidfd
+within the remaining cleanup path. The producer returns closed
+`RuntimeFingerprintProduceError::ObservationDeadlineExceeded { stage }` when
+cleanup completes, or
+`ObservationCleanupIncomplete { stage, operation }` after the owner retains an
+unreaped helper. Both return no envelope, so a missing required cwd identity or
+candidate outcome is never fabricated. The closed stages are
+`CapabilityCheck`, `WorkingDirectory`, `Candidate`, `TargetAuthorization`,
+`SourceHash`, `PreSpawnCheckpoint`, `ExecStopCheckpoint`,
+`PostReapCheckpoint`, `GroupMembership`, and `CleanupMembership`; closed
+operations are `Termination`, `Reap`, and `ProtocolClose`. A reply with a
+truncated or oversized frame, surplus fields, descriptor-count mismatch, or an
+unexpected helper exit returns
+`ObservationProtocolInvalid { stage, reason }` with closed reason
+`TruncatedFrame`, `OversizedFrame`, `SurplusFields`,
+`DescriptorCountMismatch`, or `HelperExited`. It is not mislabeled as a
+deadline. Caller cancellation follows the owner cleanup path and returns no
+envelope without fabricating an observation error. These errors contain no PID,
+path, or OS diagnostic.
+
+For the initial target, the subprocess opens the selected target once and
+operates on that file handle. It first uses path metadata only to skip a target
+already known to be non-regular, then calls `libc::open` with
 `O_RDONLY | O_CLOEXEC | O_NONBLOCK`; it never uses a potentially blocking
 ordinary `File::open` on an unclassified path. Handle `fstat` is authoritative
 after open and rejects a FIFO, socket, directory, device, or any race-swapped
@@ -674,8 +773,9 @@ derives execute permission from handle mode bits. Windows extension/search
 eligibility belongs to resolution and successful OS loading belongs to spawn;
 the producer does not claim that an extension or parsed PE header proves
 loadability. On a platform with supervised spawn, a bad-image or access failure
-is `spawn_failed`; Windows v0.1 instead stops at `containment_unavailable`
-before spawn and makes no loadability claim.
+is `spawn_failed`; Windows v0.1 instead returns no-envelope producer error
+`ContainmentUnavailable(UnsupportedPlatform)` before spawn and makes no
+loadability claim.
 
 Failure to create the retained inspection handle, except exact
 `ENOENT`/`ENOTDIR`, is `identity/open_failed`. It occurs before metadata or content facts and is
@@ -687,13 +787,32 @@ For a bare Unix candidate this stops the search fail closed; absolute and
 qualified candidates have no fallback. Exact `ENOENT`/`ENOTDIR` instead maps
 to `Absent` under the command-form rules above.
 
-The closure checks the fixed, non-caller-adjustable
+The helper checks the fixed, non-caller-adjustable
 `RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES = 67_108_864` limit against initial
 metadata and again while reading, stops at byte 67,108,865, does not preallocate
-the maximum, and returns only bounded typed facts. It runs through
-`spawn_blocking`; no
-multi-megabyte file read occurs on a Tokio worker and no `std::fs::read` whole-
-file allocation is allowed.
+the maximum, and returns only bounded typed facts. No multi-megabyte file read
+occurs in the Harness process and no `std::fs::read` whole-file allocation is
+allowed.
+
+After final target authorization, the owner creates the target and remains the
+sole parent-side ptrace controller and wait/reap owner. The target helper's
+audited pre-exec closure is the one exception: it first
+`PTRACE_TRACEME`s and stops itself before exec. The parent verifies that stop,
+sets `PTRACE_O_TRACEEXEC`, and resumes only into retained-handle
+`execveat(AT_EMPTY_PATH)`. Exact `EACCES`/`ETXTBSY`/`ENOEXEC` retain their
+closed attempt semantics; exact `ENOENT` is terminal
+`interpreter_authorization_unavailable` because the retained handle exists and
+the closed-on-exec script/interpreter contract could not be satisfied. A
+successful exec must deliver exactly one `PTRACE_EVENT_EXEC` before the new
+image's first instruction. While it remains stopped and kernel executable
+write denial is active, one registered observation helper re-hashes the
+retained handle and opens/stats `/proc/<pid>/exe` to match the original strong
+identity; no `/proc` image observation runs on the owner or async runtime.
+Mismatch kills/reaps the stopped child and emits `identity_changed`; only an
+exact match may resume. A missing or surplus exec event, abnormal trace state,
+or inability to prove this ordering returns the closed no-envelope producer
+error `ExecutionVerificationUnavailable`; the owner kills/reaps the stopped
+child without resume, and no pathname fallback exists.
 
 The retained strong identity is device/inode from handle metadata on Unix and
 volume serial plus 128-bit `FILE_ID_INFO` from the opened handle on Windows.
@@ -715,31 +834,33 @@ directory descriptor used for initial observation and child `fchdir`.
 Replacing the configured cwd pathname therefore cannot redirect resolution or
 either checkpoint; a race-swapped FIFO or other special file in the retained
 directory cannot block and becomes `identity_changed`.
-All three retained-handle size and digest observations must match, and both
-later path identities must equal the retained handle. A symlink is identified
+Initial, pre-spawn, exec-stop, and post-reap retained-handle size/digest
+observations must match, and both later path identities must equal the retained
+handle. A symlink is identified
 by the opened target, not by mixing link metadata with target bytes.
 
 If any size, digest, or strong-identity comparison fails, the envelope records
 `identity/identity_changed`, emits no version fact, and does not associate the
 version output with the inspected executable digest. A pre-spawn mismatch
 prevents the probe; a post-reap mismatch discards the candidate version. The
-successful correlation is explicitly named `checkpoint_consistent_path`. It
-cannot claim pathname execution is race-free or that the executed bytes equal
-the digest: mutation and restoration entirely between checkpoints remains a
-residual TOCTOU gap. This implements B-006 and its non-goal.
+successful source correlation remains named `checkpoint_consistent_path`;
+mutation and restoration entirely between path checkpoints remains a
+pathname-history gap. The separate `exec_stop_consistent_handle` fact requires
+the verified pre-first-instruction exec stop, stopped-image strong identity,
+and matching retained-handle digest while kernel write denial is active. It
+proves no changed target or interpreter instruction ran before validation and
+that the resumed executable bytes equal the recorded digest. This implements
+B-006 and its non-goal without promoting path history to attestation.
 
 ## Supervised Version Probe
 
 `probe.rs` owns a fingerprint-specific `RuntimeFingerprintProbeSupervisor`
 instead of treating the existing `ManagedChild` drop path as completion
-evidence. The platform matrix is checked before any helper: Windows v0.1
-returns `containment_unavailable` because atomic supervision is unavailable.
-On Unix, after source/target authorization, retained-handle exec capability is
-checked without creating a process. A Unix platform with process-group
-supervision but no no-path handle-exec primitive records
-`handle_execution_unavailable` and returns identity-only evidence; it cannot
-reopen the pathname or create an anchor/target. Before any supervision helper
-or target child is created, `RuntimeFingerprintProbeSupervisor::reserve`
+evidence. A static platform matrix is checked after isolation/sandbox
+validation but before owner reservation: Windows, macOS, and other Unix return
+no-envelope producer error `ContainmentUnavailable(UnsupportedPlatform)`.
+Linux with the required syscall surface reserves
+`RuntimeFingerprintProbeSupervisor::reserve`
 creates a runtime-independent owner thread and waits for its readiness
 handshake under
 `RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE = Duration::from_millis(1_000)`,
@@ -750,29 +871,73 @@ expiry, or caller cancellation closes that channel and starts the separate
 `RUNTIME_FINGERPRINT_OWNER_STOP_JOIN_DEADLINE =
 Duration::from_millis(1_000)` from the stop request. The owner must join within
 that second bound. Start failure, readiness timeout, and stop/join timeout use
-the closed `RuntimeContainmentUnavailableReason` values `OwnerStartFailed`,
-`OwnerReadyTimeout`, and `OwnerStopJoinTimeout`; failure emits
-`containment_unavailable` when an envelope is applicable, no child exists, and
-there is no synchronous fallback.
+the closed producer-error reasons `OwnerStartFailed`, `OwnerReadyTimeout`, and
+`OwnerStopJoinTimeout`; failure returns no envelope, no helper or child exists,
+and there is no synchronous fallback.
 The owner is the lifecycle owner from the outset, not a thread constructed
 during cancellation.
 
-On supported Unix, the ready owner creates a minimal process-group anchor that
-becomes and remains the group leader. Target helpers join the anchor's group
-before target handle exec; null stdin and piped stdout/stderr are unchanged. The
-owner retains the anchor control/reap handle and every root/group identity.
-Platform-specific membership enumeration is capability-checked before anchor
-creation; if an anchored proof cannot be implemented, v0.1 returns
-`containment_unavailable` without a child. Every negative-PGID signal and membership decision
-occurs while the anchor is alive, so the numeric PGID cannot be reused. Normal
-success first proves that the anchor is the only member, then requests anchor
-exit and reaps it. After releasing the anchor, no code may query, signal, or
-make an ownership decision using that numeric PGID. This is deliberately named
+Immediately after owner readiness and before the observation subprocess that
+opens the cwd, one private monotonic
+`RUNTIME_FINGERPRINT_PROBE_DEADLINE = Duration::from_millis(5_000)` starts.
+Under that deadline, the owner runs one bounded system-only capability helper:
+`pidfd_open` plus signal zero, `PTRACE_TRACEME` plus parent
+`PTRACE_O_TRACEEXEC` installation, an invalid-fd `execveat` probe that
+distinguishes `EBADF` from `ENOSYS`, and strong `/proc` process/group/image
+enumeration. The helper is atomically pidfd-owned like every observation helper
+and is reaped before cwd access. Unsupported capability returns no-envelope
+`ContainmentUnavailable` with one closed reason; timeout uses
+`ObservationDeadlineExceeded(CapabilityCheck)`.
+It covers every observation subprocess and handoff, target authorization,
+traced exec-stop verification, anchor setup, every target group join,
+working-directory entry and exec handshake, the optional 150 ms `ETXTBSY`
+delay and second attempt, concurrent output reads, root exit, and the post-reap
+observation subprocess. Expiry while an observation helper owns the current
+stage returns the typed producer error above and no envelope. Expiry during
+trace setup or after a target attempt begins but before the verified
+`exec_started` resume returns `ExecutionVerificationUnavailable`, kills/reaps
+the stopped child without resume, and emits no envelope. Only expiry after that
+verified resume records `version_probe/timeout`.
+
+The ready owner creates a minimal process-group anchor that becomes and remains
+the group leader. Target helpers join the anchor's group before target handle
+exec; null stdin and piped stdout/stderr are unchanged. The owner retains the
+anchor control/reap handle and exact pidfds for the anchor, root, every
+observation helper, and every discovered non-anchor member. Every `/proc`
+membership enumeration and revalidation runs in an owner-created,
+atomically pidfd-registered observation helper, never on the owner or async
+runtime. `RUNTIME_FINGERPRINT_MEMBERSHIP_BATCH = 64` is fixed. Starting from
+the beginning of `/proc` on every pass, the helper opens and revalidates at
+most 64 exact non-anchor pidfds, transfers exactly the declared descriptor
+count in one bounded `SCM_RIGHTS` response, and sets `more = true` as soon as a
+65th matching member is observed. It never drops a member because a batch is
+full. The owner takes ownership of the transferred pidfds, signals that batch
+when cleanup is required, and launches a fresh from-the-beginning pass under
+the same deadline. Repeated rescans, rather than a reusable PID cursor, avoid
+PID-reuse omissions. Completion is legal only when a full pass reports zero
+non-anchor members and `more = false`; continuous churn ends in the applicable
+typed deadline error, never a false empty claim.
+
+Active-path enumeration uses `GroupMembership`; cleanup-path enumeration uses
+`CleanupMembership`. A stalled membership helper returns
+`ObservationDeadlineExceeded` when it is reaped or
+`ObservationCleanupIncomplete` when ownership remains. Malformed protocol or
+unexpected helper exit returns `ObservationProtocolInvalid`; cancellation
+returns no envelope through the owner cleanup path. Every case returns no
+envelope—even when cleanup began from an otherwise envelope-producing probe
+failure. The owner signals only transferred non-anchor pidfds. No code signals
+a negative PGID, so the anchor cannot be collateral damage from group-wide
+`SIGTERM` or `SIGKILL`. Normal success first proves through the bounded helper
+that the anchor is the only member, then requests anchor exit through its
+private control channel and reaps it. Only after the group is proven empty may
+a failed control/reap path signal the anchor through its own pidfd. After
+releasing the anchor, no code may query, signal, or make an ownership decision
+using that numeric PGID. This is deliberately named
 process-group supervision, not descendant containment: a Unix child may call
 `setsid` or change process groups, so the producer can prove only root status
 and observations about processes that remain in the anchored original group.
 It never emits a whole-descendant-tree-empty claim. A non-escapable
-Linux/macOS sandbox is outside this packet, and the closed
+Linux sandbox is outside this packet, and the closed
 source-plus-opened-target policy prevents repository/worktree code from
 reaching this probe.
 
@@ -785,37 +950,40 @@ discards the provisional version, and starts cleanup. Existing timeout,
 overflow, output-read, nonzero/signal, and parse failures also enter cleanup
 whenever their root or original group remains live.
 
-The active probe uses the exact private nonzero
-`RUNTIME_FINGERPRINT_PROBE_DEADLINE = Duration::from_millis(5_000)`. Its
-monotonic timestamp is captured immediately before anchor creation and covers
-anchor setup, every target group join, working-directory entry, and exec
-handshake, the optional 150 ms
-`ETXTBSY` delay and second attempt, concurrent output reads, and root exit.
-Expiry records `version_probe/timeout`.
-
 Under a separate private nonzero five-second monotonic
-`RUNTIME_FINGERPRINT_CLEANUP_DEADLINE`, cleanup signals the negative
-process-group ID, drains or closes both pipes within the remaining budget,
-reaps the root if not already reaped, and verifies that only the still-live
-anchor remains.
+`RUNTIME_FINGERPRINT_CLEANUP_DEADLINE`, envelope-producing probe cleanup signals
+the exact root and helper-transferred non-anchor member pidfds, drains or closes
+both pipes within the remaining budget, reaps the root where possible, and
+verifies through a `CleanupMembership` observation helper that only the
+still-live anchor remains. The owner reserves no unbounded final wait: on
+cleanup-deadline expiry it closes helper IPC, signals the exact helper pidfd,
+and returns the applicable observation producer error while retaining any
+unreaped ownership. Observation-helper cleanup instead returns one of the
+producer errors above and never creates a partial envelope.
 If all operations complete, the envelope carries only the triggering
 `version_probe` failure. If an operation fails or the deadline expires, the
 envelope also carries the applicable closed `lifecycle_cleanup` failure:
 
 | Cleanup kind | Trigger |
 | --- | --- |
-| `termination_failed` | signalling the root/original group failed |
+| `termination_failed` | signalling an exact root, non-anchor member, or post-empty-group anchor pidfd failed |
 | `output_drain_failed` | bounded drain did not complete before read handles were closed |
-| `reap_failed` | root reap failed or was not verified |
+| `reap_failed` | root or anchor reap failed or was not verified |
 | `group_verification_failed` | the owner could not verify that only its live anchor remained |
 
 Original trigger failures sort before cleanup failures. Any cleanup failure
 closes parent read handles, omits version and any terminated/reaped or
 whole-tree claim, and leaves child/group ownership with the already-running
 fingerprint-specific runtime-independent owner before returning evidence. The
-owner emits an `error`, keeps ownership, and continues signalling, reaping, and
+owner emits an `error`, keeps ownership, and continues exact-pidfd signalling,
+reaping, and
 anchored-group verification; later success does not rewrite an already emitted
-fingerprint. It never signals by PGID after the anchor is reaped. This prevents
+fingerprint. It never signals by PGID. A probe child in kernel uninterruptible
+I/O may outlive the cleanup deadline; an observation helper has the separate
+typed no-envelope error contract above. In either case the independent owner
+continues to hold the pidfd and reap obligation while the producer future and
+every in-process worker have returned, and no result claims that process
+terminated. This prevents
 both an escaped pipe holder and a normal root that leaves a same-group child
 from blocking the API or yielding false success while remaining honest about
 the limited process-group evidence.
@@ -827,11 +995,12 @@ on-demand cleanup-thread creation and no synchronous unbounded drop fallback.
 Root-only `kill_on_drop` and the existing detached Tokio `ManagedChild` reaper
 are not completion evidence.
 
-The current non-Unix `ManagedChild` has no equivalent pre-spawn process-group
-or Job Object supervision. Windows v0.1 therefore records
-`version_probe/containment_unavailable` before spawning and emits no version
-fact. The frozen failure name means the required supervision primitive is
-unavailable; it does not imply that Unix process groups are non-escapable.
+The current non-Linux `ManagedChild` has no equivalent pre-observation
+kill-isolated helper plus exact-pidfd supervision. Windows, macOS, and other
+Unix v0.1 therefore return no-envelope producer error
+`ContainmentUnavailable(UnsupportedPlatform)` before cwd observation or spawn.
+The name means the required supervision primitive is unavailable; it does not
+imply that Linux process groups are non-escapable.
 Assigning a Job Object after `Command::spawn` is insufficient. Atomic Windows
 supervision would require suspended low-level launch, no-breakaway
 kill-on-close Job Object assignment, then resume, which is outside this packet.
@@ -854,13 +1023,23 @@ The canonical failure record contains only closed enums and compatible bounded
 details: an exit code, byte limit, timeout milliseconds, closed
 `RuntimeProbeAuthorizationReason`
 (`ConfigurationSourceRepository` or `ResolvedTargetRepository`), closed
-`RuntimeContainmentUnavailableReason`, closed
 `RuntimeSupervisionSetupStage`, or closed cleanup operation where applicable.
 It never contains `io::Error` text, localized diagnostics, raw output, raw
 paths, or environment values. Define closed `RuntimeProbePhase` and
 `RuntimeProbeFailureKind` enums for every row in the B-008 table. Constructors
 validate legal phase/kind/detail combinations. Producers sort by phase rank and
 kind rank and reject duplicates; parsers reject unknown or noncanonical input.
+
+The closed `RuntimeFingerprintProduceError` additionally contains
+`ContainmentUnavailable` with closed platform/owner/capability reasons,
+`ObservationDeadlineExceeded { stage }`,
+`ObservationCleanupIncomplete { stage, operation }`,
+`ObservationProtocolInvalid { stage, reason }`, and
+`ExecutionVerificationUnavailable`. These producer errors never construct a
+partial envelope. The protocol-invalid reasons are the five closed values
+defined above. `ExecutionVerificationUnavailable` covers a missing or
+surplus `PTRACE_EVENT_EXEC`, an abnormal trace transition, and active-deadline
+expiry before verified resume; it carries no PID, path, errno, or OS text.
 
 The result-state matrix is fail closed:
 
@@ -872,14 +1051,18 @@ The result-state matrix is fail closed:
 | later identity failure | bounded opened-handle facts only; no stable executable digest/version pair |
 | source/target repository probe not authorized | one `inspection_target` identity/hash may remain with the closed authorization reason; no selected/executed identity, exec attempt, fallback, child, or version |
 | target authorization unavailable | inspected identity/hash may remain; no selected/executed identity, exec attempt, fallback, child, or version |
-| retained-handle execution unavailable | stable inspected identity may remain; no anchor/target was created, no pathname was reopened for exec, and version is absent |
+| executable/interpreter authorization unavailable before anchor | stable inspected identity/hash may remain; no loader/interpreter lookup, anchor, target, selected identity, or version exists |
+| traced retained-handle execution unavailable | stable inspected identity may remain; no target instruction was allowed to run, no pathname was reopened for exec, and version is absent |
 | Unix bare-name `bare_eacces_exhausted` | configured-command, search, and ordered attempt digests may remain; every inspected-candidate identity is discarded and no final executable identity, child, or version exists |
-| supervision unavailable | stable identity may remain; no child was spawned and version is absent |
-| supervision setup failure | the closed stage is anchor setup, group join, or working-directory entry; every helper was reaped, target handle exec was not attempted, its errno cannot cause PATH fallback, and version is absent |
+| pre-observation supervision unavailable | typed producer error and no envelope; no cwd/executable fact or child exists |
+| supervision setup failure | the closed stage is anchor setup, group join, working-directory entry, or trace setup; every helper was reaped, target handle exec was not attempted, its errno cannot cause PATH fallback, and version is absent |
+| pre-resume execution verification unavailable | typed producer error and no envelope; the owner kills/reaps the stopped child without resume, no target instruction runs, and no pathname fallback occurs |
 | terminal pre-start `spawn_failed` | the inspected target identity may remain, but no selected/executed identity or version exists |
 | post-`exec_started` lifecycle/exit/output failure | the selected/executed identity may remain; version is absent |
 | root exited with a non-anchor member still in the anchored group | `lingering_process_group` is required; selected/executed identity may remain, version is absent, and cleanup must run |
-| cleanup failure | stable identity may remain; version and completed-cleanup claims are absent; independent owner continues |
+| observation timeout | typed producer error and no envelope; the producer future is bounded and the independent owner continues exact helper, root, and member ownership where cleanup is incomplete |
+| invalid observation protocol or helper exit | typed producer error and no envelope; the closed stage/reason is retained, no deadline is fabricated, and the owner continues exact cleanup ownership |
+| probe timeout or cleanup failure | stable identity may remain; version and completed-cleanup claims are absent; the producer future is bounded and the independent owner continues exact child ownership |
 | `identity_changed` after exit | candidate output/version is discarded |
 | caller cancellation | no envelope; cleanup ownership survives Tokio shutdown and is never abandoned |
 | success | stable identity, zero exit, two exact output digests, selected stream, one normalized version, and no failures |
@@ -1005,40 +1188,50 @@ Exact limits are legal; limit-plus-one returns the specific closed
 `McpContractLimitKind` and emits no digest or envelope. Depth 64 keeps recursive
 schema traversal below the fixed safe bound without a new parser or dependency.
 
-The private state machine has these contexts:
+Before entering the private state machine, the duplicate-aware root parser
+selects one closed `McpSchemaDialect`: absent `$schema` and exact
+`https://json-schema.org/draft/2020-12/schema` select `Draft202012`; exact
+`http://json-schema.org/draft-07/schema#` selects `Draft07`. Any other
+root value, a non-string root value, or `$schema` in a nested `Schema` context
+returns `UnsupportedSchemaDialect`. The exact root member remains in canonical
+JSON. v0.1 does not fetch a metaschema or permit an embedded dialect switch.
 
-- `Schema`: an object whose keys may be JSON Schema keywords;
-- `SchemaMap`: values under `$defs`, `definitions`, `properties`,
-  `patternProperties`, and `dependentSchemas` are schemas;
-- `StringSetMap`: every object value under `dependentRequired` must be an array
-  of strings and is sorted by canonical string bytes without deduplication;
-- `LegacyDependenciesMap`: every object value under `dependencies` is either an
+The private state machine carries that dialect through these contexts:
+
+- `Schema(dialect)`: an object whose recognized keywords come only from that
+  dialect;
+- `SchemaMap(dialect)`: schema-valued map children;
+- `StringSetMap(dialect)`: dialect-recognized property-dependency string sets;
+- `LegacyDependenciesMap(Draft07)`: every dependency value is an
   object/boolean schema or an array of strings canonicalized as a set;
-- `SchemaArrayOrdered`: `prefixItems` and legacy array-form `items` traverse
-  elements as schemas but preserve array order;
-- `SchemaArraySet`: `allOf`, `anyOf`, and `oneOf` traverse elements as schemas
-  and sort their canonical bytes; and
-- `InstanceData`: annotation and unknown-extension objects sort object members
-  but preserve arrays recursively.
+- `SchemaArrayOrdered(dialect)`: recognized tuple/prefix children traverse as
+  schemas but preserve array order;
+- `SchemaArraySet(dialect)`: `allOf`, `anyOf`, and `oneOf` traverse as schemas
+  and sort canonical bytes; and
+- `InstanceData`: object members sort but all arrays preserve order recursively.
 
-At `Schema`, `required`, `type`, and `enum` arrays are canonical sets. `enum`
-elements themselves enter `InstanceData`, so an object inside an enum value
-cannot activate schema keywords. `default`, `const`, `examples`, and `example`
-always enter `InstanceData`. Known single-schema locations such as `not`,
-`if`, `then`, `else`, `contains`, `contentSchema`, `propertyNames`,
-`additionalProperties`, `unevaluatedItems`, and `unevaluatedProperties` enter
-`Schema`. At `items`, an
-object or boolean enters `Schema`, an array enters `SchemaArrayOrdered`, and
-any other value is a typed malformed-schema error. `additionalItems` enters
-`Schema` only when the same object has legacy array-form `items`; when `items`
-is absent, object-form, or boolean, `additionalItems` enters `InstanceData`.
-`dependentRequired` enters `StringSetMap`; a non-object, non-array property
-value, or non-string array element fails typed. `dependencies` enters
-`LegacyDependenciesMap`; its own value must be an object, each property value
-must be an object/boolean schema or string array, and every other shape fails
-typed. Unknown and vendor-extension values enter `InstanceData`. Object
-members are sorted in all contexts, but an array is sorted only at the eight
-closed B-013 keyword families.
+In both dialects, `required`, `type`, and `enum` arrays are canonical sets;
+`allOf`, `anyOf`, and `oneOf` enter `SchemaArraySet`. `enum` elements,
+`default`, `const`, `examples`, and `example` enter `InstanceData`.
+`properties` and `patternProperties` are schema maps in both dialects.
+
+For `Draft202012`, `$defs` and `dependentSchemas` are schema maps;
+`dependentRequired` enters `StringSetMap`; `prefixItems` enters
+`SchemaArrayOrdered`; `items` accepts only an object or boolean schema; and
+`contentSchema`, `unevaluatedItems`, and `unevaluatedProperties` are
+single-schema locations. `definitions`, `dependencies`, and
+`additionalItems` are extension instance data. Array-form `items` is a typed
+malformed standard keyword rather than legacy tuple syntax.
+
+For `Draft07`, `definitions` is a schema map, `dependencies` enters
+`LegacyDependenciesMap`, array-form `items` enters `SchemaArrayOrdered`, and
+`additionalItems` enters `Schema` only beside array-form `items`; otherwise it
+is instance data. `$defs`, `dependentSchemas`, `dependentRequired`,
+`prefixItems`, `contentSchema`, `unevaluatedItems`, and
+`unevaluatedProperties` are extension instance data. Unknown/vendor-extension
+values are `InstanceData` in either dialect. Object members sort in all
+contexts, but arrays sort only in the recognized set contexts for the selected
+dialect.
 
 Set sorting uses canonical JSON bytes after child traversal and does not silently
 remove duplicates. Ordered arrays retain their exact order. Tests specifically
@@ -1065,30 +1258,32 @@ owns user-facing collection commands. This is B-016.
 | B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; `sandbox_passthrough_state_is_only_supported_policy`; `restricted_sandbox_fails_before_host_observation`; `narrowed_allowed_write_paths_fail_before_host_observation`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
 | B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `configured_mcp_server_key_accepts_1024_and_rejects_1025_before_expansion`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
 | B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; `runtime_command_form_round_trips_and_rejects_cross_form_outcomes`; `working_directory_spelling_and_unix_identity_digests_have_fixed_vectors`; `working_directory_open_failure_precedes_resolution`; `cwd_path_replacement_keeps_relative_resolution_checkpoints_and_fchdir_on_one_handle`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; `unix_retained_handle_exec_preserves_configured_argv0`; `unix_bare_path_unset_is_path_unusable_without_default_search`; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `etxtbsy_retries_same_candidate_once_after_150_ms`; `etxtbsy_checkpoint_rechecks_authorization_hash_and_path_identity`; `etxtbsy_checkpoint_authorization_change_prevents_second_exec`; `etxtbsy_checkpoint_rejects_configuration_source_reason`; `etxtbsy_checkpoint_unavailable_authorization_prevents_second_exec`; `etxtbsy_retry_group_join_failure_is_reaped_without_exec_or_fallback`; `second_etxtbsy_is_terminal`; `etxtbsy_sequence_rejects_wrong_errno_delay_count_and_outcome`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_search_fallback`; `open_enoent_and_enotdir_are_absent_with_command_form_semantics`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `absolute_and_qualified_nonregular_and_nonexecutable_require_identity_failure`; `runtime_resolution_attempts_round_trip_all_outcomes_and_exec_sequences`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `handle_execution_unavailable_requires_none_and_no_child`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `frozen_windows_search_order_is_compiler_independent`; `current_command_differential_fails_on_frozen_resolver_drift`; `windows_resolution_context_digest_domains_and_vectors_are_fixed`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
-| B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; independent fixed vectors freeze PATH and `CLAUDE_CONFIG_DIR` domains, platform tags, big-endian counts, Unix raw bytes, Windows UTF-16LE, absent/empty distinction, and non-UTF-8 Unix values; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
-| B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `fifo_swap_at_each_checkpoint_is_nonblocking_identity_changed`; `opened_handle_drives_metadata_and_incremental_hash`; `retained_working_directory_handle_survives_path_replacement`; `executable_size_accepts_67108864_and_rejects_67108865`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_after_authorization_executes_retained_handle_not_replacement`; Unix `supervised_platform_without_handle_exec_fails_before_anchor_without_path_fallback`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
-| B-007 | Unix `owner_ready_deadline_bounds_success_delay_and_cancellation`; `owner_stop_join_deadline_is_separate_and_typed`; `owner_stop_join_timeout_is_childless_containment_unavailable`; `ordinary_timeout_reaps_root_and_verifies_only_anchor_remains`; `active_and_cleanup_deadlines_are_distinct_and_fixed`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_reaps_root_then_anchor_without_released_pgid_use`; `every_signal_and_membership_check_has_live_anchor`; `initial_group_setup_failure_is_reaped_without_exec`; `initial_and_retry_fchdir_failure_are_stage_tagged_reaped_without_exec_or_fallback`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `output_cap_rejects_0_and_65537_before_allocation_or_helper`; `output_cap_accepts_1_and_65536`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; Windows `containment_unavailable_prevents_spawn` |
-| B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
+| B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; `direct_and_env_shebangs_fail_before_interpreter_or_anchor`; `interpreter_authorization_unavailable_requires_none_and_no_child`; independent fixed vectors freeze PATH and `CLAUDE_CONFIG_DIR` domains, platform tags, big-endian counts, Unix raw bytes, Windows UTF-16LE, absent/empty distinction, and non-UTF-8 Unix values; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
+| B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `fifo_swap_at_each_checkpoint_is_nonblocking_identity_changed`; `opened_handle_drives_metadata_and_incremental_hash`; `retained_working_directory_handle_survives_path_replacement`; `executable_size_accepts_67108864_and_rejects_67108865`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `all_blocking_observation_uses_kill_isolated_processes`; `owner_is_sole_target_anchor_fork_parent_ptrace_wait_reap_and_helper_spawner_except_target_traceme`; `owner_spawns_and_registers_pidfd_before_exposing_lease`; cancellation injection at every create/register boundary; `observation_protocol_rejects_bad_frames_descriptor_counts_and_helper_exit`; `every_observation_timeout_returns_typed_error_without_envelope`; `active_and_cleanup_membership_stalls_return_no_envelope`; `membership_batch_accepts_64_and_rescans_65_and_larger`; `membership_continuous_churn_expires_without_false_empty`; `candidate_open_boundary_hash_exec_stop_checkpoint_and_membership_timeouts_transfer_exact_pidfd_ownership`; `uninterruptible_helper_never_fabricates_termination`; `native_static_et_exec_and_static_pie_are_accepted`; `pt_interp_wrong_machine_bad_versions_sizes_extended_counts_bounds_and_non_elf_are_rejected_before_anchor`; `fd_cloexec_script_fails_before_interpreter_execution`; `ptrace_exec_stop_precedes_first_instruction`; `exec_stop_identity_and_hash_run_under_kernel_write_denial`; `changed_native_image_is_killed_before_first_instruction`; `missing_surplus_abnormal_and_pre_resume_timeout_never_resume_and_return_no_envelope`; `path_replacement_after_authorization_executes_verified_retained_handle_not_replacement`; Linux `missing_execveat_fails_without_path_fallback`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistent_path_does_not_attest_path_history`; `exec_stop_consistent_handle_attests_executed_digest` |
+| B-007 | Linux `owner_ready_deadline_bounds_success_delay_and_cancellation`; `owner_stop_join_deadline_is_separate_and_typed`; `owner_stop_join_timeout_is_childless_containment_unavailable`; `active_deadline_starts_before_cwd_observation_and_includes_post_reap_checkpoint`; `ordinary_timeout_reaps_root_and_verifies_only_anchor_remains`; `active_and_cleanup_deadlines_are_distinct_and_fixed`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_reaps_root_then_anchor_without_released_pgid_use`; `pidfd_revalidation_precedes_every_non_anchor_signal`; `negative_pgid_signal_is_absent`; `anchor_is_not_signalled_until_group_is_empty`; `initial_group_setup_failure_is_reaped_without_exec`; `initial_and_retry_fchdir_failure_are_stage_tagged_reaped_without_exec_or_fallback`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `output_cap_rejects_0_and_65537_before_allocation_or_helper`; `output_cap_accepts_1_and_65536`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; macOS/other-Unix/Windows `containment_unavailable_prevents_cwd_observation_and_spawn` |
+| B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `observation_deadline_cleanup_and_protocol_errors_are_closed_redacted_distinct_and_have_no_envelope`; `probe_deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `anchor_termination_and_reap_failures_are_typed`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
 | B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `both_streams_are_parsed_before_selection`; `same_version_on_both_streams_is_ambiguous`; `valid_version_with_nonblank_other_stream_is_unparseable`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; `mcp_output_schema_absence_and_presence_are_distinct`; `mcp_annotations_preserve_absent_empty_hints_title_vendor_values_and_ordered_arrays`; `mcp_annotation_hints_do_not_infer_capabilities`; exact-limit and limit-plus-one tool-name/description/annotations fixtures |
-| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `schema_set_locations_reorder_canonically`; `content_schema_traverses_nested_required_and_one_of_as_schema`; `legacy_dependencies_schema_and_string_set_forms_are_context_aware`; `legacy_dependencies_rejects_invalid_shapes`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `object_form_items_traverses_nested_schema`; `object_form_items_required_and_one_of_reorder_canonically`; `legacy_array_items_preserves_tuple_order`; `legacy_additional_items_traverses_schema_context`; `additional_items_without_legacy_array_items_remains_instance_data`; `dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; independent exact counting vectors pin root depth, value nodes, decoded key/value strings, direct entries, raw bytes, and canonical bytes; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
+| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `absent_schema_dialect_defaults_to_draft_2020_12`; `exact_supported_schema_dialects_round_trip`; `unknown_nonstring_and_nested_schema_dialects_fail_typed`; `schema_set_locations_reorder_canonically`; Draft 2020-12 `content_schema_traverses_nested_required_and_one_of_as_schema`; Draft-07 `content_schema_remains_ordered_instance_data`; `draft_07_dependencies_schema_and_string_set_forms_are_context_aware`; `draft_07_dependencies_reject_invalid_shapes`; `draft_2020_12_legacy_keywords_remain_instance_data`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `draft_2020_12_object_items_traverses_nested_schema`; `draft_2020_12_array_items_is_malformed`; `draft_07_array_items_preserves_tuple_order`; `draft_07_additional_items_traverses_schema_context`; `additional_items_without_draft_07_array_items_remains_instance_data`; `draft_2020_12_dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; independent exact counting vectors pin root depth, value nodes, decoded key/value strings, direct entries, raw bytes, and canonical bytes; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
 
 All failure tests assert the absence of a version fact and the absence of raw
 path, PATH, output, environment, and OS-diagnostic text from serialized
-evidence. Ordinary explicit lifecycle tests retain child PIDs/process-group IDs
-and verify root reap plus only-anchor-remains, anchor reap, and no subsequent
-PGID operation when no cleanup failure is recorded. Fault-injection tests cover
+evidence. Ordinary explicit lifecycle tests retain exact helper/root/member
+pidfds plus process-group IDs and verify root reap, only-anchor-remains, anchor
+reap, absence of negative-PGID signals, and no released-PGID operation when no
+cleanup failure is recorded. Fault-injection tests cover
 every cleanup operation, retain
-ownership before returning incomplete evidence, and never claim an escaped
-descendant was contained. Cancellation tests drop the hosting Tokio runtime
+ownership before returning incomplete probe evidence or a typed no-envelope
+observation error, and never claim an escaped descendant was contained.
+Cancellation tests drop the hosting Tokio runtime
 immediately and verify the independent owner continues cleanup. PATH tests
 create multiple same-basename candidates, a directory containing spaces, and
 literal shell metacharacters.
-The qualified `/usr/bin/env`-style child-execution fixture is Unix-only;
-Windows tests stop before spawn with `containment_unavailable`. Schema expected
-digests are fixed independent vectors rather than values generated by the
-production helper under test.
+Direct and `/usr/bin/env` shebang fixtures stop before interpreter or anchor
+creation. macOS, other-Unix, and Windows tests stop before cwd observation with
+`containment_unavailable`. Schema expected digests are fixed independent
+vectors rather than values generated by the production helper under test.
 
 ## Authorized Implementation Surface
 
@@ -1143,13 +1338,16 @@ be unchanged and `cargo tree -p harness-agents -i libc` must show the pinned
 workspace dependency. A call-site audit
 must show that production uses of the new APIs remain confined to their
 defining modules; test uses do not count as consumers. File-length checks must
-show every Rust file below 800 lines. The sandbox parity gate and Unix
+show every Rust file below 800 lines. The sandbox parity gate and Linux
 retained-directory/retained-executable path require mandatory human security
-review for exact `SandboxSpec` passthrough equivalence, descriptor ownership,
-`fchdir` ordering and error staging,
-close-on-exec/interpreter semantics, argument/environment pointers, NUL
-validation, error propagation, proof that authorization cannot fall back to a
-pathname, and proof that `ENOEXEC` never starts a shell. Because the repository
+review for exact `SandboxSpec` passthrough equivalence, observation-process
+fixed-frame/`SCM_RIGHTS` protocol, pidfd ownership and revalidation,
+allocation-free post-fork work, descriptor ownership, `fchdir` ordering and
+error staging, `FD_CLOEXEC` script rejection, ptrace-stop ordering,
+stopped-image identity/hash validation under kernel write denial,
+non-anchor-only signalling, anchor exit ordering, argument/environment pointers, NUL validation, error
+propagation, proof that authorization cannot fall back to a pathname, and proof
+that `ENOEXEC` never starts a shell. Because the repository
 no longer contains the historical SpecRail
 checker, verification must not claim to run a removed script; structural
 review of the manifest and B-001 through B-016 coverage is the current spec
@@ -1212,7 +1410,11 @@ fall back to the unsafe pre-spec PATH/environment behavior.
 - Adding a snapshot or server collector to make the API appear used is rejected:
   ASC-005 owns that consumer and its aggregation semantics.
 
-The residual TOCTOU gap between the final pre-spawn check and OS execution is
-explicit and cannot be promoted to attestation. Platform process-group and
-file-identity capabilities differ; unsupported guarantees must yield the
-applicable typed failure rather than a warning-only fallback.
+The residual source-path history gap between checkpoints is explicit and is
+not promoted to path attestation. Executed-byte attribution instead requires
+`FD_CLOEXEC` retained-handle `execveat(AT_EMPTY_PATH)`, a verified
+`PTRACE_EVENT_EXEC` before the first instruction, stopped-image strong
+identity, and a matching handle hash while kernel write denial is active;
+without every condition, the child is killed before resume. Platform
+process-group and file-identity capabilities differ; unsupported guarantees
+must yield the applicable typed failure rather than a warning-only fallback.

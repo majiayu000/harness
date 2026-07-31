@@ -197,13 +197,31 @@ facts in snapshots or through a CLI.
    `identity/open_failed` and stops. Reaching
    entry 65 before a terminal outcome is
    `path_resolution/candidate_limit_exceeded`. After inspection and the pre-spawn
-   checkpoint, a direct no-shell handle-exec primitive (`fexecve` or an exact
-   platform equivalent) attempts the retained, authorized candidate handle with
-   fixed B-002 arguments. The call's `argv[0]` is the exact original configured
-   command `OsStr` spelling used by the adapter; resolution never substitutes
-   the candidate spelling. No path-based `execve` is permitted after
-   authorization. If a Unix platform on which process-group supervision is
-   otherwise available cannot execute that retained handle,
+   checkpoint, a bounded parser first requires a current-architecture static
+   ELF. Linux `x86_64` accepts only `EM_X86_64`/ELF64/little-endian and Linux
+   `aarch64` only `EM_AARCH64`/ELF64/little-endian. Both require exact ELF
+   magic, `EI_VERSION` and `e_version` `EV_CURRENT`, ELF64 header size 64,
+   program-header entry size 56, `ET_EXEC` or `ET_DYN`, a nonzero
+   non-extended program-header count below `PN_XNUM`, overflow-safe in-file
+   program-header bounds, and no `PT_INTERP`; other build targets fail the
+   capability gate before observation. Scripts, dynamic or structurally
+   malformed ELF, wrong-machine ELF, and every other format fail
+   `interpreter_authorization_unavailable` before anchor creation so neither an
+   ELF loader nor `binfmt_misc` interpreter can run. Linux then keeps
+   `FD_CLOEXEC` on the retained authorized handle and
+   uses direct no-shell `execveat(..., AT_EMPTY_PATH)` under a traced
+   pre-first-instruction exec-stop. `FD_CLOEXEC` makes interpreter-script
+   `execveat` fail before the interpreter can run. A successful native exec
+   must stop at `PTRACE_EVENT_EXEC`; while the kernel's executable write denial
+   is active and before the new image executes an instruction, a registered
+   observation helper re-hashes the retained handle and verifies the stopped
+   image's strong identity through `/proc/<pid>/exe`. Only an exact match
+   resumes. The call's `argv[0]` is the exact
+   original configured command `OsStr` spelling used by the adapter; resolution
+   never substitutes the candidate spelling. No path-based `execve` is
+   permitted after authorization. If a Linux platform on which process-group
+   supervision is otherwise available cannot provide this traced
+   retained-handle primitive,
    `handle_execution_unavailable` is emitted before an anchor or target child;
    path execution is not a fallback. Only an exact target-handle `EACCES` result may
    discard that bare-name candidate and continue to the next same-basename
@@ -211,8 +229,10 @@ facts in snapshots or through a CLI.
    authorization plus the full retained-handle/path identity checkpoint, and
    retries that same retained candidate handle exactly once.
    Identity change prevents retry; a second `ETXTBSY` is terminal
-   `spawn_failed`. `ENOEXEC` is terminal `spawn_failed` and never invokes
-   `/bin/sh`; every other spawn error is terminal. Absolute and qualified
+   `spawn_failed`. Exact retained-handle exec-time `ENOENT` is terminal
+   `interpreter_authorization_unavailable`; `ENOEXEC` is terminal
+   `spawn_failed` and never invokes `/bin/sh`; every other spawn error is
+   terminal. Absolute and qualified
    commands may perform the one same-candidate `ETXTBSY` retry but never search
    or fallback to another candidate. Ordered attempt evidence retains only
    domain-separated candidate
@@ -240,11 +260,23 @@ facts in snapshots or through a CLI.
    boundary. That target is never called selected or executed. An earlier
    open/identity failure remains the sole earliest failure.
 5. **B-005:** The version child receives only the sanitized `PATH` value
-   included in the B-004 launch context so `#!/usr/bin/env` launchers can find
-   their interpreter. No caller can declare or expose another key. Evidence
-   classification comes from the closed B-010 policy, never from a caller
-   string, and every non-`PATH` v0.1 policy key is excluded from the version
-   child. Platform search inputs outside child `PATH` remain explicit
+   included in the B-004 launch context. No caller can declare or expose
+   another key. Because script execution delegates to an interpreter whose own
+   target and transitive launch behavior are not bound by the inspected file
+   identity, v0.1 accepts only a current-architecture static ELF with no
+   `PT_INTERP`. Exact leading `#!`, dynamic/malformed ELF, and any non-ELF
+   format fail closed with
+   `version_probe/interpreter_authorization_unavailable` after target
+   authorization but before anchor or target creation. It never invokes a
+   interpreter or loader and never searches child `PATH` for one. If accepted
+   static bytes change into a script after that check,
+   `FD_CLOEXEC` makes `execveat(AT_EMPTY_PATH)` fail before interpreter
+   execution; exact exec-time `ENOENT` is mapped to the same terminal
+   interpreter failure. A later revision may support scripts only by resolving,
+   retaining, fingerprinting, and authorizing the complete interpreter chain.
+   Evidence classification comes from the closed B-010 policy, never from a
+   caller string, and every non-`PATH` v0.1 policy key is excluded from the
+   version child. Platform search inputs outside child `PATH` remain explicit
    resolution context and are never misrepresented as child environment.
    Every name in `codex.cloud.setup_secret_env` is excluded from both the child
    environment and persisted fingerprint facts before policy matching,
@@ -263,14 +295,42 @@ facts in snapshots or through a CLI.
    filename/search contract, while actual loadability can be proven only by a
    successful supervised spawn. On a platform where process supervision is
    available, a bad image or access error is `spawn_failed`, not a fabricated
-   `not_executable`; Windows v0.1 reaches `containment_unavailable` before that
-   attempt. The producer enforces the fixed, non-caller-adjustable
+   `not_executable`; Windows v0.1 returns typed producer error
+   `containment_unavailable` with no envelope before that attempt. The producer
+   enforces the fixed, non-caller-adjustable
    `RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES = 67_108_864` byte ceiling before
-   and during reading, performs potentially blocking file hashing outside the
-   async
-   executor, and does not allocate the declared maximum eagerly. The retained
-   handle is re-read and re-hashed immediately before spawn and after the child
-   is reaped; all three size and digest observations must match. At both later
+   and during reading, and does not allocate the declared maximum eagerly.
+   Every potentially blocking cwd open, candidate open/stat, boundary
+   classification, content read/hash, and path checkpoint runs in a dedicated
+   Linux observation subprocess, never in `spawn_blocking`, a Tokio worker, or
+   the runtime-independent owner thread. The ready owner synchronously creates
+   each subprocess, acquires its pidfd, and records reap ownership before it
+   exposes any client lease, descriptor, or response channel. That
+   create/register critical section contains no await, cancellation point, or
+   fallible ownership transfer; if the client disappears later, the owner
+   already has cleanup authority. The subprocess uses a fixed, allocation-free
+   syscall protocol and transfers only bounded facts and retained descriptors
+   over a private socket. The one active deadline begins before the first cwd
+   observation and bounds each wait; expiry closes IPC, requests termination
+   through that pidfd, transfers sole ownership to the owner, and returns a
+   closed typed producer error with no envelope, without waiting synchronously
+   for potentially uninterruptible filesystem I/O. The error is
+   `observation_deadline_exceeded` when cleanup completes and
+   `observation_cleanup_incomplete` with a closed stage/operation when it does
+   not. A helper that the kernel has not yet reaped
+   remains explicitly owned and cannot hold the producer future or an
+   in-process worker indefinitely; no evidence claims it was terminated.
+   Platforms without this kill-isolated, strongly identified helper protocol
+   return typed producer error `containment_unavailable` with no envelope before
+   cwd or executable observation.
+   Exact leading `#!` on the retained authorized handle is terminal
+   `interpreter_authorization_unavailable`. The same bounded check rejects any
+   `PT_INTERP`, non-ELF, wrong-architecture, or malformed image. The retained
+   handle is re-read and
+   re-hashed immediately before spawn, at the successful
+   `PTRACE_EVENT_EXEC` stop while kernel write denial is active, and after the
+   child is reaped, within that same active deadline; all four observations
+   must match before version attribution. At both later path
    checkpoints the private candidate reference is reopened with the same Unix
    `O_RDONLY | O_CLOEXEC | O_NONBLOCK` classification as the initial open:
    absolute references use `open`, and working-directory-relative references
@@ -282,9 +342,14 @@ facts in snapshots or through a CLI.
    back to path, timestamps, extension, or a parsed PE header. Replacement,
    in-place content change, or inability to correlate version output with the
    inspected checkpoints emits `identity_changed` and discards version
-   evidence. The correlation is named `checkpoint_consistent_path`: mutation
-   and restoration entirely between checkpoints remains a residual TOCTOU gap,
-   so it is not proof that the executed bytes equal the digest.
+   evidence. The path correlation remains named
+   `checkpoint_consistent_path`: mutation and restoration entirely between
+   path checkpoints remains a residual pathname-history gap. Execution
+   attribution is separately named `exec_stop_consistent_handle`: successful
+   `PTRACE_EVENT_EXEC`, stopped-image strong identity, and retained-handle hash
+   under kernel write denial prove that no changed target or interpreter
+   instruction ran before validation and that the resumed executable bytes
+   equal the recorded digest.
 7. **B-007:** A version probe has one lifecycle covering authorization, spawn,
    concurrent stdout/stderr reads, exit, timeout, cleanup, and root reap.
    Authorization is the conjunction of configuration-source policy and opened
@@ -304,14 +369,8 @@ facts in snapshots or through a CLI.
    while observing byte `max_output_bytes + 1` triggers
    `output_limit_exceeded`.
 
-   The active version-probe deadline is the fixed nonzero
-   `RUNTIME_FINGERPRINT_PROBE_DEADLINE = 5_000 ms`. Its monotonic clock starts
-   immediately before anchor creation and includes process-group setup, every
-   target-child attempt, the optional 150 ms `ETXTBSY` delay/retry, output
-   collection, and root exit. Expiry records `timeout`; cleanup receives its
-   own separate five-second deadline.
-
-   On Unix, before any supervision helper or target child is created, v0.1
+   On Unix, before cwd or executable observation, any supervision helper, or
+   any target child, v0.1
    starts a fingerprint-specific runtime-independent cleanup owner and receives
    a readiness handshake under the separate fixed
    `RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE = 1_000 ms`, measured monotonically
@@ -321,51 +380,102 @@ facts in snapshots or through a CLI.
    that channel and starts a separate fixed
    `RUNTIME_FINGERPRINT_OWNER_STOP_JOIN_DEADLINE = 1_000 ms` from the stop
    request. The bootstrap owner is joined within that second bound. Failure
-   records `containment_unavailable` with one closed reason
+   returns typed producer error `containment_unavailable` with no envelope and
+   one closed reason
    (`owner_start_failed`, `owner_ready_timeout`, or
    `owner_stop_join_timeout`) without creating a child. Caller cancellation
    during reservation follows the same bounded stop/join path and emits no
-   envelope. The ready owner creates
-   and retains a dedicated process-group anchor, then target children join that
-   anchored group before exec. The anchor remains a live, non-reusable group
-   identity throughout every membership decision and negative-PGID signal.
-   Success requires proving that no non-anchor member remains, then requesting
-   anchor exit and reaping it; after anchor reap, code performs no lookup,
-   signal, or ownership decision using the released numeric PGID. A platform
-   unable to provide that anchored membership proof records
-   `containment_unavailable` before target exec. v0.1 claims only
+   envelope. After readiness and before the first cwd open, the producer starts
+   the fixed nonzero
+   `RUNTIME_FINGERPRINT_PROBE_DEADLINE = 5_000 ms`. That one monotonic budget
+   covers every observation subprocess, cwd and executable observation,
+   authorization, static-ELF classification, traced exec-stop setup/
+   verification, anchor and target
+   setup, every target-child attempt, the optional 150 ms `ETXTBSY` delay/retry,
+   output collection, root exit, and the post-reap identity checkpoint.
+   Expiry during an observation subprocess returns the typed producer error
+   above and no envelope, so required payload facts and attempt states are
+   never fabricated. Any timeout, missing/surplus exec event, or trace
+   verification failure before a verified `exec_started` resume returns typed
+   producer error `execution_verification_unavailable` or the applicable
+   observation error with no envelope; the stopped child remains owner-managed
+   and is killed/reaped without resume. Only expiry after verified resume
+   records `version_probe/timeout`. Cleanup receives its own separate
+   five-second deadline.
+
+   Linux v0.1 requires `pidfd_open`, `pidfd_send_signal`, parent-child ptrace
+   with `PTRACE_O_TRACEEXEC`, `execveat(AT_EMPTY_PATH)`, and strong `/proc`
+   process/image identity enumeration before host filesystem observation;
+   other Unix platforms return that typed no-envelope error without opening the
+   cwd or executable. The ready owner thread is the sole target/anchor fork,
+   parent-side ptrace-control, wait/reap, and observation-helper-spawn owner;
+   the target's audited pre-exec `PTRACE_TRACEME` call is the sole exception.
+   The owner creates and retains a dedicated process-group anchor, creates every
+   target, atomically records target pidfd/reap ownership, and establishes the
+   ptrace relationship before exposing a cancellable client lease. Target
+   children join that anchored
+   group before exec. The owner holds pidfds for the anchor, root, and every
+   discovered non-anchor member. Every `/proc` group enumeration and
+   revalidation runs in an owner-created, atomically pidfd-registered
+   observation helper under the active or cleanup deadline; no such filesystem
+   work runs on the owner or async runtime. Each bounded pass transfers at most
+   64 exact revalidated non-anchor pidfds plus a `more` bit. The owner signals
+   the transferred batch and rescans `/proc` from the beginning until a full
+   pass reports only the anchor; it never uses a reusable PID cursor or drops
+   members beyond a full batch. Continuous churn reaches the applicable
+   deadline rather than claiming empty. Timeout or incomplete helper cleanup
+   returns its closed observation error; malformed protocol/helper exit returns
+   a distinct closed protocol-invalid error; cancellation uses owner cleanup.
+   All return no envelope, including when probe cleanup had already begun. The
+   owner signals those pidfds individually. It never sends a signal
+   to a negative PGID, so group-wide
+   termination cannot kill the anchor. Success requires proving that no
+   non-anchor member remains, then requesting anchor exit over its private
+   control channel and reaping it. Only after the group is proven empty may a
+   failed anchor control/reap path signal the anchor through its own pidfd.
+   After anchor reap, code performs no lookup, signal, or ownership decision
+   using the released numeric PGID. A platform unable to provide that
+   identity-safe membership proof returns the typed no-envelope error before
+   cwd observation or target exec. v0.1 claims only
    `process_group_supervision`: root reap and visibility of members that remain
    in the anchored original group. A child can call `setsid` or change groups,
    so v0.1 does not claim non-escapable descendant containment or whole-process-
-   tree emptiness. On Unix platforms with process-group supervision but no
-   no-path retained-handle exec primitive, `handle_execution_unavailable` is
+   tree emptiness. On Linux platforms with process-group supervision but no
+   verified traced retained-handle exec primitive, `handle_execution_unavailable` is
    recorded before anchor or target creation.
    Failure to establish the anchor group or failure of either
    the initial or post-`ETXTBSY` target helper's pre-exec group join or
    retained-working-directory `fchdir` is `supervision_setup_failed` with the
-   closed `setup_stage` `group_join` or `working_directory_enter`; anchor
+   closed `setup_stage` `group_join`, `working_directory_enter`, or
+   `trace_setup`; anchor
    failure uses `anchor_setup`. Every created helper is reaped, the affected
    target handle exec is not attempted, and its errno is never treated as a
    target-exec error or PATH fallback signal. On Windows, where the existing launcher cannot atomically
-   assign a Job Object before execution, `containment_unavailable` is recorded
-   without spawning.
+   assign a Job Object before execution, the typed no-envelope
+   `containment_unavailable` producer error is returned without spawning.
 
    Every terminal path, including a zero exit with apparently valid output,
    reaps the root and verifies that only the live anchor remains before success
-   is possible, then exits/reaps the anchor without another PGID operation. A
+   is possible, then exits/reaps the anchor without another group-membership
+   operation. A
    non-anchor member still present after root exit records
    `lingering_process_group`, suppresses version success, and starts group
-   termination. Timeout, overflow, read failure, and any lingering non-anchor
-   member run bounded pipe drain, root reap where still needed, and anchored
-   membership verification under one fixed five-second monotonic cleanup
-   deadline. If all
+   termination. An observation-helper timeout runs bounded exact-helper pidfd
+   termination/reap and returns the closed no-envelope producer error defined
+   in B-006. Separately, probe timeout, overflow, read failure, and any
+   lingering non-anchor member run bounded member pidfd signalling, pipe drain,
+   root reap where still needed, and anchored membership verification under one
+   fixed five-second monotonic cleanup deadline. If all
    complete, only the triggering probe failure is recorded. If signalling,
    drain, reap, or verification fails or the deadline expires, the applicable
    closed `lifecycle_cleanup` failure is also recorded, read handles are closed,
    and the already-reserved runtime-independent cleanup owner retains sole
    ownership before the API returns. That owner emits an `error`, retains
-   ownership, and continues anchored signalling, reaping, and original-group
-   verification; it never silently abandons the child. There is no on-demand
+   ownership, and continues exact-pidfd signalling, reaping, and original-group
+   verification; it never silently abandons a child. The separate producer
+   error path gives the same ownership guarantee for observation helpers. A
+   process stuck in kernel uninterruptible I/O may outlive both deadlines, so
+   no result fabricates a termination guarantee. There is no on-demand
    cleanup-thread creation or synchronous unbounded drop fallback. Caller
    cancellation activates the same pre-existing owner but emits no fingerprint.
    Root-only
@@ -474,26 +584,40 @@ facts in snapshots or through a CLI.
 13. **B-013:** Every present MCP input or output schema must have a JSON object
     at its root; a root boolean, array, string, number, or null fails typed
     before canonicalization or digest construction. Boolean schemas remain
-    legal only at schema-valued child positions. Within that object,
-    canonicalization is context-aware.
-    JSON object member order is canonicalized lexicographically. Only arrays at
-    the closed order-insensitive schema-keyword locations `required`, `type`,
-    `enum`, `allOf`, `anyOf`, `oneOf`, and each property value beneath
-    `dependentRequired` are sorted, and schema-valued children are traversed as
-    schemas. Under legacy `dependencies`, each object or boolean property value
-    enters schema context and each array property value must be a string set;
-    other shapes fail typed. `additionalItems` is a schema-valued child when
-    the legacy array form of `items` is used. Ordered schema locations such as `prefixItems`, all
-    unknown/vendor-extension arrays, and instance-valued annotations including
+    legal only at schema-valued child positions. The root dialect is frozen
+    before keyword traversal: absent `$schema` means Draft 2020-12; the only
+    accepted explicit values are exactly
+    `https://json-schema.org/draft/2020-12/schema` and
+    `http://json-schema.org/draft-07/schema#`. A non-string, unknown value, or
+    `$schema` at any nested schema position fails typed
+    `unsupported_schema_dialect`; nested dialect changes are outside v0.1.
+    The exact `$schema` member remains canonical payload data.
+
+    JSON object member order is canonicalized lexicographically. In both
+    dialects, arrays at `required`, `type`, `enum`, `allOf`, `anyOf`, and
+    `oneOf` are order-insensitive under their closed contexts. Draft 2020-12
+    additionally treats `$defs`, `dependentSchemas`, `dependentRequired`,
+    `prefixItems`, `contentSchema`, and `unevaluatedItems` /
+    `unevaluatedProperties` according to that dialect; `dependentRequired`
+    property arrays are string sets, `prefixItems` remains an ordered schema
+    array, and `items` accepts only an object or boolean schema. In Draft-07,
+    `definitions`, legacy `dependencies`, array-form `items`, and its sibling
+    `additionalItems` receive their legacy schema or string-set semantics.
+    Under Draft-07 `contentSchema`, `dependentRequired`, `dependentSchemas`,
+    `prefixItems`, and other later-draft keywords are extension instance data;
+    under Draft 2020-12 `dependencies`, `definitions`, `additionalItems`, and
+    array-form `items` are extension instance data or a typed malformed
+    standard keyword as applicable. Thus Draft-07 `contentSchema` arrays retain
+    order and cannot be collapsed by Draft 2020-12 keyword rules.
+
+    Unknown/vendor-extension values and instance-valued annotations including
     `default`, `const`, `examples`, and `example` preserve array order at every
-    depth. A key named `enum`, `required`, or `oneOf` inside annotation data is
-    ordinary instance data and does not activate schema sorting. Public evidence
+    depth. A key named `enum`, `required`, or `oneOf` inside instance data is
+    ordinary data and does not activate schema sorting. Public evidence
     construction accepts only raw JSON text or bytes through a duplicate-aware
-    parser. It exposes no `serde_json::Value`, generic serializable, or typed-map
-    constructor that could claim duplicate-free original input after an
-    ordinary decoder overwrote a key. `contentSchema` always enters schema
-    context. Object- or boolean-form `items` enters schema context; legacy
-    array-form `items` traverses schemas while retaining tuple order.
+    parser. It exposes no `serde_json::Value`, generic serializable, or
+    typed-map constructor that could claim duplicate-free original input after
+    an ordinary decoder overwrote a key.
 
     Resource limits are fixed by v0.1 and are not caller-adjustable. For each
     present schema: raw bytes are at most 1,048,576; canonical bytes at most
@@ -579,9 +703,9 @@ facts in snapshots or through a CLI.
 | `identity` | `identity_changed` | Path strong identity or retained-handle size/content digest changed across checkpoints. |
 | `version_probe` | `probe_not_authorized` | Configuration-source or resolved-target repository policy forbids executing this inspected target; the closed reason identifies which and no child was started. |
 | `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary, so no child was started. |
-| `version_probe` | `containment_unavailable` | Required pre-spawn process supervision could not be established, so no child was started; the name does not claim non-escapable containment on supported platforms. |
-| `version_probe` | `handle_execution_unavailable` | A Unix platform with process-group supervision cannot execute the retained authorized handle without reopening its pathname, so no anchor or target child was started. |
-| `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join/working-directory entry failed; the closed setup stage identifies which, every created helper was reaped, and the affected target handle exec was never attempted. |
+| `version_probe` | `interpreter_authorization_unavailable` | The retained executable was not a current-architecture static ELF without `PT_INTERP`, or exact retained-handle exec-time `ENOENT` showed that a late interpreter contract could not be satisfied. No target, loader, or interpreter instruction ran; a late-race setup helper is reaped. |
+| `version_probe` | `handle_execution_unavailable` | A Linux platform with process-group supervision cannot provide `FD_CLOEXEC` retained-handle `execveat(AT_EMPTY_PATH)` plus a verified pre-first-instruction `PTRACE_EVENT_EXEC` checkpoint, so no target instruction was allowed to run. |
+| `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join, working-directory entry, or pre-exec ptrace stop/options setup failed; the closed setup stage identifies which, every created helper was reaped, and target handle exec was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
 | `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
 | `version_probe` | `lingering_process_group` | The root exited but a non-anchor member remained in the anchored Unix process group; version success was suppressed and cleanup started. |
@@ -594,8 +718,8 @@ facts in snapshots or through a CLI.
 | `version_probe` | `empty_output` | Exit was successful but both streams were blank. |
 | `version_probe` | `unparseable_version` | Nonblank output did not exactly match the selected runtime's whole-output grammar. |
 | `version_probe` | `ambiguous_version` | Stdout and stderr each matched the selected grammar, so the selected stream was not unique. |
-| `lifecycle_cleanup` | `termination_failed` | Signalling the root/original process group failed before cleanup ownership was transferred. |
-| `lifecycle_cleanup` | `reap_failed` | Root reap failed or was not verified before cleanup ownership was transferred. |
+| `lifecycle_cleanup` | `termination_failed` | Signalling an exact root, non-anchor member, or post-empty-group anchor pidfd failed before cleanup ownership was transferred. Observation-helper failures are producer errors and never enter an envelope. |
+| `lifecycle_cleanup` | `reap_failed` | Root or anchor reap failed or was not verified before cleanup ownership was transferred. Observation-helper failures are producer errors and never enter an envelope. |
 | `lifecycle_cleanup` | `output_drain_failed` | Bounded drain did not complete before read handles were closed and ownership was transferred. |
 | `lifecycle_cleanup` | `group_verification_failed` | The owner could not verify that only its live anchor remained before ownership was retained; this never represents the whole descendant tree. |
 
@@ -617,19 +741,23 @@ exec sequence (`none`, `single`, or
 | `inspection_failed` | Open or later inspection failed; this is terminal and requires the matching B-008 identity failure. |
 | `inspection_target` | Configuration-source or resolved-target repository policy retained this first authorized inspection identity and stopped without exec. |
 | `authorization_unavailable` | Final-target repository/worktree classification could not be proven; this is terminal and requires `target_authorization_unavailable`. |
-| `handle_execution_unavailable` | No safe retained-handle exec primitive exists; this is terminal, uses no exec sequence, and requires the matching version-probe failure. |
-| `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join/working-directory entry failed, every created helper was reaped, and the affected target never attempted handle exec; this is terminal and requires the matching version-probe failure and exact setup stage. |
+| `interpreter_authorization_unavailable` | Initial script/dynamic-ELF/unsupported-format detection uses `none`; exact exec-time `ENOENT` uses `single` or the one `ETXTBSY` retry sequence. It requires the matching version-probe failure, executes no target/loader/interpreter instruction, and is terminal. |
+| `handle_execution_unavailable` | No safe traced retained-handle `execveat(AT_EMPTY_PATH)` primitive exists; this is terminal, uses no exec sequence, and requires the matching version-probe failure. |
+| `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join, working-directory entry, or ptrace setup failed, every created helper was reaped, and the affected target never attempted handle exec; this is terminal and requires the matching version-probe failure and exact setup stage. |
 | `retry_not_authorized` | After first exec returned `ETXTBSY`, the repeated checkpoint classified the target as repository-owned; requires `probe_not_authorized` with exact reason `resolved_target_repository` and forbids a second exec. |
 | `retry_authorization_unavailable` | After first exec returned `ETXTBSY`, the repeated checkpoint could not prove target authorization; requires `target_authorization_unavailable` and forbids a second exec. |
+| `exec_verification_failed` | Native exec reached `PTRACE_EVENT_EXEC`, but stopped-image strong identity or retained-handle digest mismatched before the first instruction; requires `identity_changed`, uses `single` or the retry sequence, and proves the stopped child was killed/reaped without resume. |
 | `exec_eacces` | Direct retained-handle exec returned exact `EACCES`; final identity is discarded and search continues. |
 | `exec_failed` | Direct retained-handle exec returned another terminal error; requires `spawn_failed` and no selected/executed claim. |
-| `exec_started` | Direct retained-handle exec succeeded; this is the sole terminal selected executable. |
+| `exec_started` | Direct retained-handle exec reached a verified exec-stop and was resumed; this is the sole terminal selected executable. |
 
 Parsers preserve list order and reject more than 64 attempts, an outcome after
 a terminal outcome, any exec outcome after identity-only authorization,
 multiple terminal outcomes, `inspection_target` without
 `probe_not_authorized` and its closed source-or-target reason,
 `authorization_unavailable` without `target_authorization_unavailable`,
+`interpreter_authorization_unavailable` without its matching failure and legal
+pre-exec or exec-time sequence,
 `handle_execution_unavailable` without the matching
 `version_probe/handle_execution_unavailable`,
 `supervision_setup_failed` without the matching
@@ -638,7 +766,8 @@ multiple terminal outcomes, `inspection_target` without
 `resolved_target_repository`,
 `retry_authorization_unavailable` without
 `target_authorization_unavailable`,
-`exec_failed` without `spawn_failed`, `exec_started` with a spawn failure, or
+`exec_verification_failed` without `identity_changed` and verified no-resume
+reap, `exec_failed` without `spawn_failed`, `exec_started` with a spawn failure, or
 `bare_eacces_exhausted` unless the final non-skipped attempt is `exec_eacces`
 and no final executable identity exists. `candidate_limit_exceeded` requires
 `unix_bare` and exactly 64 nonterminal attempts. For `unix_bare`,
@@ -649,15 +778,18 @@ and no final executable identity exists. `candidate_limit_exceeded` requires
 `none` is required for outcomes that
 terminate before any direct exec; an initial `inspection_failed` or
 `handle_execution_unavailable` uses `none`.
-An initial `supervision_setup_failed` requires `none`; `single` is required for
-an ordinary one-exec outcome.
+An initial `supervision_setup_failed` or pre-observed shebang requires `none`;
+`single` is required for an ordinary one-exec outcome, an exec-time interpreter
+failure, or `exec_verification_failed`.
 `etxtbsy_then_checkpoint_after_150_ms` requires an exact first `ETXTBSY` and a
 repeated authorization/identity checkpoint. It permits
 `retry_not_authorized`, `retry_authorization_unavailable`, or
 `inspection_failed` without a second helper, and
-`supervision_setup_failed` when the second helper's group join or retained
-working-directory entry fails before target handle exec; `exec_eacces` for a
-bare name, `exec_failed`, or `exec_started` proves
+`supervision_setup_failed` when the second helper's group join, retained
+working-directory entry, or trace setup fails before target handle exec;
+exec-time `interpreter_authorization_unavailable`,
+`exec_verification_failed`, `exec_eacces` for a bare name, `exec_failed`, or
+`exec_started` proves
 the second target exec was attempted. It is rejected for every initial skip,
 inspection-only, or authorization-unavailable outcome.
 Absolute/qualified attempts reject `exec_eacces`, because their `EACCES` is
@@ -733,9 +865,15 @@ terminal `exec_failed`.
       absent/present states, UTF-16LE framing, and independent `C:\X` vectors
       for current-executable directory, system directory, Windows directory,
       and parent PATH.
-- [ ] Unix launch fixtures prove bare, qualified, and absolute probes pass the
-      retained authorized handle to the no-path exec primitive while preserving
-      the exact configured command bytes as `argv[0]`. The parent opens the
+- [ ] Linux launch fixtures prove bare, qualified, and absolute probes use
+      `FD_CLOEXEC` retained-handle `execveat(AT_EMPTY_PATH)`, stop at
+      `PTRACE_EVENT_EXEC` before the first target instruction, and resume only
+      after stopped-image identity plus retained-handle hash match while
+      preserving exact configured command bytes as `argv[0]`. A call-site
+      audit proves the owner is the sole target/anchor fork, parent-side ptrace
+      controller, wait/reap, and observation-helper-spawn authority; the
+      target pre-exec closure's audited `PTRACE_TRACEME` is the sole exception.
+      The owner opens the
       declared child directory once, fixed working-directory spelling/identity
       digests enter the payload, both initial and retry helpers `fchdir` that
       retained handle, and injected `fchdir` failure is stage-tagged, reaped,
@@ -743,45 +881,75 @@ terminal `exec_failed`.
       after that open proves qualified and relative-PATH observation, initial
       open, both checkpoints, and initial/retry helpers all remain anchored to
       the same retained directory identity.
-- [ ] A Unix interpreter-launcher fixture proves that sanitized child `PATH` is
-      identical for resolution and child execution, while a setup-only secret
-      named `NPM_ACCESS` is absent from the child and from serialized facts.
+- [ ] Linux executable-format fixtures prove static `ET_EXEC` and static-PIE
+      `ET_DYN` success for the exact native machine tuple. Direct and
+      `#!/usr/bin/env` shebangs, `PT_INTERP`, same-class/endianness
+      wrong-machine ELF, wrong header version/size, extended or out-of-bounds
+      program headers, and non-ELF/binfmt inputs yield
+      `interpreter_authorization_unavailable` before anchor, target, loader, or
+      interpreter creation. Neither sanitized `PATH` nor a setup-only secret
+      named `NPM_ACCESS` can select or reach an interpreter. A supported static
+      native-binary fixture separately proves sanitized `PATH` is the only
+      child environment key.
 - [ ] Identity fixtures prove handle-based metadata/hash consistency, before-
       and during-read fixed 67,108,864-byte size limit plus limit-plus-one,
-      nonblocking async execution, Unix
+      kill-isolated observation subprocess execution, Unix
       nonblocking-open rejection of FIFOs and other special files, Unix
       mode-bit checks, Windows strong file-ID checks without a fabricated
       executable claim, pre-spawn/post-reap retained-handle rehashing, and
       explicit `identity_changed` evidence for path replacement or in-place
-      rewrite; FIFO swaps at both later nonblocking checkpoint reopens cannot
-      hang.
-- [ ] Authorization-race fixtures replace the pathname after the final
-      checkpoint and prove the retained authorized handle—not replacement
-      repository code—executes; supervised Unix platforms without
-      retained-handle exec emit `handle_execution_unavailable` before anchor or
-      target creation and never fall back to a pathname. Windows independently
-      returns `containment_unavailable` first under its frozen platform matrix.
+      rewrite. Delayed cwd open, candidate open, boundary lookup, read/hash, and
+      both later checkpoint fixtures prove the active deadline starts before
+      observation, every observation timeout returns a typed producer error
+      with no envelope, the producer future returns boundedly, no
+      `spawn_blocking` job survives inside the process, and an unreaped helper
+      stays owned with explicit incomplete cleanup rather than a termination
+      claim. Stalled `/proc` group enumeration under both active and cleanup
+      deadlines follows the same no-envelope rule. Membership fixtures accept
+      exactly 64 transferred pidfds, drain 65 and larger groups through
+      from-the-beginning rescans, reject descriptor-count and `more` protocol
+      mismatches distinctly from timeouts, and fail closed under continuous
+      churn. Cancellation at every create/register boundary, including both
+      membership stages, proves the owner has the pidfd before any lease is
+      exposed.
+- [ ] Authorization-race fixtures replace and rewrite the source after the
+      final checkpoint and prove the exec-stop hash/identity gate kills a
+      changed native image before its first instruction, while an introduced
+      shebang fails before interpreter execution. Linux without verified ptrace
+      exec-stop or `execveat(AT_EMPTY_PATH)` emits
+      `handle_execution_unavailable` and never falls back to a pathname. Other
+      platforms return typed no-envelope `containment_unavailable` first under
+      the frozen matrix. Separate missing-event, surplus-event, abnormal-trace,
+      and pre-resume-deadline fixtures return
+      `execution_verification_unavailable` with no envelope and prove the owner
+      kills/reaps without ever resuming the stopped target.
 - [ ] Lifecycle fixtures use hanging and unbounded dual-stream children to
       reject output caps 0 and 65,537 before allocation or helper creation and
       prove 1, 65,536, exact combined limit, and limit-plus-one behavior; owner
       readiness succeeds within its fixed one-second deadline or stops/joins
       within a separate one-second deadline, including cancellation,
-      delayed-handshake, and typed stop/join-timeout fixtures; the active
-      five-second deadline covers anchor creation through root exit, while the
-      separate cleanup deadline starts at failure; ordinary Unix cleanup
-      finishes root/anchored-group handling within five seconds; injected
+      delayed-handshake, and typed stop/join-timeout fixtures; after readiness
+      the active five-second deadline starts before cwd observation and covers
+      all observation helpers, traced exec-stop verification, anchor creation,
+      root exit, and post-reap
+      checkpoint, while the separate cleanup deadline starts at failure;
+      ordinary supported-Linux cleanup finishes helper/root/anchored-group
+      handling within five seconds; injected
       initial and post-`ETXTBSY` group-join, termination, reap, drain, and
       group-verification
-      failures produce canonical `lifecycle_cleanup` evidence and transfer
+      failures, including post-empty-group anchor termination/reap failure,
+      produce canonical `lifecycle_cleanup` evidence and transfer
       ownership without a version; an escaped `setsid` pipe holder cannot yield
       whole-tree-empty evidence or block the API past the cleanup deadline;
       a zero-exit child that leaves a same-group marker process records
       `lingering_process_group`, suppresses version success, and runs the same
       cleanup; cancellation transfers ownership to a runtime-independent reaper
-      that survives immediate Tokio shutdown and emits no evidence; on Unix
-      every PGID operation occurs with the anchor live, success proves only the
-      anchor remains before its exit/reap, no released PGID is used, and Windows
-      v0.1 proves `containment_unavailable` is emitted before any child starts.
+      that survives immediate Tokio shutdown and emits no evidence. Linux
+      fixtures prove exact pidfds are revalidated and only non-anchor members
+      are signalled, no negative-PGID signal exists, the anchor exits only after
+      the group is empty, and no released PGID is used. macOS, other Unix, and
+      Windows prove typed no-envelope `containment_unavailable` is returned
+      before cwd observation or child creation.
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
       sanitized bounded facts, and rejection of unknown values.
 - [ ] Version fixtures cover exact current Codex and Claude product lines,
@@ -813,16 +981,16 @@ terminal `exec_failed`.
 - [ ] Schema fixtures cover required `inputSchema` and absent, present,
       malformed, non-object, exact-limit, and limit-plus-one `outputSchema`;
       reject every non-object root before canonicalization and
-      prove object-key and approved set reordering stability;
-      ordered `prefixItems`, vendor arrays, and nested arrays under `default`,
-      `const`, `examples`, and `example` remain digest-sensitive even when an
-      annotation object contains a schema-keyword-shaped key; object/boolean
-      `items` traverses schema context while legacy array `items` preserves
-      order and `additionalItems` remains schema context; every
-      `dependentRequired` property array is a canonical string set; nested
-      `contentSchema.required` and `contentSchema.oneOf` canonicalize in schema
-      context; legacy `dependencies` object/boolean values enter schema context
-      and its string-array values are canonical sets.
+      prove object-key and approved set reordering stability. Absent and exact
+      Draft 2020-12 roots agree; exact Draft-07 roots select legacy semantics;
+      unknown/non-string root or any nested `$schema` fails typed. In Draft
+      2020-12, ordered `prefixItems`, `contentSchema` nested schemas,
+      `dependentRequired`, and modern schema maps are context-aware while
+      legacy keys remain extension data. In Draft-07, array `items`,
+      `additionalItems`, `definitions`, and `dependencies` use legacy
+      semantics while a `contentSchema` value with ordered arrays remains
+      instance data. Vendor arrays and nested arrays under `default`, `const`,
+      `examples`, and `example` remain digest-sensitive in both dialects.
 - [ ] Duplicate JSON keys and malformed raw schemas fail typed before digesting,
       and public API/call-site audit proves no generic serializable or
       `serde_json::Value` evidence constructor exists.
@@ -859,14 +1027,15 @@ terminal `exec_failed`.
 | Compatibility / migration | Covered by B-001, B-002, and B-016; this is additive producer-only code with no persisted or existing public wire migration. |
 | Degradation / fallback | Covered by B-008, B-009, and B-015; unavailable data becomes typed failure evidence, never a placeholder success. |
 | Evidence and audit integrity | Covered by B-003 and B-006 through B-015; ownership, observer, bytes, version, schema, failures, and redaction remain distinguishable. |
-| Cancellation / interruption / partial completion | Covered by B-007 and B-015; cancellation signals the original process group, transfers cleanup to a runtime-independent owner, and cannot publish partial evidence. |
+| Cancellation / interruption / partial completion | Covered by B-006, B-007, and B-015; cancellation or deadline expiry signals exact helper/root/non-anchor pidfds, transfers cleanup to a runtime-independent owner, and cannot publish partial success evidence. |
 
 ## Edge Cases
 
 - The configured command is a bare name and two `PATH` directories contain it.
 - A qualified relative executable contains spaces or shell metacharacters.
-- On Unix, an npm-style launcher uses `#!/usr/bin/env node` and the interpreter
-  is found only through the sanitized child `PATH`.
+- On Unix, an npm-style launcher uses `#!/usr/bin/env node`; v0.1 detects the
+  shebang and fails before searching sanitized child `PATH` or starting an
+  interpreter.
 - A setup-only secret has a harmless-looking name such as `NPM_ACCESS`.
 - Windows observation input contains `Path` and `PATH`, a case-variant setup
   secret, or a non-ASCII environment key.
@@ -878,6 +1047,9 @@ terminal `exec_failed`.
   changed and restored between observation checkpoints.
 - A candidate path names a FIFO, socket, directory, or device and must return
   without a blocking read open.
+- Cwd or executable observation stalls in kernel I/O; the producer deadline
+  returns a typed error and no envelope while the independent owner retains the
+  exact helper pidfd and no in-process blocking worker survives.
 - A regular file grows past the byte limit after its first metadata read.
 - A probe hangs, forks, closes only one stream, floods both streams, exits by
   signal, succeeds with blank output, or emits conflicting versions.
@@ -890,7 +1062,9 @@ terminal `exec_failed`.
 - An MCP description differs only by tabs, repeated spaces, or line breaks.
 - A schema annotation contains `{ "enum": [1, 2] }` as ordinary default data.
 - `prefixItems` or a vendor extension differs only by array order.
-- Object-, boolean-, and legacy array-form `items` occur at multiple depths.
+- Draft 2020-12 and Draft-07 schemas use the same extension key with different
+  keyword semantics; nested `$schema` is rejected rather than switching
+  dialect mid-document.
 - Tool text or schema input is exactly at, then one unit beyond, every fixed
   v0.1 resource limit.
 - An MCP tool is advertised by a runner but owned by repository configuration.
