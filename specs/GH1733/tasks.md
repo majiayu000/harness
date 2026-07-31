@@ -19,7 +19,7 @@ PR branch only; do not create a replacement implementation PR or force-push.
 ## Implementation Tasks
 
 - [ ] `SP1733-T1` — Owner: core fingerprint model worker. Dependencies: approved product and tech specs plus `ready_to_implement`. Covers: B-001, B-003, B-008, B-011 through B-015. Done when: the strict outer envelope, closed runtime/MCP payloads, typed failure vocabulary, source-preserving component construction, exact MCP text, duplicate-aware schema parsing, context-aware canonicalization, and canonical payload digests are implemented in the split core modules; constructors emit and parsers require an empty component capability list; invalid subject/payload/source, capability, schema, ordering, and integrity combinations fail typed; every core file is below 800 lines. Verify: `cargo test -p harness-core fingerprint`, `cargo test -p harness-core stack`, `cargo test -p harness-core`, and `cargo check -p harness-core --all-targets`.
-- [ ] `SP1733-T2` — Owner: runtime fingerprint worker. Dependencies: SP1733-T1. Covers: B-002 through B-010, B-014, and B-015. Done when: the runtime producer accepts only the three closed local executable kinds; preserves validated ownership; resolves the one configured command with native launch parity; excludes all setup secrets; records only typed declared environment evidence; hashes one opened handle off the async worker; detects path identity changes; supervises, bounds, terminates, and reaps probes; parses exactly one v0.1 version token; and emits a typed failure for every incomplete observation. No arbitrary runtime string, shell, `which`, whole-file read, `Command::output`, unbounded pipe, heuristic secret classification, or warning-only fallback remains. Verify: `cargo test -p harness-agents runtime_fingerprint`, `cargo test -p harness-agents`, and `cargo check -p harness-agents --all-targets`.
+- [ ] `SP1733-T2` — Owner: runtime fingerprint worker. Dependencies: SP1733-T1. Covers: B-002 through B-010, B-014, and B-015. Done when: the runtime producer accepts only the three closed local executable kinds and their exact whole-output grammars; preserves validated ownership; resolves one command with the explicit Unix/pinned-Rust-Windows launch matrix and spawns only the selected absolute path; rejects every explicitly named Windows non-`.exe` extension, including batch programs that would invoke a shell; excludes setup secrets; records only typed declared environment evidence; hashes one opened handle off the async worker; uses Unix device/inode or Windows volume/file ID and detects replacement; supervises Unix process groups through terminate/reap/drain; emits Windows `containment_unavailable` before spawn while atomic Job Object launch remains out of scope; enforces the combined output bound; and emits a typed failure for every incomplete observation. No arbitrary runtime string, token-scan/first-token parser, `PATHEXT` assumption, guessed relative base, weak Windows identity, root-only `kill_on_drop` claim, shell, `which`, whole-file read, `Command::output`, unbounded pipe, heuristic secret classification, or warning-only fallback remains. Verify: `cargo test -p harness-agents runtime_fingerprint`, `cargo test -p harness-agents`, and `cargo check -p harness-agents --all-targets`.
 - [ ] `SP1733-T3` — Owner: boundary contract worker. Dependencies: SP1733-T1 and SP1733-T2. Covers: B-002 and B-016. Done when: a `#[cfg(test)]`-only exhaustive workflow `RuntimeKind` mapping proves the three local kinds map one-to-one and `AnthropicApi`/`RemoteHost` are not local executables; production call-site audit proves there is no snapshot, server, workflow-runtime, task-runner, `CodeAgent`, `AgentAdapter`, CLI, HTTP, persistence, or migration consumer; and the implementation diff matches the twelve authorized paths exactly. Verify: `cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib` plus the manifest and `rg` audits described below.
 - [ ] `SP1733-T4` — Owner: verification and handoff owner. Dependencies: SP1733-T1 through SP1733-T3. Covers: B-001 through B-016. Done when: formatting, focused suites, both package suites, workspace check, workspace clippy, file-size limits, changed-file manifest, call-site audit, independent review, every valid PR #1859 review finding, current-head CI, Gemini review, and repository ruleset approval all pass without weakened assertions; the original PR may close GH-1733 only after all gates pass. Verify: run every command and audit in Required Verification on one current implementation head, then collect fresh PR-gate evidence.
 
@@ -79,18 +79,25 @@ review instead of silently expanding scope.
 - `runner_observed` describes evidence strength and trust; it never replaces
   repository, user-global, admin, system, runtime, or genuine runner ownership.
 - A bare configured command resolves only the first candidate selected by the
-  actual native launch contract. It does not authorize PATH scanning,
-  candidate execution, a shell, `which`, or a package manager.
+  explicit Unix or pinned-Rust-Windows launch contract, then spawns its absolute
+  path. It does not authorize `PATHEXT` inference, guessed relative bases, PATH
+  scanning beyond that basename, candidate execution, a shell, `which`, or a
+  package manager.
 - `codex.cloud.setup_secret_env` is an unconditional exclusion set. Setup
   values never enter evidence or the version child, regardless of key spelling.
-- Probe `PATH` is the same sanitized PATH used for resolution. Other values
-  require an explicit typed declaration and independent probe-exposure choice.
+- The child `PATH` portion of resolution context is exactly the sanitized value
+  given to the probe. Windows current-executable, system, Windows-directory,
+  and parent-PATH search inputs are explicit resolution-only facts. Other child
+  values require a typed declaration and independent probe-exposure choice.
 - Executable size, metadata, and digest come from one opened regular-file
-  handle. Path identity is checked before and after the supervised child, and a
-  mismatch discards version evidence.
-- The combined stdout/stderr cap is a read-time memory bound. Timeout, output
-  overflow, cancellation, or read failure terminates and reaps the process
-  group before the API returns.
+  handle. Unix uses device/inode and mode bits; Windows requires volume serial
+  plus file ID, then v0.1 records `containment_unavailable` without spawning or
+  claiming loadability. On platforms with contained spawn, load failure is
+  `spawn_failed`. Path identity is checked before and after every supervised
+  child, and a mismatch discards version evidence.
+- The combined stdout/stderr cap is a read-time memory bound. Unix timeout,
+  output overflow, cancellation, or read failure terminates, reaps, and drains
+  the process group; Windows v0.1 records `containment_unavailable` before spawn.
 - MCP descriptions remain exact. Schema arrays are reordered only at the six
   approved schema-set locations; annotation, extension, and ordered-schema
   arrays retain order.

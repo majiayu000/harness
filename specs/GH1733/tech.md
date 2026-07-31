@@ -137,17 +137,18 @@ the component integrity only after validation, avoiding self-reference.
 
 Add a closed `LocalExecutableRuntimeKind` with exactly:
 
-| Value | Fixed version invocation |
-| --- | --- |
-| `codex_exec` | `--version` |
-| `codex_jsonrpc` | `--version` |
-| `claude_code` | `--version` |
+| Value | Fixed version invocation | Whole-output grammar |
+| --- | --- | --- |
+| `codex_exec` | `--version` | `codex-cli <VERSION>` |
+| `codex_jsonrpc` | `--version` | `codex-cli <VERSION>` |
+| `claude_code` | `--version` | `<VERSION> (Claude Code)` |
 
 The public configured-runtime constructor takes this enum, a validated
 `AgentStackSource`, and exactly one `PathBuf`. It has no arbitrary `new(String,
 ...)`, arbitrary argument vector, shell string, alias parser, or pre-encoding
 hook. `anthropic_api` and `remote_host` have no conversion. Fixed version
-arguments are private data derived exhaustively from the enum.
+arguments and output grammars are private data derived exhaustively from the
+enum.
 
 `configured_runtime_executables_from_agents_config` produces the two distinct
 Codex roles and the Claude role with explicit persisted source bindings. It
@@ -193,33 +194,48 @@ distinct serialized facts and digest inputs, as required by B-012.
 
 ## Single-Command PATH Resolution
 
-`executable.rs` resolves one configured command without a shell:
+`executable.rs` resolves one configured command without a shell and pins the
+Rust toolchain behavior used by the adapter. The input carries a typed
+`RuntimeLaunchContext`: platform, configured child working directory,
+sanitized child `PATH`, and every platform search base that the resolver needs
+but must not infer.
 
-- absolute paths are used as the sole candidate;
-- relative paths containing a directory component are joined only to the
-  declared working directory;
-- bare names traverse the supplied sanitized native `PATH` in native order and
-  inspect only that exact basename (and native `PATHEXT` forms on Windows);
-- missing, non-file, and non-executable candidates are skipped only where the
-  platform launch contract would skip them; once the launch-selected candidate
-  is chosen, later entries are never fallback probe targets; and
-- quotes, spaces, pipes, substitutions, and redirections are literal path
-  characters. No `sh`, `which`, package manager, or candidate execution is
-  permitted during resolution.
+On Unix:
 
-Empty/native-relative PATH entries retain platform launch meaning relative to
-the declared working directory. The exact native PATH bytes are
-domain-separated by platform and represented only by SHA-256 plus the
-resolution outcome; directory contents and raw PATH text are never serialized.
-A selected path that cannot be represented in the strict fingerprint identity
-records `path_unusable` without a lossy placeholder. This implements B-004 and
-the PATH portion of B-010.
+- an absolute path is the sole candidate;
+- a qualified relative path is joined to the declared child working directory;
+- a bare name traverses sanitized `PATH` in order, with empty and relative
+  entries based on the declared child working directory, matching `chdir` then
+  `execvp`; and
+- execute permission is checked from opened-handle mode bits.
 
-The probe command receives exactly the same sanitized PATH value used by the
-resolver, so a qualified `#!/usr/bin/env node` launcher observes the same
-interpreter search. Other environment keys are supplied only by the typed
-policy below. Resolution never claims which executable a later adapter run
-will select.
+On Windows, the pinned Rust `Command` bare-name resolver is mirrored: explicit
+child `PATH`, current executable directory, system directory, Windows
+directory, then parent `PATH`, with only Rust's `.exe` completion. `PATHEXT` is
+not consulted. Explicit `.bat` and `.cmd` programs are `path_unusable` because
+Rust's batch handling invokes a command interpreter and violates the no-shell
+boundary. Every explicit non-`.exe` extension is likewise `path_unusable` in
+v0.1; supporting another extension requires a later closed grammar revision.
+The child `current_dir` is not treated as the parent search base. A qualified
+relative program, relative/empty search entry, or unavailable special directory
+is accepted only when its actual base is explicit and stable in the launch
+context; otherwise resolution records `path_unusable`. Tests freeze this order
+against the pinned toolchain so a Rust upgrade that changes resolution cannot
+silently change fingerprints.
+
+On every platform, quotes, spaces, pipes, substitutions, and redirections are
+literal path characters. Resolution inspects only the configured basename,
+never runs `sh`, `which`, a package manager, or a candidate. Once selected, the
+candidate is converted to an absolute path and that path alone is opened and
+spawned; no second OS search or later-candidate fallback is possible.
+
+The effective search inputs are domain-separated by platform and represented
+only by SHA-256 plus the resolution outcome; directory contents and raw search
+text are never serialized. The probe child receives the exact sanitized child
+`PATH` from the launch context so a qualified `#!/usr/bin/env node` launcher
+uses the declared interpreter search. Other environment keys are supplied only
+by the typed policy below. Resolution never claims which executable a later
+adapter run will select. This implements B-004 and the PATH portion of B-010.
 
 ## Typed Environment Policy
 
@@ -252,19 +268,29 @@ second time as a general declaration. These rules implement B-005 and B-010.
 
 After resolution, one blocking inspection closure opens the selected target
 once and operates on that file handle. It obtains handle metadata, proves the
-target is a regular executable file, and incrementally hashes fixed-size chunks.
-It checks the configured byte limit against initial metadata and again while
-reading, stops at `limit + 1`, does not preallocate the maximum, and returns
-only bounded typed facts. The closure runs through `spawn_blocking`; no
+target is a regular file, and incrementally hashes fixed-size chunks. Unix also
+derives execute permission from handle mode bits. Windows extension/search
+eligibility belongs to resolution and successful OS loading belongs to spawn;
+the producer does not claim that an extension or parsed PE header proves
+loadability. On a platform with contained spawn, a bad-image or access failure
+is `spawn_failed`; Windows v0.1 instead stops at `containment_unavailable`
+before spawn and makes no loadability claim.
+
+The closure checks the configured byte limit against initial metadata and again
+while reading, stops at `limit + 1`, does not preallocate the maximum, and
+returns only bounded typed facts. It runs through `spawn_blocking`; no
 multi-megabyte file read occurs on a Tokio worker and no `std::fs::read` whole-
 file allocation is allowed.
 
-The observation retains the strongest stable handle identity exposed by the
-platform (for example device/inode on Unix and the corresponding native file
-identity on Windows). Immediately before spawn and again after the child is
-reaped, it opens the resolved path and compares that identity with the retained
-handle. A symlink is identified by the opened target, not by mixing link
-metadata with target bytes.
+The retained strong identity is device/inode from handle metadata on Unix and
+volume serial plus 128-bit `FILE_ID_INFO` from the opened handle on Windows.
+Path, mtime, extension, or a weaker optional metadata field is not a fallback.
+If the opened handle cannot provide the specified strong identity, the producer
+records `identity/metadata_unavailable` before version attribution.
+`path_unusable` remains exclusive to resolution. Immediately before spawn and
+again after the child is reaped, the producer opens the resolved path and
+compares that identity with the retained handle. A symlink is identified by the
+opened target, not by mixing link metadata with target bytes.
 
 If either comparison fails or the identity changes, the envelope records
 `identity/identity_changed`, emits no version fact, and does not associate the
@@ -277,12 +303,22 @@ implements B-006 and its non-goal.
 
 ## Supervised Version Probe
 
-`probe.rs` reuses the crate's existing process-group and `ManagedChild`
-supervision instead of introducing another unmanaged child type. The command
-has null stdin, piped stdout/stderr, `kill_on_drop(true)`, and a dedicated Unix
-process group where supported. `ManagedChild` already kills and schedules
-reaping on cancellation; the probe adds its own explicit deadline and bounded
-dual-stream collector.
+`probe.rs` reuses and tightens the crate's `ManagedChild` supervision instead
+of introducing an unmanaged child type. On Unix the command has null stdin,
+piped stdout/stderr, `kill_on_drop(true)`, and a dedicated process group created
+before exec. Every explicit termination path signals the negative process-group
+ID, awaits the root child, and verifies the group is empty. Drop/cancellation
+must synchronously signal the process group before handing root reaping and
+group-drain verification to an owned cleanup task; root-only `kill_on_drop` is
+not counted as containment.
+
+The current non-Unix `ManagedChild` has no descendant containment. Windows v0.1
+therefore records `version_probe/containment_unavailable` before spawning and
+emits no version fact. Do not emulate Job Object safety by assigning a running
+process after `Command::spawn`; atomic Windows containment would require a
+suspended low-level launch, no-breakaway kill-on-close Job Object assignment,
+then resume, which is outside this packet. A later schema revision may authorize
+that surface.
 
 The collector reads both pipes concurrently in fixed-size chunks while one
 counter enforces `max_output_bytes` across both buffers. It never calls
@@ -308,6 +344,7 @@ The result-state matrix is fail closed:
 | --- | --- |
 | path resolution failure | no resolved identity, executable digest, or version |
 | identity failure | bounded opened-handle facts only; no stable executable digest/version pair |
+| containment unavailable | stable identity may remain; no child was spawned and version is absent |
 | spawn/lifecycle/exit/output failure | stable identity may remain; version is absent |
 | `identity_changed` after exit | candidate output/version is discarded |
 | success | stable identity, zero exit, two exact output digests, selected stream, one normalized version, and no failures |
@@ -317,23 +354,27 @@ This implements B-007, B-008, and B-015.
 ## Version Output Contract
 
 Within the combined bound, stdout and stderr remain separate exact byte
-sequences and each receives a SHA-256. Stdout is selected when it contains a
-non-ASCII-whitespace byte; otherwise stderr is selected. Successful version
+sequences and each receives a SHA-256 before parsing. Successful version
 evidence requires both complete streams to be valid UTF-8 and the child to exit
 zero.
 
-The parser scans token boundaries without regex or a new dependency. A token
-has one optional leading `v` or `V`, at least two dot-separated numeric
-components, and optional ASCII SemVer-style prerelease/build suffixes. It
-removes only the single leading `v`/`V`; digits, suffix spelling, and suffix
-case are retained exactly. Repeated occurrences of the same normalized token
-are one candidate; two distinct candidates are `ambiguous_version`.
+The closed runtime kind selects a whole-stream grammar. Codex Exec and Codex
+JSON-RPC accept exactly `codex-cli <VERSION>`; Claude Code accepts exactly
+`<VERSION> (Claude Code)`. Each permits only one optional final LF or CRLF.
+`VERSION` is ASCII SemVer with exactly three numeric core components, no
+invalid leading zero, and optional prerelease/build suffix. Its exact spelling
+and suffix case are retained. A leading `v`/`V`, surrounding whitespace, extra
+line, dependency/runtime suffix, or partial token match is rejected rather than
+guessed.
 
-Zero exit with two blank streams yields `empty_output`; nonblank output with no
-candidate yields `unparseable_version`; invalid UTF-8 yields `invalid_utf8`.
-Nonzero and signal exits yield their exact closed failure kinds and are not
-parsed into success. The payload records the selected stream plus both exact
-digests only on success. This implements B-009.
+Exactly one stream may contain the matching product line and the other must be
+ASCII blank. Matching product lines on both streams with different versions
+yield `ambiguous_version`; a blank pair yields `empty_output`; any other
+nonblank shape yields `unparseable_version`; invalid UTF-8 yields
+`invalid_utf8`. Nonzero and signal exits are not parsed into success. The
+payload records the selected stream plus both exact digests only on success.
+Changing a product output grammar requires a new schema grammar revision, not
+a heuristic first-token fallback. This implements B-009.
 
 ## Context-Aware MCP Schema Canonicalization
 
@@ -387,14 +428,14 @@ owns user-facing collection commands. This is B-016.
 | Product behavior | Required verification |
 | --- | --- |
 | B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_integrity_mismatch`; `payload_digest_is_canonical_and_component_free` |
-| B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
+| B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
 | B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `mcp_tool_requires_typed_matching_server_and_tool_ownership` |
-| B-004 | `bare_path_resolution_matches_first_native_launch_candidate`; `qualified_relative_and_metacharacter_paths_are_literal`; `resolver_never_inspects_or_executes_unrelated_commands` |
+| B-004 | Unix `bare_path_resolution_uses_child_cwd_and_first_path_candidate`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable`; `resolver_spawns_only_the_selected_absolute_path` |
 | B-005, B-010 | `setup_secret_env_is_absent_from_probe_and_facts`; `typed_runtime_environment_records_set_unset_digest_and_redacted`; `environment_rejects_duplicates_invalid_keys_and_setup_conflicts` |
-| B-006 | `opened_handle_drives_metadata_and_incremental_hash`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed` |
-| B-007 | `timeout_kills_and_reaps_probe_group`; `cancellation_kills_and_reaps_probe_group`; `dual_stream_limit_is_combined_and_bounded`; `pipe_read_failure_terminates_and_reaps` |
+| B-006 | `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed` |
+| B-007 | Unix `timeout_kills_reaps_and_drains_probe_group`; `cancellation_signals_group_before_owned_reap`; `dual_stream_limit_is_combined_and_bounded`; Windows `containment_unavailable_prevents_spawn` |
 | B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
-| B-009 | `version_parser_accepts_exact_v01_grammar_and_preserves_suffix_case`; `stdout_stderr_and_output_digests_are_exact`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
+| B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions` |
 | B-013 | `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `duplicate_json_keys_fail_before_digest` |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
@@ -403,10 +444,11 @@ All failure tests assert the absence of a version fact and the absence of raw
 path, PATH, output, environment, and OS-diagnostic text from serialized
 evidence. Lifecycle tests retain child PIDs/process-group IDs and verify that
 they are gone after the API returns. PATH tests create multiple same-basename
-candidates, a directory containing spaces, literal shell metacharacters, and a
-qualified `/usr/bin/env`-style test launcher. Schema expected digests are fixed
-independent vectors rather than values generated by the production helper
-under test.
+candidates, a directory containing spaces, and literal shell metacharacters.
+The qualified `/usr/bin/env`-style child-execution fixture is Unix-only;
+Windows tests stop before spawn with `containment_unavailable`. Schema expected
+digests are fixed independent vectors rather than values generated by the
+production helper under test.
 
 ## Authorized Implementation Surface
 

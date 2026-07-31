@@ -78,7 +78,9 @@ facts in snapshots or through a CLI.
    case variants, UUIDs, display labels, and caller-supplied hex encodings
    cannot be converted into a local runtime identity. Version arguments come
    from the closed mapping for the selected kind and are not an arbitrary
-   public command vector.
+   public command vector. The same mapping owns a whole-output version grammar:
+   both Codex kinds accept only `codex-cli <VERSION>`, and Claude Code accepts
+   only `<VERSION> (Claude Code)`, apart from one optional final line ending.
 3. **B-003:** Every producer accepts or derives a validated ASC-001 source from
    persisted ownership information. Repository-, user-global-, admin-, system-,
    and runtime-owned runtime or MCP components retain that source scope and
@@ -90,41 +92,64 @@ facts in snapshots or through a CLI.
    before a fingerprint is emitted.
 4. **B-004:** Runtime resolution treats the configured executable as exactly
    one command name or path and never invokes a shell or parses embedded
-   arguments, quoting, pipes, substitutions, or redirections. A path with a
-   directory component resolves only relative to the declared working
-   directory or as an absolute path. A bare name searches the exact sanitized
-   `PATH` used for the probe in native order and selects according to the same
-   launch contract as the adapter. Resolution checks only that configured
-   basename, never executes `which`, never runs candidates while searching,
-   and never falls through to a later candidate after selecting the executable
-   that normal launch semantics would select.
+   arguments, quoting, pipes, substitutions, or redirections. Resolution
+   mirrors the pinned Rust `Command` behavior used by the adapter, with an
+   explicit platform contract. On Unix, a qualified relative path and
+   relative or empty `PATH` entries are resolved from the declared child
+   working directory. On Windows, a bare name follows the pinned Rust search
+   order and `.exe` completion rules using explicit launch-context inputs; it
+   does not use `PATHEXT`, and `.bat`/`.cmd` are `path_unusable` because Rust
+   would invoke a command interpreter contrary to the no-shell boundary. Every
+   explicitly named non-`.exe` extension is `path_unusable` in v0.1. A
+   qualified relative path or relative/empty search input whose base cannot be
+   proven is also `path_unusable`. The selected candidate is converted to one
+   absolute path before probing so spawn cannot perform a second search.
+   Resolution checks only the configured basename, never executes `which`,
+   never runs candidates while searching, and never falls through after
+   selecting the candidate that normal launch semantics would select.
 5. **B-005:** The version child receives a minimal declared environment. It
-   retains the same sanitized `PATH` used by B-004 so `#!/usr/bin/env`
-   launchers can find their interpreter, and receives only other keys whose
-   typed declaration explicitly permits probe exposure. Every name in
+   receives the same sanitized `PATH` value included in the B-004 launch
+   context so `#!/usr/bin/env` launchers can find their interpreter, and
+   receives only other keys whose typed declaration explicitly permits probe
+   exposure. Platform search inputs that exist outside child `PATH` remain
+   explicit resolution context and are never misrepresented as child
+   environment. Every name in
    `codex.cloud.setup_secret_env` is excluded from both the child environment
    and persisted fingerprint facts regardless of spelling; sensitivity is not
    guessed from substrings such as `TOKEN` or `SECRET`. No setup-only value can
    reach `codex --version` or an equivalent child.
 6. **B-006:** Executable identity comes from one opened regular-file handle,
-   not separate path-based metadata and content reads. Size, executable status,
-   and SHA-256 cover the bytes read from that handle. The producer enforces the
-   configured byte ceiling before and during reading, performs potentially
-   blocking file hashing outside the async executor, and does not allocate the
-   declared maximum eagerly. Before spawn and after child completion it checks
-   that the resolved path still identifies the opened file using the strongest
-   stable file identity available on the platform. A detected replacement or
-   an inability to link version output to the inspected identity is explicit;
+   not separate path-based metadata and content reads. Size and SHA-256 cover
+   the bytes read from that handle. Unix executable permission is derived from
+   handle metadata; Windows candidate eligibility comes from the B-004
+   filename/search contract, while actual loadability can be proven only by a
+   successful contained spawn. On a platform where contained spawn is
+   available, a bad image or access error is `spawn_failed`, not a fabricated
+   `not_executable`; Windows v0.1 reaches `containment_unavailable` before that
+   attempt. The producer enforces the configured byte
+   ceiling before and during reading, performs potentially blocking file
+   hashing outside the async executor, and does not allocate the declared
+   maximum eagerly. Before spawn and after child completion it checks that the
+   resolved path still identifies the opened file using device/inode on Unix
+   or volume serial plus 128-bit file ID on Windows. If that strong identity is
+   unavailable, observation fails typed rather than falling back to path,
+   timestamps, extension, or a parsed PE header. A detected replacement or an
+   inability to link version output to the inspected identity is explicit;
    version facts are not attributed to the digest. This is local observation,
    not a claim that path execution is race-free or cryptographically attested.
 7. **B-007:** A version probe has one lifecycle covering spawn, concurrent
    stdout/stderr reads, exit, timeout, and reap. Stdout and stderr are drained
-   incrementally under one hard combined byte limit. Reaching the output limit,
-   reaching the timeout, dropping/cancelling the future, or encountering a read
-   failure terminates and reaps the child and descendants covered by the launch
-   contract; no probe process is left running. Output is never fully buffered
-   and then truncated. Limit or timeout evidence contains no success-shaped
-   version fact.
+   incrementally under one hard combined byte limit. The producer spawns only
+   after descendant containment is established: a dedicated process group on
+   Unix, or an equivalent pre-spawn containment primitive on another platform.
+   Reaching the output limit, reaching the timeout, dropping/cancelling the
+   future, or encountering a read failure terminates the containment unit,
+   reaps the root, and verifies that the unit is empty. `kill_on_drop` of only
+   the root is not sufficient evidence. On Windows v0.1, where the existing
+   launcher cannot atomically assign a Job Object before execution, the
+   producer records `containment_unavailable` without spawning. Output is never
+   fully buffered and then truncated. Limit, timeout, or containment evidence
+   contains no success-shaped version fact.
 8. **B-008:** Probe incompleteness is represented by closed typed phase and
    kind values, not caller-defined strings. The v0.1 vocabulary is the table
    below. A failure record contains bounded, redacted structured facts only,
@@ -132,15 +157,19 @@ facts in snapshots or through a CLI.
    environment values are not part of the canonical digest. Failures serialize
    in deterministic phase/kind order, and an unsupported phase/kind is rejected.
 9. **B-009:** Version success requires a stable executable identity, exit code
-   zero, bounded valid UTF-8 output, and exactly one unambiguous version token.
-   The v0.1 token grammar is an optional single `v` or `V`, at least two
-   dot-separated numeric components, and optional ASCII SemVer-style
-   prerelease/build suffix. Normalization removes only the leading `v`/`V` and
-   preserves the remaining byte spelling and case. The exact bounded stdout and
-   stderr byte digests and the selected stream are retained. Successful but
-   blank output records `empty_output`; nonblank output with no token records
-   `unparseable_version`; conflicting candidates record `ambiguous_version`.
-   None may yield `failures = []` or fabricate a normalized value.
+   zero, bounded valid UTF-8 output, and one exact whole-stream match for the
+   selected B-002 runtime grammar. `VERSION` is strict ASCII SemVer with exactly
+   three numeric core components, no invalid leading zero, and optional
+   prerelease/build suffix; its byte spelling and suffix case are preserved.
+   No leading `v`/`V`, token scan, first-token fallback, dependency-version
+   filter, surrounding whitespace, or extra nonblank line is accepted. Exactly
+   one of stdout or stderr may contain the matching product line and the other
+   must be ASCII blank; two matching streams with different versions record
+   `ambiguous_version`. The exact bounded stdout and stderr byte digests and
+   selected stream are retained. Successful but blank output records
+   `empty_output`; nonblank output that does not fully match records
+   `unparseable_version`. None may yield `failures = []` or fabricate a
+   normalized value.
 10. **B-010:** Runtime environment evidence uses an explicit typed allowlist of
     behavior-affecting keys for each supported runtime. Keys are unique and
     sorted; missing values are `unset`; allowed non-secret values are represented
@@ -148,8 +177,10 @@ facts in snapshots or through a CLI.
     a value digest. Probe exposure is a separate typed decision from evidence
     inclusion. Blank, NUL-containing, duplicate, undeclared, full-environment,
     and setup-secret entries are rejected or excluded according to B-005 rather
-    than silently reclassified by a name heuristic. `PATH` is recorded only as
-    a digest plus resolution outcome, never as raw directory content.
+    than silently reclassified by a name heuristic. Child `PATH` and every
+    platform-specific search input used by B-004 are represented only by
+    domain-separated digests plus the resolution outcome, never as raw paths or
+    directory content.
 11. **B-011:** An MCP tool producer requires a validated stable tool source and
     exact server/tool identities. The source describes component ownership;
     runner observation describes who obtained the advertised contract. A
@@ -205,12 +236,13 @@ facts in snapshots or through a CLI.
 | --- | --- | --- |
 | `path_resolution` | `path_not_found` | No executable selected by the configured path/`PATH` launch contract. |
 | `path_resolution` | `path_unusable` | The launch contract selected a path that cannot be represented or inspected safely. |
-| `identity` | `metadata_unavailable` | Metadata could not be read from the opened handle. |
+| `identity` | `metadata_unavailable` | Required metadata or strong file identity could not be read from the opened handle. |
 | `identity` | `not_regular_file` | The selected target is not a regular file. |
-| `identity` | `not_executable` | The selected target is not executable under the platform launch contract. |
+| `identity` | `not_executable` | Unix handle mode bits do not permit execution; Windows does not infer this fact from an extension or header. |
 | `identity` | `executable_too_large` | The byte ceiling was exceeded before or during hashing. |
 | `identity` | `read_failed` | The opened executable could not be read completely. |
 | `identity` | `identity_changed` | Path identity did not remain linked to the opened handle across the probe. |
+| `version_probe` | `containment_unavailable` | Required descendant containment could not be established before spawn, so no child was started. |
 | `version_probe` | `spawn_failed` | The selected command could not be spawned. |
 | `version_probe` | `timeout` | The lifecycle deadline expired and the child was terminated and reaped. |
 | `version_probe` | `output_limit_exceeded` | Combined stdout/stderr crossed the hard byte limit and the child was terminated and reaped. |
@@ -219,8 +251,8 @@ facts in snapshots or through a CLI.
 | `version_probe` | `terminated_by_signal` | The child terminated without an exit code. |
 | `version_probe` | `invalid_utf8` | Bounded output was not valid UTF-8. |
 | `version_probe` | `empty_output` | Exit was successful but both streams were blank. |
-| `version_probe` | `unparseable_version` | Nonblank output contained no v0.1 version token. |
-| `version_probe` | `ambiguous_version` | Output contained conflicting candidate version tokens. |
+| `version_probe` | `unparseable_version` | Nonblank output did not exactly match the selected runtime's whole-output grammar. |
+| `version_probe` | `ambiguous_version` | Stdout and stderr each matched the selected grammar but yielded different `VERSION` values. |
 
 ## Acceptance Criteria
 
@@ -235,25 +267,33 @@ facts in snapshots or through a CLI.
 - [ ] Source fixtures prove repository-, user-, admin-, system-, runtime-, and
       genuinely runner-owned runtime/MCP components keep identical component
       IDs when observation strengthens to `runner_observed`.
-- [ ] PATH fixtures prove bare-name first-match launch parity, qualified and
-      working-directory-relative paths, an absent command, duplicate basenames,
-      path entries containing spaces, shell-metacharacter non-interpretation,
-      and refusal to probe any unrelated executable.
-- [ ] An interpreter-launcher fixture proves that sanitized `PATH` is identical
-      for resolution and child execution, while a setup-only secret named
-      `NPM_ACCESS` is absent from the child and from serialized facts.
+- [ ] PATH fixtures prove Unix child-working-directory semantics and Windows
+      pinned-Rust search order/`.exe` behavior, including Windows refusal to use
+      `PATHEXT`, accept any explicitly named non-`.exe` extension, execute
+      `.bat`/`.cmd` through a shell, or guess a qualified-relative base; both
+      platforms cover an absent command, duplicate basenames, spaces, literal
+      shell metacharacters, one absolute selected probe path, and no unrelated
+      executable.
+- [ ] A Unix interpreter-launcher fixture proves that sanitized child `PATH` is
+      identical for resolution and child execution, while a setup-only secret
+      named `NPM_ACCESS` is absent from the child and from serialized facts.
 - [ ] Identity fixtures prove handle-based metadata/hash consistency, before-
-      and during-read size limits, nonblocking async execution, and explicit
-      `identity_changed` evidence when the selected path is replaced between
-      inspection and probe.
+      and during-read size limits, nonblocking async execution, Unix mode-bit
+      checks, Windows strong file-ID checks without a fabricated executable
+      claim, and explicit `identity_changed` evidence when the selected path is
+      replaced between inspection and probe.
 - [ ] Lifecycle fixtures use hanging and unbounded dual-stream children to
-      prove timeout, cancellation, and combined output-limit paths terminate and
-      reap the child without unbounded allocation or a version fact.
+      prove Unix timeout, cancellation, and combined output-limit paths kill the
+      process group, reap the root, and leave the group empty without unbounded
+      allocation or a version fact; Windows v0.1 proves
+      `containment_unavailable` is emitted before any child starts.
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
       sanitized bounded facts, and rejection of unknown values.
-- [ ] Version fixtures cover stdout, stderr, leading `v`/`V`, prerelease/build
-      case preservation, nonzero and signalled exit, invalid UTF-8, successful
-      blank output, unparseable output, and conflicting candidates.
+- [ ] Version fixtures cover exact current Codex and Claude product lines,
+      stdout/stderr selection, prerelease/build case preservation, CRLF/LF,
+      rejected `v`/`V`, leading/trailing text, extra dependency versions,
+      nonzero and signalled exit, invalid UTF-8, successful blank output,
+      unparseable output, and conflicting matching streams.
 - [ ] Environment fixtures prove declared set/unset/digest/redacted behavior,
       raw-value and raw-PATH absence, duplicate/invalid-key rejection, separate
       probe exposure, and unconditional exclusion of every setup-secret key.
@@ -291,16 +331,16 @@ facts in snapshots or through a CLI.
 
 - The configured command is a bare name and two `PATH` directories contain it.
 - A qualified relative executable contains spaces or shell metacharacters.
-- An npm-style launcher uses `#!/usr/bin/env node` and the interpreter is found
-  only through the sanitized `PATH`.
+- On Unix, an npm-style launcher uses `#!/usr/bin/env node` and the interpreter
+  is found only through the sanitized child `PATH`.
 - A setup-only secret has a harmless-looking name such as `NPM_ACCESS`.
 - The executable is a symlink, is replaced during hashing, or is replaced and
   restored around the version probe.
 - A regular file grows past the byte limit after its first metadata read.
 - A probe hangs, forks, closes only one stream, floods both streams, exits by
   signal, succeeds with blank output, or emits conflicting versions.
-- Version output contains invalid UTF-8 or valid Unicode surrounding one ASCII
-  version token.
+- Version output contains invalid UTF-8 or valid Unicode surrounding an
+  otherwise valid product line; both are explicit failures.
 - An MCP description differs only by tabs, repeated spaces, or line breaks.
 - A schema annotation contains `{ "enum": [1, 2] }` as ordinary default data.
 - `prefixItems` or a vendor extension differs only by array order.
