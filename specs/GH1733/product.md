@@ -90,30 +90,80 @@ facts in snapshots or through a CLI.
    path does not identify the host executable actually launched.
 3. **B-003:** Every producer accepts or derives a validated ASC-001 source from
    persisted ownership information. Repository-, user-global-, admin-, system-,
-   and runtime-owned runtime or MCP components retain that source scope and
-   locator when observed by a runner. Only a genuinely runner-owned executable
-   or tool definition uses `runner` source scope. The emitted observation class,
-   trust, selection state, and freshness are `runner_observed`,
+   and runtime-owned runtime or MCP components retain their source scope and
+   persisted ownership identity when observed by a runner; the closed runtime
+   and MCP bindings below may derive a typed locator from that base identity.
+   Only a genuinely runner-owned executable or tool definition uses `runner`
+   source scope. The emitted observation class, trust, selection state, and
+   freshness are `runner_observed`,
    `runner_observed`, `observed`, and `fresh`; stronger observation never
    rewrites the component ID. Invalid, ambiguous, or untyped ownership fails
-   before a fingerprint is emitted.
+   before a fingerprint is emitted. Runtime component identity is a typed role
+   binding derived internally from the base source and exact B-002 runtime-kind
+   spelling:
+   `<base_locator>/harness_agent_runtime_role_v0_1/u<byte_length>_<lowercase_utf8_hex>`.
+   This injective mapping preserves scope and gives `codex_exec`,
+   `codex_jsonrpc`, and `claude_code` distinct component IDs even when two
+   roles share one persisted base binding. Callers cannot supply or pre-encode
+   the role locator. Envelope parsing strips the final two locator segments,
+   validates the remaining base source under the same scope, decodes the exact
+   length-prefixed suffix, requires one canonical runtime-kind spelling equal
+   to the payload kind, re-derives the locator, and rejects missing, malformed,
+   noncanonical, or wrong-role suffixes. If the base binding has exact
+   canonical source bytes, each derived role retains their identical ASC-001
+   integrity; otherwise integrity is absent. Role text and fingerprint payload
+   never enter component integrity.
 4. **B-004:** Runtime resolution treats the configured executable as exactly
    one command name or path and never invokes a shell or parses embedded
-   arguments, quoting, pipes, substitutions, or redirections. Resolution
-   mirrors the pinned Rust `Command` behavior used by the adapter, with an
-   explicit platform contract. On Unix, a qualified relative path and
+   arguments, quoting, pipes, substitutions, or redirections. Windows mirrors
+   the pinned Rust `Command` search behavior; Unix uses an explicit safe subset
+   that preserves `EACCES` fallback but deliberately rejects `ENOEXEC` shell
+   fallback. On Unix, a qualified relative path and
    relative or empty `PATH` entries are resolved from the declared child
-   working directory. On Windows, a bare name follows the pinned Rust search
+   working directory. Every payload includes
+   `configured_command_digest = SHA-256("harness_runtime_configured_command_v0_1\0" || platform_tag || unit_count_be || exact_units)`.
+   `platform_tag` is exactly `b"unix\0"` or `b"windows\0"`;
+   `unit_count_be` is an unsigned fixed-width `u64` in big-endian order.
+   Unix exact units are the raw `OsStr` bytes; Windows exact units are the
+   original UTF-16 code units serialized little-endian, and the count is UTF-16
+   units rather than bytes. There is no UTF-8,
+   case, separator, dot-segment, symlink, or absolute-path normalization, and
+   the raw command is never serialized.
+
+   On Windows, a bare name follows the pinned Rust search
    order and `.exe` completion rules using explicit launch-context inputs; it
    does not use `PATHEXT`, and `.bat`/`.cmd` are `path_unusable` because Rust
    would invoke a command interpreter contrary to the no-shell boundary. Every
    explicitly named non-`.exe` extension is `path_unusable` in v0.1. A
    qualified relative path or relative/empty search input whose base cannot be
-   proven is also `path_unusable`. The selected candidate is converted to one
-   absolute path before probing so spawn cannot perform a second search.
-   Resolution checks only the configured basename, never executes `which`,
-   never runs candidates while searching, and never falls through after
-   selecting the candidate that normal launch semantics would select.
+   proven is also `path_unusable`.
+
+   Unix bare-name execution uses a frozen Harness search algorithm rather than
+   delegating to `execvp`: candidates keep the exact basename and sanitized
+   `PATH` order and at most 64 entries are observed. Missing, non-regular, or
+   mode-ineligible candidates are skipped without execution; failure to open an
+   otherwise selected candidate is `identity/open_failed` and stops. Reaching
+   entry 65 before a terminal outcome is
+   `path_resolution/candidate_limit_exceeded`. After inspection and the pre-spawn
+   checkpoint, a direct no-shell `execve` primitive attempts the absolute
+   candidate with fixed B-002 arguments. Only an exact `EACCES` result may
+   discard that candidate and continue to the next same-basename entry.
+   `ENOEXEC` is terminal `spawn_failed` and never invokes `/bin/sh`; every
+   other spawn error is terminal. Absolute and qualified commands never
+   fallback. Ordered attempt evidence retains only domain-separated candidate
+   path digests and the closed outcomes defined by B-008. Candidate digests use
+   `"harness_runtime_resolution_candidate_v0_1\0"` followed by the same exact
+   platform tag, `u64` big-endian unit count, and OS units as the configured
+   command digest. The first successful exec is the selected executable;
+   exhausting only `EACCES` candidates is `bare_eacces_exhausted`, while no
+   inspectable candidate is `path_not_found`. Resolution never invokes
+   `which`, a package manager, or an arbitrary candidate command.
+
+   Repository-owned bare commands stop after the first statically eligible,
+   successfully inspected candidate, record its identity as
+   `inspection_target` plus `probe_not_authorized`, and perform no exec attempt
+   or fallback. That target is never called selected or executed. An earlier
+   open/identity failure remains the sole earliest failure.
 5. **B-005:** The version child receives only the sanitized `PATH` value
    included in the B-004 launch context so `#!/usr/bin/env` launchers can find
    their interpreter. No caller can declare or expose another key. Evidence
@@ -301,6 +351,8 @@ facts in snapshots or through a CLI.
 | --- | --- | --- |
 | `path_resolution` | `path_not_found` | No executable selected by the configured path/`PATH` launch contract. |
 | `path_resolution` | `path_unusable` | The launch contract selected a path that cannot be represented or inspected safely. |
+| `path_resolution` | `candidate_limit_exceeded` | Unix bare-name search reached candidate 65 before a terminal outcome; no further entry was observed. |
+| `identity` | `open_failed` | A resolved candidate could not be opened as the retained inspection handle. |
 | `identity` | `metadata_unavailable` | Required metadata or strong file identity could not be read from the opened handle. |
 | `identity` | `not_regular_file` | The selected target is not a regular file. |
 | `identity` | `not_executable` | Unix handle mode bits do not permit execution; Windows does not infer this fact from an extension or header. |
@@ -309,7 +361,8 @@ facts in snapshots or through a CLI.
 | `identity` | `identity_changed` | Path strong identity or retained-handle size/content digest changed across checkpoints. |
 | `version_probe` | `probe_not_authorized` | Closed source-scope policy forbids executing this inspected executable; no child was started. |
 | `version_probe` | `containment_unavailable` | Required pre-spawn process supervision could not be established, so no child was started; the name does not claim non-escapable containment on supported platforms. |
-| `version_probe` | `spawn_failed` | The selected command could not be spawned. |
+| `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
+| `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
 | `version_probe` | `timeout` | The probe deadline expired; cleanup outcome is represented independently. |
 | `version_probe` | `output_limit_exceeded` | Combined stdout/stderr exceeded the inclusive hard byte limit; cleanup outcome is represented independently. |
 | `version_probe` | `output_read_failed` | Either output pipe failed before a complete bounded result was obtained. |
@@ -323,6 +376,32 @@ facts in snapshots or through a CLI.
 | `lifecycle_cleanup` | `reap_failed` | Root reap failed or was not verified before cleanup ownership was transferred. |
 | `lifecycle_cleanup` | `output_drain_failed` | Bounded drain did not complete before read handles were closed and ownership was transferred. |
 | `lifecycle_cleanup` | `group_verification_failed` | Original process-group emptiness was not verified before ownership was transferred; this never represents the whole descendant tree. |
+
+### Unix Bare-Name Attempt Vocabulary
+
+`RuntimeResolutionAttempt` exists only for Unix bare-name resolution and is
+ordered exactly like the first at most 64 sanitized `PATH` entries. It contains
+a candidate digest and one closed outcome:
+
+| Outcome | Meaning |
+| --- | --- |
+| `absent` | Candidate open returned exact not-found/not-a-directory semantics; search continues. |
+| `not_regular` | Opened candidate is not a regular file; search continues without a global identity failure. |
+| `not_executable` | Opened candidate lacks required mode bits; search continues without a global identity failure. |
+| `inspection_failed` | Open or later inspection failed; this is terminal and requires the matching B-008 identity failure. |
+| `inspection_target` | Repository policy retained this first statically eligible identity and stopped without exec. |
+| `exec_eacces` | Direct `execve` returned exact `EACCES`; final identity is discarded and search continues. |
+| `exec_failed` | Direct `execve` returned another terminal error; requires `spawn_failed` and no selected/executed claim. |
+| `exec_started` | Direct `execve` succeeded; this is the sole terminal selected executable. |
+
+Parsers preserve list order and reject more than 64 attempts, an outcome after
+a terminal outcome, any exec outcome for a repository source, multiple
+terminal outcomes, `inspection_target` without `probe_not_authorized`,
+`exec_failed` without `spawn_failed`, `exec_started` with a spawn failure, or
+`bare_eacces_exhausted` unless the final non-skipped attempt is `exec_eacces`
+and no final executable identity exists. `candidate_limit_exceeded` requires
+exactly 64 nonterminal attempts. `path_not_found` permits only skipped outcomes
+and no inspection or selected identity.
 
 ## Acceptance Criteria
 
@@ -342,14 +421,36 @@ facts in snapshots or through a CLI.
       IDs when observation strengthens to `runner_observed`; repository-owned
       runtime fixtures retain identity/hash evidence but emit
       `probe_not_authorized` without executing a marker program, and callers
-      cannot promote that source to an executable trust class.
+      cannot promote that source to an executable trust class. Runtime-role
+      fixtures prove the three derived IDs are pairwise distinct for one base
+      source, preserve scope and identical exact-source integrity or absence,
+      and cannot be caller pre-encoded. Strict parser fixtures reject missing,
+      malformed, noncanonical, and payload-wrong role suffixes.
 - [ ] PATH fixtures prove Unix child-working-directory semantics and Windows
       pinned-Rust search order/`.exe` behavior, including Windows refusal to use
       `PATHEXT`, accept any explicitly named non-`.exe` extension, execute
       `.bat`/`.cmd` through a shell, or guess a qualified-relative base; both
       platforms cover an absent command, duplicate basenames, spaces, literal
       shell metacharacters, one absolute selected probe path, and no unrelated
-      executable.
+      executable. Unix bare-name fixtures prove exact `EACCES` fallback to a
+      later same-basename candidate, terminal `ENOEXEC` without `/bin/sh`,
+      terminal non-`EACCES` errors, and no fallback for absolute or qualified
+      commands. Injected open denial is `open_failed`, mutually exclusive with
+      handle-based failures, and never leaks OS diagnostics.
+- [ ] Unix attempt fixtures round-trip every closed outcome, reject illegal
+      source/outcome/failure/terminal combinations, preserve duplicate PATH
+      entries and order, cover exactly 64 candidates and candidate 65, and
+      prove `bare_eacces_exhausted` retains no final executable identity.
+- [ ] Repository bare-name fixtures with an injected first-candidate `EACCES`
+      condition and a second marker prove only the first static inspection
+      target is hashed, no exec attempt or fallback occurs, and no
+      selected/executed claim is emitted.
+- [ ] Configured-command digest fixtures freeze Unix raw-byte and Windows
+      UTF-16LE vectors, distinguish absent commands and spelling/path variants
+      under otherwise identical search facts, and prove raw command text is
+      absent from serialized evidence. Independent hard-coded vectors also
+      freeze the exact platform tags, `u64` big-endian counts, candidate digest
+      domain, and Windows little-endian `u16` units.
 - [ ] A Unix interpreter-launcher fixture proves that sanitized child `PATH` is
       identical for resolution and child execution, while a setup-only secret
       named `NPM_ACCESS` is absent from the child and from serialized facts.
@@ -406,7 +507,9 @@ facts in snapshots or through a CLI.
       `cargo test -p harness-agents runtime_fingerprint`.
 - [ ] A changed-file and call-site audit proves there is no snapshot, CLI,
       server, workflow-runtime, `CodeAgent`, or `AgentAdapter` consumer and no
-      persistence, dependency, or existing launch-behavior change.
+      persistence or existing launch-behavior change. The only manifest change
+      is a direct `harness-agents` dependency on the existing workspace `libc`;
+      no new package, version, or lockfile change is allowed.
 
 ## Boundary Checklist
 

@@ -9,7 +9,7 @@ GH-1733
 See `specs/GH1733/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1733,"complete":true,"paths":["crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
+{"issue":1733,"complete":true,"paths":["crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
 -->
 
 ## Current System and Root Cause
@@ -65,8 +65,8 @@ before adding the remediation:
 - `stack/fingerprint.rs` is the public facade for envelope construction,
   parsing, validation, and canonical fingerprint hashing.
 - `stack/fingerprint/model.rs` owns the closed subjects, payloads, runtime
-  kinds, environment facts, version facts, failure vocabulary, and typed
-  errors.
+  kinds, canonical runtime-role source binding, environment facts, version
+  facts, failure vocabulary, and typed errors.
 - `stack/fingerprint/schema.rs` owns duplicate-aware JSON decoding and the
   schema-context canonicalization state machine.
 - `stack/fingerprint/tests.rs` owns core wire, MCP, schema, and digest tests.
@@ -86,7 +86,9 @@ Every production file and test file must remain below 800 lines after rustfmt;
 the typical target is 200-400 lines. `stack/mod.rs` and `harness-agents/lib.rs`
 only expose the two facades. The one authorized server-file change is a
 `#[cfg(test)]` contract test described below; it adds no production import,
-mapping, call site, or consumer. No manifest or dependency change is required.
+mapping, call site, or consumer. `harness-agents` adds a direct dependency on
+the already pinned workspace `libc` solely for the Unix no-shell `execve`
+primitive. This adds no package/version and must not change `Cargo.lock`.
 
 ## Strict Fingerprint Envelope
 
@@ -115,7 +117,9 @@ failure, then validates, in order:
 
 1. exact outer version and closed subject;
 2. matching typed payload and exact inner version;
-3. the ASC-001 component, subject/kind agreement, and an empty capability list;
+3. the ASC-001 component, subject/kind agreement, an empty capability list,
+   and a canonical runtime-role locator whose decoded suffix equals the runtime
+   payload kind;
 4. exact B-003 observation, trust, selection, and freshness values;
 5. payload-local ordering and impossible-state invariants; and
 6. ASC-001 integrity wire shape, plus the subject-specific invariant that a
@@ -169,10 +173,21 @@ from the enum, and successful v0.1 payloads record `execution_isolation: host`.
 
 `configured_runtime_executables_from_agents_config` produces the two distinct
 Codex roles and the Claude role with explicit persisted source bindings. It
-does not invent a runner source when ownership is absent, and it rejects
-duplicate component IDs across those bindings. Callers that cannot provide a
-validated ownership source get a typed error rather than a generated UUID,
-display label, or hex-encoded locator.
+does not invent a runner source when ownership is absent. A private
+producer calls the core typed
+`RuntimeRoleSourceBinding::derive(base_source, runtime_kind)`, which preserves
+scope and appends
+`harness_agent_runtime_role_v0_1/u<byte_length>_<lowercase_utf8_hex>` using the
+exact closed runtime-kind wire bytes. The three derived component IDs are
+pairwise distinct even when both Codex roles share one base binding. Callers
+cannot supply, pre-encode, or override the role locator; an apparent suffix in
+the base is treated as ordinary base input and receives another derived suffix.
+Callers that cannot provide a validated ownership source get a typed error
+rather than a generated UUID, display label, or free-form locator. Core parsing
+uses `RuntimeRoleSourceBinding::parse` to strip the final two segments, validate
+the base source under the same scope, decode exactly one closed kind, re-derive
+the complete locator, and require equality with the payload kind. Missing,
+malformed, noncanonical, or wrong-role suffixes fail typed.
 
 The `#[cfg(test)]` addition in
 `workflow_runtime_worker/runtime_profile.rs` imports the producer enum only in
@@ -190,12 +205,14 @@ For runtimes, a closed `ConfiguredRuntimeSource` retains the caller's validated
 `AgentStackSource` plus optional exact source bytes. Its constructors are
 `without_canonical_bytes(source)` and `from_exact_source_bytes(source, bytes)`;
 the latter computes ASC-001 integrity internally, and there is no bare-digest
-setter. `ConfiguredRuntimeExecutable` emits an `agent_runtime` component with
-that source and either the exact-byte integrity or absence. Executable and
-payload digests never overwrite it. For MCP tools, the constructor accepts an
-existing validated `mcp_server` component, the exact advertised tool name,
-optional exact description, and raw input-schema JSON. It accepts no separate
-tool source.
+setter. `ConfiguredRuntimeExecutable` asks the core typed binding to derive the
+role source above and emits
+an `agent_runtime` component with the same exact-byte integrity or absence.
+Multiple roles may truthfully share the base exact-source digest; integrity is
+not identity and never includes role text, locator, executable bytes, or
+payload. For MCP tools, the constructor accepts an existing validated
+`mcp_server` component, the exact advertised tool name, optional exact
+description, and raw input-schema JSON. It accepts no separate tool source.
 
 A private typed `McpToolSource::derive` mapping preserves the server source
 scope and appends
@@ -233,11 +250,31 @@ distinct serialized facts and digest inputs, as required by B-012.
 
 ## Single-Command PATH Resolution
 
-`executable.rs` resolves one configured command without a shell and pins the
-Rust toolchain behavior used by the adapter. The input carries a typed
+`executable.rs` resolves one configured command without a shell. Windows pins
+the Rust toolchain search behavior used by the adapter; Unix freezes the
+explicit safe subset below. The input carries a typed
 `RuntimeLaunchContext`: platform, configured child working directory,
 sanitized child `PATH`, and every platform search base that the resolver needs
 but must not infer.
+
+Before resolution, the producer computes `configured_command_digest` from a
+domain-separated exact OS-string representation:
+
+```text
+"harness_runtime_configured_command_v0_1\0"
+  || platform_tag
+  || unit_count_be
+  || exact_units
+```
+
+`platform_tag` is exactly `b"unix\0"` or `b"windows\0"`.
+`unit_count_be` is an unsigned fixed-width `u64` in big-endian order. Unix
+counts and appends `OsStrExt::as_bytes()` unchanged. Windows counts original
+`encode_wide()` code units and appends each as little-endian `u16`. No UTF-8 conversion,
+case-folding, slash normalization, dot-segment folding, absolutization, or
+symlink resolution occurs. Empty or NUL-containing commands fail typed before
+hashing. The digest is a payload fact and enters `fingerprint_digest`; the raw
+command is never serialized and the value never becomes ASC-001 integrity.
 
 The first operation exhaustively matches the existing `IsolationTier`. Any
 non-host tier returns its typed producer-input error before the resolver
@@ -250,9 +287,68 @@ On Unix:
 - an absolute path is the sole candidate;
 - a qualified relative path is joined to the declared child working directory;
 - a bare name traverses sanitized `PATH` in order, with empty and relative
-  entries based on the declared child working directory, matching `chdir` then
-  `execvp`; and
-- execute permission is checked from opened-handle mode bits.
+  entries based on the declared child working directory;
+- missing, non-regular, and mode-ineligible same-basename candidates advance
+  without process creation;
+- no more than 64 sanitized PATH entries are observed; reaching entry 65
+  before a terminal outcome emits `candidate_limit_exceeded`;
+- failure to open an otherwise statically eligible candidate stops with
+  `identity/open_failed`, because skipping an unreadable execute-only candidate
+  could select a different executable than the adapter;
+- after handle inspection and the pre-spawn checkpoint, `probe.rs` uses an
+  absolute-path `execve` call from the direct workspace `libc` dependency with
+  the fixed arguments and no shell;
+- only exact `EACCES` from that call advances to the next same-basename
+  candidate; `ENOEXEC` and every other error are terminal `spawn_failed`;
+- absolute and qualified commands never fallback; and
+- the first successful exec becomes the selected executable.
+
+The implementation must not call `execvp`: POSIX `ENOEXEC` fallback may invoke
+`/bin/sh`, which violates the no-shell boundary. Every observed bare-name
+candidate adds one ordered `RuntimeResolutionAttempt` with at most 64 entries.
+Its digest is:
+
+```text
+SHA-256(
+  "harness_runtime_resolution_candidate_v0_1\0"
+  || platform_tag
+  || unit_count_be
+  || exact_units
+)
+```
+
+The tags, counts, and exact units are encoded identically to
+`configured_command_digest`. The closed `RuntimeResolutionAttemptOutcome` is
+exactly `Absent`, `NotRegular`, `NotExecutable`, `InspectionFailed`,
+`InspectionTarget`, `ExecEacces`, `ExecFailed`, or `ExecStarted`. Attempts
+preserve PATH order and duplicates; they are never sorted.
+
+The parser enforces a finite-state contract. Skipped outcomes and `ExecEacces`
+may precede one terminal outcome. `InspectionFailed` requires the matching
+identity failure. `InspectionTarget` is permitted only for a repository source
+with `probe_not_authorized` and forbids all exec outcomes. `ExecFailed`
+requires `spawn_failed`; `ExecStarted` forbids a spawn failure and is the only
+outcome that creates a selected/executed identity. A sequence containing only
+skips yields `path_not_found`; one ending in `ExecEacces` with no final identity
+yields `bare_eacces_exhausted`; reaching the bound without a terminal outcome
+yields `candidate_limit_exceeded` with exactly 64 attempts. Outcomes after a
+terminal, multiple terminals, wrong source/failure pairs, or more than 64
+entries fail parsing.
+
+Failed candidates contribute no final executable identity. Repository-owned
+bare commands stop after the first statically eligible successful inspection,
+record that handle as an `inspection_target`, emit `probe_not_authorized`, and
+never enter pre-exec or fallback. An earlier open or identity failure wins and
+no authorization failure is appended. Fault-injection tests freeze these paths
+without requiring CI to mount a `noexec` filesystem.
+
+All `CString` path, argument, and environment storage and pointer arrays are
+built and NUL-validated in the parent. The audited Unix pre-exec closure uses
+only async-signal-safe `setpgid` and `execve`; it never allocates, logs, locks,
+or constructs strings after fork. Successful `execve` never returns. A failed
+call returns the captured errno through the spawn error channel, so only
+`EACCES` reaches the fallback branch and `ENOEXEC` cannot reach a second shell
+execution path.
 
 On Windows, the pinned Rust `Command` bare-name resolver is mirrored: explicit
 child `PATH`, current executable directory, system directory, Windows
@@ -270,17 +366,18 @@ silently change fingerprints.
 
 On every platform, quotes, spaces, pipes, substitutions, and redirections are
 literal path characters. Resolution inspects only the configured basename,
-never runs `sh`, `which`, a package manager, or a candidate. Once selected, the
-candidate is converted to an absolute path and that path alone is opened and
-spawned; no second OS search or later-candidate fallback is possible.
+never runs `sh`, `which`, or a package manager. Windows, absolute, and qualified
+commands have one absolute selected candidate and no fallback. Unix bare-name
+fallback is limited to the ordered, inspected, same-basename `EACCES` algorithm
+above; it never changes arguments or executes a search helper.
 
 The effective search inputs are domain-separated by platform and represented
-only by SHA-256 plus the resolution outcome; directory contents and raw search
-text are never serialized. The probe child receives the exact sanitized child
-`PATH` from the launch context so a qualified `#!/usr/bin/env node` launcher
-uses the declared interpreter search. Other environment keys are supplied only
-by the typed policy below. Resolution never claims which executable a later
-adapter run will select. This implements B-004 and the PATH portion of B-010.
+only by SHA-256, ordered attempt evidence, and the resolution outcome; directory
+contents, configured command, candidate paths, and raw search text are never
+serialized. The probe child receives the exact sanitized child `PATH` from the
+launch context so a qualified `#!/usr/bin/env node` launcher uses the declared
+interpreter search. Other environment keys follow only the closed policy below.
+This implements B-004 and the PATH portion of B-010.
 
 ## Closed Environment Policy
 
@@ -326,6 +423,15 @@ the producer does not claim that an extension or parsed PE header proves
 loadability. On a platform with supervised spawn, a bad-image or access failure
 is `spawn_failed`; Windows v0.1 instead stops at `containment_unavailable`
 before spawn and makes no loadability claim.
+
+Failure to create the retained inspection handle is
+`identity/open_failed`. It occurs before metadata or content facts and is
+mutually exclusive with `metadata_unavailable` and `read_failed`, both of which
+require an opened handle. It may retain configured-command/search/attempt
+digests but never a raw path, ACL, username, localized `io::Error`, handle
+metadata, strong identity, executable digest, child, version, or cleanup claim.
+For a bare Unix candidate this stops the search fail closed; absolute and
+qualified candidates have no fallback.
 
 The closure checks the configured byte limit against initial metadata and again
 while reading, stops at `limit + 1`, does not preallocate the maximum, and
@@ -433,10 +539,13 @@ The result-state matrix is fail closed:
 | Earliest outcome | Allowed later facts |
 | --- | --- |
 | path resolution failure | no resolved identity, executable digest, or version |
-| identity failure | bounded opened-handle facts only; no stable executable digest/version pair |
-| repository probe not authorized | stable identity/hash may remain; no child was spawned and version is absent |
+| open failure | configured-command and resolution-attempt digests only; no handle, executable digest, child, or version |
+| later identity failure | bounded opened-handle facts only; no stable executable digest/version pair |
+| repository probe not authorized | one `inspection_target` identity/hash may remain; no selected/executed identity, exec attempt, fallback, child, or version |
+| Unix bare-name `bare_eacces_exhausted` | configured-command, search, and ordered attempt digests may remain; every inspected-candidate identity is discarded and no final executable identity, child, or version exists |
 | supervision unavailable | stable identity may remain; no child was spawned and version is absent |
-| spawn/lifecycle/exit/output failure | stable identity may remain; version is absent |
+| terminal pre-start `spawn_failed` | the inspected target identity may remain, but no selected/executed identity or version exists |
+| post-`exec_started` lifecycle/exit/output failure | the selected/executed identity may remain; version is absent |
 | cleanup failure | stable identity may remain; version and completed-cleanup claims are absent; independent owner continues |
 | `identity_changed` after exit | candidate output/version is discarded |
 | caller cancellation | no envelope; cleanup ownership survives Tokio shutdown and is never abandoned |
@@ -555,10 +664,10 @@ owns user-facing collection commands. This is B-016.
 | --- | --- |
 | B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch`; `fingerprint_digest_is_separate_from_component_integrity`; `failure_payload_changes_fingerprint_digest_without_fabricating_integrity`; `component_integrity_preserves_exact_source_bytes_or_absence` |
 | B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
-| B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `caller_cannot_supply_preencoded_mcp_tool_source` |
-| B-004 | Unix `bare_path_resolution_uses_child_cwd_and_first_path_candidate`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable`; `resolver_spawns_only_the_selected_absolute_path` |
+| B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `caller_cannot_supply_preencoded_mcp_tool_source` |
+| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_fallback`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `runtime_resolution_attempts_round_trip_all_outcomes`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
 | B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
-| B-006 | `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
+| B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
 | B-007 | Unix `ordinary_timeout_reaps_root_and_verifies_original_group`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; Windows `containment_unavailable_prevents_spawn` |
 | B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
 | B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `both_streams_are_parsed_before_selection`; `same_version_on_both_streams_is_ambiguous`; `valid_version_with_nonblank_other_stream_is_unparseable`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
@@ -590,20 +699,23 @@ Only these paths are authorized:
 3. `crates/harness-core/src/stack/fingerprint/model.rs`
 4. `crates/harness-core/src/stack/fingerprint/schema.rs`
 5. `crates/harness-core/src/stack/fingerprint/tests.rs`
-6. `crates/harness-agents/src/lib.rs`
-7. `crates/harness-agents/src/runtime_fingerprint.rs`
-8. `crates/harness-agents/src/runtime_fingerprint/environment.rs`
-9. `crates/harness-agents/src/runtime_fingerprint/executable.rs`
-10. `crates/harness-agents/src/runtime_fingerprint/probe.rs`
-11. `crates/harness-agents/src/runtime_fingerprint/tests.rs`
-12. `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs`
+6. `crates/harness-agents/Cargo.toml` (direct existing workspace `libc` only)
+7. `crates/harness-agents/src/lib.rs`
+8. `crates/harness-agents/src/runtime_fingerprint.rs`
+9. `crates/harness-agents/src/runtime_fingerprint/environment.rs`
+10. `crates/harness-agents/src/runtime_fingerprint/executable.rs`
+11. `crates/harness-agents/src/runtime_fingerprint/probe.rs`
+12. `crates/harness-agents/src/runtime_fingerprint/tests.rs`
+13. `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs`
     (`#[cfg(test)]` exhaustive mapping contract only)
 
 Moving the two existing inline test modules into their listed test files is
-part of this scope. No Cargo manifest, lockfile, database, configuration,
-adapter, spawn contract, workflow model, CLI, HTTP, prompt, snapshot, or
-high-context file change is authorized. Any production server import or call
-site requires an ASC-005 consumer specification rather than an amendment here.
+part of this scope. The agents manifest may add only `libc = { workspace =
+true }`; there is no new crate/version or lockfile change. No other manifest,
+database, configuration, adapter, spawn contract, workflow model, CLI, HTTP,
+prompt, snapshot, or high-context file change is authorized. Any production
+server import or call site requires an ASC-005 consumer specification rather
+than an amendment here.
 
 ## Verification and Handoff Gates
 
@@ -622,16 +734,22 @@ cargo test -p harness-agents
 cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+cargo audit
 git diff --check
 ```
 
-The changed-file audit must equal the twelve-path manifest. A call-site audit
+The changed-file audit must equal the thirteen-path manifest. `Cargo.lock` must
+be unchanged and `cargo tree -p harness-agents -i libc` must show the pinned
+workspace dependency. A call-site audit
 must show that production uses of the new APIs remain confined to their
 defining modules; test uses do not count as consumers. File-length checks must
-show every Rust file below 800 lines. Because the repository no longer contains
-the historical SpecRail checker, verification must not claim to run a removed
-script; structural review of the manifest and B-001 through B-016 coverage is
-the current spec check.
+show every Rust file below 800 lines. The Unix `execve` pre-exec path requires
+mandatory human security review for argument/environment pointers, NUL
+validation, error propagation, and the proof that `ENOEXEC` never starts a
+shell. Because the repository no longer contains the historical SpecRail
+checker, verification must not claim to run a removed script; structural
+review of the manifest and B-001 through B-016 coverage is the current spec
+check.
 
 PR #1859 may be amended on its original branch only after this spec packet is
 approved and maintainers record `ready_to_implement`. Then every valid review
