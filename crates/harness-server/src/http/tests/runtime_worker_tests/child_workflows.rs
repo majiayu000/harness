@@ -27,7 +27,7 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::start_child_workflow(
         "github_issue_pr",
         "issue:126",
@@ -133,7 +133,7 @@ async fn runtime_job_worker_attaches_existing_issue_child_without_guarded_upsert
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let child_id =
         harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 127);
     let existing_child = harness_workflow::runtime::WorkflowInstance::new(
@@ -148,7 +148,7 @@ async fn runtime_job_worker_attaches_existing_issue_child_without_guarded_upsert
         "repo": "owner/repo",
         "issue_number": 127,
     }));
-    store.upsert_instance(&existing_child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &existing_child).await?;
     let command = harness_workflow::runtime::WorkflowCommand::start_child_workflow(
         "github_issue_pr",
         "issue:127",
@@ -228,7 +228,7 @@ async fn runtime_job_worker_starts_prompt_child_workflow_for_open_pr_feedback() 
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:pr:1120:feedback",
@@ -337,7 +337,7 @@ async fn runtime_job_worker_starts_pr_feedback_child_workflow_without_agent_turn
         "expected_base_ref": "release",
         "task_id": "runtime-task-226",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "pr-feedback-sweep:issue-226:77",
@@ -445,7 +445,7 @@ async fn runtime_job_worker_starts_quality_gate_child_workflow_without_agent_tur
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-227",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "quality-gate:issue-227:77",

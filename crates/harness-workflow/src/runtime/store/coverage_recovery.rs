@@ -1,11 +1,14 @@
+#[cfg(test)]
+use super::force_upsert_instance_for_test_tx;
 use super::{
-    apply_inline_command_side_effect, command_store,
+    apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
+    commit_same_state_instance_tx,
     decision_transitions::ensure_protected_instance_fields_match,
-    insert_decision_record_tx, insert_event_tx_with_id, insert_instance_if_absent_tx,
+    insert_decision_record_tx, insert_event_tx_with_id, insert_validated_observed_instance_tx,
     runtime_job_state::{cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation},
     select_instance_for_update_tx,
     transition_validation::{validate_transition_with_context, TransitionValidation},
-    upsert_instance_tx, WorkflowRuntimeStore,
+    WorkflowRuntimeStore,
 };
 use crate::runtime::remote_facts::upsert_remote_fact_snapshot_tx;
 use crate::runtime::{
@@ -56,7 +59,8 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(None);
         };
-        let current = instance
+        let original = instance.clone();
+        let current_trust = instance
             .data
             .get("author_trust_class")
             .map(|value| {
@@ -67,14 +71,14 @@ impl WorkflowRuntimeStore {
                 })
             })
             .transpose()?;
-        let effective = if current == Some(IsolationTrustClass::NonCollaborator)
+        let effective = if current_trust == Some(IsolationTrustClass::NonCollaborator)
             || incoming == IsolationTrustClass::NonCollaborator
         {
             IsolationTrustClass::NonCollaborator
         } else {
             IsolationTrustClass::Trusted
         };
-        if current != Some(effective) {
+        if current_trust != Some(effective) {
             let data = instance.data.as_object_mut().ok_or_else(|| {
                 anyhow::anyhow!("workflow `{workflow_id}` data must be an object")
             })?;
@@ -83,7 +87,7 @@ impl WorkflowRuntimeStore {
                 serde_json::to_value(effective)?,
             );
             instance.version = instance.version.saturating_add(1);
-            upsert_instance_tx(&mut tx, &instance).await?;
+            commit_same_state_instance_tx(&mut tx, &original, &instance).await?;
         }
         tx.commit().await?;
         Ok(Some(instance))
@@ -155,7 +159,9 @@ impl WorkflowRuntimeStore {
                 return Ok(WorkflowCoverageRecoveryOutcome::Rejected { reason });
             }
         }
-        if current.is_none() && !insert_instance_if_absent_tx(&mut tx, &validation_current).await? {
+        if current.is_none()
+            && !insert_validated_observed_instance_tx(&mut tx, &validation_current).await?
+        {
             anyhow::bail!("coverage recovery lost its advisory-locked absent insert");
         }
 
@@ -248,7 +254,14 @@ impl WorkflowRuntimeStore {
                 apply_inline_command_side_effect(&mut final_instance, command)?;
             }
         }
-        upsert_instance_tx(&mut tx, &final_instance).await?;
+        commit_decision_instance_tx(
+            &mut tx,
+            &validation_current,
+            &final_instance,
+            &record,
+            false,
+        )
+        .await?;
         tx.commit().await?;
         Ok(WorkflowCoverageRecoveryOutcome::Committed { command_ids })
     }
@@ -318,7 +331,7 @@ mod tests {
         )
         .with_id("coverage-recovery-identity-version")
         .with_parent("parent-workflow");
-        store.upsert_instance(&initial).await?;
+        store.force_upsert_instance_for_test(&initial).await?;
         let fact = RemoteFactSnapshot::new(
             "github",
             "owner/repo",
@@ -460,7 +473,7 @@ mod tests {
             WorkflowSubject::new("issue", "issue:1707"),
         )
         .with_id("coverage-stale");
-        store.upsert_instance(&initial).await?;
+        store.force_upsert_instance_for_test(&initial).await?;
         let newer_command = WorkflowCommand::enqueue_activity("implement_issue", "newer-command");
         let newer_command_id = store
             .enqueue_command(&initial.id, None, &newer_command)
@@ -470,7 +483,7 @@ mod tests {
         newer.version = 1;
         newer.data = json!({"newer": true});
         let mut tx = store.pool.begin().await?;
-        upsert_instance_tx(&mut tx, &newer).await?;
+        force_upsert_instance_for_test_tx(&mut tx, &newer).await?;
         tx.commit().await?;
 
         let mut stale_final = initial.clone();
@@ -543,7 +556,7 @@ mod tests {
             WorkflowSubject::new("issue", "issue:1784"),
         )
         .with_id("coverage-validator-bypass");
-        store.upsert_instance(&initial).await?;
+        store.force_upsert_instance_for_test(&initial).await?;
         let mut final_instance = initial.clone();
         final_instance.state = "merging".to_string();
         final_instance.version = 1;

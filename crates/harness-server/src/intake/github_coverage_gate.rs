@@ -690,7 +690,7 @@ mod tests {
                 "error_kind": "timeout",
             },
         }));
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
 
         let command = WorkflowCommand::enqueue_activity(
             "replan_issue",
@@ -706,7 +706,7 @@ mod tests {
             )
             .await?;
         workflow.data["last_stop"]["runtime_job_id"] = json!(runtime_job.id);
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
         Ok(workflow)
     }
 }

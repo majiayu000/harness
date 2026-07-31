@@ -135,7 +135,7 @@ async fn enqueue_test_runtime_job_with_not_before(
     not_before: Option<DateTime<Utc>>,
 ) -> anyhow::Result<RuntimeJob> {
     let workflow = issue_instance("implementing").with_id(format!("test-workflow-{command_key}"));
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
     enqueue_workflow_runtime_job(
         store,
         &workflow.id,

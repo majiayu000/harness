@@ -1,6 +1,7 @@
 use super::{
-    apply_inline_command_side_effect, command_store, insert_decision_record_tx, insert_event_tx,
-    select_instance_for_update_tx, upsert_instance_tx, WorkflowRuntimeStore,
+    apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
+    insert_decision_record_tx, insert_event_tx, select_instance_for_update_tx,
+    WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowDecision, WorkflowDecisionRecord,
@@ -314,6 +315,7 @@ async fn persist_runtime_completion_decision_with_context_tx(
     decision: WorkflowDecision,
     validation_context: ValidationContext,
 ) -> anyhow::Result<WorkflowDecisionRecord> {
+    let current = instance.clone();
     let record = match validator_for_instance(&instance) {
         Ok(Some(validator)) => {
             match validator.validate(&instance, &decision, &validation_context) {
@@ -374,7 +376,7 @@ async fn persist_runtime_completion_decision_with_context_tx(
         apply_runtime_completion_data_side_effect(&mut instance, &record.decision, event)?;
         instance.state = record.decision.next_state.clone();
         instance.version = instance.version.saturating_add(1);
-        upsert_instance_tx(tx, &instance).await?;
+        commit_decision_instance_tx(tx, &current, &instance, &record, false).await?;
     }
 
     Ok(record)

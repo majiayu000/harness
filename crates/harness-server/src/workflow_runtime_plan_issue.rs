@@ -51,27 +51,6 @@ pub(crate) async fn decide_plan_issue(
     }
 }
 
-pub(crate) async fn record_replan_completed(
-    store: Option<Arc<WorkflowRuntimeStore>>,
-    project_root: &Path,
-    repo: Option<&str>,
-    issue_number: u64,
-    task_id: &TaskId,
-) {
-    let Some(store) = store else {
-        return;
-    };
-    if let Err(error) =
-        persist_replan_completed(&store, project_root, repo, issue_number, task_id).await
-    {
-        tracing::warn!(
-            issue = issue_number,
-            task_id = %task_id.0,
-            "workflow runtime ReplanCompleted write failed: {error}"
-        );
-    }
-}
-
 async fn persist_plan_issue_decision(
     store: &WorkflowRuntimeStore,
     ctx: &PlanIssueRuntimeContext<'_>,
@@ -86,14 +65,17 @@ async fn persist_plan_issue_decision(
             "GitHub issue PR workflow",
         ))
         .await?;
-    let mut instance = match store.get_instance(&workflow_id).await? {
-        Some(instance) => instance,
-        None => issue_instance(
-            workflow_id,
-            project_id.clone(),
-            ctx.repo.map(ToOwned::to_owned),
-            ctx.issue_number,
-            "implementing",
+    let (mut instance, new_instance) = match store.get_instance(&workflow_id).await? {
+        Some(instance) => (instance, false),
+        None => (
+            issue_instance(
+                workflow_id,
+                project_id.clone(),
+                ctx.repo.map(ToOwned::to_owned),
+                ctx.issue_number,
+                "implementing",
+            ),
+            true,
         ),
     };
     instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
@@ -106,7 +88,6 @@ async fn persist_plan_issue_decision(
         "plan_concern": ctx.plan_issue,
         }),
     );
-    store.upsert_instance(&instance).await?;
     let event_payload = json!({
         "task_id": ctx.task_id.as_str(),
         "issue_number": ctx.issue_number,
@@ -144,7 +125,7 @@ async fn persist_plan_issue_decision(
         .apply_decision_transition(
             WorkflowDecisionTransition {
                 expected_state: &instance.state,
-                create_if_missing: None,
+                create_if_missing: new_instance.then_some(&instance),
                 event_type: "PlanIssueRaised",
                 source: "workflow_runtime_plan_issue",
                 payload: event_payload.clone(),
@@ -211,19 +192,30 @@ async fn persist_replan_completed(
             "GitHub issue PR workflow",
         ))
         .await?;
-    let (instance, new_instance) = match store.get_instance(&workflow_id).await? {
-        Some(instance) => (instance, false),
-        None => (
-            issue_instance(
-                workflow_id.clone(),
-                project_id.clone(),
-                repo.map(ToOwned::to_owned),
-                issue_number,
-                "replanning",
-            ),
-            true,
-        ),
-    };
+    let instance = store.get_instance(&workflow_id).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "replan completion task `{}` has no workflow instance `{workflow_id}`",
+            task_id.as_str()
+        )
+    })?;
+    if instance.state != "replanning" {
+        anyhow::bail!(
+            "replan completion task `{}` cannot advance workflow `{workflow_id}` from state `{}`",
+            task_id.as_str(),
+            instance.state
+        );
+    }
+    let current_task_id = instance
+        .data
+        .get("task_id")
+        .and_then(serde_json::Value::as_str);
+    if current_task_id != Some(task_id.as_str()) {
+        anyhow::bail!(
+            "stale replan completion task `{}` does not match workflow `{workflow_id}` task `{}`",
+            task_id.as_str(),
+            current_task_id.unwrap_or("<missing>")
+        );
+    }
     let event_payload = json!({
         "task_id": task_id.as_str(),
         "issue_number": issue_number,
@@ -262,7 +254,7 @@ async fn persist_replan_completed(
         .apply_decision_transition(
             WorkflowDecisionTransition {
                 expected_state: &instance.state,
-                create_if_missing: new_instance.then_some(&instance),
+                create_if_missing: None,
                 event_type: "ReplanCompleted",
                 source: "workflow_runtime_plan_issue",
                 payload: event_payload,
@@ -479,7 +471,117 @@ Workflow policy
     }
 
     #[tokio::test]
-    async fn replan_completed_creates_missing_workflow_before_event() -> anyhow::Result<()> {
+    async fn replan_completed_rejects_mismatched_task_generation() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => Arc::new(store),
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            124,
+        );
+        let instance = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            124,
+            "replanning",
+        )
+        .with_data(json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 124,
+            "task_id": "current-replan-task",
+        }));
+        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &instance).await?;
+
+        let error = persist_replan_completed(
+            &store,
+            &project_root,
+            Some("owner/repo"),
+            124,
+            &TaskId::from_str("stale-replan-task"),
+        )
+        .await
+        .expect_err("a stale replan task must not advance the current generation");
+
+        assert!(error.to_string().contains("stale-replan-task"));
+        let current = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("workflow instance should remain");
+        assert_eq!(current.state, "replanning");
+        assert!(store.commands_for(&workflow_id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replan_completed_rejects_non_replanning_state() -> anyhow::Result<()> {
+        let Ok(database_url) = resolve_database_url(None) else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let store =
+            match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+                .await
+            {
+                Ok(store) => Arc::new(store),
+                Err(_) => return Ok(()),
+            };
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_root.to_string_lossy(),
+            Some("owner/repo"),
+            125,
+        );
+        let instance = issue_instance(
+            workflow_id.clone(),
+            project_root.to_string_lossy().into_owned(),
+            Some("owner/repo".to_string()),
+            125,
+            "planning",
+        )
+        .with_data(json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 125,
+            "task_id": "current-replan-task",
+        }));
+        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &instance).await?;
+
+        let error = persist_replan_completed(
+            &store,
+            &project_root,
+            Some("owner/repo"),
+            125,
+            &TaskId::from_str("current-replan-task"),
+        )
+        .await
+        .expect_err("replan completion must require the replanning state");
+
+        assert!(error.to_string().contains("planning"));
+        let current = store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("workflow instance should remain");
+        assert_eq!(current.state, "planning");
+        assert!(store.commands_for(&workflow_id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replan_completed_rejects_missing_workflow() -> anyhow::Result<()> {
         let Ok(database_url) = resolve_database_url(None) else {
             return Ok(());
         };
@@ -495,39 +597,18 @@ Workflow policy
         std::fs::create_dir(&project_root)?;
         let task_id = TaskId::from_str("task-2");
 
-        record_replan_completed(
-            Some(store.clone()),
-            &project_root,
-            Some("owner/repo"),
-            124,
-            &task_id,
-        )
-        .await;
+        let error =
+            persist_replan_completed(&store, &project_root, Some("owner/repo"), 124, &task_id)
+                .await
+                .expect_err("a completion without its replan generation must be rejected");
 
         let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
             &project_root.to_string_lossy(),
             Some("owner/repo"),
             124,
         );
-        let Some(instance) = store.get_instance(&workflow_id).await? else {
-            anyhow::bail!("replan completion should create the workflow instance first");
-        };
-        assert_eq!(instance.state, "implementing");
-        assert_eq!(instance.version, 1);
-        assert_eq!(instance.data["task_id"], "task-2");
-        assert_eq!(instance.data["last_event"], "ReplanCompleted");
-
-        let events = store.events_for(&workflow_id).await?;
-        let Some(event) = events
-            .iter()
-            .find(|event| event.event_type == "ReplanCompleted")
-        else {
-            anyhow::bail!("replan completion event should be recorded");
-        };
-        assert_eq!(event.workflow_id, workflow_id);
-        assert_eq!(event.event["task_id"], "task-2");
-        assert_eq!(event.event["issue_number"], 124);
-        assert_eq!(event.event["repo"], "owner/repo");
+        assert!(error.to_string().contains(task_id.as_str()));
+        assert!(store.get_instance(&workflow_id).await?.is_none());
         Ok(())
     }
 }

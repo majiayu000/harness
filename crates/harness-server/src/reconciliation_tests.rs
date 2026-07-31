@@ -246,7 +246,8 @@ async fn persist_ready_to_merge_runtime(
         pr_number,
         chrono::Utc::now() - chrono::Duration::seconds(age_secs),
     );
-    stores.runtime_store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&stores.runtime_store, &instance)
+        .await?;
     Ok((project_id, workflow_id))
 }
 
@@ -401,7 +402,8 @@ async fn atomic_stale_reconciliation_does_not_record_issue_side_effects() -> any
         "issue_number": 42,
         "task_id": "stale-reconciliation-task",
     }));
-    stores.runtime_store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&stores.runtime_store, &instance)
+        .await?;
     let stale_instance = instance.clone();
     stores
         .runtime_store
@@ -539,7 +541,8 @@ async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> 
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
-    stores.runtime_store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&stores.runtime_store, &instance)
+        .await?;
 
     let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),
@@ -624,7 +627,8 @@ async fn run_once_reconciles_runtime_closed_pr_workflow() -> anyhow::Result<()> 
         "pr_number": 88,
         "pr_url": "https://github.com/owner/repo/pull/88",
     }));
-    stores.runtime_store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&stores.runtime_store, &instance)
+        .await?;
 
     let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),

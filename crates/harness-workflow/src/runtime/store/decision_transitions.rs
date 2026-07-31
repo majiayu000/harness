@@ -5,8 +5,8 @@
 //! home; every write here must pass `validate_transition` first.
 
 use super::{
-    apply_inline_command_side_effect, command_store, insert_decision_record_tx, insert_event_tx,
-    load_or_insert_initial_instance_tx, to_jsonb_string,
+    apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
+    insert_decision_record_tx, insert_event_tx, load_or_insert_initial_instance_tx,
     transition_validation::{validate_transition, TransitionValidation},
     WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
 };
@@ -178,31 +178,7 @@ impl WorkflowRuntimeStore {
             }
         }
 
-        let instance_data = to_jsonb_string(&final_instance)?;
-        sqlx::query(
-            "INSERT INTO workflow_instances
-                (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
-             ON CONFLICT (id) DO UPDATE SET
-                definition_id = EXCLUDED.definition_id,
-                state = EXCLUDED.state,
-                subject_type = EXCLUDED.subject_type,
-                subject_key = EXCLUDED.subject_key,
-                parent_workflow_id = EXCLUDED.parent_workflow_id,
-                data = EXCLUDED.data,
-                version = EXCLUDED.version,
-                updated_at = CURRENT_TIMESTAMP",
-        )
-        .bind(&final_instance.id)
-        .bind(&final_instance.definition_id)
-        .bind(&final_instance.state)
-        .bind(&final_instance.subject.subject_type)
-        .bind(&final_instance.subject.subject_key)
-        .bind(&final_instance.parent_workflow_id)
-        .bind(&instance_data)
-        .bind(final_instance.version as i64)
-        .execute(&mut *tx)
-        .await?;
+        commit_decision_instance_tx(&mut tx, &current, &final_instance, &record, false).await?;
 
         tx.commit().await?;
         Ok(Some(record))
@@ -309,7 +285,7 @@ mod submission_guard_tests {
         let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
         for (suffix, state) in [("unrelated", "planning"), ("terminal", "done")] {
             let current = instance(&format!("stale-replay-{suffix}"), state);
-            store.upsert_instance(&current).await?;
+            store.force_upsert_instance_for_test(&current).await?;
             let decision = accepted_decision(&current);
             let record = seed_accepted_record(&store, &decision).await?;
             let mut final_instance = current.clone();

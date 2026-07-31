@@ -1,10 +1,10 @@
 use super::{
-    command_store,
+    command_store, commit_decision_instance_tx, commit_rejected_initial_failure_instance_tx,
     decision_transitions::ensure_protected_instance_fields_match,
-    insert_decision_record_tx, insert_event_tx_with_id, insert_instance_if_absent_tx,
+    insert_decision_record_tx, insert_event_tx_with_id, insert_validated_observed_instance_tx,
     select_instance_for_update_tx,
     transition_validation::{validate_transition_with_context, TransitionValidation},
-    upsert_instance_tx, WorkflowRuntimeStore,
+    WorkflowRuntimeStore,
 };
 use crate::runtime::{
     ValidationContext, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
@@ -263,7 +263,24 @@ impl WorkflowRuntimeStore {
                     );
                 }
             }
-            upsert_instance_tx(&mut tx, final_instance).await?;
+            if record.accepted {
+                commit_decision_instance_tx(
+                    &mut tx,
+                    &current,
+                    final_instance,
+                    &record,
+                    replays_applied_instance,
+                )
+                .await?;
+            } else {
+                commit_rejected_initial_failure_instance_tx(
+                    &mut tx,
+                    &current,
+                    final_instance,
+                    &record,
+                )
+                .await?;
+            }
         } else if record.accepted {
             anyhow::bail!("accepted workflow submission requires a final instance");
         }
@@ -309,7 +326,7 @@ async fn load_submission_instance_tx(
     {
         return Ok(None);
     }
-    if insert_instance_if_absent_tx(tx, initial).await? {
+    if insert_validated_observed_instance_tx(tx, initial).await? {
         return Ok(Some((initial.clone(), true)));
     }
     Ok(select_instance_for_update_tx(tx, transition.workflow_id)
@@ -430,7 +447,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
         let initial = submission_test_instance("submission-accepted-identity-version");
-        store.upsert_instance(&initial).await?;
+        store.force_upsert_instance_for_test(&initial).await?;
         let decision = submission_test_decision(&initial);
         let mut final_instance = initial.clone();
         final_instance.state = decision.next_state.clone();

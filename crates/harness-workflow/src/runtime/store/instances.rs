@@ -1,8 +1,9 @@
 use super::{
-    insert_instance_if_absent_tx,
+    commit_parent_attachment_instance_tx, commit_same_state_instance_tx,
+    insert_validated_canonical_initial_instance_tx,
     instance_helpers::{otel_trace_context_from_data, terminal_state_pairs},
-    select_instance_for_update_tx, upsert_instance_tx, workflow_instance_from_row,
-    RuntimeHistoryPruneSummary, WorkflowInstancePage, WorkflowRuntimeStore,
+    select_instance_for_update_tx, workflow_instance_from_row, RuntimeHistoryPruneSummary,
+    WorkflowInstancePage, WorkflowRuntimeStore,
 };
 use crate::runtime::model::WorkflowInstance;
 use crate::runtime::WorkflowOtelTraceContext;
@@ -14,7 +15,7 @@ impl WorkflowRuntimeStore {
         instance: &WorkflowInstance,
     ) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let inserted = insert_instance_if_absent_tx(&mut tx, instance).await?;
+        let inserted = insert_validated_canonical_initial_instance_tx(&mut tx, instance).await?;
         tx.commit().await?;
         Ok(inserted)
     }
@@ -23,7 +24,7 @@ impl WorkflowRuntimeStore {
         let mut tx = self.pool.begin().await?;
         let current = match select_instance_for_update_tx(&mut tx, &instance.id).await? {
             Some(current) => current,
-            None if insert_instance_if_absent_tx(&mut tx, instance).await? => {
+            None if insert_validated_canonical_initial_instance_tx(&mut tx, instance).await? => {
                 tx.commit().await?;
                 return Ok(());
             }
@@ -36,17 +37,22 @@ impl WorkflowRuntimeStore {
                     )
                 })?,
         };
+        if current == *instance {
+            tx.commit().await?;
+            return Ok(());
+        }
         ensure_public_upsert_preserves_instance_boundary(&current, instance)?;
-        if instance.version < current.version {
+        if instance.version == current.version {
             anyhow::bail!(
-                "public workflow instance upsert cannot move version backwards from {} to {}",
-                current.version,
-                instance.version
+                "public workflow instance upsert cannot overwrite data at the same version {}; use a state-specific compare-and-swap API",
+                current.version
             );
         }
-        upsert_instance_tx(&mut tx, instance).await?;
-        tx.commit().await?;
-        Ok(())
+        anyhow::bail!(
+            "public workflow instance upsert is insert-only and cannot change version from {} to {}; use a validated decision or state-specific write API",
+            current.version,
+            instance.version
+        )
     }
 
     pub async fn attach_parent_workflow_if_missing(
@@ -55,10 +61,11 @@ impl WorkflowRuntimeStore {
         parent_workflow_id: &str,
     ) -> anyhow::Result<Option<WorkflowInstance>> {
         let mut tx = self.pool.begin().await?;
-        let Some(mut instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+        let Some(current) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
             tx.commit().await?;
             return Ok(None);
         };
+        let mut instance = current.clone();
         match instance.parent_workflow_id.as_deref() {
             Some(existing) if existing == parent_workflow_id => {
                 tx.commit().await?;
@@ -72,7 +79,7 @@ impl WorkflowRuntimeStore {
             None => {
                 instance.parent_workflow_id = Some(parent_workflow_id.to_string());
                 instance.version = instance.version.saturating_add(1);
-                upsert_instance_tx(&mut tx, &instance).await?;
+                commit_parent_attachment_instance_tx(&mut tx, &current, &instance).await?;
                 tx.commit().await?;
                 Ok(Some(instance))
             }
@@ -84,10 +91,11 @@ impl WorkflowRuntimeStore {
         workflow_id: &str,
     ) -> anyhow::Result<Option<WorkflowOtelTraceContext>> {
         let mut tx = self.pool.begin().await?;
-        let Some(mut instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+        let Some(current) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
             tx.commit().await?;
             return Ok(None);
         };
+        let mut instance = current.clone();
         if let Some(context) = otel_trace_context_from_data(&instance.data) {
             tx.commit().await?;
             return Ok(Some(context));
@@ -106,7 +114,7 @@ impl WorkflowRuntimeStore {
             serde_json::to_value(&context)?,
         );
         instance.version = instance.version.saturating_add(1);
-        upsert_instance_tx(&mut tx, &instance).await?;
+        commit_same_state_instance_tx(&mut tx, &current, &instance).await?;
         tx.commit().await?;
         Ok(Some(context))
     }
@@ -126,10 +134,11 @@ impl WorkflowRuntimeStore {
         auto_recovery: Option<&serde_json::Value>,
     ) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let Some(mut instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+        let Some(current) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
             tx.commit().await?;
             return Ok(false);
         };
+        let mut instance = current.clone();
         if instance.state != expected_state {
             tx.rollback().await?;
             return Ok(false);
@@ -150,7 +159,7 @@ impl WorkflowRuntimeStore {
             }
         }
         instance.version = instance.version.saturating_add(1);
-        upsert_instance_tx(&mut tx, &instance).await?;
+        commit_same_state_instance_tx(&mut tx, &current, &instance).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -723,46 +732,5 @@ fn ensure_public_upsert_preserves_instance_boundary(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::runtime::model::WorkflowSubject;
-    use harness_core::db::resolve_database_url;
-
-    #[tokio::test]
-    async fn public_upsert_rejects_unrecorded_state_change() -> anyhow::Result<()> {
-        if resolve_database_url(None).is_err() {
-            return Ok(());
-        }
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-        let initial = WorkflowInstance::new(
-            "github_issue_pr",
-            1,
-            "discovered",
-            WorkflowSubject::new("issue", "issue:1784"),
-        )
-        .with_id("public-upsert-state-change");
-        store.upsert_instance(&initial).await?;
-
-        let mut target = initial.clone();
-        target.state = "implementing".to_string();
-        target.version = 1;
-        let error = match store.upsert_instance(&target).await {
-            Ok(()) => anyhow::bail!("state change was written without a matching decision"),
-            Err(error) => error,
-        };
-
-        assert!(error
-            .to_string()
-            .contains("public workflow instance upsert cannot change protected fields: state"));
-        assert_eq!(
-            store
-                .get_instance(&initial.id)
-                .await?
-                .expect("workflow")
-                .state,
-            "discovered"
-        );
-        Ok(())
-    }
-}
+#[path = "instances_tests.rs"]
+mod tests;

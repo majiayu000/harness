@@ -76,7 +76,7 @@ async fn non_runtime_dispatch_rejects_reclaimed_generation() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = project_issue_instance("/project-a", 1601, "pr_open");
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
     let command = WorkflowCommand::bind_pr(
         1617,
         "https://github.com/majiayu000/harness/pull/1617",

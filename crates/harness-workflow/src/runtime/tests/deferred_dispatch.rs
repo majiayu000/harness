@@ -17,7 +17,7 @@ async fn claimed_deferred_test_command(
     owner: &str,
 ) -> anyhow::Result<(WorkflowInstance, String, WorkflowCommandRecord)> {
     let workflow = issue_instance("implementing").with_id(format!("deferred-{suffix}"));
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity(
         "implement_issue",
         format!("deferred-command-{suffix}"),
@@ -296,7 +296,7 @@ async fn deferred_command_generation_overflow_rolls_back() -> anyhow::Result<()>
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = issue_instance("implementing").with_id("deferred-generation-overflow");
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("implement_issue", "generation-overflow");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     sqlx::query(
@@ -536,7 +536,7 @@ async fn runtime_store_migrates_deferred_commands() -> anyhow::Result<()> {
     let path = dir.path().join("workflow_runtime.db");
     let store = WorkflowRuntimeStore::open(&path).await?;
     let workflow = issue_instance("implementing").with_id("deferred-migration");
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
     let legacy_statuses = [
         WorkflowCommandStatus::Pending,
         WorkflowCommandStatus::Dispatching,

@@ -12,7 +12,7 @@ use std::fmt;
 use super::prompt_memory::remove_prompt_submission_prompt_durable;
 use super::{
     commit_runtime_decision, commit_runtime_decision_with_validator, optional_string_field,
-    runtime_issue_task_handle, set_data_bool, GITHUB_ISSUE_PR_DEFINITION_ID,
+    runtime_issue_task_handle, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 
 struct DeclarativeCancellation {
@@ -210,7 +210,7 @@ async fn finish_cancellation_cleanup(
         )
         .await?
     {
-        WorkflowCancellationCleanupOutcome::Cleaned => {}
+        WorkflowCancellationCleanupOutcome::Cleaned(instance) => *cancelled = *instance,
         WorkflowCancellationCleanupOutcome::NoCancellationCommand => return Ok(false),
         WorkflowCancellationCleanupOutcome::StaleInstance => {
             return Err(RuntimeSubmissionCancelError::Store(anyhow::anyhow!(
@@ -218,7 +218,6 @@ async fn finish_cancellation_cleanup(
             )));
         }
     }
-    cancelled.data = set_data_bool(std::mem::take(&mut cancelled.data), "cancelled", true);
     if remove_prompt {
         remove_prompt_submission_prompt_durable(
             store,
@@ -352,7 +351,7 @@ mod tests {
             WorkflowSubject::new("prompt", "retry-cancellation-cleanup"),
         )
         .with_id("retry-cancellation-cleanup");
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
 
         let activity = WorkflowCommand::enqueue_activity(
             "implement_prompt",
@@ -385,10 +384,9 @@ mod tests {
             .await?;
 
         let outcome = cancel_submission_by_workflow_id(&store, &workflow.id).await?;
-        assert!(matches!(
-            outcome,
-            RuntimeSubmissionCancelOutcome::AlreadyTerminal(_)
-        ));
+        let RuntimeSubmissionCancelOutcome::AlreadyTerminal(first_returned) = outcome else {
+            anyhow::bail!("terminal cancellation should remain terminal");
+        };
         let Some(activity_command) = store.get_command(&activity_command_id).await? else {
             anyhow::bail!("activity command should remain queryable");
         };
@@ -401,6 +399,25 @@ mod tests {
             anyhow::bail!("cancelled workflow should remain queryable");
         };
         assert_eq!(stale_cancelled.data["cancelled"], true);
+        assert_eq!(
+            first_returned.version, stale_cancelled.version,
+            "cleanup must return the persisted post-cleanup version"
+        );
+        let first_cleanup_version = stale_cancelled.version;
+
+        let retry = cancel_submission_by_workflow_id(&store, &workflow.id).await?;
+        let RuntimeSubmissionCancelOutcome::AlreadyTerminal(retry_returned) = retry else {
+            anyhow::bail!("terminal cancellation retry should remain terminal");
+        };
+        let retry_stored = store
+            .get_instance(&workflow.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("cancelled workflow disappeared after retry"))?;
+        assert_eq!(retry_returned.version, first_cleanup_version);
+        assert_eq!(
+            retry_stored.version, first_cleanup_version,
+            "an idempotent cancellation retry must not advance the instance version"
+        );
 
         let mut reopened = stale_cancelled.clone();
         reopened.state = "planning".to_string();

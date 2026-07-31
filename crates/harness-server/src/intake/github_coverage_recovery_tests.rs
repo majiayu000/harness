@@ -138,7 +138,7 @@ async fn recovery_maps_open_pr_facts() -> anyhow::Result<()> {
             "task_id": format!("github-issue:{REPO}:issue:{issue_number}"),
             "task_ids": [format!("existing-handle-{issue_number}")],
         }));
-        store.upsert_instance(&existing).await?;
+        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &existing).await?;
         store
             .enqueue_command(
                 &existing.id,
@@ -565,7 +565,7 @@ async fn ready_pr_recovery_transitions_existing_uncovered_workflow_before_report
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id(&project_id, Some(REPO), issue_number));
-    store.upsert_instance(&existing).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &existing).await?;
     let rest_url = spawn_json_server("200 OK", vec![rest_candidates(&[])]).await;
     let graphql_url = spawn_json_server(
         "200 OK",

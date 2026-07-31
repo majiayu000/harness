@@ -1,7 +1,7 @@
 use crate::http::AppState;
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, WorkflowDefinition, WorkflowInstance,
-    WorkflowSubject, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
+    ActivityArtifact, ActivityResult, RuntimeJob, WorkflowChildStart, WorkflowDefinition,
+    WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
     QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::{json, Value};
@@ -108,23 +108,21 @@ pub(super) async fn execute_start_child_workflow(
         job.command_id.as_str(),
     );
     if !child_started_by_command || !child_start_event_recorded {
-        store.upsert_instance(&child).await?;
-        if !child_start_event_recorded {
-            store
-                .append_event(
-                    &child.id,
-                    "ChildWorkflowStarted",
-                    "workflow_runtime_worker",
-                    json!({
-                        "parent_workflow_id": parent.map(|workflow| workflow.id.as_str()),
-                        "runtime_job_id": job.id.as_str(),
-                        "command_id": job.command_id.as_str(),
-                        "definition_id": definition_id,
-                        "subject_key": subject_key,
-                    }),
-                )
-                .await?;
-        }
+        child = store
+            .ensure_child_workflow_started(WorkflowChildStart {
+                instance: &child,
+                command_id: &job.command_id,
+                source: "workflow_runtime_worker",
+                payload: json!({
+                    "parent_workflow_id": parent.map(|workflow| workflow.id.as_str()),
+                    "runtime_job_id": job.id.as_str(),
+                    "command_id": job.command_id.as_str(),
+                    "definition_id": definition_id,
+                    "subject_key": subject_key,
+                }),
+            })
+            .await?
+            .instance;
     }
 
     let mut child_submission = None;

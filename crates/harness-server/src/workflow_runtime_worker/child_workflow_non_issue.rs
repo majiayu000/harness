@@ -3,9 +3,9 @@ use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     build_pr_feedback_inspect_decision, build_quality_gate_run_decision, ActivityArtifact,
     ActivityErrorKind, ActivityResult, PrFeedbackInspectDecisionInput, QualityGateDecisionInput,
-    RuntimeJob, WorkflowCommandStatus, WorkflowDefinition, WorkflowInstance, WorkflowSubject,
-    WorkflowSubmissionDecisionTransition, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
-    QUALITY_GATE_DEFINITION_ID,
+    RuntimeJob, WorkflowChildStart, WorkflowCommandStatus, WorkflowDefinition, WorkflowInstance,
+    WorkflowSubject, WorkflowSubmissionDecisionTransition, PROMPT_TASK_DEFINITION_ID,
+    PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -32,17 +32,19 @@ pub(super) async fn execute_start_prompt_task_child_workflow(
         anyhow::bail!("workflow runtime store is unavailable");
     };
     ensure_runtime_job_still_owns_lease(store, job).await?;
+    let parent =
+        parent.ok_or_else(|| anyhow::anyhow!("prompt task child workflow requires a parent"))?;
     let project_id = parent
-        .and_then(|workflow| workflow.data.get("project_id"))
+        .data
+        .get("project_id")
         .and_then(Value::as_str)
         .or_else(|| job.input.get("project_id").and_then(Value::as_str))
         .ok_or_else(|| anyhow::anyhow!("prompt task child workflow project_id is missing"))?;
     let prompt = required_string(command, "prompt")?;
-    let repo = command.get("repo").and_then(Value::as_str).or_else(|| {
-        parent
-            .and_then(|workflow| workflow.data.get("repo"))
-            .and_then(Value::as_str)
-    });
+    let repo = command
+        .get("repo")
+        .and_then(Value::as_str)
+        .or_else(|| parent.data.get("repo").and_then(Value::as_str));
     let task_id = optional_string(command, "task_id").unwrap_or_else(|| {
         format!(
             "runtime-child:{}:{}",
@@ -74,36 +76,31 @@ pub(super) async fn execute_start_prompt_task_child_workflow(
         .get_instance(&submission.workflow_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("prompt task child workflow was not persisted"))?;
-    let child_start_event_recorded =
-        child_start_event_recorded(store, &child.id, &job.command_id).await?;
 
-    if let Some(parent) = parent {
-        if child.parent_workflow_id.is_none() {
-            child = store
-                .attach_parent_workflow_if_missing(&child.id, &parent.id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("prompt task child workflow disappeared during parent attach")
-                })?;
-        }
+    if child.parent_workflow_id.is_none() {
+        child = store
+            .attach_parent_workflow_if_missing(&child.id, &parent.id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("prompt task child workflow disappeared during parent attach")
+            })?;
     }
 
-    if !child_start_event_recorded {
-        store
-            .append_event(
-                &submission.workflow_id,
-                "ChildWorkflowStarted",
-                "workflow_runtime_worker",
-                json!({
-                    "parent_workflow_id": parent.map(|workflow| workflow.id.as_str()),
-                    "runtime_job_id": job.id.as_str(),
-                    "command_id": job.command_id.as_str(),
-                    "definition_id": PROMPT_TASK_DEFINITION_ID,
-                    "subject_key": subject_key,
-                }),
-            )
-            .await?;
-    }
+    child = store
+        .ensure_child_workflow_started(WorkflowChildStart {
+            instance: &child,
+            command_id: &job.command_id,
+            source: "workflow_runtime_worker",
+            payload: json!({
+                "parent_workflow_id": parent.id.as_str(),
+                "runtime_job_id": job.id.as_str(),
+                "command_id": job.command_id.as_str(),
+                "definition_id": PROMPT_TASK_DEFINITION_ID,
+                "subject_key": subject_key,
+            }),
+        })
+        .await?
+        .instance;
 
     Ok(ActivityResult::succeeded(
         activity_name(job),
@@ -214,23 +211,21 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
     );
     let inherited_trust = inherit_author_trust_class(&mut child.data, &parent.data)?;
     if !child_started_by_command || !child_start_event_recorded {
-        store.upsert_instance(&child).await?;
-        if !child_start_event_recorded {
-            store
-                .append_event(
-                    &child.id,
-                    "ChildWorkflowStarted",
-                    "workflow_runtime_worker",
-                    json!({
-                        "parent_workflow_id": parent.id.as_str(),
-                        "runtime_job_id": job.id.as_str(),
-                        "command_id": job.command_id.as_str(),
-                        "definition_id": QUALITY_GATE_DEFINITION_ID,
-                        "subject_key": subject_key,
-                    }),
-                )
-                .await?;
-        }
+        child = store
+            .ensure_child_workflow_started(WorkflowChildStart {
+                instance: &child,
+                command_id: &job.command_id,
+                source: "workflow_runtime_worker",
+                payload: json!({
+                    "parent_workflow_id": parent.id.as_str(),
+                    "runtime_job_id": job.id.as_str(),
+                    "command_id": job.command_id.as_str(),
+                    "definition_id": QUALITY_GATE_DEFINITION_ID,
+                    "subject_key": subject_key,
+                }),
+            })
+            .await?
+            .instance;
     } else if let Some(inherited_trust) = inherited_trust {
         child = store
             .reconcile_instance_author_trust_class(&child.id, inherited_trust)
@@ -442,23 +437,21 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
     );
     let inherited_trust = inherit_author_trust_class(&mut child.data, &parent.data)?;
     if !child_started_by_command || !child_start_event_recorded {
-        store.upsert_instance(&child).await?;
-        if !child_start_event_recorded {
-            store
-                .append_event(
-                    &child.id,
-                    "ChildWorkflowStarted",
-                    "workflow_runtime_worker",
-                    json!({
-                        "parent_workflow_id": parent.id.as_str(),
-                        "runtime_job_id": job.id.as_str(),
-                        "command_id": job.command_id.as_str(),
-                        "definition_id": PR_FEEDBACK_DEFINITION_ID,
-                        "subject_key": subject_key,
-                    }),
-                )
-                .await?;
-        }
+        child = store
+            .ensure_child_workflow_started(WorkflowChildStart {
+                instance: &child,
+                command_id: &job.command_id,
+                source: "workflow_runtime_worker",
+                payload: json!({
+                    "parent_workflow_id": parent.id.as_str(),
+                    "runtime_job_id": job.id.as_str(),
+                    "command_id": job.command_id.as_str(),
+                    "definition_id": PR_FEEDBACK_DEFINITION_ID,
+                    "subject_key": subject_key,
+                }),
+            })
+            .await?
+            .instance;
     } else if let Some(inherited_trust) = inherited_trust {
         child = store
             .reconcile_instance_author_trust_class(&child.id, inherited_trust)

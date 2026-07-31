@@ -720,5 +720,12 @@ pub(crate) async fn approve_runtime_merge_by_workflow_id(
     approve_runtime_merge(store, instance, None).await
 }
 
+pub(crate) async fn approve_runtime_merge_with_instance(
+    store: &WorkflowRuntimeStore,
+    instance: WorkflowInstance,
+) -> anyhow::Result<RuntimeMergeApprovalOutcome> {
+    approve_runtime_merge(store, instance, None).await
+}
+
 #[cfg(test)]
 mod tests;

@@ -1,8 +1,8 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkflowCancellationCleanupOutcome {
-    Cleaned,
+    Cleaned(Box<WorkflowInstance>),
     NoCancellationCommand,
     StaleInstance,
 }
@@ -282,6 +282,7 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(WorkflowCancellationCleanupOutcome::StaleInstance);
         }
+        let original = current.clone();
 
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT id, status, data::text FROM workflow_commands
@@ -317,25 +318,35 @@ impl WorkflowRuntimeStore {
             .filter(|(_, status, _)| active_statuses.contains(&status.as_str()))
             .map(|(command_id, _, _)| RuntimeJobCancellation::new(command_id, activity, summary))
             .collect::<Vec<_>>();
-        cancel_unfinished_runtime_jobs_for_commands_tx(&mut tx, &cancellations).await?;
-        let command_ids = cancellations
-            .iter()
-            .map(|cancellation| cancellation.command_id.clone())
-            .collect::<Vec<_>>();
-        sqlx::query(
-            "UPDATE workflow_commands
-             SET status = $2,
-                 dispatch_owner = NULL,
-                 dispatch_lease_expires_at = NULL,
-                 dispatch_not_before = NULL,
-                 dispatch_barrier = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ANY($1::text[])",
-        )
-        .bind(&command_ids)
-        .bind(WorkflowCommandStatus::Cancelled.as_str())
-        .execute(&mut *tx)
-        .await?;
+        if !cancellations.is_empty() {
+            cancel_unfinished_runtime_jobs_for_commands_tx(&mut tx, &cancellations).await?;
+            let command_ids = cancellations
+                .iter()
+                .map(|cancellation| cancellation.command_id.clone())
+                .collect::<Vec<_>>();
+            sqlx::query(
+                "UPDATE workflow_commands
+                 SET status = $2,
+                     dispatch_owner = NULL,
+                     dispatch_lease_expires_at = NULL,
+                     dispatch_not_before = NULL,
+                     dispatch_barrier = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ANY($1::text[])",
+            )
+            .bind(&command_ids)
+            .bind(WorkflowCommandStatus::Cancelled.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        let data_already_cancelled =
+            current.data.get("cancelled").and_then(Value::as_bool) == Some(true);
+        if cancellations.is_empty() && data_already_cancelled {
+            tx.commit().await?;
+            return Ok(WorkflowCancellationCleanupOutcome::Cleaned(Box::new(
+                current,
+            )));
+        }
         if !current.data.is_object() {
             current.data = json!({});
         }
@@ -344,9 +355,19 @@ impl WorkflowRuntimeStore {
             .as_object_mut()
             .context("workflow instance data must be an object")?
             .insert("cancelled".to_string(), Value::Bool(true));
-        upsert_instance_tx(&mut tx, &current).await?;
+        if current.data != original.data {
+            current.version = current.version.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workflow instance `{}` version cannot advance during cancellation cleanup",
+                    current.id
+                )
+            })?;
+            commit_same_state_instance_tx(&mut tx, &original, &current).await?;
+        }
         tx.commit().await?;
-        Ok(WorkflowCancellationCleanupOutcome::Cleaned)
+        Ok(WorkflowCancellationCleanupOutcome::Cleaned(Box::new(
+            current,
+        )))
     }
 }
 

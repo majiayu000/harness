@@ -78,7 +78,7 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
     };
 
     let running = blocked("declarative-recovery-running");
-    store.upsert_instance(&running).await?;
+    store.force_upsert_instance_for_test(&running).await?;
     let missing_evidence = store
         .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
             workflow_id: &running.id,
@@ -124,7 +124,7 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
     assert_eq!(store.decisions_for(&running.id).await?[0].decision.evidence, evidence);
 
     let waiting = blocked("declarative-recovery-waiting");
-    store.upsert_instance(&waiting).await?;
+    store.force_upsert_instance_for_test(&waiting).await?;
     store
         .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
             workflow_id: &waiting.id,
@@ -149,7 +149,7 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
     )
     .with_id("declarative-completion-missing-evidence")
     .with_data(json!({ "definition_hash": definition.definition_hash() }));
-    store.upsert_instance(&completion).await?;
+    store.force_upsert_instance_for_test(&completion).await?;
     let result = ActivityResult::succeeded("run", "completed without the release report");
     let command = WorkflowCommand::enqueue_activity("run", "declarative-completion-command");
     let policy = store

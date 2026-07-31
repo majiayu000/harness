@@ -62,7 +62,7 @@ async fn seed_stopped_instance(
     )
     .with_id(id.to_string())
     .with_data(data);
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         format!("{id}-source"),
@@ -78,7 +78,7 @@ async fn seed_stopped_instance(
         )
         .await?;
     workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     Ok(workflow)
 }
 
@@ -239,7 +239,7 @@ async fn auto_recovery_selects_transient_and_skips_terminal_and_legacy() -> anyh
         )
         .with_id("ar-select-legacy".to_string())
         .with_data(json!({ "repo": TEST_REPO, "blocked_reason": "legacy free text" }));
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
         workflow
     };
 
@@ -661,7 +661,7 @@ async fn auto_recovery_terminal_recheck_outcome_stops_scheduling() -> anyhow::Re
     )
     .with_id("ar-recheck-1".to_string())
     .with_data(data);
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
 
     let now = Utc::now();
     let tick = run_auto_recovery_tick(
@@ -756,7 +756,7 @@ async fn auto_recovery_scan_is_not_starved_by_ineligible_backlog() -> anyhow::Re
                 "event_id": format!("episode-{index}"),
             },
         }));
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
     }
     // The eligible instance arrives last (newest updated_at).
     let eligible = seed_stopped_instance(
