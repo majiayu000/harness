@@ -745,7 +745,7 @@ async fn create_task_with_terminal_issue_retry_returns_stable_submission_handle(
         .expect("runtime workflow should be persisted");
     assert_eq!(instance.data["submission_id"], stable_submission_id);
     instance.state = "failed".to_string();
-    store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &instance).await?;
 
     let retry_response = app
         .oneshot(

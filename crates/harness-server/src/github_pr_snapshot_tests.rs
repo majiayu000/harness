@@ -3,7 +3,7 @@ use super::*;
 async fn spawn_graphql_responses(
     responses: Vec<String>,
 ) -> anyhow::Result<(String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>)> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -14,14 +14,10 @@ async fn spawn_graphql_responses(
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
-            let mut buf = [0_u8; 32_768];
-            let Ok(read) = socket.read(&mut buf).await else {
+            let Some(request) = read_http_request(&mut socket).await else {
                 return;
             };
-            received_server
-                .lock()
-                .await
-                .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+            received_server.lock().await.push(request);
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
                 response_body.len()
@@ -32,6 +28,38 @@ async fn spawn_graphql_responses(
         }
     });
     Ok((format!("http://{addr}"), received))
+}
+
+async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 4_096];
+    loop {
+        let read = socket.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.len() > 64 * 1_024 {
+            return None;
+        }
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_end = header_end + 4;
+        let headers = std::str::from_utf8(&request[..header_end]).ok()?;
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })?;
+        if request.len() >= header_end + content_length {
+            break;
+        }
+    }
+    String::from_utf8(request).ok()
 }
 
 fn ready_pr() -> Value {

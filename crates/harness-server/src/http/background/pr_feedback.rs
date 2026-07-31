@@ -288,13 +288,8 @@ async fn request_auto_merge_if_enabled(
         AutoMergeSnapshotGate::Ready(workflow) => workflow,
         AutoMergeSnapshotGate::NotReady => return Ok(AutoMergeRequestOutcome::NotReady),
     };
-    store.upsert_instance(&workflow).await?;
-
-    match crate::workflow_runtime_pr_feedback::approve_runtime_merge_by_workflow_id(
-        store,
-        &workflow.id,
-    )
-    .await?
+    match crate::workflow_runtime_pr_feedback::approve_runtime_merge_with_instance(store, *workflow)
+        .await?
     {
         crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::Approved { .. } => {
             Ok(AutoMergeRequestOutcome::Requested)
@@ -314,52 +309,37 @@ async fn request_auto_merge_if_enabled(
 
 async fn recover_runtime_pr_binding_from_bind_pr_command(
     store: &WorkflowRuntimeStore,
-    mut workflow: WorkflowInstance,
+    workflow: WorkflowInstance,
 ) -> anyhow::Result<Option<WorkflowInstance>> {
-    let commands = store.commands_for(&workflow.id).await?;
-    let Some(command) = commands
-        .into_iter()
-        .rev()
-        .find(|record| record.command.command_type == WorkflowCommandType::BindPr)
-    else {
-        return Ok(None);
-    };
-    let Some(pr_number) = command
-        .command
-        .command
-        .get("pr_number")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return Ok(None);
-    };
-    let Some(pr_url) = command
-        .command
-        .command
-        .get("pr_url")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return Ok(None);
-    };
-
-    if !workflow.data.is_object() {
-        workflow.data = serde_json::json!({});
+    match store
+        .repair_pr_binding_from_latest_command(&workflow.id, workflow.version)
+        .await?
+    {
+        WorkflowPrBindingRepairOutcome::Repaired {
+            instance,
+            command_id,
+            pr_number,
+            pr_url,
+        } => {
+            tracing::info!(
+                workflow_id = %instance.id,
+                pr_number,
+                pr_url,
+                command_id,
+                "workflow runtime PR feedback sweeper recovered missing PR binding"
+            );
+            Ok(Some(*instance))
+        }
+        WorkflowPrBindingRepairOutcome::NoBindPrCommand => Ok(None),
+        WorkflowPrBindingRepairOutcome::StaleInstance => {
+            tracing::debug!(
+                workflow_id = %workflow.id,
+                expected_version = workflow.version,
+                "workflow runtime PR binding repair deferred after concurrent instance change"
+            );
+            Ok(None)
+        }
     }
-    let data = workflow
-        .data
-        .as_object_mut()
-        .context("workflow runtime instance data is not an object")?;
-    data.insert("pr_number".to_string(), serde_json::json!(pr_number));
-    data.insert("pr_url".to_string(), serde_json::json!(pr_url));
-    workflow.version = workflow.version.saturating_add(1);
-    store.upsert_instance(&workflow).await?;
-    tracing::info!(
-        workflow_id = %workflow.id,
-        pr_number,
-        pr_url,
-        command_id = %command.id,
-        "workflow runtime PR feedback sweeper recovered missing PR binding"
-    );
-    Ok(Some(workflow))
 }
 
 pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) {

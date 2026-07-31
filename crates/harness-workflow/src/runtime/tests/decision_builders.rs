@@ -572,6 +572,33 @@ fn pr_feedback_sweep_decision_starts_child_workflow() {
 }
 
 #[test]
+fn local_review_request_can_restart_from_waiting_for_remote_feedback() {
+    let instance = issue_instance("awaiting_feedback");
+    let output = build_local_review_request_decision(
+        &instance,
+        LocalReviewDecisionInput {
+            dedupe_key: "local-review:123:77",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            issue_number: Some(123),
+            repo: Some("owner/repo"),
+            summary: "Runtime workflow requested local review before remote feedback.",
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::RequestLocalReview);
+    assert_eq!(output.decision.decision, "run_local_review");
+    assert_eq!(output.decision.next_state, "local_review_gate");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("waiting PR feedback workflows may re-enter local review");
+}
+
+#[test]
 fn pr_feedback_decision_waits_when_no_actionable_feedback_exists() {
     let instance = issue_instance("awaiting_feedback");
     let output = build_pr_feedback_decision(

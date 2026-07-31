@@ -94,17 +94,17 @@ mod tests {
             .await?,
         );
         for id in ["driverless-a", "driverless-b"] {
-            store
-                .upsert_instance(
-                    &WorkflowInstance::new(
-                        GITHUB_ISSUE_PR_DEFINITION_ID,
-                        1,
-                        "implementing",
-                        WorkflowSubject::new("issue", format!("issue:{id}")),
-                    )
-                    .with_id(id.to_string()),
+            crate::test_helpers::force_upsert_runtime_instance_for_test(
+                &store,
+                &WorkflowInstance::new(
+                    GITHUB_ISSUE_PR_DEFINITION_ID,
+                    1,
+                    "implementing",
+                    WorkflowSubject::new("issue", format!("issue:{id}")),
                 )
-                .await?;
+                .with_id(id.to_string()),
+            )
+            .await?;
         }
         state.core.workflow_runtime_store = Some(store);
 

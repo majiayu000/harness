@@ -429,7 +429,7 @@ mod tests {
                 "error_kind": "timeout",
                 "last_stop": { "state": state, "activity": "implement_issue" },
             }));
-            store.upsert_instance(&workflow).await?;
+            crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
             let command = WorkflowCommand::new(
                 WorkflowCommandType::EnqueueActivity,
                 format!("{id}-source"),
@@ -445,7 +445,7 @@ mod tests {
                 )
                 .await?;
             workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
-            store.upsert_instance(&workflow).await?;
+            crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
             workflows.push(workflow);
         }
 

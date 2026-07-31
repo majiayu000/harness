@@ -60,7 +60,9 @@ async fn eval_enqueue_does_not_return_a_plan_for_a_same_state_stale_snapshot() -
     let mut concurrent_instance = eval_case_initial_instance(input);
     concurrent_instance.version = concurrent_instance.version.saturating_add(1);
     concurrent_instance.data["concurrent_marker"] = json!("preserve-me");
-    store.upsert_instance(&concurrent_instance).await?;
+    store
+        .force_upsert_instance_for_test(&concurrent_instance)
+        .await?;
 
     let error = enqueue_eval_case_workflow(&store, input)
         .await
@@ -232,7 +234,9 @@ async fn eval_cleanup_reports_reload_failure_when_the_workflow_disappears() -> a
         .ok_or_else(|| anyhow::anyhow!("test workflow version overflow"))?;
     prior_instance.data["eval"]["workspace_path"] = json!("/tmp/eval-missing-worktree");
     prior_instance.data["eval"]["pr_number"] = json!(99);
-    store.upsert_instance(&prior_instance).await?;
+    store
+        .force_upsert_instance_for_test(&prior_instance)
+        .await?;
 
     let mut lock_tx = store.pool().begin().await?;
     let _: (String,) = sqlx::query_as("SELECT id FROM workflow_instances WHERE id = $1 FOR UPDATE")

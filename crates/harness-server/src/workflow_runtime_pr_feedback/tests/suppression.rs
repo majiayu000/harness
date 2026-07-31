@@ -34,7 +34,7 @@ async fn completed_inspecting_child_does_not_block_next_feedback_sweep() -> anyh
         123,
         "awaiting_feedback",
     );
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -43,7 +43,7 @@ async fn completed_inspecting_child_does_not_block_next_feedback_sweep() -> anyh
     )
     .with_id("pr-feedback-child-completed")
     .with_parent(workflow_id.clone());
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
 
     assert!(
         !has_active_pr_feedback_command(
@@ -108,7 +108,7 @@ async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyho
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -117,7 +117,7 @@ async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyho
     )
     .with_id("pr-feedback-child-failed")
     .with_parent(workflow_id.clone());
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
     let child_command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let child_command_id = store
@@ -181,7 +181,7 @@ async fn completed_waiting_pr_feedback_child_suppresses_duplicate_feedback_sweep
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let start_child = WorkflowCommand::start_child_workflow(
         PR_FEEDBACK_DEFINITION_ID,
         "pr:77",
@@ -201,7 +201,7 @@ async fn completed_waiting_pr_feedback_child_suppresses_duplicate_feedback_sweep
     )
     .with_id("pr-feedback-child-no-action")
     .with_parent(workflow_id.clone());
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
 
     let child_count = store
         .list_instances_by_parent(&workflow_id, None)
@@ -264,7 +264,7 @@ async fn completed_waiting_pr_feedback_child_uses_row_timestamp_for_cooldown() -
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let start_child = WorkflowCommand::start_child_workflow(
         PR_FEEDBACK_DEFINITION_ID,
         "pr:77",
@@ -285,7 +285,7 @@ async fn completed_waiting_pr_feedback_child_uses_row_timestamp_for_cooldown() -
     .with_id("pr-feedback-child-stale-json-updated-at")
     .with_parent(workflow_id.clone());
     child.updated_at = chrono::Utc::now() - chrono::Duration::hours(25);
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
 
     let command_count = store.commands_for(&workflow_id).await?.len();
     let outcome = request_pr_feedback_sweep(&store, &workflow_id).await?;
@@ -334,7 +334,7 @@ async fn completed_waiting_pr_feedback_child_allows_sweep_after_newer_observed_p
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let start_child = WorkflowCommand::start_child_workflow(
         PR_FEEDBACK_DEFINITION_ID,
         "pr:77",
@@ -372,7 +372,7 @@ async fn completed_waiting_pr_feedback_child_allows_sweep_after_newer_observed_p
         "remote_fact_hash": handled_snapshot.fact_hash,
         "remote_fact_activity_at": handled_fact_at.to_rfc3339(),
     }));
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
     let observed_fact_at = chrono::Utc::now() + chrono::Duration::seconds(1);
     let snapshot = RemoteFactSnapshot::new(
         "github",
@@ -435,7 +435,7 @@ async fn completed_waiting_pr_feedback_child_uses_pr_url_for_observed_fact_looku
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let start_child = WorkflowCommand::start_child_workflow(
         PR_FEEDBACK_DEFINITION_ID,
         "pr:77",
@@ -459,7 +459,7 @@ async fn completed_waiting_pr_feedback_child_uses_pr_url_for_observed_fact_looku
         "remote_fact_hash": "sha256:old",
         "remote_fact_activity_at": "2026-07-30T00:00:00Z",
     }));
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
     let observed_fact_at = chrono::Utc::now();
     let snapshot = RemoteFactSnapshot::new(
         "github",
@@ -521,7 +521,7 @@ async fn failed_pr_feedback_child_allows_sweep_after_changed_observed_fact() -> 
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -534,7 +534,7 @@ async fn failed_pr_feedback_child_allows_sweep_after_changed_observed_fact() -> 
         "remote_fact_hash": "sha256:old",
         "remote_fact_activity_at": "2026-07-30T00:00:00Z",
     }));
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
     let child_command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let child_command_id = store
@@ -605,7 +605,7 @@ async fn explicit_pr_feedback_request_starts_local_review_before_remote_suppress
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -614,7 +614,7 @@ async fn explicit_pr_feedback_request_starts_local_review_before_remote_suppress
     )
     .with_id("pr-feedback-child-failed-explicit-request")
     .with_parent(workflow_id.clone());
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
     let child_command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let child_command_id = store
@@ -685,7 +685,7 @@ async fn failed_pr_feedback_child_respects_disabled_suppression_window() -> anyh
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -694,7 +694,7 @@ async fn failed_pr_feedback_child_respects_disabled_suppression_window() -> anyh
     )
     .with_id("pr-feedback-child-failed")
     .with_parent(workflow_id.clone());
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
     let child_command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let child_command_id = store
@@ -767,7 +767,7 @@ async fn orphan_pending_child_does_not_block_next_feedback_sweep() -> anyhow::Re
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -776,7 +776,7 @@ async fn orphan_pending_child_does_not_block_next_feedback_sweep() -> anyhow::Re
     )
     .with_id("pr-feedback-child-orphan")
     .with_parent(workflow_id.clone());
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
 
     assert!(
         !has_active_pr_feedback_command(

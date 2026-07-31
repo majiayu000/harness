@@ -301,7 +301,7 @@ pub(super) async fn persist_pr_feedback(
     )
     .await?;
     if instance.state == "pr_open" {
-        store.upsert_instance(&instance).await?;
+        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &instance).await?;
         request_local_review(store, &instance.id).await?;
         return Ok(());
     }

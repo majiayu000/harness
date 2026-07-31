@@ -4,9 +4,9 @@ use harness_workflow::runtime::{
     candidate_fanout_from_policy, candidate_fanout_from_value, continuation_value,
     prompt_continuation_state_from_data, CandidateFanoutRequest, DecisionValidator,
     IssueSubmissionDecisionInput, PromptContinuationPolicy, PromptSubmissionDecisionInput,
-    SubmissionMode, ValidationContext, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    PROMPT_TASK_DEFINITION_ID,
+    SubmissionMode, ValidationContext, WorkflowCommandStatus, WorkflowDecision,
+    WorkflowDecisionTransition, WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
+    WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
@@ -279,7 +279,9 @@ async fn commit_runtime_decision(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
     decision: WorkflowDecision,
-    event_id: String,
+    event_type: &'static str,
+    source: &'static str,
+    event_payload: serde_json::Value,
     accepted_data: Option<serde_json::Value>,
 ) -> anyhow::Result<WorkflowInstance> {
     let validator = decision_validator_for_instance(&instance)?;
@@ -287,7 +289,9 @@ async fn commit_runtime_decision(
         store,
         instance,
         decision,
-        event_id,
+        event_type,
+        source,
+        event_payload,
         accepted_data,
         validator,
         false,
@@ -297,9 +301,11 @@ async fn commit_runtime_decision(
 
 async fn commit_runtime_decision_with_validator(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     decision: WorkflowDecision,
-    event_id: String,
+    event_type: &'static str,
+    source: &'static str,
+    event_payload: serde_json::Value,
     accepted_data: Option<serde_json::Value>,
     validator: DecisionValidator,
     allow_missing_pinned_cancel: bool,
@@ -312,28 +318,44 @@ async fn commit_runtime_decision_with_validator(
     if allow_missing_pinned_cancel {
         validation_context = validation_context.allow_missing_pinned_cancel();
     }
-    if let Err(error) = validator.validate(&instance, &decision, &validation_context) {
-        let reason = error.to_string();
-        let record = WorkflowDecisionRecord::rejected(decision, Some(event_id), &reason);
-        store.record_decision(&record).await?;
-        anyhow::bail!(reason);
-    }
-
-    let record = WorkflowDecisionRecord::accepted(decision.clone(), Some(event_id));
-    store.record_decision(&record).await?;
-    for command in &decision.commands {
-        store
-            .enqueue_command(&instance.id, Some(&record.id), command)
-            .await?;
-    }
-    instance.state = decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(
+    let expected_state = instance.state.clone();
+    let mut final_instance = instance.clone();
+    final_instance.state = decision.next_state.clone();
+    final_instance.version = final_instance.version.saturating_add(1);
+    final_instance.data = merge_last_decision(
         accepted_data.unwrap_or_else(|| instance.data.clone()),
         &decision.decision,
     );
-    store.upsert_instance(&instance).await?;
-    Ok(instance)
+    let record = store
+        .apply_decision_transition_with_validator(
+            WorkflowDecisionTransition {
+                expected_state: &expected_state,
+                create_if_missing: None,
+                event_type,
+                source,
+                payload: event_payload,
+                decision: &decision,
+                final_instance: &final_instance,
+                command_status: WorkflowCommandStatus::Pending,
+            },
+            &validator,
+            validation_context,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow state changed before runtime submission transition could be committed"
+            )
+        })?;
+    if !record.accepted {
+        anyhow::bail!(
+            "{}",
+            record
+                .rejection_reason
+                .unwrap_or_else(|| "decision rejected".to_string())
+        );
+    }
+    Ok(final_instance)
 }
 
 fn decision_validator_for_instance(
