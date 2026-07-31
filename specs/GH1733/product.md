@@ -25,8 +25,9 @@ facts in snapshots or through a CLI.
 
 - Produce versioned, deterministic ASC-001 evidence for configured local agent
   runtime executables and advertised MCP tool contracts.
-- Resolve one configured executable with the same single-command and `PATH`
-  semantics as its adapter, without enumerating or probing unrelated commands.
+- Resolve one configured executable with the adapter-compatible safe subset of
+  its single-command and `PATH` semantics, with every fail-closed divergence
+  documented and without enumerating or probing unrelated commands.
 - Bound executable reads, child-process lifetime, and combined probe output,
   while recording every incomplete observation with a closed failure vocabulary.
 - Preserve actual component ownership separately from runner observation and
@@ -106,7 +107,21 @@ facts in snapshots or through a CLI.
    freshness are `runner_observed`,
    `runner_observed`, `observed`, and `fresh`; stronger observation never
    rewrites the component ID. Invalid, ambiguous, or untyped ownership fails
-   before a fingerprint is emitted. Runtime component identity is a typed role
+   before a fingerprint is emitted. This bounded producer accepts a validated
+   ASC-001 base source locator of at most 4,096 UTF-8 bytes and a complete
+   derived runtime/server/tool locator of at most 8,259 UTF-8 bytes. These are
+   fingerprint-local limits, not changes to global ASC-001 validity. All
+   derivation uses checked length arithmetic and validates before suffix
+   allocation or copying. Strict envelope input is at most 2,097,152 raw bytes
+   and is rejected before JSON allocation when larger. Exact limits are
+   accepted; limit-plus-one fails with the matching closed limit kind. The
+   closed `RuntimeFingerprintLimitKind` values are
+   `base_source_locator_bytes`, `derived_source_locator_bytes`, and
+   `envelope_bytes`. Raw-envelope size has first precedence before JSON
+   allocation; strict parsing then checks complete derived-locator size before
+   suffix decoding and recovered-base size, while typed construction checks
+   base size before checked suffix expansion and complete derived size.
+   Runtime component identity is a typed role
    binding derived internally from the base source and exact B-002 runtime-kind
    spelling:
    `<base_locator>/harness_agent_runtime_role_v0_1/u<byte_length>_<lowercase_utf8_hex>`.
@@ -229,7 +244,7 @@ facts in snapshots or through a CLI.
    authorization plus the full retained-handle/path identity checkpoint, and
    retries that same retained candidate handle exactly once.
    Identity change prevents retry; a second `ETXTBSY` is terminal
-   `spawn_failed`. Exact retained-handle exec-time `ENOENT` is terminal
+   `spawn_failed`. Exact retained-handle exec-time `ENOENT` or `ENOTDIR` is terminal
    `interpreter_authorization_unavailable`; `ENOEXEC` is terminal
    `spawn_failed` and never invokes `/bin/sh`; every other spawn error is
    terminal. Absolute and qualified
@@ -247,6 +262,12 @@ facts in snapshots or through a CLI.
    exhausting only `EACCES` candidates is `bare_eacces_exhausted`, while no
    inspectable candidate is `path_not_found`. Resolution never invokes
    `which`, a package manager, or an arbitrary candidate command.
+   Fingerprint selection parity applies only after the selected eligible
+   native target is successfully authorized and executed. Interpreter,
+   alias-ownership, and identity fail-closed branches intentionally may reject
+   a command that the adapter could later launch through Unix PATH fallback.
+   In particular, retained-handle `ENOENT`/`ENOTDIR` stops at that candidate
+   and never attributes or executes a later same-basename candidate.
 
    A bare Unix command with sanitized child `PATH = Unset` is
    `path_unusable` before candidate observation. v0.1 never guesses libc's
@@ -271,7 +292,7 @@ facts in snapshots or through a CLI.
    interpreter or loader and never searches child `PATH` for one. If accepted
    static bytes change into a script after that check,
    `FD_CLOEXEC` makes `execveat(AT_EMPTY_PATH)` fail before interpreter
-   execution; exact exec-time `ENOENT` is mapped to the same terminal
+   execution; exact exec-time `ENOENT`/`ENOTDIR` is mapped to the same terminal
    interpreter failure. A later revision may support scripts only by resolving,
    retaining, fingerprinting, and authorizing the complete interpreter chain.
    Evidence classification comes from the closed B-010 policy, never from a
@@ -290,7 +311,17 @@ facts in snapshots or through a CLI.
    close-on-exec semantics and treats handle metadata as authoritative before
    any read. A FIFO, socket, directory, or device cannot block the producer
    while waiting for ordinary read access and never reaches hashing. Unix
-   executable permission is derived from handle metadata; Windows candidate
+   executable permission is derived from handle metadata. Supported Linux also
+   requires authoritative handle `st_nlink == 1` before target authorization.
+   An unavailable count is
+   `target_authorization_unavailable/link_count_unprovable`; zero is
+   `target_authorization_unavailable/unlinked_target`; a count greater than one
+   is `target_authorization_unavailable/multiple_hard_links`. Each
+   forbids the next exec or fallback. This intentionally rejects legitimate
+   multiply linked binaries
+   because v0.1 cannot prove every hard-link alias lies outside repository
+   boundaries; it does not claim to eliminate bind-mount or namespace aliases.
+   Windows candidate
    eligibility comes from the B-004
    filename/search contract, while actual loadability can be proven only by a
    successful supervised spawn. On a platform where process supervision is
@@ -330,7 +361,14 @@ facts in snapshots or through a CLI.
    re-hashed immediately before spawn, at the successful
    `PTRACE_EVENT_EXEC` stop while kernel write denial is active, and after the
    child is reaped, within that same active deadline; all four observations
-   must match before version attribution. At both later path
+   and link counts must match before version attribution. The initial,
+   pre-spawn, and post-`ETXTBSY` authorization gates require link count one.
+   A changed count at exec-stop kills before resume with
+   `identity_changed/exec_verification_failed`; a later change discards version
+   with `identity_changed`. If link-count observation itself is unavailable at
+   exec-stop, the producer kills/reaps without resume and returns
+   `execution_verification_unavailable` with no envelope; if unavailable only
+   after reap, version is discarded with `identity/metadata_unavailable`. At both later path
    checkpoints the private candidate reference is reopened with the same Unix
    `O_RDONLY | O_CLOEXEC | O_NONBLOCK` classification as the initial open:
    absolute references use `open`, and working-directory-relative references
@@ -496,7 +534,14 @@ facts in snapshots or through a CLI.
    No leading `v`/`V`, token scan, first-token fallback, dependency-version
    filter, surrounding whitespace, or extra nonblank line is accepted. Both
    complete bounded streams are parsed independently before stream selection.
-   Exactly one may match while the other is ASCII blank. Two matching streams,
+   Processing order is capture limit, complete-stream UTF-8 validation, blank
+   classification, then whole-stream grammar. `ASCII blank` means the empty
+   stream or bytes drawn only from HT `0x09`, LF `0x0a`, CR `0x0d`, and space
+   `0x20`; VT, FF, NUL, nonbreaking space, and every other byte are nonblank.
+   Implementations may not substitute `trim` or a library whitespace predicate.
+   A selected product line still permits only optional final LF or CRLF, so a
+   lone CR is legal only in the other blank stream. Exactly one may match while
+   the other is ASCII blank. Two matching streams,
    even with the same version, are `ambiguous_version`; one match plus nonblank
    invalid output or any other nonblank mismatch is `unparseable_version`; two
    blank streams are `empty_output`. The exact bounded stdout and stderr byte
@@ -617,7 +662,12 @@ facts in snapshots or through a CLI.
     construction accepts only raw JSON text or bytes through a duplicate-aware
     parser. It exposes no `serde_json::Value`, generic serializable, or
     typed-map constructor that could claim duplicate-free original input after
-    an ordinary decoder overwrote a key.
+    an ordinary decoder overwrote a key. `harness-core` explicitly enables the
+    existing `serde_json/raw_value` feature. The private visitor borrows each
+    member/element as `RawValue`, recursively visits its validated source slice,
+    and retains number-leaf `RawValue::get()` text so `1`, `1.0`, `1e0`, and
+    long valid tokens remain distinct. No handwritten lexer, new package, or
+    lockfile change is permitted.
 
     Resource limits are fixed by v0.1 and are not caller-adjustable. For each
     present schema: raw bytes are at most 1,048,576; canonical bytes at most
@@ -700,10 +750,10 @@ facts in snapshots or through a CLI.
 | `identity` | `not_executable` | Unix handle mode bits do not permit execution; Windows does not infer this fact from an extension or header. |
 | `identity` | `executable_too_large` | The byte ceiling was exceeded before or during hashing. |
 | `identity` | `read_failed` | The opened executable could not be read completely. |
-| `identity` | `identity_changed` | Path strong identity or retained-handle size/content digest changed across checkpoints. |
+| `identity` | `identity_changed` | Path strong identity, retained-handle size/content digest, or an already observed link count changed across checkpoints. |
 | `version_probe` | `probe_not_authorized` | Configuration-source or resolved-target repository policy forbids executing this inspected target; the closed reason identifies which and no child was started. |
-| `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary, so no child was started. |
-| `version_probe` | `interpreter_authorization_unavailable` | The retained executable was not a current-architecture static ELF without `PT_INTERP`, or exact retained-handle exec-time `ENOENT` showed that a late interpreter contract could not be satisfied. No target, loader, or interpreter instruction ran; a late-race setup helper is reaped. |
+| `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary or could not prove single-link ownership; the closed reason is `boundary_unprovable`, `link_count_unprovable`, `unlinked_target`, or `multiple_hard_links`. No target instruction ran. Initial/pre-spawn failure permits no target exec; retry failure requires exactly one prior retained-handle exec returning `ETXTBSY`, that helper reaped, and no second helper or exec. |
+| `version_probe` | `interpreter_authorization_unavailable` | The retained executable was not a current-architecture static ELF without `PT_INTERP`, or exact retained-handle exec-time `ENOENT`/`ENOTDIR` showed that a late interpreter contract could not be satisfied. No target, loader, or interpreter instruction ran; a late-race setup helper is reaped. |
 | `version_probe` | `handle_execution_unavailable` | A Linux platform with process-group supervision cannot provide `FD_CLOEXEC` retained-handle `execveat(AT_EMPTY_PATH)` plus a verified pre-first-instruction `PTRACE_EVENT_EXEC` checkpoint, so no target instruction was allowed to run. |
 | `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join, working-directory entry, or pre-exec ptrace stop/options setup failed; the closed setup stage identifies which, every created helper was reaped, and target handle exec was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
@@ -740,12 +790,12 @@ exec sequence (`none`, `single`, or
 | `not_executable` | Opened candidate lacks required mode bits; a bare search skips without a global identity failure, while an absolute/qualified attempt is terminal and requires `identity/not_executable`. |
 | `inspection_failed` | Open or later inspection failed; this is terminal and requires the matching B-008 identity failure. |
 | `inspection_target` | Configuration-source or resolved-target repository policy retained this first authorized inspection identity and stopped without exec. |
-| `authorization_unavailable` | Final-target repository/worktree classification could not be proven; this is terminal and requires `target_authorization_unavailable`. |
-| `interpreter_authorization_unavailable` | Initial script/dynamic-ELF/unsupported-format detection uses `none`; exact exec-time `ENOENT` uses `single` or the one `ETXTBSY` retry sequence. It requires the matching version-probe failure, executes no target/loader/interpreter instruction, and is terminal. |
+| `authorization_unavailable` | Final-target repository/worktree classification or single-link ownership could not be proven; this is terminal and requires `target_authorization_unavailable` with exact reason `boundary_unprovable`, `link_count_unprovable`, `unlinked_target`, or `multiple_hard_links`. |
+| `interpreter_authorization_unavailable` | Initial script/dynamic-ELF/unsupported-format detection uses `none`; exact exec-time `ENOENT`/`ENOTDIR` uses `single` or the one `ETXTBSY` retry sequence. It requires the matching version-probe failure, executes no target/loader/interpreter instruction, and is terminal. |
 | `handle_execution_unavailable` | No safe traced retained-handle `execveat(AT_EMPTY_PATH)` primitive exists; this is terminal, uses no exec sequence, and requires the matching version-probe failure. |
 | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join, working-directory entry, or ptrace setup failed, every created helper was reaped, and the affected target never attempted handle exec; this is terminal and requires the matching version-probe failure and exact setup stage. |
 | `retry_not_authorized` | After first exec returned `ETXTBSY`, the repeated checkpoint classified the target as repository-owned; requires `probe_not_authorized` with exact reason `resolved_target_repository` and forbids a second exec. |
-| `retry_authorization_unavailable` | After first exec returned `ETXTBSY`, the repeated checkpoint could not prove target authorization; requires `target_authorization_unavailable` and forbids a second exec. |
+| `retry_authorization_unavailable` | After first exec returned `ETXTBSY`, the repeated checkpoint could not prove target authorization; requires `target_authorization_unavailable` with the exact checkpoint reason `boundary_unprovable`, `link_count_unprovable`, `unlinked_target`, or `multiple_hard_links`, requires the first helper to be reaped, and forbids a second helper or exec. |
 | `exec_verification_failed` | Native exec reached `PTRACE_EVENT_EXEC`, but stopped-image strong identity or retained-handle digest mismatched before the first instruction; requires `identity_changed`, uses `single` or the retry sequence, and proves the stopped child was killed/reaped without resume. |
 | `exec_eacces` | Direct retained-handle exec returned exact `EACCES`; final identity is discarded and search continues. |
 | `exec_failed` | Direct retained-handle exec returned another terminal error; requires `spawn_failed` and no selected/executed claim. |
@@ -755,7 +805,9 @@ Parsers preserve list order and reject more than 64 attempts, an outcome after
 a terminal outcome, any exec outcome after identity-only authorization,
 multiple terminal outcomes, `inspection_target` without
 `probe_not_authorized` and its closed source-or-target reason,
-`authorization_unavailable` without `target_authorization_unavailable`,
+`authorization_unavailable` without `target_authorization_unavailable` and
+exactly one of `boundary_unprovable`, `link_count_unprovable`,
+`unlinked_target`, or `multiple_hard_links`,
 `interpreter_authorization_unavailable` without its matching failure and legal
 pre-exec or exec-time sequence,
 `handle_execution_unavailable` without the matching
@@ -765,7 +817,10 @@ pre-exec or exec-time sequence,
 `retry_not_authorized` without `probe_not_authorized` carrying exact reason
 `resolved_target_repository`,
 `retry_authorization_unavailable` without
-`target_authorization_unavailable`,
+`target_authorization_unavailable` and its exact checkpoint
+`boundary_unprovable`, `link_count_unprovable`, `unlinked_target`, or
+`multiple_hard_links` reason, one reaped first helper, and no second helper or
+exec,
 `exec_verification_failed` without `identity_changed` and verified no-resume
 reap, `exec_failed` without `spawn_failed`, `exec_started` with a spawn failure, or
 `bare_eacces_exhausted` unless the final non-skipped attempt is `exec_eacces`
@@ -824,7 +879,13 @@ terminal `exec_failed`.
       fixtures prove the three derived IDs are pairwise distinct for one base
       source, preserve scope and identical exact-source integrity or absence,
       and cannot be caller pre-encoded. Strict parser fixtures reject missing,
-      malformed, noncanonical, and payload-wrong role suffixes.
+      malformed, noncanonical, and payload-wrong role suffixes. All
+      runtime/server/tool bindings accept 4,096-byte base locators and reject
+      4,097 before copying, use checked derivation, and reject complete
+      locators above 8,259 bytes. A maximum base plus maximum stable key and
+      tool name reaches exactly 8,259 bytes. Strict envelope parsing accepts
+      2,097,152 raw bytes and rejects byte 2,097,153 before JSON allocation;
+      fixtures pin the three closed limit reasons and their precedence.
 - [ ] PATH fixtures prove Unix child-working-directory semantics and Windows
       frozen search order/`.exe` behavior, including Windows refusal to use
       `PATHEXT`, accept any explicitly named non-`.exe` extension, execute
@@ -841,7 +902,12 @@ terminal `exec_failed`.
       remains `absent`; bare search continues, while an absolute/qualified sole
       candidate becomes `path_not_found`. Existing non-regular or
       mode-ineligible absolute/qualified paths retain their matching identity
-      failure instead of masquerading as not found.
+      failure instead of masquerading as not found. Separate late-race
+      retained-handle `ENOENT` and `ENOTDIR`
+      fixtures prove the fingerprint stops with
+      `interpreter_authorization_unavailable`, does not execute a later PATH
+      candidate, and records the documented security divergence even when the
+      adapter would continue searching.
 - [ ] Unix bare-name PATH-unset fixtures return `path_unusable` without
       observing a default search path, while absolute and qualified commands
       remain representable; Windows conformance compares the frozen resolver
@@ -898,7 +964,17 @@ terminal `exec_failed`.
       mode-bit checks, Windows strong file-ID checks without a fabricated
       executable claim, pre-spawn/post-reap retained-handle rehashing, and
       explicit `identity_changed` evidence for path replacement or in-place
-      rewrite. Delayed cwd open, candidate open, boundary lookup, read/hash, and
+      rewrite. Initial in-repository/outside hard-link aliases fail
+      `multiple_hard_links` before spawn; an unlinked retained target is the
+      distinct `unlinked_target` reason, and unavailable link metadata is the
+      distinct `link_count_unprovable` reason. New or removed links at
+      pre-spawn, retry, exec-stop, and post-reap checkpoints produce the
+      stage-appropriate authorization or identity failure. Retry fixtures
+      require one reaped `ETXTBSY` helper and prove no second helper or exec,
+      while a stable single-link target remains eligible. Exact 0/1/2 counts
+      and unavailable exec-stop/post-reap observations exercise the closed
+      outcomes above. These tests do not claim bind-mount alias exclusion.
+      Delayed cwd open, candidate open, boundary lookup, read/hash, and
       both later checkpoint fixtures prove the active deadline starts before
       observation, every observation timeout returns a typed producer error
       with no envelope, the producer future returns boundedly, no
@@ -958,7 +1034,10 @@ terminal `exec_failed`.
       nonzero and signalled exit, invalid UTF-8, successful blank output,
       one valid stream plus nonblank invalid output, same/different versions on
       both matching streams, unparseable output, and conflicting matching
-      streams.
+      streams. Blank fixtures cover empty and every mixture of HT/LF/CR/SP as
+      allowed, VT/FF/NUL/NBSP as nonblank, lone CR as legal only in the
+      unselected blank stream, and invalid UTF-8 precedence; implementation
+      audits forbid generic whitespace predicates.
 - [ ] Environment fixtures prove the runtime-kind policy table's
       set/unset/digest/redacted behavior, arbitrary and cross-runtime keys
       cannot be declared or exposed, raw-value and raw-PATH absence, setup
@@ -993,7 +1072,11 @@ terminal `exec_failed`.
       `examples`, and `example` remain digest-sensitive in both dialects.
 - [ ] Duplicate JSON keys and malformed raw schemas fail typed before digesting,
       and public API/call-site audit proves no generic serializable or
-      `serde_json::Value` evidence constructor exists.
+      `serde_json::Value` evidence constructor exists. The core manifest
+      explicitly enables `serde_json/raw_value`; borrowed recursive
+      `RawValue::get()` tests distinguish `1`, `1.0`, `1e0`, long valid tokens,
+      malformed number syntax, and the canonical long-number boundary without
+      a handwritten lexer or lockfile change.
 - [ ] Tool-name, description, annotation, raw-schema, depth, node,
       decoded-string, per-container, and canonical-byte limit fixtures cover
       exact limits and limit-plus-one. Independent fixtures pin root depth one,

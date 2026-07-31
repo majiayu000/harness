@@ -9,7 +9,7 @@ GH-1733
 See `specs/GH1733/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1733,"complete":true,"paths":["crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
+{"issue":1733,"complete":true,"paths":["crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
 -->
 
 ## Current System and Root Cause
@@ -89,7 +89,11 @@ only expose the two facades. The one authorized server-file change is a
 mapping, call site, or consumer. `harness-agents` adds a direct dependency on
 the already pinned workspace `libc` solely for Linux no-shell process-group,
 pidfd, ptrace exec-stop, and `execveat(AT_EMPTY_PATH)` primitives. This adds no
-package/version and must not change `Cargo.lock`.
+package/version and must not change `Cargo.lock`. `harness-core` explicitly
+enables the existing workspace `serde_json` dependency's `raw_value` feature
+so borrowed `RawValue` slices can preserve validated number lexemes. This also
+adds no package/version and must not change `Cargo.lock`; no handwritten JSON
+lexer is authorized.
 
 ## Strict Fingerprint Envelope
 
@@ -222,6 +226,27 @@ exact closed runtime-kind wire bytes. The three derived component IDs are
 pairwise distinct even when both Codex roles share one base binding. Callers
 cannot supply, pre-encode, or override the role locator; an apparent suffix in
 the base is treated as ordinary base input and receives another derived suffix.
+Every fingerprint binding first checks the validated ASC-001 base locator
+against the fingerprint-local inclusive
+`RUNTIME_FINGERPRINT_MAX_BASE_SOURCE_LOCATOR_BYTES = 4_096` UTF-8-byte limit.
+This does not redefine global ASC-001 validity; a longer otherwise-valid source
+is unsupported by this bounded producer. Every suffix calculation uses
+`checked_add`, and every complete runtime/server/tool locator must fit the
+inclusive
+`RUNTIME_FINGERPRINT_MAX_DERIVED_SOURCE_LOCATOR_BYTES = 8_259` limit before
+allocation or copying. The maximum tool locator is reachable exactly:
+4,096 base bytes + 38 server-suffix prefix/count bytes + 2,048 stable-key hex
+bytes + 29 tool-suffix prefix/count bytes + 2,048 tool-name hex bytes. The
+natural runtime and server maxima are 4,159 and 6,182 bytes. Byte 4,097 at the
+base or byte 8,260 in a complete parsed locator fails with the matching closed
+limit kind.
+The typed contract error carries one closed `RuntimeFingerprintLimitKind`:
+`BaseSourceLocatorBytes`, `DerivedSourceLocatorBytes`, or `EnvelopeBytes`.
+For raw input, `EnvelopeBytes` is checked first before JSON allocation. After a
+bounded decode, strict parsing checks `DerivedSourceLocatorBytes` before suffix
+grammar/decoding and recovered `BaseSourceLocatorBytes`. Typed construction
+checks `BaseSourceLocatorBytes`, then the binding-specific stable-key/tool-name
+limit, then checked derived length before any suffix allocation or copying.
 Callers that cannot provide a validated ownership source get a typed error
 rather than a generated UUID, display label, or free-form locator. Core parsing
 uses `RuntimeRoleSourceBinding::parse` to strip the final two segments, validate
@@ -290,6 +315,11 @@ tool name to match them. No
 valid source. Fixtures cover every ASC-001 source scope, multiple exact tool
 names on one configured server, distinct configured keys, parser mismatch
 rejection, and component IDs before and after runner observation.
+`from_json_str` and `from_json_slice` reject raw input above
+`RUNTIME_FINGERPRINT_MAX_ENVELOPE_BYTES = 2_097_152` before Serde allocation,
+then enforce the base and complete-locator limits while parsing. Exact raw
+envelope size can be reached with trailing JSON whitespace; byte 2,097,153
+fails typed before decoding.
 This implements B-003 and B-011.
 
 Runtime version-probe authorization is a private conjunction of source and
@@ -304,11 +334,19 @@ canonical root in a typed `ValidatedRepositoryBoundarySet` derived from the
 declared project repository and linked worktree roots. A target inside any
 boundary maps to `IdentityOnly` with `resolved_target_repository`. Missing,
 incomplete, renamed, or ambiguous final-handle/boundary evidence records
-`target_authorization_unavailable`. Only a target proven outside every
-boundary becomes `VersionProbeEligible`. Raw roots and final paths are never
-serialized. There is no caller boolean, string trust level, path label, or
-builder that can promote either identity-only result. This policy does not
-reinterpret ASC-001 observation or trust metadata.
+`target_authorization_unavailable` with `BoundaryUnprovable`. On supported
+Linux, the same authorization step requires exact handle `st_nlink == 1`;
+zero records `target_authorization_unavailable` with `UnlinkedTarget`, a count
+greater than one records `MultipleHardLinks`, and an unavailable count records
+the honest `LinkCountUnprovable` reason. v0.1 deliberately
+rejects otherwise legitimate multiply linked binaries because it cannot prove
+every alias lies outside the repository boundaries. This closes hard-link
+ambiguity only and does not claim to enumerate bind-mount or other namespace
+aliases. Only a single-link target proven outside every boundary becomes
+`VersionProbeEligible`. Raw roots and final paths are never serialized. There
+is no caller boolean, string trust level, path label, or builder that can
+promote either identity-only result. This policy does not reinterpret ASC-001
+observation or trust metadata.
 
 Tool name and description are copied as exact UTF-8 strings. The producer does
 not call `trim`, `split_whitespace`, Unicode normalization, case conversion, or
@@ -444,8 +482,10 @@ On Unix:
   strong-identity checkpoint, and retries the same retained authorized handle
   once; the retained candidate reference and its lexical digest remain
   resolution evidence only;
-  identity change stops without retry, while second `ETXTBSY`, `ENOEXEC`, and
-  every other retry/error are terminal `spawn_failed`;
+  identity change stops without retry; exact `ENOENT`/`ENOTDIR` on either the
+  first or second target exec is terminal
+  `interpreter_authorization_unavailable`, while second `ETXTBSY`, `ENOEXEC`,
+  and every other retry/error are terminal `spawn_failed`;
 - absolute and qualified commands may use that one same-candidate `ETXTBSY`
   retry but never search or fallback to another path; and
 - the first successful exec becomes the selected executable.
@@ -479,7 +519,7 @@ The tags, counts, and exact units are encoded identically to
 `RuntimeExecSequence::None` when the bounded pre-anchor classifier observes a
 script, dynamic or malformed ELF, wrong-architecture ELF, or any other
 unsupported format, or `Single` / `EtxtbsyThenCheckpointAfter150Ms` for exact
-exec-time `ENOENT`; every form proves no target/loader/interpreter instruction
+exec-time `ENOENT`/`ENOTDIR`; every form proves no target/loader/interpreter instruction
 ran and any setup helper was reaped. `ExecVerificationFailed` requires
 `identity/identity_changed`, uses `Single` or the retry sequence, and proves the
 exec-stopped child was killed/reaped without resume.
@@ -508,10 +548,13 @@ Under `UnixAbsolute` or `UnixQualified`, exactly one attempt is required:
 identity failure. `InspectionTarget` is permitted only with
 `probe_not_authorized` and one closed configuration-source or resolved-target
 repository reason, and forbids all exec outcomes. `AuthorizationUnavailable`
-requires exactly `target_authorization_unavailable`, is terminal, and forbids
-exec, fallback, or selected identity. `InterpreterAuthorizationUnavailable`
+requires exactly `target_authorization_unavailable` carrying
+`BoundaryUnprovable`, `LinkCountUnprovable`, `UnlinkedTarget`, or
+`MultipleHardLinks`, is terminal, and forbids exec, fallback, or selected
+identity.
+`InterpreterAuthorizationUnavailable`
 requires exactly the matching failure and its sequence distinguishes
-pre-observed shebang from exact exec-time `ENOENT`; both forbid fallback and
+pre-observed unsupported format from exact exec-time `ENOENT`/`ENOTDIR`; both forbid fallback and
 selected identity. `ExecVerificationFailed` requires `identity_changed`,
 forbids resume/fallback/selected identity, and proves the stopped child was
 reaped.
@@ -537,8 +580,10 @@ delay and the repeated authorization/hash/path-identity checkpoint. If that
 checkpoint changes authorization, `RetryNotAuthorized` requires
 `probe_not_authorized` with exact `ResolvedTargetRepository` reason, while
 `RetryAuthorizationUnavailable` requires
-`target_authorization_unavailable`; either forbids the second helper, fallback,
-and selected identity. `InspectionFailed` with `identity_changed` likewise
+`target_authorization_unavailable` carrying the exact checkpoint reason
+`BoundaryUnprovable`, `LinkCountUnprovable`, `UnlinkedTarget`, or
+`MultipleHardLinks`, requires the first `ETXTBSY` helper to be reaped, and
+forbids the second helper, fallback, and selected identity. `InspectionFailed` with `identity_changed` likewise
 forbids the second helper. `SupervisionSetupFailed` is also legal in this
 sequence when the second helper is reaped after group join fails and before
 target handle exec; it cannot fall back. Only `ExecEacces` for a bare name,
@@ -575,11 +620,17 @@ non-ELF/binfmt format emit
 header bytes, interpreter path, or raw prefix are serialized. If accepted
 bytes become a script after this check,
 `FD_CLOEXEC` retained-handle `execveat(AT_EMPTY_PATH)` fails before interpreter
-execution; exact exec-time `ENOENT` is the same terminal interpreter failure,
-not PATH fallback. This is intentionally conservative because script execution
-or dynamic loading delegates to another executable that this packet does not
-authorize. Fault-injection tests freeze these paths without a `noexec`
-filesystem.
+execution; exact exec-time `ENOENT` or `ENOTDIR` is the same terminal
+interpreter failure, not PATH fallback. This is intentionally conservative
+because script execution or dynamic loading delegates to another executable
+that this packet does not authorize. Fingerprint selection parity applies only
+after successful authorization and execution of the selected eligible native
+target. Interpreter, alias-ownership, or identity fail-closed branches may
+reject a command that the adapter could later launch through Unix PATH
+fallback; the producer must stop at that retained candidate and must not
+attribute any later adapter candidate. A fixture freezes this deliberate
+security divergence for both exec-time errors. Fault-injection tests freeze
+these paths without a `noexec` filesystem.
 
 All `CString` argument and environment storage and pointer arrays are built and
 NUL-validated in the parent. The audited Linux pre-exec closure receives the
@@ -601,7 +652,7 @@ failure). `TraceSetup` covers `PTRACE_TRACEME`, the initial stop, and parent
 `PTRACE_O_TRACEEXEC` installation, all before target exec.
 Successful handle exec never returns. A failed target call returns its
 captured errno through the distinct exec channel, so only exact target
-`EACCES` reaches the fallback branch, exact `ENOENT` maps to terminal
+`EACCES` reaches the fallback branch, exact `ENOENT`/`ENOTDIR` maps to terminal
 interpreter authorization unavailable, and a setup errno or `ENOEXEC` cannot
 reach a fallback or shell execution path.
 
@@ -800,7 +851,7 @@ audited pre-exec closure is the one exception: it first
 `PTRACE_TRACEME`s and stops itself before exec. The parent verifies that stop,
 sets `PTRACE_O_TRACEEXEC`, and resumes only into retained-handle
 `execveat(AT_EMPTY_PATH)`. Exact `EACCES`/`ETXTBSY`/`ENOEXEC` retain their
-closed attempt semantics; exact `ENOENT` is terminal
+closed attempt semantics; exact `ENOENT` or `ENOTDIR` is terminal
 `interpreter_authorization_unavailable` because the retained handle exists and
 the closed-on-exec script/interpreter contract could not be satisfied. A
 successful exec must deliver exactly one `PTRACE_EVENT_EXEC` before the new
@@ -823,10 +874,24 @@ pre-spawn checkpoint, platform handle APIs must also return the final target
 path used by the B-007 boundary classifier. Failure to prove that target lies
 outside every validated repository/worktree root records
 `target_authorization_unavailable` or `probe_not_authorized` and stops without
-spawn. `path_unusable` remains exclusive to resolution. Immediately before
-spawn and again after the child is reaped, one blocking checkpoint re-reads and
-re-hashes the retained executable handle and reopens the private candidate
-reference to compare strong identity. On Unix both checkpoint reopens use the
+spawn. Initial authorization, pre-spawn, the post-`ETXTBSY` retry gate,
+exec-stop, and post-reap checkpoints all re-read `st_nlink`. Before target
+creation, zero uses
+`target_authorization_unavailable/UnlinkedTarget`, a value greater than one
+uses `target_authorization_unavailable/MultipleHardLinks`, and an unavailable
+value uses `target_authorization_unavailable/LinkCountUnprovable`. During retry
+each produces `RetryAuthorizationUnavailable` with the same matching reason
+after the first `ETXTBSY` helper is reaped and before a second helper exists.
+At exec-stop, a changed observed count produces
+`identity_changed`/`ExecVerificationFailed` and kills before resume; inability
+to observe the count returns no-envelope `ExecutionVerificationUnavailable`
+and also kills/reaps without resume. After resume or reap, a changed count
+produces `identity_changed`, while post-reap observation unavailability
+produces `identity/metadata_unavailable`; both discard version evidence.
+`path_unusable` remains exclusive to resolution. Immediately
+before spawn and again after the child is reaped, one blocking checkpoint
+re-reads and re-hashes the retained executable handle and reopens the private
+candidate reference to compare strong identity. On Unix both checkpoint reopens use the
 same `O_RDONLY | O_CLOEXEC | O_NONBLOCK` flags and authoritative handle
 classification as the initial open. Absolute references use `open`;
 working-directory-relative references use `openat` against the same retained
@@ -1023,7 +1088,10 @@ The canonical failure record contains only closed enums and compatible bounded
 details: an exit code, byte limit, timeout milliseconds, closed
 `RuntimeProbeAuthorizationReason`
 (`ConfigurationSourceRepository` or `ResolvedTargetRepository`), closed
-`RuntimeSupervisionSetupStage`, or closed cleanup operation where applicable.
+`RuntimeTargetAuthorizationUnavailableReason` (`BoundaryUnprovable`,
+`LinkCountUnprovable`, `UnlinkedTarget`, or `MultipleHardLinks`), closed
+`RuntimeSupervisionSetupStage`, or closed cleanup
+operation where applicable.
 It never contains `io::Error` text, localized diagnostics, raw output, raw
 paths, or environment values. Define closed `RuntimeProbePhase` and
 `RuntimeProbeFailureKind` enums for every row in the B-008 table. Constructors
@@ -1038,8 +1106,9 @@ The closed `RuntimeFingerprintProduceError` additionally contains
 `ExecutionVerificationUnavailable`. These producer errors never construct a
 partial envelope. The protocol-invalid reasons are the five closed values
 defined above. `ExecutionVerificationUnavailable` covers a missing or
-surplus `PTRACE_EVENT_EXEC`, an abnormal trace transition, and active-deadline
-expiry before verified resume; it carries no PID, path, errno, or OS text.
+surplus `PTRACE_EVENT_EXEC`, an abnormal trace transition, unavailable required
+stopped-image/link-count observation, and active-deadline expiry before
+verified resume; it carries no PID, path, errno, or OS text.
 
 The result-state matrix is fail closed:
 
@@ -1050,7 +1119,8 @@ The result-state matrix is fail closed:
 | open failure | configured-command and resolution-attempt digests only; no handle, executable digest, child, or version |
 | later identity failure | bounded opened-handle facts only; no stable executable digest/version pair |
 | source/target repository probe not authorized | one `inspection_target` identity/hash may remain with the closed authorization reason; no selected/executed identity, exec attempt, fallback, child, or version |
-| target authorization unavailable | inspected identity/hash may remain; no selected/executed identity, exec attempt, fallback, child, or version |
+| target authorization unavailable before target exec | inspected identity/hash and the exact closed `BoundaryUnprovable`, `LinkCountUnprovable`, `UnlinkedTarget`, or `MultipleHardLinks` reason may remain; no selected/executed identity, target exec, fallback, target instruction, or version |
+| target authorization unavailable at the post-`ETXTBSY` retry checkpoint | exactly one failed retained-handle exec returned `ETXTBSY` and its helper was reaped; inspected identity/hash plus the exact closed checkpoint reason may remain, but no second helper/exec, fallback, selected/executed identity, target instruction, or version exists |
 | executable/interpreter authorization unavailable before anchor | stable inspected identity/hash may remain; no loader/interpreter lookup, anchor, target, selected identity, or version exists |
 | traced retained-handle execution unavailable | stable inspected identity may remain; no target instruction was allowed to run, no pathname was reopened for exec, and version is absent |
 | Unix bare-name `bare_eacces_exhausted` | configured-command, search, and ordered attempt digests may remain; every inspected-candidate identity is discarded and no final executable identity, child, or version exists |
@@ -1084,6 +1154,16 @@ invalid leading zero, and optional prerelease/build suffix. Its exact spelling
 and suffix case are retained. A leading `v`/`V`, surrounding whitespace, extra
 line, dependency/runtime suffix, or partial token match is rejected rather than
 guessed.
+
+`ASCII blank` is a closed byte predicate: the empty stream, or a nonempty
+stream whose every byte is exactly one of `0x09` (HT), `0x0a` (LF), `0x0d`
+(CR), or `0x20` (space). `0x0b` (VT), `0x0c` (FF), NUL, nonbreaking space,
+and every other byte are nonblank. Processing order is capture-limit
+enforcement, complete-stream UTF-8 validation, this byte predicate, then the
+whole-stream product grammar. Code must not use `trim`, `split_whitespace`, or
+`is_ascii_whitespace`. The selected product line still permits only its
+optional final LF or CRLF; a lone final CR is legal only in an unselected blank
+stream, never as the selected line ending.
 
 Both complete streams are parsed independently before selection:
 
@@ -1120,16 +1200,22 @@ typed map, or a generic serializable value.
 The required `McpInputSchema` and optional `McpOutputSchema` share one private
 `McpToolSchema` representation and expose only subject-specific
 `from_json_str` and `from_json_slice` constructors. Both start from raw JSON
-and use a duplicate-detecting serde visitor rather than first
-decoding to `serde_json::Value`, because the latter can overwrite an earlier
-duplicate key. After parse and before canonicalization, the root must be an
+and use a duplicate-detecting Serde visitor rather than first decoding to
+`serde_json::Value`, because the latter can overwrite an earlier duplicate key.
+With the explicitly enabled `serde_json/raw_value` feature, each object member
+value and array element is first borrowed as `&RawValue`; the private visitor
+recurses over `RawValue::get()` while retaining the source slice for a number
+leaf. This uses serde_json's validated raw-value scanner, not a handwritten
+JSON lexer, and preserves `1`, `1.0`, `1e0`, and arbitrarily long valid
+in-bound number tokens as distinct lexemes. After parse and before
+canonicalization, the root must be an
 object; root boolean, array, string, number, and null values return a typed
 `RootNotObject` contract error and emit no digest. Boolean schemas remain legal
 only in schema-valued child positions. Malformed JSON and
 duplicate-object-key errors remain typed and occur before canonicalization or
-digesting. The visitor also retains each validated raw JSON number token for
-the exact B-014 encoding instead of round-tripping it through `f64`. There is
-no public
+digesting. Invalid JSON-number spellings fail syntax validation. The visitor
+retains each validated raw JSON number token for the exact B-014 encoding
+instead of round-tripping it through `i64`, `u64`, or `f64`. There is no public
 `from_serializable`, `serde_json::Value`, or typed-map evidence constructor:
 after ordinary decoding, original duplicate-key absence cannot be attested.
 
@@ -1186,7 +1272,9 @@ Independent schema limit vectors are frozen as follows:
 
 Exact limits are legal; limit-plus-one returns the specific closed
 `McpContractLimitKind` and emits no digest or envelope. Depth 64 keeps recursive
-schema traversal below the fixed safe bound without a new parser or dependency.
+schema traversal below the fixed safe bound. Borrowed `RawValue` recursion
+requires only the explicitly enabled existing feature and no new parser,
+package, or lockfile entry.
 
 Before entering the private state machine, the duplicate-aware root parser
 selects one closed `McpSchemaDialect`: absent `$schema` and exact
@@ -1267,6 +1355,26 @@ owns user-facing collection commands. This is B-016.
 | B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `absent_schema_dialect_defaults_to_draft_2020_12`; `exact_supported_schema_dialects_round_trip`; `unknown_nonstring_and_nested_schema_dialects_fail_typed`; `schema_set_locations_reorder_canonically`; Draft 2020-12 `content_schema_traverses_nested_required_and_one_of_as_schema`; Draft-07 `content_schema_remains_ordered_instance_data`; `draft_07_dependencies_schema_and_string_set_forms_are_context_aware`; `draft_07_dependencies_reject_invalid_shapes`; `draft_2020_12_legacy_keywords_remain_instance_data`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `draft_2020_12_object_items_traverses_nested_schema`; `draft_2020_12_array_items_is_malformed`; `draft_07_array_items_preserves_tuple_order`; `draft_07_additional_items_traverses_schema_context`; `additional_items_without_draft_07_array_items_remains_instance_data`; `draft_2020_12_dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; independent exact counting vectors pin root depth, value nodes, decoded key/value strings, direct entries, raw bytes, and canonical bytes; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
 
+Cross-cutting mandatory tests additionally include
+`base_source_locator_accepts_4096_and_rejects_4097_before_copy`,
+`maximum_tool_source_locator_reaches_8259_and_parser_rejects_8260`,
+`runtime_fingerprint_limit_reason_precedence_is_closed`,
+`raw_envelope_accepts_2097152_and_rejects_2097153_before_json_allocation`,
+`late_exec_enoent_and_enotdir_stop_without_adapter_path_fallback`,
+`single_link_target_is_eligible`,
+`unavailable_link_count_is_not_multiple_hard_links`,
+`link_counts_zero_one_and_two_have_distinct_closed_outcomes`,
+`multiple_hard_links_fail_initial_and_retry_authorization`,
+`link_count_change_at_exec_stop_kills_before_resume`,
+`link_count_change_after_resume_discards_version`,
+`unavailable_exec_stop_link_count_returns_no_envelope`,
+`unavailable_post_reap_link_count_is_metadata_unavailable`,
+`ascii_blank_is_exactly_empty_or_ht_lf_cr_space`,
+`vt_ff_nul_nbsp_are_nonblank_with_invalid_utf8_precedence`,
+`serde_json_raw_value_feature_is_direct`,
+`raw_number_lexemes_1_1point0_1e0_are_distinct`, and
+`long_and_malformed_number_boundaries_are_typed`.
+
 All failure tests assert the absence of a version fact and the absence of raw
 path, PATH, output, environment, and OS-diagnostic text from serialized
 evidence. Ordinary explicit lifecycle tests retain exact helper/root/member
@@ -1289,24 +1397,27 @@ vectors rather than values generated by the production helper under test.
 
 Only these paths are authorized:
 
-1. `crates/harness-core/src/stack/mod.rs`
-2. `crates/harness-core/src/stack/fingerprint.rs`
-3. `crates/harness-core/src/stack/fingerprint/model.rs`
-4. `crates/harness-core/src/stack/fingerprint/schema.rs`
-5. `crates/harness-core/src/stack/fingerprint/tests.rs`
-6. `crates/harness-agents/Cargo.toml` (direct existing workspace `libc` only)
-7. `crates/harness-agents/src/lib.rs`
-8. `crates/harness-agents/src/runtime_fingerprint.rs`
-9. `crates/harness-agents/src/runtime_fingerprint/environment.rs`
-10. `crates/harness-agents/src/runtime_fingerprint/executable.rs`
-11. `crates/harness-agents/src/runtime_fingerprint/probe.rs`
-12. `crates/harness-agents/src/runtime_fingerprint/tests.rs`
-13. `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs`
+1. `crates/harness-core/Cargo.toml` (enable `serde_json/raw_value` only)
+2. `crates/harness-core/src/stack/mod.rs`
+3. `crates/harness-core/src/stack/fingerprint.rs`
+4. `crates/harness-core/src/stack/fingerprint/model.rs`
+5. `crates/harness-core/src/stack/fingerprint/schema.rs`
+6. `crates/harness-core/src/stack/fingerprint/tests.rs`
+7. `crates/harness-agents/Cargo.toml` (direct existing workspace `libc` only)
+8. `crates/harness-agents/src/lib.rs`
+9. `crates/harness-agents/src/runtime_fingerprint.rs`
+10. `crates/harness-agents/src/runtime_fingerprint/environment.rs`
+11. `crates/harness-agents/src/runtime_fingerprint/executable.rs`
+12. `crates/harness-agents/src/runtime_fingerprint/probe.rs`
+13. `crates/harness-agents/src/runtime_fingerprint/tests.rs`
+14. `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs`
     (`#[cfg(test)]` exhaustive mapping contract only)
 
 Moving the two existing inline test modules into their listed test files is
 part of this scope. The agents manifest may add only `libc = { workspace =
-true }`; there is no new crate/version or lockfile change. No other manifest,
+true }`; the core manifest may change only its existing `serde_json` dependency
+to `{ workspace = true, features = ["raw_value"] }`. There is no new
+crate/version or lockfile change. No other manifest,
 database, configuration, adapter, spawn contract, workflow model, CLI, HTTP,
 prompt, snapshot, or high-context file change is authorized. Any production
 server import or call site requires an ASC-005 consumer specification rather
@@ -1333,9 +1444,10 @@ cargo audit
 git diff --check
 ```
 
-The changed-file audit must equal the thirteen-path manifest. `Cargo.lock` must
+The changed-file audit must equal the fourteen-path manifest. `Cargo.lock` must
 be unchanged and `cargo tree -p harness-agents -i libc` must show the pinned
-workspace dependency. A call-site audit
+workspace dependency. `cargo tree -e features -p harness-core` must show the
+direct `serde_json/raw_value` feature. A call-site audit
 must show that production uses of the new APIs remain confined to their
 defining modules; test uses do not count as consumers. File-length checks must
 show every Rust file below 800 lines. The sandbox parity gate and Linux

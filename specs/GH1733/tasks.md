@@ -18,10 +18,26 @@ PR branch only; do not create a replacement implementation PR or force-push.
 
 ## Implementation Tasks
 
-- [ ] `SP1733-T1` — Owner: core fingerprint model worker. Dependencies: approved product and tech specs plus `ready_to_implement`. Covers: B-001, B-003, B-008, B-011 through B-015. Done when: the strict outer envelope carries a canonical `fingerprint_digest` separate from ASC-001 exact-source-byte component integrity; its exact domain, three `u64` frames, string escaping, raw-number preservation, two framing vectors, and one full valid vector per subject are frozen independently; closed runtime/MCP payloads, probe and lifecycle-cleanup failures, injective runtime-role and configured-server-scoped MCP tool-source derivation, exact bounded MCP text, optional presence-sensitive raw-object `annotations`, required `inputSchema`, optional presence-sensitive `outputSchema`, and raw-JSON-only duplicate-aware object-root schema parsing are implemented in the split core modules. The schema parser defaults absent `$schema` to Draft 2020-12, accepts only the two exact Draft 2020-12 and Draft-07 identifiers, rejects unknown/non-string/nested dialect declarations, and applies `contentSchema`, modern dependency/prefix keywords, legacy `dependencies`, tuple `items`, and `additionalItems` only under the selected dialect; Draft-07 `contentSchema` remains ordered instance data. Core owns typed `RuntimeRoleSourceBinding::derive` and strict `parse`; configured MCP server identity uses the exact bounded stable key; every non-object schema root and every invalid subject/payload/source, dialect, capability, ordering, integrity, fingerprint-digest, or fixed resource-limit combination fails typed; callers cannot supply generic serializable/schema maps; constructors and parsers require an empty capability list; exact and limit-plus-one vectors cover root depth, value nodes, decoded strings, direct entries, raw bytes, and canonical bytes; every core file is below 800 lines. Verify: `cargo test -p harness-core fingerprint`, `cargo test -p harness-core stack`, `cargo test -p harness-core`, and `cargo check -p harness-core --all-targets`.
-- [ ] `SP1733-T2` — Owner: runtime fingerprint worker. Dependencies: SP1733-T1. Covers: B-002 through B-010, B-014, and B-015. Done when: isolation and exact passthrough `DangerFullAccess` sandbox gates run before host observation; only Linux `x86_64`/`aarch64` with `pidfd_open`, `pidfd_send_signal`, parent-child `PTRACE_O_TRACEEXEC`, `execveat(AT_EMPTY_PATH)`, strong `/proc` process/image identity, and the fixed observation protocol proceeds. The ready owner is the sole target/anchor fork, parent-side ptrace-control, wait/reap, and observation-helper-spawn owner; the target pre-exec closure's audited `PTRACE_TRACEME` is the sole exception. It atomically pidfd-registers and owns each helper or target before exposing any cancellable lease. Every cwd/candidate/boundary/hash/exec-stop/checkpoint/membership wait is bounded by the active or cleanup deadline. Observation timeout, cleanup-incomplete, and protocol-invalid are distinct closed producer errors with no envelope and exact ownership retained; no missing cwd fact or attempt outcome is fabricated. Resolution remains handle-relative and bounded with the exact `ENOENT`/`ENOTDIR`, `EACCES`, and one 150 ms `ETXTBSY` retry semantics. A bounded classifier accepts only the frozen native ELF64 machine tuple, current header versions/sizes, non-extended in-file program headers, `ET_EXEC` or `ET_DYN`, and no `PT_INTERP`; scripts, dynamic/malformed/wrong-machine ELF, and non-ELF/binfmt formats fail before target creation. Target exec uses `FD_CLOEXEC` retained-handle `execveat`, so a late script fails before interpreter execution. Every successful native exec stops at exactly one `PTRACE_EVENT_EXEC` before its first instruction and resumes only after a registered observation helper matches stopped-image strong identity plus retained-handle hash while kernel write denial is active. Changed bytes, missing/surplus events, abnormal trace state, and pre-resume timeout kill/reap without resume; verification-unavailable cases return no envelope, and no pathname fallback exists. Every `/proc` membership enumeration/revalidation uses an atomically registered observation helper with at most 64 transferred pidfds plus `more`; cleanup signals each batch individually and rescans from the beginning until only the anchor remains or the deadline expires. It never drops overflow members, uses a negative PGID, or signals the anchor before the group is empty. Membership stalls, malformed frames/helper exit, continuous churn, and anchor failures are typed. The active deadline includes observations, exec-stop, root exit, and post-reap checkpoint; probe cleanup has a separate five-second deadline. All closed runtime/environment/command/attempt/failure contracts, executable/output bounds, Windows digests, repository authorization, exact output grammars, and prior fail-closed/no-shell requirements remain covered; no `spawn_blocking`, unbounded wait, whole-file read, unbounded pipe, warning-only fallback, or detached-`ManagedChild` completion claim remains. Verify: `cargo test -p harness-agents runtime_fingerprint`, `cargo test -p harness-agents`, and `cargo check -p harness-agents --all-targets`.
-- [ ] `SP1733-T3` — Owner: boundary contract worker. Dependencies: SP1733-T1 and SP1733-T2. Covers: B-002 and B-016. Done when: a `#[cfg(test)]`-only exhaustive workflow `RuntimeKind` mapping proves the three local kinds map one-to-one, `AnthropicApi`/`RemoteHost` are not local executables, and no non-host isolation can be interpreted as a host fingerprint subject; production call-site audit proves there is no snapshot, server, workflow-runtime, task-runner, `CodeAgent`, `AgentAdapter`, CLI, HTTP, persistence, or migration consumer; and the implementation diff matches the thirteen authorized paths exactly with no lockfile change. Verify: `cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib` plus the manifest and `rg` audits described below.
+- [ ] `SP1733-T1` — Owner: core fingerprint model worker. Dependencies: approved product and tech specs plus `ready_to_implement`. Covers: B-001, B-003, B-008, B-011 through B-015. Done when: the strict outer envelope carries a canonical `fingerprint_digest` separate from ASC-001 exact-source-byte component integrity; its exact domain, three `u64` frames, string escaping, raw-number preservation, two framing vectors, and one full valid vector per subject are frozen independently; closed runtime/MCP payloads, probe and lifecycle-cleanup failures, injective runtime-role and configured-server-scoped MCP tool-source derivation, exact bounded MCP text, optional presence-sensitive raw-object `annotations`, required `inputSchema`, optional presence-sensitive `outputSchema`, and raw-JSON-only duplicate-aware object-root schema parsing are implemented in the split core modules. The core manifest explicitly enables existing `serde_json/raw_value`; a borrowed `RawValue` recursive visitor preserves exact validated number lexemes without a handwritten lexer, new package, or lockfile change. The schema parser defaults absent `$schema` to Draft 2020-12, accepts only the two exact Draft 2020-12 and Draft-07 identifiers, rejects unknown/non-string/nested dialect declarations, and applies `contentSchema`, modern dependency/prefix keywords, legacy `dependencies`, tuple `items`, and `additionalItems` only under the selected dialect; Draft-07 `contentSchema` remains ordered instance data. Core owns typed `RuntimeRoleSourceBinding::derive` and strict `parse`; base source locators are bounded at 4,096 UTF-8 bytes, complete derived locators at 8,259, and raw envelopes at 2,097,152 before JSON allocation; the three closed limit reasons and precedence are frozen, and configured MCP server identity uses the exact bounded stable key. Every non-object schema root and every invalid subject/payload/source, dialect, capability, ordering, integrity, fingerprint-digest, or fixed resource-limit combination fails typed; callers cannot supply generic serializable/schema maps; constructors and parsers require an empty capability list; exact and limit-plus-one vectors cover locator/envelope sizes, number spellings, root depth, value nodes, decoded strings, direct entries, raw bytes, and canonical bytes; every core file is below 800 lines. Verify: `cargo test -p harness-core fingerprint`, `cargo test -p harness-core stack`, `cargo test -p harness-core`, `cargo check -p harness-core --all-targets`, and `cargo tree -e features -p harness-core`.
+- [ ] `SP1733-T2` — Owner: runtime fingerprint worker. Dependencies: SP1733-T1. Covers: B-002 through B-010, B-014, and B-015. Done when: isolation and exact passthrough `DangerFullAccess` sandbox gates run before host observation; only Linux `x86_64`/`aarch64` with `pidfd_open`, `pidfd_send_signal`, parent-child `PTRACE_O_TRACEEXEC`, `execveat(AT_EMPTY_PATH)`, strong `/proc` process/image identity, and the fixed observation protocol proceeds. The ready owner is the sole target/anchor fork, parent-side ptrace-control, wait/reap, and observation-helper-spawn owner; the target pre-exec closure's audited `PTRACE_TRACEME` is the sole exception. It atomically pidfd-registers and owns each helper or target before exposing any cancellable lease. Every cwd/candidate/boundary/hash/exec-stop/checkpoint/membership wait is bounded by the active or cleanup deadline. Observation timeout, cleanup-incomplete, and protocol-invalid are distinct closed producer errors with no envelope and exact ownership retained; no missing cwd fact or attempt outcome is fabricated. Resolution remains handle-relative and bounded with the exact open-time `ENOENT`/`ENOTDIR`, exec-time `EACCES`, and one 150 ms `ETXTBSY` retry semantics. A retained-handle exec-time `ENOENT`/`ENOTDIR` terminates interpreter authorization and deliberately does not follow the adapter's later PATH fallback; the producer never attributes a later candidate. A bounded classifier accepts only the frozen native ELF64 machine tuple, current header versions/sizes, non-extended in-file program headers, `ET_EXEC` or `ET_DYN`, and no `PT_INTERP`; scripts, dynamic/malformed/wrong-machine ELF, and non-ELF/binfmt formats fail before target creation. Supported Linux authorization requires `st_nlink == 1` initially and at pre-spawn/retry; exec-stop and post-reap revalidate link count, with multiple links failing authorization before spawn or producing identity change after target creation. Target exec uses `FD_CLOEXEC` retained-handle `execveat`, so a late script fails before interpreter execution. Every successful native exec stops at exactly one `PTRACE_EVENT_EXEC` before its first instruction and resumes only after a registered observation helper matches stopped-image strong identity plus retained-handle hash while kernel write denial is active. Changed bytes, missing/surplus events, abnormal trace state, and pre-resume timeout kill/reap without resume; verification-unavailable cases return no envelope, and no pathname fallback exists. Every `/proc` membership enumeration/revalidation uses an atomically registered observation helper with at most 64 transferred pidfds plus `more`; cleanup signals each batch individually and rescans from the beginning until only the anchor remains or the deadline expires. It never drops overflow members, uses a negative PGID, or signals the anchor before the group is empty. Membership stalls, malformed frames/helper exit, continuous churn, and anchor failures are typed. The active deadline includes observations, exec-stop, root exit, and post-reap checkpoint; probe cleanup has a separate five-second deadline. Version blank classification is exactly empty or HT/LF/CR/SP bytes after UTF-8 validation, never a generic whitespace predicate. All closed runtime/environment/command/attempt/failure contracts, executable/output bounds, Windows digests, repository authorization, exact output grammars, and prior fail-closed/no-shell requirements remain covered; no `spawn_blocking`, unbounded wait, whole-file read, unbounded pipe, warning-only fallback, or detached-`ManagedChild` completion claim remains. Verify: `cargo test -p harness-agents runtime_fingerprint`, `cargo test -p harness-agents`, and `cargo check -p harness-agents --all-targets`.
+      An unavailable link count is the closed
+      `target_authorization_unavailable/link_count_unprovable` reason, zero is
+      `unlinked_target`, and only a count greater than one is
+      `multiple_hard_links`; retry authorization records exactly one reaped
+      `ETXTBSY` helper and proves no second helper or exec occurred. Exec-stop
+      observation failure is no-envelope execution verification failure;
+      post-reap failure is `identity/metadata_unavailable`.
+- [ ] `SP1733-T3` — Owner: boundary contract worker. Dependencies: SP1733-T1 and SP1733-T2. Covers: B-002 and B-016. Done when: a `#[cfg(test)]`-only exhaustive workflow `RuntimeKind` mapping proves the three local kinds map one-to-one, `AnthropicApi`/`RemoteHost` are not local executables, and no non-host isolation can be interpreted as a host fingerprint subject; production call-site audit proves there is no snapshot, server, workflow-runtime, task-runner, `CodeAgent`, `AgentAdapter`, CLI, HTTP, persistence, or migration consumer; and the implementation diff matches the fourteen authorized paths exactly with no lockfile change. Verify: `cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib` plus the manifest and `rg` audits described below.
 - [ ] `SP1733-T4` — Owner: verification and handoff owner. Dependencies: SP1733-T1 through SP1733-T3. Covers: B-001 through B-016. Done when: formatting, focused/package/workspace tests, clippy, file-size/manifest/API/call-site audits, current-head independent review, Gemini, and ruleset approval all pass; every #1862 thread and valid #1859 finding is re-evaluated on the exact head. Verification must prove owner exclusivity across target/anchor fork, parent-side ptrace control, wait/reap, and helper spawn, with only the audited target pre-exec `PTRACE_TRACEME` exception; owner-atomic helper registration at every cancellation boundary; distinct typed no-envelope timeout, cleanup-incomplete, and protocol-invalid paths through post-reap and active/cleanup group-membership checks; 64-member, 65-member, larger, and continuous-churn membership behavior; no in-process blocking worker or negative-PGID signal; anchor exclusion plus typed anchor shutdown failure; static `ET_EXEC` and static-PIE success; direct/env/race-introduced shebang, `PT_INTERP`, wrong-machine, malformed-header, and non-ELF/binfmt rejection before loader/interpreter execution; missing and surplus `PTRACE_EVENT_EXEC`, abnormal trace transition, and pre-resume deadline each produce no envelope and kill/reap without resume; successful native exec reaches a verified pre-first-instruction ptrace stop and matches hash/image identity under kernel write denial before resume; macOS/other-Unix/Windows fail before cwd observation; retained cwd/target handles survive pathname replacement; repository targets never execute; and Draft 2020-12 versus Draft-07 fixtures preserve their distinct `contentSchema`, dependency, items, and extension semantics. All previous digest vectors, output/executable limits, `ETXTBSY`, cleanup, schema counting, duplicate-key, source binding, annotation, and fail-closed assertions remain unweakened; the call-site audit must prove only the owner invokes target/anchor fork, parent-side ptrace controls, and wait/reap, while only the target's audited pre-exec closure invokes `PTRACE_TRACEME`. The original PR may close GH-1733 only after all gates pass. Verify: run every command and audit in Required Verification on one current implementation head, then collect fresh PR-gate evidence.
+      The exact-head matrix must additionally cover: 4,096/4,097-byte base
+      locators, 8,259/8,260-byte derived locators, and 2,097,152/2,097,153-byte
+      raw envelopes before allocation; raw number forms `1`, `1.0`, `1e0`,
+      malformed numbers, and the long-number canonical boundary through
+      `serde_json/raw_value`; exact hard-link counts 0/1/2, unavailable
+      exec-stop/post-reap observations, and initial/retry/later count changes;
+      deliberate terminal exec-time `ENOENT`/`ENOTDIR` despite
+      adapter PATH continuation; and empty/HT/LF/CR/SP versus VT/FF/NUL/NBSP
+      blank classification with UTF-8 precedence.
 
 ## Ownership and Ordering
 
@@ -31,13 +47,15 @@ files remain disjoint exactly as follows.
 
 | Task | Writable files |
 | --- | --- |
-| SP1733-T1 | `crates/harness-core/src/stack/mod.rs`; `crates/harness-core/src/stack/fingerprint.rs`; `crates/harness-core/src/stack/fingerprint/model.rs`; `crates/harness-core/src/stack/fingerprint/schema.rs`; `crates/harness-core/src/stack/fingerprint/tests.rs` |
+| SP1733-T1 | `crates/harness-core/Cargo.toml`; `crates/harness-core/src/stack/mod.rs`; `crates/harness-core/src/stack/fingerprint.rs`; `crates/harness-core/src/stack/fingerprint/model.rs`; `crates/harness-core/src/stack/fingerprint/schema.rs`; `crates/harness-core/src/stack/fingerprint/tests.rs` |
 | SP1733-T2 | `crates/harness-agents/Cargo.toml`; `crates/harness-agents/src/lib.rs`; `crates/harness-agents/src/runtime_fingerprint.rs`; `crates/harness-agents/src/runtime_fingerprint/environment.rs`; `crates/harness-agents/src/runtime_fingerprint/executable.rs`; `crates/harness-agents/src/runtime_fingerprint/probe.rs`; `crates/harness-agents/src/runtime_fingerprint/tests.rs` |
 | SP1733-T3 | `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs` (`#[cfg(test)]` contract only) |
 | SP1733-T4 | Read-only verification, review-thread resolution, and original-branch handoff; no writable source files |
 
 No other implementation path is authorized. The agents manifest may add only
-the existing workspace `libc`; do not edit any other Cargo file, the lockfile,
+the existing workspace `libc`; the core manifest may only enable
+`serde_json/raw_value` on its existing workspace dependency. Do not edit any
+other Cargo file, the lockfile,
 database or persistence code, configuration schemas, adapter launch paths,
 snapshots, prompts, CLI/HTTP surfaces, or high-context files. A newly
 discovered need outside this manifest returns the change to spec review instead
@@ -60,10 +78,12 @@ of silently expanding scope.
 - [ ] Run `cargo audit`.
 - [ ] Run `git diff --check`.
 - [ ] Confirm every changed Rust file is below 800 lines after rustfmt.
-- [ ] Confirm the implementation changed-file set equals the thirteen paths in
+- [ ] Confirm the implementation changed-file set equals the fourteen paths in
       the tech-spec `specrail-planned-changes` manifest.
 - [ ] Confirm `Cargo.lock` is unchanged and `cargo tree -p harness-agents -i
-      libc` resolves the existing pinned workspace dependency.
+      libc` resolves the existing pinned workspace dependency; confirm
+      `cargo tree -e features -p harness-core` shows direct
+      `serde_json/raw_value`.
 - [ ] Use `rg` to prove the new producer APIs have no production consumer
       outside their defining modules; `#[cfg(test)]` references do not count.
 - [ ] Use `rg` to prove the public MCP schema evidence API exposes no
@@ -95,6 +115,11 @@ of silently expanding scope.
   original branch after the readiness gate opens.
 - `runner_observed` describes evidence strength and trust; it never replaces
   repository, user-global, admin, system, runtime, or genuine runner ownership.
+- Fingerprint bindings accept base source locators through 4,096 UTF-8 bytes
+  and complete derived locators through 8,259 bytes, with checked arithmetic
+  before allocation. Strict envelope input is capped at 2,097,152 raw bytes
+  before JSON decoding. The three closed limit reasons and parser/constructor
+  precedence are frozen. These limits do not change global ASC-001 validity.
 - A bare configured command follows the frozen Unix or Windows v0.1 launch
   contract independently of the build compiler. Unix rejects unset PATH rather
   than guessing a default, attempts inspected candidates in PATH order, and
@@ -104,7 +129,11 @@ of silently expanding scope.
   The closed command form makes bare search skips distinct from
   absolute/qualified failures: exact open `ENOENT`/`ENOTDIR` is absent, while
   an existing non-regular or mode-ineligible configured path retains its
-  identity failure.
+  identity failure. Fingerprint selection parity applies only to an eligible
+  native target that passes authorization and executes. Retained-handle
+  exec-time `ENOENT`/`ENOTDIR` is a deliberate terminal security divergence:
+  the producer does not execute or attribute a later PATH candidate even if
+  the adapter would continue.
 - `codex.cloud.setup_secret_env` is an unconditional exclusion set. Setup
   values never enter evidence or the version child, regardless of key spelling.
 - The child `PATH` portion of resolution context is exactly the sanitized value
@@ -132,7 +161,17 @@ of silently expanding scope.
   size/digest and path strong identity are checked initially, immediately
   before spawn, at the pre-first-instruction exec stop under kernel write
   denial, and after reap; a
-  mismatch discards version evidence. This checkpoint correlation is not
+  mismatch discards version evidence. Supported Linux also requires
+  `st_nlink == 1` at authorization and rechecks it before spawn, after
+  `ETXTBSY`, at exec-stop, and after reap. An unavailable count is
+  `link_count_unprovable`, zero is `unlinked_target`, and only a count greater
+  than one is `multiple_hard_links`. Multiple links
+  fail authorization before spawn, fail retry authorization after one reaped
+  `ETXTBSY` helper and before a second helper, or become identity change after
+  target creation. Exec-stop observation failure is no-envelope execution
+  verification failure; post-reap failure is `identity/metadata_unavailable`.
+  This closes hard-link ambiguity but does not claim
+  bind-mount alias exclusion. This checkpoint correlation is not
   path-history attestation. A bounded classifier accepts only
   current-architecture static ELF without `PT_INTERP`; exact leading `#!`,
   dynamic/malformed ELF, wrong-architecture ELF, and every non-ELF/binfmt
@@ -160,6 +199,10 @@ of silently expanding scope.
   raw Unix bytes or Windows UTF-16LE units; PATH is the sole version-child key.
   Platform-normalized setup-secret exclusion runs first, and Windows rejects
   canonical key collisions or non-ASCII ambiguity.
+- Version stream processing checks the output cap, validates complete UTF-8,
+  then classifies blank as exactly empty or bytes from HT/LF/CR/SP. VT, FF,
+  NUL, NBSP, and every other byte are nonblank; no generic trimming or
+  whitespace predicate is allowed.
 - The combined stdout/stderr cap is caller-selectable only in `1..=65_536`,
   validated before allocation or helper creation, inclusive, and bounded at
   read time. After owner readiness, the five-second active deadline begins
@@ -189,7 +232,10 @@ of silently expanding scope.
   `additionalItems` semantics apply only to Draft-07. Draft-07
   `contentSchema` remains ordered instance data. Annotation, extension, and
   ordered-schema arrays retain order; evidence accepts only duplicate-aware raw
-  JSON; and fixed text/annotation/schema limits fail typed under the frozen
+  JSON. `harness-core` explicitly enables existing `serde_json/raw_value`;
+  borrowed recursive `RawValue` slices preserve exact validated number tokens
+  without a handwritten lexer, new package, or lockfile change. Fixed
+  text/annotation/schema limits fail typed under the frozen
   depth, node, decoded-string, direct-entry, raw-byte, and canonical-byte
   counting rules.
 - Envelope `fingerprint_digest` uses the frozen domain, three length frames,
