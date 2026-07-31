@@ -112,15 +112,20 @@ facts in snapshots or through a CLI.
    derived runtime/server/tool locator of at most 8,259 UTF-8 bytes. These are
    fingerprint-local limits, not changes to global ASC-001 validity. All
    derivation uses checked length arithmetic and validates before suffix
-   allocation or copying. Strict envelope input is at most 2,097,152 raw bytes
-   and is rejected before JSON allocation when larger. Exact limits are
-   accepted; limit-plus-one fails with the matching closed limit kind. The
-   closed `RuntimeFingerprintLimitKind` values are
+   allocation or copying. `from_exact_source_bytes` accepts at most 2,097,152
+   source bytes and checks byte 2,097,153 before copying or SHA-256 work; this
+   fingerprint-local constructor limit does not change global ASC-001 validity.
+   Strict envelope input is at most 2,097,152 raw bytes and is rejected before
+   JSON allocation when larger. Exact limits are accepted; limit-plus-one fails
+   with the matching closed limit kind. The closed
+   `RuntimeFingerprintLimitKind` values are `exact_source_bytes`,
    `base_source_locator_bytes`, `derived_source_locator_bytes`, and
    `envelope_bytes`. Raw-envelope size has first precedence before JSON
    allocation; strict parsing then checks complete derived-locator size before
-   suffix decoding and recovered-base size, while typed construction checks
-   base size before checked suffix expansion and complete derived size.
+   suffix decoding and recovered-base size. Exact-source construction checks
+   source byte length before base size, checked suffix expansion, complete
+   derived size, copying, or hashing; construction without source bytes begins
+   at the base-size check.
    Runtime component identity is a typed role
    binding derived internally from the base source and exact B-002 runtime-kind
    spelling:
@@ -343,6 +348,10 @@ facts in snapshots or through a CLI.
    the 65,536-unit value check. An excluded over-limit Claude directory is
    absent without a limit error; an excluded over-limit PATH becomes `Unset`,
    and a later bare Unix lookup returns `path_unusable`.
+   For an accepted static target, sanitized PATH remains evidence and the sole
+   child environment value, but the B-007 post-exec guard prevents it or the
+   retained working directory from selecting any later process image or new
+   executable mapping.
 6. **B-006:** Executable identity comes from one opened regular-file handle,
    not separate path-based metadata and content reads. Size and SHA-256 cover
    the bytes read from that handle. Unix first rejects a path already known to
@@ -426,7 +435,11 @@ facts in snapshots or through a CLI.
    `PTRACE_EVENT_EXEC`, stopped-image strong identity, and retained-handle hash
    under kernel write denial prove that no changed target or interpreter
    instruction ran before validation and that the resumed executable bytes
-   equal the recorded digest.
+   equal the recorded digest. Resume occurs only under the B-007 syscall-stop
+   guard: every later process-creation or image-execution syscall, and every
+   request for a new executable mapping, is stopped before kernel execution and
+   fails closed. Thus an allowed static target cannot use PATH, cwd, `dlopen`,
+   or a child process to execute repository/worktree native code.
 7. **B-007:** A version probe has one lifecycle covering authorization, spawn,
    concurrent stdout/stderr reads, exit, timeout, cleanup, and root reap.
    Authorization is the conjunction of configuration-source policy and opened
@@ -511,13 +524,19 @@ facts in snapshots or through a CLI.
    five-second deadline.
 
    Linux v0.1 requires descriptor-table isolation, `pidfd_open`,
-   `pidfd_send_signal`, parent-child ptrace with `PTRACE_O_TRACEEXEC`,
-   `execveat(AT_EMPTY_PATH)`, and strong `/proc` process/image identity
-   enumeration before host filesystem observation;
+   `pidfd_send_signal`, parent-child ptrace with `PTRACE_O_TRACEEXEC` and
+   `PTRACE_O_TRACESYSGOOD`, exact `PTRACE_GET_SYSCALL_INFO` inspection at
+   syscall-entry stops, `execveat(AT_EMPTY_PATH)`, and strong `/proc`
+   process/image identity enumeration before host filesystem observation;
    other Unix platforms return that typed no-envelope error without opening the
-   cwd or executable. The ready owner thread is the sole target/anchor fork,
+   cwd or executable. Missing tagged syscall-stop/syscall-info capability is
+   no-envelope
+   `containment_unavailable/post_exec_guard_unavailable` before cwd observation.
+   The ready owner thread is the sole target/anchor fork,
    parent-side ptrace-control, wait/reap, and observation-helper-spawn owner;
    the target's audited pre-exec `PTRACE_TRACEME` call is the sole exception.
+   The pre-observation capability child is instead traced only by owner-side
+   `PTRACE_SEIZE/PTRACE_INTERRUPT`; it never calls `PTRACE_TRACEME`.
    Before every capability/observation/membership helper, anchor, initial
    target, or retry target fork, the owner reserves all logical slots, then
    creates a close-on-exec start gate, descriptor-ready/status channel, and
@@ -545,6 +564,21 @@ facts in snapshots or through a CLI.
    precedes deadline; no status before deadline uses the deadline error, and
    cancellation emits no result while rollback continues. No lease or
    descriptor is exposed.
+   After the verified initial `PTRACE_EVENT_EXEC`, the owner resumes only with
+   `PTRACE_SYSCALL` and classifies each entry stop before the syscall executes.
+   The closed denied classes are `process_creation` (`fork`, `vfork`, `clone`,
+   `clone3`), `image_execution` (`execve`, `execveat`), and
+   `executable_mapping` (`mmap`/`mmap2`/`mprotect`/`pkey_mprotect` requesting
+   `PROT_EXEC`, or `shmat` requesting `SHM_EXEC`). A denied entry is never
+   executed: the owner records `version_probe/transitive_execution_denied` with
+   only that closed class and starts exact stopped-target cleanup.
+   Termination/reap failure is represented independently by the normative
+   lifecycle-cleanup kinds while the owner retains the stopped obligation.
+   Missing, surplus, untagged, or unreadable syscall stops return no-envelope
+   `execution_verification_unavailable`; no version or transitive-containment
+   claim is emitted. The initial static image needs no post-exec executable
+   mapping; a runtime that requires threads, a helper process, dynamic loading,
+   or JIT execution is deliberately unrepresentable in v0.1.
    The owner creates and retains a dedicated process-group anchor, creates every
    target through this gate, records target pidfd/reap ownership, and
    establishes the ptrace relationship before exposing a cancellable client
@@ -683,7 +717,12 @@ facts in snapshots or through a CLI.
     prebuilt `mcp_server` component, display label, UUID, or session identity.
     The stable key is at most 1,024 UTF-8 bytes; the exact limit is accepted
     and limit-plus-one fails typed before hexadecimal expansion or locator
-    allocation.
+    allocation. After UTF-8 validation it is rejected as blank exactly when it
+    is empty or every byte is HT (`0x09`), LF (`0x0a`), CR (`0x0d`), or SP
+    (`0x20`). There is no trimming or Unicode whitespace predicate; VT, FF,
+    NBSP, and every other valid UTF-8 scalar are nonblank and remain exact
+    identity bytes. The advertised tool-name nonblank check uses the same
+    predicate.
     The binding derives the server locator as
     `<base_locator>/harness_mcp_server_config_v0_1/u<byte_length>_<lowercase_utf8_hex>`
     from that exact nonblank UTF-8 key. The tool producer also requires the
@@ -844,6 +883,13 @@ facts in snapshots or through a CLI.
 
 ### Runtime Probe Failure Vocabulary
 
+The table order below is normative. Phase ranks are `path_resolution = 0`,
+`identity = 1`, `version_probe = 2`, and `lifecycle_cleanup = 3`; within each
+phase, kind rank is the zero-based row order shown. Producers serialize failures
+by `(phase_rank, kind_rank)` and parsers reject any other order. Thus concurrent
+cleanup failures are always `termination_failed`, `reap_failed`,
+`output_drain_failed`, then `group_verification_failed` when present.
+
 | Phase | Kind | Meaning |
 | --- | --- | --- |
 | `path_resolution` | `path_not_found` | No executable selected by the configured path/`PATH` launch contract. |
@@ -862,6 +908,7 @@ facts in snapshots or through a CLI.
 | `version_probe` | `handle_execution_unavailable` | A Linux platform with process-group supervision cannot provide `FD_CLOEXEC` retained-handle `execveat(AT_EMPTY_PATH)` plus a verified pre-first-instruction `PTRACE_EVENT_EXEC` checkpoint, so no target instruction was allowed to run. |
 | `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join, working-directory entry, or pre-exec ptrace stop/options setup failed; the closed setup stage identifies which, every created helper was reaped, and target handle exec was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
+| `version_probe` | `transitive_execution_denied` | After the verified initial static image began under syscall-stop supervision, it attempted closed class `process_creation`, `image_execution`, or `executable_mapping`; the denied syscall never executed, stopped-target cleanup began, cleanup outcome is independent, and no version fact was emitted. |
 | `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
 | `version_probe` | `lingering_process_group` | The root exited but a non-anchor member remained in the anchored Unix process group; version success was suppressed and cleanup started. |
 | `version_probe` | `timeout` | The probe deadline expired; cleanup outcome is represented independently. |
@@ -990,7 +1037,9 @@ terminal `exec_failed`.
       locators above 8,259 bytes. A maximum base plus maximum stable key and
       tool name reaches exactly 8,259 bytes. Strict envelope parsing accepts
       2,097,152 raw bytes and rejects byte 2,097,153 before JSON allocation;
-      fixtures pin the three closed limit reasons and their precedence.
+      exact source construction accepts 2,097,152 bytes and rejects byte
+      2,097,153 before copy or SHA-256;
+      fixtures pin the four closed limit reasons and their precedence.
 - [ ] PATH fixtures prove Unix child-working-directory semantics and Windows
       frozen search order/`.exe` behavior, including Windows refusal to use
       `PATHEXT`, accept any explicitly named non-`.exe` extension, execute
@@ -1055,6 +1104,12 @@ terminal `exec_failed`.
       audit proves the owner is the sole target/anchor fork, parent-side ptrace
       controller, wait/reap, and observation-helper-spawn authority; the
       target pre-exec closure's audited `PTRACE_TRACEME` is the sole exception.
+      After verified initial exec, syscall-entry fixtures prove `fork`, `vfork`,
+      `clone`, `clone3`, `execve`, `execveat`, executable `mmap`/`mprotect`, and
+      executable `shmat` are stopped before kernel execution, yield the exact
+      closed transitive-denial class, execute no second-image/child/mapping
+      marker, and suppress version. Missing/untagged/unreadable syscall stops
+      return no envelope and cleanup the target.
       The owner opens the
       declared child directory once, fixed working-directory spelling/identity
       digests enter the payload, both initial and retry helpers `fchdir` that
@@ -1072,7 +1127,8 @@ terminal `exec_failed`.
       interpreter creation. Neither sanitized `PATH` nor a setup-only secret
       named `NPM_ACCESS` can select or reach an interpreter. A supported static
       native-binary fixture separately proves sanitized `PATH` is the only
-      child environment key.
+      child environment key and that any later PATH/cwd helper launch or
+      executable mapping is denied before execution.
 - [ ] Identity fixtures prove handle-based metadata/hash consistency, before-
       and during-read fixed 67,108,864-byte size limit plus limit-plus-one,
       kill-isolated observation subprocess execution, Unix
@@ -1165,7 +1221,9 @@ terminal `exec_failed`.
       resource capacity; reserved slots plus `EMFILE` return the exact
       registration stage.
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
-      sanitized bounded facts, and rejection of unknown values.
+      sanitized bounded facts, rejection of unknown values, and a fixed vector
+      that orders simultaneous cleanup kinds as termination, reap, output-drain,
+      then group-verification regardless of observation order.
 - [ ] Version fixtures cover exact current Codex and Claude product lines,
       stdout/stderr selection, prerelease/build case preservation, CRLF/LF,
       rejected `v`/`V`, leading/trailing text, extra dependency versions,
@@ -1192,7 +1250,9 @@ terminal `exec_failed`.
       server/tool suffix parsing, absent tool component integrity, exact
       tool/description sensitivity, and distinct absence, empty, spaces, tabs,
       and newlines; exact 1,024-byte and rejected 1,025-byte stable keys are
-      checked before locator expansion. Absent, empty, standard-hint, title,
+      checked before locator expansion. Stable keys and tool names reject empty
+      or all-HT/LF/CR/SP bytes, preserve mixed nonblank input exactly, and treat
+      VT, FF, and NBSP as nonblank without trimming. Absent, empty, standard-hint, title,
       vendor-value, and ordered-array annotation fixtures remain distinct under
       the bounded raw-object contract without inferring ASC capabilities.
 - [ ] Schema fixtures cover required `inputSchema` and absent, present,

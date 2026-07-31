@@ -241,12 +241,16 @@ natural runtime and server maxima are 4,159 and 6,182 bytes. Byte 4,097 at the
 base or byte 8,260 in a complete parsed locator fails with the matching closed
 limit kind.
 The typed contract error carries one closed `RuntimeFingerprintLimitKind`:
-`BaseSourceLocatorBytes`, `DerivedSourceLocatorBytes`, or `EnvelopeBytes`.
+`ExactSourceBytes`, `BaseSourceLocatorBytes`, `DerivedSourceLocatorBytes`, or
+`EnvelopeBytes`.
 For raw input, `EnvelopeBytes` is checked first before JSON allocation. After a
 bounded decode, strict parsing checks `DerivedSourceLocatorBytes` before suffix
 grammar/decoding and recovered `BaseSourceLocatorBytes`. Typed construction
-checks `BaseSourceLocatorBytes`, then the binding-specific stable-key/tool-name
-limit, then checked derived length before any suffix allocation or copying.
+through `from_exact_source_bytes` first checks
+`RUNTIME_FINGERPRINT_MAX_EXACT_SOURCE_BYTES = 2_097_152` before copying or
+hashing, then `BaseSourceLocatorBytes`, the binding-specific stable-key/tool-
+name limit, and checked derived length before suffix allocation or copying.
+Construction without exact source bytes begins at `BaseSourceLocatorBytes`.
 Callers that cannot provide a validated ownership source get a typed error
 rather than a generated UUID, display label, or free-form locator. Core parsing
 uses `RuntimeRoleSourceBinding::parse` to strip the final two segments, validate
@@ -269,8 +273,9 @@ Observation and ownership remain separate at both producer boundaries.
 For runtimes, a closed `ConfiguredRuntimeSource` retains the caller's validated
 `AgentStackSource` plus optional exact source bytes. Its constructors are
 `without_canonical_bytes(source)` and `from_exact_source_bytes(source, bytes)`;
-the latter computes ASC-001 integrity internally, and there is no bare-digest
-setter. `ConfiguredRuntimeExecutable` asks the core typed binding to derive the
+the latter rejects byte 2,097,153 before copy/hash and computes ASC-001
+integrity internally for accepted input. There is no bare-digest setter.
+`ConfiguredRuntimeExecutable` asks the core typed binding to derive the
 role source above and emits
 an `agent_runtime` component with the same exact-byte integrity or absence.
 Multiple roles may truthfully share the base exact-source digest; integrity is
@@ -288,7 +293,11 @@ nonblank UTF-8 stable key of one persisted MCP configuration entry. Its only
 constructor derives
 `harness_mcp_server_config_v0_1/u<byte_length>_<lowercase_utf8_hex>` beneath
 the base locator. The key has an inclusive 1,024-byte UTF-8 maximum checked
-before hex expansion or locator allocation; byte 1,025 fails typed. There is no
+before hex expansion or locator allocation; byte 1,025 fails typed. After
+UTF-8 validation, blank means exactly empty or all bytes in HT/LF/CR/SP
+(`0x09`, `0x0a`, `0x0d`, `0x20`). No trim or Unicode whitespace predicate is
+used; VT, FF, NBSP, and every other valid UTF-8 scalar remain nonblank exact
+identity bytes. The exact advertised tool name uses the same predicate. There is no
 constructor from a component, display label,
 UUID, session ID, or already encoded locator. This binds observations to the
 configured key but deliberately does not claim historical proof that an
@@ -509,7 +518,8 @@ On Unix:
 - after handle inspection and the pre-spawn checkpoint, `probe.rs` keeps
   `FD_CLOEXEC` on the retained authorized handle and uses direct
   `execveat(..., AT_EMPTY_PATH)` from the existing workspace `libc` dependency
-  under a `PTRACE_O_TRACEEXEC` parent trace, with fixed arguments and no shell;
+  under a `PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD` parent trace, with fixed
+  arguments, post-exec syscall-stop guard, and no shell;
   interpreter-script exec fails before interpreter execution because the script
   descriptor closes on exec; a successful native exec stops at
   `PTRACE_EVENT_EXEC` before its first instruction, and only matching stopped-
@@ -686,7 +696,8 @@ only async-signal-safe `ptrace(PTRACE_TRACEME)`, `raise(SIGSTOP)`, `setpgid`,
 logs, locks,
 resolves, or reopens a pathname after fork. It first joins the anchored group
 and enters the exact retained working directory, then requests tracing and
-stops. Only after the parent installs `PTRACE_O_TRACEEXEC` does it close
+stops. Only after the parent installs
+`PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD` does it close
 unrelated descriptors and call `execveat`. Its stage-tagged error pipe
 distinguishes group-join, working-directory-entry, trace-setup, and target
 handle-exec failure. A failed `setpgid`, `fchdir`, ptrace request, stop, or
@@ -695,7 +706,8 @@ option install produces
 evidence; its closed `RuntimeSupervisionSetupStage` is `GroupJoin`,
 `WorkingDirectoryEnter`, or `TraceSetup` (`AnchorSetup` is reserved for anchor
 failure). `TraceSetup` covers `PTRACE_TRACEME`, the initial stop, and parent
-`PTRACE_O_TRACEEXEC` installation, all before target exec.
+`PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD` installation, all before target
+exec.
 Successful handle exec never returns. A failed target call returns its
 captured errno through the distinct exec channel, so only exact target
 `EACCES` reaches the fallback branch, exact `ENOENT`/`ENOTDIR` maps to terminal
@@ -761,9 +773,10 @@ ordered attempt evidence, and resolution outcome; directory contents,
 configured command, candidate paths, and raw search text are never serialized.
 The supported native-binary probe child receives the exact sanitized child
 `PATH` from the launch context. A shebang launcher fails before child
-environment construction can select an interpreter. Other environment keys
-follow only the closed policy below. This implements B-004, B-005, and the PATH
-portion of B-010.
+environment construction can select an interpreter, and the post-exec guard
+prevents an accepted target from using PATH or cwd for a later image or
+executable mapping. Other environment keys follow only the closed policy below.
+This implements B-004, B-005, and the PATH portion of B-010.
 
 ## Closed Environment Policy
 
@@ -969,7 +982,8 @@ After final target authorization, the owner creates the target and remains the
 sole parent-side ptrace controller and wait/reap owner. The target helper's
 audited pre-exec closure is the one exception: it first
 `PTRACE_TRACEME`s and stops itself before exec. The parent verifies that stop,
-sets `PTRACE_O_TRACEEXEC`, and resumes only into retained-handle
+sets `PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD`, and resumes only into
+retained-handle
 `execveat(AT_EMPTY_PATH)`. Exact `EACCES`/`ETXTBSY`/`ENOEXEC` retain their
 closed attempt semantics; exact `ENOENT` or `ENOTDIR` is terminal
 `interpreter_authorization_unavailable` because the retained handle exists and
@@ -980,10 +994,44 @@ write denial is active, one registered observation helper re-hashes the
 retained handle and opens/stats `/proc/<pid>/exe` to match the original strong
 identity; no `/proc` image observation runs on the owner or async runtime.
 Mismatch kills/reaps the stopped child and emits `identity_changed`; only an
-exact match may resume. A missing or surplus exec event, abnormal trace state,
+exact match may resume under the post-exec syscall-stop guard below. A missing
+or surplus exec event, abnormal trace state,
 or inability to prove this ordering returns the closed no-envelope producer
 error `ExecutionVerificationUnavailable`; the owner kills/reaps the stopped
 child without resume, and no pathname fallback exists.
+
+After that exact match, the owner uses only `PTRACE_SYSCALL` resumes and
+requires alternating entry/exit stops tagged by `PTRACE_O_TRACESYSGOOD`.
+`PTRACE_GET_SYSCALL_INFO` must return the expected entry or exit information
+whose audit architecture exactly matches the admitted Linux `x86_64` or `aarch64` tuple;
+raw register guessing is forbidden. At each entry stop, before kernel
+execution, the owner rejects closed `RuntimeTransitiveExecutionClass`:
+
+- `ProcessCreation`: `fork`, `vfork`, `clone`, or `clone3`;
+- `ImageExecution`: `execve` or `execveat`;
+- `ExecutableMapping`: `mmap`/`mmap2`, `mprotect`, or `pkey_mprotect` requesting
+  `PROT_EXEC`, or `shmat` requesting `SHM_EXEC`.
+
+The closed trace state begins `AwaitInitialExecExit`: after the already verified
+`PTRACE_EVENT_EXEC`, exactly one tagged syscall-exit stop for that authorized
+`execveat` is accepted before `AwaitEntry`. Thereafter an allowed entry moves to
+`AwaitExit`, its matching tagged exit returns to `AwaitEntry`, and only `exit`
+or `exit_group` may terminate directly from their allowed entry without a
+matching exit stop. Signal-delivery, group, seccomp, event, untagged, wrong-op,
+wrong-architecture, and duplicate stops are never treated as syscall progress;
+they return `ExecutionVerificationUnavailable` and start cleanup. The active
+deadline covers every trace stop and resume through root exit.
+
+The owner never resumes a denied entry. It kills/reaps the stopped target and
+records `version_probe/transitive_execution_denied` with only the closed class,
+no syscall number, argument, path, or OS text, and no version. If termination
+or reap does not complete, the normative lifecycle-cleanup failure is appended
+and the owner retains the stopped obligation. Missing,
+surplus, untagged, out-of-order, or unreadable syscall stops return no-envelope
+`ExecutionVerificationUnavailable` and run the same cleanup. This guard means
+the initial current-architecture static ELF is the only process image and
+executable mapping allowed to run; PATH/cwd helper launches, dynamic loading,
+JIT mappings, processes, and threads are deliberately unsupported in v0.1.
 
 The retained strong identity is device/inode from handle metadata on Unix and
 volume serial plus 128-bit `FILE_ID_INFO` from the opened handle on Windows.
@@ -1114,13 +1162,19 @@ opens the cwd, one private monotonic
 `RUNTIME_FINGERPRINT_PROBE_DEADLINE = Duration::from_millis(5_000)` starts.
 Under that deadline, the owner runs one bounded system-only capability helper:
 successful `DescriptorsReady` isolation plus `pidfd_open` and signal zero,
-`PTRACE_TRACEME` plus parent
-`PTRACE_O_TRACEEXEC` installation, an invalid-fd `execveat` probe that
+owner-side `PTRACE_SEIZE`/`PTRACE_INTERRUPT` plus
+`PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD` installation, tagged
+`PTRACE_SYSCALL` entry/exit stops with exact `PTRACE_GET_SYSCALL_INFO`, an invalid-fd
+`execveat` probe that
 distinguishes `EBADF` from `ENOSYS`, and strong `/proc` process/group/image
 enumeration. The helper is atomically pidfd-owned like every observation helper
 and is reaped before cwd access. Unsupported capability returns no-envelope
-`ContainmentUnavailable` with one closed reason; timeout uses
+`ContainmentUnavailable` with one closed reason; unavailable tagged syscall
+stops or syscall-info decoding use `PostExecGuardUnavailable`. Timeout uses
 `ObservationDeadlineExceeded(CapabilityCheck)`.
+The capability helper never calls `PTRACE_TRACEME`; the target pre-exec closure
+remains its sole production call site, and target trace setup can still fail
+closed as `supervision_setup_failed/trace_setup` before target exec.
 It covers every observation subprocess and handoff, target authorization,
 traced exec-stop verification, anchor setup, every target group join,
 working-directory entry and exec handshake, the optional 150 ms `ETXTBSY`
@@ -1263,12 +1317,18 @@ operation where applicable.
 It never contains `io::Error` text, localized diagnostics, raw output, raw
 paths, or environment values. Define closed `RuntimeProbePhase` and
 `RuntimeProbeFailureKind` enums for every row in the B-008 table. Constructors
-validate legal phase/kind/detail combinations. Producers sort by phase rank and
-kind rank and reject duplicates; parsers reject unknown or noncanonical input.
+validate legal phase/kind/detail combinations. The B-008 product table order is
+normative: phase ranks are `PathResolution = 0`, `Identity = 1`,
+`VersionProbe = 2`, and `LifecycleCleanup = 3`; kind rank is the zero-based row
+ordinal inside its phase. Producers sort by that exact pair and reject
+duplicates; parsers reject unknown or noncanonical input. In particular, the
+cleanup ranks are `TerminationFailed = 0`, `ReapFailed = 1`,
+`OutputDrainFailed = 2`, and `GroupVerificationFailed = 3`.
 
 The closed `RuntimeFingerprintProduceError` additionally contains
 `ContainmentUnavailable` with closed platform/owner/capability reasons
-(including `OwnerCapacityExhausted`),
+(including `DescriptorIsolationUnavailable`, `PostExecGuardUnavailable`, and
+`OwnerCapacityExhausted`),
 `LaunchInputLimitExceeded { kind }`,
 `OwnerResourceCapacityExceeded { kind }` with closed kind `Pidfds` or
 `NonPidfdFds`,
@@ -1282,7 +1342,9 @@ partial envelope. The protocol-invalid reasons are the five closed values
 defined above. `ExecutionVerificationUnavailable` covers a missing or
 surplus `PTRACE_EVENT_EXEC`, an abnormal trace transition, unavailable required
 stopped-image/link-count observation, and active-deadline expiry before
-verified resume; it carries no PID, path, errno, or OS text.
+verified resume. It also covers missing, surplus, untagged, out-of-order, or
+unreadable post-resume syscall stops; it carries no PID, path, errno, syscall
+number, argument, or OS text.
 
 The result-state matrix is fail closed:
 
@@ -1292,6 +1354,7 @@ The result-state matrix is fail closed:
 | global owner capacity exhausted | typed no-envelope containment error before owner thread, fd, cwd observation, helper, or child |
 | owner descriptor capacity exceeded | typed no-envelope error; the admitted fingerprint-specific owner retains its permit and every existing obligation until actual exit |
 | child registration unavailable | typed no-envelope error; no child workload ran, rollback either reaped the still-gated direct child or retained its exact obligation plus the owner permit |
+| transitive execution denied | closed failure evidence with no version; denied syscall never executed, stopped-target cleanup began, and incomplete cleanup is represented independently |
 | path resolution failure | no resolved identity, executable digest, or version |
 | absolute/qualified non-regular or non-executable | matching identity failure and bounded inspected-handle facts only; no child, fallback, selected identity, or version |
 | open failure | configured-command and resolution-attempt digests only; no handle, executable digest, child, or version |
@@ -1549,6 +1612,7 @@ Cross-cutting mandatory tests additionally include
 `base_source_locator_accepts_4096_and_rejects_4097_before_copy`,
 `maximum_tool_source_locator_reaches_8259_and_parser_rejects_8260`,
 `runtime_fingerprint_limit_reason_precedence_is_closed`,
+`exact_source_accepts_2097152_and_rejects_2097153_before_copy_or_hash`,
 `raw_envelope_accepts_2097152_and_rejects_2097153_before_json_allocation`,
 `late_exec_enoent_and_enotdir_stop_without_adapter_path_fallback`,
 `single_link_target_is_eligible`,
@@ -1569,6 +1633,15 @@ Cross-cutting mandatory tests additionally include
 `launch_limit_precedes_ninth_owner_capacity`,
 `logical_fd_exhaustion_precedes_injected_emfile`,
 `reserved_fd_slot_emfile_is_child_registration_stage`,
+`post_exec_guard_unavailable_fails_before_cwd_observation`,
+`capability_helper_uses_owner_seize_and_never_traceme`,
+`post_exec_guard_denies_process_creation_before_kernel_entry`,
+`post_exec_guard_denies_image_execution_before_kernel_entry`,
+`post_exec_guard_denies_executable_mapping_before_kernel_entry`,
+`post_exec_guard_accepts_initial_exec_exit_then_alternates_entry_exit`,
+`post_exec_guard_allows_exit_entry_to_terminate_without_exit_stop`,
+`post_exec_guard_rejects_signal_event_wrong_arch_and_wrong_op_stops`,
+`post_exec_guard_unverifiable_stop_returns_no_envelope`,
 `owner_admission_accepts_eight_and_ninth_fails_before_thread_or_fd`,
 `owner_permit_is_held_until_actual_thread_exit`,
 `owner_pidfd_and_nonpidfd_caps_never_accumulate_across_batches`,
@@ -1578,6 +1651,8 @@ Cross-cutting mandatory tests additionally include
 `pidfd_registration_failure_runs_no_child_work_and_reaps_or_retains`,
 `ascii_blank_is_exactly_empty_or_ht_lf_cr_space`,
 `vt_ff_nul_nbsp_are_nonblank_with_invalid_utf8_precedence`,
+`stable_key_and_tool_name_blank_predicate_is_exact`,
+`multiple_cleanup_failures_follow_normative_rank`,
 `serde_json_raw_value_feature_is_direct`,
 `raw_number_lexemes_1_1point0_1e0_are_distinct`, and
 `long_and_malformed_number_boundaries_are_typed`.
@@ -1667,6 +1742,8 @@ descriptor ledgers, bounded launch/environment/setup-secret counting before
 hashing/splitting/joining, allocation-free post-fork work, descriptor ownership,
 `fchdir` ordering and error staging, `FD_CLOEXEC` script rejection, ptrace-stop ordering,
 stopped-image identity/hash validation under kernel write denial,
+post-exec syscall-stop denial of process creation, image execution, and
+executable mappings,
 non-anchor-only signalling, anchor exit ordering, argument/environment pointers, NUL validation, error
 propagation, proof that authorization cannot fall back to a pathname, and proof
 that `ENOEXEC` never starts a shell. Because the repository
