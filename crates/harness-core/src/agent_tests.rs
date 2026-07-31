@@ -94,23 +94,39 @@ fn concurrent_similar_prompts_keep_explicit_layer_attribution() {
         long_static.to_prompt_string()
     );
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let spawn_request = |layers: AgentPromptLayers| {
         let barrier = std::sync::Arc::clone(&barrier);
         std::thread::spawn(move || {
-            barrier.wait();
+            let flattened = prompts::PromptParts {
+                static_instructions: layers.static_instructions.clone(),
+                context: layers.context.clone(),
+                dynamic_payload: layers.dynamic_payload.clone(),
+            }
+            .to_prompt_string();
             let request = AgentRequest::from_prompt_layers(layers, PathBuf::from("/tmp/project"));
             barrier.wait();
             let system_prompt = request
                 .claude_system_prompt()
                 .map(|prompt| prompt.into_owned());
             let main_prompt = request.claude_main_prompt().into_owned();
-            (request.prompt, system_prompt, main_prompt)
+            (flattened, request.prompt, system_prompt, main_prompt)
         })
     };
 
     let short_static_request = spawn_request(short_static);
     let long_static_request = spawn_request(long_static);
+    barrier.wait();
+
+    let flattened_prompt = "static\ncontext\ndynamic\n".to_string();
+    let flattened_request = AgentRequest {
+        prompt: flattened_prompt.clone(),
+        project_root: PathBuf::from("/tmp/project"),
+        ..AgentRequest::default()
+    };
+    assert_eq!(flattened_request.claude_system_prompt().as_deref(), None);
+    assert_eq!(flattened_request.claude_main_prompt(), flattened_prompt);
+
     let short_static_request = match short_static_request.join() {
         Ok(request) => request,
         Err(payload) => std::panic::resume_unwind(payload),
@@ -124,6 +140,7 @@ fn concurrent_similar_prompts_keep_explicit_layer_attribution() {
         short_static_request,
         (
             "static\ncontext\ndynamic\n".to_string(),
+            "static\ncontext\ndynamic\n".to_string(),
             Some("static\n".to_string()),
             "context\ndynamic\n".to_string(),
         )
@@ -131,6 +148,7 @@ fn concurrent_similar_prompts_keep_explicit_layer_attribution() {
     assert_eq!(
         long_static_request,
         (
+            "static\ncontext\ndynamic\n".to_string(),
             "static\ncontext\ndynamic\n".to_string(),
             Some("static\ncontext\n".to_string()),
             "dynamic\n".to_string(),
