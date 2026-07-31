@@ -199,6 +199,39 @@ facts in snapshots or through a CLI.
    spec. Absent is distinct from present empty. These fields enter the
    fingerprint payload; raw directories and parent PATH never do.
 
+   For a platform admitted by the static matrix, after isolation, sandbox, and
+   public output-limit validation and before any digest, PATH split, lexical
+   join, owner reservation, cwd open, helper, or child, v0.1 checks each launch
+   input through at most limit-plus-one exact OS units. The configured command,
+   configured working-directory spelling, exclusion-surviving sanitized child
+   `PATH` and policy-selected `CLAUDE_CONFIG_DIR`, and each present Windows
+   current-executable directory, system directory, Windows directory, and
+   parent `PATH` have the inclusive per-field limit 65,536. Unix units are
+   exact `OsStr` bytes; Windows units are original UTF-16 code units.
+   Observation environment entries and setup-secret names are each limited to
+   1,024, and every environment key or setup-secret name is limited to 1,024
+   exact OS units before canonicalization or value access. A derived lexical
+   candidate has the inclusive checked limit 196,610, exactly reachable as
+   65,536 cwd units + separator + 65,536 relative PATH-entry units + separator
+   + 65,536 command units. The closed limit reasons are `configured_command`,
+   `working_directory`, `windows_current_executable_directory`,
+   `windows_system_directory`, `windows_directory`, `windows_parent_path`,
+   `observation_environment_entries`, `environment_key`,
+   `setup_secret_names`, `setup_secret_name`, `child_path`,
+   `claude_config_directory`, and `derived_candidate`.
+   Limit-plus-one returns typed no-envelope `launch_input_limit_exceeded`
+   without a digest, split, join, owner, fd, observation, child, truncation, or
+   fallback. Exact precedence is isolation, sandbox, actual unsupported
+   platform, public output range, command/cwd/explicit search-base limits,
+   environment count/key limits, setup-secret count/name limits, key
+   shape/canonicalization/collision, setup-secret exclusion, selected
+   PATH/Claude value limits, empty/NUL/shape validation, whole-PATH splitting
+   and the 64-entry check, derived length, digest/join, then owner admission.
+   Cross-platform digest/model helpers enforce the same relevant limits before
+   hashing.
+   Over-limit rejection is a documented representability divergence from an
+   adapter launch, not evidence for another PATH candidate.
+
    Unix bare-name execution uses a frozen Harness search algorithm rather than
    delegating to `execvp`: candidates keep the exact basename and sanitized
    `PATH` order and at most 64 entries are observed. Missing, non-regular, or
@@ -303,7 +336,13 @@ facts in snapshots or through a CLI.
    environment and persisted fingerprint facts before policy matching,
    regardless of spelling. Sensitivity is not guessed from substrings such as
    `TOKEN` or `SECRET`; no setup-only or undeclared value can reach
-   `codex --version` or an equivalent child.
+   `codex --version` or an equivalent child. The producer counts and bounds
+   environment/setup names before canonicalization, but never reads, copies,
+   bounds, or hashes an undeclared or setup-secret-excluded value. Only
+   exclusion-surviving selected `PATH` and `CLAUDE_CONFIG_DIR` values receive
+   the 65,536-unit value check. An excluded over-limit Claude directory is
+   absent without a limit error; an excluded over-limit PATH becomes `Unset`,
+   and a later bare Unix lookup returns `path_unusable`.
 6. **B-006:** Executable identity comes from one opened regular-file handle,
    not separate path-based metadata and content reads. Size and SHA-256 cover
    the bytes read from that handle. Unix first rejects a path already known to
@@ -407,8 +446,12 @@ facts in snapshots or through a CLI.
    while observing byte `max_output_bytes + 1` triggers
    `output_limit_exceeded`.
 
-   On Unix, before cwd or executable observation, any supervision helper, or
-   any target child, v0.1
+   On Linux after isolation/sandbox and the static platform gate, before cwd
+   or executable observation, any supervision helper, or
+   any target child, v0.1 first atomically `try_acquire`s one of exactly eight
+   process-global owner permits. Capacity exhaustion is typed no-envelope
+   `containment_unavailable/owner_capacity_exhausted` before a thread, fd, cwd
+   open, helper, or child and never waits or falls back. An admitted request
    starts a fingerprint-specific runtime-independent cleanup owner and receives
    a readiness handshake under the separate fixed
    `RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE = 1_000 ms`, measured monotonically
@@ -423,7 +466,33 @@ facts in snapshots or through a CLI.
    (`owner_start_failed`, `owner_ready_timeout`, or
    `owner_stop_join_timeout`) without creating a child. Caller cancellation
    during reservation follows the same bounded stop/join path and emits no
-   envelope. After readiness and before the first cwd open, the producer starts
+   envelope. The permit moves to a created owner and is released only after its
+   thread actually exits and every helper/child obligation is reaped; API
+   return, cancellation, deadline expiry, cleanup-incomplete, or stop/join
+   timeout cannot release it early. A thread that never started returns the
+   caller-held permit. After descriptor isolation reports
+   `descriptors_ready`, each owner retains at most 67 Harness-owned pidfds
+   (anchor, root, one current helper, and one 64-member batch); a membership
+   helper may retain the 64 transferred member references, so one descriptor-
+   isolated fingerprint is bounded at 131 retained pidfd references after READY
+   and eight are bounded at 1,048 after READY. Each owner has an exact 32-slot
+   non-pidfd ledger covering control,
+   gate, descriptor-ready/status, protocol, anchor, cwd/executable,
+   stdin/stdout/stderr, pre-exec, observation, membership-transfer, and
+   relocation/rollback descriptors. Each role's child allowlist is at most 12
+   non-pidfd descriptors, giving post-READY retained ceilings of 44 per
+   fingerprint and 352 across eight. Pre-READY fork inheritance is bounded only
+   in time by the registration/cleanup deadline and exact positive-PID rollback;
+   none of the numeric retained-reference ceilings claims that transient
+   interval. A batch is disposed before another is accepted.
+   Capacity violation is typed no-envelope
+   `owner_resource_capacity_exceeded` with closed reason `pidfds` or
+   `non_pidfd_fds` and retains the permit with all existing obligations. Every
+   logical slot is reserved before fd creation, fork, `pidfd_open`, or
+   `SCM_RIGHTS`; logical exhaustion wins over an injected OS resource failure,
+   while a post-reservation `EMFILE` is the applicable child-registration
+   stage. After readiness and
+   before the first cwd open, the producer starts
    the fixed nonzero
    `RUNTIME_FINGERPRINT_PROBE_DEADLINE = 5_000 ms`. That one monotonic budget
    covers every observation subprocess, cwd and executable observation,
@@ -441,24 +510,54 @@ facts in snapshots or through a CLI.
    records `version_probe/timeout`. Cleanup receives its own separate
    five-second deadline.
 
-   Linux v0.1 requires `pidfd_open`, `pidfd_send_signal`, parent-child ptrace
-   with `PTRACE_O_TRACEEXEC`, `execveat(AT_EMPTY_PATH)`, and strong `/proc`
-   process/image identity enumeration before host filesystem observation;
+   Linux v0.1 requires descriptor-table isolation, `pidfd_open`,
+   `pidfd_send_signal`, parent-child ptrace with `PTRACE_O_TRACEEXEC`,
+   `execveat(AT_EMPTY_PATH)`, and strong `/proc` process/image identity
+   enumeration before host filesystem observation;
    other Unix platforms return that typed no-envelope error without opening the
    cwd or executable. The ready owner thread is the sole target/anchor fork,
    parent-side ptrace-control, wait/reap, and observation-helper-spawn owner;
    the target's audited pre-exec `PTRACE_TRACEME` call is the sole exception.
+   Before every capability/observation/membership helper, anchor, initial
+   target, or retry target fork, the owner reserves all logical slots, then
+   creates a close-on-exec start gate, descriptor-ready/status channel, and
+   role-specific fixed descriptor allowlist. Before gate wait, the child uses
+   only raw allocation-free syscalls to map stdio, close every non-allowlisted
+   inherited fd with segmented `close_range`, and emit one closed bootstrap
+   status: `descriptors_ready`, `descriptor_isolation_unavailable`, or
+   `descriptor_isolation_failed`. Until the parent receives READY, opens and
+   commits the pidfd/reap
+   obligation, and sends one-byte `GO`, the child cannot touch
+   cwd/filesystem/proc, join a group, ptrace, inspect, or exec. Registration
+   failure or cancellation closes the gate, and the exact still-unreaped
+   direct-child positive PID is used only for bounded rollback before reap; no
+   negative PGID or post-reap PID action is allowed. Completed rollback returns
+   typed no-envelope `child_registration_unavailable` with closed child role
+   and gate/fork/descriptor-isolation/pidfd-open/registry/gate-release stage;
+   incomplete rollback retains the exact
+   obligation and owner permit under
+   `child_registration_cleanup_incomplete` with closed gate-close/termination/
+   reap operation. For the initial capability child only, exact
+   `ENOSYS`/seccomp `EPERM` or `EACCES`/unsupported-flag `EINVAL` maps after reap
+   only to `containment_unavailable/descriptor_isolation_unavailable`; another
+   initial isolation error and every post-capability isolation failure map only
+   to `child_registration_unavailable/descriptor_isolation`. A concrete status
+   precedes deadline; no status before deadline uses the deadline error, and
+   cancellation emits no result while rollback continues. No lease or
+   descriptor is exposed.
    The owner creates and retains a dedicated process-group anchor, creates every
-   target, atomically records target pidfd/reap ownership, and establishes the
-   ptrace relationship before exposing a cancellable client lease. Target
+   target through this gate, records target pidfd/reap ownership, and
+   establishes the ptrace relationship before exposing a cancellable client
+   lease. Target
    children join that anchored
-   group before exec. The owner holds pidfds for the anchor, root, and every
-   discovered non-anchor member. Every `/proc` group enumeration and
+   group before exec. The owner holds pidfds for the anchor, root, current
+   helper, and only the current bounded non-anchor member batch. Every `/proc` group enumeration and
    revalidation runs in an owner-created, atomically pidfd-registered
    observation helper under the active or cleanup deadline; no such filesystem
    work runs on the owner or async runtime. Each bounded pass transfers at most
    64 exact revalidated non-anchor pidfds plus a `more` bit. The owner signals
-   the transferred batch and rescans `/proc` from the beginning until a full
+   and disposes the transferred batch before accepting another, then rescans
+   `/proc` from the beginning until a full
    pass reports only the anchor; it never uses a reusable PID cursor or drops
    members beyond a full batch. Continuous churn reaches the applicable
    deadline rather than claiming empty. Timeout or incomplete helper cleanup
@@ -645,9 +744,15 @@ facts in snapshots or through a CLI.
     `prefixItems`, `contentSchema`, and `unevaluatedItems` /
     `unevaluatedProperties` according to that dialect; `dependentRequired`
     property arrays are string sets, `prefixItems` remains an ordered schema
-    array, and `items` accepts only an object or boolean schema. In Draft-07,
-    `definitions`, legacy `dependencies`, array-form `items`, and its sibling
-    `additionalItems` receive their legacy schema or string-set semantics.
+    array, and `items` accepts only an object or boolean schema. In both
+    dialects, `not`, `if`, `then`, `else`, `contains`, `propertyNames`, and
+    `additionalProperties` are single object-or-boolean schema positions even
+    when a neighboring activating keyword is absent. Other value shapes fail
+    typed `malformed_single_schema_keyword` with a closed dialect/keyword
+    detail, and nested `$schema` at any of these positions is rejected. In
+    Draft-07, `definitions`, legacy `dependencies`, and array-form `items`
+    receive their legacy schema or string-set semantics; `additionalItems`
+    always remains a schema-valued keyword, even without array-form `items`.
     Under Draft-07 `contentSchema`, `dependentRequired`, `dependentSchemas`,
     `prefixItems`, and other later-draft keywords are extension instance data;
     under Draft 2020-12 `dependencies`, `definitions`, `additionalItems`, and
@@ -913,6 +1018,17 @@ terminal `exec_failed`.
       remain representable; Windows conformance compares the frozen resolver
       against the adapter's current `Command` behavior and fails on drift
       instead of adopting it.
+- [ ] Launch-input fixtures accept 65,536 and reject 65,537 exact OS units for
+      every closed value field before hashing/splitting/owner admission; accept
+      the reachable 196,610-unit Unix lexical candidate and reject 196,611
+      before joining. Environment keys/setup-secret names and their collection
+      counts accept 1,024 and reject 1,025 before canonicalization or value
+      access. They cover Unix non-UTF8 bytes, Windows surrogate-pair UTF-16
+      counting, one huge PATH entry, whole PATH, 64/65 entry precedence, and
+      every closed limit reason. Excluded over-limit PATH/Claude values and
+      undeclared over-limit values are never read, hashed, or reported as value
+      limits; selected counterparts fail closed. Limit failure produces no
+      digest, owner, fd, cwd observation, helper, child, truncation, or fallback.
 - [ ] Unix attempt fixtures round-trip every closed outcome, reject illegal
       source/outcome/failure/terminal combinations, preserve duplicate PATH
       entries and order, cover exactly 64 candidates and candidate 65, and
@@ -1026,6 +1142,28 @@ terminal `exec_failed`.
       the group is empty, and no released PGID is used. macOS, other Unix, and
       Windows prove typed no-envelope `containment_unavailable` is returned
       before cwd observation or child creation.
+- [ ] Owner-capacity fixtures retain exactly eight permanently stalled owners
+      and prove the ninth fails before thread/fd/cwd/child creation; API return,
+      cancellation, cleanup-incomplete, and stop/join timeout do not release a
+      permit, while actual owner exit does. Concurrent admission never exceeds
+      eight. Each owner stays within 67 pidfds and 32 other fds, each membership
+      helper stays within 64 pidfds, and after `DESCRIPTORS_READY` retained
+      transfer stays within 131 per fingerprint and 1,048 globally; the
+      pre-READY transient is asserted only to meet its deadline/rollback bound.
+      One 64-member batch is disposed
+      before another. Two-owner and eight-owner interleavings inspect
+      `/proc/<pid>/fd` at `DESCRIPTORS_READY` and find exactly the role allowlist;
+      foreign-fd markers prove a stalled helper retains no other owner's gate,
+      output, or control fd and cannot delay its EOF or bounded rollback.
+      Start-gate fault injection covers every observation stage, anchor, initial
+      target, and retry target: bootstrap unavailable, post-capability isolation
+      failure, missing READY until deadline, cancellation, and forced
+      `pidfd_open`/registry/gate-release failure. None runs a child marker or
+      filesystem/group/ptrace/exec work before `GO`; each then either
+      reaps the exact gated direct child or retains its closed cleanup obligation
+      and owner permit. Logical slot exhaustion plus injected `EMFILE` returns
+      resource capacity; reserved slots plus `EMFILE` return the exact
+      registration stage.
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
       sanitized bounded facts, and rejection of unknown values.
 - [ ] Version fixtures cover exact current Codex and Claude product lines,
@@ -1068,8 +1206,14 @@ terminal `exec_failed`.
       legacy keys remain extension data. In Draft-07, array `items`,
       `additionalItems`, `definitions`, and `dependencies` use legacy
       semantics while a `contentSchema` value with ordered arrays remains
-      instance data. Vendor arrays and nested arrays under `default`, `const`,
-      `examples`, and `example` remain digest-sensitive in both dialects.
+      instance data; `additionalItems` traverses schema context even without
+      tuple `items`. In both dialects every `not`, `if`, `then`, `else`,
+      `contains`, `propertyNames`, and `additionalProperties` object/boolean
+      child traverses schema context, rejects another value shape with its
+      closed keyword detail, rejects nested `$schema`, and canonicalizes nested
+      sets. The same key names under vendor extensions, `default`, `const`,
+      `examples`, and `example` remain ordered instance data and digest-
+      sensitive in both dialects.
 - [ ] Duplicate JSON keys and malformed raw schemas fail typed before digesting,
       and public API/call-site audit proves no generic serializable or
       `serde_json::Value` evidence constructor exists. The core manifest

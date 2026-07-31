@@ -367,6 +367,52 @@ but must not infer. It also carries the validated repository boundary set used
 only for B-007 target authorization; an absent or incomplete set can still
 produce identity evidence but can never authorize process creation.
 
+For a platform admitted by the static matrix, immediately after the isolation,
+sandbox, and public `max_output_bytes` gates, and before hashing, splitting,
+joining, owner admission, cwd observation, or child creation, the producer
+validates every launch string with bounded iteration through at most
+limit-plus-one OS units. `RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS = 65_536`
+is the inclusive limit for each configured command, configured working-
+directory spelling, sanitized child `PATH`, policy-selected
+`CLAUDE_CONFIG_DIR` after setup-secret exclusion, and each present Windows
+current-executable directory, system directory, Windows directory, and parent
+`PATH`. A Unix unit is one exact `OsStrExt::as_bytes()` byte; a Windows unit is
+one original `encode_wide()` UTF-16 code unit.
+`RUNTIME_FINGERPRINT_MAX_OBSERVATION_ENV_ENTRIES = 1_024`,
+`RUNTIME_FINGERPRINT_MAX_ENVIRONMENT_KEY_UNITS = 1_024`,
+`RUNTIME_FINGERPRINT_MAX_SETUP_SECRET_NAMES = 1_024`, and
+`RUNTIME_FINGERPRINT_MAX_SETUP_SECRET_NAME_UNITS = 1_024` bound the two
+producer-local name collections before canonicalization or value access.
+`RUNTIME_FINGERPRINT_MAX_DERIVED_CANDIDATE_UNITS = 196_610` is the inclusive
+checked limit before allocating any lexical candidate: the exact reachable
+maximum is 65,536 cwd units + one separator + 65,536 relative PATH-entry units
+plus one separator plus 65,536 command units.
+
+The closed `RuntimeLaunchInputLimitKind` values are `ConfiguredCommand`,
+`WorkingDirectory`, `WindowsCurrentExecutableDirectory`,
+`WindowsSystemDirectory`, `WindowsDirectory`, `WindowsParentPath`,
+`ObservationEnvironmentEntries`, `EnvironmentKey`, `SetupSecretNames`,
+`SetupSecretName`, `ChildPath`, `ClaudeConfigDirectory`, and
+`DerivedCandidate`. Exceeding one returns no-envelope
+`LaunchInputLimitExceeded { kind }` with no raw value, digest, owner, fd, cwd
+open, helper, exec, or PATH fallback.
+
+Validation precedence is exactly isolation, sandbox, the actual static
+unsupported-platform gate, public `max_output_bytes` range, configured command,
+working directory, and present explicit Windows search-base limits,
+observation-environment entry count then its key limits, setup-secret name
+count then its name limits, key shape/canonicalization/collision checks, setup-secret
+exclusion, selected `PATH` and `CLAUDE_CONFIG_DIR` value limits, empty/NUL and
+launch-context shape validation, whole-PATH split plus the 64-entry bound,
+checked derived-candidate length, hashing/joining, then owner-capacity
+admission. Within each collection its count precedes its per-name checks, and
+per-name checks use input order. Pure typed digest/model helpers apply every relevant limit before
+hashing even in cross-platform contract tests.
+Inputs are never truncated, normalized, or prefix-hashed. This bounded
+producer may therefore reject an over-limit launch the adapter could attempt;
+that is an explicit representability divergence, not another candidate
+selection.
+
 The payload records a closed `RuntimeCommandForm` with exactly `UnixBare`,
 `UnixAbsolute`, `UnixQualified`, `WindowsBare`, `WindowsAbsolute`, or
 `WindowsQualified`. The producer derives it from the original configured
@@ -485,7 +531,7 @@ On Unix:
   identity change stops without retry; exact `ENOENT`/`ENOTDIR` on either the
   first or second target exec is terminal
   `interpreter_authorization_unavailable`, while second `ETXTBSY`, `ENOEXEC`,
-  and every other retry/error are terminal `spawn_failed`;
+  and every remaining error are terminal `spawn_failed`;
 - absolute and qualified commands may use that one same-candidate `ETXTBSY`
   retry but never search or fallback to another path; and
 - the first successful exec becomes the selected executable.
@@ -754,20 +800,30 @@ No other ordinary key enters evidence or the version child. There is no public
 fallback, or caller-set exposure flag. The closed table is the only source of
 `unset`, `redacted`, and digest facts.
 
-Environment-key normalization occurs before duplicate, `PATH`, policy, and
-setup-secret checks. Unix retains exact case-sensitive UTF-8 names. Windows
-v0.1 accepts only ASCII names, canonicalizes them to uppercase for comparison,
-rejects canonical collisions such as `Path` plus `PATH`, and serializes the
-policy spelling from the table. A non-ASCII Windows name fails typed because
-the producer cannot reproduce the OS's Unicode case-insensitive comparison
-without an authorized platform primitive.
+The producer counts at most 1,025 observation-environment entries, then
+measures at most 1,025 exact OS units per environment key in input order. Only
+after that collection passes does it count at most 1,025 setup-secret names and
+measure their exact OS units in input order. Counting and measurement do not
+copy or canonicalize a name. Unix measures raw key bytes before UTF-8/name
+shape validation and retains exact case-sensitive UTF-8 names. Windows measures
+original UTF-16 units, then accepts only ASCII names, canonicalizes them to
+uppercase for comparison, rejects canonical collisions such as `Path` plus
+`PATH`, and serializes the policy spelling from the table. A non-ASCII Windows
+name fails typed because the producer cannot reproduce the OS's Unicode
+case-insensitive comparison without an authorized platform primitive.
 
 `codex.cloud.setup_secret_env` is a separate exclusion set, not a source of
 policy entries. Its names pass through the same platform canonicalizer, and
 matching keys are removed from evidence and child input before policy lookup.
 Thus setup-secret exclusion overrides even a listed policy key. PATH cannot be
-represented a second time as an ordinary entry. Raw values and undeclared keys
-never enter the envelope. These rules implement B-005 and B-010.
+represented a second time as an ordinary entry. The producer does not inspect,
+copy, bound, or hash the value of an undeclared or setup-secret-excluded key.
+Only an exclusion-surviving policy-selected `PATH` or `CLAUDE_CONFIG_DIR` value
+is read and checked against the 65,536-unit value limit. An excluded over-limit
+`CLAUDE_CONFIG_DIR` is absent without a limit error; an excluded over-limit
+`PATH` becomes `Unset`, so a bare Unix command later returns the existing
+`path_unusable` outcome. Raw values and undeclared keys never enter the
+envelope. These rules implement B-005 and B-010.
 
 ## Handle-Based Executable Observation and TOCTOU Policy
 
@@ -776,11 +832,75 @@ filesystem operation runs in a dedicated Linux observation subprocess. This
 includes cwd open/metadata, candidate `fstatat`/`openat`, final-target boundary
 classification, retained-handle read/hash, exec-stop re-hash/image
 classification, and both path/hash checkpoints. No such operation runs through `spawn_blocking`, a
-Tokio worker, or the owner thread. The ready owner is the sole helper spawner:
-inside one synchronous, non-cancellable critical section it creates the helper,
-opens its pidfd, records reap ownership, and only then exposes the client lease,
-response channel, or transferred descriptor. No await or fallible ownership
-handoff exists between creation and registration. The helper uses only preallocated
+Tokio worker, or the owner thread. The ready owner is the sole helper spawner.
+Before every fork it atomically reserves the complete logical registry,
+non-pidfd, future-pidfd, and maximum transfer-slot budget, then creates a
+private `pipe2(O_CLOEXEC)` start gate, descriptor-ready/status channel, and
+single protocol/control socket. Each role has a frozen descriptor allowlist.
+The common allowlist is gate-read, descriptor-ready/status, and the one
+protocol/control fd. An observation role adds only the stage-required retained
+cwd/target inputs; the anchor adds only anchor control; a target adds retained
+cwd, retained executable, pre-exec status, and explicitly mapped stdin,
+stdout, and stderr.
+
+Immediately after fork and before waiting on the gate, the child uses only raw
+async-signal-safe `dup2`/`dup3`, segmented `close_range`, `write`, `read`,
+`close`, and `_exit` syscalls. It establishes the frozen stdio/allowlist
+numbers, closes every inherited fd not in that role's allowlist, writes one
+closed bootstrap status, then waits for one-byte `GO`. The closed
+`RuntimeDescriptorBootstrapStatus` values are `DescriptorsReady`,
+`DescriptorIsolationUnavailable`, and `DescriptorIsolationFailed`. This path is
+allocation-free and non-panicking. Before `GO`, the child cannot access cwd or
+any filesystem/proc path, join a group, invoke ptrace, inspect a target, or
+exec. Inside one synchronous, non-cancellable parent critical section, the
+owner forks and waits for one closed bootstrap status. Only
+`DescriptorsReady` permits `pidfd_open`, registry commit of the pidfd plus
+direct-child reap obligation, and the later `GO`; no client lease, response
+channel, or transferred descriptor is exposed earlier. `close_range`
+descriptor isolation, or an exactly
+equivalent audited primitive, is part of the Linux capability contract; the
+initial capability child attempts that isolation before any other role work,
+and unavailability fails typed before cwd/filesystem observation, ptrace, or
+exec.
+
+This gate applies to every closed `RuntimeOwnedChildRole`:
+`Observation(RuntimeObservationStage)` (including capability, membership, and
+cleanup-membership helpers), `Anchor`, `InitialTarget`, and `RetryTarget`.
+The closed `RuntimeChildRegistrationStage` values are `GateCreate`, `Fork`,
+`DescriptorIsolation`, `PidfdOpen`, `RegistryCommit`, and `GateRelease`.
+Failure or cancellation before registry commit closes the
+parent gate, so the still-gated direct child exits without workload. Until that
+child is reaped, its exact positive PID cannot be reused; the owner may use only
+that positive direct-child PID for bounded rollback termination/wait and never
+after reap or through a negative PGID. Failure after commit uses the registered
+pidfd. A completed rollback returns no-envelope
+`ChildRegistrationUnavailable { role, stage }`; a rollback that misses the
+applicable cleanup deadline returns
+`ChildRegistrationCleanupIncomplete { role, operation }`, retains the direct-
+child or pidfd reap obligation and global owner permit, and exposes no lease or
+descriptor. Its closed cleanup operations are `GateClose`, `Termination`, and
+`Reap`. Logical slot exhaustion is instead
+`OwnerResourceCapacityExceeded`; after slots are reserved, `pipe2`/`socketpair`
+or `pidfd_open` resource failure is the concrete child-registration stage.
+`SCM_RIGHTS` descriptor counts cannot exceed reserved transfer slots, and a
+surplus is protocol-invalid descriptor mismatch. A concrete registration
+failure observed before deadline has precedence over a later deadline; a
+deadline error is used only when no concrete syscall failure was observed.
+Cancellation returns no visible result and drives the same owner rollback. The
+capability probe cannot waive this per-child ordering. For the initial
+capability role only, `ENOSYS`, seccomp `EPERM`/`EACCES`, or unsupported-flag
+`EINVAL` from the validated descriptor-isolation syscall emits
+`DescriptorIsolationUnavailable`; after the child is reaped, that status maps
+only to `ContainmentUnavailable(DescriptorIsolationUnavailable)`. Any other
+initial isolation error emits `DescriptorIsolationFailed` and maps to
+`ChildRegistrationUnavailable { role, DescriptorIsolation }`. After capability
+success, every non-ready isolation status for every role maps only to that
+child-registration variant. A concrete status observed before deadline wins;
+deadline is used only before any status, and cancellation emits no visible
+result while the owner performs the same rollback. Descriptor-isolation and
+`pidfd_open` failure are tested at every role.
+
+After `GO`, the helper uses only preallocated
 fixed-size frames, bounded buffers, raw syscalls, and an allocation-free,
 non-panicking SHA-256 state; retained descriptors cross the private Unix socket
 with `SCM_RIGHTS`. Protocol truncation, surplus fields, descriptor-count
@@ -924,9 +1044,54 @@ instead of treating the existing `ManagedChild` drop path as completion
 evidence. A static platform matrix is checked after isolation/sandbox
 validation but before owner reservation: Windows, macOS, and other Unix return
 no-envelope producer error `ContainmentUnavailable(UnsupportedPlatform)`.
-Linux with the required syscall surface reserves
-`RuntimeFingerprintProbeSupervisor::reserve`
-creates a runtime-independent owner thread and waits for its readiness
+Linux with the required syscall surface, including descriptor isolation, first
+performs fail-fast process-global
+admission. `RUNTIME_FINGERPRINT_MAX_ACTIVE_OWNERS = 8` is fixed and not caller
+adjustable. `RuntimeFingerprintProbeSupervisor::reserve` atomically
+`try_acquire`s one permit before creating an owner thread, start-gate fd, cwd
+observer, helper, anchor, or target. Capacity exhaustion returns no-envelope
+`ContainmentUnavailable(OwnerCapacityExhausted)` before host filesystem
+observation and does not wait or fall back. The permit is transferred to the
+fingerprint-specific owner and is released only after that thread has actually
+exited and every helper/child obligation is reaped. API return, cancellation,
+active/cleanup deadline expiry, cleanup-incomplete, or owner stop/join timeout
+cannot release it early; only a true pre-thread spawn failure leaves release to
+the caller.
+
+Each admitted owner has fixed descriptor-isolated retained ceilings.
+After descriptor isolation reports `DescriptorsReady`,
+`RUNTIME_FINGERPRINT_MAX_OWNER_PIDFDS = 67` counts Harness-owned retained
+anchor, root, one current helper, and at most 64 deduplicated non-anchor member
+pidfds in the owner.
+`RUNTIME_FINGERPRINT_MAX_MEMBERSHIP_HELPER_PIDFDS = 64` separately counts the
+helper-local references before one membership transfer completes. Therefore
+one descriptor-isolated fingerprint has at most 131 Harness-owned retained
+pidfd references after READY and eight admitted fingerprints have at most
+1,048 after READY. A membership batch must be
+signalled/reaped or closed before the next batch is accepted; rescans never
+accumulate pidfds across passes.
+
+`RUNTIME_FINGERPRINT_MAX_OWNER_NON_PIDFD_FDS = 32` is enforced by a per-stage
+ledger: owner control/readiness (2), gate pair (2), descriptor-ready/status
+pair (2), protocol socket pair (2), anchor control pair (2), retained cwd and
+executable (2), target stdin/stdout/stderr parent and child ends (6), pre-exec
+status pair (2), one observation input pair (2), one observation reply pair
+(2), membership-transfer socket pair (2), and six explicitly reserved
+transient relocation/rollback slots. Mutually exclusive roles reuse these
+slots; the ledger reserves each required slot before `pipe2`, `socketpair`,
+fork, `pidfd_open`, or `SCM_RIGHTS`. Each child role's frozen allowlist contains
+at most 12 non-pidfd descriptors, so after `DESCRIPTORS_READY` one fingerprint
+has at most 44 Harness-owned non-pidfd references and eight have at most 352.
+Descriptor isolation closes every foreign owner or Harness fd before READY.
+Pre-READY inherited references have only the registration/cleanup deadline and
+exact direct-child positive-PID rollback time bound; the 131/1,048 and 44/352
+numeric retained-reference ceilings do not claim to cover that transient
+interval. Reaching a logical ceiling fails closed under the existing owner and
+cleanup deadlines, retains the global
+permit until actual owner exit, and never uses a negative PGID.
+
+After admission, `RuntimeFingerprintProbeSupervisor::reserve` creates a
+runtime-independent owner thread and waits for its readiness
 handshake under
 `RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE = Duration::from_millis(1_000)`,
 measured monotonically from immediately before thread creation. Bootstrap does
@@ -938,7 +1103,9 @@ Duration::from_millis(1_000)` from the stop request. The owner must join within
 that second bound. Start failure, readiness timeout, and stop/join timeout use
 the closed producer-error reasons `OwnerStartFailed`, `OwnerReadyTimeout`, and
 `OwnerStopJoinTimeout`; failure returns no envelope, no helper or child exists,
-and there is no synchronous fallback.
+and there is no synchronous fallback. A created owner that misses stop/join
+continues to hold its admission permit; a thread that never started releases
+the caller-held permit.
 The owner is the lifecycle owner from the outset, not a thread constructed
 during cancellation.
 
@@ -946,7 +1113,8 @@ Immediately after owner readiness and before the observation subprocess that
 opens the cwd, one private monotonic
 `RUNTIME_FINGERPRINT_PROBE_DEADLINE = Duration::from_millis(5_000)` starts.
 Under that deadline, the owner runs one bounded system-only capability helper:
-`pidfd_open` plus signal zero, `PTRACE_TRACEME` plus parent
+successful `DescriptorsReady` isolation plus `pidfd_open` and signal zero,
+`PTRACE_TRACEME` plus parent
 `PTRACE_O_TRACEEXEC` installation, an invalid-fd `execveat` probe that
 distinguishes `EBADF` from `ENOSYS`, and strong `/proc` process/group/image
 enumeration. The helper is atomically pidfd-owned like every observation helper
@@ -967,8 +1135,8 @@ verified resume records `version_probe/timeout`.
 The ready owner creates a minimal process-group anchor that becomes and remains
 the group leader. Target helpers join the anchor's group before target handle
 exec; null stdin and piped stdout/stderr are unchanged. The owner retains the
-anchor control/reap handle and exact pidfds for the anchor, root, every
-observation helper, and every discovered non-anchor member. Every `/proc`
+anchor control/reap handle and exact pidfds for the anchor, root, the current
+observation helper, and only the current bounded non-anchor member batch. Every `/proc`
 membership enumeration and revalidation runs in an owner-created,
 atomically pidfd-registered observation helper, never on the owner or async
 runtime. `RUNTIME_FINGERPRINT_MEMBERSHIP_BATCH = 64` is fixed. Starting from
@@ -1099,7 +1267,13 @@ validate legal phase/kind/detail combinations. Producers sort by phase rank and
 kind rank and reject duplicates; parsers reject unknown or noncanonical input.
 
 The closed `RuntimeFingerprintProduceError` additionally contains
-`ContainmentUnavailable` with closed platform/owner/capability reasons,
+`ContainmentUnavailable` with closed platform/owner/capability reasons
+(including `OwnerCapacityExhausted`),
+`LaunchInputLimitExceeded { kind }`,
+`OwnerResourceCapacityExceeded { kind }` with closed kind `Pidfds` or
+`NonPidfdFds`,
+`ChildRegistrationUnavailable { role, stage }`,
+`ChildRegistrationCleanupIncomplete { role, operation }`,
 `ObservationDeadlineExceeded { stage }`,
 `ObservationCleanupIncomplete { stage, operation }`,
 `ObservationProtocolInvalid { stage, reason }`, and
@@ -1114,6 +1288,10 @@ The result-state matrix is fail closed:
 
 | Earliest outcome | Allowed later facts |
 | --- | --- |
+| launch input limit exceeded | typed no-envelope error before digest, split, join, owner admission, cwd observation, helper, or child |
+| global owner capacity exhausted | typed no-envelope containment error before owner thread, fd, cwd observation, helper, or child |
+| owner descriptor capacity exceeded | typed no-envelope error; the admitted fingerprint-specific owner retains its permit and every existing obligation until actual exit |
+| child registration unavailable | typed no-envelope error; no child workload ran, rollback either reaped the still-gated direct child or retained its exact obligation plus the owner permit |
 | path resolution failure | no resolved identity, executable digest, or version |
 | absolute/qualified non-regular or non-executable | matching identity failure and bounded inspected-handle facts only; no child, fallback, selected identity, or version |
 | open failure | configured-command and resolution-attempt digests only; no handle, executable digest, child, or version |
@@ -1302,6 +1480,16 @@ In both dialects, `required`, `type`, and `enum` arrays are canonical sets;
 `allOf`, `anyOf`, and `oneOf` enter `SchemaArraySet`. `enum` elements,
 `default`, `const`, `examples`, and `example` enter `InstanceData`.
 `properties` and `patternProperties` are schema maps in both dialects.
+The shared single-schema keywords `not`, `if`, `then`, `else`, `contains`,
+`propertyNames`, and `additionalProperties` always enter `Schema(dialect)` in
+both dialects, even when an adjacent activating keyword is absent. Each accepts
+only an object or boolean schema; array, string, number, and null return
+`MalformedSingleSchemaKeyword { dialect, keyword }`. The closed keyword enum
+contains exactly `Not`, `If`, `Then`, `Else`, `Contains`, `PropertyNames`,
+`AdditionalProperties`, `Items`, `AdditionalItems`, `ContentSchema`,
+`UnevaluatedItems`, and `UnevaluatedProperties`. Consequently a nested
+`$schema` inside any recognized single-schema position is rejected by the
+existing nested-dialect rule rather than hidden as instance data.
 
 For `Draft202012`, `$defs` and `dependentSchemas` are schema maps;
 `dependentRequired` enters `StringSetMap`; `prefixItems` enters
@@ -1313,8 +1501,10 @@ malformed standard keyword rather than legacy tuple syntax.
 
 For `Draft07`, `definitions` is a schema map, `dependencies` enters
 `LegacyDependenciesMap`, array-form `items` enters `SchemaArrayOrdered`, and
-`additionalItems` enters `Schema` only beside array-form `items`; otherwise it
-is instance data. `$defs`, `dependentSchemas`, `dependentRequired`,
+object/boolean `items` enters `Schema(Draft07)`. `additionalItems` always enters
+`Schema(Draft07)` whether or not array-form `items` is present; its validation
+effect is separate from its standard schema-valued grammar. `$defs`,
+`dependentSchemas`, `dependentRequired`,
 `prefixItems`, `contentSchema`, `unevaluatedItems`, and
 `unevaluatedProperties` are extension instance data. Unknown/vendor-extension
 values are `InstanceData` in either dialect. Object members sort in all
@@ -1346,13 +1536,13 @@ owns user-facing collection commands. This is B-016.
 | B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; `sandbox_passthrough_state_is_only_supported_policy`; `restricted_sandbox_fails_before_host_observation`; `narrowed_allowed_write_paths_fail_before_host_observation`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
 | B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `configured_mcp_server_key_accepts_1024_and_rejects_1025_before_expansion`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
 | B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; `runtime_command_form_round_trips_and_rejects_cross_form_outcomes`; `working_directory_spelling_and_unix_identity_digests_have_fixed_vectors`; `working_directory_open_failure_precedes_resolution`; `cwd_path_replacement_keeps_relative_resolution_checkpoints_and_fchdir_on_one_handle`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; `unix_retained_handle_exec_preserves_configured_argv0`; `unix_bare_path_unset_is_path_unusable_without_default_search`; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `etxtbsy_retries_same_candidate_once_after_150_ms`; `etxtbsy_checkpoint_rechecks_authorization_hash_and_path_identity`; `etxtbsy_checkpoint_authorization_change_prevents_second_exec`; `etxtbsy_checkpoint_rejects_configuration_source_reason`; `etxtbsy_checkpoint_unavailable_authorization_prevents_second_exec`; `etxtbsy_retry_group_join_failure_is_reaped_without_exec_or_fallback`; `second_etxtbsy_is_terminal`; `etxtbsy_sequence_rejects_wrong_errno_delay_count_and_outcome`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_search_fallback`; `open_enoent_and_enotdir_are_absent_with_command_form_semantics`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `absolute_and_qualified_nonregular_and_nonexecutable_require_identity_failure`; `runtime_resolution_attempts_round_trip_all_outcomes_and_exec_sequences`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `handle_execution_unavailable_requires_none_and_no_child`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `frozen_windows_search_order_is_compiler_independent`; `current_command_differential_fails_on_frozen_resolver_drift`; `windows_resolution_context_digest_domains_and_vectors_are_fixed`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
-| B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; `direct_and_env_shebangs_fail_before_interpreter_or_anchor`; `interpreter_authorization_unavailable_requires_none_and_no_child`; independent fixed vectors freeze PATH and `CLAUDE_CONFIG_DIR` domains, platform tags, big-endian counts, Unix raw bytes, Windows UTF-16LE, absent/empty distinction, and non-UTF-8 Unix values; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
+| B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; `direct_and_env_shebangs_fail_before_interpreter_or_anchor`; `interpreter_authorization_unavailable_requires_none_and_no_child`; independent fixed vectors freeze PATH and `CLAUDE_CONFIG_DIR` domains, platform tags, big-endian counts, Unix raw bytes, Windows UTF-16LE, absent/empty distinction, and non-UTF-8 Unix values; `environment_entry_count_accepts_1024_and_rejects_1025_before_value_access`; `environment_key_units_accept_1024_and_reject_1025_before_canonicalization`; `setup_secret_count_accepts_1024_and_rejects_1025_before_value_access`; `setup_secret_name_units_accept_1024_and_reject_1025_before_canonicalization`; `excluded_overlimit_path_and_claude_values_are_not_read_or_hashed`; `selected_overlimit_path_and_claude_values_fail_closed`; `undeclared_overlimit_value_is_not_read`; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
 | B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `fifo_swap_at_each_checkpoint_is_nonblocking_identity_changed`; `opened_handle_drives_metadata_and_incremental_hash`; `retained_working_directory_handle_survives_path_replacement`; `executable_size_accepts_67108864_and_rejects_67108865`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `all_blocking_observation_uses_kill_isolated_processes`; `owner_is_sole_target_anchor_fork_parent_ptrace_wait_reap_and_helper_spawner_except_target_traceme`; `owner_spawns_and_registers_pidfd_before_exposing_lease`; cancellation injection at every create/register boundary; `observation_protocol_rejects_bad_frames_descriptor_counts_and_helper_exit`; `every_observation_timeout_returns_typed_error_without_envelope`; `active_and_cleanup_membership_stalls_return_no_envelope`; `membership_batch_accepts_64_and_rescans_65_and_larger`; `membership_continuous_churn_expires_without_false_empty`; `candidate_open_boundary_hash_exec_stop_checkpoint_and_membership_timeouts_transfer_exact_pidfd_ownership`; `uninterruptible_helper_never_fabricates_termination`; `native_static_et_exec_and_static_pie_are_accepted`; `pt_interp_wrong_machine_bad_versions_sizes_extended_counts_bounds_and_non_elf_are_rejected_before_anchor`; `fd_cloexec_script_fails_before_interpreter_execution`; `ptrace_exec_stop_precedes_first_instruction`; `exec_stop_identity_and_hash_run_under_kernel_write_denial`; `changed_native_image_is_killed_before_first_instruction`; `missing_surplus_abnormal_and_pre_resume_timeout_never_resume_and_return_no_envelope`; `path_replacement_after_authorization_executes_verified_retained_handle_not_replacement`; Linux `missing_execveat_fails_without_path_fallback`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistent_path_does_not_attest_path_history`; `exec_stop_consistent_handle_attests_executed_digest` |
-| B-007 | Linux `owner_ready_deadline_bounds_success_delay_and_cancellation`; `owner_stop_join_deadline_is_separate_and_typed`; `owner_stop_join_timeout_is_childless_containment_unavailable`; `active_deadline_starts_before_cwd_observation_and_includes_post_reap_checkpoint`; `ordinary_timeout_reaps_root_and_verifies_only_anchor_remains`; `active_and_cleanup_deadlines_are_distinct_and_fixed`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_reaps_root_then_anchor_without_released_pgid_use`; `pidfd_revalidation_precedes_every_non_anchor_signal`; `negative_pgid_signal_is_absent`; `anchor_is_not_signalled_until_group_is_empty`; `initial_group_setup_failure_is_reaped_without_exec`; `initial_and_retry_fchdir_failure_are_stage_tagged_reaped_without_exec_or_fallback`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `output_cap_rejects_0_and_65537_before_allocation_or_helper`; `output_cap_accepts_1_and_65536`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; macOS/other-Unix/Windows `containment_unavailable_prevents_cwd_observation_and_spawn` |
+| B-007 | Linux `owner_ready_deadline_bounds_success_delay_and_cancellation`; `owner_stop_join_deadline_is_separate_and_typed`; `owner_stop_join_timeout_is_childless_containment_unavailable`; `active_deadline_starts_before_cwd_observation_and_includes_post_reap_checkpoint`; `ordinary_timeout_reaps_root_and_verifies_only_anchor_remains`; `active_and_cleanup_deadlines_are_distinct_and_fixed`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_reaps_root_then_anchor_without_released_pgid_use`; `pidfd_revalidation_precedes_every_non_anchor_signal`; `negative_pgid_signal_is_absent`; `anchor_is_not_signalled_until_group_is_empty`; `initial_group_setup_failure_is_reaped_without_exec`; `initial_and_retry_fchdir_failure_are_stage_tagged_reaped_without_exec_or_fallback`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `output_cap_rejects_0_and_65537_before_allocation_or_helper`; `output_cap_accepts_1_and_65536`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; `descriptor_ready_fd_table_matches_role_allowlist_for_two_and_eight_owners`; `stalled_helper_holds_no_foreign_gate_output_or_control_fd`; `foreign_helper_cannot_delay_eof_or_registration_rollback`; `post_ready_membership_transfer_caps_owner_67_helper_64_fingerprint_131_and_global_1048`; `bootstrap_isolation_unavailable_maps_only_to_containment`; `post_capability_isolation_failure_maps_only_to_child_registration`; `bootstrap_status_deadline_and_cancellation_precedence_is_closed`; macOS/other-Unix/Windows `containment_unavailable_prevents_cwd_observation_and_spawn` |
 | B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `observation_deadline_cleanup_and_protocol_errors_are_closed_redacted_distinct_and_have_no_envelope`; `probe_deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `anchor_termination_and_reap_failures_are_typed`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
 | B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `both_streams_are_parsed_before_selection`; `same_version_on_both_streams_is_ambiguous`; `valid_version_with_nonblank_other_stream_is_unparseable`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; `mcp_output_schema_absence_and_presence_are_distinct`; `mcp_annotations_preserve_absent_empty_hints_title_vendor_values_and_ordered_arrays`; `mcp_annotation_hints_do_not_infer_capabilities`; exact-limit and limit-plus-one tool-name/description/annotations fixtures |
-| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `absent_schema_dialect_defaults_to_draft_2020_12`; `exact_supported_schema_dialects_round_trip`; `unknown_nonstring_and_nested_schema_dialects_fail_typed`; `schema_set_locations_reorder_canonically`; Draft 2020-12 `content_schema_traverses_nested_required_and_one_of_as_schema`; Draft-07 `content_schema_remains_ordered_instance_data`; `draft_07_dependencies_schema_and_string_set_forms_are_context_aware`; `draft_07_dependencies_reject_invalid_shapes`; `draft_2020_12_legacy_keywords_remain_instance_data`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `draft_2020_12_object_items_traverses_nested_schema`; `draft_2020_12_array_items_is_malformed`; `draft_07_array_items_preserves_tuple_order`; `draft_07_additional_items_traverses_schema_context`; `additional_items_without_draft_07_array_items_remains_instance_data`; `draft_2020_12_dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; independent exact counting vectors pin root depth, value nodes, decoded key/value strings, direct entries, raw bytes, and canonical bytes; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
+| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `absent_schema_dialect_defaults_to_draft_2020_12`; `exact_supported_schema_dialects_round_trip`; `unknown_nonstring_and_nested_schema_dialects_fail_typed`; `schema_set_locations_reorder_canonically`; Draft 2020-12 `content_schema_traverses_nested_required_and_one_of_as_schema`; Draft-07 `content_schema_remains_ordered_instance_data`; `draft_07_dependencies_schema_and_string_set_forms_are_context_aware`; `draft_07_dependencies_reject_invalid_shapes`; `draft_2020_12_legacy_keywords_remain_instance_data`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `draft_2020_12_object_items_traverses_nested_schema`; `draft_2020_12_array_items_is_malformed`; `draft_07_array_items_preserves_tuple_order`; `draft_07_additional_items_traverses_schema_context`; `draft_07_additional_items_without_tuple_items_traverses_schema_context`; `shared_single_schema_keywords_traverse_closed_dialect_context`; `shared_single_schema_keywords_reject_non_schema_shapes_with_closed_detail`; `nested_schema_dialect_is_rejected_in_every_shared_single_schema_keyword`; `draft_2020_12_dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; independent exact counting vectors pin root depth, value nodes, decoded key/value strings, direct entries, raw bytes, and canonical bytes; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
 
 Cross-cutting mandatory tests additionally include
@@ -1369,6 +1559,23 @@ Cross-cutting mandatory tests additionally include
 `link_count_change_after_resume_discards_version`,
 `unavailable_exec_stop_link_count_returns_no_envelope`,
 `unavailable_post_reap_link_count_is_metadata_unavailable`,
+`every_launch_input_accepts_65536_and_rejects_65537_before_work`,
+`derived_candidate_accepts_196610_and_rejects_196611_before_join`,
+`launch_limit_precedence_is_closed_and_nonallocating`,
+`unsupported_platform_precedes_overlimit_launch`,
+`invalid_output_cap_precedes_overlimit_path`,
+`environment_key_limit_precedes_setup_secret_count_limit`,
+`excluded_overlimit_value_precedes_owner_capacity_without_value_access`,
+`launch_limit_precedes_ninth_owner_capacity`,
+`logical_fd_exhaustion_precedes_injected_emfile`,
+`reserved_fd_slot_emfile_is_child_registration_stage`,
+`owner_admission_accepts_eight_and_ninth_fails_before_thread_or_fd`,
+`owner_permit_is_held_until_actual_thread_exit`,
+`owner_pidfd_and_nonpidfd_caps_never_accumulate_across_batches`,
+`descriptor_ready_child_has_exact_role_allowlist`,
+`stalled_child_retains_no_foreign_owner_fd`,
+`every_owned_child_role_waits_for_registry_commit_before_go`,
+`pidfd_registration_failure_runs_no_child_work_and_reaps_or_retains`,
 `ascii_blank_is_exactly_empty_or_ht_lf_cr_space`,
 `vt_ff_nul_nbsp_are_nonblank_with_invalid_utf8_precedence`,
 `serde_json_raw_value_feature_is_direct`,
@@ -1454,8 +1661,11 @@ show every Rust file below 800 lines. The sandbox parity gate and Linux
 retained-directory/retained-executable path require mandatory human security
 review for exact `SandboxSpec` passthrough equivalence, observation-process
 fixed-frame/`SCM_RIGHTS` protocol, pidfd ownership and revalidation,
-allocation-free post-fork work, descriptor ownership, `fchdir` ordering and
-error staging, `FD_CLOEXEC` script rejection, ptrace-stop ordering,
+pre-fork descriptor allowlists/foreign-fd isolation/start-gate ordering and
+direct-child rollback, global owner-permit lifetime, owner/helper/child
+descriptor ledgers, bounded launch/environment/setup-secret counting before
+hashing/splitting/joining, allocation-free post-fork work, descriptor ownership,
+`fchdir` ordering and error staging, `FD_CLOEXEC` script rejection, ptrace-stop ordering,
 stopped-image identity/hash validation under kernel write denial,
 non-anchor-only signalling, anchor exit ordering, argument/environment pointers, NUL validation, error
 propagation, proof that authorization cannot fall back to a pathname, and proof
