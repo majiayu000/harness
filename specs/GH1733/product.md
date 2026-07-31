@@ -114,23 +114,24 @@ facts in snapshots or through a CLI.
    Resolution checks only the configured basename, never executes `which`,
    never runs candidates while searching, and never falls through after
    selecting the candidate that normal launch semantics would select.
-5. **B-005:** The version child receives a minimal declared environment. It
-   receives the same sanitized `PATH` value included in the B-004 launch
-   context so `#!/usr/bin/env` launchers can find their interpreter, and
-   receives only other keys whose typed declaration explicitly permits probe
-   exposure. Platform search inputs that exist outside child `PATH` remain
-   explicit resolution context and are never misrepresented as child
-   environment. Every name in
-   `codex.cloud.setup_secret_env` is excluded from both the child environment
-   and persisted fingerprint facts regardless of spelling; sensitivity is not
-   guessed from substrings such as `TOKEN` or `SECRET`. No setup-only value can
-   reach `codex --version` or an equivalent child.
+5. **B-005:** The version child receives only the sanitized `PATH` value
+   included in the B-004 launch context so `#!/usr/bin/env` launchers can find
+   their interpreter. No caller can declare or expose another key. Evidence
+   classification comes from the closed B-010 policy, never from a caller
+   string, and every non-`PATH` v0.1 policy key is excluded from the version
+   child. Platform search inputs outside child `PATH` remain explicit
+   resolution context and are never misrepresented as child environment.
+   Every name in `codex.cloud.setup_secret_env` is excluded from both the child
+   environment and persisted fingerprint facts before policy matching,
+   regardless of spelling. Sensitivity is not guessed from substrings such as
+   `TOKEN` or `SECRET`; no setup-only or undeclared value can reach
+   `codex --version` or an equivalent child.
 6. **B-006:** Executable identity comes from one opened regular-file handle,
    not separate path-based metadata and content reads. Size and SHA-256 cover
    the bytes read from that handle. Unix executable permission is derived from
    handle metadata; Windows candidate eligibility comes from the B-004
    filename/search contract, while actual loadability can be proven only by a
-   successful contained spawn. On a platform where contained spawn is
+   successful supervised spawn. On a platform where process supervision is
    available, a bad image or access error is `spawn_failed`, not a fabricated
    `not_executable`; Windows v0.1 reaches `containment_unavailable` before that
    attempt. The producer enforces the configured byte ceiling before and during
@@ -147,27 +148,39 @@ facts in snapshots or through a CLI.
    evidence. The correlation is named `checkpoint_consistent_path`: mutation
    and restoration entirely between checkpoints remains a residual TOCTOU gap,
    so it is not proof that the executed bytes equal the digest.
-7. **B-007:** A version probe has one lifecycle covering spawn, concurrent
-   stdout/stderr reads, exit, timeout, and reap. Stdout and stderr are drained
-   incrementally under one inclusive hard combined byte limit: exactly
-   `max_output_bytes` is allowed, while observing byte `max_output_bytes + 1`
-   terminates the probe with `output_limit_exceeded`. The producer spawns only
-   after descendant containment is established: a dedicated process group on
-   Unix, or an equivalent pre-spawn containment primitive on another platform.
-   Explicit timeout, overflow, or read-failure returns await containment
-   termination, root reap, and empty-unit verification. Caller cancellation
-   synchronously signals the containment unit and transfers child ownership to
-   a fingerprint-specific cleanup owner that does not depend on the cancelled
-   future or Tokio runtime. The owner uses a fixed five-second cleanup
-   verification deadline. Root reap plus empty containment within that deadline
-   is normal completion; crossing it emits an `error`, retains ownership, and
-   continues kill/reap/empty-unit verification rather than silently abandoning
-   the child. Cancellation emits no fingerprint. `kill_on_drop` of only the
-   root and the existing detached `ManagedChild` reaper are not completion
-   evidence. On Windows v0.1, where the existing launcher cannot atomically
-   assign a Job Object before execution, the producer records
-   `containment_unavailable` without spawning. Output is never fully buffered
-   and then truncated.
+7. **B-007:** A version probe has one lifecycle covering authorization, spawn,
+   concurrent stdout/stderr reads, exit, timeout, cleanup, and root reap.
+   Repository-owned executables are identity-only evidence:
+   `probe_not_authorized` is recorded after inspection and no child is spawned.
+   User-global, admin, system, runtime, and genuine runner sources are eligible
+   under this closed source-scope policy; callers cannot override it with a
+   boolean or trust string. Stdout and stderr are read incrementally under one
+   inclusive hard combined byte limit: exactly `max_output_bytes` is allowed,
+   while observing byte `max_output_bytes + 1` triggers
+   `output_limit_exceeded`.
+
+   On Unix, v0.1 establishes a dedicated process group before exec and claims
+   only `process_group_supervision`: root reap and visibility of members that
+   remain in the original group. A child can call `setsid` or change groups, so
+   v0.1 does not claim non-escapable descendant containment or whole-process-
+   tree emptiness. On Windows, where the existing launcher cannot atomically
+   assign a Job Object before execution, `containment_unavailable` is recorded
+   without spawning.
+
+   Explicit timeout, overflow, or read failure starts group termination,
+   bounded pipe drain, root reap, and original-group verification under a fixed
+   five-second monotonic cleanup deadline. If all complete, only the triggering
+   probe failure is recorded. If signalling, drain, reap, or verification
+   fails or the deadline expires, the applicable closed `lifecycle_cleanup`
+   failure is also recorded, read handles are closed, and ownership transfers
+   to a fingerprint-specific runtime-independent cleanup owner before the API
+   returns. That owner emits an `error`, retains ownership, and continues
+   signalling, reaping, and original-group verification; it never silently
+   abandons the child. Caller cancellation follows the same transfer but emits
+   no fingerprint. Root-only `kill_on_drop` and the existing detached
+   `ManagedChild` reaper are not completion evidence. Output is never fully
+   buffered and then truncated, and no lifecycle or cleanup failure contains a
+   version fact.
 8. **B-008:** Probe incompleteness is represented by closed typed phase and
    kind values, not caller-defined strings. The v0.1 vocabulary is the table
    below. A failure record contains bounded, redacted structured facts only,
@@ -188,17 +201,26 @@ facts in snapshots or through a CLI.
    blank streams are `empty_output`. The exact bounded stdout and stderr byte
    digests and selected stream are retained only on success. No failure may
    yield `failures = []` or fabricate a normalized value.
-10. **B-010:** Runtime environment evidence uses an explicit typed allowlist of
-    behavior-affecting keys for each supported runtime. Keys are unique and
-    sorted; missing values are `unset`; allowed non-secret values are represented
-    only by SHA-256; explicitly sensitive runtime values are `redacted` without
-    a value digest. Probe exposure is a separate typed decision from evidence
-    inclusion. Blank, NUL-containing, duplicate, undeclared, full-environment,
-    and setup-secret entries are rejected or excluded according to B-005 rather
-    than silently reclassified by a name heuristic. Child `PATH` and every
-    platform-specific search input used by B-004 are represented only by
-    domain-separated digests plus the resolution outcome, never as raw paths or
-    directory content.
+10. **B-010:** Runtime environment evidence is derived from this exact closed
+    v0.1 policy; callers provide values but never names, sensitivity, evidence
+    inclusion, or probe exposure:
+
+    | Runtime kind | Key | Evidence | Version-child exposure |
+    | --- | --- | --- | --- |
+    | `codex_exec`, `codex_jsonrpc` | `OPENAI_API_KEY` | `unset` or `redacted` | excluded |
+    | `claude_code` | `ANTHROPIC_API_KEY` | `unset` or `redacted` | excluded |
+    | `claude_code` | `CLAUDE_CONFIG_DIR` | `unset` or SHA-256 | excluded |
+    | all three | `PATH` | domain-separated SHA-256 plus resolution outcome | exposed as the sanitized B-004 value |
+
+    Undeclared keys are ignored and can never enter evidence or the child.
+    Setup-secret exclusion runs first and can remove even a listed policy key.
+    Before duplicate, `PATH`, policy, or setup-secret matching, Unix compares
+    keys exactly and case-sensitively. Windows v0.1 accepts only ASCII
+    environment names, canonicalizes them to uppercase for comparison, rejects
+    canonical collisions such as `Path` plus `PATH`, and serializes the policy
+    spelling above; a non-ASCII Windows key fails typed rather than guessing OS
+    comparison semantics. Raw values, raw paths, and directory contents never
+    enter the envelope.
 11. **B-011:** An MCP tool producer requires a validated MCP server component
     and exact advertised tool name; callers cannot supply a separate or
     pre-encoded tool source. A typed v0.1 mapping preserves the server source
@@ -216,7 +238,10 @@ facts in snapshots or through a CLI.
     collapse, case-fold, Unicode-normalize, or otherwise rewrite whitespace or
     punctuation. `None`, an empty description, a single space, repeated spaces,
     tabs, and newlines remain distinct payload facts and produce distinct
-    digests when their exact advertised values differ.
+    digests when their exact advertised values differ. v0.1 permits a nonblank
+    tool name of at most 1,024 UTF-8 bytes and a description of at most 65,536
+    UTF-8 bytes; exact limits are allowed and limit-plus-one fails typed before
+    fingerprint construction.
 13. **B-013:** MCP input-schema canonicalization is context-aware. JSON object
     member order is canonicalized lexicographically. Only arrays at the closed
     order-insensitive schema-keyword locations `required`, `type`, `enum`,
@@ -229,7 +254,19 @@ facts in snapshots or through a CLI.
     construction accepts only raw JSON text or bytes through a duplicate-aware
     parser. It exposes no `serde_json::Value`, generic serializable, or typed-map
     constructor that could claim duplicate-free original input after an
-    ordinary decoder overwrote a key.
+    ordinary decoder overwrote a key. Object- or boolean-form `items` enters
+    schema context; legacy array-form `items` traverses schemas while retaining
+    tuple order.
+
+    Resource limits are fixed by v0.1 and are not caller-adjustable: raw schema
+    bytes and canonical bytes are each at most 1,048,576; nesting depth at most
+    64; total JSON nodes and cumulative decoded string bytes at most 65,536 and
+    1,048,576 respectively; and any single object or array at most 4,096
+    entries. Exact limits are valid. Raw size is checked before parsing; the
+    duplicate-aware visitor counts depth, nodes, strings, and container entries;
+    canonicalization and set sorting recheck depth, nodes, and canonical-byte
+    budget. A limit-plus-one condition returns a closed typed limit error,
+    emits no digest or envelope, and cannot panic or overflow the stack.
 14. **B-014:** The envelope `fingerprint_digest` covers the exact subject,
     payload schema version, and every behavior-affecting typed payload fact,
     with lexicographic object keys and stable collection ordering. It excludes
@@ -242,12 +279,13 @@ facts in snapshots or through a CLI.
     description text, an ordered annotation, or a failure kind changes it.
     Aggregate ordering and stack IDs remain ASC-005 responsibilities.
 15. **B-015:** Invalid producer inputs, invalid source evidence, unsupported
-    runtime kinds, non-host isolation, malformed schema JSON, and impossible
-    envelope combinations return typed errors and emit no fingerprint. Expected
-    observation failures such as a missing executable or unavailable version
-    are successful evidence records only when they contain the applicable B-008
-    failure and omit every unsupported fact. Missing data remains absent; no
-    empty digest, sentinel path, placeholder version, runner-owned alias,
+    runtime kinds, non-host isolation, malformed or over-limit schema JSON, and
+    impossible envelope combinations return typed errors and emit no
+    fingerprint. Expected observation failures such as a missing executable,
+    unauthorized repository probe, unavailable version, or incomplete cleanup
+    are successful evidence records only when they contain the applicable
+    B-008 failure and omit every unsupported fact. Missing data remains absent;
+    no empty digest, sentinel path, placeholder version, runner-owned alias,
     fingerprint-as-integrity substitution, or warning-only fallback is used.
 16. **B-016:** This issue exposes deterministic producer APIs in
     `harness-core` and `harness-agents` plus contract tests. It does not invoke
@@ -269,10 +307,11 @@ facts in snapshots or through a CLI.
 | `identity` | `executable_too_large` | The byte ceiling was exceeded before or during hashing. |
 | `identity` | `read_failed` | The opened executable could not be read completely. |
 | `identity` | `identity_changed` | Path strong identity or retained-handle size/content digest changed across checkpoints. |
-| `version_probe` | `containment_unavailable` | Required descendant containment could not be established before spawn, so no child was started. |
+| `version_probe` | `probe_not_authorized` | Closed source-scope policy forbids executing this inspected executable; no child was started. |
+| `version_probe` | `containment_unavailable` | Required pre-spawn process supervision could not be established, so no child was started; the name does not claim non-escapable containment on supported platforms. |
 | `version_probe` | `spawn_failed` | The selected command could not be spawned. |
-| `version_probe` | `timeout` | The lifecycle deadline expired and the child was terminated and reaped. |
-| `version_probe` | `output_limit_exceeded` | Combined stdout/stderr exceeded the inclusive hard byte limit and the child was terminated and reaped. |
+| `version_probe` | `timeout` | The probe deadline expired; cleanup outcome is represented independently. |
+| `version_probe` | `output_limit_exceeded` | Combined stdout/stderr exceeded the inclusive hard byte limit; cleanup outcome is represented independently. |
 | `version_probe` | `output_read_failed` | Either output pipe failed before a complete bounded result was obtained. |
 | `version_probe` | `nonzero_exit` | The child exited with a nonzero code. |
 | `version_probe` | `terminated_by_signal` | The child terminated without an exit code. |
@@ -280,6 +319,10 @@ facts in snapshots or through a CLI.
 | `version_probe` | `empty_output` | Exit was successful but both streams were blank. |
 | `version_probe` | `unparseable_version` | Nonblank output did not exactly match the selected runtime's whole-output grammar. |
 | `version_probe` | `ambiguous_version` | Stdout and stderr each matched the selected grammar, so the selected stream was not unique. |
+| `lifecycle_cleanup` | `termination_failed` | Signalling the root/original process group failed before cleanup ownership was transferred. |
+| `lifecycle_cleanup` | `reap_failed` | Root reap failed or was not verified before cleanup ownership was transferred. |
+| `lifecycle_cleanup` | `output_drain_failed` | Bounded drain did not complete before read handles were closed and ownership was transferred. |
+| `lifecycle_cleanup` | `group_verification_failed` | Original process-group emptiness was not verified before ownership was transferred; this never represents the whole descendant tree. |
 
 ## Acceptance Criteria
 
@@ -296,7 +339,10 @@ facts in snapshots or through a CLI.
       host resolution, file access, or process creation.
 - [ ] Source fixtures prove repository-, user-, admin-, system-, runtime-, and
       genuinely runner-owned runtime/MCP components keep identical component
-      IDs when observation strengthens to `runner_observed`.
+      IDs when observation strengthens to `runner_observed`; repository-owned
+      runtime fixtures retain identity/hash evidence but emit
+      `probe_not_authorized` without executing a marker program, and callers
+      cannot promote that source to an executable trust class.
 - [ ] PATH fixtures prove Unix child-working-directory semantics and Windows
       pinned-Rust search order/`.exe` behavior, including Windows refusal to use
       `PATHEXT`, accept any explicitly named non-`.exe` extension, execute
@@ -313,14 +359,15 @@ facts in snapshots or through a CLI.
       claim, pre-spawn/post-reap retained-handle rehashing, and explicit
       `identity_changed` evidence for path replacement or in-place rewrite.
 - [ ] Lifecycle fixtures use hanging and unbounded dual-stream children to
-      prove Unix explicit timeout and output-limit paths await group termination
-      and root reap; exact combined limit succeeds and limit-plus-one fails;
+      prove exact combined limit succeeds and limit-plus-one fails; ordinary
+      Unix explicit cleanup finishes root/original-group handling within five
+      seconds; injected termination, reap, drain, and group-verification
+      failures produce canonical `lifecycle_cleanup` evidence and transfer
+      ownership without a version; an escaped `setsid` pipe holder cannot yield
+      whole-tree-empty evidence or block the API past the cleanup deadline;
       cancellation transfers ownership to a runtime-independent reaper that
-      survives immediate Tokio shutdown, normally completes within the fixed
-      five-second verification deadline, retains ownership and emits an error
-      while continuing cleanup if that deadline is crossed, and emits no
-      evidence; Windows v0.1 proves `containment_unavailable` is emitted before
-      any child starts.
+      survives immediate Tokio shutdown and emits no evidence; Windows v0.1
+      proves `containment_unavailable` is emitted before any child starts.
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
       sanitized bounded facts, and rejection of unknown values.
 - [ ] Version fixtures cover exact current Codex and Claude product lines,
@@ -330,9 +377,12 @@ facts in snapshots or through a CLI.
       one valid stream plus nonblank invalid output, same/different versions on
       both matching streams, unparseable output, and conflicting matching
       streams.
-- [ ] Environment fixtures prove declared set/unset/digest/redacted behavior,
-      raw-value and raw-PATH absence, duplicate/invalid-key rejection, separate
-      probe exposure, and unconditional exclusion of every setup-secret key.
+- [ ] Environment fixtures prove the runtime-kind policy table's
+      set/unset/digest/redacted behavior, arbitrary and cross-runtime keys
+      cannot be declared or exposed, raw-value and raw-PATH absence, setup
+      secrets override the closed policy, Unix comparison remains
+      case-sensitive, and Windows canonical comparison rejects `Path`/`PATH`
+      collisions and non-ASCII keys.
 - [ ] MCP fixtures prove stable ownership, injective typed source derivation for
       multiple exact UTF-8 tool names on one server, rejection of caller-supplied
       encoded sources, absent component integrity, exact tool/description
@@ -340,10 +390,16 @@ facts in snapshots or through a CLI.
 - [ ] Schema fixtures prove object-key and approved set reordering stability;
       ordered `prefixItems`, vendor arrays, and nested arrays under `default`,
       `const`, `examples`, and `example` remain digest-sensitive even when an
-      annotation object contains a schema-keyword-shaped key.
+      annotation object contains a schema-keyword-shaped key; object/boolean
+      `items` traverses schema context while legacy array `items` preserves
+      order.
 - [ ] Duplicate JSON keys and malformed raw schemas fail typed before digesting,
       and public API/call-site audit proves no generic serializable or
       `serde_json::Value` evidence constructor exists.
+- [ ] Tool-name, description, raw-schema, depth, node, decoded-string,
+      per-container, and canonical-byte limit fixtures cover exact limits and
+      limit-plus-one; deep/wide hostile input fails typed without a digest,
+      envelope, panic, unbounded allocation, or stack overflow.
 - [ ] Focused and package suites pass with
       `cargo check -p harness-agents -p harness-core --all-targets`,
       `cargo test -p harness-core fingerprint`, and
@@ -358,14 +414,14 @@ facts in snapshots or through a CLI.
 | --- | --- |
 | Empty / missing input | Covered by B-002, B-009, B-011, B-012, and B-015; blank identities and output are explicit errors or failure evidence. |
 | Error and failure paths | Covered by B-006 through B-009 and B-015; every incomplete observation uses the closed vocabulary. |
-| Authorization / permission | Covered by B-004, B-005, B-010, and B-016; the producer gains no shell, arbitrary-command, snapshot, or runtime authority. |
+| Authorization / permission | Covered by B-004, B-005, B-007, B-010, and B-016; repository-owned code is never executed and the producer gains no shell, caller policy, snapshot, or runtime authority. |
 | Concurrency / race / ordering | Covered by B-006, B-007, B-008, B-013, and B-014; handle identity, child lifecycle, and canonical ordering are explicit. |
 | Retry / repetition / idempotency | Covered by B-008 and B-014; unchanged bounded facts produce identical records and digests. |
 | Illegal state transitions | N/A. Producers are stateless; B-001 and B-015 reject impossible evidence combinations. |
 | Compatibility / migration | Covered by B-001, B-002, and B-016; this is additive producer-only code with no persisted or existing public wire migration. |
 | Degradation / fallback | Covered by B-008, B-009, and B-015; unavailable data becomes typed failure evidence, never a placeholder success. |
 | Evidence and audit integrity | Covered by B-003 and B-006 through B-015; ownership, observer, bytes, version, schema, failures, and redaction remain distinguishable. |
-| Cancellation / interruption / partial completion | Covered by B-007 and B-015; cancellation signals containment, transfers cleanup to a runtime-independent deadline-governed owner, and cannot publish partial evidence. |
+| Cancellation / interruption / partial completion | Covered by B-007 and B-015; cancellation signals the original process group, transfers cleanup to a runtime-independent owner, and cannot publish partial evidence. |
 
 ## Edge Cases
 
@@ -374,16 +430,25 @@ facts in snapshots or through a CLI.
 - On Unix, an npm-style launcher uses `#!/usr/bin/env node` and the interpreter
   is found only through the sanitized child `PATH`.
 - A setup-only secret has a harmless-looking name such as `NPM_ACCESS`.
+- Windows observation input contains `Path` and `PATH`, a case-variant setup
+  secret, or a non-ASCII environment key.
+- A repository-owned marker executable would write or access the network if
+  invoked; fingerprinting must stop after identity/hash evidence.
 - The executable is a symlink, is replaced, is overwritten in place, or is
   changed and restored between observation checkpoints.
 - A regular file grows past the byte limit after its first metadata read.
 - A probe hangs, forks, closes only one stream, floods both streams, exits by
   signal, succeeds with blank output, or emits conflicting versions.
+- A probe forks a `setsid` descendant that retains an output pipe beyond the
+  cleanup deadline; evidence must not claim the whole descendant tree is empty.
 - Version output contains invalid UTF-8 or valid Unicode surrounding an
   otherwise valid product line; both are explicit failures.
 - An MCP description differs only by tabs, repeated spaces, or line breaks.
 - A schema annotation contains `{ "enum": [1, 2] }` as ordinary default data.
 - `prefixItems` or a vendor extension differs only by array order.
+- Object-, boolean-, and legacy array-form `items` occur at multiple depths.
+- Tool text or schema input is exactly at, then one unit beyond, every fixed
+  v0.1 resource limit.
 - An MCP tool is advertised by a runner but owned by repository configuration.
 - One MCP server advertises two exact tool names that differ only by case,
   Unicode bytes, slash placement, or a prefix of the other name.
