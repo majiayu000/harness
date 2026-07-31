@@ -52,25 +52,108 @@ fn claude_prompt_helpers_do_not_split_static_only_layers() {
 }
 
 #[test]
-fn agent_request_recovers_layers_from_registered_flattened_prompt_with_runtime_additions() {
+fn agent_request_does_not_infer_layers_from_flattened_prompt() {
     let flattened =
         prompts::implement_from_issue(1471, None, Some("follow the spec")).to_prompt_string();
+    let prompt = format!("Constitution\n\n{flattened}\n\n## Available Skills\n- review");
     let request = AgentRequest {
-        prompt: format!("Constitution\n\n{flattened}\n\n## Available Skills\n- review"),
+        prompt: prompt.clone(),
         project_root: PathBuf::from("/tmp/project"),
         ..AgentRequest::default()
     };
 
-    let Some(system_prompt) = request.claude_system_prompt() else {
-        panic!("registered PromptParts should provide a Claude system prompt");
-    };
-    let main_prompt = request.claude_main_prompt();
+    assert_eq!(request.claude_system_prompt().as_deref(), None);
+    assert_eq!(request.claude_main_prompt(), prompt);
+}
 
-    assert!(system_prompt.contains("Senior Engineer"));
-    assert!(!system_prompt.contains("follow the spec"));
-    assert!(main_prompt.contains("Constitution"));
-    assert!(main_prompt.contains("follow the spec"));
-    assert!(main_prompt.contains("## Available Skills"));
+#[test]
+fn flattened_prompt_without_layers_does_not_cross_associate_with_similar_prompt() {
+    let registered_flattened = prompts::PromptParts {
+        static_instructions: "shared static instructions\n".to_string(),
+        context: "shared request context\n".to_string(),
+        dynamic_payload: "shared dynamic payload\n".to_string(),
+    }
+    .to_prompt_string();
+    let similar_prompt = format!("{registered_flattened}runtime-specific suffix\n");
+    let request = AgentRequest {
+        prompt: similar_prompt.clone(),
+        project_root: PathBuf::from("/tmp/project"),
+        ..AgentRequest::default()
+    };
+
+    assert_eq!(request.claude_system_prompt().as_deref(), None);
+    assert_eq!(request.claude_main_prompt(), similar_prompt);
+}
+
+#[test]
+fn concurrent_similar_prompts_keep_explicit_layer_attribution() {
+    let short_static = AgentPromptLayers::new("static\n", "context\n", "dynamic\n");
+    let long_static = AgentPromptLayers::new("static\ncontext\n", "dynamic\n", "");
+    assert_eq!(
+        short_static.to_prompt_string(),
+        long_static.to_prompt_string()
+    );
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let spawn_request = |layers: AgentPromptLayers| {
+        let barrier = std::sync::Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let flattened = prompts::PromptParts {
+                static_instructions: layers.static_instructions.clone(),
+                context: layers.context.clone(),
+                dynamic_payload: layers.dynamic_payload.clone(),
+            }
+            .to_prompt_string();
+            let request = AgentRequest::from_prompt_layers(layers, PathBuf::from("/tmp/project"));
+            barrier.wait();
+            let system_prompt = request
+                .claude_system_prompt()
+                .map(|prompt| prompt.into_owned());
+            let main_prompt = request.claude_main_prompt().into_owned();
+            (flattened, request.prompt, system_prompt, main_prompt)
+        })
+    };
+
+    let short_static_request = spawn_request(short_static);
+    let long_static_request = spawn_request(long_static);
+    barrier.wait();
+
+    let flattened_prompt = "static\ncontext\ndynamic\n".to_string();
+    let flattened_request = AgentRequest {
+        prompt: flattened_prompt.clone(),
+        project_root: PathBuf::from("/tmp/project"),
+        ..AgentRequest::default()
+    };
+    assert_eq!(flattened_request.claude_system_prompt().as_deref(), None);
+    assert_eq!(flattened_request.claude_main_prompt(), flattened_prompt);
+
+    let short_static_request = match short_static_request.join() {
+        Ok(request) => request,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    let long_static_request = match long_static_request.join() {
+        Ok(request) => request,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+
+    assert_eq!(
+        short_static_request,
+        (
+            "static\ncontext\ndynamic\n".to_string(),
+            "static\ncontext\ndynamic\n".to_string(),
+            Some("static\n".to_string()),
+            "context\ndynamic\n".to_string(),
+        )
+    );
+    assert_eq!(
+        long_static_request,
+        (
+            "static\ncontext\ndynamic\n".to_string(),
+            "static\ncontext\ndynamic\n".to_string(),
+            Some("static\ncontext\n".to_string()),
+            "dynamic\n".to_string(),
+        )
+    );
 }
 
 #[test]

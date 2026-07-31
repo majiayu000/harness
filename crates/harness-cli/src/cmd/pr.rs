@@ -64,11 +64,10 @@ pub async fn fix(
 
     println!("[harness] Round 1 — Implementing issue #{issue} and creating PR");
 
-    let req = AgentRequest {
-        prompt: prompts::implement_from_issue(issue, None, None).to_prompt_string(),
-        project_root: project.clone(),
-        ..Default::default()
-    };
+    let req = AgentRequest::from_prompt_layers(
+        prompts::implement_from_issue(issue, None, None).into(),
+        project.clone(),
+    );
 
     let resp = agent.execute(req).await?;
     println!("{}", resp.output);
