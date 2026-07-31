@@ -87,8 +87,9 @@ the typical target is 200-400 lines. `stack/mod.rs` and `harness-agents/lib.rs`
 only expose the two facades. The one authorized server-file change is a
 `#[cfg(test)]` contract test described below; it adds no production import,
 mapping, call site, or consumer. `harness-agents` adds a direct dependency on
-the already pinned workspace `libc` solely for the Unix no-shell `execve`
-primitive. This adds no package/version and must not change `Cargo.lock`.
+the already pinned workspace `libc` solely for Unix no-shell process-group and
+retained-handle exec primitives. This adds no package/version and must not
+change `Cargo.lock`.
 
 ## Strict Fingerprint Envelope
 
@@ -309,9 +310,9 @@ distinct serialized facts and digest inputs, as required by B-012.
 
 ## Single-Command PATH Resolution
 
-`executable.rs` resolves one configured command without a shell. Windows pins
-the Rust toolchain search behavior used by the adapter; Unix freezes the
-explicit safe subset below. The input carries a typed
+`executable.rs` resolves one configured command without a shell. Windows and
+Unix each freeze the explicit v0.1 algorithm below independently of the
+compiler used to build Harness. The input carries a typed
 `RuntimeLaunchContext`: platform, configured child working directory,
 sanitized child `PATH`, and every platform search base that the resolver needs
 but must not infer. It also carries the validated repository boundary set used
@@ -349,6 +350,9 @@ On Unix:
 - a qualified relative path is joined to the declared child working directory;
 - a bare name traverses sanitized `PATH` in order, with empty and relative
   entries based on the declared child working directory;
+- a bare name with sanitized child `PATH = Unset` is `path_unusable` before
+  candidate observation; v0.1 does not guess libc's platform default, while
+  absolute and qualified commands remain representable;
 - missing, non-regular, and mode-ineligible same-basename candidates advance
   without process creation;
 - no more than 64 sanitized PATH entries are observed; reaching entry 65
@@ -356,16 +360,22 @@ On Unix:
 - failure to open an otherwise statically eligible candidate stops with
   `identity/open_failed`, because skipping an unreadable execute-only candidate
   could select a different executable than the adapter;
-- after handle inspection and the pre-spawn checkpoint, `probe.rs` uses an
-  absolute-path `execve` call from the direct workspace `libc` dependency with
-  the fixed arguments and no shell; the executable pathname is the inspected
-  absolute candidate while `argv[0]` retains the exact original configured
-  command `OsStr` units used by the adapter;
+- after handle inspection and the pre-spawn checkpoint, `probe.rs` uses
+  `fexecve` or an exact no-path equivalent from the direct workspace `libc`
+  dependency on the retained authorized handle, with fixed arguments and no
+  shell; `argv[0]` retains the exact original configured command `OsStr` units
+  used by the adapter;
+- path-based `execve` after authorization is forbidden; a Unix platform on
+  which process-group supervision is otherwise available but no supported
+  retained-handle exec primitive exists records
+  `handle_execution_unavailable` before anchor or target creation and never
+  falls back to the pathname;
 - only exact `EACCES` from that call advances to the next same-basename
   candidate;
 - exact first `ETXTBSY` waits the adapter's fixed 150 milliseconds, repeats
   opened-target authorization plus the full retained-handle hash and path
-  strong-identity checkpoint, and retries the same absolute candidate once;
+  strong-identity checkpoint, and retries the same retained authorized handle
+  once; the absolute candidate remains resolution evidence only;
   identity change stops without retry, while second `ETXTBSY`, `ENOEXEC`, and
   every other retry/error are terminal `spawn_failed`;
 - absolute and qualified commands may use that one same-candidate `ETXTBSY`
@@ -392,13 +402,13 @@ The tags, counts, and exact units are encoded identically to
 `EtxtbsyThenCheckpointAfter150Ms`. The closed
 `RuntimeResolutionAttemptOutcome` is exactly `Absent`, `NotRegular`,
 `NotExecutable`, `InspectionFailed`, `InspectionTarget`,
-`AuthorizationUnavailable`, `RetryNotAuthorized`,
+`AuthorizationUnavailable`, `HandleExecutionUnavailable`, `RetryNotAuthorized`,
 `RetryAuthorizationUnavailable`, `SupervisionSetupFailed`, `ExecEacces`,
 `ExecFailed`, or `ExecStarted`. `SupervisionSetupFailed` is terminal, requires
 the matching version-probe failure, uses `RuntimeExecSequence::None` for initial
 anchor/target setup or `EtxtbsyThenCheckpointAfter150Ms` for the second helper
 after an exact first `ETXTBSY`, and proves every created helper was reaped before
-the affected target `execve`. Attempts preserve PATH order and duplicates; they
+the affected target handle-exec call. Attempts preserve PATH order and duplicates; they
 are never sorted.
 
 The parser enforces a finite-state contract. Skipped outcomes and `ExecEacces`
@@ -407,7 +417,9 @@ identity failure. `InspectionTarget` is permitted only with
 `probe_not_authorized` and one closed configuration-source or resolved-target
 repository reason, and forbids all exec outcomes. `AuthorizationUnavailable`
 requires exactly `target_authorization_unavailable`, is terminal, and forbids
-exec, fallback, or selected identity. `ExecFailed`
+exec, fallback, or selected identity. `HandleExecutionUnavailable` requires
+exactly `handle_execution_unavailable`, is terminal, uses `None`, and forbids
+anchor/target creation, path fallback, and selected identity. `ExecFailed`
 requires `spawn_failed`; `ExecStarted` forbids a spawn failure and is the only
 outcome that creates a selected/executed identity. A sequence containing only
 skips yields `path_not_found`; one ending in `ExecEacces` with no final identity
@@ -416,8 +428,9 @@ yields `candidate_limit_exceeded` with exactly 64 attempts. Outcomes after a
 terminal, multiple terminals, wrong source/failure pairs, or more than 64
 entries fail parsing.
 
-`RuntimeExecSequence::None` is required for skips, inspection-only, initial
-authorization-unavailable, and initial supervision-setup-failed outcomes.
+`RuntimeExecSequence::None` is required for skips, inspection-only,
+handle-execution-unavailable, initial authorization-unavailable, and initial
+supervision-setup-failed outcomes.
 `Single` is required for an ordinary exec
 outcome. `EtxtbsyThenCheckpointAfter150Ms` is legal only after the first direct
 exec returned raw errno `ETXTBSY`; it requires the 150-millisecond monotonic
@@ -429,7 +442,7 @@ checkpoint changes authorization, `RetryNotAuthorized` requires
 and selected identity. `InspectionFailed` with `identity_changed` likewise
 forbids the second helper. `SupervisionSetupFailed` is also legal in this
 sequence when the second helper is reaped after group join fails and before
-target `execve`; it cannot fall back. Only `ExecEacces` for a bare name,
+target handle exec; it cannot fall back. Only `ExecEacces` for a bare name,
 `ExecFailed`, or `ExecStarted` proves that the second target exec was attempted.
 A second `ETXTBSY` is
 `ExecFailed`. Absolute and qualified commands reject `ExecEacces` and represent
@@ -446,30 +459,36 @@ appended. Unavailable target authorization also stops without exec or fallback.
 Fault-injection tests freeze these paths without requiring CI to mount a
 `noexec` filesystem.
 
-All `CString` path, argument, and environment storage and pointer arrays are
-built and NUL-validated in the parent. The audited Unix pre-exec closure uses
-only async-signal-safe `setpgid` and `execve`; it never allocates, logs, locks,
-or constructs strings after fork. Its stage-tagged error pipe distinguishes
-group-join failure from target `execve` failure. A failed `setpgid` produces
+All `CString` argument and environment storage and pointer arrays are built and
+NUL-validated in the parent. The audited Unix pre-exec closure receives a
+retained-handle exec descriptor prepared without close-on-exec only where the
+platform requires that for interpreter handling, closes unrelated descriptors,
+and uses only async-signal-safe `setpgid` and retained-handle exec; it never
+allocates, logs, locks, resolves, or reopens a pathname after fork. Its
+stage-tagged error pipe distinguishes group-join failure from target handle-exec
+failure. A failed `setpgid` produces
 `supervision_setup_failed`, and the parent reaps that helper before emitting
-evidence. Successful `execve` never returns. A failed target call returns its
+evidence. Successful handle exec never returns. A failed target call returns its
 captured errno through the distinct exec channel, so only exact target
 `EACCES` reaches the fallback branch and a setup errno or `ENOEXEC` cannot reach
 a fallback or shell execution path.
 
-On Windows, the pinned Rust `Command` bare-name resolver is mirrored: explicit
-child `PATH`, current executable directory, system directory, Windows
-directory, then parent `PATH`, with only Rust's `.exe` completion. `PATHEXT` is
-not consulted. Explicit `.bat` and `.cmd` programs are `path_unusable` because
-Rust's batch handling invokes a command interpreter and violates the no-shell
-boundary. Every explicit non-`.exe` extension is likewise `path_unusable` in
-v0.1; supporting another extension requires a later closed grammar revision.
+On Windows, v0.1 independently freezes this bare-name resolver: explicit child
+`PATH`, current executable directory, system directory, Windows directory,
+then parent `PATH`, with only `.exe` completion. The algorithm and fixtures are
+not derived from the compiler that happens to build Harness. `PATHEXT` is not
+consulted. Explicit `.bat` and `.cmd` programs are `path_unusable` because the
+adapter's batch handling invokes a command interpreter and violates the
+no-shell boundary. Every explicit non-`.exe` extension is likewise
+`path_unusable` in v0.1; supporting another extension requires a later closed
+grammar revision.
 The child `current_dir` is not treated as the parent search base. A qualified
 relative program, relative/empty search entry, or unavailable special directory
 is accepted only when its actual base is explicit and stable in the launch
-context; otherwise resolution records `path_unusable`. Tests freeze this order
-against the pinned toolchain so a Rust upgrade that changes resolution cannot
-silently change fingerprints.
+context; otherwise resolution records `path_unusable`. A differential
+conformance test runs the current adapter `Command` against fixed fixtures and
+fails if it diverges from the frozen resolver; it never updates expected
+behavior from the running compiler.
 
 On every platform, quotes, spaces, pipes, substitutions, and redirections are
 literal path characters. Resolution inspects only the configured basename,
@@ -478,11 +497,41 @@ commands have one absolute selected candidate and no fallback. Unix bare-name
 fallback is limited to the ordered, inspected, same-basename `EACCES` algorithm
 above; it never changes arguments or executes a search helper.
 
-The effective search inputs are domain-separated by platform and represented
-only by SHA-256, ordered attempt evidence, and the resolution outcome; directory
-contents, configured command, candidate paths, and raw search text are never
-serialized. The probe child receives the exact sanitized child `PATH` from the
-launch context so a qualified `#!/usr/bin/env node` launcher uses the declared
+The payload carries a closed `WindowsResolutionContextEvidence` with exactly
+four optional fields:
+`current_executable_dir_digest`, `system_dir_digest`,
+`windows_dir_digest`, and `parent_path_digest`. Each present value uses:
+
+```text
+SHA-256(domain || b"windows\0" || u64be(utf16_unit_count) || utf16le_units)
+```
+
+The domains are exactly:
+
+```text
+b"harness_runtime_windows_search_current_executable_dir_v0_1\0"
+b"harness_runtime_windows_search_system_dir_v0_1\0"
+b"harness_runtime_windows_search_windows_dir_v0_1\0"
+b"harness_runtime_windows_search_parent_path_v0_1\0"
+```
+
+Absent is a distinct typed state with no digest; present empty hashes the
+zero-unit framing. For the independent original UTF-16 units of `C:\X`
+(`0043 003a 005c 0058`), the four digests in field order are exactly:
+
+```text
+4864a078702061a4fd859437dcadfce7519d755e47de020039dd4473d3651e7e
+cc203ab9fd082171309ae3c4f28bae151cbc8d52e26870c25547977d196eb5ab
+2fc48563c782059e0c54ca5a1c3741a991ca429434557cd070d1e87be4f7bfd7
+0206b6610a84596f5fcdda5879d0fa56bb6ab45d0c88b27b25fa9d4301327db8
+```
+
+Child `PATH` retains the separate B-010 environment digest. On every platform,
+effective search inputs are represented only by their frozen SHA-256 fields,
+ordered attempt evidence, and resolution outcome; directory contents,
+configured command, candidate paths, and raw search text are never serialized.
+The probe child receives the exact sanitized child `PATH` from the launch
+context so a qualified `#!/usr/bin/env node` launcher uses the declared
 interpreter search. Other environment keys follow only the closed policy below.
 This implements B-004 and the PATH portion of B-010.
 
@@ -563,9 +612,11 @@ metadata, strong identity, executable digest, child, version, or cleanup claim.
 For a bare Unix candidate this stops the search fail closed; absolute and
 qualified candidates have no fallback.
 
-The closure checks the configured byte limit against initial metadata and again
-while reading, stops at `limit + 1`, does not preallocate the maximum, and
-returns only bounded typed facts. It runs through `spawn_blocking`; no
+The closure checks the fixed, non-caller-adjustable
+`RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES = 67_108_864` limit against initial
+metadata and again while reading, stops at byte 67,108,865, does not preallocate
+the maximum, and returns only bounded typed facts. It runs through
+`spawn_blocking`; no
 multi-megabyte file read occurs on a Tokio worker and no `std::fs::read` whole-
 file allocation is allowed.
 
@@ -602,7 +653,13 @@ residual TOCTOU gap. This implements B-006 and its non-goal.
 
 `probe.rs` owns a fingerprint-specific `RuntimeFingerprintProbeSupervisor`
 instead of treating the existing `ManagedChild` drop path as completion
-evidence. After source/target authorization but before any supervision helper
+evidence. The platform matrix is checked before any helper: Windows v0.1
+returns `containment_unavailable` because atomic supervision is unavailable.
+On Unix, after source/target authorization, retained-handle exec capability is
+checked without creating a process. A Unix platform with process-group
+supervision but no no-path handle-exec primitive records
+`handle_execution_unavailable` and returns identity-only evidence; it cannot
+reopen the pathname or create an anchor/target. Before any supervision helper
 or target child is created, `RuntimeFingerprintProbeSupervisor::reserve`
 creates a runtime-independent owner thread and waits for its readiness
 handshake under
@@ -623,7 +680,7 @@ during cancellation.
 
 On supported Unix, the ready owner creates a minimal process-group anchor that
 becomes and remains the group leader. Target helpers join the anchor's group
-before target `execve`; null stdin and piped stdout/stderr are unchanged. The
+before target handle exec; null stdin and piped stdout/stderr are unchanged. The
 owner retains the anchor control/reap handle and every root/group identity.
 Platform-specific membership enumeration is capability-checked before anchor
 creation; if an anchored proof cannot be implemented, v0.1 returns
@@ -734,9 +791,10 @@ The result-state matrix is fail closed:
 | later identity failure | bounded opened-handle facts only; no stable executable digest/version pair |
 | source/target repository probe not authorized | one `inspection_target` identity/hash may remain with the closed authorization reason; no selected/executed identity, exec attempt, fallback, child, or version |
 | target authorization unavailable | inspected identity/hash may remain; no selected/executed identity, exec attempt, fallback, child, or version |
+| retained-handle execution unavailable | stable inspected identity may remain; no anchor/target was created, no pathname was reopened for exec, and version is absent |
 | Unix bare-name `bare_eacces_exhausted` | configured-command, search, and ordered attempt digests may remain; every inspected-candidate identity is discarded and no final executable identity, child, or version exists |
 | supervision unavailable | stable identity may remain; no child was spawned and version is absent |
-| supervision setup failure | the target helper was reaped, target `execve` was not attempted, its errno cannot cause PATH fallback, and version is absent |
+| supervision setup failure | the target helper was reaped, target handle exec was not attempted, its errno cannot cause PATH fallback, and version is absent |
 | terminal pre-start `spawn_failed` | the inspected target identity may remain, but no selected/executed identity or version exists |
 | post-`exec_started` lifecycle/exit/output failure | the selected/executed identity may remain; version is absent |
 | root exited with a non-anchor member still in the anchored group | `lingering_process_group` is required; selected/executed identity may remain, version is absent, and cleanup must run |
@@ -841,8 +899,9 @@ At `Schema`, `required`, `type`, and `enum` arrays are canonical sets. `enum`
 elements themselves enter `InstanceData`, so an object inside an enum value
 cannot activate schema keywords. `default`, `const`, `examples`, and `example`
 always enter `InstanceData`. Known single-schema locations such as `not`,
-`if`, `then`, `else`, `contains`, `propertyNames`, `additionalProperties`,
-`unevaluatedItems`, and `unevaluatedProperties` enter `Schema`. At `items`, an
+`if`, `then`, `else`, `contains`, `contentSchema`, `propertyNames`,
+`additionalProperties`, `unevaluatedItems`, and `unevaluatedProperties` enter
+`Schema`. At `items`, an
 object or boolean enters `Schema`, an array enters `SchemaArrayOrdered`, and
 any other value is a typed malformed-schema error. `additionalItems` enters
 `Schema` only when the same object has legacy array-form `items`; when `items`
@@ -876,14 +935,14 @@ owns user-facing collection commands. This is B-016.
 | B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch`; `fingerprint_digest_is_separate_from_component_integrity`; `fingerprint_digest_framing_vectors_are_independent`; `complete_runtime_and_mcp_payload_digest_vectors_are_fixed`; `canonical_payload_string_escaping_is_frozen`; `canonical_payload_preserves_raw_json_number_tokens`; `failure_payload_changes_fingerprint_digest_without_fabricating_integrity`; `component_integrity_preserves_exact_source_bytes_or_absence` |
 | B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
 | B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `configured_mcp_server_key_accepts_1024_and_rejects_1025_before_expansion`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
-| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; `unix_execve_candidate_and_configured_argv0_match_adapter`; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `etxtbsy_retries_same_candidate_once_after_150_ms`; `etxtbsy_checkpoint_rechecks_authorization_hash_and_path_identity`; `etxtbsy_checkpoint_authorization_change_prevents_second_exec`; `etxtbsy_checkpoint_rejects_configuration_source_reason`; `etxtbsy_checkpoint_unavailable_authorization_prevents_second_exec`; `etxtbsy_retry_group_join_failure_is_reaped_without_exec_or_fallback`; `second_etxtbsy_is_terminal`; `etxtbsy_sequence_rejects_wrong_errno_delay_count_and_outcome`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_search_fallback`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `runtime_resolution_attempts_round_trip_all_outcomes_and_exec_sequences`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
+| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; `unix_retained_handle_exec_preserves_configured_argv0`; `unix_bare_path_unset_is_path_unusable_without_default_search`; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `etxtbsy_retries_same_candidate_once_after_150_ms`; `etxtbsy_checkpoint_rechecks_authorization_hash_and_path_identity`; `etxtbsy_checkpoint_authorization_change_prevents_second_exec`; `etxtbsy_checkpoint_rejects_configuration_source_reason`; `etxtbsy_checkpoint_unavailable_authorization_prevents_second_exec`; `etxtbsy_retry_group_join_failure_is_reaped_without_exec_or_fallback`; `second_etxtbsy_is_terminal`; `etxtbsy_sequence_rejects_wrong_errno_delay_count_and_outcome`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_search_fallback`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `runtime_resolution_attempts_round_trip_all_outcomes_and_exec_sequences`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `handle_execution_unavailable_requires_none_and_no_child`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `frozen_windows_search_order_is_compiler_independent`; `current_command_differential_fails_on_frozen_resolver_drift`; `windows_resolution_context_digest_domains_and_vectors_are_fixed`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
 | B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; independent fixed vectors freeze PATH and `CLAUDE_CONFIG_DIR` domains, platform tags, big-endian counts, Unix raw bytes, Windows UTF-16LE, absent/empty distinction, and non-UTF-8 Unix values; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
-| B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `fifo_swap_at_each_checkpoint_is_nonblocking_identity_changed`; `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
+| B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `fifo_swap_at_each_checkpoint_is_nonblocking_identity_changed`; `opened_handle_drives_metadata_and_incremental_hash`; `executable_size_accepts_67108864_and_rejects_67108865`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_after_authorization_executes_retained_handle_not_replacement`; Unix `supervised_platform_without_handle_exec_fails_before_anchor_without_path_fallback`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
 | B-007 | Unix `owner_ready_deadline_bounds_success_delay_and_cancellation`; `owner_stop_join_deadline_is_separate_and_typed`; `owner_stop_join_timeout_is_childless_containment_unavailable`; `ordinary_timeout_reaps_root_and_verifies_only_anchor_remains`; `active_and_cleanup_deadlines_are_distinct_and_fixed`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_reaps_root_then_anchor_without_released_pgid_use`; `every_signal_and_membership_check_has_live_anchor`; `initial_group_setup_failure_is_reaped_without_exec`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `output_cap_rejects_0_and_65537_before_allocation_or_helper`; `output_cap_accepts_1_and_65536`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; Windows `containment_unavailable_prevents_spawn` |
 | B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
 | B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `both_streams_are_parsed_before_selection`; `same_version_on_both_streams_is_ambiguous`; `valid_version_with_nonblank_other_stream_is_unparseable`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; `mcp_output_schema_absence_and_presence_are_distinct`; exact-limit and limit-plus-one tool-name/description fixtures |
-| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `object_form_items_traverses_nested_schema`; `object_form_items_required_and_one_of_reorder_canonically`; `legacy_array_items_preserves_tuple_order`; `legacy_additional_items_traverses_schema_context`; `additional_items_without_legacy_array_items_remains_instance_data`; `dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
+| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `schema_set_locations_reorder_canonically`; `content_schema_traverses_nested_required_and_one_of_as_schema`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `object_form_items_traverses_nested_schema`; `object_form_items_required_and_one_of_reorder_canonically`; `legacy_array_items_preserves_tuple_order`; `legacy_additional_items_traverses_schema_context`; `additional_items_without_legacy_array_items_remains_instance_data`; `dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
 
 All failure tests assert the absence of a version fact and the absence of raw
@@ -955,10 +1014,12 @@ be unchanged and `cargo tree -p harness-agents -i libc` must show the pinned
 workspace dependency. A call-site audit
 must show that production uses of the new APIs remain confined to their
 defining modules; test uses do not count as consumers. File-length checks must
-show every Rust file below 800 lines. The Unix `execve` pre-exec path requires
-mandatory human security review for argument/environment pointers, NUL
-validation, error propagation, and the proof that `ENOEXEC` never starts a
-shell. Because the repository no longer contains the historical SpecRail
+show every Rust file below 800 lines. The Unix retained-handle exec path
+requires mandatory human security review for descriptor ownership,
+close-on-exec/interpreter semantics, argument/environment pointers, NUL
+validation, error propagation, proof that authorization cannot fall back to a
+pathname, and proof that `ENOEXEC` never starts a shell. Because the repository
+no longer contains the historical SpecRail
 checker, verification must not claim to run a removed script; structural
 review of the manifest and B-001 through B-016 coverage is the current spec
 check.

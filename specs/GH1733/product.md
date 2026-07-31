@@ -116,9 +116,10 @@ facts in snapshots or through a CLI.
 4. **B-004:** Runtime resolution treats the configured executable as exactly
    one command name or path and never invokes a shell or parses embedded
    arguments, quoting, pipes, substitutions, or redirections. Windows mirrors
-   the pinned Rust `Command` search behavior; Unix uses an explicit safe subset
-   that preserves `EACCES` fallback but deliberately rejects `ENOEXEC` shell
-   fallback. On Unix, a qualified relative path and
+   the frozen Windows v0.1 search behavior below, independent of the compiler
+   used to build Harness; Unix uses an explicit safe subset that preserves
+   `EACCES` fallback but deliberately rejects `ENOEXEC` shell fallback. On
+   Unix, a qualified relative path and
    relative or empty `PATH` entries are resolved from the declared child
    working directory. Every payload includes
    `configured_command_digest = SHA-256("harness_runtime_configured_command_v0_1\0" || platform_tag || unit_count_be || exact_units)`.
@@ -130,13 +131,23 @@ facts in snapshots or through a CLI.
    case, separator, dot-segment, symlink, or absolute-path normalization, and
    the raw command is never serialized.
 
-   On Windows, a bare name follows the pinned Rust search
+   On Windows, a bare name follows the frozen v0.1 search
    order and `.exe` completion rules using explicit launch-context inputs; it
-   does not use `PATHEXT`, and `.bat`/`.cmd` are `path_unusable` because Rust
-   would invoke a command interpreter contrary to the no-shell boundary. Every
+   does not use `PATHEXT`, and `.bat`/`.cmd` are `path_unusable` because the
+   adapter's batch handling would invoke a command interpreter contrary to the
+   no-shell boundary. Every
    explicitly named non-`.exe` extension is `path_unusable` in v0.1. A
    qualified relative path or relative/empty search input whose base cannot be
    proven is also `path_unusable`.
+
+   The payload carries exactly four optional Windows resolution-context fields:
+   `current_executable_dir_digest`, `system_dir_digest`,
+   `windows_dir_digest`, and `parent_path_digest`. Each present field is
+   `SHA-256(domain || b"windows\0" || u64be(utf16_unit_count) ||
+   utf16le_units)` under its field-specific
+   `harness_runtime_windows_search_<field>_v0_1\0` domain frozen in the tech
+   spec. Absent is distinct from present empty. These fields enter the
+   fingerprint payload; raw directories and parent PATH never do.
 
    Unix bare-name execution uses a frozen Harness search algorithm rather than
    delegating to `execvp`: candidates keep the exact basename and sanitized
@@ -145,15 +156,19 @@ facts in snapshots or through a CLI.
    otherwise selected candidate is `identity/open_failed` and stops. Reaching
    entry 65 before a terminal outcome is
    `path_resolution/candidate_limit_exceeded`. After inspection and the pre-spawn
-   checkpoint, a direct no-shell `execve` primitive attempts the absolute
-   candidate with fixed B-002 arguments. Its executable pathname is the
-   inspected absolute candidate, but `argv[0]` is the exact original configured
+   checkpoint, a direct no-shell handle-exec primitive (`fexecve` or an exact
+   platform equivalent) attempts the retained, authorized candidate handle with
+   fixed B-002 arguments. The call's `argv[0]` is the exact original configured
    command `OsStr` spelling used by the adapter; resolution never substitutes
-   the candidate spelling into `argv[0]`. Only an exact `EACCES` result may
+   the candidate spelling. No path-based `execve` is permitted after
+   authorization. If a Unix platform on which process-group supervision is
+   otherwise available cannot execute that retained handle,
+   `handle_execution_unavailable` is emitted before an anchor or target child;
+   path execution is not a fallback. Only an exact target-handle `EACCES` result may
    discard that bare-name candidate and continue to the next same-basename
    entry. An exact first `ETXTBSY` waits 150 milliseconds, repeats target
    authorization plus the full retained-handle/path identity checkpoint, and
-   retries that same absolute candidate exactly once to mirror the adapter.
+   retries that same retained candidate handle exactly once.
    Identity change prevents retry; a second `ETXTBSY` is terminal
    `spawn_failed`. `ENOEXEC` is terminal `spawn_failed` and never invokes
    `/bin/sh`; every other spawn error is terminal. Absolute and qualified
@@ -172,7 +187,11 @@ facts in snapshots or through a CLI.
    inspectable candidate is `path_not_found`. Resolution never invokes
    `which`, a package manager, or an arbitrary candidate command.
 
-   Repository-owned bare commands stop after the first statically eligible,
+   A bare Unix command with sanitized child `PATH = Unset` is
+   `path_unusable` before candidate observation. v0.1 never guesses libc's
+   platform-dependent default search path; absolute and qualified commands
+   remain valid with PATH unset. Repository-owned bare commands stop after the
+   first statically eligible,
    successfully inspected candidate, record its identity as
    `inspection_target` plus `probe_not_authorized`, and perform no exec attempt
    or fallback. The same stop applies when any otherwise eligible source
@@ -204,8 +223,10 @@ facts in snapshots or through a CLI.
    successful supervised spawn. On a platform where process supervision is
    available, a bad image or access error is `spawn_failed`, not a fabricated
    `not_executable`; Windows v0.1 reaches `containment_unavailable` before that
-   attempt. The producer enforces the configured byte ceiling before and during
-   reading, performs potentially blocking file hashing outside the async
+   attempt. The producer enforces the fixed, non-caller-adjustable
+   `RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES = 67_108_864` byte ceiling before
+   and during reading, performs potentially blocking file hashing outside the
+   async
    executor, and does not allocate the declared maximum eagerly. The retained
    handle is re-read and re-hashed immediately before spawn and after the child
    is reaped; all three size and digest observations must match. At both later
@@ -273,11 +294,14 @@ facts in snapshots or through a CLI.
    `process_group_supervision`: root reap and visibility of members that remain
    in the anchored original group. A child can call `setsid` or change groups,
    so v0.1 does not claim non-escapable descendant containment or whole-process-
-   tree emptiness. Failure to establish the anchor group or failure of either
+   tree emptiness. On Unix platforms with process-group supervision but no
+   no-path retained-handle exec primitive, `handle_execution_unavailable` is
+   recorded before anchor or target creation.
+   Failure to establish the anchor group or failure of either
    the initial or post-`ETXTBSY` target helper's pre-exec group join is
    `supervision_setup_failed`; every created helper is reaped, the affected
-   target `execve` is not attempted, and its errno is never treated as an
-   `execve` error or PATH fallback signal. On Windows, where the existing launcher cannot atomically
+   target handle exec is not attempted, and its errno is never treated as a
+   target-exec error or PATH fallback signal. On Windows, where the existing launcher cannot atomically
    assign a Job Object before execution, `containment_unavailable` is recorded
    without spawning.
 
@@ -410,9 +434,9 @@ facts in snapshots or through a CLI.
     construction accepts only raw JSON text or bytes through a duplicate-aware
     parser. It exposes no `serde_json::Value`, generic serializable, or typed-map
     constructor that could claim duplicate-free original input after an
-    ordinary decoder overwrote a key. Object- or boolean-form `items` enters
-    schema context; legacy array-form `items` traverses schemas while retaining
-    tuple order.
+    ordinary decoder overwrote a key. `contentSchema` always enters schema
+    context. Object- or boolean-form `items` enters schema context; legacy
+    array-form `items` traverses schemas while retaining tuple order.
 
     Resource limits are fixed by v0.1 and are not caller-adjustable. For each
     present schema, raw schema bytes and canonical bytes are each at most
@@ -491,7 +515,8 @@ facts in snapshots or through a CLI.
 | `version_probe` | `probe_not_authorized` | Configuration-source or resolved-target repository policy forbids executing this inspected target; the closed reason identifies which and no child was started. |
 | `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary, so no child was started. |
 | `version_probe` | `containment_unavailable` | Required pre-spawn process supervision could not be established, so no child was started; the name does not claim non-escapable containment on supported platforms. |
-| `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join failed; every created helper was reaped and the affected target `execve` was never attempted. |
+| `version_probe` | `handle_execution_unavailable` | A Unix platform with process-group supervision cannot execute the retained authorized handle without reopening its pathname, so no anchor or target child was started. |
+| `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join failed; every created helper was reaped and the affected target handle exec was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
 | `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
 | `version_probe` | `lingering_process_group` | The root exited but a non-anchor member remained in the anchored Unix process group; version success was suppressed and cleanup started. |
@@ -525,18 +550,21 @@ candidate digest, one closed exec sequence (`none`, `single`, or
 | `inspection_failed` | Open or later inspection failed; this is terminal and requires the matching B-008 identity failure. |
 | `inspection_target` | Configuration-source or resolved-target repository policy retained this first authorized inspection identity and stopped without exec. |
 | `authorization_unavailable` | Final-target repository/worktree classification could not be proven; this is terminal and requires `target_authorization_unavailable`. |
-| `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join failed, every created helper was reaped, and the affected target never attempted `execve`; this is terminal and requires the matching version-probe failure. |
+| `handle_execution_unavailable` | No safe retained-handle exec primitive exists; this is terminal, uses no exec sequence, and requires the matching version-probe failure. |
+| `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join failed, every created helper was reaped, and the affected target never attempted handle exec; this is terminal and requires the matching version-probe failure. |
 | `retry_not_authorized` | After first exec returned `ETXTBSY`, the repeated checkpoint classified the target as repository-owned; requires `probe_not_authorized` with exact reason `resolved_target_repository` and forbids a second exec. |
 | `retry_authorization_unavailable` | After first exec returned `ETXTBSY`, the repeated checkpoint could not prove target authorization; requires `target_authorization_unavailable` and forbids a second exec. |
-| `exec_eacces` | Direct `execve` returned exact `EACCES`; final identity is discarded and search continues. |
-| `exec_failed` | Direct `execve` returned another terminal error; requires `spawn_failed` and no selected/executed claim. |
-| `exec_started` | Direct `execve` succeeded; this is the sole terminal selected executable. |
+| `exec_eacces` | Direct retained-handle exec returned exact `EACCES`; final identity is discarded and search continues. |
+| `exec_failed` | Direct retained-handle exec returned another terminal error; requires `spawn_failed` and no selected/executed claim. |
+| `exec_started` | Direct retained-handle exec succeeded; this is the sole terminal selected executable. |
 
 Parsers preserve list order and reject more than 64 attempts, an outcome after
 a terminal outcome, any exec outcome after identity-only authorization,
 multiple terminal outcomes, `inspection_target` without
 `probe_not_authorized` and its closed source-or-target reason,
 `authorization_unavailable` without `target_authorization_unavailable`,
+`handle_execution_unavailable` without the matching
+`version_probe/handle_execution_unavailable`,
 `supervision_setup_failed` without the matching
 `version_probe/supervision_setup_failed`,
 `retry_not_authorized` without `probe_not_authorized` carrying exact reason
@@ -548,7 +576,8 @@ multiple terminal outcomes, `inspection_target` without
 and no final executable identity exists. `candidate_limit_exceeded` requires
 exactly 64 nonterminal attempts. `path_not_found` permits only skipped outcomes
 and no inspection or selected identity. `none` is required for outcomes that
-terminate before any direct exec; an initial `inspection_failed` uses `none`.
+terminate before any direct exec; an initial `inspection_failed` or
+`handle_execution_unavailable` uses `none`.
 An initial `supervision_setup_failed` requires `none`; `single` is required for
 an ordinary one-exec outcome.
 `etxtbsy_then_checkpoint_after_150_ms` requires an exact first `ETXTBSY` and a
@@ -556,7 +585,7 @@ repeated authorization/identity checkpoint. It permits
 `retry_not_authorized`, `retry_authorization_unavailable`, or
 `inspection_failed` without a second helper, and
 `supervision_setup_failed` when the second helper's group join fails before its
-`execve`; `exec_eacces` for a bare name, `exec_failed`, or `exec_started` proves
+target handle exec; `exec_eacces` for a bare name, `exec_failed`, or `exec_started` proves
 the second target exec was attempted. It is rejected for every initial skip,
 inspection-only, or authorization-unavailable outcome.
 Absolute/qualified attempts reject `exec_eacces`, because their `EACCES` is
@@ -590,7 +619,7 @@ terminal `exec_failed`.
       and cannot be caller pre-encoded. Strict parser fixtures reject missing,
       malformed, noncanonical, and payload-wrong role suffixes.
 - [ ] PATH fixtures prove Unix child-working-directory semantics and Windows
-      pinned-Rust search order/`.exe` behavior, including Windows refusal to use
+      frozen search order/`.exe` behavior, including Windows refusal to use
       `PATHEXT`, accept any explicitly named non-`.exe` extension, execute
       `.bat`/`.cmd` through a shell, or guess a qualified-relative base; both
       platforms cover an absent command, duplicate basenames, spaces, literal
@@ -602,6 +631,11 @@ terminal `exec_failed`.
       and no search fallback for absolute or qualified commands. Injected open
       denial is `open_failed`, mutually exclusive with handle-based failures,
       and never leaks OS diagnostics.
+- [ ] Unix bare-name PATH-unset fixtures return `path_unusable` without
+      observing a default search path, while absolute and qualified commands
+      remain representable; Windows conformance compares the frozen resolver
+      against the adapter's current `Command` behavior and fails on drift
+      instead of adopting it.
 - [ ] Unix attempt fixtures round-trip every closed outcome, reject illegal
       source/outcome/failure/terminal combinations, preserve duplicate PATH
       entries and order, cover exactly 64 candidates and candidate 65, and
@@ -616,20 +650,31 @@ terminal `exec_failed`.
       absent from serialized evidence. Independent hard-coded vectors also
       freeze the exact platform tags, `u64` big-endian counts, candidate digest
       domain, and Windows little-endian `u16` units.
+- [ ] Windows resolution-context fixtures freeze the four exact fields, domains,
+      absent/present states, UTF-16LE framing, and independent `C:\X` vectors
+      for current-executable directory, system directory, Windows directory,
+      and parent PATH.
 - [ ] Unix launch fixtures prove bare, qualified, and absolute probes pass the
-      inspected absolute candidate as the executable pathname while preserving
+      retained authorized handle to the no-path exec primitive while preserving
       the exact configured command bytes as `argv[0]`.
 - [ ] A Unix interpreter-launcher fixture proves that sanitized child `PATH` is
       identical for resolution and child execution, while a setup-only secret
       named `NPM_ACCESS` is absent from the child and from serialized facts.
 - [ ] Identity fixtures prove handle-based metadata/hash consistency, before-
-      and during-read size limits, nonblocking async execution, Unix
+      and during-read fixed 67,108,864-byte size limit plus limit-plus-one,
+      nonblocking async execution, Unix
       nonblocking-open rejection of FIFOs and other special files, Unix
       mode-bit checks, Windows strong file-ID checks without a fabricated
       executable claim, pre-spawn/post-reap retained-handle rehashing, and
       explicit `identity_changed` evidence for path replacement or in-place
       rewrite; FIFO swaps at both later nonblocking checkpoint reopens cannot
       hang.
+- [ ] Authorization-race fixtures replace the pathname after the final
+      checkpoint and prove the retained authorized handle—not replacement
+      repository code—executes; supervised Unix platforms without
+      retained-handle exec emit `handle_execution_unavailable` before anchor or
+      target creation and never fall back to a pathname. Windows independently
+      returns `containment_unavailable` first under its frozen platform matrix.
 - [ ] Lifecycle fixtures use hanging and unbounded dual-stream children to
       reject output caps 0 and 65,537 before allocation or helper creation and
       prove 1, 65,536, exact combined limit, and limit-plus-one behavior; owner
@@ -686,7 +731,9 @@ terminal `exec_failed`.
       annotation object contains a schema-keyword-shaped key; object/boolean
       `items` traverses schema context while legacy array `items` preserves
       order and `additionalItems` remains schema context; every
-      `dependentRequired` property array is a canonical string set.
+      `dependentRequired` property array is a canonical string set; nested
+      `contentSchema.required` and `contentSchema.oneOf` canonicalize in schema
+      context.
 - [ ] Duplicate JSON keys and malformed raw schemas fail typed before digesting,
       and public API/call-site audit proves no generic serializable or
       `serde_json::Value` evidence constructor exists.
