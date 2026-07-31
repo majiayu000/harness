@@ -86,24 +86,56 @@ fn flattened_prompt_without_layers_does_not_cross_associate_with_similar_prompt(
 }
 
 #[test]
-fn explicit_layers_keep_similar_prompts_test_isolated() {
-    let short_layers = AgentPromptLayers::new("static\n", "context\n", "dynamic\n");
-    let long_layers = AgentPromptLayers::new("static\ncontext\n", "dynamic\n", "runtime\n");
+fn concurrent_similar_prompts_keep_explicit_layer_attribution() {
+    let short_static = AgentPromptLayers::new("static\n", "context\n", "dynamic\n");
+    let long_static = AgentPromptLayers::new("static\ncontext\n", "dynamic\n", "");
+    assert_eq!(
+        short_static.to_prompt_string(),
+        long_static.to_prompt_string()
+    );
 
-    let short_request =
-        AgentRequest::from_prompt_layers(short_layers, PathBuf::from("/tmp/project"));
-    let long_request = AgentRequest::from_prompt_layers(long_layers, PathBuf::from("/tmp/project"));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let spawn_request = |layers: AgentPromptLayers| {
+        let barrier = std::sync::Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            let request = AgentRequest::from_prompt_layers(layers, PathBuf::from("/tmp/project"));
+            barrier.wait();
+            let system_prompt = request
+                .claude_system_prompt()
+                .map(|prompt| prompt.into_owned());
+            let main_prompt = request.claude_main_prompt().into_owned();
+            (request.prompt, system_prompt, main_prompt)
+        })
+    };
+
+    let short_static_request = spawn_request(short_static);
+    let long_static_request = spawn_request(long_static);
+    let short_static_request = match short_static_request.join() {
+        Ok(request) => request,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    let long_static_request = match long_static_request.join() {
+        Ok(request) => request,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
 
     assert_eq!(
-        short_request.claude_system_prompt().as_deref(),
-        Some("static\n")
+        short_static_request,
+        (
+            "static\ncontext\ndynamic\n".to_string(),
+            Some("static\n".to_string()),
+            "context\ndynamic\n".to_string(),
+        )
     );
-    assert_eq!(short_request.claude_main_prompt(), "context\ndynamic\n");
     assert_eq!(
-        long_request.claude_system_prompt().as_deref(),
-        Some("static\ncontext\n")
+        long_static_request,
+        (
+            "static\ncontext\ndynamic\n".to_string(),
+            Some("static\ncontext\n".to_string()),
+            "dynamic\n".to_string(),
+        )
     );
-    assert_eq!(long_request.claude_main_prompt(), "dynamic\nruntime\n");
 }
 
 #[test]
