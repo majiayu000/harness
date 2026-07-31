@@ -210,12 +210,22 @@ role source above and emits
 an `agent_runtime` component with the same exact-byte integrity or absence.
 Multiple roles may truthfully share the base exact-source digest; integrity is
 not identity and never includes role text, locator, executable bytes, or
-payload. For MCP tools, the constructor accepts an existing validated
-`mcp_server` component, the exact advertised tool name, optional exact
-description, and raw input-schema JSON. It accepts no separate tool source.
+payload.
 
-A private typed `McpToolSource::derive` mapping preserves the server source
-scope and appends
+For MCP tools, the constructor accepts a `ConfiguredMcpServerBinding`, exact
+advertised tool name, optional exact description, and raw input-schema JSON.
+It accepts no arbitrary `mcp_server` component or separate server/tool source.
+The typed binding contains a validated base ownership source and the exact
+nonblank UTF-8 stable key of one persisted MCP configuration entry. Its only
+constructor derives
+`harness_mcp_server_config_v0_1/u<byte_length>_<lowercase_utf8_hex>` beneath
+the base locator; there is no constructor from a component, display label,
+UUID, session ID, or already encoded locator. This binds observations to the
+configured key but deliberately does not claim historical proof that an
+external caller persisted the same key across earlier observations.
+
+A private typed `McpToolSource::derive` mapping preserves the configured
+server source scope and appends
 `harness_mcp_tool_v0_1/u<byte_length>_<lowercase_utf8_hex>` to the server
 locator. The exact UTF-8 byte length and lowercase hexadecimal bytes make the
 mapping reversible, injective, case-sensitive, and distinct for every tool on
@@ -226,21 +236,33 @@ than canonical raw source bytes, the tool component integrity is absent.
 
 Both components use `runner_observed`, `runner_observed`, `observed`, and
 `fresh`, while retaining the supplied or derived scope and locator. Blank tool
-names, wrong server kind, generated per-observation server identity,
-UUID/display ownership, malformed derived locators, caller-supplied encodings,
-and duplicate component identity fail before hashing. No
+names or stable keys, wrong server kind, malformed or noncanonical derived
+locators, payload/server/tool mismatches, caller-supplied encodings, and
+duplicate component identity fail before hashing. Strict envelope parsing
+peels and re-derives both suffixes and requires the payload server ID and exact
+tool name to match them. No
 `stable_logical_segment` or caller-facing encoder may turn invalid input into a
 valid source. Fixtures cover every ASC-001 source scope, multiple exact tool
-names on one server, and component IDs before and after runner observation.
+names on one configured server, distinct configured keys, parser mismatch
+rejection, and component IDs before and after runner observation.
 This implements B-003 and B-011.
 
-Runtime version-probe authorization is a separate private closed mapping from
-`AgentStackSourceScope`. `Repository` maps to `IdentityOnly`: resolution,
+Runtime version-probe authorization is a private conjunction of source and
+opened-target policy. `Repository` source maps to `IdentityOnly`; resolution,
 handle inspection, and hashing may run, but the payload records
-`version_probe/probe_not_authorized` and no process is created. `UserGlobal`,
-`Admin`, `System`, `Runtime`, and genuine `Runner` map to
-`VersionProbeEligible`. There is no caller boolean, string trust level, or
-builder that can promote a repository source. This execution policy does not
+`version_probe/probe_not_authorized` with
+`configuration_source_repository`, and no process is created. `UserGlobal`,
+`Admin`, `System`, `Runtime`, and genuine `Runner` pass only the source half.
+After opening the target, the producer resolves the final handle path and
+compares it, with platform-correct component and case semantics, against every
+canonical root in a typed `ValidatedRepositoryBoundarySet` derived from the
+declared project repository and linked worktree roots. A target inside any
+boundary maps to `IdentityOnly` with `resolved_target_repository`. Missing,
+incomplete, renamed, or ambiguous final-handle/boundary evidence records
+`target_authorization_unavailable`. Only a target proven outside every
+boundary becomes `VersionProbeEligible`. Raw roots and final paths are never
+serialized. There is no caller boolean, string trust level, path label, or
+builder that can promote either identity-only result. This policy does not
 reinterpret ASC-001 observation or trust metadata.
 
 Tool name and description are copied as exact UTF-8 strings. The producer does
@@ -255,7 +277,9 @@ the Rust toolchain search behavior used by the adapter; Unix freezes the
 explicit safe subset below. The input carries a typed
 `RuntimeLaunchContext`: platform, configured child working directory,
 sanitized child `PATH`, and every platform search base that the resolver needs
-but must not infer.
+but must not infer. It also carries the validated repository boundary set used
+only for B-007 target authorization; an absent or incomplete set can still
+produce identity evidence but can never authorize process creation.
 
 Before resolution, the producer computes `configured_command_digest` from a
 domain-separated exact OS-string representation:
@@ -320,13 +344,17 @@ SHA-256(
 The tags, counts, and exact units are encoded identically to
 `configured_command_digest`. The closed `RuntimeResolutionAttemptOutcome` is
 exactly `Absent`, `NotRegular`, `NotExecutable`, `InspectionFailed`,
-`InspectionTarget`, `ExecEacces`, `ExecFailed`, or `ExecStarted`. Attempts
-preserve PATH order and duplicates; they are never sorted.
+`InspectionTarget`, `AuthorizationUnavailable`, `ExecEacces`, `ExecFailed`, or
+`ExecStarted`. Attempts preserve PATH order and duplicates; they are never
+sorted.
 
 The parser enforces a finite-state contract. Skipped outcomes and `ExecEacces`
 may precede one terminal outcome. `InspectionFailed` requires the matching
-identity failure. `InspectionTarget` is permitted only for a repository source
-with `probe_not_authorized` and forbids all exec outcomes. `ExecFailed`
+identity failure. `InspectionTarget` is permitted only with
+`probe_not_authorized` and one closed configuration-source or resolved-target
+repository reason, and forbids all exec outcomes. `AuthorizationUnavailable`
+requires exactly `target_authorization_unavailable`, is terminal, and forbids
+exec, fallback, or selected identity. `ExecFailed`
 requires `spawn_failed`; `ExecStarted` forbids a spawn failure and is the only
 outcome that creates a selected/executed identity. A sequence containing only
 skips yields `path_not_found`; one ending in `ExecEacces` with no final identity
@@ -338,9 +366,12 @@ entries fail parsing.
 Failed candidates contribute no final executable identity. Repository-owned
 bare commands stop after the first statically eligible successful inspection,
 record that handle as an `inspection_target`, emit `probe_not_authorized`, and
-never enter pre-exec or fallback. An earlier open or identity failure wins and
-no authorization failure is appended. Fault-injection tests freeze these paths
-without requiring CI to mount a `noexec` filesystem.
+never enter pre-exec or fallback. The same stop applies to any otherwise
+eligible source whose opened target is inside a repository/worktree boundary.
+An earlier open or identity failure wins and no authorization failure is
+appended. Unavailable target authorization also stops without exec or fallback.
+Fault-injection tests freeze these paths without requiring CI to mount a
+`noexec` filesystem.
 
 All `CString` path, argument, and environment storage and pointer arrays are
 built and NUL-validated in the parent. The audited Unix pre-exec closure uses
@@ -415,8 +446,14 @@ never enter the envelope. These rules implement B-005 and B-010.
 ## Handle-Based Executable Observation and TOCTOU Policy
 
 After resolution, one blocking inspection closure opens the selected target
-once and operates on that file handle. It obtains handle metadata, proves the
-target is a regular file, and incrementally hashes fixed-size chunks. Unix also
+once and operates on that file handle. On Unix it first uses path metadata only
+to skip a target already known to be non-regular, then calls `libc::open` with
+`O_RDONLY | O_CLOEXEC | O_NONBLOCK`; it never uses a potentially blocking
+ordinary `File::open` on an unclassified path. Handle `fstat` is authoritative
+after open and rejects a FIFO, socket, directory, device, or any race-swapped
+non-regular target before reading. Symlinks are classified by the opened final
+target. The retained regular handle remains nonblocking, which does not alter
+regular-file reads, and is incrementally hashed in fixed-size chunks. Unix also
 derives execute permission from handle mode bits. Windows extension/search
 eligibility belongs to resolution and successful OS loading belongs to spawn;
 the producer does not claim that an extension or parsed PE header proves
@@ -443,8 +480,12 @@ The retained strong identity is device/inode from handle metadata on Unix and
 volume serial plus 128-bit `FILE_ID_INFO` from the opened handle on Windows.
 Path, mtime, extension, or a weaker optional metadata field is not a fallback.
 If the opened handle cannot provide the specified strong identity, the producer
-records `identity/metadata_unavailable` before version attribution.
-`path_unusable` remains exclusive to resolution. Immediately before spawn and
+records `identity/metadata_unavailable` before version attribution. Before the
+pre-spawn checkpoint, platform handle APIs must also return the final target
+path used by the B-007 boundary classifier. Failure to prove that target lies
+outside every validated repository/worktree root records
+`target_authorization_unavailable` or `probe_not_authorized` and stops without
+spawn. `path_unusable` remains exclusive to resolution. Immediately before spawn and
 again after the child is reaped, one blocking checkpoint re-reads and re-hashes
 the retained handle and opens the resolved path to compare strong identity.
 All three retained-handle size and digest observations must match, and both
@@ -471,16 +512,24 @@ descendant containment: a Unix child may call `setsid` or change process groups,
 so the producer can prove only root status and observations about processes
 that remain in the original group. It never emits a whole-descendant-tree-empty
 claim. A non-escapable Linux/macOS sandbox is outside this packet, and the
-closed source policy prevents repository-owned code from reaching this probe.
+closed source-plus-opened-target policy prevents repository/worktree code from
+reaching this probe.
 
-Every explicit timeout, overflow, or read-error path attempts, under one
-private nonzero five-second monotonic
-`RUNTIME_FINGERPRINT_CLEANUP_DEADLINE`, to signal the negative process-group
-ID, drain both pipes within the remaining budget, reap the root, and verify the
-original group is empty. If all operations complete, the envelope carries only
-the triggering `version_probe` failure. If an operation fails or the deadline
-expires, the envelope also carries the applicable closed
-`lifecycle_cleanup` failure:
+Every terminal path reaps the root and checks original-group emptiness before
+it can publish a result. A zero exit and valid output is only a provisional
+success until that check proves the group empty. If the group remains
+populated, the producer records `version_probe/lingering_process_group`,
+discards the provisional version, and starts cleanup. Existing timeout,
+overflow, output-read, nonzero/signal, and parse failures also enter cleanup
+whenever their root or original group remains live.
+
+Under one private nonzero five-second monotonic
+`RUNTIME_FINGERPRINT_CLEANUP_DEADLINE`, cleanup signals the negative
+process-group ID, drains or closes both pipes within the remaining budget,
+reaps the root if not already reaped, and verifies the original group is empty.
+If all operations complete, the envelope carries only the triggering
+`version_probe` failure. If an operation fails or the deadline expires, the
+envelope also carries the applicable closed `lifecycle_cleanup` failure:
 
 | Cleanup kind | Trigger |
 | --- | --- |
@@ -495,8 +544,9 @@ whole-tree claim, and transfers child/group ownership to a
 fingerprint-specific runtime-independent owner before returning evidence. The
 owner emits an `error`, keeps ownership, and continues signalling, reaping, and
 original-group verification; later success does not rewrite an already emitted
-fingerprint. This prevents an escaped pipe holder from blocking the API
-indefinitely while remaining honest about the limited process-group evidence.
+fingerprint. This prevents both an escaped pipe holder and a normal root that
+leaves a same-group child from blocking the API or yielding false success while
+remaining honest about the limited process-group evidence.
 
 Caller cancellation synchronously signals the original process group and uses
 the same ownership transfer, but emits no envelope. The owner survives
@@ -526,8 +576,10 @@ may close read handles rather than waiting forever for EOF. No lifecycle or
 cleanup failure can produce a version fact.
 
 The canonical failure record contains only closed enums and compatible bounded
-details: an exit code, byte limit, timeout milliseconds, or closed cleanup
-operation where applicable.
+details: an exit code, byte limit, timeout milliseconds, closed
+`RuntimeProbeAuthorizationReason`
+(`ConfigurationSourceRepository` or `ResolvedTargetRepository`), or closed
+cleanup operation where applicable.
 It never contains `io::Error` text, localized diagnostics, raw output, raw
 paths, or environment values. Define closed `RuntimeProbePhase` and
 `RuntimeProbeFailureKind` enums for every row in the B-008 table. Constructors
@@ -541,11 +593,13 @@ The result-state matrix is fail closed:
 | path resolution failure | no resolved identity, executable digest, or version |
 | open failure | configured-command and resolution-attempt digests only; no handle, executable digest, child, or version |
 | later identity failure | bounded opened-handle facts only; no stable executable digest/version pair |
-| repository probe not authorized | one `inspection_target` identity/hash may remain; no selected/executed identity, exec attempt, fallback, child, or version |
+| source/target repository probe not authorized | one `inspection_target` identity/hash may remain with the closed authorization reason; no selected/executed identity, exec attempt, fallback, child, or version |
+| target authorization unavailable | inspected identity/hash may remain; no selected/executed identity, exec attempt, fallback, child, or version |
 | Unix bare-name `bare_eacces_exhausted` | configured-command, search, and ordered attempt digests may remain; every inspected-candidate identity is discarded and no final executable identity, child, or version exists |
 | supervision unavailable | stable identity may remain; no child was spawned and version is absent |
 | terminal pre-start `spawn_failed` | the inspected target identity may remain, but no selected/executed identity or version exists |
 | post-`exec_started` lifecycle/exit/output failure | the selected/executed identity may remain; version is absent |
+| root exited with a populated original group | `lingering_process_group` is required; selected/executed identity may remain, version is absent, and cleanup must run |
 | cleanup failure | stable identity may remain; version and completed-cleanup claims are absent; independent owner continues |
 | `identity_changed` after exit | candidate output/version is discarded |
 | caller cancellation | no envelope; cleanup ownership survives Tokio shutdown and is never abandoned |
@@ -591,8 +645,12 @@ grammar revision, not a heuristic first-token fallback. This implements B-009.
 `McpInputSchema` exposes only `from_json_str` and `from_json_slice`. Both start
 from raw JSON and use a duplicate-detecting serde visitor rather than first
 decoding to `serde_json::Value`, because the latter can overwrite an earlier
-duplicate key. Malformed JSON and duplicate-object-key errors remain typed and
-occur before canonicalization or digesting. There is no public
+duplicate key. After parse and before canonicalization, the root must be an
+object; root boolean, array, string, number, and null values return a typed
+`RootNotObject` contract error and emit no digest. Boolean schemas remain legal
+only in schema-valued child positions. Malformed JSON and
+duplicate-object-key errors remain typed and occur before canonicalization or
+digesting. There is no public
 `from_serializable`, `serde_json::Value`, or typed-map evidence constructor:
 after ordinary decoding, original duplicate-key absence cannot be attested.
 
@@ -664,15 +722,15 @@ owns user-facing collection commands. This is B-016.
 | --- | --- |
 | B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch`; `fingerprint_digest_is_separate_from_component_integrity`; `failure_payload_changes_fingerprint_digest_without_fabricating_integrity`; `component_integrity_preserves_exact_source_bytes_or_absence` |
 | B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
-| B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `caller_cannot_supply_preencoded_mcp_tool_source` |
-| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_fallback`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `runtime_resolution_attempts_round_trip_all_outcomes`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
+| B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
+| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_fallback`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `runtime_resolution_attempts_round_trip_all_outcomes`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
 | B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
-| B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
-| B-007 | Unix `ordinary_timeout_reaps_root_and_verifies_original_group`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; Windows `containment_unavailable_prevents_spawn` |
+| B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
+| B-007 | Unix `ordinary_timeout_reaps_root_and_verifies_original_group`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_requires_empty_original_group`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; Windows `containment_unavailable_prevents_spawn` |
 | B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
 | B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `both_streams_are_parsed_before_selection`; `same_version_on_both_streams_is_ambiguous`; `valid_version_with_nonblank_other_stream_is_unparseable`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; exact-limit and limit-plus-one tool-name/description fixtures |
-| B-013 | `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `object_form_items_traverses_nested_schema`; `object_form_items_required_and_one_of_reorder_canonically`; `legacy_array_items_preserves_tuple_order`; `boolean_items_is_canonical_schema`; `raw_schema_rejects_duplicate_keys`; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
+| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `object_form_items_traverses_nested_schema`; `object_form_items_required_and_one_of_reorder_canonically`; `legacy_array_items_preserves_tuple_order`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
 
 All failure tests assert the absence of a version fact and the absence of raw
@@ -788,8 +846,9 @@ fall back to the unsafe pre-spec PATH/environment behavior.
 - Treating a Unix process group as non-escapable descendant containment is
   rejected: v0.1 records only root and original-group observations.
 - Executing repository-owned code merely to obtain `--version` is rejected:
-  repository sources produce identity-only evidence with
-  `probe_not_authorized` until a separately specified hardened sandbox exists.
+  repository sources and any resolved repository/worktree target produce
+  identity-only evidence with `probe_not_authorized` until a separately
+  specified hardened sandbox exists.
 - Caller-declared environment sensitivity or exposure is rejected: the closed
   runtime-kind table is the only policy.
 - Unbounded MCP parsing/canonicalization is rejected: every v0.1 contract limit

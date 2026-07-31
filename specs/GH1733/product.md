@@ -162,7 +162,9 @@ facts in snapshots or through a CLI.
    Repository-owned bare commands stop after the first statically eligible,
    successfully inspected candidate, record its identity as
    `inspection_target` plus `probe_not_authorized`, and perform no exec attempt
-   or fallback. That target is never called selected or executed. An earlier
+   or fallback. The same stop applies when any otherwise eligible source
+   resolves to an opened target inside a validated repository/worktree
+   boundary. That target is never called selected or executed. An earlier
    open/identity failure remains the sole earliest failure.
 5. **B-005:** The version child receives only the sanitized `PATH` value
    included in the B-004 launch context so `#!/usr/bin/env` launchers can find
@@ -178,8 +180,13 @@ facts in snapshots or through a CLI.
    `codex --version` or an equivalent child.
 6. **B-006:** Executable identity comes from one opened regular-file handle,
    not separate path-based metadata and content reads. Size and SHA-256 cover
-   the bytes read from that handle. Unix executable permission is derived from
-   handle metadata; Windows candidate eligibility comes from the B-004
+   the bytes read from that handle. Unix first rejects a path already known to
+   be non-regular, then opens the remaining candidate with nonblocking,
+   close-on-exec semantics and treats handle metadata as authoritative before
+   any read. A FIFO, socket, directory, or device cannot block the producer
+   while waiting for ordinary read access and never reaches hashing. Unix
+   executable permission is derived from handle metadata; Windows candidate
+   eligibility comes from the B-004
    filename/search contract, while actual loadability can be proven only by a
    successful supervised spawn. On a platform where process supervision is
    available, a bad image or access error is `spawn_failed`, not a fabricated
@@ -200,11 +207,17 @@ facts in snapshots or through a CLI.
    so it is not proof that the executed bytes equal the digest.
 7. **B-007:** A version probe has one lifecycle covering authorization, spawn,
    concurrent stdout/stderr reads, exit, timeout, cleanup, and root reap.
-   Repository-owned executables are identity-only evidence:
-   `probe_not_authorized` is recorded after inspection and no child is spawned.
-   User-global, admin, system, runtime, and genuine runner sources are eligible
-   under this closed source-scope policy; callers cannot override it with a
-   boolean or trust string. Stdout and stderr are read incrementally under one
+   Authorization is the conjunction of configuration-source policy and opened
+   target policy. Repository-owned configuration and any opened executable
+   proven inside a validated repository/worktree boundary are identity-only:
+   `probe_not_authorized` carries the closed reason
+   `configuration_source_repository` or `resolved_target_repository`, and no
+   child is spawned. User-global, admin, system, runtime, and genuine runner
+   sources are eligible only when the opened target is proven outside every
+   validated boundary. Missing or ambiguous final-target/boundary evidence is
+   `target_authorization_unavailable` and prevents spawn. Callers cannot
+   override either decision with a boolean, path label, or trust string. Stdout
+   and stderr are read incrementally under one
    inclusive hard combined byte limit: exactly `max_output_bytes` is allowed,
    while observing byte `max_output_bytes + 1` triggers
    `output_limit_exceeded`.
@@ -217,20 +230,24 @@ facts in snapshots or through a CLI.
    assign a Job Object before execution, `containment_unavailable` is recorded
    without spawning.
 
-   Explicit timeout, overflow, or read failure starts group termination,
-   bounded pipe drain, root reap, and original-group verification under a fixed
-   five-second monotonic cleanup deadline. If all complete, only the triggering
-   probe failure is recorded. If signalling, drain, reap, or verification
-   fails or the deadline expires, the applicable closed `lifecycle_cleanup`
-   failure is also recorded, read handles are closed, and ownership transfers
-   to a fingerprint-specific runtime-independent cleanup owner before the API
-   returns. That owner emits an `error`, retains ownership, and continues
-   signalling, reaping, and original-group verification; it never silently
-   abandons the child. Caller cancellation follows the same transfer but emits
-   no fingerprint. Root-only `kill_on_drop` and the existing detached
-   `ManagedChild` reaper are not completion evidence. Output is never fully
-   buffered and then truncated, and no lifecycle or cleanup failure contains a
-   version fact.
+   Every terminal path, including a zero exit with apparently valid output,
+   reaps the root and verifies the original group is empty before success is
+   possible. A group still populated after root exit records
+   `lingering_process_group`, suppresses version success, and starts group
+   termination. Timeout, overflow, read failure, and any lingering group run
+   bounded pipe drain, root reap where still needed, and original-group
+   verification under one fixed five-second monotonic cleanup deadline. If all
+   complete, only the triggering probe failure is recorded. If signalling,
+   drain, reap, or verification fails or the deadline expires, the applicable
+   closed `lifecycle_cleanup` failure is also recorded, read handles are closed,
+   and ownership transfers to a fingerprint-specific runtime-independent
+   cleanup owner before the API returns. That owner emits an `error`, retains
+   ownership, and continues signalling, reaping, and original-group
+   verification; it never silently abandons the child. Caller cancellation
+   follows the same transfer but emits no fingerprint. Root-only
+   `kill_on_drop` and the existing detached `ManagedChild` reaper are not
+   completion evidence. Output is never fully buffered and then truncated, and
+   no lifecycle or cleanup failure contains a version fact.
 8. **B-008:** Probe incompleteness is represented by closed typed phase and
    kind values, not caller-defined strings. The v0.1 vocabulary is the table
    below. A failure record contains bounded, redacted structured facts only,
@@ -271,18 +288,28 @@ facts in snapshots or through a CLI.
     spelling above; a non-ASCII Windows key fails typed rather than guessing OS
     comparison semantics. Raw values, raw paths, and directory contents never
     enter the envelope.
-11. **B-011:** An MCP tool producer requires a validated MCP server component
-    and exact advertised tool name; callers cannot supply a separate or
-    pre-encoded tool source. A typed v0.1 mapping preserves the server source
+11. **B-011:** An MCP tool producer requires a typed configured-server binding
+    made from a validated ownership source and the exact stable key of a
+    persisted MCP configuration entry; it does not accept an arbitrary
+    prebuilt `mcp_server` component, display label, UUID, or session identity.
+    The binding derives the server locator as
+    `<base_locator>/harness_mcp_server_config_v0_1/u<byte_length>_<lowercase_utf8_hex>`
+    from that exact nonblank UTF-8 key. The tool producer also requires the
+    exact advertised tool name; callers cannot supply a separate or pre-encoded
+    server or tool source. A typed v0.1 mapping preserves the server source
     scope and derives the tool locator as
     `<server_locator>/harness_mcp_tool_v0_1/u<byte_length>_<lowercase_utf8_hex>`.
     The length-prefixed exact UTF-8 encoding is reversible, injective, and
     case-sensitive, so multiple tools from one server cannot collide. Runner
     observation describes who obtained the contract and never changes ownership
-    scope. The derived structured tool binding has no canonical raw source bytes,
-    so ASC-001 component integrity is absent. Blank names, wrong server kind,
-    generated per-observation server identity, UUID/display-alias ownership,
-    malformed derived locators, and caller-supplied encodings fail closed.
+    scope. The derived structured tool binding has no canonical raw source
+    bytes, so ASC-001 component integrity is absent. Strict parsing validates
+    both derived suffixes and requires the payload server ID and tool name to
+    match them. Blank stable keys or names, wrong server kind, malformed or
+    noncanonical derived locators, payload mismatches, and caller-supplied
+    encodings fail closed. This contract binds identity to the exact stable
+    configuration key; it does not claim historical proof that a caller kept
+    the same key across observations.
 12. **B-012:** MCP tool name and optional description are fingerprinted exactly
     as advertised in their UTF-8 string values. The producer does not trim,
     collapse, case-fold, Unicode-normalize, or otherwise rewrite whitespace or
@@ -292,8 +319,11 @@ facts in snapshots or through a CLI.
     tool name of at most 1,024 UTF-8 bytes and a description of at most 65,536
     UTF-8 bytes; exact limits are allowed and limit-plus-one fails typed before
     fingerprint construction.
-13. **B-013:** MCP input-schema canonicalization is context-aware. JSON object
-    member order is canonicalized lexicographically. Only arrays at the closed
+13. **B-013:** An MCP input schema must have a JSON object at its root; a root
+    boolean, array, string, number, or null fails typed before canonicalization
+    or digest construction. Boolean schemas remain legal only at schema-valued
+    child positions. Within that object, canonicalization is context-aware.
+    JSON object member order is canonicalized lexicographically. Only arrays at the closed
     order-insensitive schema-keyword locations `required`, `type`, `enum`,
     `allOf`, `anyOf`, and `oneOf` are sorted, and schema-valued children are
     traversed as schemas. Ordered schema locations such as `prefixItems`, all
@@ -359,10 +389,12 @@ facts in snapshots or through a CLI.
 | `identity` | `executable_too_large` | The byte ceiling was exceeded before or during hashing. |
 | `identity` | `read_failed` | The opened executable could not be read completely. |
 | `identity` | `identity_changed` | Path strong identity or retained-handle size/content digest changed across checkpoints. |
-| `version_probe` | `probe_not_authorized` | Closed source-scope policy forbids executing this inspected executable; no child was started. |
+| `version_probe` | `probe_not_authorized` | Configuration-source or resolved-target repository policy forbids executing this inspected target; the closed reason identifies which and no child was started. |
+| `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary, so no child was started. |
 | `version_probe` | `containment_unavailable` | Required pre-spawn process supervision could not be established, so no child was started; the name does not claim non-escapable containment on supported platforms. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
 | `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
+| `version_probe` | `lingering_process_group` | The root exited but the original Unix process group was still populated; version success was suppressed and cleanup started. |
 | `version_probe` | `timeout` | The probe deadline expired; cleanup outcome is represented independently. |
 | `version_probe` | `output_limit_exceeded` | Combined stdout/stderr exceeded the inclusive hard byte limit; cleanup outcome is represented independently. |
 | `version_probe` | `output_read_failed` | Either output pipe failed before a complete bounded result was obtained. |
@@ -389,14 +421,17 @@ a candidate digest and one closed outcome:
 | `not_regular` | Opened candidate is not a regular file; search continues without a global identity failure. |
 | `not_executable` | Opened candidate lacks required mode bits; search continues without a global identity failure. |
 | `inspection_failed` | Open or later inspection failed; this is terminal and requires the matching B-008 identity failure. |
-| `inspection_target` | Repository policy retained this first statically eligible identity and stopped without exec. |
+| `inspection_target` | Configuration-source or resolved-target repository policy retained this first authorized inspection identity and stopped without exec. |
+| `authorization_unavailable` | Final-target repository/worktree classification could not be proven; this is terminal and requires `target_authorization_unavailable`. |
 | `exec_eacces` | Direct `execve` returned exact `EACCES`; final identity is discarded and search continues. |
 | `exec_failed` | Direct `execve` returned another terminal error; requires `spawn_failed` and no selected/executed claim. |
 | `exec_started` | Direct `execve` succeeded; this is the sole terminal selected executable. |
 
 Parsers preserve list order and reject more than 64 attempts, an outcome after
-a terminal outcome, any exec outcome for a repository source, multiple
-terminal outcomes, `inspection_target` without `probe_not_authorized`,
+a terminal outcome, any exec outcome after identity-only authorization,
+multiple terminal outcomes, `inspection_target` without
+`probe_not_authorized` and its closed source-or-target reason,
+`authorization_unavailable` without `target_authorization_unavailable`,
 `exec_failed` without `spawn_failed`, `exec_started` with a spawn failure, or
 `bare_eacces_exhausted` unless the final non-skipped attempt is `exec_eacces`
 and no final executable identity exists. `candidate_limit_exceeded` requires
@@ -421,7 +456,11 @@ and no inspection or selected identity.
       IDs when observation strengthens to `runner_observed`; repository-owned
       runtime fixtures retain identity/hash evidence but emit
       `probe_not_authorized` without executing a marker program, and callers
-      cannot promote that source to an executable trust class. Runtime-role
+      cannot promote that source to an executable trust class. Non-repository
+      source fixtures resolving inside a repository/worktree boundary do the
+      same, while missing or ambiguous target-boundary evidence emits
+      `target_authorization_unavailable`; neither case starts a child or falls
+      through to another PATH candidate. Runtime-role
       fixtures prove the three derived IDs are pairwise distinct for one base
       source, preserve scope and identical exact-source integrity or absence,
       and cannot be caller pre-encoded. Strict parser fixtures reject missing,
@@ -455,10 +494,12 @@ and no inspection or selected identity.
       identical for resolution and child execution, while a setup-only secret
       named `NPM_ACCESS` is absent from the child and from serialized facts.
 - [ ] Identity fixtures prove handle-based metadata/hash consistency, before-
-      and during-read size limits, nonblocking async execution, Unix mode-bit
-      checks, Windows strong file-ID checks without a fabricated executable
-      claim, pre-spawn/post-reap retained-handle rehashing, and explicit
-      `identity_changed` evidence for path replacement or in-place rewrite.
+      and during-read size limits, nonblocking async execution, Unix
+      nonblocking-open rejection of FIFOs and other special files, Unix
+      mode-bit checks, Windows strong file-ID checks without a fabricated
+      executable claim, pre-spawn/post-reap retained-handle rehashing, and
+      explicit `identity_changed` evidence for path replacement or in-place
+      rewrite.
 - [ ] Lifecycle fixtures use hanging and unbounded dual-stream children to
       prove exact combined limit succeeds and limit-plus-one fails; ordinary
       Unix explicit cleanup finishes root/original-group handling within five
@@ -466,9 +507,11 @@ and no inspection or selected identity.
       failures produce canonical `lifecycle_cleanup` evidence and transfer
       ownership without a version; an escaped `setsid` pipe holder cannot yield
       whole-tree-empty evidence or block the API past the cleanup deadline;
-      cancellation transfers ownership to a runtime-independent reaper that
-      survives immediate Tokio shutdown and emits no evidence; Windows v0.1
-      proves `containment_unavailable` is emitted before any child starts.
+      a zero-exit child that leaves a same-group marker process records
+      `lingering_process_group`, suppresses version success, and runs the same
+      cleanup; cancellation transfers ownership to a runtime-independent reaper
+      that survives immediate Tokio shutdown and emits no evidence; Windows
+      v0.1 proves `containment_unavailable` is emitted before any child starts.
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
       sanitized bounded facts, and rejection of unknown values.
 - [ ] Version fixtures cover exact current Codex and Claude product lines,
@@ -484,11 +527,15 @@ and no inspection or selected identity.
       secrets override the closed policy, Unix comparison remains
       case-sensitive, and Windows canonical comparison rejects `Path`/`PATH`
       collisions and non-ASCII keys.
-- [ ] MCP fixtures prove stable ownership, injective typed source derivation for
-      multiple exact UTF-8 tool names on one server, rejection of caller-supplied
-      encoded sources, absent component integrity, exact tool/description
-      sensitivity, and distinct absence, empty, spaces, tabs, and newlines.
-- [ ] Schema fixtures prove object-key and approved set reordering stability;
+- [ ] MCP fixtures prove exact stable configuration-key binding, distinct
+      server IDs for distinct keys, injective typed source derivation for
+      multiple exact UTF-8 tool names on one server, rejection of arbitrary
+      prebuilt server components and caller-supplied encoded sources, strict
+      server/tool suffix parsing, absent tool component integrity, exact
+      tool/description sensitivity, and distinct absence, empty, spaces, tabs,
+      and newlines.
+- [ ] Schema fixtures reject every non-object root before canonicalization and
+      prove object-key and approved set reordering stability;
       ordered `prefixItems`, vendor arrays, and nested arrays under `default`,
       `const`, `examples`, and `example` remain digest-sensitive even when an
       annotation object contains a schema-keyword-shaped key; object/boolean
@@ -517,7 +564,7 @@ and no inspection or selected identity.
 | --- | --- |
 | Empty / missing input | Covered by B-002, B-009, B-011, B-012, and B-015; blank identities and output are explicit errors or failure evidence. |
 | Error and failure paths | Covered by B-006 through B-009 and B-015; every incomplete observation uses the closed vocabulary. |
-| Authorization / permission | Covered by B-004, B-005, B-007, B-010, and B-016; repository-owned code is never executed and the producer gains no shell, caller policy, snapshot, or runtime authority. |
+| Authorization / permission | Covered by B-004, B-005, B-007, B-010, and B-016; repository-owned configuration and resolved repository/worktree targets are never executed, ambiguous target ownership fails closed, and the producer gains no shell, caller policy, snapshot, or runtime authority. |
 | Concurrency / race / ordering | Covered by B-006, B-007, B-008, B-013, and B-014; handle identity, child lifecycle, and canonical ordering are explicit. |
 | Retry / repetition / idempotency | Covered by B-008 and B-014; unchanged bounded facts produce identical records and digests. |
 | Illegal state transitions | N/A. Producers are stateless; B-001 and B-015 reject impossible evidence combinations. |
@@ -537,11 +584,17 @@ and no inspection or selected identity.
   secret, or a non-ASCII environment key.
 - A repository-owned marker executable would write or access the network if
   invoked; fingerprinting must stop after identity/hash evidence.
+- A user-global binding resolves to a repository executable, or final-target
+  containment cannot be proven; neither case may start a child.
 - The executable is a symlink, is replaced, is overwritten in place, or is
   changed and restored between observation checkpoints.
+- A candidate path names a FIFO, socket, directory, or device and must return
+  without a blocking read open.
 - A regular file grows past the byte limit after its first metadata read.
 - A probe hangs, forks, closes only one stream, floods both streams, exits by
   signal, succeeds with blank output, or emits conflicting versions.
+- A zero-exit probe leaves a child in the original process group after closing
+  both output streams.
 - A probe forks a `setsid` descendant that retains an output pipe beyond the
   cleanup deadline; evidence must not claim the whole descendant tree is empty.
 - Version output contains invalid UTF-8 or valid Unicode surrounding an
