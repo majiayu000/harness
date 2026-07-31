@@ -82,6 +82,7 @@ pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProv
 pub use recovery::{
     WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
 };
+pub use runtime_job_state::WorkflowCancellationCleanupOutcome;
 pub use runtime_usage::{
     cost_usd_from_micros, cost_usd_to_micros, RuntimeUsageMetrics, RuntimeUsageRecord,
     RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,

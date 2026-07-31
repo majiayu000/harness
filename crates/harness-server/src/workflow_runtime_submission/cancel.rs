@@ -1,8 +1,9 @@
 use harness_core::config::workflow::{WorkflowActivityPolicy, WorkflowDefinitionPolicy};
 use harness_workflow::runtime::{
     build_declarative_definition, resolve_declarative_definition, DecisionValidator,
-    DeclarativeDefinitionResolution, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
-    WorkflowDecision, WorkflowInstance, WorkflowRuntimeStore, PROMPT_TASK_DEFINITION_ID,
+    DeclarativeDefinitionResolution, WorkflowCancellationCleanupOutcome, WorkflowCommand,
+    WorkflowCommandType, WorkflowDecision, WorkflowInstance, WorkflowRuntimeStore,
+    PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -199,32 +200,23 @@ async fn finish_cancellation_cleanup(
     decision_name: &str,
     remove_prompt: bool,
 ) -> Result<bool, RuntimeSubmissionCancelError> {
-    let commands = store.commands_for(&cancelled.id).await?;
-    if !commands
-        .iter()
-        .any(|command| command.command.command_type == WorkflowCommandType::MarkCancelled)
+    match store
+        .finish_cancellation_cleanup_if_current(
+            cancelled,
+            decision_name,
+            "Runtime submission was cancelled before execution.",
+        )
+        .await?
     {
-        return Ok(false);
-    }
-    for command in commands {
-        if matches!(
-            command.status,
-            WorkflowCommandStatus::Pending
-                | WorkflowCommandStatus::Dispatching
-                | WorkflowCommandStatus::Deferred
-                | WorkflowCommandStatus::Dispatched
-        ) {
-            store
-                .cancel_command_and_unfinished_runtime_jobs(
-                    &command.id,
-                    decision_name,
-                    "Runtime submission was cancelled before execution.",
-                )
-                .await?;
+        WorkflowCancellationCleanupOutcome::Cleaned => {}
+        WorkflowCancellationCleanupOutcome::NoCancellationCommand => return Ok(false),
+        WorkflowCancellationCleanupOutcome::StaleInstance => {
+            return Err(RuntimeSubmissionCancelError::Store(anyhow::anyhow!(
+                "workflow changed before cancellation cleanup could be committed"
+            )));
         }
     }
     cancelled.data = set_data_bool(std::mem::take(&mut cancelled.data), "cancelled", true);
-    store.upsert_instance(cancelled).await?;
     if remove_prompt {
         remove_prompt_submission_prompt_durable(
             store,
@@ -403,10 +395,39 @@ mod tests {
             anyhow::bail!("runtime job should remain queryable");
         };
         assert_eq!(cancelled_job.status, RuntimeJobStatus::Cancelled);
-        let Some(updated) = store.get_instance(&workflow.id).await? else {
+        let Some(mut stale_cancelled) = store.get_instance(&workflow.id).await? else {
             anyhow::bail!("cancelled workflow should remain queryable");
         };
-        assert_eq!(updated.data["cancelled"], true);
+        assert_eq!(stale_cancelled.data["cancelled"], true);
+
+        let mut reopened = stale_cancelled.clone();
+        reopened.state = "planning".to_string();
+        reopened.version += 1;
+        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &reopened).await?;
+        let reopened_command =
+            WorkflowCommand::enqueue_activity("plan_prompt", "retry-cancellation-cleanup-reopened");
+        let reopened_command_id = store
+            .enqueue_command(&workflow.id, None, &reopened_command)
+            .await?;
+
+        let error = match finish_cancellation_cleanup(
+            &store,
+            &mut stale_cancelled,
+            "cancel_prompt_submission",
+            true,
+        )
+        .await
+        {
+            Ok(_) => panic!("stale cancellation cleanup should fail after reopen"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("workflow changed before cancellation cleanup"));
+        let Some(reopened_command) = store.get_command(&reopened_command_id).await? else {
+            anyhow::bail!("reopened workflow command should remain queryable");
+        };
+        assert_eq!(reopened_command.status, WorkflowCommandStatus::Pending);
         Ok(())
     }
 }
