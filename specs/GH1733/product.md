@@ -146,7 +146,10 @@ facts in snapshots or through a CLI.
    entry 65 before a terminal outcome is
    `path_resolution/candidate_limit_exceeded`. After inspection and the pre-spawn
    checkpoint, a direct no-shell `execve` primitive attempts the absolute
-   candidate with fixed B-002 arguments. Only an exact `EACCES` result may
+   candidate with fixed B-002 arguments. Its executable pathname is the
+   inspected absolute candidate, but `argv[0]` is the exact original configured
+   command `OsStr` spelling used by the adapter; resolution never substitutes
+   the candidate spelling into `argv[0]`. Only an exact `EACCES` result may
    discard that bare-name candidate and continue to the next same-basename
    entry. An exact first `ETXTBSY` waits 150 milliseconds, repeats target
    authorization plus the full retained-handle/path identity checkpoint, and
@@ -206,7 +209,10 @@ facts in snapshots or through a CLI.
    executor, and does not allocate the declared maximum eagerly. The retained
    handle is re-read and re-hashed immediately before spawn and after the child
    is reaped; all three size and digest observations must match. At both later
-   checkpoints the resolved path must still identify that handle using
+   checkpoints the resolved path is reopened with the same Unix
+   `O_RDONLY | O_CLOEXEC | O_NONBLOCK` classification as the initial open,
+   rejects a race-swapped non-regular target from handle metadata without
+   blocking, and must still identify the retained handle using
    device/inode on Unix or volume serial plus 128-bit file ID on Windows. If
    strong identity is unavailable, observation fails typed rather than falling
    back to path, timestamps, extension, or a parsed PE header. Replacement,
@@ -228,33 +234,72 @@ facts in snapshots or through a CLI.
    `target_authorization_unavailable` and prevents spawn. Callers cannot
    override either decision with a boolean, path label, or trust string. Stdout
    and stderr are read incrementally under one
-   inclusive hard combined byte limit: exactly `max_output_bytes` is allowed,
+   inclusive hard combined byte limit. The validated public value is in
+   `1..=65_536`; values outside that range fail typed before allocation or
+   process creation. Exactly `max_output_bytes` is allowed,
    while observing byte `max_output_bytes + 1` triggers
    `output_limit_exceeded`.
 
-   On Unix, v0.1 establishes a dedicated process group before exec and claims
-   only `process_group_supervision`: root reap and visibility of members that
-   remain in the original group. A child can call `setsid` or change groups, so
-   v0.1 does not claim non-escapable descendant containment or whole-process-
-   tree emptiness. On Windows, where the existing launcher cannot atomically
+   The active version-probe deadline is the fixed nonzero
+   `RUNTIME_FINGERPRINT_PROBE_DEADLINE = 5_000 ms`. Its monotonic clock starts
+   immediately before anchor creation and includes process-group setup, every
+   target-child attempt, the optional 150 ms `ETXTBSY` delay/retry, output
+   collection, and root exit. Expiry records `timeout`; cleanup receives its
+   own separate five-second deadline.
+
+   On Unix, before any supervision helper or target child is created, v0.1
+   starts a fingerprint-specific runtime-independent cleanup owner and receives
+   a readiness handshake under the separate fixed
+   `RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE = 1_000 ms`, measured monotonically
+   from immediately before thread creation. The owner bootstrap performs no
+   blocking work before sending readiness and observing its cancellation-aware
+   control channel. Thread creation, closed handshake, or deadline expiry closes
+   that channel and starts a separate fixed
+   `RUNTIME_FINGERPRINT_OWNER_STOP_JOIN_DEADLINE = 1_000 ms` from the stop
+   request. The bootstrap owner is joined within that second bound. Failure
+   records `containment_unavailable` with one closed reason
+   (`owner_start_failed`, `owner_ready_timeout`, or
+   `owner_stop_join_timeout`) without creating a child. Caller cancellation
+   during reservation follows the same bounded stop/join path and emits no
+   envelope. The ready owner creates
+   and retains a dedicated process-group anchor, then target children join that
+   anchored group before exec. The anchor remains a live, non-reusable group
+   identity throughout every membership decision and negative-PGID signal.
+   Success requires proving that no non-anchor member remains, then requesting
+   anchor exit and reaping it; after anchor reap, code performs no lookup,
+   signal, or ownership decision using the released numeric PGID. A platform
+   unable to provide that anchored membership proof records
+   `containment_unavailable` before target exec. v0.1 claims only
+   `process_group_supervision`: root reap and visibility of members that remain
+   in the anchored original group. A child can call `setsid` or change groups,
+   so v0.1 does not claim non-escapable descendant containment or whole-process-
+   tree emptiness. Failure to establish the anchor group or failure of either
+   the initial or post-`ETXTBSY` target helper's pre-exec group join is
+   `supervision_setup_failed`; every created helper is reaped, the affected
+   target `execve` is not attempted, and its errno is never treated as an
+   `execve` error or PATH fallback signal. On Windows, where the existing launcher cannot atomically
    assign a Job Object before execution, `containment_unavailable` is recorded
    without spawning.
 
    Every terminal path, including a zero exit with apparently valid output,
-   reaps the root and verifies the original group is empty before success is
-   possible. A group still populated after root exit records
+   reaps the root and verifies that only the live anchor remains before success
+   is possible, then exits/reaps the anchor without another PGID operation. A
+   non-anchor member still present after root exit records
    `lingering_process_group`, suppresses version success, and starts group
-   termination. Timeout, overflow, read failure, and any lingering group run
-   bounded pipe drain, root reap where still needed, and original-group
-   verification under one fixed five-second monotonic cleanup deadline. If all
+   termination. Timeout, overflow, read failure, and any lingering non-anchor
+   member run bounded pipe drain, root reap where still needed, and anchored
+   membership verification under one fixed five-second monotonic cleanup
+   deadline. If all
    complete, only the triggering probe failure is recorded. If signalling,
    drain, reap, or verification fails or the deadline expires, the applicable
    closed `lifecycle_cleanup` failure is also recorded, read handles are closed,
-   and ownership transfers to a fingerprint-specific runtime-independent
-   cleanup owner before the API returns. That owner emits an `error`, retains
-   ownership, and continues signalling, reaping, and original-group
-   verification; it never silently abandons the child. Caller cancellation
-   follows the same transfer but emits no fingerprint. Root-only
+   and the already-reserved runtime-independent cleanup owner retains sole
+   ownership before the API returns. That owner emits an `error`, retains
+   ownership, and continues anchored signalling, reaping, and original-group
+   verification; it never silently abandons the child. There is no on-demand
+   cleanup-thread creation or synchronous unbounded drop fallback. Caller
+   cancellation activates the same pre-existing owner but emits no fingerprint.
+   Root-only
    `kill_on_drop` and the existing detached `ManagedChild` reaper are not
    completion evidence. Output is never fully buffered and then truncated, and
    no lifecycle or cleanup failure contains a version fact.
@@ -313,6 +358,9 @@ facts in snapshots or through a CLI.
     made from a validated ownership source and the exact stable key of a
     persisted MCP configuration entry; it does not accept an arbitrary
     prebuilt `mcp_server` component, display label, UUID, or session identity.
+    The stable key is at most 1,024 UTF-8 bytes; the exact limit is accepted
+    and limit-plus-one fails typed before hexadecimal expansion or locator
+    allocation.
     The binding derives the server locator as
     `<base_locator>/harness_mcp_server_config_v0_1/u<byte_length>_<lowercase_utf8_hex>`
     from that exact nonblank UTF-8 key. The tool producer also requires the
@@ -331,8 +379,12 @@ facts in snapshots or through a CLI.
     encodings fail closed. This contract binds identity to the exact stable
     configuration key; it does not claim historical proof that a caller kept
     the same key across observations.
-12. **B-012:** MCP tool name and optional description are fingerprinted exactly
-    as advertised in their UTF-8 string values. The producer does not trim,
+12. **B-012:** MCP tool name, optional description, required `inputSchema`, and
+    optional `outputSchema` are fingerprinted exactly as advertised. Absence of
+    `outputSchema` remains distinct from any present schema. Both schemas use
+    the same duplicate-aware, object-root, bounded canonicalization contract in
+    B-013. Tool text is retained in its exact UTF-8 string value; the producer
+    does not trim,
     collapse, case-fold, Unicode-normalize, or otherwise rewrite whitespace or
     punctuation. `None`, an empty description, a single space, repeated spaces,
     tabs, and newlines remain distinct payload facts and produce distinct
@@ -340,10 +392,11 @@ facts in snapshots or through a CLI.
     tool name of at most 1,024 UTF-8 bytes and a description of at most 65,536
     UTF-8 bytes; exact limits are allowed and limit-plus-one fails typed before
     fingerprint construction.
-13. **B-013:** An MCP input schema must have a JSON object at its root; a root
-    boolean, array, string, number, or null fails typed before canonicalization
-    or digest construction. Boolean schemas remain legal only at schema-valued
-    child positions. Within that object, canonicalization is context-aware.
+13. **B-013:** Every present MCP input or output schema must have a JSON object
+    at its root; a root boolean, array, string, number, or null fails typed
+    before canonicalization or digest construction. Boolean schemas remain
+    legal only at schema-valued child positions. Within that object,
+    canonicalization is context-aware.
     JSON object member order is canonicalized lexicographically. Only arrays at
     the closed order-insensitive schema-keyword locations `required`, `type`,
     `enum`, `allOf`, `anyOf`, `oneOf`, and each property value beneath
@@ -361,8 +414,9 @@ facts in snapshots or through a CLI.
     schema context; legacy array-form `items` traverses schemas while retaining
     tuple order.
 
-    Resource limits are fixed by v0.1 and are not caller-adjustable: raw schema
-    bytes and canonical bytes are each at most 1,048,576; nesting depth at most
+    Resource limits are fixed by v0.1 and are not caller-adjustable. For each
+    present schema, raw schema bytes and canonical bytes are each at most
+    1,048,576; nesting depth at most
     64; total JSON nodes and cumulative decoded string bytes at most 65,536 and
     1,048,576 respectively; and any single object or array at most 4,096
     entries. Exact limits are valid. Raw size is checked before parsing; the
@@ -371,10 +425,32 @@ facts in snapshots or through a CLI.
     budget. A limit-plus-one condition returns a closed typed limit error,
     emits no digest or envelope, and cannot panic or overflow the stack.
 14. **B-014:** The envelope `fingerprint_digest` covers the exact subject,
-    payload schema version, and every behavior-affecting typed payload fact,
-    with lexicographic object keys and stable collection ordering. It excludes
-    timestamps, run IDs, localized diagnostics, raw secret values, and the
-    outer ASC-001 component to avoid self-reference. ASC-001 component integrity
+    payload schema version, and every behavior-affecting typed payload fact.
+    Hash input is frozen as
+    `domain || u64be(subject_len) || subject_utf8 ||
+    u64be(inner_version_len) || inner_version_utf8 ||
+    u64be(payload_len) || canonical_payload_utf8`, where `domain` is exactly
+    `b"harness_agent_stack_fingerprint_digest_v0_1\0"` and every length counts
+    bytes. Canonical payload JSON has no insignificant whitespace; object keys
+    sort by decoded UTF-8 bytes; arrays retain typed order unless B-013 declares
+    the location a set; `null`, booleans, and typed integers use
+    lowercase/minimal JSON spelling; strings escape only quote, backslash, and
+    U+0000..U+001F, using `\b`, `\t`, `\n`, `\f`, `\r` where applicable and
+    lowercase `\u00xx` otherwise, while other Unicode scalars are emitted as
+    UTF-8 and slash is never escaped. Raw MCP JSON number tokens are validated
+    and preserved byte-for-byte, so `1`, `1.0`, and `1e0` remain distinct
+    contract facts rather than passing through a floating-point formatter.
+    The normative payload bytes `{"a":1,"z":"\n"}` (hex
+    `7b2261223a312c227a223a225c6e227d`) produce digest
+    `3f45cc1b14c0099eaf056f9475aa210b4f84d45b2a4940ecff35079b3b1611fe`
+    for subject/version `agent_runtime` /
+    `runtime-executable-fingerprint/v0.1`, and
+    `e00eca6b5f5a3fe3494cf590e68ec59f70e40ee54b7f7f42e48756d296fa85d9`
+    for `mcp_tool` / `mcp-tool-fingerprint/v0.1`. These framing vectors are
+    independent of production serialization; tests also pin one complete valid
+    payload vector for each subject. The digest excludes timestamps, run IDs,
+    localized diagnostics, raw secret values, and the outer ASC-001 component
+    to avoid self-reference. ASC-001 component integrity
     independently preserves exact-source-byte evidence when one exists and is
     absent otherwise; payload or failure changes never fabricate or overwrite
     it. Reordering JSON object members or a B-013 order-insensitive set leaves
@@ -415,9 +491,10 @@ facts in snapshots or through a CLI.
 | `version_probe` | `probe_not_authorized` | Configuration-source or resolved-target repository policy forbids executing this inspected target; the closed reason identifies which and no child was started. |
 | `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary, so no child was started. |
 | `version_probe` | `containment_unavailable` | Required pre-spawn process supervision could not be established, so no child was started; the name does not claim non-escapable containment on supported platforms. |
+| `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join failed; every created helper was reaped and the affected target `execve` was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
 | `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
-| `version_probe` | `lingering_process_group` | The root exited but the original Unix process group was still populated; version success was suppressed and cleanup started. |
+| `version_probe` | `lingering_process_group` | The root exited but a non-anchor member remained in the anchored Unix process group; version success was suppressed and cleanup started. |
 | `version_probe` | `timeout` | The probe deadline expired; cleanup outcome is represented independently. |
 | `version_probe` | `output_limit_exceeded` | Combined stdout/stderr exceeded the inclusive hard byte limit; cleanup outcome is represented independently. |
 | `version_probe` | `output_read_failed` | Either output pipe failed before a complete bounded result was obtained. |
@@ -430,7 +507,7 @@ facts in snapshots or through a CLI.
 | `lifecycle_cleanup` | `termination_failed` | Signalling the root/original process group failed before cleanup ownership was transferred. |
 | `lifecycle_cleanup` | `reap_failed` | Root reap failed or was not verified before cleanup ownership was transferred. |
 | `lifecycle_cleanup` | `output_drain_failed` | Bounded drain did not complete before read handles were closed and ownership was transferred. |
-| `lifecycle_cleanup` | `group_verification_failed` | Original process-group emptiness was not verified before ownership was transferred; this never represents the whole descendant tree. |
+| `lifecycle_cleanup` | `group_verification_failed` | The owner could not verify that only its live anchor remained before ownership was retained; this never represents the whole descendant tree. |
 
 ### Unix Bare-Name Attempt Vocabulary
 
@@ -448,6 +525,7 @@ candidate digest, one closed exec sequence (`none`, `single`, or
 | `inspection_failed` | Open or later inspection failed; this is terminal and requires the matching B-008 identity failure. |
 | `inspection_target` | Configuration-source or resolved-target repository policy retained this first authorized inspection identity and stopped without exec. |
 | `authorization_unavailable` | Final-target repository/worktree classification could not be proven; this is terminal and requires `target_authorization_unavailable`. |
+| `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join failed, every created helper was reaped, and the affected target never attempted `execve`; this is terminal and requires the matching version-probe failure. |
 | `retry_not_authorized` | After first exec returned `ETXTBSY`, the repeated checkpoint classified the target as repository-owned; requires `probe_not_authorized` with exact reason `resolved_target_repository` and forbids a second exec. |
 | `retry_authorization_unavailable` | After first exec returned `ETXTBSY`, the repeated checkpoint could not prove target authorization; requires `target_authorization_unavailable` and forbids a second exec. |
 | `exec_eacces` | Direct `execve` returned exact `EACCES`; final identity is discarded and search continues. |
@@ -459,6 +537,8 @@ a terminal outcome, any exec outcome after identity-only authorization,
 multiple terminal outcomes, `inspection_target` without
 `probe_not_authorized` and its closed source-or-target reason,
 `authorization_unavailable` without `target_authorization_unavailable`,
+`supervision_setup_failed` without the matching
+`version_probe/supervision_setup_failed`,
 `retry_not_authorized` without `probe_not_authorized` carrying exact reason
 `resolved_target_repository`,
 `retry_authorization_unavailable` without
@@ -469,13 +549,16 @@ and no final executable identity exists. `candidate_limit_exceeded` requires
 exactly 64 nonterminal attempts. `path_not_found` permits only skipped outcomes
 and no inspection or selected identity. `none` is required for outcomes that
 terminate before any direct exec; an initial `inspection_failed` uses `none`.
-`single` is required for an ordinary one-exec outcome.
+An initial `supervision_setup_failed` requires `none`; `single` is required for
+an ordinary one-exec outcome.
 `etxtbsy_then_checkpoint_after_150_ms` requires an exact first `ETXTBSY` and a
 repeated authorization/identity checkpoint. It permits
 `retry_not_authorized`, `retry_authorization_unavailable`, or
-`inspection_failed` without a second exec, and `exec_eacces` for a bare name,
-`exec_failed`, or `exec_started` only after the second exec. It is rejected for
-every initial skip, inspection-only, or authorization-unavailable outcome.
+`inspection_failed` without a second helper, and
+`supervision_setup_failed` when the second helper's group join fails before its
+`execve`; `exec_eacces` for a bare name, `exec_failed`, or `exec_started` proves
+the second target exec was attempted. It is rejected for every initial skip,
+inspection-only, or authorization-unavailable outcome.
 Absolute/qualified attempts reject `exec_eacces`, because their `EACCES` is
 terminal `exec_failed`.
 
@@ -533,6 +616,9 @@ terminal `exec_failed`.
       absent from serialized evidence. Independent hard-coded vectors also
       freeze the exact platform tags, `u64` big-endian counts, candidate digest
       domain, and Windows little-endian `u16` units.
+- [ ] Unix launch fixtures prove bare, qualified, and absolute probes pass the
+      inspected absolute candidate as the executable pathname while preserving
+      the exact configured command bytes as `argv[0]`.
 - [ ] A Unix interpreter-launcher fixture proves that sanitized child `PATH` is
       identical for resolution and child execution, while a setup-only secret
       named `NPM_ACCESS` is absent from the child and from serialized facts.
@@ -542,18 +628,28 @@ terminal `exec_failed`.
       mode-bit checks, Windows strong file-ID checks without a fabricated
       executable claim, pre-spawn/post-reap retained-handle rehashing, and
       explicit `identity_changed` evidence for path replacement or in-place
-      rewrite.
+      rewrite; FIFO swaps at both later nonblocking checkpoint reopens cannot
+      hang.
 - [ ] Lifecycle fixtures use hanging and unbounded dual-stream children to
-      prove exact combined limit succeeds and limit-plus-one fails; ordinary
-      Unix explicit cleanup finishes root/original-group handling within five
-      seconds; injected termination, reap, drain, and group-verification
+      reject output caps 0 and 65,537 before allocation or helper creation and
+      prove 1, 65,536, exact combined limit, and limit-plus-one behavior; owner
+      readiness succeeds within its fixed one-second deadline or stops/joins
+      within a separate one-second deadline, including cancellation,
+      delayed-handshake, and typed stop/join-timeout fixtures; the active
+      five-second deadline covers anchor creation through root exit, while the
+      separate cleanup deadline starts at failure; ordinary Unix cleanup
+      finishes root/anchored-group handling within five seconds; injected
+      initial and post-`ETXTBSY` group-join, termination, reap, drain, and
+      group-verification
       failures produce canonical `lifecycle_cleanup` evidence and transfer
       ownership without a version; an escaped `setsid` pipe holder cannot yield
       whole-tree-empty evidence or block the API past the cleanup deadline;
       a zero-exit child that leaves a same-group marker process records
       `lingering_process_group`, suppresses version success, and runs the same
       cleanup; cancellation transfers ownership to a runtime-independent reaper
-      that survives immediate Tokio shutdown and emits no evidence; Windows
+      that survives immediate Tokio shutdown and emits no evidence; on Unix
+      every PGID operation occurs with the anchor live, success proves only the
+      anchor remains before its exit/reap, no released PGID is used, and Windows
       v0.1 proves `containment_unavailable` is emitted before any child starts.
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
       sanitized bounded facts, and rejection of unknown values.
@@ -579,8 +675,11 @@ terminal `exec_failed`.
       prebuilt server components and caller-supplied encoded sources, strict
       server/tool suffix parsing, absent tool component integrity, exact
       tool/description sensitivity, and distinct absence, empty, spaces, tabs,
-      and newlines.
-- [ ] Schema fixtures reject every non-object root before canonicalization and
+      and newlines; exact 1,024-byte and rejected 1,025-byte stable keys are
+      checked before locator expansion.
+- [ ] Schema fixtures cover required `inputSchema` and absent, present,
+      malformed, non-object, exact-limit, and limit-plus-one `outputSchema`;
+      reject every non-object root before canonicalization and
       prove object-key and approved set reordering stability;
       ordered `prefixItems`, vendor arrays, and nested arrays under `default`,
       `const`, `examples`, and `example` remain digest-sensitive even when an
@@ -595,6 +694,10 @@ terminal `exec_failed`.
       per-container, and canonical-byte limit fixtures cover exact limits and
       limit-plus-one; deep/wide hostile input fails typed without a digest,
       envelope, panic, unbounded allocation, or stack overflow.
+- [ ] Independent digest fixtures freeze the exact B-014 domain, all three
+      `u64` frames, canonical string escaping, raw JSON number-token
+      preservation, both normative framing vectors, and one complete valid
+      payload vector per subject.
 - [ ] Focused and package suites pass with
       `cargo check -p harness-agents -p harness-core --all-targets`,
       `cargo test -p harness-core fingerprint`, and

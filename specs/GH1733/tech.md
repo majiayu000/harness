@@ -138,17 +138,47 @@ Expected probe failures are valid runtime envelopes only when their failure and
 missing-fact matrix is valid. Invalid producer input returns a typed error and
 does not construct an envelope. This implements B-001, B-014, and B-015.
 
-Canonical fingerprint hashing uses a domain-separated object containing the
-exact subject, inner schema version, and every typed payload field. JSON object
-keys are sorted lexicographically and typed collections use their specified
-stable order. The hash excludes the outer component, observation timestamp, run
-identity, raw diagnostics, and secret values. The resulting `Sha256Digest` is
-stored only in `fingerprint_digest`. It never replaces ASC-001 component
-integrity, which remains evidence about exact component source bytes or is
-absent. The envelope parser cannot attest which bytes a producer hashed because
-wire input carries no source bytes; exact-byte correspondence is established
-only by typed producer construction and its tests. This avoids self-reference
-while preserving the two distinct claims.
+Canonical fingerprint hashing uses these exact bytes:
+
+```text
+SHA-256(
+  "harness_agent_stack_fingerprint_digest_v0_1\0"
+  || u64be(subject_utf8.len) || subject_utf8
+  || u64be(inner_schema_version_utf8.len) || inner_schema_version_utf8
+  || u64be(canonical_payload_utf8.len) || canonical_payload_utf8
+)
+```
+
+Every count is an unsigned fixed-width `u64` in big-endian order and counts
+bytes. Canonical payload JSON contains no insignificant whitespace. Object keys
+sort by decoded UTF-8 bytes. Arrays preserve typed order except at the closed
+B-013 set locations. `null`, booleans, and typed integers use lowercase/minimal
+JSON spelling. Strings escape only quote, backslash, and U+0000 through U+001F:
+use `\b`, `\t`, `\n`, `\f`, and `\r` for those five scalars and lowercase
+`\u00xx` for the others; emit every other Unicode scalar directly as UTF-8 and
+never escape slash. The duplicate-aware schema parser retains every validated
+raw JSON number token, and canonicalization emits that token unchanged, so
+`1`, `1.0`, and `1e0` remain distinct rather than depending on a floating-point
+formatter.
+
+For independent framing conformance, canonical payload bytes
+`{"a":1,"z":"\n"}` are hex
+`7b2261223a312c227a223a225c6e227d`. With subject/version
+`agent_runtime` / `runtime-executable-fingerprint/v0.1`, the digest is
+`3f45cc1b14c0099eaf056f9475aa210b4f84d45b2a4940ecff35079b3b1611fe`;
+with `mcp_tool` / `mcp-tool-fingerprint/v0.1`, it is
+`e00eca6b5f5a3fe3494cf590e68ec59f70e40ee54b7f7f42e48756d296fa85d9`.
+Tests also pin an independently calculated complete valid payload for each
+subject.
+
+The hash excludes the outer component, observation timestamp, run identity,
+raw diagnostics, and secret values. The resulting `Sha256Digest` is stored only
+in `fingerprint_digest`. It never replaces ASC-001 component integrity, which
+remains evidence about exact component source bytes or is absent. The envelope
+parser cannot attest which bytes a producer hashed because wire input carries
+no source bytes; exact-byte correspondence is established only by typed
+producer construction and its tests. This avoids self-reference while
+preserving the two distinct claims.
 
 ## Closed Local Runtime Identity
 
@@ -216,13 +246,17 @@ not identity and never includes role text, locator, executable bytes, or
 payload.
 
 For MCP tools, the constructor accepts a `ConfiguredMcpServerBinding`, exact
-advertised tool name, optional exact description, and raw input-schema JSON.
+advertised tool name, optional exact description, raw input-schema JSON, and
+optional raw output-schema JSON. Absence of `outputSchema` is a typed payload
+state distinct from every present schema.
 It accepts no arbitrary `mcp_server` component or separate server/tool source.
 The typed binding contains a validated base ownership source and the exact
 nonblank UTF-8 stable key of one persisted MCP configuration entry. Its only
 constructor derives
 `harness_mcp_server_config_v0_1/u<byte_length>_<lowercase_utf8_hex>` beneath
-the base locator; there is no constructor from a component, display label,
+the base locator. The key has an inclusive 1,024-byte UTF-8 maximum checked
+before hex expansion or locator allocation; byte 1,025 fails typed. There is no
+constructor from a component, display label,
 UUID, session ID, or already encoded locator. This binds observations to the
 configured key but deliberately does not claim historical proof that an
 external caller persisted the same key across earlier observations.
@@ -324,7 +358,9 @@ On Unix:
   could select a different executable than the adapter;
 - after handle inspection and the pre-spawn checkpoint, `probe.rs` uses an
   absolute-path `execve` call from the direct workspace `libc` dependency with
-  the fixed arguments and no shell;
+  the fixed arguments and no shell; the executable pathname is the inspected
+  absolute candidate while `argv[0]` retains the exact original configured
+  command `OsStr` units used by the adapter;
 - only exact `EACCES` from that call advances to the next same-basename
   candidate;
 - exact first `ETXTBSY` waits the adapter's fixed 150 milliseconds, repeats
@@ -357,9 +393,13 @@ The tags, counts, and exact units are encoded identically to
 `RuntimeResolutionAttemptOutcome` is exactly `Absent`, `NotRegular`,
 `NotExecutable`, `InspectionFailed`, `InspectionTarget`,
 `AuthorizationUnavailable`, `RetryNotAuthorized`,
-`RetryAuthorizationUnavailable`, `ExecEacces`, `ExecFailed`, or
-`ExecStarted`. Attempts preserve PATH order and duplicates; they are never
-sorted.
+`RetryAuthorizationUnavailable`, `SupervisionSetupFailed`, `ExecEacces`,
+`ExecFailed`, or `ExecStarted`. `SupervisionSetupFailed` is terminal, requires
+the matching version-probe failure, uses `RuntimeExecSequence::None` for initial
+anchor/target setup or `EtxtbsyThenCheckpointAfter150Ms` for the second helper
+after an exact first `ETXTBSY`, and proves every created helper was reaped before
+the affected target `execve`. Attempts preserve PATH order and duplicates; they
+are never sorted.
 
 The parser enforces a finite-state contract. Skipped outcomes and `ExecEacces`
 may precede one terminal outcome. `InspectionFailed` requires the matching
@@ -376,18 +416,22 @@ yields `candidate_limit_exceeded` with exactly 64 attempts. Outcomes after a
 terminal, multiple terminals, wrong source/failure pairs, or more than 64
 entries fail parsing.
 
-`RuntimeExecSequence::None` is required for skips, inspection-only, and initial
-authorization-unavailable outcomes. `Single` is required for an ordinary exec
+`RuntimeExecSequence::None` is required for skips, inspection-only, initial
+authorization-unavailable, and initial supervision-setup-failed outcomes.
+`Single` is required for an ordinary exec
 outcome. `EtxtbsyThenCheckpointAfter150Ms` is legal only after the first direct
 exec returned raw errno `ETXTBSY`; it requires the 150-millisecond monotonic
 delay and the repeated authorization/hash/path-identity checkpoint. If that
 checkpoint changes authorization, `RetryNotAuthorized` requires
 `probe_not_authorized` with exact `ResolvedTargetRepository` reason, while
 `RetryAuthorizationUnavailable` requires
-`target_authorization_unavailable`; either forbids the second exec, fallback,
+`target_authorization_unavailable`; either forbids the second helper, fallback,
 and selected identity. `InspectionFailed` with `identity_changed` likewise
-forbids the second exec. Only `ExecEacces` for a bare name, `ExecFailed`, or
-`ExecStarted` proves that the second exec was attempted. A second `ETXTBSY` is
+forbids the second helper. `SupervisionSetupFailed` is also legal in this
+sequence when the second helper is reaped after group join fails and before
+target `execve`; it cannot fall back. Only `ExecEacces` for a bare name,
+`ExecFailed`, or `ExecStarted` proves that the second target exec was attempted.
+A second `ETXTBSY` is
 `ExecFailed`. Absolute and qualified commands reject `ExecEacces` and represent
 terminal `EACCES` as `ExecFailed`. Cancellation during the delay emits no
 envelope and starts no child. No other errno, retry count, or delay is accepted.
@@ -405,10 +449,13 @@ Fault-injection tests freeze these paths without requiring CI to mount a
 All `CString` path, argument, and environment storage and pointer arrays are
 built and NUL-validated in the parent. The audited Unix pre-exec closure uses
 only async-signal-safe `setpgid` and `execve`; it never allocates, logs, locks,
-or constructs strings after fork. Successful `execve` never returns. A failed
-call returns the captured errno through the spawn error channel, so only
-`EACCES` reaches the fallback branch and `ENOEXEC` cannot reach a second shell
-execution path.
+or constructs strings after fork. Its stage-tagged error pipe distinguishes
+group-join failure from target `execve` failure. A failed `setpgid` produces
+`supervision_setup_failed`, and the parent reaps that helper before emitting
+evidence. Successful `execve` never returns. A failed target call returns its
+captured errno through the distinct exec channel, so only exact target
+`EACCES` reaches the fallback branch and a setup errno or `ENOEXEC` cannot reach
+a fallback or shell execution path.
 
 On Windows, the pinned Rust `Command` bare-name resolver is mirrored: explicit
 child `PATH`, current executable directory, system directory, Windows
@@ -531,9 +578,13 @@ pre-spawn checkpoint, platform handle APIs must also return the final target
 path used by the B-007 boundary classifier. Failure to prove that target lies
 outside every validated repository/worktree root records
 `target_authorization_unavailable` or `probe_not_authorized` and stops without
-spawn. `path_unusable` remains exclusive to resolution. Immediately before spawn and
-again after the child is reaped, one blocking checkpoint re-reads and re-hashes
-the retained handle and opens the resolved path to compare strong identity.
+spawn. `path_unusable` remains exclusive to resolution. Immediately before
+spawn and again after the child is reaped, one blocking checkpoint re-reads and
+re-hashes the retained handle and opens the resolved path to compare strong
+identity. On Unix both checkpoint reopens use the same
+`O_RDONLY | O_CLOEXEC | O_NONBLOCK` flags and authoritative handle
+classification as the initial open, so a race-swapped FIFO or other special
+file cannot block and becomes `identity_changed`.
 All three retained-handle size and digest observations must match, and both
 later path identities must equal the retained handle. A symlink is identified
 by the opened target, not by mixing link metadata with target bytes.
@@ -551,28 +602,65 @@ residual TOCTOU gap. This implements B-006 and its non-goal.
 
 `probe.rs` owns a fingerprint-specific `RuntimeFingerprintProbeSupervisor`
 instead of treating the existing `ManagedChild` drop path as completion
-evidence. On Unix the command has null stdin, piped stdout/stderr, and a
-dedicated process group created before exec. The supervisor owns the lifecycle
-before spawn. This is deliberately named process-group supervision, not
-descendant containment: a Unix child may call `setsid` or change process groups,
-so the producer can prove only root status and observations about processes
-that remain in the original group. It never emits a whole-descendant-tree-empty
-claim. A non-escapable Linux/macOS sandbox is outside this packet, and the
-closed source-plus-opened-target policy prevents repository/worktree code from
+evidence. After source/target authorization but before any supervision helper
+or target child is created, `RuntimeFingerprintProbeSupervisor::reserve`
+creates a runtime-independent owner thread and waits for its readiness
+handshake under
+`RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE = Duration::from_millis(1_000)`,
+measured monotonically from immediately before thread creation. Bootstrap does
+no blocking work before sending readiness and observing its
+cancellation-aware control channel. Thread creation, closed handshake, deadline
+expiry, or caller cancellation closes that channel and starts the separate
+`RUNTIME_FINGERPRINT_OWNER_STOP_JOIN_DEADLINE =
+Duration::from_millis(1_000)` from the stop request. The owner must join within
+that second bound. Start failure, readiness timeout, and stop/join timeout use
+the closed `RuntimeContainmentUnavailableReason` values `OwnerStartFailed`,
+`OwnerReadyTimeout`, and `OwnerStopJoinTimeout`; failure emits
+`containment_unavailable` when an envelope is applicable, no child exists, and
+there is no synchronous fallback.
+The owner is the lifecycle owner from the outset, not a thread constructed
+during cancellation.
+
+On supported Unix, the ready owner creates a minimal process-group anchor that
+becomes and remains the group leader. Target helpers join the anchor's group
+before target `execve`; null stdin and piped stdout/stderr are unchanged. The
+owner retains the anchor control/reap handle and every root/group identity.
+Platform-specific membership enumeration is capability-checked before anchor
+creation; if an anchored proof cannot be implemented, v0.1 returns
+`containment_unavailable` without a child. Every negative-PGID signal and membership decision
+occurs while the anchor is alive, so the numeric PGID cannot be reused. Normal
+success first proves that the anchor is the only member, then requests anchor
+exit and reaps it. After releasing the anchor, no code may query, signal, or
+make an ownership decision using that numeric PGID. This is deliberately named
+process-group supervision, not descendant containment: a Unix child may call
+`setsid` or change process groups, so the producer can prove only root status
+and observations about processes that remain in the anchored original group.
+It never emits a whole-descendant-tree-empty claim. A non-escapable
+Linux/macOS sandbox is outside this packet, and the closed
+source-plus-opened-target policy prevents repository/worktree code from
 reaching this probe.
 
-Every terminal path reaps the root and checks original-group emptiness before
-it can publish a result. A zero exit and valid output is only a provisional
-success until that check proves the group empty. If the group remains
-populated, the producer records `version_probe/lingering_process_group`,
+Every terminal path reaps the root and proves that only the live anchor remains
+before it can publish a result. A zero exit and valid output is only a
+provisional success until that check passes and the anchor is then exited and
+reaped. If another anchored-group member remains, the producer records
+`version_probe/lingering_process_group`,
 discards the provisional version, and starts cleanup. Existing timeout,
 overflow, output-read, nonzero/signal, and parse failures also enter cleanup
 whenever their root or original group remains live.
 
-Under one private nonzero five-second monotonic
+The active probe uses the exact private nonzero
+`RUNTIME_FINGERPRINT_PROBE_DEADLINE = Duration::from_millis(5_000)`. Its
+monotonic timestamp is captured immediately before anchor creation and covers
+anchor setup, every target group join and exec handshake, the optional 150 ms
+`ETXTBSY` delay and second attempt, concurrent output reads, and root exit.
+Expiry records `version_probe/timeout`.
+
+Under a separate private nonzero five-second monotonic
 `RUNTIME_FINGERPRINT_CLEANUP_DEADLINE`, cleanup signals the negative
 process-group ID, drains or closes both pipes within the remaining budget,
-reaps the root if not already reaped, and verifies the original group is empty.
+reaps the root if not already reaped, and verifies that only the still-live
+anchor remains.
 If all operations complete, the envelope carries only the triggering
 `version_probe` failure. If an operation fails or the deadline expires, the
 envelope also carries the applicable closed `lifecycle_cleanup` failure:
@@ -582,23 +670,23 @@ envelope also carries the applicable closed `lifecycle_cleanup` failure:
 | `termination_failed` | signalling the root/original group failed |
 | `output_drain_failed` | bounded drain did not complete before read handles were closed |
 | `reap_failed` | root reap failed or was not verified |
-| `group_verification_failed` | original-group emptiness was not verified |
+| `group_verification_failed` | the owner could not verify that only its live anchor remained |
 
 Original trigger failures sort before cleanup failures. Any cleanup failure
 closes parent read handles, omits version and any terminated/reaped or
-whole-tree claim, and transfers child/group ownership to a
+whole-tree claim, and leaves child/group ownership with the already-running
 fingerprint-specific runtime-independent owner before returning evidence. The
 owner emits an `error`, keeps ownership, and continues signalling, reaping, and
-original-group verification; later success does not rewrite an already emitted
-fingerprint. This prevents both an escaped pipe holder and a normal root that
-leaves a same-group child from blocking the API or yielding false success while
-remaining honest about the limited process-group evidence.
+anchored-group verification; later success does not rewrite an already emitted
+fingerprint. It never signals by PGID after the anchor is reaped. This prevents
+both an escaped pipe holder and a normal root that leaves a same-group child
+from blocking the API or yielding false success while remaining honest about
+the limited process-group evidence.
 
-Caller cancellation synchronously signals the original process group and uses
-the same ownership transfer, but emits no envelope. The owner survives
-immediate shutdown of the Tokio runtime that hosted the cancelled future. If
-starting the cleanup thread fails, the drop path logs an error and performs
-synchronous blocking termination and reap rather than abandoning ownership.
+Caller cancellation closes the client lease and activates cleanup in the same
+pre-existing owner, but emits no envelope. The owner survives immediate
+shutdown of the Tokio runtime that hosted the cancelled future. There is no
+on-demand cleanup-thread creation and no synchronous unbounded drop fallback.
 Root-only `kill_on_drop` and the existing detached Tokio `ManagedChild` reaper
 are not completion evidence.
 
@@ -611,8 +699,12 @@ Assigning a Job Object after `Command::spawn` is insufficient. Atomic Windows
 supervision would require suspended low-level launch, no-breakaway
 kill-on-close Job Object assignment, then resume, which is outside this packet.
 
-The collector reads both pipes concurrently in fixed-size chunks while one
-counter enforces an inclusive `max_output_bytes` across both buffers. It reads
+Before reserving the owner, allocating output buffers, or spawning any helper,
+the producer validates `max_output_bytes` in the closed inclusive range
+`1..=RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES`, where the v0.1 constant is exactly
+65,536. Zero and 65,537 fail typed. The collector reads both pipes concurrently
+in fixed-size chunks while one counter enforces the validated inclusive
+`max_output_bytes` across both buffers. It reads
 at most the remaining capacity plus one sentinel byte and never calls
 `Command::output` or `wait_with_output`. Exactly the configured maximum is
 legal; observing byte `max_output_bytes + 1` records
@@ -624,8 +716,9 @@ cleanup failure can produce a version fact.
 The canonical failure record contains only closed enums and compatible bounded
 details: an exit code, byte limit, timeout milliseconds, closed
 `RuntimeProbeAuthorizationReason`
-(`ConfigurationSourceRepository` or `ResolvedTargetRepository`), or closed
-cleanup operation where applicable.
+(`ConfigurationSourceRepository` or `ResolvedTargetRepository`), closed
+`RuntimeContainmentUnavailableReason`, or closed cleanup operation where
+applicable.
 It never contains `io::Error` text, localized diagnostics, raw output, raw
 paths, or environment values. Define closed `RuntimeProbePhase` and
 `RuntimeProbeFailureKind` enums for every row in the B-008 table. Constructors
@@ -643,9 +736,10 @@ The result-state matrix is fail closed:
 | target authorization unavailable | inspected identity/hash may remain; no selected/executed identity, exec attempt, fallback, child, or version |
 | Unix bare-name `bare_eacces_exhausted` | configured-command, search, and ordered attempt digests may remain; every inspected-candidate identity is discarded and no final executable identity, child, or version exists |
 | supervision unavailable | stable identity may remain; no child was spawned and version is absent |
+| supervision setup failure | the target helper was reaped, target `execve` was not attempted, its errno cannot cause PATH fallback, and version is absent |
 | terminal pre-start `spawn_failed` | the inspected target identity may remain, but no selected/executed identity or version exists |
 | post-`exec_started` lifecycle/exit/output failure | the selected/executed identity may remain; version is absent |
-| root exited with a populated original group | `lingering_process_group` is required; selected/executed identity may remain, version is absent, and cleanup must run |
+| root exited with a non-anchor member still in the anchored group | `lingering_process_group` is required; selected/executed identity may remain, version is absent, and cleanup must run |
 | cleanup failure | stable identity may remain; version and completed-cleanup claims are absent; independent owner continues |
 | `identity_changed` after exit | candidate output/version is discarded |
 | caller cancellation | no envelope; cleanup ownership survives Tokio shutdown and is never abandoned |
@@ -688,15 +782,19 @@ grammar revision, not a heuristic first-token fallback. This implements B-009.
 
 ## Context-Aware MCP Schema Canonicalization
 
-`McpInputSchema` exposes only `from_json_str` and `from_json_slice`. Both start
-from raw JSON and use a duplicate-detecting serde visitor rather than first
+The required `McpInputSchema` and optional `McpOutputSchema` share one private
+`McpToolSchema` representation and expose only subject-specific
+`from_json_str` and `from_json_slice` constructors. Both start from raw JSON
+and use a duplicate-detecting serde visitor rather than first
 decoding to `serde_json::Value`, because the latter can overwrite an earlier
 duplicate key. After parse and before canonicalization, the root must be an
 object; root boolean, array, string, number, and null values return a typed
 `RootNotObject` contract error and emit no digest. Boolean schemas remain legal
 only in schema-valued child positions. Malformed JSON and
 duplicate-object-key errors remain typed and occur before canonicalization or
-digesting. There is no public
+digesting. The visitor also retains each validated raw JSON number token for
+the exact B-014 encoding instead of round-tripping it through `f64`. There is
+no public
 `from_serializable`, `serde_json::Value`, or typed-map evidence constructor:
 after ordinary decoding, original duplicate-key absence cannot be attested.
 
@@ -704,6 +802,7 @@ The parser and canonicalizer enforce fixed v0.1 resource limits:
 
 | Resource | Inclusive maximum |
 | --- | ---: |
+| configured MCP server stable-key UTF-8 bytes | 1,024 |
 | tool-name UTF-8 bytes | 1,024 |
 | description UTF-8 bytes | 65,536 |
 | raw schema bytes | 1,048,576 |
@@ -713,7 +812,9 @@ The parser and canonicalizer enforce fixed v0.1 resource limits:
 | entries in one object or array | 4,096 |
 | canonical schema bytes | 1,048,576 |
 
-The raw-byte check occurs before parse. The duplicate-aware visitor counts
+The stable-key check occurs before hex expansion. Each present input/output
+schema independently receives the table's schema limits. The raw-byte check
+occurs before parse. The duplicate-aware visitor counts
 depth, nodes, decoded string bytes, and per-container entries while building
 the private representation. Canonicalization rechecks depth and nodes, charges
 every intermediate canonical byte before set sorting, and rejects budget
@@ -772,24 +873,25 @@ owns user-facing collection commands. This is B-016.
 
 | Product behavior | Required verification |
 | --- | --- |
-| B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch`; `fingerprint_digest_is_separate_from_component_integrity`; `failure_payload_changes_fingerprint_digest_without_fabricating_integrity`; `component_integrity_preserves_exact_source_bytes_or_absence` |
+| B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch`; `fingerprint_digest_is_separate_from_component_integrity`; `fingerprint_digest_framing_vectors_are_independent`; `complete_runtime_and_mcp_payload_digest_vectors_are_fixed`; `canonical_payload_string_escaping_is_frozen`; `canonical_payload_preserves_raw_json_number_tokens`; `failure_payload_changes_fingerprint_digest_without_fabricating_integrity`; `component_integrity_preserves_exact_source_bytes_or_absence` |
 | B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
-| B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
-| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `etxtbsy_retries_same_candidate_once_after_150_ms`; `etxtbsy_checkpoint_rechecks_authorization_hash_and_path_identity`; `etxtbsy_checkpoint_authorization_change_prevents_second_exec`; `etxtbsy_checkpoint_rejects_configuration_source_reason`; `etxtbsy_checkpoint_unavailable_authorization_prevents_second_exec`; `second_etxtbsy_is_terminal`; `etxtbsy_sequence_rejects_wrong_errno_delay_count_and_outcome`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_search_fallback`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `runtime_resolution_attempts_round_trip_all_outcomes_and_exec_sequences`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
+| B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `configured_mcp_server_key_accepts_1024_and_rejects_1025_before_expansion`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
+| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; `unix_execve_candidate_and_configured_argv0_match_adapter`; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `bare_eacces_exhaustion_has_no_final_identity`; `etxtbsy_retries_same_candidate_once_after_150_ms`; `etxtbsy_checkpoint_rechecks_authorization_hash_and_path_identity`; `etxtbsy_checkpoint_authorization_change_prevents_second_exec`; `etxtbsy_checkpoint_rejects_configuration_source_reason`; `etxtbsy_checkpoint_unavailable_authorization_prevents_second_exec`; `etxtbsy_retry_group_join_failure_is_reaped_without_exec_or_fallback`; `second_etxtbsy_is_terminal`; `etxtbsy_sequence_rejects_wrong_errno_delay_count_and_outcome`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_search_fallback`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `runtime_resolution_attempts_round_trip_all_outcomes_and_exec_sequences`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `bare_path_accepts_exactly_64_attempts`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `bare_path_resolution_matches_pinned_rust_order_without_pathext`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
 | B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; independent fixed vectors freeze PATH and `CLAUDE_CONFIG_DIR` domains, platform tags, big-endian counts, Unix raw bytes, Windows UTF-16LE, absent/empty distinction, and non-UTF-8 Unix values; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
-| B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
-| B-007 | Unix `ordinary_timeout_reaps_root_and_verifies_original_group`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_requires_empty_original_group`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; Windows `containment_unavailable_prevents_spawn` |
+| B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `fifo_swap_at_each_checkpoint_is_nonblocking_identity_changed`; `opened_handle_drives_metadata_and_incremental_hash`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `hashing_runs_off_the_async_worker`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistency_does_not_claim_executed_digest` |
+| B-007 | Unix `owner_ready_deadline_bounds_success_delay_and_cancellation`; `owner_stop_join_deadline_is_separate_and_typed`; `owner_stop_join_timeout_is_childless_containment_unavailable`; `ordinary_timeout_reaps_root_and_verifies_only_anchor_remains`; `active_and_cleanup_deadlines_are_distinct_and_fixed`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_reaps_root_then_anchor_without_released_pgid_use`; `every_signal_and_membership_check_has_live_anchor`; `initial_group_setup_failure_is_reaped_without_exec`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `output_cap_rejects_0_and_65537_before_allocation_or_helper`; `output_cap_accepts_1_and_65536`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; Windows `containment_unavailable_prevents_spawn` |
 | B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
 | B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `both_streams_are_parsed_before_selection`; `same_version_on_both_streams_is_ambiguous`; `valid_version_with_nonblank_other_stream_is_unparseable`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
-| B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; exact-limit and limit-plus-one tool-name/description fixtures |
-| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `object_form_items_traverses_nested_schema`; `object_form_items_required_and_one_of_reorder_canonically`; `legacy_array_items_preserves_tuple_order`; `legacy_additional_items_traverses_schema_context`; `additional_items_without_legacy_array_items_remains_instance_data`; `dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
+| B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; `mcp_output_schema_absence_and_presence_are_distinct`; exact-limit and limit-plus-one tool-name/description fixtures |
+| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `schema_set_locations_reorder_canonically`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `object_form_items_traverses_nested_schema`; `object_form_items_required_and_one_of_reorder_canonically`; `legacy_array_items_preserves_tuple_order`; `legacy_additional_items_traverses_schema_context`; `additional_items_without_legacy_array_items_remains_instance_data`; `dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
 
 All failure tests assert the absence of a version fact and the absence of raw
 path, PATH, output, environment, and OS-diagnostic text from serialized
 evidence. Ordinary explicit lifecycle tests retain child PIDs/process-group IDs
-and verify root reap plus original-group emptiness when no cleanup failure is
-recorded. Fault-injection tests cover every cleanup operation, transfer
+and verify root reap plus only-anchor-remains, anchor reap, and no subsequent
+PGID operation when no cleanup failure is recorded. Fault-injection tests cover
+every cleanup operation, retain
 ownership before returning incomplete evidence, and never claim an escaped
 descendant was contained. Cancellation tests drop the hosting Tokio runtime
 immediately and verify the independent owner continues cleanup. PATH tests
