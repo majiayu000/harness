@@ -215,23 +215,28 @@ facts in snapshots or through a CLI.
    exact `OsStr` bytes; Windows units are original UTF-16 code units.
    Observation environment entries and setup-secret names are each limited to
    1,024, and every environment key or setup-secret name is limited to 1,024
-   exact OS units before canonicalization or value access. A derived lexical
-   candidate has the inclusive checked limit 196,610, exactly reachable as
+   exact OS units before canonicalization or value access. These validated
+   fields mathematically bound every reached derived lexical candidate to at
+   most 196,610 units:
    65,536 cwd units + separator + 65,536 relative PATH-entry units + separator
-   + 65,536 command units. The closed limit reasons are `configured_command`,
+   + 65,536 command units. There is no separate, caller-reachable
+   derived-candidate limit failure. The closed limit reasons are `configured_command`,
    `working_directory`, `windows_current_executable_directory`,
    `windows_system_directory`, `windows_directory`, `windows_parent_path`,
    `observation_environment_entries`, `environment_key`,
    `setup_secret_names`, `setup_secret_name`, `child_path`,
-   `claude_config_directory`, and `derived_candidate`.
+   and `claude_config_directory`.
    Limit-plus-one returns typed no-envelope `launch_input_limit_exceeded`
    without a digest, split, join, owner, fd, observation, child, truncation, or
    fallback. Exact precedence is isolation, sandbox, actual unsupported
    platform, public output range, command/cwd/explicit search-base limits,
    environment count/key limits, setup-secret count/name limits, key
    shape/canonicalization/collision, setup-secret exclusion, selected
-   PATH/Claude value limits, empty/NUL/shape validation, whole-PATH splitting
-   and the 64-entry check, derived length, digest/join, then owner admission.
+   PATH/Claude value limits, empty/NUL/shape validation, digest, then owner
+   admission. The already byte-bounded Unix `PATH` is traversed lazily after
+   admission; it is not rejected merely because it contains more than 64
+   entries. Each reached candidate join uses checked arithmetic and allocates
+   no more than the already-proven 196,610-unit maximum.
    Cross-platform digest/model helpers enforce the same relevant limits before
    hashing.
    Over-limit rejection is a documented representability divergence from an
@@ -249,7 +254,9 @@ facts in snapshots or through a CLI.
    ends as `path_not_found`. Every other open failure is
    `identity/open_failed` and stops. Reaching
    entry 65 before a terminal outcome is
-   `path_resolution/candidate_limit_exceeded`. After inspection and the pre-spawn
+   `path_resolution/candidate_limit_exceeded`; an earlier terminal outcome
+   succeeds or fails normally without inspecting or counting the remaining
+   entries. After inspection and the pre-spawn
    checkpoint, a bounded parser first requires a current-architecture static
    ELF. Linux `x86_64` accepts only `EM_X86_64`/ELF64/little-endian and Linux
    `aarch64` only `EM_AARCH64`/ELF64/little-endian. Both require exact ELF
@@ -261,8 +268,9 @@ facts in snapshots or through a CLI.
    malformed ELF, wrong-machine ELF, and every other format fail
    `interpreter_authorization_unavailable` before anchor creation so neither an
    ELF loader nor `binfmt_misc` interpreter can run. Linux then keeps
-   `FD_CLOEXEC` on the retained authorized handle and
-   uses direct no-shell `execveat(..., AT_EMPTY_PATH)` under a traced
+   `FD_CLOEXEC` on the retained authorized handle, maps it collision-safely to
+   child fd 10, and uses direct no-shell
+   `execveat(10, "", ..., AT_EMPTY_PATH)` under a traced
    pre-first-instruction exec-stop. `FD_CLOEXEC` makes interpreter-script
    `execveat` fail before the interpreter can run. A successful native exec
    must stop at `PTRACE_EVENT_EXEC`; while the kernel's executable write denial
@@ -271,12 +279,26 @@ facts in snapshots or through a CLI.
    image's strong identity through `/proc/<pid>/exe`. Only an exact match
    resumes. The call's `argv[0]` is the exact
    original configured command `OsStr` spelling used by the adapter; resolution
-   never substitutes the candidate spelling. No path-based `execve` is
-   permitted after authorization. If a Linux platform on which process-group
-   supervision is otherwise available cannot provide this traced
-   retained-handle primitive,
-   `handle_execution_unavailable` is emitted before an anchor or target child;
-   path execution is not a fallback. Only an exact target-handle `EACCES` result may
+   never substitutes the candidate spelling. Linux nevertheless exposes exact
+   `AT_EXECFN = "/dev/fd/10"` for this `AT_EMPTY_PATH` launch, and fd 10 is
+   closed in the new image. That deliberate difference from the adapter's
+   pathname launch is represented on every direct-exec attempt by the sole
+   closed execution context
+   `linux_fd_cloexec_execveat_empty_path_fd_10`, which enters the fingerprint.
+   A static executable that derives behavior or resources from `AT_EXECFN` may
+   therefore produce different output or fail; the producer never claims
+   pathname-launch parity for that program. No path-based `execve` is
+   permitted after authorization. The pre-observation gate separately requires
+   the ptrace exec-stop and post-exec syscall guard. If those are unavailable,
+   the producer returns no-envelope
+   `containment_unavailable/post_exec_guard_unavailable`. If those mandatory
+   containment capabilities are present, the fixed target helper makes the
+   actual `execveat(10, "", ..., AT_EMPTY_PATH)` call. Exact `ENOSYS`, `EPERM`,
+   or `EINVAL` from that fully frozen call is terminal
+   `handle_execution_unavailable`: every created target helper is reaped, no
+   target instruction ran, and path execution is not a fallback. Exact
+   `EACCES` retains the
+   separate bare-name fallback rule. Only that exact target-handle `EACCES` may
    discard that bare-name candidate and continue to the next same-basename
    entry. An exact first `ETXTBSY` waits 150 milliseconds, repeats target
    authorization plus the full retained-handle/path identity checkpoint, and
@@ -293,7 +315,9 @@ facts in snapshots or through a CLI.
    `"harness_runtime_resolution_candidate_v0_1\0"` followed by the same exact
    platform tag, `u64` big-endian unit count, and OS units as the configured
    command digest. It also records the closed exec sequence `none`, `single`,
-   or `etxtbsy_then_checkpoint_after_150_ms`; the checkpoint sequence is legal
+   or `etxtbsy_then_checkpoint_after_150_ms`. `none` requires absent execution
+   context; the other two require exactly
+   `linux_fd_cloexec_execveat_empty_path_fd_10`. The checkpoint sequence is legal
    only when the first direct exec returned exact `ETXTBSY` and does not imply
    that authorization allowed a second exec. The first successful exec is the
    selected executable;
@@ -305,7 +329,18 @@ facts in snapshots or through a CLI.
    alias-ownership, and identity fail-closed branches intentionally may reject
    a command that the adapter could later launch through Unix PATH fallback.
    In particular, retained-handle `ENOENT`/`ENOTDIR` stops at that candidate
-   and never attributes or executes a later same-basename candidate.
+   and never attributes or executes a later same-basename candidate. All
+   child-creation and no-child statements are attempt-local: a terminal
+   pre-anchor result on a later candidate preserves every earlier ordered
+   attempt, including a fully reaped `exec_eacces` helper, while proving that
+   the terminal candidate itself created no anchor or target.
+   The anchor is probe-local rather than attempt-local: once the first direct
+   exec attempt creates it, it remains the live group leader across bare-name
+   fallback. Every later terminal outcome, including a pre-anchor classifier
+   rejection or candidate-limit failure, must prove the group contains only
+   that anchor, request anchor exit, and reap it under the active/finalization
+   deadline. Failure appends the canonical lifecycle-cleanup evidence and
+   retains exact ownership; it never rewrites the terminal attempt.
 
    A bare Unix command with sanitized child `PATH = Unset` is
    `path_unusable` before candidate observation. v0.1 never guesses libc's
@@ -326,7 +361,7 @@ facts in snapshots or through a CLI.
    `PT_INTERP`. Exact leading `#!`, dynamic/malformed ELF, and any non-ELF
    format fail closed with
    `version_probe/interpreter_authorization_unavailable` after target
-   authorization but before anchor or target creation. It never invokes a
+   authorization but before this attempt's target creation. It never invokes a
    interpreter or loader and never searches child `PATH` for one. If accepted
    static bytes change into a script after that check,
    `FD_CLOEXEC` makes `execveat(AT_EMPTY_PATH)` fail before interpreter
@@ -526,7 +561,7 @@ facts in snapshots or through a CLI.
    Linux v0.1 requires descriptor-table isolation, `pidfd_open`,
    `pidfd_send_signal`, parent-child ptrace with `PTRACE_O_TRACEEXEC` and
    `PTRACE_O_TRACESYSGOOD`, exact `PTRACE_GET_SYSCALL_INFO` inspection at
-   syscall-entry stops, `execveat(AT_EMPTY_PATH)`, and strong `/proc`
+   syscall-entry stops, and strong `/proc`
    process/image identity enumeration before host filesystem observation;
    other Unix platforms return that typed no-envelope error without opening the
    cwd or executable. Missing tagged syscall-stop/syscall-info capability is
@@ -611,9 +646,10 @@ facts in snapshots or through a CLI.
    `process_group_supervision`: root reap and visibility of members that remain
    in the anchored original group. A child can call `setsid` or change groups,
    so v0.1 does not claim non-escapable descendant containment or whole-process-
-   tree emptiness. On Linux platforms with process-group supervision but no
-   verified traced retained-handle exec primitive, `handle_execution_unavailable` is
-   recorded before anchor or target creation.
+   tree emptiness. On Linux platforms that pass the mandatory ptrace guard,
+   exact `ENOSYS`, `EPERM`, or `EINVAL` from the reached eligible candidate's
+   fully frozen fd-10 `execveat(AT_EMPTY_PATH)` call records
+   `handle_execution_unavailable` after every created target helper is reaped.
    Failure to establish the anchor group or failure of either
    the initial or post-`ETXTBSY` target helper's pre-exec group join or
    retained-working-directory `fchdir` is `supervision_setup_failed` with the
@@ -905,7 +941,7 @@ cleanup failures are always `termination_failed`, `reap_failed`,
 | `version_probe` | `probe_not_authorized` | Configuration-source or resolved-target repository policy forbids executing this inspected target; the closed reason identifies which and no child was started. |
 | `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary or could not prove single-link ownership; the closed reason is `boundary_unprovable`, `link_count_unprovable`, `unlinked_target`, or `multiple_hard_links`. No target instruction ran. Initial/pre-spawn failure permits no target exec; retry failure requires exactly one prior retained-handle exec returning `ETXTBSY`, that helper reaped, and no second helper or exec. |
 | `version_probe` | `interpreter_authorization_unavailable` | The retained executable was not a current-architecture static ELF without `PT_INTERP`, or exact retained-handle exec-time `ENOENT`/`ENOTDIR` showed that a late interpreter contract could not be satisfied. No target, loader, or interpreter instruction ran; a late-race setup helper is reaped. |
-| `version_probe` | `handle_execution_unavailable` | A Linux platform with process-group supervision cannot provide `FD_CLOEXEC` retained-handle `execveat(AT_EMPTY_PATH)` plus a verified pre-first-instruction `PTRACE_EVENT_EXEC` checkpoint, so no target instruction was allowed to run. |
+| `version_probe` | `handle_execution_unavailable` | Mandatory ptrace containment passed, but the candidate's fully frozen fd-10 `execveat(AT_EMPTY_PATH)` returned exact `ENOSYS`, `EPERM`, or `EINVAL`; every created target helper was reaped and no target instruction ran. |
 | `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join, working-directory entry, or pre-exec ptrace stop/options setup failed; the closed setup stage identifies which, every created helper was reaped, and target handle exec was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
 | `version_probe` | `transitive_execution_denied` | After the verified initial static image began under syscall-stop supervision, it attempted closed class `process_creation`, `image_execution`, or `executable_mapping`; the denied syscall never executed, stopped-target cleanup began, cleanup outcome is independent, and no version fact was emitted. |
@@ -933,7 +969,12 @@ from a single-entry bare search. Absolute and qualified commands have exactly
 one entry; bare-name entries are ordered exactly like the first at most 64
 sanitized `PATH` entries. Each attempt contains a candidate digest, one closed
 exec sequence (`none`, `single`, or
-`etxtbsy_then_checkpoint_after_150_ms`), and one closed outcome:
+`etxtbsy_then_checkpoint_after_150_ms`), one optional closed execution context,
+and one closed outcome. The context is absent exactly when the sequence is
+`none`; `single` and the retry sequence require exactly
+`linux_fd_cloexec_execveat_empty_path_fd_10`, freezing child fd 10,
+`FD_CLOEXEC`, empty path, `AT_EMPTY_PATH`, and resulting
+`AT_EXECFN = "/dev/fd/10"`:
 
 | Outcome | Meaning |
 | --- | --- |
@@ -944,7 +985,7 @@ exec sequence (`none`, `single`, or
 | `inspection_target` | Configuration-source or resolved-target repository policy retained this first authorized inspection identity and stopped without exec. |
 | `authorization_unavailable` | Final-target repository/worktree classification or single-link ownership could not be proven; this is terminal and requires `target_authorization_unavailable` with exact reason `boundary_unprovable`, `link_count_unprovable`, `unlinked_target`, or `multiple_hard_links`. |
 | `interpreter_authorization_unavailable` | Initial script/dynamic-ELF/unsupported-format detection uses `none`; exact exec-time `ENOENT`/`ENOTDIR` uses `single` or the one `ETXTBSY` retry sequence. It requires the matching version-probe failure, executes no target/loader/interpreter instruction, and is terminal. |
-| `handle_execution_unavailable` | No safe traced retained-handle `execveat(AT_EMPTY_PATH)` primitive exists; this is terminal, uses no exec sequence, and requires the matching version-probe failure. |
+| `handle_execution_unavailable` | Mandatory ptrace containment passed but the fully frozen fd-10 call returned exact `ENOSYS`, `EPERM`, or `EINVAL`; this candidate-local terminal uses `single` for the first call or the one `ETXTBSY` retry sequence for the second, requires the fd-10 execution context and matching version-probe failure, and proves every created target helper was reaped before any target instruction ran. |
 | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join, working-directory entry, or ptrace setup failed, every created helper was reaped, and the affected target never attempted handle exec; this is terminal and requires the matching version-probe failure and exact setup stage. |
 | `retry_not_authorized` | After first exec returned `ETXTBSY`, the repeated checkpoint classified the target as repository-owned; requires `probe_not_authorized` with exact reason `resolved_target_repository` and forbids a second exec. |
 | `retry_authorization_unavailable` | After first exec returned `ETXTBSY`, the repeated checkpoint could not prove target authorization; requires `target_authorization_unavailable` with the exact checkpoint reason `boundary_unprovable`, `link_count_unprovable`, `unlinked_target`, or `multiple_hard_links`, requires the first helper to be reaped, and forbids a second helper or exec. |
@@ -982,12 +1023,14 @@ and no final executable identity exists. `candidate_limit_exceeded` requires
 `not_executable` outcomes and no identity failure. For `unix_absolute` or
 `unix_qualified`, it permits exactly one `absent`; a sole `not_regular` or
 `not_executable` is terminal and requires its matching identity failure.
-`none` is required for outcomes that
-terminate before any direct exec; an initial `inspection_failed` or
-`handle_execution_unavailable` uses `none`.
+The no-target-helper invariant of a `none` attempt is local to that attempt;
+it does not erase a preceding reaped `exec_eacces` attempt or its probe-level
+anchor. `none` is required for outcomes that terminate before any direct exec;
+an initial `inspection_failed` uses `none`.
 An initial `supervision_setup_failed` or pre-observed shebang requires `none`;
 `single` is required for an ordinary one-exec outcome, an exec-time interpreter
-failure, or `exec_verification_failed`.
+failure, initial-call `handle_execution_unavailable`, or
+`exec_verification_failed`.
 `etxtbsy_then_checkpoint_after_150_ms` requires an exact first `ETXTBSY` and a
 repeated authorization/identity checkpoint. It permits
 `retry_not_authorized`, `retry_authorization_unavailable`, or
@@ -995,8 +1038,8 @@ repeated authorization/identity checkpoint. It permits
 `supervision_setup_failed` when the second helper's group join, retained
 working-directory entry, or trace setup fails before target handle exec;
 exec-time `interpreter_authorization_unavailable`,
-`exec_verification_failed`, `exec_eacces` for a bare name, `exec_failed`, or
-`exec_started` proves
+`handle_execution_unavailable`, `exec_verification_failed`, `exec_eacces` for
+a bare name, `exec_failed`, or `exec_started` proves
 the second target exec was attempted. It is rejected for every initial skip,
 inspection-only, or authorization-unavailable outcome.
 Absolute/qualified attempts reject `exec_eacces`, because their `EACCES` is
@@ -1068,13 +1111,17 @@ terminal `exec_failed`.
       against the adapter's current `Command` behavior and fails on drift
       instead of adopting it.
 - [ ] Launch-input fixtures accept 65,536 and reject 65,537 exact OS units for
-      every closed value field before hashing/splitting/owner admission; accept
-      the reachable 196,610-unit Unix lexical candidate and reject 196,611
-      before joining. Environment keys/setup-secret names and their collection
+      every closed value field before hashing/splitting/owner admission.
+      Checked joins accept the mathematically maximal 196,610-unit Unix lexical
+      candidate; no public input can reach 196,611 after those field gates.
+      Environment keys/setup-secret names and their collection
       counts accept 1,024 and reject 1,025 before canonicalization or value
       access. They cover Unix non-UTF8 bytes, Windows surrogate-pair UTF-16
-      counting, one huge PATH entry, whole PATH, 64/65 entry precedence, and
-      every closed limit reason. Excluded over-limit PATH/Claude values and
+      counting, one huge PATH entry, whole PATH, and every closed limit reason.
+      A 65-entry PATH selecting or terminally rejecting an earlier entry never
+      reaches the candidate ceiling, while 64 nonterminal attempts followed by
+      entry 65 yields `candidate_limit_exceeded`. Excluded over-limit
+      PATH/Claude values and
       undeclared over-limit values are never read, hashed, or reported as value
       limits; selected counterparts fail closed. Limit failure produces no
       digest, owner, fd, cwd observation, helper, child, truncation, or fallback.
@@ -1110,6 +1157,15 @@ terminal `exec_failed`.
       closed transitive-denial class, execute no second-image/child/mapping
       marker, and suppress version. Missing/untagged/unreadable syscall stops
       return no envelope and cleanup the target.
+      A static aux-vector fixture proves each direct-exec attempt records
+      `linux_fd_cloexec_execveat_empty_path_fd_10`, observes exact
+      `AT_EXECFN = "/dev/fd/10"`, cannot reopen fd 10 after exec, and does not
+      misstate pathname-launch parity. A preceding reaped first-candidate
+      `EACCES` followed by a second-candidate pre-anchor classifier rejection
+      preserves both attempt records and applies the no-child invariant only
+      to the second attempt. It also proves the pre-existing probe anchor exits
+      and is reaped; injected group-verification, termination, and reap failures
+      append independent lifecycle-cleanup evidence and retain ownership.
       The owner opens the
       declared child directory once, fixed working-directory spelling/identity
       digests enter the payload, both initial and retry helpers `fchdir` that
@@ -1163,9 +1219,17 @@ terminal `exec_failed`.
 - [ ] Authorization-race fixtures replace and rewrite the source after the
       final checkpoint and prove the exec-stop hash/identity gate kills a
       changed native image before its first instruction, while an introduced
-      shebang fails before interpreter execution. Linux without verified ptrace
-      exec-stop or `execveat(AT_EMPTY_PATH)` emits
-      `handle_execution_unavailable` and never falls back to a pathname. Other
+      shebang fails before interpreter execution. After mandatory ptrace
+      containment passes, exact `ENOSYS`, `EPERM`, and fixed-call `EINVAL` from
+      `execveat(10, "", ..., AT_EMPTY_PATH)` each emit an inspected
+      `handle_execution_unavailable` envelope, reap every created helper, and
+      never fall back to a pathname. Fixtures cover each errno on the initial
+      call and after exact first-call `ETXTBSY`, requiring `single` and the
+      retry sequence respectively; exact `EACCES` remains the separate
+      bare-name fallback case. Missing ptrace exec-stop or tagged syscall guarding instead
+      returns no-envelope
+      `containment_unavailable/post_exec_guard_unavailable` before cwd
+      observation. Other
       platforms return typed no-envelope `containment_unavailable` first under
       the frozen matrix. Separate missing-event, surplus-event, abnormal-trace,
       and pre-resume-deadline fixtures return

@@ -24,7 +24,7 @@ PR branch only; do not create a replacement implementation PR or force-push.
       object/boolean schema positions in both dialects, and Draft-07
       `additionalItems` as schema-valued even without tuple `items`; malformed
       shapes and nested `$schema` fail with closed details.
-- [ ] `SP1733-T2` — Owner: runtime fingerprint worker. Dependencies: SP1733-T1. Covers: B-002 through B-010, B-014, and B-015. Done when: isolation and exact passthrough `DangerFullAccess` sandbox gates run before host observation; only Linux `x86_64`/`aarch64` with audited `close_range` descriptor isolation, `pidfd_open`, `pidfd_send_signal`, parent-child `PTRACE_O_TRACEEXEC`, `execveat(AT_EMPTY_PATH)`, strong `/proc` process/image identity, and the fixed observation protocol proceeds. The ready owner is the sole target/anchor fork, parent-side ptrace-control, wait/reap, and observation-helper-spawn owner; the target pre-exec closure's audited `PTRACE_TRACEME` is the sole exception. It atomically pidfd-registers and owns each helper or target before exposing any cancellable lease. Every cwd/candidate/boundary/hash/exec-stop/checkpoint/membership wait is bounded by the active or cleanup deadline. Observation timeout, cleanup-incomplete, and protocol-invalid are distinct closed producer errors with no envelope and exact ownership retained; no missing cwd fact or attempt outcome is fabricated. Resolution remains handle-relative and bounded with the exact open-time `ENOENT`/`ENOTDIR`, exec-time `EACCES`, and one 150 ms `ETXTBSY` retry semantics. A retained-handle exec-time `ENOENT`/`ENOTDIR` terminates interpreter authorization and deliberately does not follow the adapter's later PATH fallback; the producer never attributes a later candidate. A bounded classifier accepts only the frozen native ELF64 machine tuple, current header versions/sizes, non-extended in-file program headers, `ET_EXEC` or `ET_DYN`, and no `PT_INTERP`; scripts, dynamic/malformed/wrong-machine ELF, and non-ELF/binfmt formats fail before target creation. Supported Linux authorization requires `st_nlink == 1` initially and at pre-spawn/retry; exec-stop and post-reap revalidate link count, with multiple links failing authorization before spawn or producing identity change after target creation. Target exec uses `FD_CLOEXEC` retained-handle `execveat`, so a late script fails before interpreter execution. Every successful native exec stops at exactly one `PTRACE_EVENT_EXEC` before its first instruction and resumes only after a registered observation helper matches stopped-image strong identity plus retained-handle hash while kernel write denial is active. Changed bytes, missing/surplus events, abnormal trace state, and pre-resume timeout kill/reap without resume; verification-unavailable cases return no envelope, and no pathname fallback exists. Every `/proc` membership enumeration/revalidation uses an atomically registered observation helper with at most 64 transferred pidfds plus `more`; cleanup signals each batch individually and rescans from the beginning until only the anchor remains or the deadline expires. It never drops overflow members, uses a negative PGID, or signals the anchor before the group is empty. Membership stalls, malformed frames/helper exit, continuous churn, and anchor failures are typed. The active deadline includes observations, exec-stop, root exit, and post-reap checkpoint; probe cleanup has a separate five-second deadline. Version blank classification is exactly empty or HT/LF/CR/SP bytes after UTF-8 validation, never a generic whitespace predicate. All closed runtime/environment/command/attempt/failure contracts, executable/output bounds, Windows digests, repository authorization, exact output grammars, and prior fail-closed/no-shell requirements remain covered; no `spawn_blocking`, unbounded wait, whole-file read, unbounded pipe, warning-only fallback, or detached-`ManagedChild` completion claim remains. Verify: `cargo test -p harness-agents runtime_fingerprint`, `cargo test -p harness-agents`, and `cargo check -p harness-agents --all-targets`.
+- [ ] `SP1733-T2` — Owner: runtime fingerprint worker. Dependencies: SP1733-T1. Covers: B-002 through B-010, B-014, and B-015. Done when: isolation and exact passthrough `DangerFullAccess` sandbox gates run before host observation; only Linux `x86_64`/`aarch64` with audited `close_range` descriptor isolation, `pidfd_open`, `pidfd_send_signal`, parent-child `PTRACE_O_TRACEEXEC`, tagged post-exec syscall guarding, strong `/proc` process/image identity, and the fixed observation protocol proceeds. Missing ptrace guarding is pre-observation no-envelope containment failure. After that gate passes, exact `ENOSYS`, `EPERM`, or `EINVAL` from an eligible target's fully frozen fd-10 `execveat(AT_EMPTY_PATH)` call becomes initial-single or post-`ETXTBSY` retry-sequence `handle_execution_unavailable`; exact `EACCES` remains the separate bare-name fallback case. The ready owner is the sole target/anchor fork, parent-side ptrace-control, wait/reap, and observation-helper-spawn owner; the target pre-exec closure's audited `PTRACE_TRACEME` is the sole exception. It atomically pidfd-registers and owns each helper or target before exposing any cancellable lease. Every cwd/candidate/boundary/hash/exec-stop/checkpoint/membership wait is bounded by the active or cleanup deadline. Observation timeout, cleanup-incomplete, and protocol-invalid are distinct closed producer errors with no envelope and exact ownership retained; no missing cwd fact or attempt outcome is fabricated. Resolution remains handle-relative and bounded with the exact open-time `ENOENT`/`ENOTDIR`, exec-time `EACCES`, and one 150 ms `ETXTBSY` retry semantics. The bounded PATH is traversed lazily: only reaching entry 65 after 64 nonterminal attempts emits `candidate_limit_exceeded`; an earlier terminal outcome ignores later entries. A retained-handle exec-time `ENOENT`/`ENOTDIR` terminates interpreter authorization and deliberately does not follow the adapter's later PATH fallback; the producer never attributes a later candidate. Candidate-local no-target-helper facts preserve any earlier ordered, fully reaped `EACCES` attempt and its probe-level anchor; every later terminal finalizes that anchor, with independent cleanup evidence on failure. A bounded classifier accepts only the frozen native ELF64 machine tuple, current header versions/sizes, non-extended in-file program headers, `ET_EXEC` or `ET_DYN`, and no `PT_INTERP`; scripts, dynamic/malformed/wrong-machine ELF, and non-ELF/binfmt formats fail before target creation. Supported Linux authorization requires `st_nlink == 1` initially and at pre-spawn/retry; exec-stop and post-reap revalidate link count, with multiple links failing authorization before spawn or producing identity change after target creation. Target exec collision-safely maps the retained handle to child fd 10 and uses `FD_CLOEXEC` `execveat(10, "", ..., AT_EMPTY_PATH)`, so a late script fails before interpreter execution. Every direct-exec attempt records the closed fd-10 execution context; exact configured bytes remain `argv[0]`, while exact `AT_EXECFN = "/dev/fd/10"` and failed post-exec reopen are a represented pathname-launch divergence. Every successful native exec stops at exactly one `PTRACE_EVENT_EXEC` before its first instruction and resumes only after a registered observation helper matches stopped-image strong identity plus retained-handle hash while kernel write denial is active. Changed bytes, missing/surplus events, abnormal trace state, and pre-resume timeout kill/reap without resume; verification-unavailable cases return no envelope, and no pathname fallback exists. Every `/proc` membership enumeration/revalidation uses an atomically registered observation helper with at most 64 transferred pidfds plus `more`; cleanup signals each batch individually and rescans from the beginning until only the anchor remains or the deadline expires. It never drops overflow members, uses a negative PGID, or signals the anchor before the group is empty. Membership stalls, malformed frames/helper exit, continuous churn, and anchor failures are typed. The active deadline includes observations, exec-stop, root exit, and post-reap checkpoint; probe cleanup has a separate five-second deadline. Version blank classification is exactly empty or HT/LF/CR/SP bytes after UTF-8 validation, never a generic whitespace predicate. All closed runtime/environment/command/attempt/failure contracts, executable/output bounds, Windows digests, repository authorization, exact output grammars, and prior fail-closed/no-shell requirements remain covered; no `spawn_blocking`, unbounded wait, whole-file read, unbounded pipe, warning-only fallback, or detached-`ManagedChild` completion claim remains. Verify: `cargo test -p harness-agents runtime_fingerprint`, `cargo test -p harness-agents`, and `cargo check -p harness-agents --all-targets`.
       An unavailable link count is the closed
       `target_authorization_unavailable/link_count_unprovable` reason, zero is
       `unlinked_target`, and only a count greater than one is
@@ -33,8 +33,9 @@ PR branch only; do not create a replacement implementation PR or force-push.
       observation failure is no-envelope execution verification failure;
       post-reap failure is `identity/metadata_unavailable`.
       Value launch inputs are checked at 65,536 exact OS units, environment and
-      setup-secret name collections/names at 1,024, and derived candidates at
-      196,610 before hashing/splitting/joining or owner admission. Excluded and
+      setup-secret name collections/names at 1,024 before hashing/splitting or
+      owner admission; those field limits prove every reached derived candidate
+      is at most 196,610 units without a separate failure. Excluded and
       undeclared values are never read. A fail-fast global eight-owner permit,
       post-READY owner-side 67-pidfd/32-other-fd ceilings, helper-local 64
       pidfds, and child allowlists bound retained resources; the permit survives API return
@@ -46,7 +47,9 @@ PR branch only; do not create a replacement implementation PR or force-push.
       `PTRACE_SYSCALL` entry/exit stops, and exact x86_64/aarch64
       `PTRACE_GET_SYSCALL_INFO` through owner-side
       `PTRACE_SEIZE/PTRACE_INTERRUPT`; the target pre-exec remains the only
-      `PTRACE_TRACEME` caller. After the verified initial static exec, the owner denies
+      `PTRACE_TRACEME` caller. Actual target-call `ENOSYS`/`EPERM`/`EINVAL` is
+      candidate-local handle-execution failure, not a ptrace-containment
+      decision. After the verified initial static exec, the owner denies
       fork/vfork/clone/clone3, execve/execveat, and new executable mmap/mprotect/
       shmat at syscall entry before kernel execution; denial is closed failure
       evidence without a version, while an unverifiable stop is no-envelope.
@@ -59,14 +62,22 @@ PR branch only; do not create a replacement implementation PR or force-push.
       `serde_json/raw_value`; exact hard-link counts 0/1/2, unavailable
       exec-stop/post-reap observations, and initial/retry/later count changes;
       all selected launch values at 65,536/65,537 units, environment/setup
-      counts and names at 1,024/1,025, and derived candidates at
-      196,610/196,611; eight/ninth owner admission, permit lifetime, owner
+      counts and names at 1,024/1,025, and the mathematically maximal 196,610
+      derived candidate with no reachable 196,611 input; eight/ninth owner admission, permit lifetime, owner
       post-READY owner 67/32, helper 64, combined 131/global 1,048 fd ceilings, foreign-fd
       isolation, and every child-role registration gate failure; every shared
       single-schema keyword plus Draft-07 unconditional `additionalItems`;
       deliberate terminal exec-time `ENOENT`/`ENOTDIR` despite
-      adapter PATH continuation; post-exec process/image/mapping denials and
-      unavailable stop verification; exact-source 2,097,152/2,097,153 bytes;
+      adapter PATH continuation; a 65-entry PATH with an earlier terminal
+      outcome versus 64 nonterminal attempts reaching entry 65; reaped
+      first-candidate `EACCES` followed by candidate-local pre-anchor failure;
+      exact fd-10 execution context, `/dev/fd/10` `AT_EXECFN`, and failed
+      post-exec reopen; candidate-local actual-call
+      initial and post-`ETXTBSY` `ENOSYS`/`EPERM`/`EINVAL` with their exact
+      `single`/retry sequences versus
+      pre-observation missing ptrace guard; post-exec
+      process/image/mapping denials and unavailable stop verification;
+      exact-source 2,097,152/2,097,153 bytes;
       stable-key/tool-name empty/HT/LF/CR/SP versus VT/FF/NBSP; normative
       multi-cleanup failure ordering; and version-output empty/HT/LF/CR/SP
       versus VT/FF/NUL/NBSP blank classification with UTF-8 precedence.
@@ -159,8 +170,9 @@ of silently expanding scope.
   precedence are frozen. These limits do not change global ASC-001 validity.
 - Runtime launch inputs are bounded before digest/split/join and before owner
   admission: 65,536 exact Unix-byte or Windows-UTF-16 units per selected value,
-  1,024 observation environment entries/keys and setup-secret names/name units,
-  and 196,610 checked derived-candidate units. Excluded or undeclared values are
+  and 1,024 observation environment entries/keys and setup-secret
+  names/name units. Those gates prove a 196,610-unit maximum for every reached
+  derived candidate without a separate limit failure. Excluded or undeclared values are
   never read. Limit failure is no-envelope and cannot allocate an fd, occupy an
   owner slot, or select another PATH candidate.
 - At most eight fingerprint-specific owners exist concurrently. Each retains
@@ -240,9 +252,13 @@ of silently expanding scope.
   target; a late shebang is blocked by `FD_CLOEXEC` `execveat`. Supported native
   Linux binaries stop at `PTRACE_EVENT_EXEC` before their first instruction and
   resume only after handle hash and image identity match; the pathname is never
-  reopened. A supported Linux platform without such a primitive emits
-  `handle_execution_unavailable` before creating an anchor or target and never
-  fall back to a path; Windows independently returns
+  reopened. After mandatory ptrace containment passes, exact
+  `ENOSYS`/`EPERM`/`EINVAL` from the actual fd-10 target call emits
+  candidate-local `handle_execution_unavailable` with `single` on the first
+  call or the retry sequence after `ETXTBSY`, reaps every created helper, and
+  never falls back to a path. Missing ptrace guarding instead
+  returns no-envelope containment failure before cwd observation; Windows
+  independently returns
   `containment_unavailable` first under its frozen platform matrix.
 - Runtime v0.1 is host-only. Container and microVM inputs fail before host
   resolution, file access, or process creation. It also accepts only the
