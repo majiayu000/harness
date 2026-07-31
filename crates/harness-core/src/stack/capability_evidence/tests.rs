@@ -53,6 +53,43 @@ fn observed_at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap()
 }
 
+fn system_time(value: DateTime<Utc>) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(value.timestamp().try_into().unwrap())
+}
+
+fn capability_token(
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    allowed_write_paths: Vec<PathBuf>,
+) -> CapabilityToken {
+    CapabilityToken {
+        token_id: Uuid::nil(),
+        subtask_index: 0,
+        allowed_write_paths,
+        issued_at: system_time(issued_at),
+        expires_at: system_time(expires_at),
+    }
+}
+
+fn assert_grants(
+    actual: &[AgentStackCapabilityEvidence],
+    expected: &[(AgentStackCapability, AgentStackCapabilityScope)],
+) {
+    assert_eq!(actual.len(), expected.len(), "{actual:#?}");
+    for (capability, scope) in expected {
+        assert!(
+            actual
+                .iter()
+                .any(|item| item.capability() == *capability && item.scope() == scope),
+            "missing {capability:?} at {scope:?} in {actual:#?}"
+        );
+    }
+    assert!(actual.iter().all(|item| {
+        item.evidence_class() == AgentStackCapabilityEvidenceClass::Granted
+            && item.observed_at() == Some(&observed_at())
+    }));
+}
+
 #[test]
 fn capability_evidence_defines_complete_initial_vocabulary() {
     let defined = AGENT_STACK_CAPABILITY_DEFINITIONS
@@ -250,92 +287,391 @@ fn observed_evidence_rejects_repository_source_and_weak_trust() {
 }
 
 #[test]
-fn capability_token_grants_file_write_path_evidence_only() {
+fn evidence_json_rejects_noncanonical_component_ids() {
     let component = component();
-    let token = CapabilityToken {
-        token_id: Uuid::nil(),
-        subtask_index: 0,
-        allowed_write_paths: vec![
-            PathBuf::from("/tmp/harness-worktree-0"),
-            PathBuf::from("/tmp/harness-worktree-1/src"),
-        ],
-        issued_at: SystemTime::UNIX_EPOCH,
-        expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
-    };
-
-    let evidence = AgentStackCapabilityEvidence::granted_by_capability_token(
-        &component,
-        &token,
-        runtime_source(),
-        observed_at(),
+    let mut wire = serde_json::to_value(
+        AgentStackCapabilityEvidence::granted(
+            &component,
+            AgentStackCapability::Shell,
+            runtime_source(),
+            observed_at(),
+            AgentStackTrustLevel::RuntimeObserved,
+            AgentStackCapabilityScope::Host,
+        )
+        .unwrap(),
     )
     .unwrap();
+    wire["component_id"] = json!("bogus:bogus:anything");
 
-    assert_eq!(evidence.len(), 2);
-    assert!(evidence.iter().all(|item| {
-        item.evidence_class() == AgentStackCapabilityEvidenceClass::Granted
-            && item.capability() == AgentStackCapability::FileWrite
-            && matches!(item.scope(), AgentStackCapabilityScope::Path { .. })
-    }));
+    assert!(matches!(
+        AgentStackCapabilityEvidence::from_json(&wire.to_string()),
+        Err(AgentStackCapabilityEvidenceParseError::Validation(
+            AgentStackCapabilityEvidenceError::InvalidComponentId
+        ))
+    ));
 }
 
 #[test]
-fn sandbox_mode_grants_evidence_without_claiming_runtime_use() {
+fn runtime_evidence_requires_trust_exactly_matching_its_source() {
     let component = component();
+    for evidence_class in [
+        AgentStackCapabilityEvidenceClass::Granted,
+        AgentStackCapabilityEvidenceClass::Observed,
+    ] {
+        for (source, trust_level) in [
+            (runtime_source(), AgentStackTrustLevel::RunnerObserved),
+            (runner_source(), AgentStackTrustLevel::RuntimeObserved),
+        ] {
+            let error = AgentStackCapabilityEvidence::new(
+                evidence_class,
+                AgentStackCapability::Shell,
+                component.component_id().clone(),
+                source,
+                Some(observed_at()),
+                trust_level,
+                AgentStackCapabilityScope::Host,
+            )
+            .unwrap_err();
+            assert_eq!(error, AgentStackCapabilityEvidenceError::TrustNotSupported);
+        }
+    }
+}
+
+#[test]
+fn evidence_json_rejects_unknown_nested_scope_fields() {
+    let component = component();
+    let mut wire = serde_json::to_value(
+        AgentStackCapabilityEvidence::granted(
+            &component,
+            AgentStackCapability::Network,
+            runtime_source(),
+            observed_at(),
+            AgentStackTrustLevel::RuntimeObserved,
+            AgentStackCapabilityScope::network(None::<String>).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    wire["scope"]["allow_all"] = json!(true);
+
+    assert!(matches!(
+        AgentStackCapabilityEvidence::from_json(&wire.to_string()),
+        Err(AgentStackCapabilityEvidenceParseError::Syntax(_))
+    ));
+}
+
+#[test]
+fn evidence_json_normalizes_path_scopes_before_storage() {
+    let component = component();
+    let mut wire = serde_json::to_value(
+        AgentStackCapabilityEvidence::granted(
+            &component,
+            AgentStackCapability::FileWrite,
+            runtime_source(),
+            observed_at(),
+            AgentStackTrustLevel::RuntimeObserved,
+            AgentStackCapabilityScope::path(Path::new("/tmp/evidence/canonical")).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    wire["scope"] = json!({
+        "kind": "path",
+        "path": "/tmp/evidence/a/../canonical"
+    });
+
+    let decoded = AgentStackCapabilityEvidence::from_json(&wire.to_string()).unwrap();
+    assert_eq!(
+        decoded.scope(),
+        &AgentStackCapabilityScope::path(Path::new("/tmp/evidence/canonical")).unwrap()
+    );
+}
+
+#[test]
+fn capability_scope_compatibility_rejects_cross_domain_pairs() {
+    let component = component();
+    let incompatible = [
+        (
+            AgentStackCapability::FileWrite,
+            AgentStackCapabilityScope::network(None::<String>).unwrap(),
+        ),
+        (
+            AgentStackCapability::Network,
+            AgentStackCapabilityScope::repository("deploy/production").unwrap(),
+        ),
+        (
+            AgentStackCapability::Network,
+            AgentStackCapabilityScope::path(Path::new("/tmp/capability-scope")).unwrap(),
+        ),
+    ];
+
+    for (capability, scope) in incompatible {
+        let error = AgentStackCapabilityEvidence::granted(
+            &component,
+            capability,
+            runtime_source(),
+            observed_at(),
+            AgentStackTrustLevel::RuntimeObserved,
+            scope,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AgentStackCapabilityEvidenceError::IncompatibleCapabilityScope
+        );
+    }
+}
+
+#[test]
+fn cross_boundary_risk_capabilities_accept_specific_scopes() {
+    let component = component();
+    let compatible = [
+        (
+            AgentStackCapability::ProductionWrite,
+            AgentStackCapabilityScope::path(Path::new("/srv/production")).unwrap(),
+        ),
+        (
+            AgentStackCapability::ProductionWrite,
+            AgentStackCapabilityScope::repository("deploy/production").unwrap(),
+        ),
+        (
+            AgentStackCapability::Destructive,
+            AgentStackCapabilityScope::network(Some("production.example.com")).unwrap(),
+        ),
+        (
+            AgentStackCapability::SecretRead,
+            AgentStackCapabilityScope::path(Path::new("/run/secrets")).unwrap(),
+        ),
+        (
+            AgentStackCapability::Shell,
+            AgentStackCapabilityScope::repository("scripts/release").unwrap(),
+        ),
+        (
+            AgentStackCapability::Privileged,
+            AgentStackCapabilityScope::network(None::<String>).unwrap(),
+        ),
+    ];
+
+    for (capability, scope) in compatible {
+        AgentStackCapabilityEvidence::granted(
+            &component,
+            capability,
+            runtime_source(),
+            observed_at(),
+            AgentStackTrustLevel::RuntimeObserved,
+            scope,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn capability_token_lifetime_is_inclusive_and_validated() {
+    let component = component();
+    let path = PathBuf::from("/tmp/harness-token");
+    let at = observed_at();
+
+    for token in [
+        capability_token(at, at, vec![path.clone()]),
+        capability_token(at - chrono::Duration::seconds(60), at, vec![path.clone()]),
+        capability_token(at, at + chrono::Duration::seconds(60), vec![path.clone()]),
+    ] {
+        assert!(AgentStackCapabilityEvidence::granted_by_sandbox_mode(
+            &component,
+            SandboxMode::WorkspaceWrite,
+            Path::new("/tmp/project"),
+            Some(&token),
+            runtime_source(),
+            at,
+        )
+        .is_ok());
+    }
+
+    for token in [
+        capability_token(
+            at + chrono::Duration::seconds(1),
+            at - chrono::Duration::seconds(1),
+            vec![path.clone()],
+        ),
+        capability_token(
+            at + chrono::Duration::seconds(1),
+            at + chrono::Duration::seconds(60),
+            vec![path.clone()],
+        ),
+        capability_token(
+            at - chrono::Duration::seconds(60),
+            at - chrono::Duration::seconds(1),
+            vec![path.clone()],
+        ),
+    ] {
+        let error = AgentStackCapabilityEvidence::granted_by_sandbox_mode(
+            &component,
+            SandboxMode::WorkspaceWrite,
+            Path::new("/tmp/project"),
+            Some(&token),
+            runtime_source(),
+            at,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AgentStackCapabilityEvidenceError::CapabilityTokenNotEffectiveAtEvidenceTime
+        );
+    }
+}
+
+#[test]
+fn sandbox_modes_without_token_report_effective_authority() {
+    let component = component();
+    let project_scope =
+        AgentStackCapabilityScope::path(Path::new("/tmp/harness-workspace")).unwrap();
+    let network_scope = AgentStackCapabilityScope::network(None::<String>).unwrap();
+
+    for (sandbox_mode, expected) in [
+        (
+            SandboxMode::ReadOnly,
+            vec![
+                (AgentStackCapability::Shell, AgentStackCapabilityScope::Host),
+                (
+                    AgentStackCapability::SecretRead,
+                    AgentStackCapabilityScope::Host,
+                ),
+            ],
+        ),
+        (
+            SandboxMode::ReadOnlyWithNetwork,
+            vec![
+                (AgentStackCapability::Shell, AgentStackCapabilityScope::Host),
+                (
+                    AgentStackCapability::SecretRead,
+                    AgentStackCapabilityScope::Host,
+                ),
+                (AgentStackCapability::Network, network_scope.clone()),
+            ],
+        ),
+        (
+            SandboxMode::WorkspaceWrite,
+            vec![
+                (AgentStackCapability::Shell, AgentStackCapabilityScope::Host),
+                (
+                    AgentStackCapability::SecretRead,
+                    AgentStackCapabilityScope::Host,
+                ),
+                (AgentStackCapability::Network, network_scope.clone()),
+                (AgentStackCapability::FileWrite, project_scope.clone()),
+                (AgentStackCapability::Destructive, project_scope.clone()),
+            ],
+        ),
+        (
+            SandboxMode::DangerFullAccess,
+            [
+                AgentStackCapability::Shell,
+                AgentStackCapability::SecretRead,
+                AgentStackCapability::Network,
+                AgentStackCapability::Privileged,
+                AgentStackCapability::FileWrite,
+                AgentStackCapability::Destructive,
+            ]
+            .into_iter()
+            .map(|capability| (capability, AgentStackCapabilityScope::Host))
+            .collect(),
+        ),
+    ] {
+        let actual = AgentStackCapabilityEvidence::granted_by_sandbox_mode(
+            &component,
+            sandbox_mode,
+            Path::new("/tmp/harness-workspace"),
+            None,
+            runtime_source(),
+            observed_at(),
+        )
+        .unwrap();
+        assert_grants(&actual, &expected);
+    }
+}
+
+#[test]
+fn capability_token_narrows_writable_sandboxes_without_upgrading_read_only_modes() {
+    let component = component();
+    let at = observed_at();
+    let token_paths = [
+        PathBuf::from("/tmp/harness-token-a"),
+        PathBuf::from("/tmp/harness-token-b/child/.."),
+    ];
+    let token = capability_token(
+        at - chrono::Duration::seconds(60),
+        at + chrono::Duration::seconds(60),
+        token_paths.to_vec(),
+    );
+    let network_scope = AgentStackCapabilityScope::network(None::<String>).unwrap();
+    let baseline = vec![
+        (AgentStackCapability::Shell, AgentStackCapabilityScope::Host),
+        (
+            AgentStackCapability::SecretRead,
+            AgentStackCapabilityScope::Host,
+        ),
+    ];
+    let mut networked = baseline.clone();
+    networked.push((AgentStackCapability::Network, network_scope));
+    let mut token_scoped = networked.clone();
+    for path in token_paths {
+        let scope = AgentStackCapabilityScope::path(&path).unwrap();
+        token_scoped.push((AgentStackCapability::FileWrite, scope.clone()));
+        token_scoped.push((AgentStackCapability::Destructive, scope));
+    }
+
+    for (sandbox_mode, expected) in [
+        (SandboxMode::ReadOnly, baseline),
+        (SandboxMode::ReadOnlyWithNetwork, networked.clone()),
+        (SandboxMode::WorkspaceWrite, token_scoped.clone()),
+        (SandboxMode::DangerFullAccess, token_scoped),
+    ] {
+        let actual = AgentStackCapabilityEvidence::granted_by_sandbox_mode(
+            &component,
+            sandbox_mode,
+            Path::new("/tmp/harness-workspace"),
+            Some(&token),
+            runtime_source(),
+            observed_at(),
+        )
+        .unwrap();
+        assert_grants(&actual, &expected);
+        assert!(!actual.iter().any(|item| {
+            item.capability() == AgentStackCapability::Privileged
+                || matches!(
+                    (item.capability(), item.scope()),
+                    (
+                        AgentStackCapability::FileWrite | AgentStackCapability::Destructive,
+                        AgentStackCapabilityScope::Host
+                    )
+                )
+        }));
+    }
+}
+
+#[test]
+fn sandbox_evidence_preserves_runtime_source_and_trust() {
+    let component = component();
+    let token = capability_token(
+        observed_at(),
+        observed_at(),
+        vec![PathBuf::from("/tmp/harness-token")],
+    );
     let evidence = AgentStackCapabilityEvidence::granted_by_sandbox_mode(
         &component,
         SandboxMode::WorkspaceWrite,
         Path::new("/tmp/harness-workspace"),
+        Some(&token),
         runtime_source(),
         observed_at(),
     )
     .unwrap();
 
-    let capabilities = evidence
-        .iter()
-        .map(AgentStackCapabilityEvidence::capability)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        capabilities,
-        [
-            AgentStackCapability::Network,
-            AgentStackCapability::FileWrite
-        ]
-    );
-    assert!(evidence
-        .iter()
-        .all(|item| item.evidence_class() == AgentStackCapabilityEvidenceClass::Granted));
-}
-
-#[test]
-fn danger_full_access_sandbox_grants_host_boundary_evidence() {
-    let component = component();
-    let evidence = AgentStackCapabilityEvidence::granted_by_sandbox_mode(
-        &component,
-        SandboxMode::DangerFullAccess,
-        Path::new("/tmp/harness-workspace"),
-        runtime_source(),
-        observed_at(),
-    )
-    .unwrap();
-
-    let capabilities = evidence
-        .iter()
-        .map(AgentStackCapabilityEvidence::capability)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        capabilities,
-        [
-            AgentStackCapability::Destructive,
-            AgentStackCapability::SecretRead,
-            AgentStackCapability::Network,
-            AgentStackCapability::Privileged,
-            AgentStackCapability::FileWrite,
-        ]
-    );
-    assert!(evidence
-        .iter()
-        .all(|item| matches!(item.scope(), AgentStackCapabilityScope::Host)));
+    assert!(evidence.iter().all(|item| {
+        item.component_id() == component.component_id()
+            && item.source() == &runtime_source()
+            && item.trust_level() == AgentStackTrustLevel::RuntimeObserved
+    }));
 }
 
 #[test]

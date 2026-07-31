@@ -1,12 +1,13 @@
 use super::{
-    AgentStackCapability, AgentStackComponent, AgentStackComponentId, AgentStackSource,
-    AgentStackSourceScope, AgentStackTrustLevel,
+    AgentStackCapability, AgentStackComponent, AgentStackComponentId, AgentStackComponentKind,
+    AgentStackSource, AgentStackSourceScope, AgentStackTrustLevel,
 };
 use crate::capability::CapabilityToken;
 use crate::config::agents::SandboxMode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -67,7 +68,7 @@ impl AgentStackCapabilityEvidenceClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum AgentStackCapabilityScope {
     Component,
     Repository {
@@ -126,9 +127,14 @@ impl AgentStackCapabilityScope {
                 if path.is_empty() || path.contains('\0') || !Path::new(path).is_absolute() {
                     Err(AgentStackCapabilityEvidenceError::InvalidScope)
                 } else {
-                    super::normalize_absolute_path(Path::new(path))
-                        .map(|_| ())
-                        .map_err(|_| AgentStackCapabilityEvidenceError::InvalidScope)
+                    let normalized = super::normalize_absolute_path(Path::new(path))
+                        .map_err(|_| AgentStackCapabilityEvidenceError::InvalidScope)?;
+                    let normalized = normalized
+                        .to_str()
+                        .ok_or(AgentStackCapabilityEvidenceError::NonUtf8Scope)?;
+                    (normalized == path)
+                        .then_some(())
+                        .ok_or(AgentStackCapabilityEvidenceError::InvalidScope)
                 }
             }
             Self::Network { endpoint } => {
@@ -140,6 +146,16 @@ impl AgentStackCapabilityScope {
                 } else {
                     Ok(())
                 }
+            }
+        }
+    }
+
+    fn canonicalized(self) -> Result<Self, AgentStackCapabilityEvidenceError> {
+        match self {
+            Self::Path { path } => Self::path(Path::new(&path)),
+            scope => {
+                scope.validate()?;
+                Ok(scope)
             }
         }
     }
@@ -239,62 +255,53 @@ impl AgentStackCapabilityEvidence {
         )
     }
 
-    pub fn granted_by_capability_token(
-        component: &AgentStackComponent,
-        token: &CapabilityToken,
-        source: AgentStackSource,
-        observed_at: DateTime<Utc>,
-    ) -> Result<Vec<Self>, AgentStackCapabilityEvidenceError> {
-        let trust_level = runtime_trust_for_source(source.scope())?;
-        token
-            .allowed_write_paths
-            .iter()
-            .map(|path| {
-                Self::granted(
-                    component,
-                    AgentStackCapability::FileWrite,
-                    source.clone(),
-                    observed_at,
-                    trust_level,
-                    AgentStackCapabilityScope::path(path)?,
-                )
-            })
-            .collect()
-    }
-
     pub fn granted_by_sandbox_mode(
         component: &AgentStackComponent,
         sandbox_mode: SandboxMode,
         project_root: &Path,
+        capability_token: Option<&CapabilityToken>,
         source: AgentStackSource,
         observed_at: DateTime<Utc>,
     ) -> Result<Vec<Self>, AgentStackCapabilityEvidenceError> {
         let trust_level = runtime_trust_for_source(source.scope())?;
-        let grants = match sandbox_mode {
-            SandboxMode::ReadOnly => Vec::new(),
-            SandboxMode::ReadOnlyWithNetwork => vec![(
+        if let Some(token) = capability_token {
+            validate_capability_token_time(token, &observed_at)?;
+        }
+
+        let mut grants = vec![
+            (AgentStackCapability::Shell, AgentStackCapabilityScope::Host),
+            (
+                AgentStackCapability::SecretRead,
+                AgentStackCapabilityScope::Host,
+            ),
+        ];
+        match (sandbox_mode, capability_token) {
+            (SandboxMode::ReadOnly, _) => {}
+            (SandboxMode::ReadOnlyWithNetwork, _) => grants.push((
                 AgentStackCapability::Network,
                 AgentStackCapabilityScope::network(None::<String>)?,
-            )],
-            SandboxMode::WorkspaceWrite => vec![
-                (
+            )),
+            (SandboxMode::WorkspaceWrite | SandboxMode::DangerFullAccess, Some(token)) => {
+                grants.push((
                     AgentStackCapability::Network,
                     AgentStackCapabilityScope::network(None::<String>)?,
-                ),
-                (
-                    AgentStackCapability::FileWrite,
-                    AgentStackCapabilityScope::path(project_root)?,
-                ),
-            ],
-            SandboxMode::DangerFullAccess => vec![
-                (
-                    AgentStackCapability::Destructive,
-                    AgentStackCapabilityScope::Host,
-                ),
-                (
-                    AgentStackCapability::SecretRead,
-                    AgentStackCapabilityScope::Host,
-                ),
+                ));
+                for path in &token.allowed_write_paths {
+                    let scope = AgentStackCapabilityScope::path(path)?;
+                    grants.push((AgentStackCapability::FileWrite, scope.clone()));
+                    grants.push((AgentStackCapability::Destructive, scope));
+                }
+            }
+            (SandboxMode::WorkspaceWrite, None) => {
+                let scope = AgentStackCapabilityScope::path(project_root)?;
+                grants.push((
+                    AgentStackCapability::Network,
+                    AgentStackCapabilityScope::network(None::<String>)?,
+                ));
+                grants.push((AgentStackCapability::FileWrite, scope.clone()));
+                grants.push((AgentStackCapability::Destructive, scope));
+            }
+            (SandboxMode::DangerFullAccess, None) => grants.extend([
                 (
                     AgentStackCapability::Network,
                     AgentStackCapabilityScope::Host,
@@ -307,8 +314,12 @@ impl AgentStackCapabilityEvidence {
                     AgentStackCapability::FileWrite,
                     AgentStackCapabilityScope::Host,
                 ),
-            ],
-        };
+                (
+                    AgentStackCapability::Destructive,
+                    AgentStackCapabilityScope::Host,
+                ),
+            ]),
+        }
         grants
             .into_iter()
             .map(|(capability, scope)| {
@@ -328,11 +339,12 @@ impl AgentStackCapabilityEvidence {
         if self.schema_version != AGENT_STACK_CAPABILITY_EVIDENCE_SCHEMA_VERSION {
             return Err(AgentStackCapabilityEvidenceError::UnsupportedSchemaVersion);
         }
-        validate_component_id(self.component_id.as_str())?;
+        validate_component_id(&self.component_id)?;
         validate_source_for_class(self.evidence_class, self.source.scope())?;
         validate_time_for_class(self.evidence_class, self.observed_at.as_ref())?;
-        validate_trust_for_class(self.evidence_class, self.trust_level)?;
-        self.scope.validate()
+        validate_trust_for_source(self.evidence_class, self.source.scope(), self.trust_level)?;
+        self.scope.validate()?;
+        validate_scope_for_capability(self.capability, &self.scope)
     }
 
     pub fn from_json(value: &str) -> Result<Self, AgentStackCapabilityEvidenceParseError> {
@@ -397,6 +409,10 @@ pub enum AgentStackCapabilityEvidenceError {
     InvalidScope,
     #[error("the Agent Stack capability evidence scope contains non-UTF-8 data")]
     NonUtf8Scope,
+    #[error("the Agent Stack capability evidence scope is incompatible with its capability")]
+    IncompatibleCapabilityScope,
+    #[error("the capability token is not effective at the evidence observation time")]
+    CapabilityTokenNotEffectiveAtEvidenceTime,
 }
 
 #[derive(Debug, Error)]
@@ -442,6 +458,7 @@ impl TryFrom<V01WireCapabilityEvidence> for AgentStackCapabilityEvidence {
         }
         let source = AgentStackSource::new(wire.source.scope, &wire.source.locator)
             .map_err(|_| AgentStackCapabilityEvidenceError::InvalidEvidenceSource)?;
+        let scope = wire.scope.canonicalized()?;
         AgentStackCapabilityEvidence::new(
             wire.evidence_class,
             wire.capability,
@@ -449,7 +466,7 @@ impl TryFrom<V01WireCapabilityEvidence> for AgentStackCapabilityEvidence {
             source,
             wire.observed_at,
             wire.trust_level,
-            wire.scope,
+            scope,
         )
     }
 }
@@ -469,19 +486,37 @@ fn runtime_trust_for_source(
     }
 }
 
-fn validate_component_id(value: &str) -> Result<(), AgentStackCapabilityEvidenceError> {
-    let mut segments = value.splitn(3, ':');
-    let source_scope = segments.next();
-    let component_kind = segments.next();
-    let locator = segments.next();
-    if source_scope.is_some_and(|value| !value.is_empty())
-        && component_kind.is_some_and(|value| !value.is_empty())
-        && locator.is_some_and(|value| !value.is_empty() && !value.contains('\0'))
-    {
-        Ok(())
-    } else {
-        Err(AgentStackCapabilityEvidenceError::InvalidComponentId)
-    }
+fn validate_component_id(
+    component_id: &AgentStackComponentId,
+) -> Result<(), AgentStackCapabilityEvidenceError> {
+    let mut segments = component_id.as_str().splitn(3, ':');
+    let source_scope = segments
+        .next()
+        .and_then(|value| {
+            AgentStackSourceScope::ALL
+                .iter()
+                .copied()
+                .find(|scope| scope.as_str() == value)
+        })
+        .ok_or(AgentStackCapabilityEvidenceError::InvalidComponentId)?;
+    let component_kind = segments
+        .next()
+        .and_then(|value| {
+            AgentStackComponentKind::ALL
+                .iter()
+                .copied()
+                .find(|kind| kind.as_str() == value)
+        })
+        .ok_or(AgentStackCapabilityEvidenceError::InvalidComponentId)?;
+    let locator = segments
+        .next()
+        .ok_or(AgentStackCapabilityEvidenceError::InvalidComponentId)?;
+    let parsed_source = AgentStackSource::new(source_scope, locator)
+        .map_err(|_| AgentStackCapabilityEvidenceError::InvalidComponentId)?;
+    let canonical_id = AgentStackComponentId::from_source(component_kind, &parsed_source);
+    (canonical_id.as_str() == component_id.as_str())
+        .then_some(())
+        .ok_or(AgentStackCapabilityEvidenceError::InvalidComponentId)
 }
 
 fn validate_source_for_class(
@@ -520,8 +555,9 @@ fn validate_time_for_class(
     }
 }
 
-fn validate_trust_for_class(
+fn validate_trust_for_source(
     evidence_class: AgentStackCapabilityEvidenceClass,
+    source_scope: AgentStackSourceScope,
     trust_level: AgentStackTrustLevel,
 ) -> Result<(), AgentStackCapabilityEvidenceError> {
     let valid = match evidence_class {
@@ -530,14 +566,63 @@ fn validate_trust_for_class(
             AgentStackTrustLevel::SelfDeclared | AgentStackTrustLevel::RepositoryObserved
         ),
         AgentStackCapabilityEvidenceClass::Granted
-        | AgentStackCapabilityEvidenceClass::Observed => {
-            matches!(
-                trust_level,
-                AgentStackTrustLevel::RuntimeObserved | AgentStackTrustLevel::RunnerObserved
-            )
-        }
+        | AgentStackCapabilityEvidenceClass::Observed => match source_scope {
+            AgentStackSourceScope::Runtime => trust_level == AgentStackTrustLevel::RuntimeObserved,
+            AgentStackSourceScope::Runner => trust_level == AgentStackTrustLevel::RunnerObserved,
+            AgentStackSourceScope::Repository
+            | AgentStackSourceScope::UserGlobal
+            | AgentStackSourceScope::Admin
+            | AgentStackSourceScope::System => false,
+        },
     };
     valid
         .then_some(())
         .ok_or(AgentStackCapabilityEvidenceError::TrustNotSupported)
+}
+
+fn validate_scope_for_capability(
+    capability: AgentStackCapability,
+    scope: &AgentStackCapabilityScope,
+) -> Result<(), AgentStackCapabilityEvidenceError> {
+    let valid = !matches!(
+        (capability, scope),
+        (
+            AgentStackCapability::FileWrite,
+            AgentStackCapabilityScope::Network { .. }
+        ) | (
+            AgentStackCapability::Network,
+            AgentStackCapabilityScope::Repository { .. } | AgentStackCapabilityScope::Path { .. }
+        )
+    );
+    valid
+        .then_some(())
+        .ok_or(AgentStackCapabilityEvidenceError::IncompatibleCapabilityScope)
+}
+
+fn validate_capability_token_time(
+    token: &CapabilityToken,
+    observed_at: &DateTime<Utc>,
+) -> Result<(), AgentStackCapabilityEvidenceError> {
+    let issued_at = system_time_unix_nanos(token.issued_at);
+    let expires_at = system_time_unix_nanos(token.expires_at);
+    let observed_at = datetime_unix_nanos(observed_at);
+    (issued_at <= expires_at && issued_at <= observed_at && observed_at <= expires_at)
+        .then_some(())
+        .ok_or(AgentStackCapabilityEvidenceError::CapabilityTokenNotEffectiveAtEvidenceTime)
+}
+
+fn system_time_unix_nanos(value: SystemTime) -> i128 {
+    match value.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos())
+        }
+        Err(error) => {
+            let duration = error.duration();
+            -(i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos()))
+        }
+    }
+}
+
+fn datetime_unix_nanos(value: &DateTime<Utc>) -> i128 {
+    i128::from(value.timestamp()) * 1_000_000_000 + i128::from(value.timestamp_subsec_nanos())
 }
