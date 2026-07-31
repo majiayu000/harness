@@ -352,6 +352,83 @@ mod submission_guard_tests {
     }
 
     #[tokio::test]
+    async fn accepted_same_state_submission_replay_is_idempotent() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+        let initial = instance("same-state-submission-replay", "planning");
+        let decision = WorkflowDecision::new(
+            &initial.id,
+            "planning",
+            "continue_planning",
+            "planning",
+            "planning requires another pass",
+        )
+        .with_command(WorkflowCommand::enqueue_activity(
+            "plan_issue",
+            "same-state-submission-replay-plan",
+        ));
+        let mut final_instance = initial.clone();
+        final_instance.version = 1;
+
+        let Some(first) = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &initial.id,
+                expected_state: &initial.state,
+                expected_version: initial.version,
+                create_if_missing: Some(&initial),
+                event_id: None,
+                new_event_id: Some("same-state-submission-replay-event"),
+                event_type: "IssueSubmitted",
+                source: "workflow-runtime-test",
+                payload: json!({}),
+                decision: &decision,
+                existing_record: None,
+                rejection_reason: None,
+                final_instance: Some(&final_instance),
+                command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
+            })
+            .await?
+        else {
+            anyhow::bail!("initial same-state transition should commit");
+        };
+
+        let Some(replay) = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &initial.id,
+                expected_state: &final_instance.state,
+                expected_version: final_instance.version,
+                create_if_missing: Some(&initial),
+                event_id: first.record.event_id.as_deref(),
+                new_event_id: None,
+                event_type: "IssueSubmitted",
+                source: "workflow-runtime-test",
+                payload: json!({}),
+                decision: &decision,
+                existing_record: Some(&first.record),
+                rejection_reason: None,
+                final_instance: Some(&final_instance),
+                command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
+            })
+            .await?
+        else {
+            anyhow::bail!("same-state replay should reuse the accepted decision");
+        };
+
+        assert_eq!(replay.record.id, first.record.id);
+        assert_eq!(replay.command_ids, first.command_ids);
+        assert_eq!(store.get_instance(&initial.id).await?, Some(final_instance));
+        assert_eq!(store.events_for(&initial.id).await?.len(), 1);
+        assert_eq!(store.decisions_for(&initial.id).await?.len(), 1);
+        assert_eq!(store.commands_for(&initial.id).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rejected_new_submission_requires_failed_terminal_state() -> anyhow::Result<()> {
         if resolve_database_url(None).is_err() {
             return Ok(());

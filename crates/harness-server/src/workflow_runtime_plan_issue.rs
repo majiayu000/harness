@@ -1,9 +1,9 @@
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     build_plan_issue_decision, PlanIssueDecisionInput, PlanIssueWorkflowAction, WorkflowCommand,
-    WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition,
-    WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
-    WorkflowSubject,
+    WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition,
+    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition,
+    WorkflowRuntimeStore, WorkflowSubject,
 };
 use serde_json::json;
 use std::path::Path;
@@ -273,17 +273,22 @@ async fn persist_replan_completed(
             "workflow-policy",
         )
         .await?;
-    if let Some(record) = record {
-        if !record.accepted {
-            anyhow::bail!(
-                "replan completion transition rejected: {}",
-                record
-                    .rejection_reason
-                    .unwrap_or_else(|| "unknown rejection".to_string())
-            );
-        }
+    require_replan_completion_record(record)
+}
+
+fn require_replan_completion_record(record: Option<WorkflowDecisionRecord>) -> anyhow::Result<()> {
+    match record {
+        Some(record) if record.accepted => Ok(()),
+        Some(record) => anyhow::bail!(
+            "replan completion transition rejected: {}",
+            record
+                .rejection_reason
+                .unwrap_or_else(|| "unknown rejection".to_string())
+        ),
+        None => anyhow::bail!(
+            "workflow state changed before replan completion transition could be committed"
+        ),
     }
-    Ok(())
 }
 
 fn fallback_action(ctx: &PlanIssueRuntimeContext<'_>) -> PlanIssueRuntimeAction {
@@ -460,6 +465,17 @@ Workflow policy
             }
             _ => panic!("expected PlanIssueRuntimeAction::Block"),
         }
+    }
+
+    #[test]
+    fn replan_completion_rejects_stale_transition() {
+        let error = match require_replan_completion_record(None) {
+            Ok(()) => panic!("stale replan completion should fail"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("workflow state changed before replan completion transition"));
     }
 
     #[tokio::test]

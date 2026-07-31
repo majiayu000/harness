@@ -104,8 +104,8 @@ impl WorkflowRuntimeStore {
             .existing_record
             .filter(|record| record.accepted)
         {
-            Some(record) if current.state == record.decision.observed_state => false,
             Some(record) if current.state == record.decision.next_state => true,
+            Some(record) if current.state == record.decision.observed_state => false,
             Some(record) => {
                 anyhow::bail!(
                     "stale workflow submission replay `{}` observed current state `{}` outside decision transition `{} -> {}`",

@@ -148,7 +148,8 @@ pub use reducer::{
     RUNTIME_JOB_COMPLETED_EVENT, SCOPE_TOO_LARGE_SIGNAL,
 };
 pub use remote_facts::{
-    remote_fact_command_dedupe_key, stable_remote_fact_hash, RemoteFactSnapshot,
+    remote_fact_command_dedupe_key, stable_pr_snapshot_fact_hash_input, stable_remote_fact_hash,
+    RemoteFactSnapshot,
 };
 pub use repo_memory::{
     RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, REPO_MEMORY_CONFIG_ARTIFACT,

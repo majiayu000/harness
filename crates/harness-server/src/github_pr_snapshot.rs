@@ -1,12 +1,15 @@
 use anyhow::Context;
 use chrono::{SecondsFormat, Utc};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, RemoteFactSnapshot,
-    PR_FEEDBACK_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
+    stable_pr_snapshot_fact_hash_input, ActivityArtifact, ActivityErrorKind, ActivityResult,
+    ActivitySignal, RemoteFactSnapshot, PR_FEEDBACK_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::Duration;
+
+mod graphql;
+use graphql::fetch_github_pr_snapshot_value;
+#[cfg(test)]
+use graphql::GITHUB_PR_SNAPSHOT_QUERY;
 
 const SERVER_PR_SNAPSHOT_SCHEMA: &str = "harness.github.pr_snapshot.v1";
 pub(crate) const GITHUB_PR_SNAPSHOT_ARTIFACT: &str = "github_pr_snapshot";
@@ -84,7 +87,7 @@ impl GitHubPrSnapshotArtifacts {
                 .as_str()
                 .to_string()
         });
-        let facts_for_hash = stable_pr_fact_hash_input(&self.normalized_snapshot);
+        let facts_for_hash = stable_pr_snapshot_fact_hash_input(&self.normalized_snapshot);
         let mut snapshot = RemoteFactSnapshot::new(
             "github",
             repo,
@@ -152,126 +155,11 @@ pub(crate) async fn fetch_github_pr_snapshot_with_client(
     })
 }
 
-async fn fetch_github_pr_snapshot_value(
-    client: &reqwest::Client,
-    target: &GitHubPrSnapshotTarget,
-    github_token: Option<&str>,
-    graphql_url: &str,
-) -> anyhow::Result<Value> {
-    let (owner, repo) = target
-        .repo_slug
-        .split_once('/')
-        .context("validated repo slug should contain owner and repo")?;
-    let query = r#"
-        query HarnessPrSnapshot($owner: String!, $repo: String!, $pr: Int!) {
-          repository(owner: $owner, name: $repo) {
-            pullRequest(number: $pr) {
-              number
-              state
-              merged
-              url
-              title
-              baseRefName
-              headRefName
-              headRefOid
-              mergeCommit {
-                oid
-              }
-              isDraft
-              mergeStateStatus
-              reviewDecision
-              statusCheckRollup {
-                state
-              }
-              reviewThreads(first: 100) {
-                pageInfo {
-                  hasNextPage
-                  endCursor
-                }
-                nodes {
-                  id
-                  path
-                  line
-                  isResolved
-                  isOutdated
-                  comments(first: 5) {
-                    nodes {
-                      author { login }
-                      body
-                      publishedAt
-                    }
-                  }
-                }
-              }
-              files(first: 100) {
-                pageInfo {
-                  hasNextPage
-                  endCursor
-                }
-                nodes {
-                  path
-                  additions
-                  deletions
-                  changeType
-                }
-              }
-              closingIssuesReferences(first: 20) {
-                pageInfo {
-                  hasNextPage
-                  endCursor
-                }
-                nodes {
-                  number
-                  url
-                }
-              }
-            }
-          }
-        }
-    "#;
-
-    let request = crate::github_client::apply_github_headers(
-        client.post(graphql_url).json(&json!({
-            "query": query,
-            "variables": {
-                "owner": owner,
-                "repo": repo,
-                "pr": target.pr_number as i64,
-            }
-        })),
-        github_token,
-    );
-
-    let response = tokio::time::timeout(Duration::from_secs(15), request.send()).await??;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("GitHub PR snapshot query failed with status {status}: {body}");
-    }
-    let parsed: GitHubPrSnapshotGraphQlResponse =
-        serde_json::from_str(&body).context("GitHub PR snapshot response was invalid JSON")?;
-    if let Some(errors) = parsed.errors.filter(|errors| !errors_is_empty(errors)) {
-        anyhow::bail!("GitHub PR snapshot query returned errors: {errors}");
-    }
-    parsed
-        .data
-        .and_then(|data| data.get("repository").cloned())
-        .and_then(|repository| repository.get("pullRequest").cloned())
-        .filter(|pr| !pr.is_null())
-        .ok_or_else(|| anyhow::anyhow!("GitHub PR snapshot query returned no PR data"))
-}
-
 pub(crate) fn github_graphql_url() -> String {
     std::env::var("HARNESS_GITHUB_GRAPHQL_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(crate::github_client::graphql_url)
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubPrSnapshotGraphQlResponse {
-    data: Option<Value>,
-    errors: Option<Value>,
 }
 
 pub(crate) fn errors_is_empty(errors: &Value) -> bool {
@@ -285,6 +173,7 @@ fn normalize_github_pr_snapshot(
     let pr_number = value_u64(pr.get("number")).context("GitHub PR snapshot missing number")?;
     let pr_url = value_string(pr.get("url")).context("GitHub PR snapshot missing url")?;
     let state = value_string(pr.get("state"));
+    let updated_at = value_string(pr.get("updatedAt"));
     let merged = pr.get("merged").and_then(Value::as_bool).or_else(|| {
         state
             .as_deref()
@@ -305,6 +194,11 @@ fn normalize_github_pr_snapshot(
         .get("statusCheckRollup")
         .and_then(|rollup| rollup.get("state"))
         .and_then(|value| value_string(Some(value)));
+    let status_check_contexts = status_check_contexts(pr);
+    let status_check_contexts_complete = !pr
+        .pointer("/statusCheckRollup/contexts/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let active_threads = active_unresolved_review_threads(pr);
     let changed_files = changed_files(pr);
     let closing_issues = closing_issues(pr);
@@ -323,6 +217,8 @@ fn normalize_github_pr_snapshot(
         "merged": merged,
         "pr_url": pr_url,
         "url": pr_url,
+        "updated_at": updated_at,
+        "updatedAt": updated_at,
         "title": title,
         "base_ref": base_ref,
         "baseRefName": base_ref,
@@ -342,6 +238,8 @@ fn normalize_github_pr_snapshot(
         "status_check_rollup_state": status_check_rollup_state,
         "statusCheckRollupState": status_check_rollup_state,
         "statusCheckRollup": pr.get("statusCheckRollup").cloned().unwrap_or(Value::Null),
+        "status_check_contexts": status_check_contexts,
+        "status_check_contexts_complete": status_check_contexts_complete,
         "active_unresolved_review_threads": active_threads,
         "active_unresolved_review_threads_count": active_threads.len(),
         "review_threads_complete": review_threads_complete,
@@ -403,6 +301,47 @@ fn closing_issues(pr: &Value) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn status_check_contexts(pr: &Value) -> Vec<Value> {
+    let mut contexts = pr
+        .pointer("/statusCheckRollup/contexts/nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(
+            |context| match value_string(context.get("__typename"))?.as_str() {
+                "CheckRun" => Some(json!({
+                    "type": "check_run",
+                    "id": value_string(context.get("id")),
+                    "database_id": value_u64(context.get("databaseId")),
+                    "name": value_string(context.get("name")),
+                    "status": value_string(context.get("status")),
+                    "conclusion": value_string(context.get("conclusion")),
+                    "details_url": value_string(context.get("detailsUrl")),
+                })),
+                "StatusContext" => Some(json!({
+                    "type": "status_context",
+                    "id": value_string(context.get("id")),
+                    "context": value_string(context.get("context")),
+                    "state": value_string(context.get("state")),
+                    "target_url": value_string(context.get("targetUrl")),
+                })),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    contexts.sort_by_key(status_check_context_sort_key);
+    contexts
+}
+
+fn status_check_context_sort_key(context: &Value) -> String {
+    let context_type = value_string(context.get("type")).unwrap_or_default();
+    let id = value_string(context.get("id")).unwrap_or_default();
+    let name = value_string(context.get("name"))
+        .or_else(|| value_string(context.get("context")))
+        .unwrap_or_default();
+    format!("{context_type}\0{id}\0{name}")
 }
 
 fn connection_nodes<'a>(pr: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
@@ -502,14 +441,6 @@ pub(crate) fn pr_readiness_for_snapshot(snapshot: &Value) -> PrReadiness {
         return PrReadiness::WaitingForMergeability;
     }
     PrReadiness::NeedsFeedbackRepair
-}
-
-fn stable_pr_fact_hash_input(snapshot: &Value) -> Value {
-    let mut stable = snapshot.clone();
-    if let Some(object) = stable.as_object_mut() {
-        object.remove("observed_at");
-    }
-    stable
 }
 
 fn snapshot_allows_ready(snapshot: &Value) -> bool {
