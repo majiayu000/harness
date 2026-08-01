@@ -143,6 +143,14 @@ Expected probe failures are valid runtime envelopes only when their failure and
 missing-fact matrix is valid. Invalid producer input returns a typed error and
 does not construct an envelope. This implements B-001, B-014, and B-015.
 
+For schema v0.1, constructors and strict parsing reject every `WindowsBare`,
+`WindowsAbsolute`, and `WindowsQualified` runtime command form, as well as any
+present Windows resolution context. Supported Windows resolver/digest functions
+remain pure contract helpers for a later schema revision; because the v0.1
+producer always returns no-envelope
+`ContainmentUnavailable(UnsupportedPlatform)` before observation, those helpers
+cannot create an otherwise unreachable envelope state.
+
 Canonical fingerprint hashing uses these exact bytes:
 
 ```text
@@ -422,11 +430,14 @@ producer may therefore reject an over-limit launch the adapter could attempt;
 that is an explicit representability divergence, not another candidate
 selection.
 
-The payload records a closed `RuntimeCommandForm` with exactly `UnixBare`,
-`UnixAbsolute`, `UnixQualified`, `WindowsBare`, `WindowsAbsolute`, or
-`WindowsQualified`. The producer derives it from the original configured
-`OsStr`; the parser uses it to validate search versus configured-path outcomes
-without serializing the command.
+The pure command-form model has exactly `UnixBare`, `UnixAbsolute`,
+`UnixQualified`, `WindowsBare`, `WindowsAbsolute`, or `WindowsQualified`. A
+v0.1 envelope payload records only one of the three Unix forms. Every Windows
+form is available only to pure resolver/digest helpers and is rejected by the
+envelope constructor and parser. For admitted Unix evidence, the producer
+derives the form from the original configured `OsStr`; the parser uses it to
+validate search versus configured-path outcomes without serializing the
+command.
 
 Before resolution, the producer computes `configured_command_digest` from a
 domain-separated exact OS-string representation:
@@ -444,13 +455,16 @@ counts and appends `OsStrExt::as_bytes()` unchanged. Windows counts original
 `encode_wide()` code units and appends each as little-endian `u16`. No UTF-8 conversion,
 case-folding, slash normalization, dot-segment folding, absolutization, or
 symlink resolution occurs. Empty or NUL-containing commands fail typed before
-hashing. The digest is a payload fact and enters `fingerprint_digest`; the raw
-command is never serialized and the value never becomes ASC-001 integrity.
+hashing. Only the admitted Unix digest is a payload fact and enters
+`fingerprint_digest`; the pure Windows digest is helper-only and never enters a
+v0.1 envelope. The raw command is never serialized and the value never becomes
+ASC-001 integrity.
 
 The configured child working-directory spelling uses the same helper with
 domain
-`b"harness_runtime_working_directory_v0_1\0"` and enters the payload as
-`working_directory_digest`. After the isolation and sandbox gates, Linux v0.1
+`b"harness_runtime_working_directory_v0_1\0"`. The admitted Unix digest enters
+the payload as `working_directory_digest`; the pure Windows helper vector never
+enters a v0.1 envelope. After the isolation and sandbox gates, Linux v0.1
 reserves the runtime-independent owner, uses one reserved slot for owner-side
 `pidfd_open(getpid(), 0)` plus `pidfd_send_signal(..., 0)`, closes that test
 pidfd, and only then creates the capability child. Any self-preflight syscall
@@ -646,7 +660,9 @@ skips yields `path_not_found`; one ending in `ExecEacces` with no final identity
 yields `bare_eacces_exhausted`; reaching the bound without a terminal outcome
 yields `candidate_limit_exceeded` with exactly 64 attempts. Outcomes after a
 terminal, multiple terminals, wrong source/failure pairs, or more than 64
-entries fail parsing. A Windows command form forbids Unix attempt evidence.
+entries fail parsing. Every Windows command form and every present Windows
+resolution context fails v0.1 envelope construction and parsing before attempt
+validation; its pure resolver/digest value is not envelope evidence.
 
 `RuntimeExecSequence::None` is required for skips, inspection-only,
 pre-observed unsupported-format interpreter-authorization-unavailable,
@@ -769,8 +785,8 @@ commands have one absolute selected candidate and no fallback. Unix bare-name
 fallback is limited to the ordered, inspected, same-basename `EACCES` algorithm
 above; it never changes arguments or executes a search helper.
 
-The payload carries a closed `WindowsResolutionContextEvidence` with exactly
-four optional fields:
+The pure non-envelope Windows resolver helper carries a closed
+`WindowsResolutionContextEvidence` with exactly four optional fields:
 `current_executable_dir_digest`, `system_dir_digest`,
 `windows_dir_digest`, and `parent_path_digest`. Each present value uses:
 
@@ -788,7 +804,8 @@ b"harness_runtime_windows_search_parent_path_v0_1\0"
 ```
 
 Absent is a distinct typed state with no digest; present empty hashes the
-zero-unit framing. For the independent original UTF-16 units of `C:\X`
+zero-unit framing. This helper value and its digests never enter a v0.1
+envelope or `fingerprint_digest`. For the independent original UTF-16 units of `C:\X`
 (`0043 003a 005c 0058`), the four digests in field order are exactly:
 
 ```text
@@ -868,7 +885,11 @@ is read and checked against the 65,536-unit value limit. An excluded over-limit
 `CLAUDE_CONFIG_DIR` is absent without a limit error; an excluded over-limit
 `PATH` becomes `Unset`, so a bare Unix command later returns the existing
 `path_unusable` outcome. Raw values and undeclared keys never enter the
-envelope. These rules implement B-005 and B-010.
+envelope or probe `envp`, and the producer never reads them for evidence. v0.1
+does not claim that the authorized target is unable to open readable same-UID
+host files or process state; such a claim requires a separate filesystem and
+process-isolation design plus security approval. These rules implement B-005
+and B-010.
 
 ## Handle-Based Executable Observation and TOCTOU Policy
 
@@ -1050,7 +1071,11 @@ requires alternating entry/exit stops tagged by `PTRACE_O_TRACESYSGOOD`.
 `PTRACE_GET_SYSCALL_INFO` must return the expected entry or exit information
 whose audit architecture exactly matches the admitted Linux `x86_64` or `aarch64` tuple;
 raw register guessing is forbidden. At each entry stop, before kernel
-execution, the owner rejects closed `RuntimeTransitiveExecutionClass`:
+execution, x86_64 first rejects every syscall number carrying
+`__X32_SYSCALL_BIT` as no-envelope `ExecutionVerificationUnavailable`; it never
+clears the bit or interprets that dispatch through the native-number table.
+This check does not apply to native x86_64 numbers or aarch64. Only after that
+ABI gate does the owner reject closed `RuntimeTransitiveExecutionClass`:
 
 - `ProcessCreation`: `fork`, `vfork`, `clone`, or `clone3`;
 - `ImageExecution`: `execve` or `execveat`;
@@ -1061,7 +1086,10 @@ execution, the owner rejects closed `RuntimeTransitiveExecutionClass`:
   `personality` argument other than the side-effect-free exact
   `0xffff_ffff` query,
   `creat`, or `open`/`openat`/`open_by_handle_at`/`openat2` whose flags request
-  `O_WRONLY`, `O_RDWR`, or `O_TRUNC`.
+  `O_WRONLY`, `O_RDWR`, or `O_TRUNC`; and
+- `ProcessSignalling`: `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`,
+  `rt_tgsigqueueinfo`, or `pidfd_send_signal`, for every target, signal, PID,
+  TID, pidfd, zero, negative, process-group, and broadcast form.
 
 The fixed-size `open_how` prefix used by `openat2` is copied from the stopped
 single-threaded target with one bounded `process_vm_readv`; an unreadable
@@ -1101,7 +1129,9 @@ immutable vDSO are the only executable mappings allowed to run, and target
 code cannot gain a write path to either. PATH/cwd helper launches, dynamic
 loading, JIT mappings, writable executable segments, executable stacks,
 asynchronous syscall submission, processes, and threads are deliberately
-unsupported in v0.1.
+unsupported in v0.1. Target-initiated process signalling is also unsupported;
+signal-delivery stops from outside the target remain abnormal trace transitions
+and never become `ProcessSignalling` evidence.
 
 The retained strong identity is device/inode from handle metadata on Unix and
 volume serial plus 128-bit `FILE_ID_INFO` from the opened handle on Windows.
@@ -1434,8 +1464,9 @@ defined above. `ExecutionVerificationUnavailable` covers a missing or
 surplus `PTRACE_EVENT_EXEC`, an abnormal trace transition, unavailable required
 stopped-image/link-count observation, and active-deadline expiry before
 verified resume. It also covers missing, surplus, untagged, out-of-order, or
-unreadable post-resume syscall stops; it carries no PID, path, errno, syscall
-number, argument, or OS text.
+unreadable post-resume syscall stops and any x86_64 dispatch carrying
+`__X32_SYSCALL_BIT`; it carries no PID, path, errno, syscall number, argument,
+or OS text.
 
 The result-state matrix is fail closed:
 
@@ -1689,17 +1720,23 @@ owns user-facing collection commands. This is B-016.
 | B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch`; `fingerprint_digest_is_separate_from_component_integrity`; `fingerprint_digest_framing_vectors_are_independent`; `complete_runtime_and_mcp_payload_digest_vectors_are_fixed`; `canonical_payload_string_escaping_is_frozen`; `canonical_payload_preserves_raw_json_number_tokens`; `failure_payload_changes_fingerprint_digest_without_fabricating_integrity`; `component_integrity_preserves_exact_source_bytes_or_absence` |
 | B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; `sandbox_passthrough_state_is_only_supported_policy`; `restricted_sandbox_fails_before_host_observation`; `narrowed_allowed_write_paths_fail_before_host_observation`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
 | B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `configured_mcp_server_key_accepts_1024_and_rejects_1025_before_expansion`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
-| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; `runtime_command_form_round_trips_and_rejects_cross_form_outcomes`; `working_directory_spelling_and_unix_identity_digests_have_fixed_vectors`; `working_directory_open_failure_precedes_resolution`; `cwd_path_replacement_keeps_relative_resolution_checkpoints_and_fchdir_on_one_handle`; independent Unix raw-byte and Windows UTF-16LE fixed vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; `unix_retained_handle_exec_preserves_configured_argv0`; `unix_retained_handle_exec_freezes_fd10_at_execfn_context`; `runtime_exec_context_matches_exec_sequence`; `unix_bare_path_unset_is_path_unusable_without_default_search`; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `eacces_then_preanchor_rejection_preserves_prior_attempt_and_finalizes_anchor`; `bare_eacces_exhaustion_has_no_final_identity`; `etxtbsy_retries_same_candidate_once_after_150_ms`; `etxtbsy_checkpoint_rechecks_authorization_hash_and_path_identity`; `etxtbsy_checkpoint_authorization_change_prevents_second_exec`; `etxtbsy_checkpoint_rejects_configuration_source_reason`; `etxtbsy_checkpoint_unavailable_authorization_prevents_second_exec`; `etxtbsy_retry_group_join_failure_is_reaped_without_exec_or_fallback`; `second_etxtbsy_is_terminal`; `etxtbsy_sequence_rejects_wrong_errno_delay_count_and_outcome`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_search_fallback`; `open_enoent_and_enotdir_are_absent_with_command_form_semantics`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `absolute_and_qualified_nonregular_and_nonexecutable_require_identity_failure`; `runtime_resolution_attempts_round_trip_all_outcomes_and_exec_sequences`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `handle_execution_unavailable_requires_legal_sequence_context_and_reaped_helpers`; `bare_path_accepts_exactly_64_attempts`; `bare_path_early_terminal_ignores_later_entries`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `frozen_windows_search_order_is_compiler_independent`; `current_command_differential_fails_on_frozen_resolver_drift`; `windows_resolution_context_digest_domains_and_vectors_are_fixed`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
-| B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_reaches_probe_or_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; `direct_and_env_shebangs_fail_before_interpreter_or_anchor`; `interpreter_authorization_unavailable_requires_none_and_no_child`; independent fixed vectors freeze PATH and `CLAUDE_CONFIG_DIR` domains, platform tags, big-endian counts, Unix raw bytes, Windows UTF-16LE, absent/empty distinction, and non-UTF-8 Unix values; `environment_entry_count_accepts_1024_and_rejects_1025_before_value_access`; `environment_key_units_accept_1024_and_reject_1025_before_canonicalization`; `setup_secret_count_accepts_1024_and_rejects_1025_before_value_access`; `setup_secret_name_units_accept_1024_and_reject_1025_before_canonicalization`; `excluded_overlimit_path_and_claude_values_are_not_read_or_hashed`; `selected_overlimit_path_and_claude_values_fail_closed`; `undeclared_overlimit_value_is_not_read`; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
+| B-004 | `configured_command_digest_distinguishes_missing_and_spelling_variants`; `runtime_command_form_round_trips_and_rejects_cross_form_outcomes`; `working_directory_spelling_and_unix_identity_digests_have_fixed_vectors`; `working_directory_open_failure_precedes_resolution`; `cwd_path_replacement_keeps_relative_resolution_checkpoints_and_fchdir_on_one_handle`; independent Unix raw-byte payload vectors and pure helper-only Windows UTF-16LE vectors freeze exact domains, platform tags, big-endian `u64` counts, little-endian Windows units, candidate digests, and raw-command absence; `unix_retained_handle_exec_preserves_configured_argv0`; `unix_retained_handle_exec_freezes_fd10_at_execfn_context`; `runtime_exec_context_matches_exec_sequence`; `unix_bare_path_unset_is_path_unusable_without_default_search`; Unix `bare_path_eacces_falls_back_to_second_same_basename`; `eacces_then_preanchor_rejection_preserves_prior_attempt_and_finalizes_anchor`; `bare_eacces_exhaustion_has_no_final_identity`; `etxtbsy_retries_same_candidate_once_after_150_ms`; `etxtbsy_checkpoint_rechecks_authorization_hash_and_path_identity`; `etxtbsy_checkpoint_authorization_change_prevents_second_exec`; `etxtbsy_checkpoint_rejects_configuration_source_reason`; `etxtbsy_checkpoint_unavailable_authorization_prevents_second_exec`; `etxtbsy_retry_group_join_failure_is_reaped_without_exec_or_fallback`; `second_etxtbsy_is_terminal`; `etxtbsy_sequence_rejects_wrong_errno_delay_count_and_outcome`; `enoexec_never_starts_a_shell`; `non_eacces_spawn_error_is_terminal_without_selected_identity`; `absolute_and_qualified_commands_never_search_fallback`; `open_enoent_and_enotdir_are_absent_with_command_form_semantics`; `open_failed_stops_bare_search_without_sensitive_diagnostics`; `absolute_and_qualified_nonregular_and_nonexecutable_require_identity_failure`; `runtime_resolution_attempts_round_trip_all_outcomes_and_exec_sequences`; `runtime_resolution_attempts_reject_illegal_state_combinations`; `authorization_unavailable_attempt_requires_matching_failure_and_no_exec`; `handle_execution_unavailable_requires_legal_sequence_context_and_reaped_helpers`; `bare_path_accepts_exactly_64_attempts`; `bare_path_early_terminal_ignores_later_entries`; `bare_path_rejects_candidate_65`; `repository_inspection_target_never_execs_or_falls_back`; `non_repository_source_cannot_exec_repository_target`; `target_authorization_unavailable_prevents_exec_and_fallback`; Windows `frozen_windows_search_order_is_compiler_independent`; `current_command_differential_fails_on_frozen_resolver_drift`; `windows_resolution_context_digest_domains_and_vectors_are_fixed`; `windows_non_exe_programs_are_path_unusable` with explicit `.bat`/`.cmd` no-shell assertions; `unstable_relative_resolution_is_path_unusable` |
+| B-005, B-010 | `runtime_kind_selects_closed_environment_policy`; `arbitrary_environment_key_cannot_be_declared_or_exposed`; `aws_secret_access_key_never_enters_probe_envp_or_persisted_evidence`; `setup_secret_exclusion_overrides_closed_policy`; `cross_runtime_environment_key_is_excluded`; `direct_and_env_shebangs_fail_before_interpreter_or_anchor`; `interpreter_authorization_unavailable_requires_none_and_no_child`; independent fixed vectors freeze PATH and `CLAUDE_CONFIG_DIR` domains, platform tags, big-endian counts, Unix raw bytes, Windows UTF-16LE, absent/empty distinction, and non-UTF-8 Unix values; `environment_entry_count_accepts_1024_and_rejects_1025_before_value_access`; `environment_key_units_accept_1024_and_reject_1025_before_canonicalization`; `setup_secret_count_accepts_1024_and_rejects_1025_before_value_access`; `setup_secret_name_units_accept_1024_and_reject_1025_before_canonicalization`; `excluded_overlimit_path_and_claude_values_are_not_read_or_hashed`; `selected_overlimit_path_and_claude_values_fail_closed`; `undeclared_overlimit_value_is_not_read`; `windows_path_case_variants_collide`; `windows_setup_secret_exclusion_is_case_insensitive`; `windows_non_ascii_environment_key_fails_closed`; `unix_environment_keys_remain_case_sensitive` |
 | B-006 | `absolute_and_qualified_open_denial_is_open_failed`; `open_failed_is_mutually_exclusive_with_handle_failures`; `unix_fifo_socket_directory_and_device_never_block_or_reach_hashing`; `fifo_swap_at_each_checkpoint_is_nonblocking_identity_changed`; `opened_handle_drives_metadata_and_incremental_hash`; `retained_working_directory_handle_survives_path_replacement`; `executable_size_accepts_67108864_and_rejects_67108865`; `unix_execute_bits_come_from_handle`; Windows `strong_file_id_is_required_without_executable_inference`; `executable_growth_crossing_limit_is_explicit`; `all_blocking_observation_uses_kill_isolated_processes`; `owner_is_sole_target_anchor_fork_parent_ptrace_wait_reap_and_helper_spawner_except_target_traceme`; `owner_spawns_and_registers_pidfd_before_exposing_lease`; cancellation injection at every create/register boundary; `observation_protocol_rejects_bad_frames_descriptor_counts_and_helper_exit`; `every_observation_timeout_returns_typed_error_without_envelope`; `active_and_cleanup_membership_stalls_return_no_envelope`; `membership_batch_accepts_64_and_rescans_65_and_larger`; `membership_continuous_churn_expires_without_false_empty`; `candidate_open_boundary_hash_exec_stop_checkpoint_and_membership_timeouts_transfer_exact_pidfd_ownership`; `uninterruptible_helper_never_fabricates_termination`; `native_static_et_exec_and_static_pie_are_accepted`; `pt_interp_wrong_machine_bad_versions_sizes_extended_counts_bounds_and_non_elf_are_rejected_before_anchor`; `fd_cloexec_script_fails_before_interpreter_execution`; `ptrace_exec_stop_precedes_first_instruction`; `exec_stop_identity_and_hash_run_under_kernel_write_denial`; `changed_native_image_is_killed_before_first_instruction`; `missing_surplus_abnormal_and_pre_resume_timeout_never_resume_and_return_no_envelope`; `path_replacement_after_authorization_executes_verified_retained_handle_not_replacement`; Linux `missing_execveat_is_candidate_local_handle_execution_unavailable`; `missing_post_exec_guard_is_preobservation_containment_unavailable`; `path_replacement_discards_version_with_identity_changed`; `in_place_rewrite_before_spawn_discards_version`; `in_place_rewrite_during_probe_discards_version`; `checkpoint_consistent_path_does_not_attest_path_history`; `exec_stop_consistent_handle_attests_executed_digest` |
 | B-007 | Linux `owner_ready_deadline_bounds_success_delay_and_cancellation`; `owner_stop_join_deadline_is_separate_and_typed`; `owner_stop_join_timeout_is_childless_containment_unavailable`; `active_deadline_starts_before_cwd_observation_and_includes_post_reap_checkpoint`; `ordinary_timeout_reaps_root_and_verifies_only_anchor_remains`; `active_and_cleanup_deadlines_are_distinct_and_fixed`; `zero_exit_with_lingering_same_group_child_is_failure_and_cleaned`; `success_reaps_root_then_anchor_without_released_pgid_use`; `pidfd_revalidation_precedes_every_non_anchor_signal`; `negative_pgid_signal_is_absent`; `anchor_is_not_signalled_until_group_is_empty`; `initial_group_setup_failure_is_reaped_without_exec`; `initial_and_retry_fchdir_failure_are_stage_tagged_reaped_without_exec_or_fallback`; `process_group_supervision_does_not_claim_non_escapable_containment`; `setsid_descendant_cannot_produce_descendant_tree_empty_evidence`; `escaped_pipe_holder_hits_cleanup_deadline_without_version`; `output_cap_rejects_0_and_65537_before_allocation_or_helper`; `output_cap_accepts_1_and_65536`; `exact_combined_output_limit_is_allowed`; `combined_output_limit_plus_one_starts_cleanup`; `cancellation_reaps_after_immediate_tokio_runtime_shutdown`; `descriptor_ready_fd_table_matches_role_allowlist_for_two_and_eight_owners`; `stalled_helper_holds_no_foreign_gate_output_or_control_fd`; `foreign_helper_cannot_delay_eof_or_registration_rollback`; `post_ready_membership_transfer_caps_owner_67_helper_64_fingerprint_131_and_global_1048`; `bootstrap_isolation_unavailable_maps_only_to_containment`; `post_capability_isolation_failure_maps_only_to_child_registration`; `bootstrap_status_deadline_and_cancellation_precedence_is_closed`; macOS/other-Unix/Windows `containment_unavailable_prevents_cwd_observation_and_spawn` |
-| B-008 | `failure_vocabulary_round_trips_every_legal_pair`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `observation_deadline_cleanup_and_protocol_errors_are_closed_redacted_distinct_and_have_no_envelope`; `probe_deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `anchor_termination_and_reap_failures_are_typed`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
+| B-008 | `failure_vocabulary_round_trips_every_legal_pair_and_closed_transitive_class`; `unknown_transitive_execution_class_is_rejected`; `process_signalling_detail_changes_canonical_payload_and_fingerprint_digest`; `process_signalling_plus_cleanup_failure_round_trips_in_canonical_order`; `timeout_plus_cleanup_failure_round_trips_in_canonical_order`; `cleanup_failure_never_emits_version_or_reaped_claim`; `observation_deadline_cleanup_and_protocol_errors_are_closed_redacted_distinct_and_have_no_envelope`; `probe_deadline_expiry_transfers_ownership_and_returns_incomplete_evidence`; `anchor_termination_and_reap_failures_are_typed`; `failure_order_and_details_are_canonical_and_redacted`; `unknown_or_incompatible_failure_values_are_rejected` |
 | B-009 | `version_parser_accepts_exact_codex_and_claude_whole_stream_grammars`; `version_parser_rejects_v_prefix_extra_text_and_dependency_versions`; `stdout_stderr_and_output_digests_are_exact`; `both_streams_are_parsed_before_selection`; `same_version_on_both_streams_is_ambiguous`; `valid_version_with_nonblank_other_stream_is_unparseable`; `blank_unparseable_ambiguous_invalid_utf8_nonzero_and_signal_are_failures` |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; `mcp_output_schema_absence_and_presence_are_distinct`; `mcp_annotations_preserve_absent_empty_hints_title_vendor_values_and_ordered_arrays`; `mcp_annotation_hints_do_not_infer_capabilities`; exact-limit and limit-plus-one tool-name/description/annotations fixtures |
 | B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `absent_schema_dialect_defaults_to_draft_2020_12`; `exact_supported_schema_dialects_round_trip`; `unknown_nonstring_and_nested_schema_dialects_fail_typed`; `schema_set_locations_reorder_canonically`; Draft 2020-12 `content_schema_traverses_nested_required_and_one_of_as_schema`; Draft-07 `content_schema_remains_ordered_instance_data`; `draft_07_dependencies_schema_and_string_set_forms_are_context_aware`; `draft_07_dependencies_reject_invalid_shapes`; `draft_2020_12_legacy_keywords_remain_instance_data`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `draft_2020_12_object_items_traverses_nested_schema`; `draft_2020_12_array_items_is_malformed`; `draft_07_array_items_preserves_tuple_order`; `draft_07_additional_items_traverses_schema_context`; `draft_07_additional_items_without_tuple_items_traverses_schema_context`; `shared_single_schema_keywords_traverse_closed_dialect_context`; `shared_single_schema_keywords_reject_non_schema_shapes_with_closed_detail`; `nested_schema_dialect_is_rejected_in_every_shared_single_schema_keyword`; `draft_2020_12_dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; independent exact counting vectors pin root depth, value nodes, decoded key/value strings, direct entries, raw bytes, and canonical bytes; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
 | B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
 
 Cross-cutting mandatory tests additionally include
+`v0_1_envelope_rejects_every_windows_command_form_and_resolution_context`,
+`setup_secret_never_enters_probe_envp_or_persisted_evidence`,
+`post_exec_guard_denies_every_process_signalling_syscall_and_target_form`,
+`external_signal_delivery_stop_is_not_target_signalling_evidence`,
+`x86_64_x32_dispatch_is_rejected_before_native_classification`,
+`native_x86_64_and_aarch64_syscall_classification_is_unchanged`,
 `base_source_locator_accepts_4096_and_rejects_4097_before_copy`,
 `maximum_tool_source_locator_reaches_8259_and_parser_rejects_8260`,
 `runtime_fingerprint_limit_reason_precedence_is_closed`,
@@ -1759,6 +1796,11 @@ Cross-cutting mandatory tests additionally include
 `serde_json_raw_value_feature_is_direct`,
 `raw_number_lexemes_1_1point0_1e0_are_distinct`, and
 `long_and_malformed_number_boundaries_are_typed`.
+
+The AWS-named setup-secret fixture fixes the exact well-known key, while the
+cross-cutting setup-secret fixture covers arbitrary configured names and
+exclusion precedence; both assert only probe-`envp` and persisted-evidence
+absence and make no host-read isolation claim.
 
 All failure tests assert the absence of a version fact and the absence of raw
 path, PATH, output, environment, and OS-diagnostic text from serialized

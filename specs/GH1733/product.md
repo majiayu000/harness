@@ -47,6 +47,10 @@ facts in snapshots or through a CLI.
   attestation or prove which bytes a later adapter invocation executed.
 - Changing adapter launch arguments, sandboxing, capability enforcement,
   prompt construction, or current runtime selection.
+- Claiming that v0.1 isolates an already authorized executable from read-only
+  same-UID host filesystem or process state. The producer controls probe
+  `envp` and persisted evidence; a complete read sandbox requires a later
+  separately reviewed isolation design.
 - Automatically collecting fingerprints into an Agent Stack snapshot; ASC-005
   owns snapshot production and consumption.
 - Adding a CLI, HTTP endpoint, persistence schema, or dashboard; ASC-026 owns
@@ -143,24 +147,28 @@ facts in snapshots or through a CLI.
    never enter component integrity.
 4. **B-004:** Runtime resolution treats the configured executable as exactly
    one command name or path and never invokes a shell or parses embedded
-   arguments, quoting, pipes, substitutions, or redirections. Windows mirrors
-   the frozen Windows v0.1 search behavior below, independent of the compiler
-   used to build Harness; Unix uses an explicit safe subset that preserves
+   arguments, quoting, pipes, substitutions, or redirections. Pure Windows
+   resolver helpers mirror the frozen Windows search behavior below,
+   independent of the compiler used to build Harness; Unix envelope production
+   uses an explicit safe subset that preserves
    `EACCES` fallback but deliberately rejects `ENOEXEC` shell fallback. On
    Unix, a qualified relative path and
    relative or empty `PATH` entries are resolved from the declared child
-   working directory. Every payload records one closed `command_form`:
+   working directory. Pure command-form helpers model the closed set
    `unix_bare`, `unix_absolute`, `unix_qualified`, `windows_bare`,
-   `windows_absolute`, or `windows_qualified`; strict parsing uses it to
-   distinguish search skips from failures of a configured path.
+   `windows_absolute`, or `windows_qualified`. A v0.1 envelope payload records
+   only one of the three Unix forms; every Windows form is helper-only and is
+   rejected by envelope construction and strict parsing. The admitted Unix
+   form distinguishes search skips from failures of a configured path.
 
-   Every payload includes
+   Every admitted Unix v0.1 payload includes
    `configured_command_digest = SHA-256("harness_runtime_configured_command_v0_1\0" || platform_tag || unit_count_be || exact_units)`.
    `platform_tag` is exactly `b"unix\0"` or `b"windows\0"`;
    `unit_count_be` is an unsigned fixed-width `u64` in big-endian order.
-   Unix exact units are the raw `OsStr` bytes; Windows exact units are the
-   original UTF-16 code units serialized little-endian, and the count is UTF-16
-   units rather than bytes. There is no UTF-8,
+   Unix exact units are the raw `OsStr` bytes. The pure cross-platform digest
+   helper also freezes Windows exact units as the original UTF-16 code units
+   serialized little-endian, with a count in UTF-16 units rather than bytes;
+   that Windows digest never enters a v0.1 envelope. There is no UTF-8,
    case, separator, dot-segment, symlink, or absolute-path normalization, and
    the raw command is never serialized. The configured child working-directory
    spelling is hashed independently with domain
@@ -186,7 +194,7 @@ facts in snapshots or through a CLI.
    that string is never used for access, and the separate directory-identity
    digest binds which retained directory supplied the target.
 
-   On Windows, a bare name follows the frozen v0.1 search
+   The pure Windows resolver helper makes a bare name follow the frozen v0.1 search
    order and `.exe` completion rules using explicit launch-context inputs; it
    does not use `PATHEXT`, and `.bat`/`.cmd` are `path_unusable` because the
    adapter's batch handling would invoke a command interpreter contrary to the
@@ -195,14 +203,16 @@ facts in snapshots or through a CLI.
    qualified relative path or relative/empty search input whose base cannot be
    proven is also `path_unusable`.
 
-   The payload carries exactly four optional Windows resolution-context fields:
+   The pure non-envelope Windows resolution helper carries exactly four
+   optional context fields:
    `current_executable_dir_digest`, `system_dir_digest`,
    `windows_dir_digest`, and `parent_path_digest`. Each present field is
    `SHA-256(domain || b"windows\0" || u64be(utf16_unit_count) ||
    utf16le_units)` under its field-specific
    `harness_runtime_windows_search_<field>_v0_1\0` domain frozen in the tech
-   spec. Absent is distinct from present empty. These fields enter the
-   fingerprint payload; raw directories and parent PATH never do.
+   spec. Absent is distinct from present empty. Neither these fields nor their
+   raw directories and parent PATH enter a v0.1 envelope or fingerprint
+   payload.
 
    For a platform admitted by the static matrix, after isolation, sandbox, and
    public output-limit validation and before any digest, PATH split, lexical
@@ -379,8 +389,10 @@ facts in snapshots or through a CLI.
    Every name in `codex.cloud.setup_secret_env` is excluded from both the child
    environment and persisted fingerprint facts before policy matching,
    regardless of spelling. Sensitivity is not guessed from substrings such as
-   `TOKEN` or `SECRET`; no setup-only or undeclared value can reach
-   `codex --version` or an equivalent child. The producer counts and bounds
+   `TOKEN` or `SECRET`; no setup-only or undeclared value is inserted into probe
+   `envp`, read by the producer for evidence, or persisted. This is not a claim
+   that an already authorized executable cannot actively read same-UID host
+   state outside its supplied environment. The producer counts and bounds
    environment/setup names before canonicalization, but never reads, copies,
    bounds, or hashes an undeclared or setup-secret-excluded value. Only
    exclusion-surviving selected `PATH` and `CLAUDE_CONFIG_DIR` values receive
@@ -615,11 +627,19 @@ facts in snapshots or through a CLI.
    descriptor is exposed.
    After the verified initial `PTRACE_EVENT_EXEC`, the owner resumes only with
    `PTRACE_SYSCALL` and classifies each entry stop before the syscall executes.
+   On x86_64, before native syscall classification, any syscall number carrying
+   `__X32_SYSCALL_BIT` returns no-envelope
+   `execution_verification_unavailable`; the owner never clears the bit or
+   interprets the dispatch through the native table. Native x86_64 numbers and
+   aarch64 classification are unchanged.
    The closed denied classes are `process_creation` (`fork`, `vfork`, `clone`,
    `clone3`), `image_execution` (`execve`, `execveat`),
    `executable_mapping` (`mmap`/`mmap2`/`mprotect`/`pkey_mprotect` requesting
-   `PROT_EXEC`, or `shmat` requesting `SHM_EXEC`), and
-   `executable_image_mutation`. The last class covers `ptrace`,
+   `PROT_EXEC`, or `shmat` requesting `SHM_EXEC`),
+   `executable_image_mutation`, and `process_signalling` (`kill`, `tkill`,
+   `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, or
+   `pidfd_send_signal`, for every target or signal form). The executable-image
+   mutation class covers `ptrace`,
    `process_vm_writev`, `userfaultfd`, `io_uring_setup`, `pidfd_getfd`,
    `recvmsg`, `recvmmsg`, `prctl`, every non-query `personality`, `creat`, and
    `open`/`openat`/`open_by_handle_at`/`openat2` whose decoded flags request
@@ -938,6 +958,10 @@ facts in snapshots or through a CLI.
     B-008 failure and omit every unsupported fact. Missing data remains absent;
     no empty digest, sentinel path, placeholder version, runner-owned alias,
     fingerprint-as-integrity substitution, or warning-only fallback is used.
+    Because every Windows v0.1 producer returns no-envelope containment failure,
+    a v0.1 envelope constructor or parser rejects all Windows command forms and
+    any present Windows resolution context; pure Windows digest helpers do not
+    make those states reachable evidence.
 16. **B-016:** This issue exposes deterministic producer APIs in
     `harness-core` and `harness-agents` plus contract tests. It does not invoke
     them from `CodeAgent`, `AgentAdapter`, the workflow runtime, task runner,
@@ -975,7 +999,7 @@ list.
 | `version_probe` | `handle_execution_unavailable` | Mandatory ptrace containment passed, but the candidate's fully frozen fd-10 `execveat(AT_EMPTY_PATH)` returned exact `ENOSYS`, `EPERM`, or `EINVAL`; every created target helper was reaped and no target instruction ran. |
 | `version_probe` | `supervision_setup_failed` | Anchor setup or an initial/retry target helper group join, working-directory entry, or pre-exec ptrace stop/options setup failed; the closed setup stage identifies which, every created helper was reaped, and target handle exec was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
-| `version_probe` | `transitive_execution_denied` | After the verified initial static image began under syscall-stop supervision, it attempted closed class `process_creation`, `image_execution`, `executable_mapping`, or `executable_image_mutation`; the denied syscall never executed, stopped-target cleanup began, cleanup outcome is independent, and no version fact was emitted. |
+| `version_probe` | `transitive_execution_denied` | After the verified initial static image began under syscall-stop supervision, it attempted closed class `process_creation`, `image_execution`, `executable_mapping`, `executable_image_mutation`, or `process_signalling`; the denied syscall never executed, stopped-target cleanup began, cleanup outcome is independent, and no version fact was emitted. |
 | `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
 | `version_probe` | `lingering_process_group` | The root exited but a non-anchor member remained in the anchored Unix process group; version success was suppressed and cleanup started. |
 | `version_probe` | `timeout` | The probe deadline expired; cleanup outcome is represented independently. |
@@ -1225,8 +1249,9 @@ terminal `exec_failed`.
       duplicate, or executable `PT_GNU_STACK`, extended or out-of-bounds program headers, and
       non-ELF/binfmt inputs yield
       `interpreter_authorization_unavailable` before anchor, target, loader, or
-      interpreter creation. Neither sanitized `PATH` nor a setup-only secret
-      named `NPM_ACCESS` can select or reach an interpreter. A supported static
+      interpreter creation. Sanitized `PATH` cannot select an interpreter, and
+      a setup-only secret named `NPM_ACCESS` never enters probe `envp` or
+      fingerprint evidence. A supported static
       native-binary fixture separately proves sanitized `PATH` is the only
       child environment key and that any later PATH/cwd helper launch or
       executable mapping is denied before execution.
@@ -1308,6 +1333,20 @@ terminal `exec_failed`.
       the group is empty, and no released PGID is used. macOS, other Unix, and
       Windows prove typed no-envelope `containment_unavailable` is returned
       before cwd observation or child creation.
+- [ ] Strict envelope fixtures reject every `WindowsBare`, `WindowsAbsolute`,
+      and `WindowsQualified` runtime command form and any present Windows
+      resolution context in v0.1. Pure Windows resolver/digest helpers remain
+      testable but cannot construct or parse a v0.1 fingerprint envelope.
+- [ ] Post-exec guard fixtures prove every target-initiated `kill`, `tkill`,
+      `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, and
+      `pidfd_send_signal` entry is classified as `process_signalling`, denied
+      before kernel execution, and cleaned up without a version. External
+      signal-delivery stops remain execution-verification failures rather than
+      target signalling evidence.
+- [ ] On x86_64, both dangerous and otherwise harmless syscall numbers carrying
+      `__X32_SYSCALL_BIT` fail no-envelope execution verification before native
+      classification and are never normalized by clearing the bit. Native
+      x86_64 and aarch64 syscall fixtures retain their existing classifications.
 - [ ] Owner-capacity fixtures retain exactly eight permanently stalled owners
       and prove the ninth fails before thread/fd/cwd/child creation; API return,
       cancellation, cleanup-incomplete, and stop/join timeout do not release a
@@ -1355,7 +1394,8 @@ terminal `exec_failed`.
       collisions and non-ASCII keys. Independent hard-coded PATH and
       `CLAUDE_CONFIG_DIR` vectors freeze both exact domains, platform tags,
       `u64` counts, Unix raw bytes, Windows UTF-16LE units, absent versus empty,
-      and non-UTF-8 Unix input.
+      and non-UTF-8 Unix input; every Windows vector is a pure helper vector and
+      never becomes v0.1 envelope evidence.
 - [ ] MCP fixtures prove exact stable configuration-key binding, distinct
       server IDs for distinct keys, injective typed source derivation for
       multiple exact UTF-8 tool names on one server, rejection of arbitrary
