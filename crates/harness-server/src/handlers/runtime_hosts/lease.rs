@@ -77,8 +77,9 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let Some(store) = state.core.workflow_runtime_store.clone() else {
-        return workflow_store_unavailable_response();
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store.clone(),
+        Err(error) => return error.into_status_json(),
     };
     let outcome = store
         .renew_remote_host_runtime_job_lease(RuntimeJobLeaseRenewalRequest {
@@ -170,10 +171,7 @@ pub(super) fn lease_lost_response() -> (StatusCode, Json<serde_json::Value>) {
 }
 
 fn workflow_store_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({ "error": "workflow runtime store unavailable" })),
-    )
+    crate::http::api_error::ApiError::store_unavailable("workflow runtime store").into_status_json()
 }
 
 #[cfg(test)]

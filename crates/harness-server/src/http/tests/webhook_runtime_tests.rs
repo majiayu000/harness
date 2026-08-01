@@ -193,12 +193,9 @@ async fn webhook_issues_opened_requires_workflow_runtime_store() -> anyhow::Resu
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let json = response_json(response).await?;
-    assert_eq!(
-        json["error"],
-        "workflow runtime store is required for submissions"
-    );
+    assert_eq!(json["error"], "workflow runtime store unavailable");
     assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
 }

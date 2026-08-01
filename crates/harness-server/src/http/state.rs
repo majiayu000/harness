@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
+use super::api_error::ApiError;
 use super::rate_limit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +290,33 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn issue_workflow_store(
+        &self,
+    ) -> Result<&Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>, ApiError> {
+        self.core
+            .issue_workflow_store
+            .as_ref()
+            .ok_or_else(|| ApiError::store_unavailable("issue workflow store"))
+    }
+
+    pub(crate) fn project_workflow_store(
+        &self,
+    ) -> Result<&Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>, ApiError> {
+        self.core
+            .project_workflow_store
+            .as_ref()
+            .ok_or_else(|| ApiError::store_unavailable("project workflow store"))
+    }
+
+    pub(crate) fn workflow_runtime_store(
+        &self,
+    ) -> Result<&Arc<harness_workflow::runtime::WorkflowRuntimeStore>, ApiError> {
+        self.core
+            .workflow_runtime_store
+            .as_ref()
+            .ok_or_else(|| ApiError::store_unavailable("workflow runtime store"))
+    }
+
     fn runtime_state_persistence_required(&self) -> bool {
         self.startup_statuses
             .iter()
