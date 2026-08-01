@@ -192,9 +192,12 @@ pub(super) fn replacement_use_counts(
                 (before_control.enabled, after_control.enabled),
                 (Some(true), None)
             );
+        let has_confidence_reduction =
+            after_control.confidence.strength() < before_control.confidence.strength();
         let roles = if (after_control.enabled == Some(false)
             && !conflicts.after_enabled.contains(component_id))
             || has_enablement_evidence_loss
+            || has_confidence_reduction
             || has_scope_reduction
             || has_failure_mode_reduction
         {
@@ -281,14 +284,15 @@ pub(super) fn shared_replacement_roles(
             .map(|candidate| candidate.component.component_id().as_str())
             .filter(|component_id| !after_conflicting_component_ids.contains(*component_id))
             .collect::<Vec<_>>();
-            !safe_candidate_ids.is_empty()
-                && safe_candidate_ids.iter().all(|component_id| {
-                    replacement_use_counts
-                        .get(*component_id)
-                        .copied()
-                        .unwrap_or(0)
-                        > 1
-                })
+            safe_candidate_ids.len() > 1
+                || (!safe_candidate_ids.is_empty()
+                    && safe_candidate_ids.iter().all(|component_id| {
+                        replacement_use_counts
+                            .get(*component_id)
+                            .copied()
+                            .unwrap_or(0)
+                            > 1
+                    }))
         })
         .collect()
 }

@@ -509,3 +509,144 @@ fn ambiguous_enablement_loss_emits_one_replacement_fact() {
     assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
     assert_eq!(reasons(&facts), [Reason::AmbiguousReplacement]);
 }
+
+#[test]
+fn confidence_reduction_counts_replacement_as_shared() {
+    let retained_before = configured_control(
+        Kind::Validation,
+        ".github/workflows/retained.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let removed = configured_control(
+        Kind::Validation,
+        ".github/workflows/removed.yml",
+        None,
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let retained_after = configured_control(
+        Kind::Validation,
+        ".github/workflows/retained.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::Medium,
+        ACTIVE_REQUIRED,
+    );
+    let replacement = configured_control(
+        Kind::Validation,
+        ".github/workflows/replacement.yml",
+        Some(HASH_B),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+
+    let facts =
+        protective_control_diff(&[retained_before, removed], &[retained_after, replacement]);
+
+    assert!(facts.iter().any(|fact| {
+        fact.reason() == Reason::AmbiguousReplacement
+            && fact
+                .before()
+                .is_some_and(|before| before.source_locator() == ".github/workflows/removed.yml")
+    }));
+}
+
+#[test]
+fn disabled_role_loss_emits_one_ambiguity_for_retained_control() {
+    let retained_before = configured_control(
+        Kind::Validation,
+        ".github/workflows/retained.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let removed = configured_control(
+        Kind::Validation,
+        ".github/workflows/removed.yml",
+        None,
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let disabled_without_roles = configured_control(
+        Kind::Validation,
+        ".github/workflows/retained.yml",
+        Some(HASH_A),
+        &[],
+        Confidence::High,
+        DISABLED_REQUIRED,
+    );
+    let replacement = configured_control(
+        Kind::Validation,
+        ".github/workflows/replacement.yml",
+        Some(HASH_B),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+
+    let facts = protective_control_diff(
+        &[retained_before, removed],
+        &[disabled_without_roles, replacement],
+    );
+    let retained_ambiguities = facts
+        .iter()
+        .filter(|fact| {
+            fact.reason() == Reason::AmbiguousReplacement
+                && fact.before().is_some_and(|before| {
+                    before.source_locator() == ".github/workflows/retained.yml"
+                })
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(retained_ambiguities.len(), 1);
+    assert_eq!(retained_ambiguities[0].roles(), [Role::Validation]);
+}
+
+#[test]
+fn alternative_partial_role_replacements_remain_ambiguous() {
+    let before = configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let retained = configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let replacement_a = configured_control(
+        Kind::Validation,
+        ".github/workflows/a.yml",
+        Some(HASH_B),
+        &[Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let replacement_b = configured_control(
+        Kind::Validation,
+        ".github/workflows/b.yml",
+        None,
+        &[Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+
+    let facts = protective_control_diff(&[before], &[retained, replacement_a, replacement_b]);
+
+    assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
+    assert_eq!(reasons(&facts), [Reason::AmbiguousReplacement]);
+    assert_eq!(facts[0].roles(), [Role::Check]);
+}

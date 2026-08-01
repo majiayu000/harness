@@ -171,7 +171,14 @@ pub(super) fn compare_existing(
         standalone_state_reduction_coverage,
         Some(RoleReplacementCoverage::Ambiguous)
     );
-    if !shared_replacement_roles.is_empty() && !standalone_state_replacement_is_ambiguous {
+    let disablement_replacement_is_ambiguous = matches!(
+        disablement_coverage,
+        Some(RoleReplacementCoverage::Ambiguous)
+    );
+    if !shared_replacement_roles.is_empty()
+        && !disablement_replacement_is_ambiguous
+        && !standalone_state_replacement_is_ambiguous
+    {
         push_existing_fact(
             AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
             shared_replacement_roles,
