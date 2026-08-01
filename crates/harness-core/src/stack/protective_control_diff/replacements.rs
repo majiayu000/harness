@@ -27,6 +27,15 @@ pub(super) struct RoleReplacementAnalysis<'a> {
     pub(super) replacement_ids: BTreeSet<String>,
 }
 
+pub(super) struct ReplacementStateConflicts<'a> {
+    pub(super) before_enabled: &'a BTreeSet<String>,
+    pub(super) after_enabled: &'a BTreeSet<String>,
+    pub(super) before_scope: &'a BTreeSet<String>,
+    pub(super) after_scope: &'a BTreeSet<String>,
+    pub(super) before_failure_mode: &'a BTreeSet<String>,
+    pub(super) after_failure_mode: &'a BTreeSet<String>,
+}
+
 pub(super) fn replacement_candidates<'a>(
     after: &'a [AgentStackProtectionControl],
     before: &AgentStackProtectionControl,
@@ -116,14 +125,17 @@ pub(super) fn replacement_use_counts(
     before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     before_conflicting_component_ids: &BTreeSet<String>,
     after_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
-    after_enabled_conflicting_component_ids: &BTreeSet<String>,
+    conflicts: ReplacementStateConflicts<'_>,
 ) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for before_control in before {
-        if before_control.roles.is_empty() || before_control.enabled == Some(false) {
+        let component_id = before_control.component.component_id().as_str();
+        if before_control.roles.is_empty()
+            || (before_control.enabled == Some(false)
+                && !conflicts.before_enabled.contains(component_id))
+        {
             continue;
         }
-        let component_id = before_control.component.component_id().as_str();
         let Some(after_control) = after_by_id.get(component_id).copied() else {
             let mut used_ids = BTreeSet::new();
             let same_integrity = replacement_candidates(
@@ -163,8 +175,16 @@ pub(super) fn replacement_use_counts(
             increment_use_counts(&mut counts, used_ids);
             continue;
         };
-        let roles = if after_control.enabled == Some(false)
-            && !after_enabled_conflicting_component_ids.contains(component_id)
+        let has_scope_reduction = !conflicts.before_scope.contains(component_id)
+            && !conflicts.after_scope.contains(component_id)
+            && scope_is_reduced(before_control, after_control);
+        let has_failure_mode_reduction = !conflicts.before_failure_mode.contains(component_id)
+            && !conflicts.after_failure_mode.contains(component_id)
+            && failure_mode_is_reduced(before_control, after_control);
+        let roles = if (after_control.enabled == Some(false)
+            && !conflicts.after_enabled.contains(component_id))
+            || has_scope_reduction
+            || has_failure_mode_reduction
         {
             before_control.roles.clone()
         } else {
@@ -284,6 +304,30 @@ pub(super) fn missing_roles(
         .copied()
         .filter(|role| !after.contains(role))
         .collect()
+}
+
+pub(super) fn scope_is_reduced(
+    before: &AgentStackProtectionControl,
+    after: &AgentStackProtectionControl,
+) -> bool {
+    match (before.scope, after.scope) {
+        (Some(_), None) => true,
+        (Some(before), Some(after)) => after.strength() < before.strength(),
+        _ => false,
+    }
+}
+
+pub(super) fn failure_mode_is_reduced(
+    before: &AgentStackProtectionControl,
+    after: &AgentStackProtectionControl,
+) -> bool {
+    matches!(
+        (before.failure_mode, after.failure_mode),
+        (
+            Some(AgentStackProtectionFailureMode::FailClosed),
+            Some(AgentStackProtectionFailureMode::FailOpen) | None,
+        )
+    )
 }
 
 fn increment_use_counts(counts: &mut BTreeMap<String, usize>, component_ids: BTreeSet<String>) {

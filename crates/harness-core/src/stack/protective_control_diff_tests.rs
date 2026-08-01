@@ -9,6 +9,7 @@ use AgentStackProtectionRole as Role;
 use AgentStackProtectionScope as Scope;
 
 mod review_threads;
+mod review_threads_late;
 
 const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

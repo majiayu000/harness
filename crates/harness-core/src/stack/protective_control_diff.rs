@@ -10,7 +10,7 @@ mod replacements;
 use existing::compare_existing;
 use replacements::{
     analyze_role_replacements, by_component_id, replacement_candidates, replacement_use_counts,
-    CandidateMode,
+    CandidateMode, ReplacementStateConflicts,
 };
 macro_rules! closed_enum {
     ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
@@ -173,6 +173,7 @@ struct ComparisonInputs<'before, 'after> {
     before_by_id: &'before BTreeMap<String, &'before AgentStackProtectionControl>,
     before_conflicting_component_ids: &'before BTreeSet<String>,
     after_conflicting_component_ids: &'after BTreeSet<String>,
+    before_enabled_conflicting_component_ids: &'before BTreeSet<String>,
     after_enabled_conflicting_component_ids: &'after BTreeSet<String>,
     before_scope_conflicting_component_ids: &'before BTreeSet<String>,
     after_scope_conflicting_component_ids: &'after BTreeSet<String>,
@@ -220,13 +221,22 @@ pub fn protective_control_diff(
         &before_by_id,
         &before_controls.conflicting_component_ids,
         &after_by_id,
-        &after_controls.enabled_conflicting_component_ids,
+        ReplacementStateConflicts {
+            before_enabled: &before_controls.enabled_conflicting_component_ids,
+            after_enabled: &after_controls.enabled_conflicting_component_ids,
+            before_scope: &before_controls.scope_conflicting_component_ids,
+            after_scope: &after_controls.scope_conflicting_component_ids,
+            before_failure_mode: &before_controls.failure_mode_conflicting_component_ids,
+            after_failure_mode: &after_controls.failure_mode_conflicting_component_ids,
+        },
     );
     let comparison_inputs = ComparisonInputs {
         after_controls: &after_controls.controls,
         before_by_id: &before_by_id,
         before_conflicting_component_ids: &before_controls.conflicting_component_ids,
         after_conflicting_component_ids: &after_controls.conflicting_component_ids,
+        before_enabled_conflicting_component_ids: &before_controls
+            .enabled_conflicting_component_ids,
         after_enabled_conflicting_component_ids: &after_controls.enabled_conflicting_component_ids,
         before_scope_conflicting_component_ids: &before_controls.scope_conflicting_component_ids,
         after_scope_conflicting_component_ids: &after_controls.scope_conflicting_component_ids,

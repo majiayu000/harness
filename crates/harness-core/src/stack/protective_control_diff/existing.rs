@@ -1,6 +1,6 @@
 use super::replacements::{
-    analyze_role_replacements, classify_role_replacement, missing_roles, shared_replacement_roles,
-    RoleReplacementCoverage,
+    analyze_role_replacements, classify_role_replacement, failure_mode_is_reduced, missing_roles,
+    scope_is_reduced, shared_replacement_roles, RoleReplacementCoverage,
 };
 use super::*;
 
@@ -17,6 +17,9 @@ pub(super) fn compare_existing(
         .after_enabled_conflicting_component_ids
         .contains(component_id);
     let before_component_id = before.component.component_id().as_str();
+    let has_before_enabled_conflict = inputs
+        .before_enabled_conflicting_component_ids
+        .contains(before_component_id);
     let has_scope_conflict = inputs
         .before_scope_conflicting_component_ids
         .contains(before_component_id)
@@ -45,6 +48,32 @@ pub(super) fn compare_existing(
         };
     let disablement_has_complete_coverage = matches!(
         disablement_coverage,
+        Some(RoleReplacementCoverage::Unique | RoleReplacementCoverage::Ambiguous)
+    );
+    let missing_roles = if has_before_enabled_conflict {
+        Vec::new()
+    } else {
+        missing_roles(before.roles(), after.roles())
+    };
+    let has_scope_reduction = !has_scope_conflict && scope_is_reduced(before, after);
+    let has_failure_mode_reduction =
+        !has_failure_mode_conflict && failure_mode_is_reduced(before, after);
+    let standalone_state_reduction_coverage =
+        if after.enabled != Some(false) && (has_scope_reduction || has_failure_mode_reduction) {
+            Some(classify_role_replacement(
+                before,
+                before.roles.clone(),
+                inputs.after_controls,
+                inputs.before_by_id,
+                inputs.before_conflicting_component_ids,
+                inputs.after_conflicting_component_ids,
+                inputs.replacement_use_counts,
+            ))
+        } else {
+            None
+        };
+    let standalone_state_reduction_has_complete_coverage = matches!(
+        standalone_state_reduction_coverage,
         Some(RoleReplacementCoverage::Unique | RoleReplacementCoverage::Ambiguous)
     );
     if !disablement_has_complete_coverage
@@ -96,7 +125,6 @@ pub(super) fn compare_existing(
         }
         _ => {}
     }
-    let missing_roles = missing_roles(before.roles(), after.roles());
     let shared_replacement_roles = shared_replacement_roles(
         before,
         missing_roles.clone(),
@@ -133,7 +161,11 @@ pub(super) fn compare_existing(
             facts,
         );
     }
-    if !shared_replacement_roles.is_empty() {
+    let standalone_state_replacement_is_ambiguous = matches!(
+        standalone_state_reduction_coverage,
+        Some(RoleReplacementCoverage::Ambiguous)
+    );
+    if !shared_replacement_roles.is_empty() && !standalone_state_replacement_is_ambiguous {
         push_existing_fact(
             AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
             shared_replacement_roles,
@@ -144,7 +176,21 @@ pub(super) fn compare_existing(
             facts,
         );
     }
-    if !disablement_has_complete_coverage && !has_scope_conflict {
+    if standalone_state_replacement_is_ambiguous {
+        push_existing_fact(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            before,
+            after,
+            confidence,
+            AgentStackProtectionControlReason::AmbiguousReplacement,
+            facts,
+        );
+    }
+    if !disablement_has_complete_coverage
+        && !standalone_state_reduction_has_complete_coverage
+        && !has_scope_conflict
+    {
         if before.scope.is_some() && after.scope.is_none() {
             push_existing_fact(
                 AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
@@ -168,7 +214,10 @@ pub(super) fn compare_existing(
             );
         }
     }
-    if !disablement_has_complete_coverage && !has_failure_mode_conflict {
+    if !disablement_has_complete_coverage
+        && !standalone_state_reduction_has_complete_coverage
+        && !has_failure_mode_conflict
+    {
         match (before.failure_mode, after.failure_mode) {
             (
                 Some(AgentStackProtectionFailureMode::FailClosed),
