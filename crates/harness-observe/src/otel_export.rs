@@ -385,7 +385,7 @@ fn resolve_endpoint(exporter: OtelExporter, config_endpoint: Option<&str>) -> St
         return endpoint.to_string();
     }
 
-    if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+    if let Ok(endpoint) = harness_core::config::process_env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
         if !endpoint.trim().is_empty() {
             return endpoint;
         }

@@ -26,7 +26,7 @@ async fn runtime_tree_reports_deferred_command() -> anyhow::Result<()> {
         "repo": "owner/repo",
         "issue_number": 1601,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
         "implement_issue",
         "issue-1601-deferred-tree-command",

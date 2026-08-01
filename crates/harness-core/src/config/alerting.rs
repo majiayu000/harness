@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::alert::AlertClass;
 
+use super::process_env;
+
 fn default_dedup_cooldown_secs() -> u64 {
     300
 }
@@ -87,7 +89,7 @@ impl AlertChannelConfig {
         self.url
             .clone()
             .filter(|u| !u.trim().is_empty())
-            .or_else(|| std::env::var(self.url_env_var()).ok())
+            .or_else(|| process_env::non_blank_config_value(&self.url_env_var()))
             .filter(|u| !u.trim().is_empty())
     }
 }

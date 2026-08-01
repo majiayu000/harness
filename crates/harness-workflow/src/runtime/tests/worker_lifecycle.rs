@@ -92,9 +92,9 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
         "issue_number": 79,
         "pr_number": 880,
     }));
-    store.upsert_instance(&matching).await?;
-    store.upsert_instance(&wrong_repo).await?;
-    store.upsert_instance(&wrong_project).await?;
+    store.force_upsert_instance_for_test(&matching).await?;
+    store.force_upsert_instance_for_test(&wrong_repo).await?;
+    store.force_upsert_instance_for_test(&wrong_project).await?;
 
     let found = store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
@@ -401,7 +401,7 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = issue_instance("replanning");
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("replan_issue", "replan-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let job = store

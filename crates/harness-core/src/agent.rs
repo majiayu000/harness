@@ -92,10 +92,8 @@ impl AgentRequest {
         }
     }
 
-    fn effective_prompt_layers(&self) -> Option<Cow<'_, AgentPromptLayers>> {
-        self.prompt_layers.as_ref().map(Cow::Borrowed).or_else(|| {
-            crate::prompts::prompt_layers_for_flattened_prompt(&self.prompt).map(Cow::Owned)
-        })
+    fn effective_prompt_layers(&self) -> Option<&AgentPromptLayers> {
+        self.prompt_layers.as_ref()
     }
 
     pub fn claude_main_prompt(&self) -> Cow<'_, str> {
@@ -107,8 +105,8 @@ impl AgentRequest {
 
     pub fn claude_system_prompt(&self) -> Option<Cow<'_, str>> {
         self.effective_prompt_layers()
-            .and_then(|layers| layers.static_system_prompt_for_cache().map(str::to_string))
-            .map(Cow::Owned)
+            .and_then(AgentPromptLayers::static_system_prompt_for_cache)
+            .map(Cow::Borrowed)
     }
 }
 
@@ -157,10 +155,13 @@ impl AgentPromptLayers {
     }
 
     pub fn to_prompt_string(&self) -> String {
-        format!(
-            "{}{}{}",
-            self.static_instructions, self.context, self.dynamic_payload
-        )
+        let mut prompt = String::with_capacity(
+            self.static_instructions.len() + self.context.len() + self.dynamic_payload.len(),
+        );
+        prompt.push_str(&self.static_instructions);
+        prompt.push_str(&self.context);
+        prompt.push_str(&self.dynamic_payload);
+        prompt
     }
 
     pub fn append_to_dynamic_payload(&mut self, text: &str) {

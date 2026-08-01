@@ -81,10 +81,10 @@ fn feishu_alert_credentials(
     let feishu = config.intake.feishu.as_ref();
     let app_id = feishu
         .and_then(|f| f.app_id.clone())
-        .or_else(|| std::env::var("FEISHU_APP_ID").ok())?;
+        .or_else(|| harness_core::config::process_env::var("FEISHU_APP_ID").ok())?;
     let app_secret = feishu
         .and_then(|f| f.app_secret.clone())
-        .or_else(|| std::env::var("FEISHU_APP_SECRET").ok())?;
+        .or_else(|| harness_core::config::process_env::var("FEISHU_APP_SECRET").ok())?;
     Some((app_id, app_secret))
 }
 
