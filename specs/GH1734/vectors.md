@@ -44,11 +44,29 @@ The exact intermediate digests are:
 This fixture is constructible from an ASC-002 `AgentStackInventoryEntry` and
 the closed GH-1734 context input without placeholder fingerprint envelopes. An
 implementation test must build the two entries through those typed inputs,
+consume the inventory through its crate-visible `into_entries(self)` API,
 require exact equality with the literal bytes below, and then hash the literal
 independently. Separate branch-matrix tests cover executable tags
 `0x00`/`0x01`, directory presence, absent context metadata/reference,
 `not_observed` coverage, and GH-1733's complete valid runtime/MCP envelope
 vectors.
+
+## Typed Context Conformance Cases
+
+The fixed successful bytes below use `repo_memory_selected`. Separate typed
+fixtures cover all six producer shapes: runtime profile (both the valid
+historical locator and GH-1732 hash fallback), central workflow source,
+repository workflow override, effective workflow document, default workflow
+document, and selected repository memory. For each row, changing only kind,
+scope, or locator fails `invalid_context_metadata` and produces no canonical
+bytes or stable ID.
+
+An exact duplicate of one valid context item fails
+`duplicate_component_evidence` before global semantic-order validation. Two
+distinct valid context items sharing one order fail `inconsistent_observation`.
+Reversing either rejected input vector preserves its error category. These are
+typed rejection vectors and do not change the successful canonical length,
+literal hex, or digest below.
 
 Canonical length: 1,312 bytes.
 

@@ -78,11 +78,15 @@ executable mode, or a verified fingerprint must.
    may share that identity and remain independently visible. Conflicting
    present integrity digests fail as `inconsistent_observation`; no source is
    silently preferred. Each component may have at most one evidence item of
-   each closed kind. A second item of the same kind with identical canonical
-   bytes is `duplicate_component_evidence`; one with different bytes is
-   `inconsistent_observation`. Runtime-context semantic orders are globally
-   unique and contiguous from zero through `N - 1`. There is no last-write-
-   wins or implicit reordering.
+   each closed kind. After item-local validation, same-kind grouping is checked
+   before global semantic order: a second item of the same kind with identical
+   canonical bytes is `duplicate_component_evidence`; one with different bytes
+   is `inconsistent_observation`. Only if no group-level duplicate or conflict
+   exists are runtime-context semantic orders required to be globally unique
+   and contiguous from zero through `N - 1`. Thus an exact duplicated context
+   item has the duplicate error, while distinct context items sharing one order
+   have the inconsistent-observation error. There is no last-write-wins or
+   implicit reordering.
 4. **B-004:** The stable projection explicitly includes every semantic
    ASC-001 component field: component schema, component ID, kind, source scope
    and locator, observation class, selection state, integrity presence/value,
@@ -204,6 +208,12 @@ executable mode, or a verified fingerprint must.
       an exact `repo_memory/record-<canonical UUID>` locator, and a metadata
       record ID equal to that locator suffix; absent integrity or mismatched
       identity fails without a snapshot.
+- [ ] Every closed runtime-context selection reason matches its producer-owned
+      component kind, source scope, and locator shape. The six-row matrix covers
+      runtime profiles (including the GH-1732 hashed fallback), central and
+      repository workflow sources, effective and default workflow documents,
+      and selected repository memory. Each one-field mismatch fails as
+      `invalid_context_metadata`.
 - [ ] Runtime and MCP construction accepts only validated GH-1733 envelopes;
       fingerprint payload changes affect the ID and schema/object
       representation noise already canonicalized upstream does not.
@@ -216,7 +226,8 @@ executable mode, or a verified fingerprint must.
 - [ ] The evidence compatibility matrix, global context-order uniqueness and
       contiguity, conflicting present integrity, every per-domain failure/
       empty/not-observed state, and every limit-plus-one case fail or succeed
-      exactly as specified.
+      exactly as specified. Exact same-kind duplicates are classified before
+      global context-order duplicates, independent of caller input order.
 - [ ] An independently calculated empty-snapshot vector pins the domain and
       framing. A literal non-empty repository/context vector is constructible
       through the closed typed inputs and pins representative option/tag

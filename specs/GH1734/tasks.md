@@ -30,6 +30,9 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
     JSON/serializable/`Any` entry point.
   - Grouping rejects exact duplicates, inconsistent identity or present
     integrity, coverage mismatch, invalid run IDs, and limits.
+  - Item validation precedes group duplicate/conflict classification, which
+    precedes global semantic-order validation; exact duplicate context evidence
+    has a deterministic error independent of input order.
   - A failure carries no domain; the constructor derives it from the slot.
     The observation value is opaque, and `NotObserved` is available only
     through `not_observed_without_attempt`.
@@ -56,7 +59,10 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
 ### SP1734-T3 — Map complete repository inventory evidence
 
 - Done when:
-  - Typed conversion consumes the complete `AgentStackInventoryEntry`.
+  - `AgentStackInventory` retains its existing public read-only `entries(&self)`
+    accessor and adds exactly one crate-visible consuming `into_entries(self)`
+    API for the adapter; typed conversion moves every complete
+    `AgentStackInventoryEntry` without cloning.
   - Executable tri-state and directory presence enter the stable projection.
   - Every `AgentStackInventoryErrorKind` maps exhaustively to one closed
     producer-failure kind; inventory failure yields no snapshot.
@@ -73,6 +79,8 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
   - It checked-converts semantic order and complete typed memory metadata,
     requires component integrity, and passes the contribution without
     `serde_json::Value`.
+  - All six closed selection reasons enforce the exact producer kind, scope,
+    and locator matrix, including the GH-1732 runtime-profile hash fallback.
   - Closed build errors map from the actual producer `Result` to `Failed`.
   - Tests require canonical UUID memory identity and distinguish representation
     reorder, valid order swap, and invalid one-field gap/duplicate.
@@ -108,6 +116,11 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
   - Vector-order, outer-time, and run-ID invariance are proven.
   - Coverage, duplicate, conflict, producer-error, exact-limit,
     limit-plus-one, and overflow seams fail typed.
+  - Exact context duplicates are classified before global order duplicates;
+    distinct entries sharing one order remain inconsistent and reversing input
+    order cannot change either error.
+  - Every context-reason matrix row has a positive producer fixture and
+    kind/scope/locator one-field negative fixtures.
   - The subject/component-kind matrix covers every reachable different-kind
     combination without treating a derived evidence count as a resource limit.
   - Minimal comparison distinguishes equal, different, incompatible coverage,

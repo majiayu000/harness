@@ -9,7 +9,7 @@ GH-1734
 See `specs/GH1734/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1734,"complete":true,"paths":["crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/mod.rs","crates/harness-core/src/stack/snapshot.rs","crates/harness-core/src/stack/snapshot/canonical.rs","crates/harness-core/src/stack/snapshot/model.rs","crates/harness-core/src/stack/snapshot/tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
+{"issue":1734,"complete":true,"paths":["crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/inventory/mod.rs","crates/harness-core/src/stack/mod.rs","crates/harness-core/src/stack/snapshot.rs","crates/harness-core/src/stack/snapshot/canonical.rs","crates/harness-core/src/stack/snapshot/model.rs","crates/harness-core/src/stack/snapshot/tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
 -->
 
 ## Current System and Root Cause
@@ -216,16 +216,36 @@ Compatibility is:
 | MCP fingerprint | MCP fingerprint, same or different digest | duplicate if identical, otherwise inconsistent |
 | one kind | a different kind | accept if identity and present-integrity rules match |
 
+Validation order is normative and independent of caller order: validate each
+item's component, envelope, context shape, and limits first; group by component
+ID and classify same-kind duplicates or conflicts second; only after every group
+passes, validate the global runtime-context semantic-order collection. An exact
+duplicated context item therefore always returns
+`duplicate_component_evidence`. Two otherwise distinct context items with the
+same semantic order return `inconsistent_observation`.
+
 Across the complete runtime-context observed collection, semantic orders must
-be unique and exactly the contiguous set `0..N`; gaps, duplicates, overflow,
-or a nonzero first order are `inconsistent_observation`. The
-runtime-context component must always have present integrity. The
-`repo_memory_selected` reason additionally requires present memory metadata,
-component kind `memory`, source scope `runtime`, and source locator exactly
-`repo_memory/record-<record_id>`. The record ID is the canonical lowercase
-hyphenated UUID spelling emitted by the existing repo-memory type. Absent
-integrity, a noncanonical UUID, a different locator suffix, wrong kind/scope,
-or metadata on any other reason is `invalid_context_metadata`.
+be exactly the empty set when `N = 0`; otherwise they must be unique and exactly
+the integers zero through `N - 1`, inclusive. Gaps, duplicates between distinct
+items, overflow, or a nonzero first order are `inconsistent_observation`.
+Every runtime-context component must have present integrity and must satisfy the
+closed producer-shape matrix:
+
+| Selection reason | Component kind | Source scope | Required source locator |
+| --- | --- | --- | --- |
+| `workflow_runtime_profile_selected` | `agent_runtime` | `runtime` | a valid historical `runtime_profile/<exact-name>` locator, or `runtime_profile_name_sha256/<lowercase SHA-256>` exactly as produced by the merged GH-1732 remediation |
+| `workflow_base_selected` | `workflow` | `runtime` | `workflow_source/central/<lowercase SHA-256>` |
+| `workflow_repository_selected` | `workflow` | `repository` | exactly `WORKFLOW.md` |
+| `workflow_document_effective` | `workflow` | `runtime` | exactly `workflow_document/effective` |
+| `workflow_defaults_selected` | `workflow` | `runtime` | exactly `workflow_document/defaults` |
+| `repo_memory_selected` | `memory` | `runtime` | `repo_memory/record-<canonical lowercase hyphenated UUID>` |
+
+The snapshot validates the closed locator shape; the typed GH-1732 producer
+remains responsible for binding a profile-name hash or central-path hash to its
+preimage. `repo_memory_selected` additionally requires present memory metadata
+whose record ID is the locator UUID. Metadata on any other reason, absent
+integrity, a malformed hash or UUID, or any reason/kind/scope/locator mismatch
+is `invalid_context_metadata`.
 
 A not-observed domain has no collection by construction. An observed domain
 with an empty collection is valid and proves an empty successful result. Any
@@ -501,8 +521,11 @@ to ASC-006.
 
 ### Repository Inventory
 
-Core moves each `AgentStackInventoryEntry` directly. The conversion retains
-the validated component and exact `AgentStackEntryClass`. The official
+Core adds the narrow consuming API
+`pub(crate) fn into_entries(self) -> Vec<AgentStackInventoryEntry>` to
+`AgentStackInventory` and moves each entry directly; no public iterator or
+clone-based adapter is introduced. The conversion retains the validated
+component and exact `AgentStackEntryClass`. The official
 repository helper accepts
 `Result<AgentStackInventory, AgentStackInventoryError>` and maps every current
 error kind exhaustively: `LimitExceeded` becomes `limit_exceeded`;
@@ -630,7 +653,11 @@ memory kind/scope/record locator/metadata made inconsistent.
 - Same ID with different kind/source after malformed test construction.
 - Same ID with two different present integrity digests.
 - The complete same-kind compatibility matrix.
-- Duplicate, gapped, nonzero-first, and overflowed context semantic order.
+- Exact context duplicate before global order validation; two distinct context
+  items with the same order; input-order reversal; gapped, nonzero-first, and
+  overflowed context semantic order.
+- Every row of the six-reason context producer-shape matrix plus one-field
+  kind, scope, locator, hash/UUID spelling, integrity, and metadata mutations.
 - Each of four domain failures versus successful empty observation versus
   not-observed.
 - Every producer `Result` error category maps to `Failed`; explicit
@@ -646,7 +673,8 @@ memory kind/scope/record locator/metadata made inconsistent.
 
 ### Integration
 
-- Inventory executable-bit changes alter stable identity.
+- The repository helper consumes a real `AgentStackInventory` through
+  `into_entries`; inventory executable-bit changes alter stable identity.
 - Runtime-context caller-vector reorder is invariant; swapping the explicit
   orders of two otherwise valid entries changes identity, while a one-entry
   gap/duplicate mutation fails.
