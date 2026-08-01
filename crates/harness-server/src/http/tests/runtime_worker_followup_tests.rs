@@ -32,7 +32,7 @@ async fn runtime_job_worker_requeues_pr_feedback_child_inspect_after_stale_dedup
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-227",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "pr-feedback-sweep:issue-227:77",
@@ -71,7 +71,7 @@ async fn runtime_job_worker_requeues_pr_feedback_child_inspect_after_stale_dedup
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone());
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
     let stale_dedupe_key = format!("pr-feedback-child:{}:inspect", child_id);
     let stale_command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
         harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
@@ -150,7 +150,7 @@ async fn runtime_job_worker_auto_submits_prompt_task_child_workflow() -> anyhow:
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:127:start",
@@ -249,7 +249,7 @@ async fn runtime_job_worker_auto_submits_prompt_task_child_with_dependencies() -
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:128:start",
@@ -357,7 +357,7 @@ async fn runtime_job_worker_applies_runtime_profile_timeout() -> anyhow::Result<
         "repo": "owner/repo",
         "issue_number": 125,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-2");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;

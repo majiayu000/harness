@@ -327,25 +327,27 @@ async fn release_issue_after_dependencies(
             candidate_fanout: fields.candidate_fanout,
         },
     );
-    let event = store
-        .append_event(
-            &instance.id,
-            "IssueDependenciesSatisfied",
-            "workflow_runtime_submission",
-            json!({
-                "task_id": fields.task_id,
-                "repo": fields.repo,
-                "issue_number": fields.issue_number,
-                "depends_on": depends_on_strings(depends_on),
-                "tracker_source": fields.tracker_source,
-                "tracker_external_id": fields.tracker_external_id,
-                "author_trust_class": fields.author_trust_class,
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": fields.task_id,
+        "repo": fields.repo,
+        "issue_number": fields.issue_number,
+        "depends_on": depends_on_strings(depends_on),
+        "tracker_source": fields.tracker_source,
+        "tracker_external_id": fields.tracker_external_id,
+        "author_trust_class": fields.author_trust_class,
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let data = set_data_bool(instance.data.clone(), "dependencies_blocked", false);
-    commit_runtime_decision(store, instance, output.decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        output.decision,
+        "IssueDependenciesSatisfied",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     Ok(())
 }
 
@@ -355,18 +357,11 @@ async fn fail_issue_for_dependency(
     dependency_id: &TaskId,
     dependency_status: &str,
 ) -> anyhow::Result<()> {
-    let event = store
-        .append_event(
-            &instance.id,
-            "IssueDependencyFailed",
-            "workflow_runtime_submission",
-            json!({
-                "dependency_task_id": dependency_id.as_str(),
-                "dependency_status": dependency_status,
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "dependency_task_id": dependency_id.as_str(),
+        "dependency_status": dependency_status,
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -396,7 +391,16 @@ async fn fail_issue_for_dependency(
         "dependency_failure_status",
         dependency_status,
     );
-    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        decision,
+        "IssueDependencyFailed",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     Ok(())
 }
 
@@ -424,20 +428,22 @@ async fn release_prompt_after_dependencies(
             continuation: fields.continuation.as_ref(),
         },
     )?;
-    let event = store
-        .append_event(
-            &instance.id,
-            "PromptDependenciesSatisfied",
-            "workflow_runtime_submission",
-            json!({
-                "task_id": fields.task_id,
-                "depends_on": depends_on_strings(depends_on),
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": fields.task_id,
+        "depends_on": depends_on_strings(depends_on),
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let data = set_data_bool(instance.data.clone(), "dependencies_blocked", false);
-    commit_runtime_decision(store, instance, output.decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        output.decision,
+        "PromptDependenciesSatisfied",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     Ok(PromptDependencyReleaseOutcome::Released)
 }
 
@@ -448,18 +454,11 @@ async fn fail_prompt_for_dependency(
     dependency_status: &str,
 ) -> anyhow::Result<()> {
     let prompt_ref = optional_string_field(&instance.data, "prompt_ref");
-    let event = store
-        .append_event(
-            &instance.id,
-            "PromptDependencyFailed",
-            "workflow_runtime_submission",
-            json!({
-                "dependency_task_id": dependency_id.as_str(),
-                "dependency_status": dependency_status,
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "dependency_task_id": dependency_id.as_str(),
+        "dependency_status": dependency_status,
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -489,7 +488,16 @@ async fn fail_prompt_for_dependency(
         "dependency_failure_status",
         dependency_status,
     );
-    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        decision,
+        "PromptDependencyFailed",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     remove_prompt_submission_prompt_durable(store, prompt_ref.as_deref()).await?;
     Ok(())
 }
@@ -499,18 +507,11 @@ async fn fail_prompt_for_missing_prompt(
     instance: WorkflowInstance,
     fields: &super::PromptSubmissionFields,
 ) -> anyhow::Result<()> {
-    let event = store
-        .append_event(
-            &instance.id,
-            "PromptSubmissionPromptMissing",
-            "workflow_runtime_submission",
-            json!({
-                "task_id": fields.task_id.as_str(),
-                "prompt_ref": fields.prompt_ref.as_str(),
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": fields.task_id.as_str(),
+        "prompt_ref": fields.prompt_ref.as_str(),
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -532,6 +533,15 @@ async fn fail_prompt_for_missing_prompt(
         "failure_reason",
         "prompt unavailable",
     );
-    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        decision,
+        "PromptSubmissionPromptMissing",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     Ok(())
 }

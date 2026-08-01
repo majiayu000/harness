@@ -34,7 +34,7 @@ async fn terminal_dispatcher_fast_path_rejects_reclaimed_generation() -> anyhow:
         old_claim.dispatch_claim_generation + 1
     );
     workflow.state = "cancelled".to_string();
-    store.upsert_instance(&workflow).await?;
+    force_upsert_instance_for_test(&store, &workflow).await?;
 
     let dispatcher = RuntimeCommandDispatcher::new(
         &store,
@@ -76,7 +76,7 @@ async fn non_runtime_dispatch_rejects_reclaimed_generation() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = project_issue_instance("/project-a", 1601, "pr_open");
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_instance_for_test(&workflow).await?;
     let command = WorkflowCommand::bind_pr(
         1617,
         "https://github.com/majiayu000/harness/pull/1617",
@@ -226,7 +226,7 @@ async fn terminal_workflow_wins_claimed_enqueue() -> anyhow::Result<()> {
     let (mut workflow, command_id, claim) =
         claimed_deferred_test_command(&store, "terminal-enqueue", "terminal-owner").await?;
     workflow.state = "cancelled".to_string();
-    store.upsert_instance(&workflow).await?;
+    force_upsert_instance_for_test(&store, &workflow).await?;
 
     assert_eq!(
         store

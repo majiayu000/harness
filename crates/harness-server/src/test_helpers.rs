@@ -122,6 +122,39 @@ use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
 
+#[cfg(test)]
+pub async fn force_upsert_runtime_instance_for_test(
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    instance: &harness_workflow::runtime::WorkflowInstance,
+) -> anyhow::Result<()> {
+    let data = serde_json::to_string(instance)?;
+    sqlx::query(
+        "INSERT INTO workflow_instances
+            (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+         ON CONFLICT (id) DO UPDATE SET
+            definition_id = EXCLUDED.definition_id,
+            state = EXCLUDED.state,
+            subject_type = EXCLUDED.subject_type,
+            subject_key = EXCLUDED.subject_key,
+            parent_workflow_id = EXCLUDED.parent_workflow_id,
+            data = EXCLUDED.data,
+            version = EXCLUDED.version,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(&instance.id)
+    .bind(&instance.definition_id)
+    .bind(&instance.state)
+    .bind(&instance.subject.subject_type)
+    .bind(&instance.subject.subject_key)
+    .bind(&instance.parent_workflow_id)
+    .bind(&data)
+    .bind(instance.version as i64)
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
 /// `$CWD/.harness-test-home` if `$HOME` is not writable.

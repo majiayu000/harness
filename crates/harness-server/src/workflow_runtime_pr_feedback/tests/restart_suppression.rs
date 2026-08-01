@@ -43,7 +43,7 @@ async fn retrying_child_and_unchanged_remote_fact_suppress_sweeps_after_restart(
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
 
     let mut child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
@@ -53,7 +53,7 @@ async fn retrying_child_and_unchanged_remote_fact_suppress_sweeps_after_restart(
     )
     .with_id("pr-feedback-child-retrying-then-same-fact")
     .with_parent(workflow_id.clone());
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
     let inspect =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let inspect_id = store.enqueue_command(&child.id, None, &inspect).await?;
@@ -113,7 +113,7 @@ async fn retrying_child_and_unchanged_remote_fact_suppress_sweeps_after_restart(
         "remote_fact_hash": fact_hash,
         "remote_fact_activity_at": observed_fact_at.to_rfc3339(),
     });
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &child).await?;
     sqlx::query(
         "UPDATE workflow_instances
          SET updated_at = CURRENT_TIMESTAMP - INTERVAL '25 hours'
