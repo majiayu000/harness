@@ -41,7 +41,7 @@ pub(super) fn compare_existing(
                 inputs.before_by_id,
                 inputs.before_conflicting_component_ids,
                 inputs.after_conflicting_component_ids,
-                inputs.replacement_use_counts,
+                inputs.replacement_assignments,
             ))
         } else {
             None
@@ -74,7 +74,7 @@ pub(super) fn compare_existing(
             inputs.before_by_id,
             inputs.before_conflicting_component_ids,
             inputs.after_conflicting_component_ids,
-            inputs.replacement_use_counts,
+            inputs.replacement_assignments,
         ))
     } else {
         None
@@ -143,7 +143,7 @@ pub(super) fn compare_existing(
         inputs.before_by_id,
         inputs.before_conflicting_component_ids,
         inputs.after_conflicting_component_ids,
-        inputs.replacement_use_counts,
+        inputs.replacement_assignments,
     );
     let replacements = analyze_role_replacements(
         before,

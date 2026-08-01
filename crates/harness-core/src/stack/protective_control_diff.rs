@@ -9,8 +9,9 @@ mod existing;
 mod replacements;
 use existing::compare_existing;
 use replacements::{
-    analyze_role_replacements, by_component_id, replacement_candidates, replacement_use_counts,
-    CandidateMode, ReplacementStateConflicts,
+    analyze_role_replacements, by_component_id, conflicted_replacement_uncovered_roles,
+    replacement_assignments, replacement_candidates, CandidateMode, ReplacementAssignmentIndex,
+    ReplacementCandidateConflicts, ReplacementStateConflicts, RoleReplacementCoverage,
 };
 macro_rules! closed_enum {
     ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
@@ -169,6 +170,7 @@ pub struct AgentStackProtectionControlDiff {
 }
 
 struct ComparisonInputs<'before, 'after> {
+    after_reports: &'after [AgentStackProtectionControl],
     after_controls: &'after [AgentStackProtectionControl],
     before_by_id: &'before BTreeMap<String, &'before AgentStackProtectionControl>,
     before_conflicting_component_ids: &'before BTreeSet<String>,
@@ -179,7 +181,7 @@ struct ComparisonInputs<'before, 'after> {
     after_scope_conflicting_component_ids: &'after BTreeSet<String>,
     before_failure_mode_conflicting_component_ids: &'before BTreeSet<String>,
     after_failure_mode_conflicting_component_ids: &'after BTreeSet<String>,
-    replacement_use_counts: &'before BTreeMap<String, usize>,
+    replacement_assignments: &'before ReplacementAssignmentIndex,
 }
 #[rustfmt::skip]
 impl AgentStackProtectionControlDiff {
@@ -215,7 +217,7 @@ pub fn protective_control_diff(
     let before_by_id = by_component_id(&before_controls.controls);
     let after_controls = aggregate_controls(after);
     let after_by_id = by_component_id(&after_controls.controls);
-    let replacement_use_counts = replacement_use_counts(
+    let replacement_assignments = replacement_assignments(
         &before_controls.controls,
         &after_controls.controls,
         &before_by_id,
@@ -232,6 +234,7 @@ pub fn protective_control_diff(
         },
     );
     let comparison_inputs = ComparisonInputs {
+        after_reports: after,
         after_controls: &after_controls.controls,
         before_by_id: &before_by_id,
         before_conflicting_component_ids: &before_controls.conflicting_component_ids,
@@ -245,7 +248,7 @@ pub fn protective_control_diff(
             .failure_mode_conflicting_component_ids,
         after_failure_mode_conflicting_component_ids: &after_controls
             .failure_mode_conflicting_component_ids,
-        replacement_use_counts: &replacement_use_counts,
+        replacement_assignments: &replacement_assignments,
     };
     let mut facts = Vec::new();
     for before_control in &before_controls.controls {
@@ -298,7 +301,7 @@ fn compare_removed(
     let before_by_id = inputs.before_by_id;
     let before_conflicting_component_ids = inputs.before_conflicting_component_ids;
     let after_conflicting_component_ids = inputs.after_conflicting_component_ids;
-    let replacement_use_counts = inputs.replacement_use_counts;
+    let replacement_assignments = inputs.replacement_assignments;
     let mut same_integrity = replacement_candidates(
         after,
         before,
@@ -325,7 +328,18 @@ fn compare_removed(
                 before_conflicting_component_ids,
                 after_conflicting_component_ids,
             );
-            let mut uncovered_roles = replacements.uncovered_roles;
+            let uncovered_roles = conflicted_replacement_uncovered_roles(
+                before,
+                after,
+                inputs.after_reports,
+                before_by_id,
+                ReplacementCandidateConflicts {
+                    before_any: before_conflicting_component_ids,
+                    after_any: after_conflicting_component_ids,
+                },
+                &replacements.conflicting_replacements,
+                component_id,
+            );
             let mut conflicting_replacements = replacements.conflicting_replacements;
             let overlapping_roles = before
                 .roles
@@ -333,7 +347,6 @@ fn compare_removed(
                 .copied()
                 .filter(|role| candidate.roles.contains(role))
                 .collect::<Vec<_>>();
-            uncovered_roles.retain(|role| !overlapping_roles.contains(role));
             if let Some((_, roles)) =
                 conflicting_replacements
                     .iter_mut()
@@ -368,13 +381,9 @@ fn compare_removed(
             rename_confidence(before, candidate),
             AgentStackProtectionControlReason::PossibleRename,
         ));
-        let has_safe_independent_equivalent = equivalent.iter().any(|replacement| {
-            let replacement_id = replacement.component.component_id().as_str();
-            replacement_id != component_id
-                && !before_conflicting_component_ids.contains(replacement_id)
-                && !after_conflicting_component_ids.contains(replacement_id)
-                && replacement_use_counts.get(replacement_id).copied() == Some(1)
-        });
+        let has_safe_independent_equivalent = replacement_assignments
+            .unique_candidate_id(before, &before.roles)
+            .is_some_and(|replacement_id| replacement_id != component_id);
         if has_safe_independent_equivalent {
             return;
         }
@@ -425,19 +434,31 @@ fn compare_removed(
     } else {
         &safe_equivalent
     };
+    match replacement_assignments.coverage(before, &before.roles) {
+        Some(RoleReplacementCoverage::Unique) => return,
+        Some(RoleReplacementCoverage::Ambiguous) => {
+            let candidate = preferred_equivalent.first().copied();
+            let confidence = candidate.map_or(AgentStackProtectionConfidence::Low, |candidate| {
+                min_confidence(before.confidence, candidate.confidence)
+            });
+            facts.push(AgentStackProtectionControlDiff::new(
+                AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+                before.roles.clone(),
+                Some(before),
+                candidate,
+                confidence,
+                AgentStackProtectionControlReason::AmbiguousReplacement,
+            ));
+            return;
+        }
+        Some(RoleReplacementCoverage::Missing) | None => {}
+    }
     if preferred_equivalent.len() == 1 {
         let candidate = preferred_equivalent[0];
         let component_id = candidate.component.component_id().as_str();
-        let has_candidate_conflict = before_conflicting_component_ids.contains(component_id)
-            || after_conflicting_component_ids.contains(component_id);
-        let use_count = replacement_use_counts
-            .get(component_id)
-            .copied()
-            .unwrap_or(0);
-        if use_count == 1 && !has_candidate_conflict {
-            return;
-        }
-        let reason = if has_candidate_conflict {
+        let reason = if before_conflicting_component_ids.contains(component_id)
+            || after_conflicting_component_ids.contains(component_id)
+        {
             AgentStackProtectionControlReason::ConflictingDuplicateReport
         } else {
             AgentStackProtectionControlReason::AmbiguousReplacement

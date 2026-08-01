@@ -4,6 +4,9 @@ use super::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+mod matching;
+use matching::{resolve_assignments, AssignmentResolution};
+
 #[derive(Clone, Copy)]
 pub(super) enum CandidateMode {
     SameIntegrity,
@@ -35,6 +38,62 @@ pub(super) struct ReplacementStateConflicts<'a> {
     pub(super) after_scope: &'a BTreeSet<String>,
     pub(super) before_failure_mode: &'a BTreeSet<String>,
     pub(super) after_failure_mode: &'a BTreeSet<String>,
+}
+
+pub(super) struct ReplacementCandidateConflicts<'a> {
+    pub(super) before_any: &'a BTreeSet<String>,
+    pub(super) after_any: &'a BTreeSet<String>,
+}
+
+pub(super) struct ReplacementAssignmentIndex {
+    demands: BTreeMap<String, ReplacementDemandResolution>,
+}
+
+struct ReplacementDemandResolution {
+    roles: Vec<AgentStackProtectionRole>,
+    coverage: RoleReplacementCoverage,
+    unique_candidate_id: Option<String>,
+}
+
+struct ReplacementDemand {
+    roles: Vec<AgentStackProtectionRole>,
+    full_candidate_ids: BTreeSet<String>,
+    per_role_candidate_ids: Vec<BTreeSet<String>>,
+    same_integrity_candidate_ids: BTreeSet<String>,
+    contending_candidate_ids: BTreeSet<String>,
+}
+
+impl ReplacementAssignmentIndex {
+    pub(super) fn coverage(
+        &self,
+        before: &AgentStackProtectionControl,
+        roles: &[AgentStackProtectionRole],
+    ) -> Option<RoleReplacementCoverage> {
+        self.demand(before, roles).map(|demand| demand.coverage)
+    }
+
+    pub(super) fn unique_candidate_id(
+        &self,
+        before: &AgentStackProtectionControl,
+        roles: &[AgentStackProtectionRole],
+    ) -> Option<&str> {
+        self.demand(before, roles)
+            .and_then(|demand| demand.unique_candidate_id.as_deref())
+    }
+
+    fn demand(
+        &self,
+        before: &AgentStackProtectionControl,
+        roles: &[AgentStackProtectionRole],
+    ) -> Option<&ReplacementDemandResolution> {
+        self.demands
+            .get(before.component.component_id().as_str())
+            .filter(|demand| {
+                demand.roles == roles
+                    || (!matches!(demand.coverage, RoleReplacementCoverage::Missing)
+                        && roles.iter().all(|role| demand.roles.contains(role)))
+            })
+    }
 }
 
 pub(super) fn replacement_candidates<'a>(
@@ -120,15 +179,59 @@ pub(super) fn analyze_role_replacements<'a>(
     }
 }
 
-pub(super) fn replacement_use_counts(
+pub(super) fn conflicted_replacement_uncovered_roles(
+    before: &AgentStackProtectionControl,
+    after: &[AgentStackProtectionControl],
+    after_reports: &[AgentStackProtectionControl],
+    before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
+    conflicts: ReplacementCandidateConflicts<'_>,
+    conflicting_replacements: &[(&AgentStackProtectionControl, Vec<AgentStackProtectionRole>)],
+    primary_conflicting_component_id: &str,
+) -> Vec<AgentStackProtectionRole> {
+    let mut conflicting_component_ids = conflicting_replacements
+        .iter()
+        .map(|(candidate, _)| candidate.component.component_id().as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    conflicting_component_ids.insert(primary_conflicting_component_id.to_owned());
+    before
+        .roles
+        .iter()
+        .copied()
+        .filter(|role| {
+            let mut probe = before.clone();
+            probe.roles = vec![*role];
+            let has_safe_candidate = replacement_candidates(
+                after,
+                &probe,
+                before_by_id,
+                conflicts.before_any,
+                CandidateMode::Equivalent,
+            )
+            .into_iter()
+            .any(|candidate| {
+                let component_id = candidate.component.component_id().as_str();
+                !conflicts.before_any.contains(component_id)
+                    && !conflicts.after_any.contains(component_id)
+            });
+            let has_individually_equivalent_conflicted_report =
+                after_reports.iter().any(|report| {
+                    conflicting_component_ids.contains(report.component.component_id().as_str())
+                        && equivalent_replacement(&probe, report)
+                });
+            !has_safe_candidate && !has_individually_equivalent_conflicted_report
+        })
+        .collect()
+}
+
+pub(super) fn replacement_assignments(
     before: &[AgentStackProtectionControl],
     after: &[AgentStackProtectionControl],
     before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     before_conflicting_component_ids: &BTreeSet<String>,
     after_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     conflicts: ReplacementStateConflicts<'_>,
-) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
+) -> ReplacementAssignmentIndex {
+    let mut demands = BTreeMap::<String, ReplacementDemand>::new();
     for before_control in before {
         let component_id = before_control.component.component_id().as_str();
         if before_control.roles.is_empty()
@@ -137,91 +240,219 @@ pub(super) fn replacement_use_counts(
         {
             continue;
         }
-        let Some(after_control) = after_by_id.get(component_id).copied() else {
-            let mut used_ids = BTreeSet::new();
-            let same_integrity = replacement_candidates(
-                after,
-                before_control,
-                before_by_id,
-                before_conflicting_component_ids,
-                CandidateMode::SameIntegrity,
-            );
-            let equivalent = replacement_candidates(
-                after,
-                before_control,
-                before_by_id,
-                before_conflicting_component_ids,
-                CandidateMode::Equivalent,
-            );
-            for candidate in same_integrity.iter().chain(equivalent.iter()) {
-                used_ids.insert(candidate.component.component_id().as_str().to_owned());
-            }
-            for role in before_control.roles.iter().copied().filter(|role| {
-                let mut probe = before_control.clone();
-                probe.roles = vec![*role];
-                !same_integrity.iter().any(|candidate| {
-                    let candidate_id = candidate.component.component_id().as_str();
-                    !conflicts.after_any.contains(candidate_id)
-                        && equivalent_replacement(&probe, candidate)
-                })
-            }) {
-                let mut probe = before_control.clone();
-                probe.roles = vec![role];
-                for candidate in replacement_candidates(
+        let roles = replacement_demand_roles(before_control, after_by_id, &conflicts);
+        if roles.is_empty() {
+            continue;
+        }
+        let full_candidate_ids = safe_candidate_ids(
+            before_control,
+            roles.clone(),
+            after,
+            before_by_id,
+            before_conflicting_component_ids,
+            conflicts.after_any,
+        );
+        let per_role_candidate_ids = roles
+            .iter()
+            .map(|role| {
+                safe_candidate_ids(
+                    before_control,
+                    vec![*role],
                     after,
-                    &probe,
                     before_by_id,
                     before_conflicting_component_ids,
-                    CandidateMode::Equivalent,
-                ) {
-                    used_ids.insert(candidate.component.component_id().as_str().to_owned());
-                }
-            }
-            increment_use_counts(&mut counts, used_ids);
-            continue;
-        };
-        let has_scope_reduction = !conflicts.before_scope.contains(component_id)
-            && !conflicts.after_scope.contains(component_id)
-            && scope_is_reduced(before_control, after_control);
-        let has_failure_mode_reduction = !conflicts.before_failure_mode.contains(component_id)
-            && !conflicts.after_failure_mode.contains(component_id)
-            && failure_mode_is_reduced(before_control, after_control);
-        let has_enablement_evidence_loss = !conflicts.before_enabled.contains(component_id)
-            && !conflicts.after_enabled.contains(component_id)
-            && matches!(
-                (before_control.enabled, after_control.enabled),
-                (Some(true), None)
-            );
-        let has_confidence_reduction =
-            after_control.confidence.strength() < before_control.confidence.strength();
-        let roles = if (after_control.enabled == Some(false)
-            && !conflicts.after_enabled.contains(component_id))
-            || has_enablement_evidence_loss
-            || has_confidence_reduction
-            || has_scope_reduction
-            || has_failure_mode_reduction
-        {
-            before_control.roles.clone()
-        } else {
-            missing_roles(before_control.roles(), after_control.roles())
-        };
-        let mut used_ids = BTreeSet::new();
-        for role in roles {
-            let mut probe = before_control.clone();
-            probe.roles = vec![role];
-            for candidate in replacement_candidates(
-                after,
-                &probe,
-                before_by_id,
-                before_conflicting_component_ids,
-                CandidateMode::Equivalent,
-            ) {
-                used_ids.insert(candidate.component.component_id().as_str().to_owned());
-            }
-        }
-        increment_use_counts(&mut counts, used_ids);
+                    conflicts.after_any,
+                )
+            })
+            .collect::<Vec<_>>();
+        let same_integrity_candidate_ids = replacement_candidates(
+            after,
+            before_control,
+            before_by_id,
+            before_conflicting_component_ids,
+            CandidateMode::SameIntegrity,
+        )
+        .into_iter()
+        .map(|candidate| candidate.component.component_id().as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+        let contending_candidate_ids = same_integrity_candidate_ids
+            .iter()
+            .cloned()
+            .chain(per_role_candidate_ids.iter().flatten().cloned())
+            .collect();
+        demands.insert(
+            component_id.to_owned(),
+            ReplacementDemand {
+                roles,
+                full_candidate_ids,
+                per_role_candidate_ids,
+                same_integrity_candidate_ids,
+                contending_candidate_ids,
+            },
+        );
     }
-    counts
+
+    let candidate_edges = demands
+        .iter()
+        .map(|(component_id, demand)| (component_id.clone(), demand.full_candidate_ids.clone()))
+        .collect();
+    let assignment_resolutions = resolve_assignments(&candidate_edges);
+    let partial_contention = partial_candidate_contention(&demands);
+    let resolutions = demands
+        .into_iter()
+        .map(|(component_id, demand)| {
+            let assignment = assignment_resolutions.get(&component_id);
+            let (coverage, unique_candidate_id) = match assignment {
+                Some(AssignmentResolution::Unique(candidate_id))
+                    if !partial_contention
+                        .get(candidate_id)
+                        .is_some_and(|claimants| {
+                            claimants.iter().any(|claimant| claimant != &component_id)
+                        })
+                        && !has_alternative_split_plan(
+                            &demand.per_role_candidate_ids,
+                            candidate_id,
+                        ) =>
+                {
+                    (RoleReplacementCoverage::Unique, Some(candidate_id.clone()))
+                }
+                Some(AssignmentResolution::Unique(_) | AssignmentResolution::Ambiguous) => {
+                    (RoleReplacementCoverage::Ambiguous, None)
+                }
+                Some(AssignmentResolution::Missing)
+                    if demand
+                        .per_role_candidate_ids
+                        .iter()
+                        .all(|candidates| !candidates.is_empty()) =>
+                {
+                    (RoleReplacementCoverage::Ambiguous, None)
+                }
+                Some(AssignmentResolution::Missing) | None => {
+                    (RoleReplacementCoverage::Missing, None)
+                }
+            };
+            (
+                component_id,
+                ReplacementDemandResolution {
+                    roles: demand.roles,
+                    coverage,
+                    unique_candidate_id,
+                },
+            )
+        })
+        .collect();
+    ReplacementAssignmentIndex {
+        demands: resolutions,
+    }
+}
+
+fn replacement_demand_roles(
+    before: &AgentStackProtectionControl,
+    after_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
+    conflicts: &ReplacementStateConflicts<'_>,
+) -> Vec<AgentStackProtectionRole> {
+    let component_id = before.component.component_id().as_str();
+    let Some(after) = after_by_id.get(component_id).copied() else {
+        return before.roles.clone();
+    };
+    let has_scope_reduction = !conflicts.before_scope.contains(component_id)
+        && !conflicts.after_scope.contains(component_id)
+        && scope_is_reduced(before, after);
+    let has_failure_mode_reduction = !conflicts.before_failure_mode.contains(component_id)
+        && !conflicts.after_failure_mode.contains(component_id)
+        && failure_mode_is_reduced(before, after);
+    let has_enablement_evidence_loss = !conflicts.before_enabled.contains(component_id)
+        && !conflicts.after_enabled.contains(component_id)
+        && matches!((before.enabled, after.enabled), (Some(true), None));
+    let has_confidence_reduction = after.confidence.strength() < before.confidence.strength();
+    if (after.enabled == Some(false) && !conflicts.after_enabled.contains(component_id))
+        || has_enablement_evidence_loss
+        || has_confidence_reduction
+        || has_scope_reduction
+        || has_failure_mode_reduction
+    {
+        before.roles.clone()
+    } else {
+        missing_roles(before.roles(), after.roles())
+    }
+}
+
+fn safe_candidate_ids(
+    before: &AgentStackProtectionControl,
+    roles: Vec<AgentStackProtectionRole>,
+    after: &[AgentStackProtectionControl],
+    before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
+    before_conflicting_component_ids: &BTreeSet<String>,
+    after_conflicting_component_ids: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut probe = before.clone();
+    probe.roles = roles;
+    replacement_candidates(
+        after,
+        &probe,
+        before_by_id,
+        before_conflicting_component_ids,
+        CandidateMode::Equivalent,
+    )
+    .into_iter()
+    .map(|candidate| candidate.component.component_id().as_str())
+    .filter(|component_id| {
+        !before_conflicting_component_ids.contains(*component_id)
+            && !after_conflicting_component_ids.contains(*component_id)
+    })
+    .map(str::to_owned)
+    .collect()
+}
+
+fn partial_candidate_contention(
+    demands: &BTreeMap<String, ReplacementDemand>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut contention = BTreeMap::<String, BTreeSet<String>>::new();
+    for (component_id, demand) in demands {
+        let has_complete_role_plan = demand
+            .per_role_candidate_ids
+            .iter()
+            .all(|candidates| !candidates.is_empty());
+        for candidate_id in demand
+            .contending_candidate_ids
+            .iter()
+            .filter(|candidate_id| {
+                !demand.full_candidate_ids.contains(*candidate_id)
+                    && (has_complete_role_plan
+                        || demand.same_integrity_candidate_ids.contains(*candidate_id))
+            })
+        {
+            contention
+                .entry(candidate_id.clone())
+                .or_default()
+                .insert(component_id.clone());
+        }
+    }
+    contention
+}
+
+fn has_alternative_split_plan(
+    per_role_candidate_ids: &[BTreeSet<String>],
+    excluded_candidate_id: &str,
+) -> bool {
+    let alternatives = per_role_candidate_ids
+        .iter()
+        .map(|candidates| {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.as_str() != excluded_candidate_id)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    if alternatives.iter().any(BTreeSet::is_empty) {
+        return false;
+    }
+    let mut common = alternatives[0].clone();
+    for candidates in &alternatives[1..] {
+        common.retain(|candidate| candidates.contains(candidate));
+    }
+    common.is_empty() && alternatives.iter().flatten().collect::<BTreeSet<_>>().len() > 1
 }
 
 pub(super) fn classify_role_replacement(
@@ -231,8 +462,11 @@ pub(super) fn classify_role_replacement(
     before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     before_conflicting_component_ids: &BTreeSet<String>,
     after_conflicting_component_ids: &BTreeSet<String>,
-    replacement_use_counts: &BTreeMap<String, usize>,
+    replacement_assignments: &ReplacementAssignmentIndex,
 ) -> RoleReplacementCoverage {
+    if let Some(coverage) = replacement_assignments.coverage(before, &roles) {
+        return coverage;
+    }
     let analysis = analyze_role_replacements(
         before,
         roles,
@@ -247,12 +481,7 @@ pub(super) fn classify_role_replacement(
     {
         return RoleReplacementCoverage::Missing;
     }
-    if analysis.replacement_ids.len() == 1
-        && analysis
-            .replacement_ids
-            .iter()
-            .all(|component_id| replacement_use_counts.get(component_id).copied() == Some(1))
-    {
+    if analysis.replacement_ids.len() == 1 {
         RoleReplacementCoverage::Unique
     } else {
         RoleReplacementCoverage::Ambiguous
@@ -266,8 +495,14 @@ pub(super) fn shared_replacement_roles(
     before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     before_conflicting_component_ids: &BTreeSet<String>,
     after_conflicting_component_ids: &BTreeSet<String>,
-    replacement_use_counts: &BTreeMap<String, usize>,
+    replacement_assignments: &ReplacementAssignmentIndex,
 ) -> Vec<AgentStackProtectionRole> {
+    if let Some(coverage) = replacement_assignments.coverage(before, &roles) {
+        return match coverage {
+            RoleReplacementCoverage::Ambiguous => roles,
+            RoleReplacementCoverage::Unique | RoleReplacementCoverage::Missing => Vec::new(),
+        };
+    }
     roles
         .into_iter()
         .filter(|role| {
@@ -285,14 +520,6 @@ pub(super) fn shared_replacement_roles(
             .filter(|component_id| !after_conflicting_component_ids.contains(*component_id))
             .collect::<Vec<_>>();
             safe_candidate_ids.len() > 1
-                || (!safe_candidate_ids.is_empty()
-                    && safe_candidate_ids.iter().all(|component_id| {
-                        replacement_use_counts
-                            .get(*component_id)
-                            .copied()
-                            .unwrap_or(0)
-                            > 1
-                    }))
         })
         .collect()
 }
@@ -346,12 +573,6 @@ pub(super) fn failure_mode_is_reduced(
     )
 }
 
-fn increment_use_counts(counts: &mut BTreeMap<String, usize>, component_ids: BTreeSet<String>) {
-    for component_id in component_ids {
-        *counts.entry(component_id).or_insert(0) += 1;
-    }
-}
-
 fn candidate_is_new_protection(
     candidate: &AgentStackProtectionControl,
     removed: &AgentStackProtectionControl,
@@ -372,7 +593,7 @@ fn candidate_is_new_protection(
     }
 }
 
-fn equivalent_replacement(
+pub(super) fn equivalent_replacement(
     before: &AgentStackProtectionControl,
     after: &AgentStackProtectionControl,
 ) -> bool {
