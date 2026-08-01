@@ -222,6 +222,7 @@ pub fn protective_control_diff(
         &before_controls.conflicting_component_ids,
         &after_by_id,
         ReplacementStateConflicts {
+            after_any: &after_controls.conflicting_component_ids,
             before_enabled: &before_controls.enabled_conflicting_component_ids,
             after_enabled: &after_controls.enabled_conflicting_component_ids,
             before_scope: &before_controls.scope_conflicting_component_ids,
@@ -252,8 +253,11 @@ pub fn protective_control_diff(
         let has_before_conflict = before_controls
             .conflicting_component_ids
             .contains(component_id);
+        let has_before_enabled_conflict = before_controls
+            .enabled_conflicting_component_ids
+            .contains(component_id);
         if before_control.roles.is_empty()
-            || (before_control.enabled == Some(false) && !has_before_conflict)
+            || (before_control.enabled == Some(false) && !has_before_enabled_conflict)
         {
             continue;
         }
@@ -407,8 +411,22 @@ fn compare_removed(
         }
         return;
     }
-    if equivalent.len() == 1 {
-        let candidate = equivalent[0];
+    let safe_equivalent = equivalent
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            let component_id = candidate.component.component_id().as_str();
+            !before_conflicting_component_ids.contains(component_id)
+                && !after_conflicting_component_ids.contains(component_id)
+        })
+        .collect::<Vec<_>>();
+    let preferred_equivalent = if safe_equivalent.is_empty() {
+        &equivalent
+    } else {
+        &safe_equivalent
+    };
+    if preferred_equivalent.len() == 1 {
+        let candidate = preferred_equivalent[0];
         let component_id = candidate.component.component_id().as_str();
         let has_candidate_conflict = before_conflicting_component_ids.contains(component_id)
             || after_conflicting_component_ids.contains(component_id);
@@ -434,7 +452,7 @@ fn compare_removed(
         ));
         return;
     }
-    if let Some(candidate) = equivalent.first() {
+    if let Some(candidate) = preferred_equivalent.first() {
         facts.push(AgentStackProtectionControlDiff::new(
             AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
             before.roles.clone(),

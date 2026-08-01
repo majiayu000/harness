@@ -245,3 +245,267 @@ fn shared_replacement_preserves_all_roles_for_mixed_state_reduction() {
     assert_eq!(a_facts.len(), 1);
     assert_eq!(a_facts[0].roles(), [Role::Check, Role::Validation]);
 }
+
+#[test]
+fn weakened_rename_counts_supplemental_replacements_as_shared() {
+    let renamed_before = configured_control(
+        Kind::Validation,
+        ".github/workflows/renamed-before.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let removed = configured_control(
+        Kind::Validation,
+        ".github/workflows/removed.yml",
+        None,
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let weakened_rename = configured_control(
+        Kind::Validation,
+        ".github/workflows/renamed-after.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ControlState(Some(true), Some(Scope::Advisory), Some(Mode::FailClosed)),
+    );
+    let shared = configured_control(
+        Kind::Validation,
+        ".github/workflows/shared.yml",
+        Some(HASH_B),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let check_replacement = configured_control(
+        Kind::Validation,
+        ".github/workflows/check.yml",
+        None,
+        &[Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+
+    let facts = protective_control_diff(
+        &[renamed_before, removed],
+        &[weakened_rename, shared, check_replacement],
+    );
+
+    assert!(facts.iter().any(|fact| {
+        fact.reason() == Reason::AmbiguousReplacement
+            && fact
+                .before()
+                .is_some_and(|before| before.source_locator() == ".github/workflows/removed.yml")
+    }));
+}
+
+#[test]
+fn unique_replacement_suppresses_enablement_evidence_loss() {
+    let before = configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let unknown_legacy = configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        UNKNOWN_REQUIRED,
+    );
+    let replacement = configured_control(
+        Kind::Validation,
+        ".github/workflows/replacement.yml",
+        Some(HASH_B),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+
+    assert!(protective_control_diff(&[before], &[unknown_legacy, replacement]).is_empty());
+}
+
+#[test]
+fn safe_replacement_wins_over_conflicted_alternative() {
+    let before = configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let safe = configured_control(
+        Kind::Validation,
+        ".github/workflows/safe.yml",
+        Some(HASH_B),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let conflicting_required = configured_control(
+        Kind::Validation,
+        ".github/workflows/conflicting.yml",
+        None,
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let conflicting_advisory = configured_control(
+        Kind::Validation,
+        ".github/workflows/conflicting.yml",
+        None,
+        &[Role::Validation],
+        Confidence::High,
+        ControlState(Some(true), Some(Scope::Advisory), Some(Mode::FailClosed)),
+    );
+
+    assert!(protective_control_diff(
+        &[before],
+        &[safe, conflicting_required, conflicting_advisory],
+    )
+    .is_empty());
+}
+
+#[test]
+fn unanimously_disabled_duplicates_stay_out_of_the_diff() {
+    let disabled_required = configured_control(
+        Kind::Policy,
+        "rules/disabled.toml",
+        Some(HASH_A),
+        &[Role::Policy],
+        Confidence::High,
+        DISABLED_REQUIRED,
+    );
+    let disabled_advisory = configured_control(
+        Kind::Policy,
+        "rules/disabled.toml",
+        Some(HASH_A),
+        &[Role::Policy],
+        Confidence::High,
+        ControlState(Some(false), Some(Scope::Advisory), Some(Mode::FailClosed)),
+    );
+
+    assert!(protective_control_diff(&[disabled_required, disabled_advisory], &[]).is_empty());
+}
+
+#[test]
+fn conflicted_rename_does_not_hide_shared_supplemental_use() {
+    let renamed_before = configured_control(
+        Kind::Validation,
+        ".github/workflows/renamed-before.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let removed = configured_control(
+        Kind::Validation,
+        ".github/workflows/removed.yml",
+        None,
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let rename_required = configured_control(
+        Kind::Validation,
+        ".github/workflows/renamed-after.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let rename_advisory = configured_control(
+        Kind::Validation,
+        ".github/workflows/renamed-after.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ControlState(Some(true), Some(Scope::Advisory), Some(Mode::FailClosed)),
+    );
+    let shared = configured_control(
+        Kind::Validation,
+        ".github/workflows/shared.yml",
+        Some(HASH_B),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let check_replacement = configured_control(
+        Kind::Validation,
+        ".github/workflows/check.yml",
+        None,
+        &[Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let original = protective_control_diff(
+        &[renamed_before.clone(), removed.clone()],
+        &[
+            rename_required.clone(),
+            rename_advisory.clone(),
+            shared.clone(),
+            check_replacement.clone(),
+        ],
+    );
+    let reversed = protective_control_diff(
+        &[removed, renamed_before],
+        &[check_replacement, shared, rename_advisory, rename_required],
+    );
+
+    assert_eq!(original, reversed);
+    assert!(original.iter().any(|fact| {
+        fact.reason() == Reason::AmbiguousReplacement
+            && fact
+                .before()
+                .is_some_and(|before| before.source_locator() == ".github/workflows/removed.yml")
+    }));
+}
+
+#[test]
+fn ambiguous_enablement_loss_emits_one_replacement_fact() {
+    let before = configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let unknown_legacy = configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        UNKNOWN_REQUIRED,
+    );
+    let replacement_a = configured_control(
+        Kind::Validation,
+        ".github/workflows/a.yml",
+        Some(HASH_B),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let replacement_b = configured_control(
+        Kind::Validation,
+        ".github/workflows/b.yml",
+        None,
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+
+    let facts = protective_control_diff(&[before], &[unknown_legacy, replacement_a, replacement_b]);
+
+    assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
+    assert_eq!(reasons(&facts), [Reason::AmbiguousReplacement]);
+}

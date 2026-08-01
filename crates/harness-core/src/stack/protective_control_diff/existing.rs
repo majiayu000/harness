@@ -58,20 +58,23 @@ pub(super) fn compare_existing(
     let has_scope_reduction = !has_scope_conflict && scope_is_reduced(before, after);
     let has_failure_mode_reduction =
         !has_failure_mode_conflict && failure_mode_is_reduced(before, after);
-    let standalone_state_reduction_coverage =
-        if after.enabled != Some(false) && (has_scope_reduction || has_failure_mode_reduction) {
-            Some(classify_role_replacement(
-                before,
-                before.roles.clone(),
-                inputs.after_controls,
-                inputs.before_by_id,
-                inputs.before_conflicting_component_ids,
-                inputs.after_conflicting_component_ids,
-                inputs.replacement_use_counts,
-            ))
-        } else {
-            None
-        };
+    let has_enablement_evidence_loss =
+        matches!((before.enabled, after.enabled), (Some(true), None));
+    let standalone_state_reduction_coverage = if after.enabled != Some(false)
+        && (has_enablement_evidence_loss || has_scope_reduction || has_failure_mode_reduction)
+    {
+        Some(classify_role_replacement(
+            before,
+            before.roles.clone(),
+            inputs.after_controls,
+            inputs.before_by_id,
+            inputs.before_conflicting_component_ids,
+            inputs.after_conflicting_component_ids,
+            inputs.replacement_use_counts,
+        ))
+    } else {
+        None
+    };
     let standalone_state_reduction_has_complete_coverage = matches!(
         standalone_state_reduction_coverage,
         Some(RoleReplacementCoverage::Unique | RoleReplacementCoverage::Ambiguous)
@@ -90,15 +93,18 @@ pub(super) fn compare_existing(
         );
     }
     match (before.enabled, after.enabled) {
-        (Some(true), None) => push_existing_fact(
-            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::EnablementEvidenceLost,
-            facts,
-        ),
+        (Some(true), None) => match standalone_state_reduction_coverage {
+            Some(RoleReplacementCoverage::Unique | RoleReplacementCoverage::Ambiguous) => {}
+            Some(RoleReplacementCoverage::Missing) | None => push_existing_fact(
+                AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+                before.roles.clone(),
+                before,
+                after,
+                confidence,
+                AgentStackProtectionControlReason::EnablementEvidenceLost,
+                facts,
+            ),
+        },
         (left, Some(false)) if left != Some(false) && !has_enabled_conflict => {
             match disablement_coverage {
                 Some(RoleReplacementCoverage::Unique) => {}

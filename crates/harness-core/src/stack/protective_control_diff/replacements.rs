@@ -28,6 +28,7 @@ pub(super) struct RoleReplacementAnalysis<'a> {
 }
 
 pub(super) struct ReplacementStateConflicts<'a> {
+    pub(super) after_any: &'a BTreeSet<String>,
     pub(super) before_enabled: &'a BTreeSet<String>,
     pub(super) after_enabled: &'a BTreeSet<String>,
     pub(super) before_scope: &'a BTreeSet<String>,
@@ -156,8 +157,12 @@ pub(super) fn replacement_use_counts(
                 used_ids.insert(candidate.component.component_id().as_str().to_owned());
             }
             for role in before_control.roles.iter().copied().filter(|role| {
+                let mut probe = before_control.clone();
+                probe.roles = vec![*role];
                 !same_integrity.iter().any(|candidate| {
-                    candidate.roles.contains(role) && candidate.enabled != Some(false)
+                    let candidate_id = candidate.component.component_id().as_str();
+                    !conflicts.after_any.contains(candidate_id)
+                        && equivalent_replacement(&probe, candidate)
                 })
             }) {
                 let mut probe = before_control.clone();
@@ -181,8 +186,15 @@ pub(super) fn replacement_use_counts(
         let has_failure_mode_reduction = !conflicts.before_failure_mode.contains(component_id)
             && !conflicts.after_failure_mode.contains(component_id)
             && failure_mode_is_reduced(before_control, after_control);
+        let has_enablement_evidence_loss = !conflicts.before_enabled.contains(component_id)
+            && !conflicts.after_enabled.contains(component_id)
+            && matches!(
+                (before_control.enabled, after_control.enabled),
+                (Some(true), None)
+            );
         let roles = if (after_control.enabled == Some(false)
             && !conflicts.after_enabled.contains(component_id))
+            || has_enablement_evidence_loss
             || has_scope_reduction
             || has_failure_mode_reduction
         {
