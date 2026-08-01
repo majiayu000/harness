@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use super::process_env;
+
 pub fn dirs_data_dir() -> PathBuf {
     match data_local_dir() {
         Some(path) => path,
@@ -17,8 +19,8 @@ pub fn dirs_data_dir() -> PathBuf {
 }
 
 fn temp_fallback_dir() -> PathBuf {
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
+    let username = process_env::var("USER")
+        .or_else(|_| process_env::var("USERNAME"))
         .unwrap_or_else(|_| "default".to_string());
     // Keep the directory name filesystem-safe: allow alphanumeric, '-', '_' only.
     let safe: String = username
@@ -64,7 +66,7 @@ fn config_candidates() -> Vec<PathBuf> {
     // paths relative to the process CWD, turning any directory an operator
     // starts harness from into a config boundary and potentially loading
     // attacker-controlled or accidental local config files.
-    let abs_home: Option<PathBuf> = std::env::var("HOME")
+    let abs_home: Option<PathBuf> = process_env::var("HOME")
         .ok()
         .map(PathBuf::from)
         .filter(|p| p.is_absolute());
@@ -72,13 +74,14 @@ fn config_candidates() -> Vec<PathBuf> {
     // 1. $XDG_CONFIG_HOME/harness/config.toml
     //    Per the XDG Base Directory Specification, XDG_CONFIG_HOME MUST be an
     //    absolute path. Relative values are silently discarded.
-    if let Some(xdg) = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| abs_home.as_ref().map(|h| h.join(".config")))
-    {
-        candidates.push(xdg.join("harness").join("config.toml"));
+    if let Some(root) = xdg_config_harness_root(
+        process_env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .as_deref(),
+        abs_home.as_deref(),
+    ) {
+        candidates.push(root.join("config.toml"));
     }
 
     // 2. macOS: $HOME/Library/Application Support/harness/config.toml
@@ -94,7 +97,7 @@ fn config_candidates() -> Vec<PathBuf> {
     // 3. Windows: %APPDATA%\harness\config.toml
     //    APPDATA must be absolute for the same reason as XDG_CONFIG_HOME.
     #[cfg(target_os = "windows")]
-    if let Some(appdata) = std::env::var("APPDATA")
+    if let Some(appdata) = process_env::var("APPDATA")
         .ok()
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -105,27 +108,39 @@ fn config_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+pub fn xdg_config_harness_root(
+    xdg_config_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home.filter(|path| path.is_absolute()) {
+        Some(xdg.join("harness"))
+    } else {
+        home.filter(|path| path.is_absolute())
+            .map(|home| home.join(".config").join("harness"))
+    }
+}
+
 fn data_local_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        std::env::var("HOME")
+        process_env::var("HOME")
             .ok()
             .map(|h| PathBuf::from(h).join("Library/Application Support"))
     }
     #[cfg(target_os = "linux")]
     {
-        std::env::var("XDG_DATA_HOME")
+        process_env::var("XDG_DATA_HOME")
             .ok()
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var("HOME")
+                process_env::var("HOME")
                     .ok()
                     .map(|h| PathBuf::from(h).join(".local/share"))
             })
     }
     #[cfg(target_os = "windows")]
     {
-        std::env::var("LOCALAPPDATA").ok().map(PathBuf::from)
+        process_env::var("LOCALAPPDATA").ok().map(PathBuf::from)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -162,7 +177,7 @@ mod tests {
         // Save originals.
         let saved: Vec<(&str, Option<String>)> = vars
             .iter()
-            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .map(|(k, _)| (*k, process_env::var(k).ok()))
             .collect();
         for (k, v) in vars {
             // SAFETY: test-only, serialized by ENV_MUTEX.
