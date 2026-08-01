@@ -60,8 +60,12 @@ pub(super) fn compare_existing(
         !has_failure_mode_conflict && failure_mode_is_reduced(before, after);
     let has_enablement_evidence_loss =
         matches!((before.enabled, after.enabled), (Some(true), None));
+    let has_confidence_reduction = after.confidence.strength() < before.confidence.strength();
     let standalone_state_reduction_coverage = if after.enabled != Some(false)
-        && (has_enablement_evidence_loss || has_scope_reduction || has_failure_mode_reduction)
+        && (has_enablement_evidence_loss
+            || has_confidence_reduction
+            || has_scope_reduction
+            || has_failure_mode_reduction)
     {
         Some(classify_role_replacement(
             before,
@@ -80,7 +84,8 @@ pub(super) fn compare_existing(
         Some(RoleReplacementCoverage::Unique | RoleReplacementCoverage::Ambiguous)
     );
     if !disablement_has_complete_coverage
-        && after.confidence.strength() < before.confidence.strength()
+        && !standalone_state_reduction_has_complete_coverage
+        && has_confidence_reduction
     {
         push_existing_fact(
             AgentStackProtectionDiffKind::AmbiguousReviewEvidence,

@@ -554,6 +554,39 @@ fn confidence_reduction_counts_replacement_as_shared() {
                 .before()
                 .is_some_and(|before| before.source_locator() == ".github/workflows/removed.yml")
     }));
+    assert!(!facts
+        .iter()
+        .any(|fact| fact.reason() == Reason::ConfidenceReduced));
+}
+
+#[test]
+fn unique_replacement_suppresses_confidence_reduction() {
+    let before = configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let lower_confidence = configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::Medium,
+        ACTIVE_REQUIRED,
+    );
+    let replacement = configured_control(
+        Kind::Validation,
+        ".github/workflows/replacement.yml",
+        Some(HASH_B),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+
+    assert!(protective_control_diff(&[before], &[lower_confidence, replacement]).is_empty());
 }
 
 #[test]
