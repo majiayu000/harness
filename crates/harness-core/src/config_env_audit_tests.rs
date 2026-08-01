@@ -10,11 +10,6 @@ struct AllowedRawEnvRead {
 
 const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
     allowed(
-        "crates/harness-agents/src/builder.rs",
-        1,
-        "agent provider secret discovery",
-    ),
-    allowed(
         "crates/harness-agents/src/claude_tests.rs",
         1,
         "serialized env fixture",
@@ -33,11 +28,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "crates/harness-agents/src/codex_tests.rs",
         1,
         "serialized env fixture",
-    ),
-    allowed(
-        "crates/harness-agents/src/compress_model.rs",
-        1,
-        "provider API key discovery",
     ),
     allowed(
         "crates/harness-agents/src/run_id_tests.rs",
@@ -83,11 +73,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "crates/harness-observe/src/event_store/store_tests.rs",
         2,
         "serialized run-id env fixture",
-    ),
-    allowed(
-        "crates/harness-observe/src/otel_export.rs",
-        1,
-        "OpenTelemetry SDK env compatibility",
     ),
     allowed(
         "crates/harness-rules/src/engine/mod.rs",
@@ -208,11 +193,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "crates/harness-server/src/websocket.rs",
         1,
         "websocket client home fallback",
-    ),
-    allowed(
-        "crates/harness-server/src/workspace.rs",
-        1,
-        "git binary compatibility override",
     ),
     allowed(
         "crates/harness-server/src/workspace_test_support.rs",

@@ -50,7 +50,7 @@ pub(crate) use workspace_helpers::run_hook;
 use workspace_helpers::*;
 
 fn git_binary() -> String {
-    std::env::var("HARNESS_GIT_BIN").unwrap_or_else(|_| "git".to_string())
+    harness_core::config::process_env::var("HARNESS_GIT_BIN").unwrap_or_else(|_| "git".to_string())
 }
 
 pub(crate) fn git_command() -> tokio::process::Command {

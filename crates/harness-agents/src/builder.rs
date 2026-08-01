@@ -155,7 +155,7 @@ pub fn registry_from_config(
         )
         .map_err(|error| anyhow::anyhow!("failed to attach the codex adapter: {error}"))?;
 
-    if let Ok(api_key) = std::env::var(ANTHROPIC_API_KEY_ENV) {
+    if let Ok(api_key) = harness_core::config::process_env::var(ANTHROPIC_API_KEY_ENV) {
         registry.register(
             "anthropic-api",
             Arc::new(crate::anthropic_api::AnthropicApiAgent::from_config(
