@@ -68,6 +68,11 @@ Reversing either rejected input vector preserves its error category. These are
 typed rejection vectors and do not change the successful canonical length,
 literal hex, or digest below.
 
+For one `(component_id, evidence_kind)` bucket, `A, A`, `A, A, A` are
+`duplicate_component_evidence`. The three unique permutations `A, A, B`,
+`A, B, A`, and `B, A, A` are all `inconsistent_observation`; distinct canonical
+bytes take precedence over exact-duplicate multiplicity.
+
 Canonical length: 1,312 bytes.
 
 Canonical input hex:

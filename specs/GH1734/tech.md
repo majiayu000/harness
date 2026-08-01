@@ -190,10 +190,11 @@ Within one group:
 1. every component ID must be identical;
 2. kind, source scope, and source locator must match;
 3. if two observations both have integrity, their digests must match;
-4. at most one evidence item of each closed kind may exist;
-5. an identical second item is `duplicate_component_evidence`;
-6. a different second item of the same kind is
-   `inconsistent_observation`; and
+4. collect the complete canonical-byte multiset for each closed evidence kind;
+5. if one such multiset contains distinct values, return
+   `inconsistent_observation`;
+6. otherwise, if its count exceeds one, return
+   `duplicate_component_evidence`; and
 7. each evidence kind requires its derived coverage domain to be `observed`.
 
 Differing observation class, selection state, capabilities, trust, or freshness
@@ -218,9 +219,11 @@ Compatibility is:
 
 Validation order is normative and independent of caller order: validate each
 item's component, envelope, context shape, and limits first; group by component
-ID and classify same-kind duplicates or conflicts second; only after every group
-passes, validate the global runtime-context semantic-order collection. An exact
-duplicated context item therefore always returns
+ID and classify each complete same-kind multiset second; only after every group
+passes, validate the global runtime-context semantic-order collection. Within a
+same-kind multiset, distinct canonical bytes take precedence over exact
+duplicates: every permutation of `A, A, B` returns
+`inconsistent_observation`, while `A, A` and `A, A, A` return
 `duplicate_component_evidence`. Two otherwise distinct context items with the
 same semantic order return `inconsistent_observation`.
 
@@ -704,13 +707,20 @@ Before commit and push:
 ```text
 cargo fmt --all
 cargo fmt --all -- --check
+cargo test --workspace
 cargo test -p harness-core
 cargo test -p harness-server context_provenance
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-No database-backed test is required because this issue adds no persistence.
+GH-1734 adds no persistence-specific test, but this does not waive the full
+workspace test gate. Always run `cargo test --workspace`. Run
+PostgreSQL-dependent suites with an isolated `HARNESS_DATABASE_URL`; when none
+is available, run the DB-less pre-push path, record only the explicit
+PostgreSQL suites as deferred, and require current-head CI or a later isolated
+database run to pass them. DB-less success is not evidence that those suites
+passed.
 
 ## Alternatives Considered
 

@@ -119,6 +119,9 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
   - Exact context duplicates are classified before global order duplicates;
     distinct entries sharing one order remain inconsistent and reversing input
     order cannot change either error.
+  - Every unique permutation of a mixed same-kind `A, A, B` multiset is
+    `inconsistent_observation`; all-identical multisets remain
+    `duplicate_component_evidence`.
   - Every context-reason matrix row has a positive producer fixture and
     kind/scope/locator one-field negative fixtures.
   - The subject/component-kind matrix covers every reachable different-kind
@@ -137,13 +140,17 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
 - Done when:
   - Changes remain library-only with no CLI, API, persistence, or automatic
     producer invocation.
-  - Formatting, package tests, workspace check, and workspace clippy pass on
-    the exact implementation commit.
+  - Formatting, full workspace tests, package-focused tests, workspace check,
+    and workspace clippy pass on the exact implementation commit.
+  - PostgreSQL-dependent suites pass with an isolated database or are
+    explicitly deferred under the repository policy to current-head CI; a
+    DB-less pre-push success is not recorded as PostgreSQL-suite success.
   - The implementation PR references GH-1734 and records that ASC-006 still
     owns untrusted import and redaction.
 - Verify:
   - `cargo fmt --all`
   - `cargo fmt --all -- --check`
+  - `cargo test --workspace`
   - `cargo test -p harness-core`
   - `cargo test -p harness-agents runtime_fingerprint`
   - `cargo test -p harness-server context_provenance`

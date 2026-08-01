@@ -78,11 +78,13 @@ executable mode, or a verified fingerprint must.
    may share that identity and remain independently visible. Conflicting
    present integrity digests fail as `inconsistent_observation`; no source is
    silently preferred. Each component may have at most one evidence item of
-   each closed kind. After item-local validation, same-kind grouping is checked
-   before global semantic order: a second item of the same kind with identical
-   canonical bytes is `duplicate_component_evidence`; one with different bytes
-   is `inconsistent_observation`. Only if no group-level duplicate or conflict
-   exists are runtime-context semantic orders required to be globally unique
+   each closed kind. After item-local validation, each complete same-kind
+   bucket is classified before global semantic order. If the bucket contains
+   distinct canonical bytes, it is `inconsistent_observation`; otherwise a
+   count greater than one is `duplicate_component_evidence`. This bucket-wide
+   precedence is independent of input order, including every permutation of
+   `A, A, B`. Only if no group-level duplicate or conflict exists are
+   runtime-context semantic orders required to be globally unique
    and contiguous from zero through `N - 1`. Thus an exact duplicated context
    item has the duplicate error, while distinct context items sharing one order
    have the inconsistent-observation error. There is no last-write-wins or
