@@ -16,6 +16,19 @@ pub(super) fn compare_existing(
     let has_enabled_conflict = inputs
         .after_enabled_conflicting_component_ids
         .contains(component_id);
+    let before_component_id = before.component.component_id().as_str();
+    let has_scope_conflict = inputs
+        .before_scope_conflicting_component_ids
+        .contains(before_component_id)
+        || inputs
+            .after_scope_conflicting_component_ids
+            .contains(component_id);
+    let has_failure_mode_conflict = inputs
+        .before_failure_mode_conflicting_component_ids
+        .contains(before_component_id)
+        || inputs
+            .after_failure_mode_conflicting_component_ids
+            .contains(component_id);
     let disablement_coverage =
         if before.enabled != Some(false) && after.enabled == Some(false) && !has_enabled_conflict {
             Some(classify_role_replacement(
@@ -131,7 +144,7 @@ pub(super) fn compare_existing(
             facts,
         );
     }
-    if !disablement_has_complete_coverage {
+    if !disablement_has_complete_coverage && !has_scope_conflict {
         if before.scope.is_some() && after.scope.is_none() {
             push_existing_fact(
                 AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
@@ -154,6 +167,8 @@ pub(super) fn compare_existing(
                 facts,
             );
         }
+    }
+    if !disablement_has_complete_coverage && !has_failure_mode_conflict {
         match (before.failure_mode, after.failure_mode) {
             (
                 Some(AgentStackProtectionFailureMode::FailClosed),

@@ -174,6 +174,10 @@ struct ComparisonInputs<'before, 'after> {
     before_conflicting_component_ids: &'before BTreeSet<String>,
     after_conflicting_component_ids: &'after BTreeSet<String>,
     after_enabled_conflicting_component_ids: &'after BTreeSet<String>,
+    before_scope_conflicting_component_ids: &'before BTreeSet<String>,
+    after_scope_conflicting_component_ids: &'after BTreeSet<String>,
+    before_failure_mode_conflicting_component_ids: &'before BTreeSet<String>,
+    after_failure_mode_conflicting_component_ids: &'after BTreeSet<String>,
     replacement_use_counts: &'before BTreeMap<String, usize>,
 }
 #[rustfmt::skip]
@@ -224,6 +228,12 @@ pub fn protective_control_diff(
         before_conflicting_component_ids: &before_controls.conflicting_component_ids,
         after_conflicting_component_ids: &after_controls.conflicting_component_ids,
         after_enabled_conflicting_component_ids: &after_controls.enabled_conflicting_component_ids,
+        before_scope_conflicting_component_ids: &before_controls.scope_conflicting_component_ids,
+        after_scope_conflicting_component_ids: &after_controls.scope_conflicting_component_ids,
+        before_failure_mode_conflicting_component_ids: &before_controls
+            .failure_mode_conflicting_component_ids,
+        after_failure_mode_conflicting_component_ids: &after_controls
+            .failure_mode_conflicting_component_ids,
         replacement_use_counts: &replacement_use_counts,
     };
     let mut facts = Vec::new();
@@ -282,6 +292,13 @@ fn compare_removed(
         before_conflicting_component_ids,
         CandidateMode::SameIntegrity,
     );
+    let equivalent = replacement_candidates(
+        after,
+        before,
+        before_by_id,
+        before_conflicting_component_ids,
+        CandidateMode::Equivalent,
+    );
     if same_integrity.len() == 1 {
         let candidate = same_integrity.remove(0);
         let component_id = candidate.component.component_id().as_str();
@@ -337,6 +354,16 @@ fn compare_removed(
             rename_confidence(before, candidate),
             AgentStackProtectionControlReason::PossibleRename,
         ));
+        let has_safe_independent_equivalent = equivalent.iter().any(|replacement| {
+            let replacement_id = replacement.component.component_id().as_str();
+            replacement_id != component_id
+                && !before_conflicting_component_ids.contains(replacement_id)
+                && !after_conflicting_component_ids.contains(replacement_id)
+                && replacement_use_counts.get(replacement_id).copied() == Some(1)
+        });
+        if has_safe_independent_equivalent {
+            return;
+        }
         compare_existing(before, candidate, inputs, false, facts);
         return;
     }
@@ -370,13 +397,6 @@ fn compare_removed(
         }
         return;
     }
-    let equivalent = replacement_candidates(
-        after,
-        before,
-        before_by_id,
-        before_conflicting_component_ids,
-        CandidateMode::Equivalent,
-    );
     if equivalent.len() == 1 {
         let candidate = equivalent[0];
         let component_id = candidate.component.component_id().as_str();
@@ -492,11 +512,15 @@ struct AggregatedControls {
     controls: Vec<AgentStackProtectionControl>,
     conflicting_component_ids: BTreeSet<String>,
     enabled_conflicting_component_ids: BTreeSet<String>,
+    scope_conflicting_component_ids: BTreeSet<String>,
+    failure_mode_conflicting_component_ids: BTreeSet<String>,
 }
 fn aggregate_controls(controls: &[AgentStackProtectionControl]) -> AggregatedControls {
     let mut by_id = BTreeMap::<String, AgentStackProtectionControl>::new();
     let mut conflicting_component_ids = BTreeSet::new();
     let mut enabled_conflicting_component_ids = BTreeSet::new();
+    let mut scope_conflicting_component_ids = BTreeSet::new();
+    let mut failure_mode_conflicting_component_ids = BTreeSet::new();
     let mut integrity_conflicting_component_ids = BTreeSet::new();
     for control in controls {
         let component_id = control.component.component_id().as_str().to_owned();
@@ -506,6 +530,12 @@ fn aggregate_controls(controls: &[AgentStackProtectionControl]) -> AggregatedCon
             }
             if conflicting_values(existing.enabled, control.enabled) {
                 enabled_conflicting_component_ids.insert(component_id.clone());
+            }
+            if conflicting_values(existing.scope, control.scope) {
+                scope_conflicting_component_ids.insert(component_id.clone());
+            }
+            if conflicting_values(existing.failure_mode, control.failure_mode) {
+                failure_mode_conflicting_component_ids.insert(component_id.clone());
             }
             if conflicting_values(
                 existing.component.integrity(),
@@ -526,6 +556,8 @@ fn aggregate_controls(controls: &[AgentStackProtectionControl]) -> AggregatedCon
         controls: by_id.into_values().collect(),
         conflicting_component_ids,
         enabled_conflicting_component_ids,
+        scope_conflicting_component_ids,
+        failure_mode_conflicting_component_ids,
     }
 }
 fn duplicate_state_conflicts(
@@ -554,6 +586,10 @@ fn merge_control(
             .with_integrity(control.component.integrity().cloned());
     }
     existing.roles = merged_roles(existing.roles(), control.roles());
+    existing.component.capabilities = merged_capabilities(
+        existing.component.capabilities(),
+        control.component.capabilities(),
+    );
     existing.enabled = merged_after_enabled(existing.enabled, control.enabled);
     existing.scope = stronger_scope(existing.scope, control.scope);
     existing.failure_mode = stronger_failure_mode(existing.failure_mode, control.failure_mode);
@@ -610,6 +646,19 @@ fn merged_roles(
     }
     roles.sort_by_key(AgentStackProtectionRole::as_str);
     roles
+}
+fn merged_capabilities(
+    left: &[AgentStackCapability],
+    right: &[AgentStackCapability],
+) -> Vec<AgentStackCapability> {
+    let mut capabilities = left.to_vec();
+    for capability in right {
+        if !capabilities.contains(capability) {
+            capabilities.push(*capability);
+        }
+    }
+    capabilities.sort_by_key(AgentStackCapability::as_str);
+    capabilities
 }
 fn merged_after_enabled(left: Option<bool>, right: Option<bool>) -> Option<bool> {
     match (left, right) {

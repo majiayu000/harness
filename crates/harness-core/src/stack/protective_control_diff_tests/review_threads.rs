@@ -452,3 +452,180 @@ fn merges_known_integrity_independently_of_duplicate_order() {
     assert_eq!(missing_first, known_first);
     assert_eq!(reasons(&missing_first), [Reason::PossibleRename]);
 }
+
+#[test]
+fn before_scope_conflict_does_not_claim_definite_reduction() {
+    let before = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/ci.yml",
+            Some(HASH_A),
+            &[Role::Validation],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/ci.yml",
+            Some(HASH_A),
+            &[Role::Validation],
+            Confidence::High,
+            ControlState(Some(true), Some(Scope::Advisory), Some(Mode::FailClosed)),
+        ),
+    ];
+    let after = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ControlState(Some(true), Some(Scope::Partial), Some(Mode::FailClosed)),
+    )];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
+    assert_eq!(reasons(&facts), [Reason::ConflictingDuplicateReport]);
+}
+
+#[test]
+fn before_failure_mode_conflict_does_not_claim_definite_relaxation() {
+    let before = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/ci.yml",
+            Some(HASH_A),
+            &[Role::Validation],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/ci.yml",
+            Some(HASH_A),
+            &[Role::Validation],
+            Confidence::High,
+            ControlState(Some(true), Some(Scope::Required), Some(Mode::FailOpen)),
+        ),
+    ];
+    let after = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ControlState(Some(true), Some(Scope::Required), Some(Mode::FailOpen)),
+    )];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
+    assert_eq!(reasons(&facts), [Reason::ConflictingDuplicateReport]);
+}
+
+#[test]
+fn merges_duplicate_capabilities_independently_of_order() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let shell = configured_control_with_capabilities(
+        ".github/workflows/ci.yml",
+        &[AgentStackCapability::Shell],
+    );
+    let network = configured_control_with_capabilities(
+        ".github/workflows/ci.yml",
+        &[AgentStackCapability::Network],
+    );
+
+    let shell_first = protective_control_diff(&before, &[shell.clone(), network.clone()]);
+    let network_first = protective_control_diff(&before, &[network.clone(), shell.clone()]);
+
+    assert_eq!(shell_first, network_first);
+    let Some(after) = shell_first.first().and_then(Diff::after) else {
+        panic!("scope reduction after evidence");
+    };
+    assert_eq!(
+        after.capabilities(),
+        [AgentStackCapability::Network, AgentStackCapability::Shell]
+    );
+
+    let after = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ControlState(Some(true), Some(Scope::Advisory), Some(Mode::FailClosed)),
+    )];
+    let shell_first = protective_control_diff(&[shell.clone(), network.clone()], &after);
+    let network_first = protective_control_diff(&[network, shell], &after);
+    assert_eq!(shell_first, network_first);
+    let Some(before) = shell_first.first().and_then(Diff::before) else {
+        panic!("scope reduction before evidence");
+    };
+    assert_eq!(
+        before.capabilities(),
+        [AgentStackCapability::Network, AgentStackCapability::Shell]
+    );
+}
+
+#[test]
+fn stronger_equivalent_replacement_precedes_weaker_rename_candidate() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/weak-rename.yml",
+            Some(HASH_A),
+            &[Role::Validation],
+            Confidence::Low,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/replacement.yml",
+            Some(HASH_B),
+            &[Role::Validation],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+    ];
+
+    assert_eq!(
+        reasons(&protective_control_diff(&before, &after)),
+        [Reason::PossibleRename]
+    );
+}
+
+fn configured_control_with_capabilities(
+    locator: &str,
+    capabilities: &[AgentStackCapability],
+) -> AgentStackProtectionControl {
+    let component = match component(Kind::Validation, locator, Some(HASH_A))
+        .with_capabilities(capabilities.iter().copied())
+    {
+        Ok(component) => component,
+        Err(error) => panic!("valid capabilities: {error}"),
+    };
+    let control =
+        match AgentStackProtectionControl::new(component, [Role::Validation], Confidence::High) {
+            Ok(control) => control,
+            Err(error) => panic!("valid protection control: {error}"),
+        };
+    control
+        .with_enabled(true)
+        .with_scope(Scope::Partial)
+        .with_failure_mode(Mode::FailClosed)
+}
