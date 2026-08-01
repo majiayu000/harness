@@ -60,11 +60,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "operator identity and sudo process checks",
     ),
     allowed(
-        "crates/harness-cli/src/commands/status.rs",
-        1,
-        "CLI token fallback",
-    ),
-    allowed(
         "crates/harness-core/src/agents_md.rs",
         2,
         "operator home instruction discovery",
@@ -115,21 +110,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "Postgres integration test gate",
     ),
     allowed(
-        "crates/harness-server/src/github_auth.rs",
-        2,
-        "GitHub token compatibility",
-    ),
-    allowed(
-        "crates/harness-server/src/github_client.rs",
-        1,
-        "GitHub API endpoint test override",
-    ),
-    allowed(
-        "crates/harness-server/src/github_pr_snapshot.rs",
-        1,
-        "GitHub GraphQL endpoint test override",
-    ),
-    allowed(
         "crates/harness-server/src/handlers/runtime_hosts_workflow_review_tests.rs",
         1,
         "Postgres integration test gate",
@@ -138,11 +118,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "crates/harness-server/src/handlers/token_usage.rs",
         1,
         "operator home usage report discovery",
-    ),
-    allowed(
-        "crates/harness-server/src/handlers/usage_monitor.rs",
-        1,
-        "local usage price catalog override",
     ),
     allowed(
         "crates/harness-server/src/hook_enforcer.rs",
@@ -156,8 +131,8 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
     ),
     allowed(
         "crates/harness-server/src/http/init.rs",
-        5,
-        "operator home and Feishu credential fallback",
+        3,
+        "operator home path discovery",
     ),
     allowed(
         "crates/harness-server/src/http/test_fixtures.rs",
@@ -180,11 +155,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "test fixture home directory",
     ),
     allowed(
-        "crates/harness-server/src/intake/feishu.rs",
-        2,
-        "Feishu credential fallback",
-    ),
-    allowed(
         "crates/harness-server/src/observation_compression.rs",
         1,
         "provider availability check",
@@ -193,11 +163,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "crates/harness-server/src/parallel_dispatch_tests.rs",
         1,
         "test git binary override",
-    ),
-    allowed(
-        "crates/harness-server/src/postgres_catalog.rs",
-        2,
-        "Postgres catalog env config parser",
     ),
     allowed(
         "crates/harness-server/src/reconciliation_tests.rs",

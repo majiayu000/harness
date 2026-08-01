@@ -152,7 +152,8 @@ impl PriceCatalog {
     }
 
     fn from_env() -> Self {
-        let Ok(raw) = std::env::var("HARNESS_USAGE_PRICE_CATALOG_JSON") else {
+        let Ok(raw) = harness_core::config::process_env::var("HARNESS_USAGE_PRICE_CATALOG_JSON")
+        else {
             return Self::default();
         };
         let raw = raw.trim();
