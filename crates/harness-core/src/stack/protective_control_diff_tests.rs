@@ -7,6 +7,9 @@ use AgentStackProtectionDiffKind as DiffKind;
 use AgentStackProtectionFailureMode as Mode;
 use AgentStackProtectionRole as Role;
 use AgentStackProtectionScope as Scope;
+
+mod review_threads;
+
 const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ACTIVE_REQUIRED: ControlState =

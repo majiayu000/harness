@@ -1,0 +1,166 @@
+use super::replacements::{
+    analyze_role_replacements, classify_role_replacement, missing_roles, shared_replacement_roles,
+    RoleReplacementCoverage,
+};
+use super::*;
+
+pub(super) fn compare_existing(
+    before: &AgentStackProtectionControl,
+    after: &AgentStackProtectionControl,
+    inputs: &ComparisonInputs<'_, '_>,
+    has_conflicting_duplicate_state: bool,
+    facts: &mut Vec<AgentStackProtectionControlDiff>,
+) {
+    let confidence = min_confidence(before.confidence, after.confidence);
+    if after.confidence.strength() < before.confidence.strength() {
+        push_existing_fact(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            before,
+            after,
+            confidence,
+            AgentStackProtectionControlReason::ConfidenceReduced,
+            facts,
+        );
+    }
+    match (before.enabled, after.enabled) {
+        (Some(true), None) => push_existing_fact(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            before,
+            after,
+            confidence,
+            AgentStackProtectionControlReason::EnablementEvidenceLost,
+            facts,
+        ),
+        (left, Some(false)) if left != Some(false) => {
+            match classify_role_replacement(
+                before,
+                before.roles.clone(),
+                inputs.after_controls,
+                inputs.before_by_id,
+                inputs.before_conflicting_component_ids,
+                inputs.after_conflicting_component_ids,
+                inputs.replacement_use_counts,
+            ) {
+                RoleReplacementCoverage::Unique => {}
+                RoleReplacementCoverage::Ambiguous => push_existing_fact(
+                    AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+                    before.roles.clone(),
+                    before,
+                    after,
+                    confidence,
+                    AgentStackProtectionControlReason::AmbiguousReplacement,
+                    facts,
+                ),
+                RoleReplacementCoverage::Missing => push_existing_fact(
+                    AgentStackProtectionDiffKind::Disabled,
+                    before.roles.clone(),
+                    before,
+                    after,
+                    confidence,
+                    AgentStackProtectionControlReason::ExplicitlyDisabled,
+                    facts,
+                ),
+            }
+        }
+        _ => {}
+    }
+    let missing_roles = missing_roles(before.roles(), after.roles());
+    let shared_replacement_roles = shared_replacement_roles(
+        before,
+        missing_roles.clone(),
+        inputs.after_controls,
+        inputs.before_by_id,
+        inputs.before_conflicting_component_ids,
+        inputs.after_conflicting_component_ids,
+        inputs.replacement_use_counts,
+    );
+    let replacements = analyze_role_replacements(
+        before,
+        missing_roles,
+        inputs.after_controls,
+        inputs.before_by_id,
+        inputs.before_conflicting_component_ids,
+        inputs.after_conflicting_component_ids,
+    );
+    for (candidate, conflicting_roles) in replacements.conflicting_replacements {
+        push_conflicting_duplicate_fact_with_roles(
+            before,
+            Some(candidate),
+            conflicting_roles,
+            facts,
+        );
+    }
+    if !replacements.uncovered_roles.is_empty() {
+        push_existing_fact(
+            AgentStackProtectionDiffKind::ScopeReduced,
+            replacements.uncovered_roles,
+            before,
+            after,
+            confidence,
+            AgentStackProtectionControlReason::RoleSetReduced,
+            facts,
+        );
+    }
+    if !shared_replacement_roles.is_empty() {
+        push_existing_fact(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            shared_replacement_roles,
+            before,
+            after,
+            confidence,
+            AgentStackProtectionControlReason::AmbiguousReplacement,
+            facts,
+        );
+    }
+    if before.scope.is_some() && after.scope.is_none() {
+        push_existing_fact(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            before,
+            after,
+            confidence,
+            AgentStackProtectionControlReason::ScopeLevelReduced,
+            facts,
+        );
+    } else if matches!((before.scope, after.scope), (Some(left), Some(right)) if right.strength() < left.strength())
+    {
+        push_existing_fact(
+            AgentStackProtectionDiffKind::ScopeReduced,
+            before.roles.clone(),
+            before,
+            after,
+            confidence,
+            AgentStackProtectionControlReason::ScopeLevelReduced,
+            facts,
+        );
+    }
+    match (before.failure_mode, after.failure_mode) {
+        (
+            Some(AgentStackProtectionFailureMode::FailClosed),
+            Some(AgentStackProtectionFailureMode::FailOpen),
+        ) => push_existing_fact(
+            AgentStackProtectionDiffKind::FailOpen,
+            before.roles.clone(),
+            before,
+            after,
+            confidence,
+            AgentStackProtectionControlReason::FailureModeRelaxed,
+            facts,
+        ),
+        (Some(AgentStackProtectionFailureMode::FailClosed), None) => push_existing_fact(
+            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+            before.roles.clone(),
+            before,
+            after,
+            confidence,
+            AgentStackProtectionControlReason::FailureModeRelaxed,
+            facts,
+        ),
+        _ => {}
+    }
+    if has_conflicting_duplicate_state {
+        push_conflicting_duplicate_fact(before, Some(after), facts);
+    }
+}

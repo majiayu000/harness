@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+mod existing;
 mod replacements;
+use existing::compare_existing;
 use replacements::{
-    analyze_role_replacements, replacement_candidates, replacement_use_counts, CandidateMode,
+    analyze_role_replacements, by_component_id, replacement_candidates, replacement_use_counts,
+    CandidateMode,
 };
 macro_rules! closed_enum {
     ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
@@ -170,6 +173,7 @@ struct ComparisonInputs<'before, 'after> {
     before_by_id: &'before BTreeMap<String, &'before AgentStackProtectionControl>,
     before_conflicting_component_ids: &'before BTreeSet<String>,
     after_conflicting_component_ids: &'after BTreeSet<String>,
+    replacement_use_counts: &'before BTreeMap<String, usize>,
 }
 #[rustfmt::skip]
 impl AgentStackProtectionControlDiff {
@@ -217,6 +221,7 @@ pub fn protective_control_diff(
         before_by_id: &before_by_id,
         before_conflicting_component_ids: &before_controls.conflicting_component_ids,
         after_conflicting_component_ids: &after_controls.conflicting_component_ids,
+        replacement_use_counts: &replacement_use_counts,
     };
     let mut facts = Vec::new();
     for before_control in &before_controls.controls {
@@ -240,18 +245,22 @@ pub fn protective_control_diff(
                         .contains(component_id),
                 &mut facts,
             ),
-            None if has_before_conflict => {
-                push_conflicting_duplicate_fact(before_control, None, &mut facts);
+            None => {
+                if has_before_conflict {
+                    push_conflicting_duplicate_fact(before_control, None, &mut facts);
+                }
+                if before_control.enabled != Some(false) {
+                    compare_removed(
+                        before_control,
+                        &after_controls.controls,
+                        &before_by_id,
+                        &before_controls.conflicting_component_ids,
+                        &after_controls.conflicting_component_ids,
+                        &replacement_use_counts,
+                        &mut facts,
+                    );
+                }
             }
-            None => compare_removed(
-                before_control,
-                &after_controls.controls,
-                &before_by_id,
-                &before_controls.conflicting_component_ids,
-                &after_controls.conflicting_component_ids,
-                &replacement_use_counts,
-                &mut facts,
-            ),
         }
     }
     facts.sort_by(|left, right| {
@@ -260,123 +269,6 @@ pub fn protective_control_diff(
             .then_with(|| left.reason.as_str().cmp(right.reason.as_str()))
     });
     facts
-}
-fn compare_existing(
-    before: &AgentStackProtectionControl,
-    after: &AgentStackProtectionControl,
-    inputs: &ComparisonInputs<'_, '_>,
-    has_conflicting_duplicate_state: bool,
-    facts: &mut Vec<AgentStackProtectionControlDiff>,
-) {
-    let confidence = min_confidence(before.confidence, after.confidence);
-    if after.confidence.strength() < before.confidence.strength() {
-        push_existing_fact(
-            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::ConfidenceReduced,
-            facts,
-        );
-    }
-    match (before.enabled, after.enabled) {
-        (Some(true), None) => push_existing_fact(
-            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::EnablementEvidenceLost,
-            facts,
-        ),
-        (left, Some(false)) if left != Some(false) => push_existing_fact(
-            AgentStackProtectionDiffKind::Disabled,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::ExplicitlyDisabled,
-            facts,
-        ),
-        _ => {}
-    }
-    let replacements = analyze_role_replacements(
-        before,
-        missing_roles(before.roles(), after.roles()),
-        inputs.after_controls,
-        inputs.before_by_id,
-        inputs.before_conflicting_component_ids,
-        inputs.after_conflicting_component_ids,
-    );
-    for (candidate, conflicting_roles) in replacements.conflicting_replacements {
-        push_conflicting_duplicate_fact_with_roles(
-            before,
-            Some(candidate),
-            conflicting_roles,
-            facts,
-        );
-    }
-    if !replacements.uncovered_roles.is_empty() {
-        push_existing_fact(
-            AgentStackProtectionDiffKind::ScopeReduced,
-            replacements.uncovered_roles,
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::RoleSetReduced,
-            facts,
-        );
-    }
-    if before.scope.is_some() && after.scope.is_none() {
-        push_existing_fact(
-            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::ScopeLevelReduced,
-            facts,
-        );
-    } else if matches!((before.scope, after.scope), (Some(left), Some(right)) if right.strength() < left.strength())
-    {
-        push_existing_fact(
-            AgentStackProtectionDiffKind::ScopeReduced,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::ScopeLevelReduced,
-            facts,
-        );
-    }
-    match (before.failure_mode, after.failure_mode) {
-        (
-            Some(AgentStackProtectionFailureMode::FailClosed),
-            Some(AgentStackProtectionFailureMode::FailOpen),
-        ) => push_existing_fact(
-            AgentStackProtectionDiffKind::FailOpen,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::FailureModeRelaxed,
-            facts,
-        ),
-        (Some(AgentStackProtectionFailureMode::FailClosed), None) => push_existing_fact(
-            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::FailureModeRelaxed,
-            facts,
-        ),
-        _ => {}
-    }
-    if has_conflicting_duplicate_state {
-        push_conflicting_duplicate_fact(before, Some(after), facts);
-    }
 }
 fn compare_removed(
     before: &AgentStackProtectionControl,
@@ -457,6 +349,7 @@ fn compare_removed(
                 before_by_id,
                 before_conflicting_component_ids,
                 after_conflicting_component_ids,
+                replacement_use_counts,
             },
             false,
             facts,
@@ -472,6 +365,25 @@ fn compare_removed(
             min_confidence(before.confidence, AgentStackProtectionConfidence::Medium),
             AgentStackProtectionControlReason::PossibleRename,
         ));
+        let uncovered_roles = analyze_role_replacements(
+            before,
+            before.roles.clone(),
+            after,
+            before_by_id,
+            before_conflicting_component_ids,
+            after_conflicting_component_ids,
+        )
+        .uncovered_roles;
+        if !uncovered_roles.is_empty() {
+            facts.push(AgentStackProtectionControlDiff::new(
+                AgentStackProtectionDiffKind::Removed,
+                uncovered_roles,
+                Some(before),
+                None,
+                before.confidence,
+                AgentStackProtectionControlReason::RemovedWithoutEquivalent,
+            ));
+        }
         return;
     }
     let equivalent = replacement_candidates(
@@ -591,19 +503,6 @@ fn compare_removed(
 #[rustfmt::skip]
 fn push_existing_fact(kind: AgentStackProtectionDiffKind, roles: Vec<AgentStackProtectionRole>, before: &AgentStackProtectionControl, after: &AgentStackProtectionControl, confidence: AgentStackProtectionConfidence, reason: AgentStackProtectionControlReason, facts: &mut Vec<AgentStackProtectionControlDiff>) {
     facts.push(AgentStackProtectionControlDiff::new(kind, roles, Some(before), Some(after), confidence, reason));
-}
-fn by_component_id(
-    controls: &[AgentStackProtectionControl],
-) -> BTreeMap<String, &AgentStackProtectionControl> {
-    controls
-        .iter()
-        .map(|control| {
-            (
-                control.component.component_id().as_str().to_owned(),
-                control,
-            )
-        })
-        .collect()
 }
 struct AggregatedControls {
     controls: Vec<AgentStackProtectionControl>,
@@ -736,16 +635,6 @@ fn stronger_failure_mode(
     } else {
         left.or(right)
     }
-}
-fn missing_roles(
-    before: &[AgentStackProtectionRole],
-    after: &[AgentStackProtectionRole],
-) -> Vec<AgentStackProtectionRole> {
-    before
-        .iter()
-        .copied()
-        .filter(|role| !after.contains(role))
-        .collect()
 }
 fn min_confidence(
     left: AgentStackProtectionConfidence,
