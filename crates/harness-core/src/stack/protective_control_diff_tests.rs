@@ -388,3 +388,286 @@ fn protective_control_diff_handles_review_edge_cases() {
     ];
     assert!(protective_control_diff(&before, &after).is_empty());
 }
+
+#[test]
+fn protective_control_diff_reviews_loss_of_explicit_enabled_evidence() {
+    let before = [configured_hook(
+        ".githooks/pre-commit",
+        Some(HASH_A),
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [configured_hook(
+        ".githooks/pre-commit",
+        Some(HASH_A),
+        Confidence::High,
+        ControlState(None, Some(Scope::Required), Some(Mode::FailClosed)),
+    )];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
+    assert_eq!(reasons(&facts), [Reason::EnablementEvidenceLost]);
+    assert!(facts[0].before().is_some() && facts[0].after().is_some());
+}
+
+#[test]
+fn protective_control_diff_reviews_loss_of_fail_closed_evidence() {
+    let before = [configured_hook(
+        ".githooks/pre-push",
+        Some(HASH_A),
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [configured_hook(
+        ".githooks/pre-push",
+        Some(HASH_A),
+        Confidence::High,
+        ControlState(Some(true), Some(Scope::Required), None),
+    )];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
+    assert_eq!(reasons(&facts), [Reason::FailureModeRelaxed]);
+    assert!(facts[0].before().is_some() && facts[0].after().is_some());
+}
+
+#[test]
+fn protective_control_diff_preserves_conflicts_in_partial_role_replacements() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/ci.yml",
+            Some(HASH_A),
+            &[Role::Validation],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/checks.yml",
+            Some(HASH_B),
+            &[Role::Check],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/checks.yml",
+            Some(HASH_B),
+            &[Role::Check],
+            Confidence::High,
+            ControlState(Some(true), Some(Scope::Partial), Some(Mode::FailOpen)),
+        ),
+    ];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
+    assert_eq!(reasons(&facts), [Reason::ConflictingDuplicateReport]);
+    assert_eq!(facts[0].roles(), [Role::Check]);
+    assert_eq!(
+        facts[0].after().map(|evidence| evidence.source_locator()),
+        Some(".github/workflows/checks.yml")
+    );
+}
+
+#[test]
+fn protective_control_diff_reviews_collective_multi_role_replacement() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/validation.yml",
+            Some(HASH_B),
+            &[Role::Validation],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/checks.yml",
+            Some(HASH_B),
+            &[Role::Check],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+    ];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
+    assert_eq!(reasons(&facts), [Reason::AmbiguousReplacement]);
+    assert_eq!(facts[0].roles(), [Role::Check, Role::Validation]);
+    assert!(facts[0].after().is_none());
+}
+
+#[test]
+fn protective_control_diff_keeps_conflict_and_uncovered_removal_facts() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/checks.yml",
+            Some(HASH_B),
+            &[Role::Check],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/checks.yml",
+            Some(HASH_B),
+            &[Role::Check],
+            Confidence::High,
+            ControlState(Some(true), Some(Scope::Partial), Some(Mode::FailOpen)),
+        ),
+    ];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(
+        kinds(&facts),
+        [DiffKind::AmbiguousReviewEvidence, DiffKind::Removed]
+    );
+    assert_eq!(facts[0].reason(), Reason::ConflictingDuplicateReport);
+    assert_eq!(facts[0].roles(), [Role::Check]);
+    assert_eq!(facts[1].reason(), Reason::RemovedWithoutEquivalent);
+    assert_eq!(facts[1].roles(), [Role::Validation]);
+}
+
+#[test]
+fn protective_control_diff_binds_conflicting_roles_to_each_candidate() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/checks.yml",
+            Some(HASH_B),
+            &[Role::Check],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/checks.yml",
+            Some(HASH_B),
+            &[Role::Check],
+            Confidence::High,
+            ControlState(Some(true), Some(Scope::Partial), Some(Mode::FailOpen)),
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/validation.yml",
+            Some(HASH_B),
+            &[Role::Validation],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/validation.yml",
+            Some(HASH_B),
+            &[Role::Validation],
+            Confidence::High,
+            ControlState(Some(true), Some(Scope::Partial), Some(Mode::FailOpen)),
+        ),
+    ];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(facts.len(), 2);
+    assert!(facts
+        .iter()
+        .all(|fact| fact.reason() == Reason::ConflictingDuplicateReport));
+    let Some(check_fact) = facts.iter().find(|fact| {
+        fact.after()
+            .is_some_and(|after| after.source_locator() == ".github/workflows/checks.yml")
+    }) else {
+        panic!("checks conflict fact");
+    };
+    assert_eq!(check_fact.roles(), [Role::Check]);
+    let Some(validation_fact) = facts.iter().find(|fact| {
+        fact.after()
+            .is_some_and(|after| after.source_locator() == ".github/workflows/validation.yml")
+    }) else {
+        panic!("validation conflict fact");
+    };
+    assert_eq!(validation_fact.roles(), [Role::Validation]);
+}
+
+#[test]
+fn protective_control_diff_keeps_same_integrity_conflict_and_uncovered_removal() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation, Role::Check],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/renamed-checks.yml",
+            Some(HASH_A),
+            &[Role::Check],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/renamed-checks.yml",
+            Some(HASH_A),
+            &[Role::Check],
+            Confidence::High,
+            ControlState(Some(true), Some(Scope::Partial), Some(Mode::FailOpen)),
+        ),
+    ];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(
+        kinds(&facts),
+        [DiffKind::AmbiguousReviewEvidence, DiffKind::Removed]
+    );
+    assert_eq!(facts[0].reason(), Reason::ConflictingDuplicateReport);
+    assert_eq!(facts[0].roles(), [Role::Check]);
+    assert_eq!(
+        facts[0].after().map(|evidence| evidence.source_locator()),
+        Some(".github/workflows/renamed-checks.yml")
+    );
+    assert_eq!(facts[1].reason(), Reason::RemovedWithoutEquivalent);
+    assert_eq!(facts[1].roles(), [Role::Validation]);
+    assert!(facts[1].after().is_none());
+}
