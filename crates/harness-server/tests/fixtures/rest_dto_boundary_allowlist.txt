@@ -17,6 +17,8 @@ src/handlers/runtime_hosts/lease.rs::ClaimRuntimeJobRequest
 src/handlers/runtime_hosts/lease.rs::RenewRuntimeJobLeaseRequest
 src/handlers/runtime_project_cache.rs::SyncProjectItem
 src/handlers/runtime_project_cache.rs::SyncWatchedProjectsRequest
+src/handlers/token_usage.rs::HourModelBucket
+src/handlers/token_usage.rs::UsageBucket
 src/handlers/usage_monitor.rs::ActiveCount
 src/handlers/usage_monitor.rs::AgentInvocation
 src/handlers/usage_monitor.rs::CostConfig
@@ -46,6 +48,7 @@ src/http/runtime_submission_routes.rs::ApprovalResponse
 src/http/runtime_submission_routes.rs::RuntimeSubmissionArtifact
 src/http/runtime_submission_routes.rs::RuntimeSubmissionPrompt
 src/http/signal_routes.rs::IngestSignalRequest
+src/http/state.rs::GitHubTokenDispatchCounterSnapshot
 src/http/task_mutation_routes.rs::RuntimeTranscriptReconstructionRequest
 src/http/task_mutation_routes.rs::WorkflowRuntimeCancelRequest
 src/http/task_mutation_routes.rs::WorkflowRuntimeMergeRequest

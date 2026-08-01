@@ -132,7 +132,9 @@ impl TypeIndex {
             .first()
             .is_some_and(|segment| segment == "crate")
         {
-            return self.resolve_crate_path(&type_ref.path);
+            return self
+                .resolve_crate_path(&type_ref.path)
+                .or_else(|| self.unique_name_key(&type_ref.name));
         }
         if let Some(relative_key) = self.resolve_relative_path(current_path, &type_ref.path) {
             return Some(relative_key);
@@ -310,7 +312,8 @@ impl Visit<'_> for RestUseSiteVisitor<'_> {
                     self.add_refs(refs);
                 }
             }
-            let refs = infer_expr_type_refs(&init.expr, &self.local_types, self.type_index);
+            let mut refs = infer_expr_type_refs(&init.expr, &self.local_types, self.type_index);
+            refs.extend(self.json_macro_initializer_refs(&init.expr));
             if !refs.is_empty() {
                 for ident in pat_binding_idents(&local.pat) {
                     self.local_types.insert(ident, refs.clone());
@@ -382,6 +385,23 @@ impl RestUseSiteVisitor<'_> {
     }
 
     fn collect_macro_local_refs(&mut self, tokens: &str) {
+        let matched_refs = self.macro_token_refs(tokens);
+        self.add_refs(&matched_refs);
+    }
+
+    fn json_macro_initializer_refs(&self, expr: &syn::Expr) -> Vec<TypeRef> {
+        match expr {
+            syn::Expr::Macro(expr) if is_json_macro_path(&expr.mac.path) => {
+                self.macro_token_refs(&expr.mac.tokens.to_string())
+            }
+            syn::Expr::Group(expr) => self.json_macro_initializer_refs(&expr.expr),
+            syn::Expr::Paren(expr) => self.json_macro_initializer_refs(&expr.expr),
+            syn::Expr::Reference(expr) => self.json_macro_initializer_refs(&expr.expr),
+            _ => Vec::new(),
+        }
+    }
+
+    fn macro_token_refs(&self, tokens: &str) -> Vec<TypeRef> {
         let mut matched_refs = Vec::new();
         for token in tokens.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
             if let Some(refs) = self.local_types.get(token) {
@@ -393,7 +413,7 @@ impl RestUseSiteVisitor<'_> {
                 });
             }
         }
-        self.add_refs(&matched_refs);
+        matched_refs
     }
 }
 
