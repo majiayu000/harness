@@ -343,13 +343,8 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
-        store
-            .upsert_instance(&runtime_workflow(
-                "implementing",
-                &project_root,
-                "runtime-dashboard-active",
-            ))
-            .await?;
+        let workflow = runtime_workflow("implementing", &project_root, "runtime-dashboard-active");
+        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
 
         let body = dashboard_body(state).await?;
 
@@ -375,13 +370,8 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
-        store
-            .upsert_instance(&runtime_workflow(
-                "done",
-                &project_root,
-                "runtime-dashboard-terminal",
-            ))
-            .await?;
+        let workflow = runtime_workflow("done", &project_root, "runtime-dashboard-terminal");
+        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
 
         let body = dashboard_body(state).await?;
 
@@ -409,17 +399,13 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
-        store
-            .upsert_instance(
-                &runtime_workflow("failed", &project_root, "dashboard-stalled-task").with_data(
-                    serde_json::json!({
-                        "project_id": project_root,
-                        "task_id": "dashboard-stalled-task",
-                        "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
-                    }),
-                ),
-            )
-            .await?;
+        let workflow = runtime_workflow("failed", &project_root, "dashboard-stalled-task")
+            .with_data(serde_json::json!({
+                "project_id": project_root,
+                "task_id": "dashboard-stalled-task",
+                "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
+            }));
+        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
 
         let body = dashboard_body(state).await?;
 
@@ -453,13 +439,8 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
-        store
-            .upsert_instance(&runtime_workflow(
-                "implementing",
-                &project_root,
-                task_id.as_str(),
-            ))
-            .await?;
+        let workflow = runtime_workflow("implementing", &project_root, task_id.as_str());
+        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
 
         let body = dashboard_body(state).await?;
 

@@ -27,7 +27,7 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::start_child_workflow(
         "github_issue_pr",
         "issue:126",
@@ -106,6 +106,101 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
 }
 
 #[tokio::test]
+async fn runtime_job_worker_attaches_existing_issue_child_without_guarded_upsert_error(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-existing-issue-child");
+    std::fs::create_dir_all(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
+    )
+    .with_id("prompt-task-existing-issue-child")
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+    }));
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
+    let child_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 127);
+    let existing_child = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "discovered",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:127"),
+    )
+    .with_id(child_id.clone())
+    .with_data(serde_json::json!({
+        "project_id": project_id.clone(),
+        "repo": "owner/repo",
+        "issue_number": 127,
+    }));
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &existing_child).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::start_child_workflow(
+        "github_issue_pr",
+        "issue:127",
+        "prompt-task:owner/repo:issue:127:start",
+    );
+    let command_id = store.enqueue_command(&parent.id, None, &command).await?;
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": parent.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key.clone(),
+                "activity": command.runtime_activity_key(),
+                "command": command.command.clone(),
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 1);
+    assert_eq!(tick.failed, 0);
+    let child = store
+        .get_instance(&child_id)
+        .await?
+        .expect("existing child workflow should remain persisted");
+    assert_eq!(
+        child.parent_workflow_id.as_deref(),
+        Some("prompt-task-existing-issue-child")
+    );
+    assert_eq!(child.data["started_by_runtime_job_id"], runtime_job.id);
+    let child_events = store.events_for(&child_id).await?;
+    assert_eq!(
+        child_events
+            .iter()
+            .filter(|event| event.event_type == "ChildWorkflowStarted")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_worker_starts_prompt_child_workflow_for_open_pr_feedback() -> anyhow::Result<()>
 {
     if !crate::test_helpers::db_tests_enabled().await {
@@ -133,7 +228,7 @@ async fn runtime_job_worker_starts_prompt_child_workflow_for_open_pr_feedback() 
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:pr:1120:feedback",
@@ -239,9 +334,10 @@ async fn runtime_job_worker_starts_pr_feedback_child_workflow_without_agent_turn
         "issue_number": 226,
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
+        "expected_base_ref": "release",
         "task_id": "runtime-task-226",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "pr-feedback-sweep:issue-226:77",
@@ -253,6 +349,7 @@ async fn runtime_job_worker_starts_pr_feedback_child_workflow_without_agent_turn
             "issue_number": 226,
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
+            "expected_base_ref": "release",
         }),
     );
     let command_id = store.enqueue_command(&parent.id, None, &command).await?;
@@ -301,12 +398,17 @@ async fn runtime_job_worker_starts_pr_feedback_child_workflow_without_agent_turn
         Some("issue-pr-feedback-parent")
     );
     assert_eq!(child.data["pr_number"], 77);
+    assert_eq!(child.data["expected_base_ref"], "release");
     assert_eq!(child.data["started_by_runtime_job_id"], runtime_job.id);
     let child_commands = store.commands_for(&child.id).await?;
     assert_eq!(child_commands.len(), 1);
     assert_eq!(
         child_commands[0].command.activity_name(),
         Some(harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY)
+    );
+    assert_eq!(
+        child_commands[0].command.command["expected_base_ref"],
+        "release"
     );
     Ok(())
 }
@@ -343,7 +445,7 @@ async fn runtime_job_worker_starts_quality_gate_child_workflow_without_agent_tur
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-227",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "quality-gate:issue-227:77",

@@ -596,25 +596,25 @@ mod tests {
             max_turns: Some(8),
             ..Default::default()
         });
-        workflow_runtime_store
-            .upsert_instance(
-                &harness_workflow::runtime::WorkflowInstance::new(
-                    harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-                    1,
-                    "awaiting_feedback",
-                    harness_workflow::runtime::WorkflowSubject::new("issue", "issue:882"),
-                )
-                .with_id(workflow_id.clone())
-                .with_data(json!({
-                    "project_id": project_id,
-                    "repo": "owner/repo",
-                    "issue_number": 882,
-                    "submission_id": "route-submission-1",
-                    "task_id": "route-task-1",
-                    "task_ids": ["route-task-1"]
-                })),
+        crate::test_helpers::force_upsert_runtime_instance_for_test(
+            &workflow_runtime_store,
+            &harness_workflow::runtime::WorkflowInstance::new(
+                harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+                1,
+                "awaiting_feedback",
+                harness_workflow::runtime::WorkflowSubject::new("issue", "issue:882"),
             )
-            .await?;
+            .with_id(workflow_id.clone())
+            .with_data(json!({
+                "project_id": project_id,
+                "repo": "owner/repo",
+                "issue_number": 882,
+                "submission_id": "route-submission-1",
+                "task_id": "route-task-1",
+                "task_ids": ["route-task-1"]
+            })),
+        )
+        .await?;
         state.core.tasks.insert(&task).await;
         state.concurrency.workspace_mgr = Some(manager);
 
@@ -702,22 +702,22 @@ mod tests {
                 _pool_permit: None,
             },
         );
-        workflow_runtime_store
-            .upsert_instance(
-                &harness_workflow::runtime::WorkflowInstance::new(
-                    harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-                    1,
-                    "awaiting_feedback",
-                    harness_workflow::runtime::WorkflowSubject::new("issue", "issue:884"),
-                )
-                .with_id("workflow-1".to_string())
-                .with_data(json!({
-                    "submission_id": "runtime-submission-1",
-                    "task_id": "runtime-workspace-1",
-                    "task_ids": ["runtime-workspace-1"]
-                })),
+        crate::test_helpers::force_upsert_runtime_instance_for_test(
+            &workflow_runtime_store,
+            &harness_workflow::runtime::WorkflowInstance::new(
+                harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+                1,
+                "awaiting_feedback",
+                harness_workflow::runtime::WorkflowSubject::new("issue", "issue:884"),
             )
-            .await?;
+            .with_id("workflow-1".to_string())
+            .with_data(json!({
+                "submission_id": "runtime-submission-1",
+                "task_id": "runtime-workspace-1",
+                "task_ids": ["runtime-workspace-1"]
+            })),
+        )
+        .await?;
         manager.active_paths.insert(workspace_path, task_id);
         state.concurrency.workspace_mgr = Some(manager);
 

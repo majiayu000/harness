@@ -11,7 +11,7 @@ async fn durable_store_persists_workflow_runtime_bus_contract() -> anyhow::Resul
     store.upsert_definition(&definition).await?;
 
     let instance = issue_instance("implementing");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let loaded = store
         .get_instance(&instance.id)
         .await?
@@ -217,7 +217,7 @@ async fn durable_store_apply_decision_transition_does_not_rewind_existing_instan
         "pr_number": 78,
         "last_decision": "record_feedback",
     });
-    store.upsert_instance(&existing).await?;
+    store.force_upsert_instance_for_test(&existing).await?;
     let decision = WorkflowDecision::new(
         &initial.id,
         "implementing",
@@ -286,9 +286,9 @@ async fn durable_store_lists_workflow_runtime_tree_inputs() -> anyhow::Result<()
     let child =
         project_issue_instance("/project-a", 123, "replanning").with_parent(parent.id.clone());
     let other_project = project_issue_instance("/project-b", 456, "implementing");
-    store.upsert_instance(&parent).await?;
-    store.upsert_instance(&child).await?;
-    store.upsert_instance(&other_project).await?;
+    store.force_upsert_instance_for_test(&parent).await?;
+    store.force_upsert_instance_for_test(&child).await?;
+    store.force_upsert_instance_for_test(&other_project).await?;
     let event = store
         .append_event(
             &child.id,
@@ -371,11 +371,11 @@ async fn durable_store_lists_nonterminal_instances_by_definition() -> anyhow::Re
         "repo": "owner/repo",
     }));
     let other_project = project_issue_instance("/project-b", 126, "implementing");
-    store.upsert_instance(&active).await?;
-    store.upsert_instance(&queued).await?;
-    store.upsert_instance(&terminal).await?;
-    store.upsert_instance(&other_definition).await?;
-    store.upsert_instance(&other_project).await?;
+    store.force_upsert_instance_for_test(&active).await?;
+    store.force_upsert_instance_for_test(&queued).await?;
+    store.force_upsert_instance_for_test(&terminal).await?;
+    store.force_upsert_instance_for_test(&other_definition).await?;
+    store.force_upsert_instance_for_test(&other_project).await?;
 
     let listed = store
         .list_nonterminal_instances_by_definition(
@@ -406,7 +406,7 @@ async fn driverless_completion_is_rejected_atomically() -> anyhow::Result<()> {
     let instance = issue_instance("replanning")
         .with_id("issue-driverless-completion")
         .with_data(json!({ "marker": "must-remain" }));
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
 
     let stale_command = WorkflowCommand::enqueue_activity(
         "implement_issue",
@@ -515,7 +515,7 @@ async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> an
     let instance = issue_instance("replanning")
         .with_id("issue-driverless-production-completion")
         .with_data(json!({ "marker": "must-remain" }));
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
 
     let state_entry = WorkflowDecision::new(
         &instance.id,
@@ -669,7 +669,7 @@ async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyh
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("implementing").with_id("issue-closed-domain-winner");
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_instance_for_test(&instance).await?;
     let driverless = WorkflowDecision::new(
         &instance.id,
         "implementing",

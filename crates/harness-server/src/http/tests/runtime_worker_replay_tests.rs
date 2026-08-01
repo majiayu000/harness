@@ -28,7 +28,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:129:start",
@@ -81,7 +81,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         "started_by_runtime_job_id": runtime_job.id.clone(),
         "started_by_command_id": command_id.clone(),
     }));
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
     store
         .append_event(
             &child_id,
@@ -126,7 +126,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         data.remove("task_id");
         data.remove("task_ids");
     }
-    store.upsert_instance(&submitted_child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &submitted_child).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,
@@ -201,7 +201,7 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:130:start",
@@ -254,7 +254,7 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
         "started_by_runtime_job_id": runtime_job.id.clone(),
         "started_by_command_id": command_id.clone(),
     }));
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
     store
         .append_event(
             &child_id,
@@ -368,7 +368,7 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let first_command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:131:start:first",
@@ -433,13 +433,14 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
         )
         .await?;
     child.state = "failed".to_string();
-    store.upsert_instance(&child).await?;
+    child.version += 1;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
     let mut parent = store
         .get_instance("prompt-task-auto-submit-reopen")
         .await?
         .expect("parent workflow should still exist");
     parent.state = "implementing".to_string();
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
     let second_command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:131:start:second",

@@ -1,8 +1,9 @@
 use super::{
-    insert_instance_if_absent_tx,
+    commit_parent_attachment_instance_tx, commit_same_state_instance_tx,
+    insert_validated_canonical_initial_instance_tx,
     instance_helpers::{otel_trace_context_from_data, terminal_state_pairs},
-    select_instance_for_update_tx, to_jsonb_string, upsert_instance_tx, workflow_instance_from_row,
-    RuntimeHistoryPruneSummary, WorkflowInstancePage, WorkflowRuntimeStore,
+    select_instance_for_update_tx, workflow_instance_from_row, RuntimeHistoryPruneSummary,
+    WorkflowInstancePage, WorkflowRuntimeStore,
 };
 use crate::runtime::model::WorkflowInstance;
 use crate::runtime::WorkflowOtelTraceContext;
@@ -14,38 +15,75 @@ impl WorkflowRuntimeStore {
         instance: &WorkflowInstance,
     ) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let inserted = insert_instance_if_absent_tx(&mut tx, instance).await?;
+        let inserted = insert_validated_canonical_initial_instance_tx(&mut tx, instance).await?;
         tx.commit().await?;
         Ok(inserted)
     }
 
     pub async fn upsert_instance(&self, instance: &WorkflowInstance) -> anyhow::Result<()> {
-        let data = to_jsonb_string(instance)?;
-        sqlx::query(
-            "INSERT INTO workflow_instances
-                (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
-             ON CONFLICT (id) DO UPDATE SET
-                definition_id = EXCLUDED.definition_id,
-                state = EXCLUDED.state,
-                subject_type = EXCLUDED.subject_type,
-                subject_key = EXCLUDED.subject_key,
-                parent_workflow_id = EXCLUDED.parent_workflow_id,
-                data = EXCLUDED.data,
-                version = EXCLUDED.version,
-                updated_at = CURRENT_TIMESTAMP",
+        let mut tx = self.pool.begin().await?;
+        let current = match select_instance_for_update_tx(&mut tx, &instance.id).await? {
+            Some(current) => current,
+            None if insert_validated_canonical_initial_instance_tx(&mut tx, instance).await? => {
+                tx.commit().await?;
+                return Ok(());
+            }
+            None => select_instance_for_update_tx(&mut tx, &instance.id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workflow instance `{}` disappeared during guarded public upsert",
+                        instance.id
+                    )
+                })?,
+        };
+        if current == *instance {
+            tx.commit().await?;
+            return Ok(());
+        }
+        ensure_public_upsert_preserves_instance_boundary(&current, instance)?;
+        if instance.version == current.version {
+            anyhow::bail!(
+                "public workflow instance upsert cannot overwrite data at the same version {}; use a state-specific compare-and-swap API",
+                current.version
+            );
+        }
+        anyhow::bail!(
+            "public workflow instance upsert is insert-only and cannot change version from {} to {}; use a validated decision or state-specific write API",
+            current.version,
+            instance.version
         )
-        .bind(&instance.id)
-        .bind(&instance.definition_id)
-        .bind(&instance.state)
-        .bind(&instance.subject.subject_type)
-        .bind(&instance.subject.subject_key)
-        .bind(&instance.parent_workflow_id)
-        .bind(&data)
-        .bind(instance.version as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    }
+
+    pub async fn attach_parent_workflow_if_missing(
+        &self,
+        workflow_id: &str,
+        parent_workflow_id: &str,
+    ) -> anyhow::Result<Option<WorkflowInstance>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(current) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let mut instance = current.clone();
+        match instance.parent_workflow_id.as_deref() {
+            Some(existing) if existing == parent_workflow_id => {
+                tx.commit().await?;
+                Ok(Some(instance))
+            }
+            Some(existing) => {
+                anyhow::bail!(
+                    "workflow instance `{workflow_id}` is already attached to parent `{existing}`"
+                );
+            }
+            None => {
+                instance.parent_workflow_id = Some(parent_workflow_id.to_string());
+                instance.version = instance.version.saturating_add(1);
+                commit_parent_attachment_instance_tx(&mut tx, &current, &instance).await?;
+                tx.commit().await?;
+                Ok(Some(instance))
+            }
+        }
     }
 
     pub async fn ensure_otel_trace_context(
@@ -53,10 +91,11 @@ impl WorkflowRuntimeStore {
         workflow_id: &str,
     ) -> anyhow::Result<Option<WorkflowOtelTraceContext>> {
         let mut tx = self.pool.begin().await?;
-        let Some(mut instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+        let Some(current) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
             tx.commit().await?;
             return Ok(None);
         };
+        let mut instance = current.clone();
         if let Some(context) = otel_trace_context_from_data(&instance.data) {
             tx.commit().await?;
             return Ok(Some(context));
@@ -75,7 +114,7 @@ impl WorkflowRuntimeStore {
             serde_json::to_value(&context)?,
         );
         instance.version = instance.version.saturating_add(1);
-        upsert_instance_tx(&mut tx, &instance).await?;
+        commit_same_state_instance_tx(&mut tx, &current, &instance).await?;
         tx.commit().await?;
         Ok(Some(context))
     }
@@ -95,10 +134,11 @@ impl WorkflowRuntimeStore {
         auto_recovery: Option<&serde_json::Value>,
     ) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let Some(mut instance) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
+        let Some(current) = select_instance_for_update_tx(&mut tx, workflow_id).await? else {
             tx.commit().await?;
             return Ok(false);
         };
+        let mut instance = current.clone();
         if instance.state != expected_state {
             tx.rollback().await?;
             return Ok(false);
@@ -119,7 +159,7 @@ impl WorkflowRuntimeStore {
             }
         }
         instance.version = instance.version.saturating_add(1);
-        upsert_instance_tx(&mut tx, &instance).await?;
+        commit_same_state_instance_tx(&mut tx, &current, &instance).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -603,8 +643,8 @@ impl WorkflowRuntimeStore {
         limit: Option<i64>,
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
         let limit = limit.map(|value| value.clamp(1, 500));
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data::text FROM workflow_instances
+        let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT data::text, updated_at FROM workflow_instances
              WHERE parent_workflow_id = $1
              ORDER BY updated_at DESC
              LIMIT COALESCE($2, 2147483647)",
@@ -614,7 +654,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
             .collect()
     }
 
@@ -655,3 +695,42 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 }
+
+fn ensure_public_upsert_preserves_instance_boundary(
+    current: &WorkflowInstance,
+    target: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    let mut changed_fields = Vec::new();
+    if current.definition_id != target.definition_id {
+        changed_fields.push("definition_id");
+    }
+    if current.definition_version != target.definition_version {
+        changed_fields.push("definition_version");
+    }
+    if current.state != target.state {
+        changed_fields.push("state");
+    }
+    if current.subject != target.subject {
+        changed_fields.push("subject");
+    }
+    if current.parent_workflow_id != target.parent_workflow_id {
+        changed_fields.push("parent_workflow_id");
+    }
+    if current.lease != target.lease {
+        changed_fields.push("lease");
+    }
+    if current.created_at != target.created_at {
+        changed_fields.push("created_at");
+    }
+    if !changed_fields.is_empty() {
+        anyhow::bail!(
+            "public workflow instance upsert cannot change protected fields: {}; use a decision commit API",
+            changed_fields.join(", ")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "instances_tests.rs"]
+mod tests;

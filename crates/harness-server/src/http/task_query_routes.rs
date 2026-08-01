@@ -145,12 +145,8 @@ pub(crate) async fn list_runtime_submissions(
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
-    if state.core.workflow_runtime_store.is_none() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "workflow runtime store unavailable"})),
-        )
-            .into_response();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
 
     let cursor = query

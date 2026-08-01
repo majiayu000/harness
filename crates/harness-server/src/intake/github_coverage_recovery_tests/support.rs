@@ -89,11 +89,10 @@ pub(super) async fn assert_no_agent_work(
     issue_number: u64,
 ) -> anyhow::Result<()> {
     let id = workflow_id(project_id, Some(REPO), issue_number);
-    assert!(store
-        .commands_for(&id)
-        .await?
-        .iter()
-        .all(|command| command.status == WorkflowCommandStatus::Cancelled));
+    assert!(store.commands_for(&id).await?.iter().all(|command| {
+        command.status == WorkflowCommandStatus::Cancelled
+            || command.status == WorkflowCommandStatus::HandledInline
+    }));
     assert!(store.pending_commands(500).await?.is_empty());
     Ok(())
 }
@@ -106,6 +105,10 @@ pub(super) async fn assert_quality_gate_queued(
 ) -> anyhow::Result<()> {
     let id = workflow_id(project_id, Some(REPO), issue_number);
     let commands = store.commands_for(&id).await?;
+    let commands = commands
+        .iter()
+        .filter(|command| command.command.requires_runtime_job())
+        .collect::<Vec<_>>();
     assert_eq!(commands.len(), 1);
     assert_eq!(
         commands[0].command.command_type,

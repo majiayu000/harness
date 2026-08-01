@@ -1,6 +1,7 @@
 use super::{
-    apply_inline_command_side_effect, command_store, insert_decision_record_tx, insert_event_tx,
-    select_instance_for_update_tx, upsert_instance_tx, WorkflowRuntimeStore,
+    apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
+    insert_decision_record_tx, insert_event_tx, select_instance_for_update_tx,
+    WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowDecision, WorkflowDecisionRecord,
@@ -16,8 +17,11 @@ use crate::runtime::state_registry::{
     resolve_declarative_definition, DeclarativeDefinitionResolution,
 };
 use crate::runtime::status::WorkflowCommandStatus;
-use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
-use serde_json::Value;
+use crate::runtime::validator::{
+    ValidationContext, WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
+};
+use anyhow::Context;
+use serde_json::{json, Value};
 
 pub(super) fn validator_for_instance(
     instance: &WorkflowInstance,
@@ -288,31 +292,63 @@ fn driverless_structured_completion_decision(
 
 async fn persist_runtime_completion_decision_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
     decision: WorkflowDecision,
 ) -> anyhow::Result<WorkflowDecisionRecord> {
+    let validation_context = runtime_completion_validation_context(source, event);
+    persist_runtime_completion_decision_with_context_tx(
+        tx,
+        instance,
+        event,
+        decision,
+        validation_context,
+    )
+    .await
+}
+
+async fn persist_runtime_completion_decision_with_context_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mut instance: WorkflowInstance,
+    event: &WorkflowEvent,
+    decision: WorkflowDecision,
+    validation_context: ValidationContext,
+) -> anyhow::Result<WorkflowDecisionRecord> {
+    let current = instance.clone();
     let record = match validator_for_instance(&instance) {
-        Ok(Some(validator)) => match validator.validate(
-            &instance,
-            &decision,
-            &ValidationContext::new(source, event.created_at),
-        ) {
-            Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone())),
-            Err(error) => WorkflowDecisionRecord::rejected(
-                decision,
-                Some(event.id.clone()),
-                error.to_string(),
-            ),
-        },
+        Ok(Some(validator)) => {
+            match validator.validate(&instance, &decision, &validation_context) {
+                Ok(()) => {
+                    WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()))
+                }
+                Err(error) => WorkflowDecisionRecord::rejected(
+                    decision,
+                    Some(event.id.clone()),
+                    error.to_string(),
+                ),
+            }
+        }
         Ok(None) => WorkflowDecisionRecord::rejected(
             decision,
             Some(event.id.clone()),
             "unknown workflow definition for runtime completion",
         ),
-        Err(_error) if is_definition_pin_safety_decision(&instance, source, event, &decision) => {
-            WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()))
+        Err(_error) if validation_context.allow_definition_pin_safety_decision => {
+            match validate_definition_pin_safety_transition(
+                &instance,
+                &decision,
+                &validation_context,
+            ) {
+                Ok(()) => {
+                    WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()))
+                }
+                Err(error) => WorkflowDecisionRecord::rejected(
+                    decision,
+                    Some(event.id.clone()),
+                    error.to_string(),
+                ),
+            }
         }
         Err(error) => {
             WorkflowDecisionRecord::rejected(decision, Some(event.id.clone()), error.to_string())
@@ -337,36 +373,112 @@ async fn persist_runtime_completion_decision_tx(
                 apply_inline_command_side_effect(&mut instance, followup)?;
             }
         }
+        apply_runtime_completion_data_side_effect(&mut instance, &record.decision, event)?;
         instance.state = record.decision.next_state.clone();
         instance.version = instance.version.saturating_add(1);
-        upsert_instance_tx(tx, &instance).await?;
+        commit_decision_instance_tx(tx, &current, &instance, &record, false).await?;
     }
 
     Ok(record)
 }
 
-fn is_definition_pin_safety_decision(
-    instance: &WorkflowInstance,
-    source: &str,
-    event: &WorkflowEvent,
+fn runtime_completion_validation_context(source: &str, event: &WorkflowEvent) -> ValidationContext {
+    ValidationContext::new(source, event.created_at).allow_definition_pin_safety_decision()
+}
+
+fn apply_runtime_completion_data_side_effect(
+    instance: &mut WorkflowInstance,
     decision: &WorkflowDecision,
-) -> bool {
-    if source.trim().is_empty()
-        || event.source != source
-        || event.event_type != "RuntimeJobCompleted"
+    event: &WorkflowEvent,
+) -> anyhow::Result<()> {
+    if instance.definition_id != crate::runtime::PR_FEEDBACK_DEFINITION_ID
+        || instance.state != "inspecting"
+        || decision.observed_state != "inspecting"
+        || !matches!(
+            decision.next_state.as_str(),
+            "feedback_found" | "no_actionable_feedback" | "ready_to_merge"
+        )
+    {
+        return Ok(());
+    }
+    let Some(snapshot) = pr_feedback_snapshot_from_completion_event(event) else {
+        return Ok(());
+    };
+    let facts_for_hash = crate::runtime::stable_pr_snapshot_fact_hash_input(snapshot);
+    let fact_hash = crate::runtime::stable_remote_fact_hash(&facts_for_hash);
+    let activity_at = ["updated_at", "updatedAt"].into_iter().find_map(|field| {
+        snapshot
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    });
+    if !instance.data.is_object() {
+        instance.data = json!({});
+    }
+    let data = instance
+        .data
+        .as_object_mut()
+        .context("workflow instance data is not an object")?;
+    data.insert("remote_fact_hash".to_string(), json!(fact_hash));
+    if let Some(activity_at) = activity_at {
+        data.insert("remote_fact_activity_at".to_string(), json!(activity_at));
+    } else {
+        data.remove("remote_fact_activity_at");
+    }
+    Ok(())
+}
+
+fn pr_feedback_snapshot_from_completion_event(event: &WorkflowEvent) -> Option<&Value> {
+    let result = event.event.get("activity_result")?;
+    if result.get("activity").and_then(Value::as_str)
+        != Some(crate::runtime::PR_FEEDBACK_INSPECT_ACTIVITY)
+    {
+        return None;
+    }
+    result
+        .get("artifacts")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|artifact| {
+            matches!(
+                artifact.get("artifact_type").and_then(Value::as_str),
+                Some(crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT)
+                    | Some(crate::runtime::PR_FEEDBACK_SNAPSHOT_ARTIFACT)
+            )
+        })
+        .and_then(|artifact| artifact.get("artifact"))
+}
+
+fn validate_definition_pin_safety_transition(
+    instance: &WorkflowInstance,
+    decision: &WorkflowDecision,
+    context: &ValidationContext,
+) -> Result<(), WorkflowDecisionRejection> {
+    if !context.allow_definition_pin_safety_decision {
+        return Err(WorkflowDecisionRejection::new(
+            WorkflowDecisionRejectionKind::TransitionNotAllowed,
+            "definition-pin safety transition requires explicit validation context",
+        ));
+    }
+    if context.actor.trim().is_empty()
         || decision.workflow_id != instance.id
         || decision.observed_state != instance.state
         || decision.next_state != "blocked"
         || decision.decision != "definition_version_missing"
         || decision.commands.len() != 2
     {
-        return false;
+        return Err(WorkflowDecisionRejection::new(
+            WorkflowDecisionRejectionKind::TransitionNotAllowed,
+            "definition-pin safety transition does not match the pinned-definition blocked policy",
+        ));
     }
     let expected = [
         crate::runtime::model::WorkflowCommandType::MarkBlocked,
         crate::runtime::model::WorkflowCommandType::RequestOperatorAttention,
     ];
-    decision
+    if !decision
         .commands
         .iter()
         .zip(expected)
@@ -375,6 +487,23 @@ fn is_definition_pin_safety_decision(
                 && !command.dedupe_key.trim().is_empty()
                 && command.command.is_object()
         })
+    {
+        return Err(WorkflowDecisionRejection::new(
+            WorkflowDecisionRejectionKind::CommandNotAllowed,
+            "definition-pin safety transition has invalid commands",
+        ));
+    }
+    if !decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "definition_pin_error")
+    {
+        return Err(WorkflowDecisionRejection::new(
+            WorkflowDecisionRejectionKind::MissingRequiredEvidence,
+            "definition-pin safety transition requires definition_pin_error evidence",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

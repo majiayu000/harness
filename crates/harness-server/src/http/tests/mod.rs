@@ -37,6 +37,7 @@ mod repo_memory_api_tests;
 mod runtime_approval_route_tests;
 mod runtime_deferred_tree_tests;
 mod runtime_dispatch_tests;
+mod runtime_pr_feedback_sweep_tests;
 mod runtime_task_route_tests;
 mod runtime_transcript_route_tests;
 mod runtime_tree_tests;
