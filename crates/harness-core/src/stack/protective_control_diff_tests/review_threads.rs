@@ -300,3 +300,155 @@ fn classifies_non_unique_disablement_replacements_as_ambiguous() {
             && fact.reason() == Reason::AmbiguousReplacement
     }));
 }
+
+#[test]
+fn unique_replacement_suppresses_inactive_legacy_state_changes() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/legacy.yml",
+            Some(HASH_A),
+            &[Role::Validation],
+            Confidence::High,
+            DISABLED_PARTIAL_OPEN,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/replacement.yml",
+            Some(HASH_B),
+            &[Role::Validation],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+    ];
+
+    assert!(protective_control_diff(&before, &after).is_empty());
+}
+
+#[test]
+fn after_enablement_conflict_does_not_claim_definite_disablement() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/ci.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let after = [
+        before[0].clone(),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/ci.yml",
+            Some(HASH_A),
+            &[Role::Validation],
+            Confidence::High,
+            DISABLED_REQUIRED,
+        ),
+    ];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(kinds(&facts), [DiffKind::AmbiguousReviewEvidence]);
+    assert_eq!(reasons(&facts), [Reason::ConflictingDuplicateReport]);
+}
+
+#[test]
+fn counts_supplemental_roles_used_by_partial_renames() {
+    let before = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/multi-role.yml",
+            Some(HASH_A),
+            &[Role::Validation, Role::Check],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/removed-check.yml",
+            Some(HASH_A),
+            &[Role::Check],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+    ];
+    let after = [
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/renamed.yml",
+            Some(HASH_A),
+            &[Role::Validation],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+        configured_control(
+            Kind::Validation,
+            ".github/workflows/supplement.yml",
+            Some(HASH_B),
+            &[Role::Check],
+            Confidence::High,
+            ACTIVE_REQUIRED,
+        ),
+    ];
+
+    let facts = protective_control_diff(&before, &after);
+
+    assert_eq!(facts.len(), 3);
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.reason() == Reason::PossibleRename)
+            .count(),
+        1
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.reason() == Reason::AmbiguousReplacement)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn merges_known_integrity_independently_of_duplicate_order() {
+    let before = [configured_control(
+        Kind::Validation,
+        ".github/workflows/legacy.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    )];
+    let missing = configured_control(
+        Kind::Validation,
+        ".github/workflows/renamed.yml",
+        None,
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let known = configured_control(
+        Kind::Validation,
+        ".github/workflows/renamed.yml",
+        Some(HASH_A),
+        &[Role::Validation],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+
+    let missing_first = protective_control_diff(&before, &[missing.clone(), known.clone()]);
+    let known_first = protective_control_diff(&before, &[known, missing]);
+
+    assert_eq!(missing_first, known_first);
+    assert_eq!(reasons(&missing_first), [Reason::PossibleRename]);
+}

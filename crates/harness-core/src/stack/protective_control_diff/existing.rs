@@ -12,7 +12,31 @@ pub(super) fn compare_existing(
     facts: &mut Vec<AgentStackProtectionControlDiff>,
 ) {
     let confidence = min_confidence(before.confidence, after.confidence);
-    if after.confidence.strength() < before.confidence.strength() {
+    let component_id = after.component.component_id().as_str();
+    let has_enabled_conflict = inputs
+        .after_enabled_conflicting_component_ids
+        .contains(component_id);
+    let disablement_coverage =
+        if before.enabled != Some(false) && after.enabled == Some(false) && !has_enabled_conflict {
+            Some(classify_role_replacement(
+                before,
+                before.roles.clone(),
+                inputs.after_controls,
+                inputs.before_by_id,
+                inputs.before_conflicting_component_ids,
+                inputs.after_conflicting_component_ids,
+                inputs.replacement_use_counts,
+            ))
+        } else {
+            None
+        };
+    let disablement_has_complete_coverage = matches!(
+        disablement_coverage,
+        Some(RoleReplacementCoverage::Unique | RoleReplacementCoverage::Ambiguous)
+    );
+    if !disablement_has_complete_coverage
+        && after.confidence.strength() < before.confidence.strength()
+    {
         push_existing_fact(
             AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
             before.roles.clone(),
@@ -33,18 +57,10 @@ pub(super) fn compare_existing(
             AgentStackProtectionControlReason::EnablementEvidenceLost,
             facts,
         ),
-        (left, Some(false)) if left != Some(false) => {
-            match classify_role_replacement(
-                before,
-                before.roles.clone(),
-                inputs.after_controls,
-                inputs.before_by_id,
-                inputs.before_conflicting_component_ids,
-                inputs.after_conflicting_component_ids,
-                inputs.replacement_use_counts,
-            ) {
-                RoleReplacementCoverage::Unique => {}
-                RoleReplacementCoverage::Ambiguous => push_existing_fact(
+        (left, Some(false)) if left != Some(false) && !has_enabled_conflict => {
+            match disablement_coverage {
+                Some(RoleReplacementCoverage::Unique) => {}
+                Some(RoleReplacementCoverage::Ambiguous) => push_existing_fact(
                     AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
                     before.roles.clone(),
                     before,
@@ -53,7 +69,7 @@ pub(super) fn compare_existing(
                     AgentStackProtectionControlReason::AmbiguousReplacement,
                     facts,
                 ),
-                RoleReplacementCoverage::Missing => push_existing_fact(
+                Some(RoleReplacementCoverage::Missing) => push_existing_fact(
                     AgentStackProtectionDiffKind::Disabled,
                     before.roles.clone(),
                     before,
@@ -62,6 +78,7 @@ pub(super) fn compare_existing(
                     AgentStackProtectionControlReason::ExplicitlyDisabled,
                     facts,
                 ),
+                None => {}
             }
         }
         _ => {}
@@ -114,51 +131,53 @@ pub(super) fn compare_existing(
             facts,
         );
     }
-    if before.scope.is_some() && after.scope.is_none() {
-        push_existing_fact(
-            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::ScopeLevelReduced,
-            facts,
-        );
-    } else if matches!((before.scope, after.scope), (Some(left), Some(right)) if right.strength() < left.strength())
-    {
-        push_existing_fact(
-            AgentStackProtectionDiffKind::ScopeReduced,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::ScopeLevelReduced,
-            facts,
-        );
-    }
-    match (before.failure_mode, after.failure_mode) {
-        (
-            Some(AgentStackProtectionFailureMode::FailClosed),
-            Some(AgentStackProtectionFailureMode::FailOpen),
-        ) => push_existing_fact(
-            AgentStackProtectionDiffKind::FailOpen,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::FailureModeRelaxed,
-            facts,
-        ),
-        (Some(AgentStackProtectionFailureMode::FailClosed), None) => push_existing_fact(
-            AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
-            before.roles.clone(),
-            before,
-            after,
-            confidence,
-            AgentStackProtectionControlReason::FailureModeRelaxed,
-            facts,
-        ),
-        _ => {}
+    if !disablement_has_complete_coverage {
+        if before.scope.is_some() && after.scope.is_none() {
+            push_existing_fact(
+                AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+                before.roles.clone(),
+                before,
+                after,
+                confidence,
+                AgentStackProtectionControlReason::ScopeLevelReduced,
+                facts,
+            );
+        } else if matches!((before.scope, after.scope), (Some(left), Some(right)) if right.strength() < left.strength())
+        {
+            push_existing_fact(
+                AgentStackProtectionDiffKind::ScopeReduced,
+                before.roles.clone(),
+                before,
+                after,
+                confidence,
+                AgentStackProtectionControlReason::ScopeLevelReduced,
+                facts,
+            );
+        }
+        match (before.failure_mode, after.failure_mode) {
+            (
+                Some(AgentStackProtectionFailureMode::FailClosed),
+                Some(AgentStackProtectionFailureMode::FailOpen),
+            ) => push_existing_fact(
+                AgentStackProtectionDiffKind::FailOpen,
+                before.roles.clone(),
+                before,
+                after,
+                confidence,
+                AgentStackProtectionControlReason::FailureModeRelaxed,
+                facts,
+            ),
+            (Some(AgentStackProtectionFailureMode::FailClosed), None) => push_existing_fact(
+                AgentStackProtectionDiffKind::AmbiguousReviewEvidence,
+                before.roles.clone(),
+                before,
+                after,
+                confidence,
+                AgentStackProtectionControlReason::FailureModeRelaxed,
+                facts,
+            ),
+            _ => {}
+        }
     }
     if has_conflicting_duplicate_state {
         push_conflicting_duplicate_fact(before, Some(after), facts);

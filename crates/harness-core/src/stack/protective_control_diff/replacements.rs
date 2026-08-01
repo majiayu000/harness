@@ -11,6 +11,7 @@ pub(super) enum CandidateMode {
     WeakEquivalent,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum RoleReplacementCoverage {
     Unique,
     Ambiguous,
@@ -115,6 +116,7 @@ pub(super) fn replacement_use_counts(
     before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     before_conflicting_component_ids: &BTreeSet<String>,
     after_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
+    after_enabled_conflicting_component_ids: &BTreeSet<String>,
 ) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for before_control in before {
@@ -124,13 +126,36 @@ pub(super) fn replacement_use_counts(
         let component_id = before_control.component.component_id().as_str();
         let Some(after_control) = after_by_id.get(component_id).copied() else {
             let mut used_ids = BTreeSet::new();
-            for mode in [CandidateMode::SameIntegrity, CandidateMode::Equivalent] {
+            let same_integrity = replacement_candidates(
+                after,
+                before_control,
+                before_by_id,
+                before_conflicting_component_ids,
+                CandidateMode::SameIntegrity,
+            );
+            let equivalent = replacement_candidates(
+                after,
+                before_control,
+                before_by_id,
+                before_conflicting_component_ids,
+                CandidateMode::Equivalent,
+            );
+            for candidate in same_integrity.iter().chain(equivalent.iter()) {
+                used_ids.insert(candidate.component.component_id().as_str().to_owned());
+            }
+            for role in before_control.roles.iter().copied().filter(|role| {
+                !same_integrity.iter().any(|candidate| {
+                    candidate.roles.contains(role) && candidate.enabled != Some(false)
+                })
+            }) {
+                let mut probe = before_control.clone();
+                probe.roles = vec![role];
                 for candidate in replacement_candidates(
                     after,
-                    before_control,
+                    &probe,
                     before_by_id,
                     before_conflicting_component_ids,
-                    mode,
+                    CandidateMode::Equivalent,
                 ) {
                     used_ids.insert(candidate.component.component_id().as_str().to_owned());
                 }
@@ -138,7 +163,9 @@ pub(super) fn replacement_use_counts(
             increment_use_counts(&mut counts, used_ids);
             continue;
         };
-        let roles = if after_control.enabled == Some(false) {
+        let roles = if after_control.enabled == Some(false)
+            && !after_enabled_conflicting_component_ids.contains(component_id)
+        {
             before_control.roles.clone()
         } else {
             missing_roles(before_control.roles(), after_control.roles())

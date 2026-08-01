@@ -173,6 +173,7 @@ struct ComparisonInputs<'before, 'after> {
     before_by_id: &'before BTreeMap<String, &'before AgentStackProtectionControl>,
     before_conflicting_component_ids: &'before BTreeSet<String>,
     after_conflicting_component_ids: &'after BTreeSet<String>,
+    after_enabled_conflicting_component_ids: &'after BTreeSet<String>,
     replacement_use_counts: &'before BTreeMap<String, usize>,
 }
 #[rustfmt::skip]
@@ -215,12 +216,14 @@ pub fn protective_control_diff(
         &before_by_id,
         &before_controls.conflicting_component_ids,
         &after_by_id,
+        &after_controls.enabled_conflicting_component_ids,
     );
     let comparison_inputs = ComparisonInputs {
         after_controls: &after_controls.controls,
         before_by_id: &before_by_id,
         before_conflicting_component_ids: &before_controls.conflicting_component_ids,
         after_conflicting_component_ids: &after_controls.conflicting_component_ids,
+        after_enabled_conflicting_component_ids: &after_controls.enabled_conflicting_component_ids,
         replacement_use_counts: &replacement_use_counts,
     };
     let mut facts = Vec::new();
@@ -250,15 +253,7 @@ pub fn protective_control_diff(
                     push_conflicting_duplicate_fact(before_control, None, &mut facts);
                 }
                 if before_control.enabled != Some(false) {
-                    compare_removed(
-                        before_control,
-                        &after_controls.controls,
-                        &before_by_id,
-                        &before_controls.conflicting_component_ids,
-                        &after_controls.conflicting_component_ids,
-                        &replacement_use_counts,
-                        &mut facts,
-                    );
+                    compare_removed(before_control, &comparison_inputs, &mut facts);
                 }
             }
         }
@@ -272,13 +267,14 @@ pub fn protective_control_diff(
 }
 fn compare_removed(
     before: &AgentStackProtectionControl,
-    after: &[AgentStackProtectionControl],
-    before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
-    before_conflicting_component_ids: &BTreeSet<String>,
-    after_conflicting_component_ids: &BTreeSet<String>,
-    replacement_use_counts: &BTreeMap<String, usize>,
+    inputs: &ComparisonInputs<'_, '_>,
     facts: &mut Vec<AgentStackProtectionControlDiff>,
 ) {
+    let after = inputs.after_controls;
+    let before_by_id = inputs.before_by_id;
+    let before_conflicting_component_ids = inputs.before_conflicting_component_ids;
+    let after_conflicting_component_ids = inputs.after_conflicting_component_ids;
+    let replacement_use_counts = inputs.replacement_use_counts;
     let mut same_integrity = replacement_candidates(
         after,
         before,
@@ -341,19 +337,7 @@ fn compare_removed(
             rename_confidence(before, candidate),
             AgentStackProtectionControlReason::PossibleRename,
         ));
-        compare_existing(
-            before,
-            candidate,
-            &ComparisonInputs {
-                after_controls: after,
-                before_by_id,
-                before_conflicting_component_ids,
-                after_conflicting_component_ids,
-                replacement_use_counts,
-            },
-            false,
-            facts,
-        );
+        compare_existing(before, candidate, inputs, false, facts);
         return;
     }
     if !same_integrity.is_empty() {
@@ -507,17 +491,33 @@ fn push_existing_fact(kind: AgentStackProtectionDiffKind, roles: Vec<AgentStackP
 struct AggregatedControls {
     controls: Vec<AgentStackProtectionControl>,
     conflicting_component_ids: BTreeSet<String>,
+    enabled_conflicting_component_ids: BTreeSet<String>,
 }
 fn aggregate_controls(controls: &[AgentStackProtectionControl]) -> AggregatedControls {
     let mut by_id = BTreeMap::<String, AgentStackProtectionControl>::new();
     let mut conflicting_component_ids = BTreeSet::new();
+    let mut enabled_conflicting_component_ids = BTreeSet::new();
+    let mut integrity_conflicting_component_ids = BTreeSet::new();
     for control in controls {
         let component_id = control.component.component_id().as_str().to_owned();
         if let Some(existing) = by_id.get_mut(&component_id) {
             if duplicate_state_conflicts(existing, control) {
-                conflicting_component_ids.insert(component_id);
+                conflicting_component_ids.insert(component_id.clone());
             }
-            merge_control(existing, control);
+            if conflicting_values(existing.enabled, control.enabled) {
+                enabled_conflicting_component_ids.insert(component_id.clone());
+            }
+            if conflicting_values(
+                existing.component.integrity(),
+                control.component.integrity(),
+            ) {
+                integrity_conflicting_component_ids.insert(component_id.clone());
+            }
+            merge_control(
+                existing,
+                control,
+                integrity_conflicting_component_ids.contains(&component_id),
+            );
         } else {
             by_id.insert(component_id, control.clone());
         }
@@ -525,6 +525,7 @@ fn aggregate_controls(controls: &[AgentStackProtectionControl]) -> AggregatedCon
     AggregatedControls {
         controls: by_id.into_values().collect(),
         conflicting_component_ids,
+        enabled_conflicting_component_ids,
     }
 }
 fn duplicate_state_conflicts(
@@ -542,12 +543,15 @@ fn conflicting_values<T: Eq>(left: Option<T>, right: Option<T>) -> bool {
 fn merge_control(
     existing: &mut AgentStackProtectionControl,
     control: &AgentStackProtectionControl,
+    has_integrity_conflict: bool,
 ) {
-    if conflicting_values(
-        existing.component.integrity(),
-        control.component.integrity(),
-    ) {
+    if has_integrity_conflict {
         existing.component = existing.component.clone().with_integrity(None);
+    } else if existing.component.integrity().is_none() && control.component.integrity().is_some() {
+        existing.component = existing
+            .component
+            .clone()
+            .with_integrity(control.component.integrity().cloned());
     }
     existing.roles = merged_roles(existing.roles(), control.roles());
     existing.enabled = merged_after_enabled(existing.enabled, control.enabled);
