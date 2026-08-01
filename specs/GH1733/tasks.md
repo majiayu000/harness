@@ -7,14 +7,19 @@ GH-1733
 ## Spec Packet
 
 - Product: `specs/GH1733/product.md`
+- Runtime product: `specs/GH1733/runtime-product.md`
+- Runtime observation: `specs/GH1733/runtime-observation.md`
+- Runtime supervision: `specs/GH1733/runtime-supervision.md`
 - Tech: `specs/GH1733/tech.md`
+- Tasks and product-to-test map: `specs/GH1733/tasks.md`
 
 ## Readiness Gate
 
 This plan is not implementation approval. GH-1733 is currently
-`ready_to_spec`. Do not modify PR #1859 production code until maintainers approve
-this packet and record `ready_to_implement`. Once approved, amend the original
-PR branch only; do not create a replacement implementation PR or force-push.
+`ready_to_spec`. Do not modify PR #1859 production code until maintainers
+approve all six files in this packet and record `ready_to_implement`. Once
+approved, amend the original PR branch only; do not create a replacement
+implementation PR or force-push.
 
 ## Implementation Tasks
 
@@ -27,86 +32,65 @@ PR branch only; do not create a replacement implementation PR or force-push.
       Schema v0.1 constructors and parsers reject every Windows command form or
       present Windows resolution context; Windows resolver/digest helpers remain
       pure contract values and cannot construct unreachable envelope evidence.
-- [ ] `SP1733-T2` — Owner: runtime fingerprint worker. Dependencies: SP1733-T1. Covers: B-002 through B-010, B-014, and B-015. Done when: isolation and exact passthrough `DangerFullAccess` sandbox gates run before host observation; only Linux `x86_64`/`aarch64` with audited `close_range` descriptor isolation, `pidfd_open`, `pidfd_send_signal`, parent-child `PTRACE_O_TRACEEXEC`, tagged post-exec syscall guarding, strong `/proc` process/image identity, and the fixed observation protocol proceeds. Missing ptrace guarding is pre-observation no-envelope containment failure. After that gate passes, exact `ENOSYS`, `EPERM`, or `EINVAL` from an eligible target's fully frozen fd-10 `execveat(AT_EMPTY_PATH)` call becomes initial-single or post-`ETXTBSY` retry-sequence `handle_execution_unavailable`; exact `EACCES` remains the separate bare-name fallback case. The ready owner is the sole target/anchor fork, parent-side ptrace-control, wait/reap, and observation-helper-spawn owner; the target pre-exec closure's audited `PTRACE_TRACEME` is the sole exception. It atomically pidfd-registers and owns each helper or target before exposing any cancellable lease. Every cwd/candidate/boundary/hash/exec-stop/checkpoint/membership wait is bounded by the active or cleanup deadline. Observation timeout, cleanup-incomplete, and protocol-invalid are distinct closed producer errors with no envelope and exact ownership retained; no missing cwd fact or attempt outcome is fabricated. Resolution remains handle-relative and bounded with the exact open-time `ENOENT`/`ENOTDIR`, exec-time `EACCES`, and one 150 ms `ETXTBSY` retry semantics. The bounded PATH is traversed lazily: only reaching entry 65 after 64 nonterminal attempts emits `candidate_limit_exceeded`; an earlier terminal outcome ignores later entries. A retained-handle exec-time `ENOENT`/`ENOTDIR` terminates interpreter authorization and deliberately does not follow the adapter's later PATH fallback; the producer never attributes a later candidate. Candidate-local no-target-helper facts preserve any earlier ordered, fully reaped `EACCES` attempt and its probe-level anchor; every later terminal finalizes that anchor, with independent cleanup evidence on failure. A bounded classifier accepts only the frozen native ELF64 machine tuple, current header versions/sizes, non-extended in-file program headers, `ET_EXEC` or `ET_DYN`, and no `PT_INTERP`; scripts, dynamic/malformed/wrong-machine ELF, and non-ELF/binfmt formats fail before target creation. Supported Linux authorization requires `st_nlink == 1` initially and at pre-spawn/retry; exec-stop and post-reap revalidate link count, with multiple links failing authorization before spawn or producing identity change after target creation. Target exec collision-safely maps the retained handle to child fd 10 and uses `FD_CLOEXEC` `execveat(10, "", ..., AT_EMPTY_PATH)`, so a late script fails before interpreter execution. Every direct-exec attempt records the closed fd-10 execution context; exact configured bytes remain `argv[0]`, while exact `AT_EXECFN = "/dev/fd/10"` and failed post-exec reopen are a represented pathname-launch divergence. Every successful native exec stops at exactly one `PTRACE_EVENT_EXEC` before its first instruction and resumes only after a registered observation helper matches stopped-image strong identity plus retained-handle hash while kernel write denial is active. Changed bytes, missing/surplus events, abnormal trace state, and pre-resume timeout kill/reap without resume; verification-unavailable cases return no envelope, and no pathname fallback exists. Every `/proc` membership enumeration/revalidation uses an atomically registered observation helper with at most 64 transferred pidfds plus `more`; cleanup signals each batch individually and rescans from the beginning until only the anchor remains or the deadline expires. It never drops overflow members, uses a negative PGID, or signals the anchor before the group is empty. Membership stalls, malformed frames/helper exit, continuous churn, and anchor failures are typed. The active deadline includes observations, exec-stop, root exit, and post-reap checkpoint; probe cleanup has a separate five-second deadline. Version blank classification is exactly empty or HT/LF/CR/SP bytes after UTF-8 validation, never a generic whitespace predicate. All closed runtime/environment/command/attempt/failure contracts, executable/output bounds, Windows digests, repository authorization, exact output grammars, and prior fail-closed/no-shell requirements remain covered; no `spawn_blocking`, unbounded wait, whole-file read, unbounded pipe, warning-only fallback, or detached-`ManagedChild` completion claim remains. Verify: `cargo test -p harness-agents runtime_fingerprint`, `cargo test -p harness-agents`, and `cargo check -p harness-agents --all-targets`.
-      An unavailable link count is the closed
-      `target_authorization_unavailable/link_count_unprovable` reason, zero is
-      `unlinked_target`, and only a count greater than one is
-      `multiple_hard_links`; retry authorization records exactly one reaped
-      `ETXTBSY` helper and proves no second helper or exec occurred. Exec-stop
-      observation failure is no-envelope execution verification failure;
-      post-reap failure is `identity/metadata_unavailable`.
-      Value launch inputs are checked at 65,536 exact OS units, environment and
-      setup-secret name collections/names at 1,024 before hashing/splitting or
-      owner admission; those field limits prove every reached derived candidate
-      is at most 196,610 units without a separate failure. Excluded and
-      undeclared values are never read. A fail-fast global eight-owner permit,
-      post-READY owner-side 67-pidfd/32-other-fd ceilings, helper-local 64
-      pidfds, and child allowlists bound retained resources; the permit survives API return
-      until actual owner exit. Every helper, anchor, and target first closes all
-      foreign descriptors, emits a closed descriptor bootstrap status, and waits behind a
-      pre-fork start gate until `pidfd_open` and registry commit succeed; closed
-      rollback states prove no workload ran before `GO`.
-      Before the capability-child fork, owner-side
-      `pidfd_open(getpid(), 0)` plus signal-zero preflight must succeed and the
-      test pidfd is closed; any failure is pre-observation no-envelope
-      `pidfd_unavailable`, while later per-child pidfd failures retain the
-      child-registration stage.
-      The capability gate also proves `PTRACE_O_TRACESYSGOOD`, tagged
-      `PTRACE_SYSCALL` entry/exit stops, and exact x86_64/aarch64
-      `PTRACE_GET_SYSCALL_INFO` through owner-side
-      `PTRACE_SEIZE/PTRACE_INTERRUPT`; the target pre-exec remains the only
-      `PTRACE_TRACEME` caller. Actual target-call `ENOSYS`/`EPERM`/`EINVAL` is
-      candidate-local handle-execution failure, not a ptrace-containment
-      decision. The ELF classifier also rejects W+X `PT_LOAD` and missing,
-      duplicate, or executable `PT_GNU_STACK`. After the verified initial static exec, the owner denies
-      fork/vfork/clone/clone3, execve/execveat, new executable mmap/mprotect/
-      shmat, `ptrace`, `process_vm_writev`, `userfaultfd`, `io_uring_setup`,
-      `pidfd_getfd`, `recvmsg`/`recvmmsg`, `prctl`, every non-query
-      `personality`, and every write-capable or truncating open-family request at syscall
-      entry before kernel execution. A capability fixture proves a
-      `/proc/self/mem` write-open, received `SCM_RIGHTS`, remote-fd
-      duplication, external-ptrace authorization, and `READ_IMPLIES_EXEC`
-      changes are denied without pathname trust; exact
-      `personality(0xffff_ffff)` is the sole allowed query and completes a
-      normal entry/exit transition. Every target-initiated `kill`, `tkill`,
-      `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, and
-      `pidfd_send_signal` form is denied as closed `process_signalling` evidence
-      before kernel execution. Constructor/parser tests round-trip every closed
-      transitive class, reject an unknown class, prove signalling detail changes
-      the canonical payload and fingerprint digest, and preserve canonical
-      ordering when signalling and cleanup failures coexist. On x86_64, any syscall number carrying
-      `__X32_SYSCALL_BIT` is rejected as no-envelope verification failure before
-      native classification; the bit is never cleared. Denial is closed failure
-      evidence without a version, while an unverifiable `openat2` payload, x32
-      dispatch, or syscall stop is no-envelope.
+- [ ] `SP1733-T2` — Owner: runtime fingerprint worker. Dependencies:
+      SP1733-T1. Covers: B-002 through B-010, B-014, and B-015. Done when:
+      isolation and exact passthrough `DangerFullAccess` gates precede all host
+      observation; supported Linux proves descriptor isolation, pidfd and
+      ptrace capability, while other platforms fail before cwd access.
+      The owner is the sole target/helper creator, ptrace controller, waiter,
+      and reaper except for the audited target `PTRACE_TRACEME`. Every child is
+      gated until its exact pidfd plus reap obligation is atomically registered.
+      Before registry commit, rollback may use only the still-unreaped direct
+      child's positive PID; afterward every signal/reap uses the registered
+      pidfd. There is no anchor, PGID, process-group membership, negative-PID,
+      post-reap-PID, or descendant-enumeration evidence.
+      Eight owners each reserve two pidfd and 28 non-pidfd slots. One gated
+      child retains at most 12 references; a post-exec target plus observer
+      retains at most eight. No other child-role concurrency is legal, proving
+      40 per fingerprint, 16 pidfds and 320 descriptors globally. The active deadline covers
+      retained cwd/target observation, authorization, exec stop, target
+      execution/reap, bounded output, and post-reap checkpoint; cleanup has its
+      separate deadline. Success requires exact target reap, complete bounded
+      streams, a passing post-reap checkpoint, and an empty registry.
+      The post-exec guard denies process creation, image execution, executable
+      mapping (including x86_64 `uselib`), image mutation, and signalling
+      before execution. The claim is registry-empty plus no executed
+      process-creation syscall, never descendant-tree-empty.
+      Cwd is retained with `O_PATH | O_DIRECTORY | O_CLOEXEC` and no
+      `O_NOFOLLOW`; search-only cwd and pathname replacement are tested.
+      Initial and retry supervision setup stages are exactly
+      `working_directory_enter` and `trace_setup`. Capture failures have
+      precedence; after complete capture, signal/nonzero is the sole semantic
+      failure, and only zero exit reaches UTF-8/blank/grammar selection.
+      Existing bounded PATH, `ETXTBSY`, fd-10 `execveat`, ELF, environment,
+      repository authorization, fail-closed, and no-shell contracts remain.
+      Verify: `cargo test -p harness-agents runtime_fingerprint`,
+      `cargo test -p harness-agents`, and
+      `cargo check -p harness-agents --all-targets`.
 - [ ] `SP1733-T3` — Owner: boundary contract worker. Dependencies: SP1733-T1 and SP1733-T2. Covers: B-002 and B-016. Done when: a `#[cfg(test)]`-only exhaustive workflow `RuntimeKind` mapping proves the three local kinds map one-to-one, `AnthropicApi`/`RemoteHost` are not local executables, and no non-host isolation can be interpreted as a host fingerprint subject; production call-site audit proves there is no snapshot, server, workflow-runtime, task-runner, `CodeAgent`, `AgentAdapter`, CLI, HTTP, persistence, or migration consumer; and the implementation diff matches the fourteen authorized paths exactly with no lockfile change. Verify: `cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib` plus the manifest and `rg` audits described below.
-- [ ] `SP1733-T4` — Owner: verification and handoff owner. Dependencies: SP1733-T1 through SP1733-T3. Covers: B-001 through B-016. Done when: formatting, focused/package/workspace tests, clippy, file-size/manifest/API/call-site audits, current-head independent review, Gemini, and ruleset approval all pass; every #1862 thread and valid #1859 finding is re-evaluated on the exact head. Verification must prove owner exclusivity across target/anchor fork, parent-side ptrace control, wait/reap, and helper spawn, with only the audited target pre-exec `PTRACE_TRACEME` exception; owner-atomic helper registration at every cancellation boundary; owner-side self-pidfd preflight before the capability child; distinct typed no-envelope timeout, cleanup-incomplete, and protocol-invalid paths through post-reap and active/cleanup group-membership checks; 64-member, 65-member, larger, and continuous-churn membership behavior; no in-process blocking worker or negative-PGID signal; anchor exclusion plus typed anchor shutdown failure; static `ET_EXEC` and static-PIE success; direct/env/race-introduced shebang, `PT_INTERP`, W+X `PT_LOAD`, executable `PT_GNU_STACK`, wrong-machine, malformed-header, and non-ELF/binfmt rejection before loader/interpreter execution; missing and surplus `PTRACE_EVENT_EXEC`, abnormal trace transition, and pre-resume deadline each produce no envelope and kill/reap without resume; successful native exec reaches a verified pre-first-instruction ptrace stop, matches hash/image identity under kernel write denial, and cannot gain a write path to executable memory before resume; macOS/other-Unix/Windows fail before cwd observation; retained cwd/target handles survive pathname replacement; repository targets never execute; and Draft 2020-12 versus Draft-07 fixtures preserve their distinct `contentSchema`, dependency, items, and extension semantics. All previous digest vectors, output/executable limits, `ETXTBSY`, cleanup, schema counting, duplicate-key, source binding, annotation, and fail-closed assertions remain unweakened; the call-site audit must prove only the owner invokes target/anchor fork, parent-side ptrace controls, and wait/reap, while only the target's audited pre-exec closure invokes `PTRACE_TRACEME`. The original PR may close GH-1733 only after all gates pass. Verify: run every command and audit in Required Verification on one current implementation head, then collect fresh PR-gate evidence.
-      The exact-head matrix must additionally cover: 4,096/4,097-byte base
-      locators, 8,259/8,260-byte derived locators, and 2,097,152/2,097,153-byte
-      raw envelopes before allocation; raw number forms `1`, `1.0`, `1e0`,
-      malformed numbers, and the long-number canonical boundary through
-      `serde_json/raw_value`; exact hard-link counts 0/1/2, unavailable
-      exec-stop/post-reap observations, and initial/retry/later count changes;
-      all selected launch values at 65,536/65,537 units, environment/setup
-      counts and names at 1,024/1,025, and the mathematically maximal 196,610
-      derived candidate with no reachable 196,611 input; eight/ninth owner admission, permit lifetime, owner
-      post-READY owner 67/32, helper 64, combined 131/global 1,048 fd ceilings, foreign-fd
-      isolation, and every child-role registration gate failure; every shared
-      single-schema keyword plus Draft-07 unconditional `additionalItems`;
-      deliberate terminal exec-time `ENOENT`/`ENOTDIR` despite
-      adapter PATH continuation; a 65-entry PATH with an earlier terminal
-      outcome versus 64 nonterminal attempts reaching entry 65; reaped
-      first-candidate `EACCES` followed by candidate-local pre-anchor failure;
-      exact fd-10 execution context, `/dev/fd/10` `AT_EXECFN`, and failed
-      post-exec reopen; candidate-local actual-call
-      initial and post-`ETXTBSY` `ENOSYS`/`EPERM`/`EINVAL` with their exact
-      `single`/retry sequences versus
-      pre-observation missing ptrace guard; post-exec
-      process/image/mapping denials and unavailable stop verification;
-      exact-source 2,097,152/2,097,153 bytes;
-      stable-key/tool-name empty/HT/LF/CR/SP versus VT/FF/NBSP; normative
-      multi-cleanup failure ordering; and version-output empty/HT/LF/CR/SP
-      versus VT/FF/NUL/NBSP blank classification with UTF-8 precedence.
+- [ ] `SP1733-T4` — Owner: verification and handoff owner.
+      Dependencies: SP1733-T1 through SP1733-T3. Covers: B-001 through B-016.
+      Done when formatting, focused/package/workspace tests, clippy,
+      file-size/manifest/API/call-site audits, current-head independent review,
+      Gemini, and ruleset approval pass; every #1862 thread and valid #1859
+      finding is re-evaluated on the exact head. Verification must prove
+      owner-exclusive process creation/ptrace/wait/reap; atomic pidfd
+      registration before `GO`; direct-child rollback before registration;
+      two-pidfd/28-non-pidfd owner ledgers; exact-pidfd-only cleanup; registry
+      emptiness on success; and absence of anchors, PGID signalling,
+      membership stages, or descendant-tree claims. It must also cover
+      an unrelated same-session process repeatedly changing process groups
+      without entering the registry, being observed/signalled, or changing
+      success evidence;
+      `O_PATH` search-only cwd, both setup stages on initial/retry targets,
+      x86_64 `uselib` denial without an aarch64 pseudo-entry, output failure
+      precedence, static ELF success and all closed format rejections,
+      exec-stop/hash verification, repository non-execution, platform gates,
+      exact digest vectors, `ETXTBSY`, schema dialect behavior, source
+      binding, annotation bounds, and unchanged producer-only scope.
+      The original PR may close GH-1733 only after all gates pass. Verify every
+      command and audit in Required Verification on one current implementation
+      head, then collect fresh PR-gate evidence.
 
 ## Ownership and Ordering
 
@@ -176,183 +160,99 @@ of silently expanding scope.
       and `fchdir`; final-target authorization; `FD_CLOEXEC` shebang rejection;
       ptrace exec-stop/first-instruction ordering and hash/image validation under
       kernel write denial; W+X/executable-stack rejection; post-exec
-      syscall-stop denial of process/image/executable-mapping and existing-
-      executable-mutation transitions, target-initiated process signalling, and
-      pre-native x32 rejection; retained-handle pre-exec; non-anchor-only signalling
-      and typed anchor exit/termination/reap ordering;
+      syscall-stop denial of process/image/executable-mapping (including
+      x86_64 `uselib`) and existing-executable-mutation transitions,
+      target-initiated process signalling, and pre-native x32 rejection;
+      retained-handle pre-exec; exact registered-pidfd-only signalling and reap
+      ordering; empty-registry success;
       argument/environment pointer ownership; NUL validation; stage-tagged
-      errno propagation; released-PGID exclusion; and proof that `ENOEXEC`
+      errno propagation; absence of PGID/membership evidence; and proof that `ENOEXEC`
       cannot invoke a shell.
+
+## Product-to-Test Mapping
+
+| Product behavior | Required verification |
+| --- | --- |
+| B-001, B-014, B-015 | `envelope_round_trips_both_closed_subjects`; `envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch`; `fingerprint_digest_is_separate_from_component_integrity`; `fingerprint_digest_framing_vectors_are_independent`; `complete_runtime_and_mcp_payload_digest_vectors_are_fixed`; `canonical_payload_string_escaping_is_frozen`; `canonical_payload_preserves_raw_json_number_tokens`; `failure_payload_changes_fingerprint_digest_without_fabricating_integrity`; `component_integrity_preserves_exact_source_bytes_or_absence` |
+| B-002 | `local_executable_runtime_kind_is_closed_and_uses_fixed_args_and_output_grammars`; `container_isolation_fails_before_host_resolution`; `microvm_isolation_fails_before_host_resolution`; `sandbox_passthrough_state_is_only_supported_policy`; `restricted_sandbox_fails_before_host_observation`; `narrowed_allowed_write_paths_fail_before_host_observation`; server `runtime_fingerprint_runtime_kind_contract_is_exhaustive` |
+| B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `configured_mcp_server_key_accepts_1024_and_rejects_1025_before_expansion`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
+| B-004 | Frozen Unix/Windows command-form and digest vectors; `O_PATH` retained cwd with no `O_NOFOLLOW`; search-only cwd and pathname replacement; raw Unix bytes and Windows UTF-16 units; exact `EACCES` fallback, one 150 ms `ETXTBSY` retry, candidate 65, no shell, and fd-10 execution context; later pre-target outcomes preserve prior reaped attempts while the registry is empty |
+| B-005, B-010 | Closed environment policy, setup-secret exclusion, exact PATH and Claude-directory digest vectors, Unix/Windows key rules, direct/env shebang rejection before target/interpreter creation, and proof that only sanitized PATH reaches an admitted static target |
+| B-006 | Nonblocking retained executable handle, size and strong-identity checkpoints, hard-link authorization, kill-isolated observation helpers, atomic pidfd registration before `GO`, exact observation errors, static ELF/exec-stop verification, path-race rejection, and no in-process blocking worker |
+| B-007 | Eight-owner deadlines and phase-proven 28 + 12 descriptor capacity; two pidfds per owner; exact-pidfd-only signal/reap; initial/retry `working_directory_enter` and `trace_setup`; process/image/mapping/mutation/signalling denial including x86_64 `uselib`; target reap + complete output + post-reap checkpoint + empty registry success barrier; unrelated same-session `setpgid` churn is never registered/observed/signalled and cannot affect success; no anchor/PGID/membership/descendant-tree claim; non-Linux pre-observation failure |
+| B-008 | Closed failure vocabulary and canonical ordering; observation errors remain no-envelope; termination/reap/drain cleanup failures retain exact ownership; removed `lingering_process_group`, anchor, and membership values are rejected |
+| B-009 | Exact Codex/Claude whole-stream grammars and stream selection; capture error precedence; after complete capture signal/nonzero exclusivity; zero-exit-only UTF-8/blank/grammar classification; exact HT/LF/CR/SP blank predicate and success-only output digests |
+| B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; `mcp_output_schema_absence_and_presence_are_distinct`; `mcp_annotations_preserve_absent_empty_hints_title_vendor_values_and_ordered_arrays`; `mcp_annotation_hints_do_not_infer_capabilities`; exact-limit and limit-plus-one tool-name/description/annotations fixtures |
+| B-013 | `mcp_input_schema_rejects_every_non_object_root`; `mcp_output_schema_rejects_malformed_and_every_non_object_root`; `mcp_output_schema_applies_every_exact_and_limit_plus_one_bound`; `absent_schema_dialect_defaults_to_draft_2020_12`; `exact_supported_schema_dialects_round_trip`; `unknown_nonstring_and_nested_schema_dialects_fail_typed`; `schema_set_locations_reorder_canonically`; Draft 2020-12 `content_schema_traverses_nested_required_and_one_of_as_schema`; Draft-07 `content_schema_remains_ordered_instance_data`; `draft_07_dependencies_schema_and_string_set_forms_are_context_aware`; `draft_07_dependencies_reject_invalid_shapes`; `draft_2020_12_legacy_keywords_remain_instance_data`; `ordered_schema_annotation_and_extension_arrays_remain_sensitive`; `schema_keyword_shaped_annotation_keys_remain_instance_data`; `draft_2020_12_object_items_traverses_nested_schema`; `draft_2020_12_array_items_is_malformed`; `draft_07_array_items_preserves_tuple_order`; `draft_07_additional_items_traverses_schema_context`; `draft_07_additional_items_without_tuple_items_traverses_schema_context`; `shared_single_schema_keywords_traverse_closed_dialect_context`; `shared_single_schema_keywords_reject_non_schema_shapes_with_closed_detail`; `nested_schema_dialect_is_rejected_in_every_shared_single_schema_keyword`; `draft_2020_12_dependent_required_property_arrays_are_canonical_string_sets`; `dependent_required_rejects_non_string_set_shapes`; `boolean_items_is_canonical_nested_schema`; `raw_schema_rejects_duplicate_keys`; independent exact counting vectors pin root depth, value nodes, decoded key/value strings, direct entries, raw bytes, and canonical bytes; exact-limit and limit-plus-one fixtures for every `McpContractLimitKind`; deep/wide input does not panic; `rg` API audit proving no public `from_serializable`, `serde_json::Value`, or typed-map evidence constructor |
+| B-016 | `git diff` manifest check plus `rg` call-site audit proving no production consumer |
+
+Cross-cutting mandatory runtime tests additionally prove:
+
+- every owned role waits for pidfd registry commit before `GO`, while failed
+  registration runs no workload and either reaps the gated direct child or
+  retains the exact obligation;
+- owner admission accepts eight, the ninth fails before work, and permits stay
+  held until actual owner exit with an empty registry;
+- exact limits are two pidfds and 28 non-pidfd slots per owner, 16 pidfds and
+  320 retained descriptors globally. Phase accounting freezes at most 12
+  simultaneous child references (or target three plus observer five), with
+  role-exact fd allowlists and no foreign owner descriptors;
+- cwd opens with `O_PATH | O_DIRECTORY | O_CLOEXEC` and no `O_NOFOLLOW`,
+  including a search/execute-only directory and pathname replacement;
+- x86_64 x32 dispatch fails before native classification, x86_64 `uselib` is
+  denied as executable mapping, and aarch64 has no fabricated `uselib` entry;
+- output overflow/read failure precedes exit classification; signal and
+  nonzero outcomes do not also emit UTF-8/blank/grammar failures;
+- success requires target reap, complete bounded streams, a passing post-reap
+  checkpoint, and an empty registry, with no PGID, membership, negative-PID,
+  post-reap-PID, or descendant-tree evidence;
+- an unrelated same-session process continuously calling `setpgid` never
+  enters the registry or evidence, is never signalled, and cannot affect
+  success;
+- launch/source/envelope/schema limits retain their exact and limit-plus-one
+  vectors, and all failures omit raw paths, output, environment, and OS text.
+
+Direct and `/usr/bin/env` shebang fixtures stop before interpreter or target
+creation. macOS, other Unix, and Windows stop before cwd observation.
+Cancellation drops the hosting Tokio runtime and proves the independent owner
+continues exact registered-pidfd cleanup. Expected digests are independent
+fixed vectors, never values generated by the helper under test.
 
 ## Handoff Notes
 
 - PR #1859 remains the sole implementation PR and must be repaired on its
-  original branch after the readiness gate opens.
-- `runner_observed` describes evidence strength and trust; it never replaces
-  repository, user-global, admin, system, runtime, or genuine runner ownership.
-- Fingerprint bindings accept base source locators through 4,096 UTF-8 bytes
-  and complete derived locators through 8,259 bytes, with checked arithmetic
-  before allocation. Strict envelope input is capped at 2,097,152 raw bytes
-  before JSON decoding. Exact source bytes are capped at 2,097,152 before copy
-  or hashing. The four closed limit reasons and parser/constructor
-  precedence are frozen. These limits do not change global ASC-001 validity.
-- Runtime launch inputs are bounded before digest/split/join and before owner
-  admission: 65,536 exact Unix-byte or Windows-UTF-16 units per selected value,
-  and 1,024 observation environment entries/keys and setup-secret
-  names/name units. Those gates prove a 196,610-unit maximum for every reached
-  derived candidate without a separate limit failure. Excluded or undeclared values are
-  never read. Limit failure is no-envelope and cannot allocate an fd, occupy an
-  owner slot, or select another PATH candidate.
-- At most eight fingerprint-specific owners exist concurrently. Each retains
-  after `DESCRIPTORS_READY` at most 67 owner-side pidfds and 32 other fds; a
-  membership helper has at most 64 pidfds, making 131 retained references per
-  descriptor-isolated fingerprint and 1,048 across eight after READY. Pre-READY
-  inheritance has a deadline/rollback time bound but no claimed numeric
-  reference bound. One membership batch is handled at a time, and the permit is
-  held through every retained obligation until actual thread exit. Every owned
-  child closes all descriptors outside its fixed role allowlist and reports
-  `descriptors_ready`, `descriptor_isolation_unavailable`, or
-  `descriptor_isolation_failed`; it cannot run workload until pidfd registry
-  commit.
-  Bootstrap unavailability maps only to containment after reap, while a later
-  role's isolation failure maps only to child registration. Deadline is used
-  only before a concrete status. Rollback uses only the still-unreaped direct
-  child identity and never a negative PGID.
-- A bare configured command follows the frozen Unix or Windows v0.1 launch
-  contract independently of the build compiler. Unix rejects unset PATH rather
-  than guessing a default, attempts inspected candidates in PATH order, and
-  advances only after exact retained-handle `EACCES`; Windows selects one absolute
-  candidate. Neither path authorizes `PATHEXT` inference, guessed relative
-  bases, another basename, an `ENOEXEC` shell, `which`, or a package manager.
-  The closed command form makes bare search skips distinct from
-  absolute/qualified failures: exact open `ENOENT`/`ENOTDIR` is absent, while
-  an existing non-regular or mode-ineligible configured path retains its
-  identity failure. Fingerprint selection parity applies only to an eligible
-  native target that passes authorization and executes. Retained-handle
-  exec-time `ENOENT`/`ENOTDIR` is a deliberate terminal security divergence:
-  the producer does not execute or attribute a later PATH candidate even if
-  the adapter would continue.
-- `codex.cloud.setup_secret_env` is an unconditional bounded exclusion set.
-  Setup values and undeclared values are never read by the producer, copied,
-  bounded, hashed, persisted, or inserted into probe `envp`. This packet does
-  not claim to sandbox an already authorized executable from readable same-UID
-  host state. Only exclusion-surviving closed-policy values receive the
-  65,536-unit value limit.
-- The child `PATH` portion of resolution context is exactly the sanitized value
-  given to the probe. Windows current-executable, system, Windows-directory,
-  and parent-PATH search inputs are explicit optional resolution-only facts,
-  represented by four exact-domain UTF-16LE digests with absence distinct from
-  present empty. The closed runtime-kind table admits no other version-child
-  value. Configured working-directory spelling and Unix directory-handle
-  identity have separate fixed digests; the parent retains that handle and
-  every qualified/relative-PATH observation, open, and checkpoint uses
-  `fstatat`/`openat` against it, while every target helper enters it with
-  stage-tagged `fchdir` before handle exec. Replacing the cwd pathname cannot
-  redirect either side.
-- Executable size, metadata, and digest come from one retained opened
-  regular-file handle. Supported Linux uses device/inode and mode bits; Windows
-  requires volume serial plus file ID but records `containment_unavailable`
-  before cwd observation or spawn. All potentially blocking cwd, open,
-  classification, hash, and checkpoint operations run in registered,
-  kill-isolated observation subprocesses under the active deadline, never
-  `spawn_blocking`. The owner creates and pidfd-registers each helper before
-  exposing a lease; timeout returns a typed producer error with no envelope
-  while the owner retains an exact unreaped pidfd and no termination claim is
-  fabricated. The fixed executable
-  ceiling is 67,108,864 bytes, and byte 67,108,865 fails typed. Retained-handle
-  size/digest and path strong identity are checked initially, immediately
-  before spawn, at the pre-first-instruction exec stop under kernel write
-  denial, and after reap; a
-  mismatch discards version evidence. Supported Linux also requires
-  `st_nlink == 1` at authorization and rechecks it before spawn, after
-  `ETXTBSY`, at exec-stop, and after reap. An unavailable count is
-  `link_count_unprovable`, zero is `unlinked_target`, and only a count greater
-  than one is `multiple_hard_links`. Multiple links
-  fail authorization before spawn, fail retry authorization after one reaped
-  `ETXTBSY` helper and before a second helper, or become identity change after
-  target creation. Exec-stop observation failure is no-envelope execution
-  verification failure; post-reap failure is `identity/metadata_unavailable`.
-  This closes hard-link ambiguity but does not claim
-  bind-mount alias exclusion. This checkpoint correlation is not
-  path-history attestation. A bounded classifier accepts only
-  current-architecture static ELF without `PT_INTERP` or W+X `PT_LOAD` and
-  with exactly one non-executable `PT_GNU_STACK`; exact leading `#!`, dynamic/writable-executable/
-  executable-stack/malformed ELF, wrong-architecture ELF, and every
-  non-ELF/binfmt format fail
-  `interpreter_authorization_unavailable` before any interpreter, anchor, or
-  target; a late shebang is blocked by `FD_CLOEXEC` `execveat`. Supported native
-  Linux binaries stop at `PTRACE_EVENT_EXEC` before their first instruction and
-  resume only after handle hash and image identity match; the pathname is never
-  reopened. After mandatory ptrace containment passes, exact
-  `ENOSYS`/`EPERM`/`EINVAL` from the actual fd-10 target call emits
-  candidate-local `handle_execution_unavailable` with `single` on the first
-  call or the retry sequence after `ETXTBSY`, reaps every created helper, and
-  never falls back to a path. Missing ptrace guarding instead
-  returns no-envelope containment failure before cwd observation; Windows
-  independently returns
-  `containment_unavailable` first under its frozen platform matrix.
-- Runtime v0.1 is host-only. Container and microVM inputs fail before host
-  resolution, file access, or process creation. It also accepts only the
-  adapter's exact passthrough `DangerFullAccess` state with no allowed-write
-  narrowing; every restricted sandbox state fails
-  `sandbox_parity_unavailable` at the same pre-observation gate.
-- Repository-owned runtime configuration and any opened target inside a
-  validated repository/worktree boundary are never run for observation; their
-  identity/hash may be retained with a closed `probe_not_authorized` reason,
-  unavailable target authorization also prevents spawn, and neither policy has
-  a caller override.
-- Runtime environment evidence comes only from the exact closed runtime-kind
-  table. PATH and `CLAUDE_CONFIG_DIR` use separate frozen digest domains plus
-  raw Unix bytes; PATH is the sole admitted Linux version-child key. Pure
-  Windows helper vectors use UTF-16LE units but never enter a v0.1 envelope.
-  Platform-normalized setup-secret exclusion runs first, and Windows rejects
-  canonical key collisions or non-ASCII ambiguity.
-- Version stream processing checks the output cap, validates complete UTF-8,
-  then classifies blank as exactly empty or bytes from HT/LF/CR/SP. VT, FF,
-  NUL, NBSP, and every other byte are nonblank; no generic trimming or
-  whitespace predicate is allowed.
-- The combined stdout/stderr cap is caller-selectable only in `1..=65_536`,
-  validated before allocation or helper creation, inclusive, and bounded at
-  read time. After owner readiness, the five-second active deadline begins
-  before cwd observation and includes every observation plus the post-reap
-  checkpoint; cleanup has a separate five-second deadline. Linux claims only
-  root/original-process-group supervision, not non-escapable descendant
-  containment. Cleanup enumerates and revalidates exact non-anchor pidfds and
-  signals each individually; it never uses a negative PGID, and the anchor
-  exits only after the group is proven empty. Any helper/root/member setup,
-  termination, drain, or reap failure is typed and leaves ownership with the
-  pre-existing owner; membership verification failure is specifically a
-  no-envelope observation error. Cancellation uses the same owner
-  without evidence; macOS, other Unix, and Windows record
-  `containment_unavailable` before cwd observation.
-- MCP server identity is derived from a typed exact stable configuration-entry
-  key of at most 1,024 UTF-8 bytes rather than an arbitrary component. MCP
-  descriptions remain exact. Optional annotations accept only bounded,
-  duplicate-aware raw JSON objects; standard hints, title/vendor values, and
-  ordered arrays enter the fingerprint without inferring capabilities.
-  Required `inputSchema` and optional
-  presence-sensitive `outputSchema` share the same duplicate-aware bounded
-  contract. Non-object schema roots fail before canonicalization. Absent
-  `$schema` means Draft 2020-12; only the exact Draft 2020-12 and Draft-07
-  identifiers are accepted, and unknown/non-string/nested declarations fail
-  typed. Keyword context follows that selected dialect: modern
-  `contentSchema`, `dependentRequired`, `$defs`, and prefix semantics apply only
-  to Draft 2020-12; legacy `definitions`, `dependencies`, and tuple `items`
-  semantics apply only to Draft-07. The shared
-  `not`/conditional/contains/property/additional-property positions are
-  schema-valued in both dialects, and Draft-07 `additionalItems` is always
-  schema-valued. Malformed values fail closed. Draft-07
-  `contentSchema` remains ordered instance data. Annotation, extension, and
-  ordered-schema arrays retain order; evidence accepts only duplicate-aware raw
-  JSON. `harness-core` explicitly enables existing `serde_json/raw_value`;
-  borrowed recursive `RawValue` slices preserve exact validated number tokens
-  without a handwritten lexer, new package, or lockfile change. Fixed
-  text/annotation/schema limits fail typed under the frozen
-  depth, node, decoded-string, direct-entry, raw-byte, and canonical-byte
-  counting rules.
-- Envelope `fingerprint_digest` uses the frozen domain, three length frames,
-  canonical payload encoding, raw number-token preservation, and independent
-  vectors for both subjects; it covers subject plus canonical payload.
-  ASC-001 component integrity remains exact-source-byte evidence or absence.
-- This issue delivers producer APIs only. ASC-005 owns snapshot consumption and
-  ASC-026 owns native snapshot/diff commands.
+  original branch only after maintainers approve this packet and record
+  `ready_to_implement`.
+- The six-file packet is normative as a unit:
+  `product.md`, `runtime-product.md`, `runtime-observation.md`,
+  `runtime-supervision.md`, `tech.md`, and `tasks.md`.
+- `runner_observed` strengthens evidence observation; it never changes
+  repository, user, admin, system, runtime, or runner ownership.
+- Base source locators are bounded at 4,096 UTF-8 bytes, complete derived
+  locators at 8,259 bytes, exact source and raw envelope input at 2,097,152
+  bytes, with checked arithmetic and closed precedence.
+- Launch inputs are bounded at 65,536 exact Unix-byte or Windows-UTF-16 units;
+  environment/setup collections and names are bounded at 1,024. Excluded or
+  undeclared values are never read.
+- The owner admits exactly eight fingerprints. Each has two pidfd slots and 28
+  non-pidfd slots; global retained ceilings are 16 pidfds and 320 descriptors.
+  One pre-`GO` child has at most 12 references; post-exec target plus observer
+  has at most eight; no other concurrent roles exist. The permit remains held
+  until the owner exits with an empty exact registry.
+- Every child is gated until its pidfd plus reap obligation is registered.
+  Pre-registration rollback may use only its exact still-unreaped positive PID;
+  post-registration cleanup uses only the registered pidfd.
+- Success proves registered obligations are empty and the guarded target
+  executed no process-creation syscall. It does not claim descendant-tree
+  emptiness. Anchors, PGIDs, membership stages, and `/proc` group scans are
+  outside the design.
+- Retained cwd uses `O_PATH | O_DIRECTORY | O_CLOEXEC` without
+  `O_NOFOLLOW`; retained target execution remains fd-10
+  `execveat(AT_EMPTY_PATH)`.
+- Initial and retry supervision setup stages are exactly
+  `working_directory_enter` and `trace_setup`.
+- Output precedence is capture completion, then signal/nonzero, then
+  zero-exit-only UTF-8/blank/grammar selection.
+- Core schema dialect, raw-number preservation, MCP bounds, fingerprint digest,
+  authorized 14-path manifest, no-lockfile, and producer-only constraints are
+  unchanged.
