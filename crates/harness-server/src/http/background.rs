@@ -12,8 +12,8 @@ use anyhow::Context;
 use harness_workflow::runtime::{
     CommandDispatchOutcome, DeferClaimedCommandOutcome, DispatchBackoffPolicy,
     DispatchBarrierInput, DispatchBarrierReasonCode, RuntimeCommandDispatcher, RuntimeKind,
-    RuntimeProfile, RuntimeProfileSelector, WorkflowCommandRecord, WorkflowCommandType,
-    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
+    RuntimeProfile, RuntimeProfileSelector, WorkflowCommandRecord, WorkflowDefinition,
+    WorkflowInstance, WorkflowPrBindingRepairOutcome, WorkflowRuntimeStore,
 };
 use sha2::{Digest, Sha256};
 

@@ -640,7 +640,7 @@ mod tests {
     ) -> anyhow::Result<Option<crate::runtime::store::RuntimeActivityCompletion>> {
         let instance =
             test_prompt_workflow_instance(workflow_id, "implementing", Some("owner/repo"));
-        store.insert_instance_if_absent(&instance).await?;
+        store.force_upsert_instance_for_test(&instance).await?;
         let command = WorkflowCommand::enqueue_activity(
             PROMPT_TASK_IMPLEMENT_ACTIVITY,
             format!("{workflow_id}:implement"),

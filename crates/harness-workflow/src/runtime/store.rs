@@ -23,6 +23,8 @@ use std::path::Path;
 mod activity_completion;
 #[path = "store/artifacts.rs"]
 mod artifacts;
+#[path = "store/child_instance_start.rs"]
+mod child_instance_start;
 #[path = "store/command_facade.rs"]
 mod command_facade;
 #[path = "store/commands.rs"]
@@ -48,6 +50,8 @@ mod lock_order;
 #[path = "store/lock_order_tests.rs"]
 #[cfg(test)]
 mod lock_order_tests;
+#[path = "store/pr_binding_repair.rs"]
+mod pr_binding_repair;
 #[path = "store/prompt_payloads.rs"]
 mod prompt_payloads;
 #[path = "store/recovery.rs"]
@@ -74,14 +78,17 @@ mod terminal_instance_queries;
 mod transaction_helpers;
 #[path = "store/transition_validation.rs"]
 mod transition_validation;
+pub use child_instance_start::{WorkflowChildStart, WorkflowChildStartOutcome};
 pub use coverage_recovery::{
     WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
     WorkflowCoverageRecoveryTransition,
 };
 pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};
+pub use pr_binding_repair::WorkflowPrBindingRepairOutcome;
 pub use recovery::{
     WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
 };
+pub use runtime_job_state::WorkflowCancellationCleanupOutcome;
 pub use runtime_usage::{
     cost_usd_from_micros, cost_usd_to_micros, RuntimeUsageMetrics, RuntimeUsageRecord,
     RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,
@@ -91,10 +98,14 @@ pub use submission_commit::{
     WorkflowSubmissionPromptPayload,
 };
 pub use submission_instances::WorkflowSubmissionFilter;
+#[cfg(test)]
+use transaction_helpers::force_upsert_instance_for_test_tx;
 use transaction_helpers::{
-    apply_inline_command_side_effect, insert_decision_record_tx, insert_event_tx_with_id,
-    insert_instance_if_absent_tx, load_or_insert_initial_instance_tx, runtime_job_for_command_tx,
-    select_instance_for_update_tx, upsert_instance_tx,
+    apply_inline_command_side_effect, commit_decision_instance_tx,
+    commit_parent_attachment_instance_tx, commit_rejected_initial_failure_instance_tx,
+    commit_same_state_instance_tx, insert_decision_record_tx, insert_event_tx_with_id,
+    insert_validated_canonical_initial_instance_tx, insert_validated_observed_instance_tx,
+    load_or_insert_initial_instance_tx, runtime_job_for_command_tx, select_instance_for_update_tx,
 };
 pub(super) use transaction_helpers::{enum_str, insert_event_tx, to_jsonb_string};
 pub struct WorkflowRuntimeStore {

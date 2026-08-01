@@ -8,6 +8,8 @@ use std::fmt;
 mod evidence_contract;
 #[path = "validator_github_issue_pr.rs"]
 mod github_issue_pr_validation;
+#[path = "validator_hidden_transitions.rs"]
+mod hidden_transitions;
 #[path = "validator_prompt_task.rs"]
 mod prompt_task_validation;
 #[path = "validator_context.rs"]
@@ -220,6 +222,11 @@ impl TransitionAllowlist {
             .allow("pr_open", "local_review_gate", [EnqueueActivity, Wait])
             .allow("pr_open", "awaiting_feedback", [Wait])
             .allow(
+                "awaiting_feedback",
+                "local_review_gate",
+                [EnqueueActivity, Wait],
+            )
+            .allow(
                 "local_review_gate",
                 "local_review_gate",
                 [EnqueueActivity, Wait],
@@ -360,6 +367,7 @@ pub struct ValidationContext {
     pub wait_available: bool,
     pub allow_terminal_reopen: bool,
     pub allow_missing_pinned_cancel: bool,
+    pub allow_definition_pin_safety_decision: bool,
     pub active_dedupe_keys: BTreeSet<String>,
 }
 
@@ -663,29 +671,6 @@ impl DecisionValidator {
             prompt_task_validation::validate_decision(decision)?;
         }
         Ok(())
-    }
-
-    fn validate_hidden_workflow_transition(
-        &self,
-        instance: &WorkflowInstance,
-        decision: &WorkflowDecision,
-        context: &ValidationContext,
-    ) -> Result<bool, WorkflowDecisionRejection> {
-        if self.kind != DecisionValidatorKind::GithubIssuePr
-            || !github_issue_pr_validation::is_reconciliation_only_done_transition(decision)
-        {
-            return Ok(false);
-        }
-
-        let rule = TransitionRule::new(
-            decision.observed_state.as_str(),
-            "done",
-            [WorkflowCommandType::MarkDone],
-        );
-        self.validate_commands(&rule, decision, context)?;
-        validator_progress::validate_target_progress_contract(instance, decision)?;
-        github_issue_pr_validation::validate_reconciliation_only_done(decision, context)?;
-        Ok(true)
     }
 
     fn validate_command_payload(

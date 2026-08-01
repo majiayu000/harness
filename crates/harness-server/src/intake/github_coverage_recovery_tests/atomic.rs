@@ -29,7 +29,12 @@ async fn cancelled_recovered_quality_gate_is_reactivated_after_terminal_job() ->
     )
     .await?;
     let workflow_id = workflow_id(&project_id, Some(REPO), issue_number);
-    let command = store.commands_for(&workflow_id).await?.remove(0);
+    let command = store
+        .commands_for(&workflow_id)
+        .await?
+        .into_iter()
+        .find(|record| record.command.requires_runtime_job())
+        .ok_or_else(|| anyhow::anyhow!("quality gate command was not queued"))?;
     store
         .enqueue_runtime_job_for_pending_command(
             &command.id,
@@ -45,7 +50,7 @@ async fn cancelled_recovered_quality_gate_is_reactivated_after_terminal_job() ->
     let mut parent = store.get_instance(&workflow_id).await?.expect("parent");
     parent.state = "cancelled".to_string();
     parent.version += 1;
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
 
     let second_graphql = ready_pr_server(issue_number, pr_number).await;
     recover_with_urls(
@@ -58,9 +63,17 @@ async fn cancelled_recovered_quality_gate_is_reactivated_after_terminal_job() ->
     )
     .await?;
     let commands = store.commands_for(&workflow_id).await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].id, command.id);
-    assert_eq!(commands[0].status, WorkflowCommandStatus::Pending);
+    assert!(commands.iter().all(|record| {
+        record.command.requires_runtime_job()
+            || record.status == WorkflowCommandStatus::HandledInline
+    }));
+    let runtime_commands = commands
+        .iter()
+        .filter(|record| record.command.requires_runtime_job())
+        .collect::<Vec<_>>();
+    assert_eq!(runtime_commands.len(), 1);
+    assert_eq!(runtime_commands[0].id, command.id);
+    assert_eq!(runtime_commands[0].status, WorkflowCommandStatus::Pending);
     store
         .enqueue_runtime_job_for_pending_command(
             &command.id,
