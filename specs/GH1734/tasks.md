@@ -39,6 +39,10 @@ must list at least one matching test. Zero matches fail verification.
   - A failure carries no domain; the constructor derives it from the slot.
     The observation value is opaque, and `NotObserved` is available only
     through `not_observed_without_attempt`.
+  - The runtime- and MCP-fingerprint wrappers each expose their own
+    `not_observed_without_attempt()` delegating constructor, so every B-007
+    coverage combination remains constructible without making the wrappers
+    interchangeable.
 - Verify:
   - `cargo test -p harness-core stack::snapshot::tests::model`
   - `cargo check -p harness-core --all-targets`

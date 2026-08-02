@@ -154,6 +154,10 @@ AgentStackSnapshotInputs
 Each wrapper owns an `observed(Vec<AgentStackFingerprintEnvelope>)` typed
 constructor that validates the required runtime or MCP subject and permits an
 empty vector. This is the supported path for the all-observed empty vector.
+Each wrapper also owns its own `not_observed_without_attempt()` delegating
+constructor; it creates the wrapped generic `NotObserved` state without
+allowing a runtime wrapper to enter the MCP slot or vice versa. Coverage tests
+exercise both wrapper-specific no-attempt constructors.
 The corresponding producer adapter maps its actual producer `Result` into the
 same wrapper. There is no conversion between the wrappers, so the snapshot
 constructor cannot exchange the two slots even though both contain the same
@@ -605,6 +609,8 @@ substitutes component integrity for payload identity.
 
 The runtime wrapper's typed `observed` constructor accepts zero or more
 validated runtime-subject envelopes, including the successful empty case. The
+runtime wrapper's `not_observed_without_attempt()` is the only supported
+no-runtime-producer-attempt path. The
 harness-agents runtime producer adapter accepts the actual
 `Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError>` and
 maps `Ok` to a one-envelope runtime wrapper. It exhaustively maps
@@ -622,7 +628,8 @@ requires every successful envelope to have subject `mcp_tool`, and exhaustively
 maps contract errors to `invalid_evidence` or `limit_exceeded`. A later network
 collector owns its transport-error mapping and cannot claim ASC-005 compliance
 without passing an explicit `Failed` kind. `NotObserved` is available only
-through an explicit no-producer-attempt constructor and accepts no `Result`.
+through the MCP wrapper's explicit `not_observed_without_attempt()` constructor
+and accepts no `Result`.
 
 ## Minimal Identity Comparison
 
