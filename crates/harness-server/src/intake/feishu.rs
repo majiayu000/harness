@@ -42,14 +42,14 @@ impl FeishuIntake {
         self.config
             .app_id
             .clone()
-            .or_else(|| std::env::var("FEISHU_APP_ID").ok())
+            .or_else(|| harness_core::config::process_env::var("FEISHU_APP_ID").ok())
     }
 
     fn app_secret(&self) -> Option<String> {
         self.config
             .app_secret
             .clone()
-            .or_else(|| std::env::var("FEISHU_APP_SECRET").ok())
+            .or_else(|| harness_core::config::process_env::var("FEISHU_APP_SECRET").ok())
     }
 
     async fn get_tenant_access_token(&self) -> anyhow::Result<String> {

@@ -8,6 +8,7 @@ pub mod isolation;
 pub mod maintenance;
 pub mod misc;
 pub mod observe;
+pub mod process_env;
 pub mod project;
 pub mod resolve;
 pub mod server;
@@ -62,41 +63,87 @@ pub struct ProjectEntry {
     pub max_concurrent: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct HarnessConfig {
-    pub server: ServerConfig,
-    pub agents: AgentsConfig,
-    pub gc: GcConfig,
-    pub rules: RulesConfig,
-    pub observe: ObserveConfig,
+macro_rules! define_harness_config {
+    ($(
+        $(#[$attr:meta])*
+        $field:ident: $ty:ty,
+    )+) => {
+        #[derive(Debug, Clone, Serialize)]
+        pub struct HarnessConfig {
+            $(
+                $(#[$attr])*
+                pub $field: $ty,
+            )+
+        }
+
+        impl Default for HarnessConfig {
+            fn default() -> Self {
+                let mut config = Self {
+                    $($field: <$ty>::default(),)+
+                };
+                config.apply_derived_defaults();
+                config
+            }
+        }
+
+        impl<'de> Deserialize<'de> for HarnessConfig {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                #[derive(Deserialize)]
+                struct ParsedHarnessConfig {
+                    $(
+                        $(#[$attr])*
+                        $field: $ty,
+                    )+
+                }
+
+                let input: ParsedHarnessConfig =
+                    reserved_key_deserializer::deserialize(deserializer)?;
+                let ParsedHarnessConfig { $($field,)+ } = input;
+                let mut config = Self { $($field,)+ };
+                config.apply_derived_defaults();
+                Ok(config)
+            }
+        }
+    };
+}
+
+define_harness_config! {
+    server: ServerConfig,
+    agents: AgentsConfig,
+    gc: GcConfig,
+    rules: RulesConfig,
+    observe: ObserveConfig,
     #[serde(default)]
-    pub context: ContextConfig,
-    pub otel: OtelConfig,
+    context: ContextConfig,
+    otel: OtelConfig,
     #[serde(default)]
-    pub validation: ValidationConfig,
+    validation: ValidationConfig,
     #[serde(default)]
-    pub workspace: WorkspaceConfig,
+    workspace: WorkspaceConfig,
     #[serde(default)]
-    pub concurrency: ConcurrencyConfig,
+    concurrency: ConcurrencyConfig,
     #[serde(default)]
-    pub intake: IntakeConfig,
+    intake: IntakeConfig,
     #[serde(default)]
-    pub review: ReviewConfig,
+    review: ReviewConfig,
     #[serde(default)]
-    pub retry_scheduler: RetrySchedulerConfig,
+    retry_scheduler: RetrySchedulerConfig,
     #[serde(default)]
-    pub reconciliation: ReconciliationConfig,
+    reconciliation: ReconciliationConfig,
     #[serde(default)]
-    pub maintenance_window: MaintenanceWindowConfig,
+    maintenance_window: MaintenanceWindowConfig,
     #[serde(default)]
-    pub workflow: WorkflowRuntimeConfig,
+    workflow: WorkflowRuntimeConfig,
     #[serde(default)]
-    pub isolation: IsolationConfig,
+    isolation: IsolationConfig,
     #[serde(default)]
-    pub alerting: AlertingConfig,
+    alerting: AlertingConfig,
     /// Projects declared in the config file. Registered on server startup.
     #[serde(default)]
-    pub projects: Vec<ProjectEntry>,
+    projects: Vec<ProjectEntry>,
 }
 
 impl HarnessConfig {
@@ -168,102 +215,6 @@ impl HarnessConfig {
     }
 }
 
-impl Default for HarnessConfig {
-    fn default() -> Self {
-        let mut config = Self {
-            server: ServerConfig::default(),
-            agents: AgentsConfig::default(),
-            gc: GcConfig::default(),
-            rules: RulesConfig::default(),
-            observe: ObserveConfig::default(),
-            context: ContextConfig::default(),
-            otel: OtelConfig::default(),
-            validation: ValidationConfig::default(),
-            workspace: WorkspaceConfig::default(),
-            concurrency: ConcurrencyConfig::default(),
-            intake: IntakeConfig::default(),
-            review: ReviewConfig::default(),
-            retry_scheduler: RetrySchedulerConfig::default(),
-            reconciliation: ReconciliationConfig::default(),
-            maintenance_window: MaintenanceWindowConfig::default(),
-            workflow: WorkflowRuntimeConfig::default(),
-            isolation: IsolationConfig::default(),
-            alerting: AlertingConfig::default(),
-            projects: Vec::new(),
-        };
-        config.apply_derived_defaults();
-        config
-    }
-}
-
-impl<'de> Deserialize<'de> for HarnessConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct HarnessConfigInput {
-            server: ServerConfig,
-            agents: AgentsConfig,
-            gc: GcConfig,
-            rules: RulesConfig,
-            observe: ObserveConfig,
-            #[serde(default)]
-            context: ContextConfig,
-            otel: OtelConfig,
-            #[serde(default)]
-            validation: ValidationConfig,
-            #[serde(default)]
-            workspace: WorkspaceConfig,
-            #[serde(default)]
-            concurrency: ConcurrencyConfig,
-            #[serde(default)]
-            intake: IntakeConfig,
-            #[serde(default)]
-            review: ReviewConfig,
-            #[serde(default)]
-            retry_scheduler: RetrySchedulerConfig,
-            #[serde(default)]
-            reconciliation: ReconciliationConfig,
-            #[serde(default)]
-            maintenance_window: MaintenanceWindowConfig,
-            #[serde(default)]
-            workflow: WorkflowRuntimeConfig,
-            #[serde(default)]
-            isolation: IsolationConfig,
-            #[serde(default)]
-            alerting: AlertingConfig,
-            #[serde(default)]
-            projects: Vec<ProjectEntry>,
-        }
-
-        let input: HarnessConfigInput = reserved_key_deserializer::deserialize(deserializer)?;
-        let mut config = Self {
-            server: input.server,
-            agents: input.agents,
-            gc: input.gc,
-            rules: input.rules,
-            observe: input.observe,
-            context: input.context,
-            otel: input.otel,
-            validation: input.validation,
-            workspace: input.workspace,
-            concurrency: input.concurrency,
-            intake: input.intake,
-            review: input.review,
-            retry_scheduler: input.retry_scheduler,
-            reconciliation: input.reconciliation,
-            maintenance_window: input.maintenance_window,
-            workflow: input.workflow,
-            isolation: input.isolation,
-            alerting: input.alerting,
-            projects: input.projects,
-        };
-        config.apply_derived_defaults();
-        Ok(config)
-    }
-}
-
 #[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
@@ -271,6 +222,10 @@ mod tests;
 #[cfg(test)]
 #[path = "config_context_tests.rs"]
 mod context_tests;
+
+#[cfg(test)]
+#[path = "config_env_audit_tests.rs"]
+mod env_audit_tests;
 
 #[cfg(test)]
 #[path = "config_workflow_circuit_breaker_tests.rs"]

@@ -156,9 +156,7 @@ pub(crate) async fn fetch_github_pr_snapshot_with_client(
 }
 
 pub(crate) fn github_graphql_url() -> String {
-    std::env::var("HARNESS_GITHUB_GRAPHQL_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    harness_core::config::process_env::non_blank_config_value("HARNESS_GITHUB_GRAPHQL_URL")
         .unwrap_or_else(crate::github_client::graphql_url)
 }
 

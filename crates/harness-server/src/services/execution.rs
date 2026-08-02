@@ -24,6 +24,7 @@ pub use crate::workflow_runtime_submission::runtime_models::QueueDomain;
 pub enum EnqueueTaskError {
     BadRequest(String),
     Internal(String),
+    StoreUnavailable(&'static str),
     MaintenanceWindow { retry_after_secs: u64 },
 }
 
@@ -32,6 +33,7 @@ impl std::fmt::Display for EnqueueTaskError {
         match self {
             Self::BadRequest(message) => write!(f, "bad request: {message}"),
             Self::Internal(message) => write!(f, "internal error: {message}"),
+            Self::StoreUnavailable(store_name) => write!(f, "{store_name} unavailable"),
             Self::MaintenanceWindow { retry_after_secs } => {
                 write!(
                     f,
@@ -387,9 +389,7 @@ impl DefaultExecutionService {
             ));
         }
         if self.workflow_runtime_store.is_none() {
-            return Err(EnqueueTaskError::Internal(
-                "workflow runtime store is required for submissions".to_string(),
-            ));
+            return Err(EnqueueTaskError::StoreUnavailable("workflow runtime store"));
         }
 
         if let Some(definition_id) = req.definition_id.as_deref() {
