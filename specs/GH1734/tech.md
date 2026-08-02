@@ -136,12 +136,26 @@ DomainObservationState<T>  // private enum
   Observed(Vec<T>)
   Failed(AgentStackProducerFailure)
 
+AgentStackRuntimeFingerprintObservation(  // opaque public newtype
+  AgentStackDomainObservation<AgentStackFingerprintEnvelope>
+)
+
+AgentStackMcpFingerprintObservation(  // opaque public newtype
+  AgentStackDomainObservation<AgentStackFingerprintEnvelope>
+)
+
 AgentStackSnapshotInputs
   repository_inventory: AgentStackDomainObservation<AgentStackInventoryEntry>
   runtime_context: AgentStackDomainObservation<AgentStackRuntimeContextEvidence>
-  runtime_fingerprint: AgentStackDomainObservation<AgentStackFingerprintEnvelope>
-  mcp_fingerprint: AgentStackDomainObservation<AgentStackFingerprintEnvelope>
+  runtime_fingerprint: AgentStackRuntimeFingerprintObservation
+  mcp_fingerprint: AgentStackMcpFingerprintObservation
 ```
+
+Only the corresponding runtime or MCP adapter constructs its fingerprint
+observation wrapper. There is no conversion between the wrappers, so the
+snapshot constructor cannot exchange the two slots even though both contain
+the same closed envelope type. A failed observation still carries no domain;
+the wrapper and destination slot determine that domain.
 
 Harness-core owns one closed `AgentStackContextSelectionReason` enum whose
 variants map one-to-one to the existing runtime constants:
