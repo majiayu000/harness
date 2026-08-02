@@ -374,6 +374,14 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    its thread exits and its exact pidfd registry is empty; API return, timeout,
    cancellation, or cleanup-incomplete cannot release it early.
 
+   Each fork occurs with every blockable signal blocked after saving the owner
+   thread's exact mask. The parent restores that mask immediately; restore
+   failure closes the gate, rolls back the child, and returns
+   `containment_unavailable/signal_isolation_unavailable`. The child resets all
+   catchable dispositions while blocked, then installs the exact empty mask
+   before `DescriptorsReady`; every target exec therefore inherits default
+   dispositions and no blocked signals.
+
    Each ready owner has two pidfd slots, one for the current target and one for
    the current observation or capability helper. Across eight owners the exact
    maximum is 16 pidfds. Its non-pidfd ledger has 28 slots. Before

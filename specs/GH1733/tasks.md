@@ -51,8 +51,9 @@ implementation PR or force-push.
       `DescriptorsReady`, at most one bootstrap child per owner may
       transiently inherit the process-wide fd table in addition to an admitted
       target; it performs no workload and is not numerically ledger-bounded.
-      The owner blocks all blockable signals before each fork, restores its
-      mask afterward, and the child resets dispositions before signal delivery.
+      The owner blocks all blockable signals before each fork and restores its
+      exact saved mask or rolls back and exits. While blocked, the child resets
+      dispositions, then installs an empty mask before readiness and target exec.
       The active deadline bounds readiness waiting; rollback uses the cleanup
       deadline, with obligation and permit retained until reap. After readiness one child retains at most 12
       allowlisted references; a post-exec target plus observer retains at most
@@ -95,7 +96,8 @@ implementation PR or force-push.
       exact-pidfd-only cleanup; registry
       emptiness on success; and absence of anchors, PGID signalling,
       membership stages, or descendant-tree claims. It must also cover
-      owner-mask and child-disposition signal isolation; offset-zero `pread`
+      owner-mask restore failure, child-disposition reset, and exact empty child
+      mask before readiness/exec; offset-zero `pread`
       hashing across transferred handles; native `init_module`/`finit_module` denial;
       an unrelated same-session process repeatedly changing process groups
       without entering the registry, being observed/signalled, or changing

@@ -680,7 +680,8 @@ review for exact `SandboxSpec` passthrough equivalence, observation-process
 fixed-frame/`SCM_RIGHTS` protocol, pidfd ownership and revalidation,
 bounded pre-ready inherited-fd transient, post-ready descriptor
 allowlists/foreign-fd isolation/start-gate ordering and direct-child rollback,
-pre-fork signal masking with parent restoration and child disposition reset,
+pre-fork signal masking, parent restore-failure rollback, child disposition
+reset, and the exact empty mask inherited by target exec,
 capability-child validating/consuming `waitid(P_PIDFD)` plus unreaped-only
 bootstrap exact-PID fallback, global owner-permit lifetime, owner/helper/child
 descriptor ledgers, bounded launch/environment/setup-secret counting before

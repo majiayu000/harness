@@ -488,30 +488,30 @@ precomputes a collision-free remap schedule; an already-fd-10 retained handle
 keeps its original `O_CLOEXEC`, otherwise the child uses `dup3(..., 10,
 O_CLOEXEC)` before closing the source descriptor.
 
-Before each fork, the owner saves the calling thread's signal mask and blocks
-every blockable signal; failure returns no-envelope
-`ContainmentUnavailable(SignalIsolationUnavailable)` before fork. The child inherits that mask, and the parent restores its saved mask immediately after
-fork inside the same critical section. While the child transiently owns the
-process-wide fd table, it uses only raw async-signal-safe `rt_sigaction`,
-`rt_sigprocmask`, `dup2`/`dup3`, segmented `close_range`, `write`, `read`,
-`close`, and `_exit`: it resets every catchable disposition to `SIG_DFL`,
-establishes the frozen role mask and fd allowlist, reports status, then waits
-for `GO`. No inherited handler can run with the full fd table; `SIGKILL` and
-`SIGSTOP` can only terminate or stop it. Closed statuses are `DescriptorsReady`,
-`SignalIsolationFailed`, `DescriptorIsolationUnavailable`, and
+Before each fork, the owner saves the calling thread's signal mask and blocks every
+blockable signal; failure returns no-envelope `ContainmentUnavailable(SignalIsolationUnavailable)` before fork. The child inherits the all-blocked mask.
+The parent restores its exact saved mask immediately after fork inside the same critical section and before waiting for child status. Restore failure closes the
+gate, runs bounded exact-positive-PID rollback, and returns that same containment
+error after reap; incomplete rollback uses the existing cleanup-incomplete result and retains the permit.
+The owner thread then exits and is never reused with the unrestored mask.
+While the child transiently owns the process-wide fd table, it uses only raw
+async-signal-safe `rt_sigaction`, `rt_sigprocmask`, `dup2`/`dup3`, segmented
+`close_range`, `write`, `read`, `close`, and `_exit`. With every blockable
+signal still blocked, it resets every catchable disposition to `SIG_DFL` and
+establishes the fd allowlist. Immediately before reporting `DescriptorsReady`
+it installs the exact empty mask for every role; each target therefore waits
+for `GO` and executes its image with default dispositions and no blocked
+signals. No inherited handler can run with the full fd table; `SIGKILL` and
+`SIGSTOP` can only terminate or stop it. Any child `rt_sigaction` or
+`rt_sigprocmask` failure emits `SignalIsolationFailed` and exits without role
+work. Other closed statuses are `DescriptorIsolationUnavailable` and
 `DescriptorIsolationFailed`. This path is allocation-free and non-panicking.
-Before `GO`, the child cannot access cwd or
-any filesystem/proc path, invoke ptrace, inspect a target, or
-exec. Inside one synchronous, non-cancellable parent critical section, the
-owner forks and waits for one closed bootstrap status. Only
-`DescriptorsReady` permits `pidfd_open`, registry commit of the pidfd plus
-direct-child reap obligation, and the later `GO`; no client lease, response
-channel, or transferred descriptor is exposed earlier. `close_range`
-descriptor isolation, or an exactly
-equivalent audited primitive, is part of the Linux capability contract; the
-initial capability child attempts that isolation before any other role work,
-and unavailability fails typed before cwd/filesystem observation, ptrace, or
-exec.
+Before `GO`, the child cannot access cwd or any filesystem/proc path, invoke
+ptrace, inspect a target, or exec. Inside one synchronous, non-cancellable
+parent critical section, only `DescriptorsReady` permits `pidfd_open`, registry
+commit of the pidfd plus direct-child reap obligation, and the later `GO`; no
+client lease, response channel, or transferred descriptor is exposed earlier.
+`close_range` descriptor isolation, or an exactly equivalent audited primitive, is part of the Linux capability contract; the initial capability child attempts it before any other role work, and unavailability fails typed before cwd or exec.
 
 This gate applies to every closed `RuntimeOwnedChildRole`:
 `Observation(RuntimeObservationStage)` (including capability and retained-
