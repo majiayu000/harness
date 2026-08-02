@@ -93,8 +93,8 @@ pub(crate) async fn get_artifacts(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if state.core.workflow_runtime_store.is_none() {
-        return runtime_store_unavailable();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_artifacts_by_handle(&state, &task_id).await {
@@ -111,8 +111,8 @@ pub(crate) async fn get_prompts(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if state.core.workflow_runtime_store.is_none() {
-        return runtime_store_unavailable();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_prompts_by_handle(&state, &task_id).await {
@@ -280,14 +280,6 @@ fn internal_server_error() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"error": "internal server error"})),
-    )
-        .into_response()
-}
-
-fn runtime_store_unavailable() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({"error": "workflow runtime store unavailable"})),
     )
         .into_response()
 }

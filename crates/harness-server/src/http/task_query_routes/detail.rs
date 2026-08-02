@@ -59,8 +59,8 @@ pub(crate) async fn get_runtime_submission(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if state.core.workflow_runtime_store.is_none() {
-        return workflow_runtime_store_unavailable_response();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_task_response_by_handle(&state, &task_id).await {
@@ -172,17 +172,6 @@ async fn runtime_task_response_by_handle(
         subtask_ids: Vec::new(),
         workflow: Some(TaskWorkflowSummary::from_runtime(&workflow)),
     }))
-}
-
-fn workflow_runtime_store_unavailable_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": "workflow runtime store unavailable",
-            "message": "workflow runtime store is unavailable",
-        })),
-    )
-        .into_response()
 }
 
 pub(crate) fn proof_from_runtime_workflow(
@@ -320,8 +309,8 @@ pub(crate) async fn get_runtime_submission_proof(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if state.core.workflow_runtime_store.is_none() {
-        return workflow_runtime_store_unavailable_response();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_proof_by_handle(&state, &task_id).await {

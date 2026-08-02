@@ -623,13 +623,8 @@ pub fn resolve_xdg_config_harness_root(
     xdg_config_home: Option<&Path>,
     home: Option<&Path>,
 ) -> Result<PathBuf, AgentStackComponentError> {
-    let root = if let Some(xdg) = xdg_config_home.filter(|path| path.is_absolute()) {
-        xdg.join("harness")
-    } else if let Some(home) = home.filter(|path| path.is_absolute()) {
-        home.join(".config").join("harness")
-    } else {
-        return Err(AgentStackComponentError::XdgConfigRootUnavailable);
-    };
+    let root = crate::config::dirs::xdg_config_harness_root(xdg_config_home, home)
+        .ok_or(AgentStackComponentError::XdgConfigRootUnavailable)?;
     normalize_absolute_path(&root)
 }
 

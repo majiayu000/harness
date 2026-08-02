@@ -169,12 +169,9 @@ pub(crate) async fn get_workflow_runtime_tree(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WorkflowRuntimeTreeQuery>,
 ) -> Response {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "workflow runtime store unavailable" })),
-        )
-            .into_response();
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
     };
     let limit = query
         .limit

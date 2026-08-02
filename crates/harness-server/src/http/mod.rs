@@ -16,6 +16,7 @@ use axum::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+pub(crate) mod api_error;
 pub(crate) mod auth;
 pub(crate) mod auth_routes;
 pub(crate) mod auto_merge;

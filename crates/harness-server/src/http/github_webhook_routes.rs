@@ -8,7 +8,7 @@ use serde_json::json;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
-use super::{state::AppState, task_routes};
+use super::{api_error::ApiError, state::AppState, task_routes};
 
 fn configured_github_webhook_project_root(
     github: Option<&harness_core::config::intake::GitHubIntakeConfig>,
@@ -209,33 +209,9 @@ pub(crate) async fn github_webhook(
                 });
                 (StatusCode::ACCEPTED, Json(response))
             }
-            Err(crate::services::execution::EnqueueTaskError::BadRequest(error)) => {
-                (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
-            }
-            Err(crate::services::execution::EnqueueTaskError::Internal(error)) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": error })),
-            ),
-            Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow {
-                retry_after_secs,
-            }) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "maintenance_window", "retry_after": retry_after_secs })),
-            ),
+            Err(error) => error.into_status_json(),
         },
-        Err(crate::services::execution::EnqueueTaskError::BadRequest(error)) => {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
-        }
-        Err(crate::services::execution::EnqueueTaskError::Internal(error)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error })),
-        ),
-        Err(crate::services::execution::EnqueueTaskError::MaintenanceWindow {
-            retry_after_secs,
-        }) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "maintenance_window", "retry_after": retry_after_secs })),
-        ),
+        Err(error) => ApiError::from(error).into_status_json(),
     }
 }
 

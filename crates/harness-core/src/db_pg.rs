@@ -156,14 +156,14 @@ fn configured_pg_pool_config() -> anyhow::Result<PgPoolConfig> {
 }
 
 fn configured_database_url_from_env(name: &str) -> Option<String> {
-    std::env::var(name)
+    crate::config::process_env::var(name)
         .ok()
         .map(|url| url.trim().to_string())
         .filter(|url| !url.is_empty())
 }
 
 fn configured_u32_from_env(name: &str) -> anyhow::Result<Option<u32>> {
-    match std::env::var(name) {
+    match crate::config::process_env::var(name) {
         Ok(value) if !value.trim().is_empty() => value
             .trim()
             .parse()
@@ -174,7 +174,7 @@ fn configured_u32_from_env(name: &str) -> anyhow::Result<Option<u32>> {
 }
 
 fn configured_u64_from_env(name: &str) -> anyhow::Result<Option<u64>> {
-    match std::env::var(name) {
+    match crate::config::process_env::var(name) {
         Ok(value) if !value.trim().is_empty() => value
             .trim()
             .parse()
@@ -199,7 +199,7 @@ fn database_url_config_paths() -> anyhow::Result<Vec<PathBuf>> {
     // Unit tests may temporarily change the process CWD while other tests open
     // stores concurrently. The test binary path is stable, so this preserves the
     // repository config fallback without reading the generic DATABASE_URL.
-    if std::env::var_os("XDG_CONFIG_HOME").is_none() {
+    if crate::config::process_env::var_os("XDG_CONFIG_HOME").is_none() {
         if let Ok(current_exe) = std::env::current_exe() {
             if let Some(parent) = current_exe.parent() {
                 if let Some(path) = repository_default_config_from_dir(parent) {
