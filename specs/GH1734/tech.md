@@ -548,16 +548,23 @@ Core adds the narrow consuming API
 `pub(crate) fn into_entries(self) -> Vec<AgentStackInventoryEntry>` to
 `AgentStackInventory` and moves each entry directly; no public iterator or
 clone-based adapter is introduced. The conversion retains the validated
-component and exact `AgentStackEntryClass`. The official
-repository helper accepts
+component and exact `AgentStackEntryClass`. Because `stack/snapshot/tests.rs`
+is a sibling of the inventory module, `AgentStackInventoryEntry` also adds one
+`#[cfg(test)] pub(super)` typed fixture factory in `stack/inventory/mod.rs`.
+It accepts a validated component plus an explicit `AgentStackEntryClass`, is
+absent from production builds, and is the portable construction path for the
+literal `0x02` vector. The official repository helper accepts
 `Result<AgentStackInventory, AgentStackInventoryError>` and maps every current
 error kind exhaustively: `LimitExceeded` becomes `limit_exceeded`;
 `InvalidOptions`, `ConfigParse`, `ConfiguredSourceInvalid`, and
 `ComponentValidation` become `invalid_evidence`; every I/O, race, escape,
 missing-source, cycle, metadata, or unsupported-entry kind becomes
 `source_unavailable`. Adding an inventory error variant breaks the exhaustive
-match. A regular-file executable toggle and file-to-directory-presence change
-have dedicated integration tests.
+match. On Unix, a real-inventory regular-file executable toggle has a dedicated
+integration test. On non-Unix, the real inventory test requires
+`unix_executable: None`; portable typed-fixture tests cover the `0x00`, `0x01`,
+and `0x02` canonical tags on every target. A file-to-directory-presence change
+has a dedicated integration test on every target.
 
 ### Runtime Context
 
@@ -700,7 +707,9 @@ memory kind/scope/record locator/metadata made inconsistent.
 ### Integration
 
 - The repository helper consumes a real `AgentStackInventory` through
-  `into_entries`; inventory executable-bit changes alter stable identity.
+  `into_entries`. On Unix, real-inventory executable-bit changes alter stable
+  identity; on non-Unix, real inventory retains `unix_executable: None` and
+  the typed fixture proves executable-tag sensitivity.
 - Runtime-context caller-vector reorder is invariant; swapping the explicit
   orders of two otherwise valid entries changes identity, while a one-entry
   gap/duplicate mutation fails.
@@ -718,8 +727,12 @@ memory kind/scope/record locator/metadata made inconsistent.
 
 During implementation:
 
+Before accepting any focused filtered command in this section, run the same
+filter with `-- --list` and require at least one matching test. Zero matches
+fail verification.
+
 ```text
-cargo test -p harness-core stack_snapshot
+cargo test -p harness-core stack::snapshot::tests
 cargo test -p harness-server context_provenance
 cargo check -p harness-core --all-targets
 cargo check -p harness-server --all-targets

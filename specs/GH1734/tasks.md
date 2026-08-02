@@ -66,6 +66,10 @@ must list at least one matching test. Zero matches fail verification.
     accessor and adds exactly one crate-visible consuming `into_entries(self)`
     API for the adapter; typed conversion moves every complete
     `AgentStackInventoryEntry` without cloning.
+  - `AgentStackInventoryEntry` adds one `#[cfg(test)] pub(super)` typed fixture
+    factory in `stack/inventory/mod.rs`, allowing sibling snapshot tests to
+    provide a validated component and explicit entry class without exposing a
+    production constructor.
   - Executable tri-state and directory presence enter the stable projection.
   - The portable conformance test constructs the literal `0x02` case from a
     typed inventory-entry fixture. A Unix-only integration test constructs
@@ -137,7 +141,7 @@ must list at least one matching test. Zero matches fail verification.
     and only unambiguous identity discontinuity.
   - Every new file remains below 800 lines and no test is weakened.
 - Verify:
-  - `cargo test -p harness-core stack::snapshot`
+  - `cargo test -p harness-core stack::snapshot::tests`
   - `cargo test -p harness-core stack`
   - `cargo test -p harness-server context_provenance`
   - `cargo check --workspace --all-targets`
