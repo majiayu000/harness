@@ -25,8 +25,11 @@ pidfds. Its exact non-pidfd ledger contains 28 slots. Before
 `DescriptorsReady`, at most one newly forked bootstrap child per owner may
 transiently retain the process-wide inherited descriptor table in addition to
 an already admitted target role. That transient has no numeric ceiling derived
-from the owner ledger, performs no workload, and is bounded by the active
-deadline plus exact direct-child rollback. After `DescriptorsReady`, foreign
+from the owner ledger and performs no workload. The active deadline bounds the
+wait for `DescriptorsReady`; expiry starts exact direct-child rollback under
+the cleanup deadline. No descriptor-reference release is claimed until reap,
+and cleanup-incomplete retains the obligation and permit. After
+`DescriptorsReady`, foreign
 references are absent and simultaneous allowlisted child references are frozen
 by phase:
 
@@ -145,9 +148,9 @@ The exact-pidfd success barrier is conjunctive:
 No group scan or descendant enumeration participates. The supported claim is
 only that every registered target/helper obligation is empty and no guarded
 process-creation syscall executed. It is not a descendant-tree-empty claim.
-Descriptor isolation prevents another process from inheriting the output
-pipes, and the pre-execution guard prevents the admitted target from creating a
-process that could receive them.
+Descriptor isolation prevents post-ready retention, not initial fork
+inheritance, of foreign output and control descriptors. The pre-execution guard
+prevents the admitted target from creating a process that could receive them.
 
 An adversarial unrelated process in the same Unix session may churn `setpgid`
 throughout the probe. It is not owner-created or registered, so its PID is

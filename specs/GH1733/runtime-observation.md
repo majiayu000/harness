@@ -521,8 +521,9 @@ Failure or cancellation before registry commit closes the
 parent gate, so the still-gated direct child exits without workload. Until that
 child is reaped, its exact positive PID cannot be reused; the owner may use only
 that positive direct-child PID for bounded rollback termination/wait and never
-after reap or through a negative PID or PGID. Failure after commit uses the registered
-pidfd. A completed rollback returns no-envelope
+after reap or through a negative PID or PGID. Failure after commit uses the
+registered pidfd, except for the failed capability-bootstrap reap defined
+below. A completed rollback returns no-envelope
 `ChildRegistrationUnavailable { role, stage }`; a rollback that misses the
 applicable cleanup deadline returns
 `ChildRegistrationCleanupIncomplete { role, operation }`, retains the direct-
@@ -546,12 +547,14 @@ failure after that successful preflight maps to
 first observes its terminal event with
 `waitid(P_PIDFD, ..., WEXITED | WNOWAIT)` and then consumes the same event
 with `waitid(P_PIDFD, ..., WEXITED)`. Both results must carry the registered
-child identity, `CLD_EXITED`, and status zero. `ENOSYS`, `EINVAL`, `EPERM`,
-`EACCES`, `ECHILD`, or an identity/code/status mismatch returns
-`ContainmentUnavailable(PidfdUnavailable)` before cwd or any later child.
-Solely on this fail-closed bootstrap path, the still-unreaped direct child may
-be reaped by exact positive PID while its pidfd remains held. Fallback failure
-returns the existing cleanup-incomplete error and retains the owner permit.
+child identity, `CLD_EXITED`, and status zero. A `WNOWAIT` call error or result
+mismatch, or a consuming-call error while the child remains unreaped, permits
+the sole exact positive-PID fallback while its pidfd remains held. A successful
+consuming wait has already reaped the child; malformed identity, code, or status
+then closes and unregisters it without any positive-PID operation. Every such
+failure returns `ContainmentUnavailable(PidfdUnavailable)` before cwd or any
+later child. Fallback failure returns the existing cleanup-incomplete error and
+retains the owner permit.
 After capability success, every registered-child wait and reap is pidfd-only.
 For the initial `Observation(CapabilityCheck)` role only, `ENOSYS`, seccomp
 `EPERM`/`EACCES`, or unsupported-flag
@@ -710,7 +713,9 @@ from tagged syscall, ptrace-event, seccomp, and group stops using the full wait
 status plus `PTRACE_GETSIGINFO`, then resumes with `PTRACE_SYSCALL` while
 injecting the same signal. A caught or ignored signal keeps `AwaitEntry`; a
 terminating signal yields only `terminated_by_signal` after complete capture.
-`SIGKILL` may terminate directly with the same semantic result. A delivery
+A direct `SIGKILL` terminal event in `AwaitEntry` or `AwaitExit` yields the same
+semantic result; in `AwaitInitialExecExit` it is
+`ExecutionVerificationUnavailable`. A delivery
 stop in `AwaitInitialExecExit` or `AwaitExit`, malformed siginfo, a group,
 seccomp, event, untagged, wrong-op, wrong-architecture, or duplicate stop
 returns `ExecutionVerificationUnavailable` and starts cleanup. The active

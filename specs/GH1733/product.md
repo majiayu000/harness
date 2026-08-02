@@ -574,6 +574,9 @@ attempt vocabularies are normative in `runtime-product.md`.
       distinguished from ptrace traps. Illegal-state delivery, group stops,
       malformed siginfo, and cleanup-originated signals never become target
       signalling or semantic exit evidence; capture failure still has priority.
+      Direct `SIGKILL` death is accepted from `AwaitEntry` or `AwaitExit` as
+      `terminated_by_signal`, but from `AwaitInitialExecExit` it is
+      `ExecutionVerificationUnavailable`; each state has a fixture.
 - [ ] On x86_64, both dangerous and otherwise harmless syscall numbers carrying
       `__X32_SYSCALL_BIT` fail no-envelope execution verification before native
       classification and are never normalized by clearing the bit. Native
@@ -587,8 +590,10 @@ attempt vocabularies are normative in `runtime-product.md`.
       fingerprint, 16 pidfds globally, and 320 descriptors globally. Before
       readiness, at most one bootstrap child per owner may transiently inherit
       the process-wide fd table in addition to an admitted target; it performs
-      no workload, has no numeric ledger-derived ceiling, and must reach
-      readiness or exact direct-child rollback by the active deadline. After
+      no workload and has no numeric ledger-derived ceiling. The active deadline
+      bounds waiting for readiness; on expiry the owner starts exact direct-child
+      rollback under the cleanup deadline and retains the obligation and permit
+      until reap. After
       readiness one child retains at most 12 allowlisted references, while a
       post-exec target retains three stdio references and a concurrent exec-stop
       observer at most five; no other phase has two live child roles. There is
@@ -597,16 +602,18 @@ attempt vocabularies are normative in `runtime-product.md`.
       Two-owner and eight-owner interleavings inspect
       `/proc/<pid>/fd` at `DESCRIPTORS_READY` and find exactly the role
       allowlist. A child stalled before readiness may retain a foreign marker
-      only until deadline/rollback; one stalled after readiness retains exactly
+      until exact rollback/reap; one stalled after readiness retains exactly
       its allowlist and no other owner's gate, output, or control descriptors.
       Owner-side
       self-pidfd fixtures cover preflight success and every
       `pidfd_open`/signal-zero failure before the capability child and cwd,
       then require successful `waitid(P_PIDFD, WEXITED | WNOWAIT)` observation
       plus consuming `waitid(P_PIDFD, WEXITED)` of the zero-exit capability
-      child. `ENOSYS`, `EINVAL`, `EPERM`, `EACCES`, `ECHILD`, identity,
-      code, and status mismatches exercise exact-PID bootstrap rollback and
-      prove no cwd or later child begins.
+      child. `WNOWAIT` errors/mismatches and consuming-call errors while the
+      child remains unreaped exercise exact-PID bootstrap rollback. A successful
+      consuming wait with malformed identity, code, or status proves no later
+      positive-PID operation occurs; every failure returns pidfd-unavailable
+      before cwd or any later child.
       Start-gate fault injection covers the `CapabilityCheck` and every other
       observation stage plus `InitialTarget` and `RetryTarget` roles. No role
       performs workload before `GO`;

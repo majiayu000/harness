@@ -378,8 +378,10 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    maximum is 16 pidfds. Its non-pidfd ledger has 28 slots. Before
    `DescriptorsReady`, at most one bootstrap child per owner may transiently
    inherit the process-wide descriptor table in addition to an admitted
-   target. It performs no workload, has no numeric owner-ledger ceiling, and is
-   bounded by the active deadline plus exact direct-child rollback. After
+   target. It performs no workload and has no numeric owner-ledger ceiling. The
+   active deadline bounds waiting for `DescriptorsReady`; expiry starts exact
+   direct-child rollback under the cleanup deadline, and no release is claimed
+   before reap. Cleanup-incomplete retains the obligation and permit. After
    readiness one child has at most 12 allowlisted references. After target
    exec, the target retains exactly three stdio references; a concurrent
    exec-stop observation helper retains at most five, for eight simultaneous
@@ -397,9 +399,12 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    `waitid(P_PIDFD, WEXITED | WNOWAIT)` followed by a consuming
    `waitid(P_PIDFD, WEXITED)`; both results require its registered identity,
    `CLD_EXITED`, and status zero. Failure returns
-   `containment_unavailable/pidfd_unavailable` before cwd or later children;
-   solely for this bootstrap, exact positive-PID reap while the pidfd remains
-   held is permitted, and fallback failure retains the owner permit. After
+   `containment_unavailable/pidfd_unavailable` before cwd or later children.
+   Solely for this bootstrap, a `WNOWAIT` failure/mismatch or consuming-call
+   error while the child remains unreaped permits exact positive-PID reap while
+   the pidfd remains held. A successful consuming wait has reaped the child, so
+   a malformed identity/code/status result closes and unregisters it without a
+   positive-PID operation. Fallback failure retains the owner permit. After
    success every registered-child wait/reap is pidfd-only. The owner is the
    sole process creator, parent-side ptrace
    controller, helper spawner, waiter, and reaper; the target pre-exec
@@ -455,7 +460,9 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    capture of a fatal signal yields only `terminated_by_signal`. Delivery in
    another state, malformed siginfo, group, seccomp, event, missing, surplus,
    untagged, out-of-order, or unreadable stops return no-envelope
-   `execution_verification_unavailable`.
+   `execution_verification_unavailable`. Direct `SIGKILL` death from
+   `AwaitEntry` or `AwaitExit` yields `terminated_by_signal`; from
+   `AwaitInitialExecExit` it is `execution_verification_unavailable`.
 
    The only setup stages after the capability gate are
    `working_directory_enter` and `trace_setup`. Failure on the initial or
