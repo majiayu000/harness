@@ -7,9 +7,9 @@
 
 mod activity;
 mod driverless_progress;
+mod response;
 mod sampling;
 
-use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::AppState;
 use crate::runtime_projection::{
     stopped_action_eligibility_for_workflows, RuntimeStoppedActionEligibility,
@@ -17,18 +17,24 @@ use crate::runtime_projection::{
 };
 use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary};
 use activity::{runtime_workflow_counts, source_activity, RuntimeWorkflowCounts, SourceActivity};
-use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState};
 use sampling::{dedupe_workflows, list_operator_action_workflows, list_recent_failed_workflows};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use driverless_progress::{list_driverless_progress, DriverlessProgressEvidence};
+pub(crate) use response::{operator_monitor, OperatorMonitorResponse};
+
+#[cfg(test)]
+use axum::http::StatusCode;
+#[cfg(test)]
+use serde_json::json;
+#[cfg(test)]
+use std::sync::Arc;
 
 const WORKFLOW_SAMPLE_LIMIT: i64 = 500;
 const FAILED_WORKFLOW_SAMPLE_RESERVE: usize = 100;
@@ -39,7 +45,7 @@ const STALLED_AFTER_MINS: u64 = 30;
 const OPERATOR_ACTION_STATES: &[&str] = &["ready_to_merge", "awaiting_feedback", "blocked"];
 
 #[derive(Debug, Clone, Serialize)]
-struct OperatorMonitorPayload {
+pub(crate) struct OperatorMonitorPayload {
     generated_at: String,
     sample_limit: i64,
     health: OperatorHealth,
@@ -141,21 +147,6 @@ struct FailureGroupKey {
     family: &'static str,
     message: String,
     repo: Option<String>,
-}
-
-pub async fn operator_monitor(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
-    match build_operator_monitor(&state).await {
-        Ok(payload) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(payload).unwrap_or_else(|error| {
-                json!({ "error": format!("failed to serialize operator monitor: {error}") })
-            })),
-        ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error.to_string() })),
-        ),
-    }
 }
 
 async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMonitorPayload> {

@@ -149,6 +149,9 @@ Harness Server enforces the boundary with typed HTTP adapters:
 - Clippy rejects direct use of Axum's `Json`, `Query`, and `Path` types in
   production server code, so aliases and qualified paths cannot bypass the
   boundary.
+- A checked-in legacy inventory fingerprints the grandfathered handler use
+  sites, registry roots, and server-local wire nodes. The inventory may only
+  shrink; changing a legacy shape or adding a use site fails the contract test.
 
 Routes that must authenticate a raw signed body may validate the bytes before
 deserializing, but their first-party payload type still belongs in

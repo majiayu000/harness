@@ -191,6 +191,7 @@ macro_rules! register_legacy_dtos {
 
 register_legacy_dtos!(
     serde_json::Value,
+    crate::handlers::operator_monitor::OperatorMonitorResponse,
     crate::handlers::projects::RegisterProjectRequest,
     crate::handlers::reconcile::ReconcileParams,
     crate::handlers::runtime_hosts::CompleteRuntimeJobRequest,
@@ -200,6 +201,7 @@ register_legacy_dtos!(
     crate::handlers::runtime_project_cache::SyncWatchedProjectsRequest,
     crate::handlers::usage_monitor::UsageMonitorQuery,
     crate::handlers::usage_monitor::UsageMonitorResponse,
+    crate::handlers::worktrees::WorktreesResponse,
     crate::http::auth_routes::PasswordResetRequest,
     crate::http::workflow_routes::runtime_tree::WorkflowRuntimeTreeQuery,
     crate::http::workflow_routes::runtime_tree::WorkflowRuntimeTreeResponse,
@@ -233,16 +235,37 @@ impl PrimitivePathValue for (String, String, u64) {}
 
 #[cfg(test)]
 mod tests {
-    use super::ContractJson;
+    use super::{
+        legacy_private, ContractJson, LegacyJson, LegacyQuery, LegacyRestDto, PrimitivePath,
+    };
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
-        routing::post,
-        Router,
+        extract::{Path as AxumPath, Query as AxumQuery},
+        http::{header::CONTENT_TYPE, Request, StatusCode},
+        response::Response,
+        routing::{get, post},
+        Json as AxumJson, Router,
     };
     use harness_protocol::methods::{Method, RpcRequest, RpcResponse};
     use http_body_util::BodyExt;
+    use serde::{Deserialize, Serialize};
     use tower::ServiceExt;
+
+    #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+    struct LegacyPayload {
+        value: String,
+    }
+
+    impl legacy_private::Sealed for LegacyPayload {}
+    impl LegacyRestDto for LegacyPayload {}
+
+    #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+    struct LegacyQueryPayload {
+        limit: u64,
+    }
+
+    impl legacy_private::Sealed for LegacyQueryPayload {}
+    impl LegacyRestDto for LegacyQueryPayload {}
 
     async fn protocol_echo(
         ContractJson(request): ContractJson<RpcRequest>,
@@ -251,6 +274,32 @@ mod tests {
             request.id,
             serde_json::json!({"ok": true}),
         ))
+    }
+
+    async fn raw_json_echo(AxumJson(payload): AxumJson<LegacyPayload>) -> AxumJson<LegacyPayload> {
+        AxumJson(payload)
+    }
+
+    async fn legacy_json_echo(
+        LegacyJson(payload): LegacyJson<LegacyPayload>,
+    ) -> LegacyJson<LegacyPayload> {
+        LegacyJson(payload)
+    }
+
+    async fn raw_query(AxumQuery(query): AxumQuery<LegacyQueryPayload>) -> String {
+        query.limit.to_string()
+    }
+
+    async fn legacy_query(LegacyQuery(query): LegacyQuery<LegacyQueryPayload>) -> String {
+        query.limit.to_string()
+    }
+
+    async fn raw_path(AxumPath(path): AxumPath<(String, String, u64)>) -> String {
+        format!("{}:{}:{}", path.0, path.1, path.2)
+    }
+
+    async fn legacy_path(PrimitivePath(path): PrimitivePath<(String, String, u64)>) -> String {
+        format!("{}:{}:{}", path.0, path.1, path.2)
     }
 
     #[tokio::test]
@@ -280,6 +329,89 @@ mod tests {
                 "result": {"ok": true}
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_json_matches_axum_success_and_rejections() -> anyhow::Result<()> {
+        let raw = Router::new().route("/", post(raw_json_echo));
+        let legacy = Router::new().route("/", post(legacy_json_echo));
+
+        for (content_type, body) in [
+            (Some("application/json"), r#"{"value":"ok"}"#),
+            (Some("application/json"), r#"{"value":}"#),
+            (Some("text/plain"), r#"{"value":"ok"}"#),
+            (None, r#"{"value":"ok"}"#),
+        ] {
+            let raw_response = request(raw.clone(), "/", content_type, body).await?;
+            let legacy_response = request(legacy.clone(), "/", content_type, body).await?;
+            assert_response_eq(raw_response, legacy_response).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_query_matches_axum_success_and_rejection() -> anyhow::Result<()> {
+        let raw = Router::new().route("/", get(raw_query));
+        let legacy = Router::new().route("/", get(legacy_query));
+
+        for uri in ["/?limit=7", "/?limit=invalid", "/"] {
+            let raw_response = raw
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty())?)
+                .await?;
+            let legacy_response = legacy
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty())?)
+                .await?;
+            assert_response_eq(raw_response, legacy_response).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn primitive_path_matches_axum_success_and_rejection() -> anyhow::Result<()> {
+        let raw = Router::new().route("/{owner}/{repo}/{number}", get(raw_path));
+        let legacy = Router::new().route("/{owner}/{repo}/{number}", get(legacy_path));
+
+        for uri in ["/openai/harness/42", "/openai/harness/not-a-number"] {
+            let raw_response = raw
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty())?)
+                .await?;
+            let legacy_response = legacy
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty())?)
+                .await?;
+            assert_response_eq(raw_response, legacy_response).await?;
+        }
+        Ok(())
+    }
+
+    async fn request(
+        app: Router,
+        uri: &str,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> anyhow::Result<Response> {
+        let mut builder = Request::post(uri);
+        if let Some(content_type) = content_type {
+            builder = builder.header(CONTENT_TYPE, content_type);
+        }
+        Ok(app
+            .oneshot(builder.body(Body::from(body.to_owned()))?)
+            .await?)
+    }
+
+    async fn assert_response_eq(left: Response, right: Response) -> anyhow::Result<()> {
+        assert_eq!(left.status(), right.status());
+        assert_eq!(
+            left.headers().get(CONTENT_TYPE),
+            right.headers().get(CONTENT_TYPE)
+        );
+        let left = left.into_body().collect().await?.to_bytes();
+        let right = right.into_body().collect().await?.to_bytes();
+        assert_eq!(left, right);
         Ok(())
     }
 }
