@@ -20,6 +20,14 @@ fn fingerprint_digest_framing_vectors_are_independent() {
 }
 
 fn runtime_payload(kind: LocalExecutableRuntimeKind) -> RuntimeExecutableFingerprintPayload {
+    runtime_payload_with_observation(kind, None, None).unwrap()
+}
+
+fn runtime_payload_with_observation(
+    kind: LocalExecutableRuntimeKind,
+    executable: Option<RuntimeExecutableIdentity>,
+    version: Option<RuntimeVersionFacts>,
+) -> Result<RuntimeExecutableFingerprintPayload, AgentStackFingerprintError> {
     let base = AgentStackSource::logical(
         AgentStackSourceScope::Runner,
         "configured_runtime",
@@ -35,8 +43,8 @@ fn runtime_payload(kind: LocalExecutableRuntimeKind) -> RuntimeExecutableFingerp
         Sha256Digest::from_bytes(b"cwd"),
         Sha256Digest::from_bytes(b"cwd identity"),
         vec![],
-        None,
-        None,
+        executable,
+        version,
         vec![
             RuntimeEnvironmentFact::new(
                 RuntimeEnvironmentKey::OpenaiApiKey,
@@ -50,6 +58,28 @@ fn runtime_payload(kind: LocalExecutableRuntimeKind) -> RuntimeExecutableFingerp
             ),
         ],
         vec![RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathNotFound).unwrap()],
+    )
+}
+
+fn runtime_identity(
+    checkpoint_consistent_path: bool,
+    exec_stop_consistent_handle: bool,
+) -> RuntimeExecutableIdentity {
+    RuntimeExecutableIdentity::new(
+        1,
+        Some(0o755),
+        Sha256Digest::from_bytes(b"executable"),
+        checkpoint_consistent_path,
+        exec_stop_consistent_handle,
+    )
+}
+
+fn runtime_version() -> RuntimeVersionFacts {
+    RuntimeVersionFacts::new(
+        "1.2.3".to_owned(),
+        Sha256Digest::from_bytes(b"stdout"),
+        Sha256Digest::from_bytes(b"stderr"),
+        RuntimeVersionStream::Stdout,
     )
     .unwrap()
 }
@@ -391,6 +421,51 @@ fn runtime_typed_constructors_reject_impossible_states() {
         RuntimeProbeFailureDetail::KernelModuleLoading,
     )
     .is_err());
+}
+
+#[test]
+fn runtime_version_requires_both_identity_consistency_proofs() {
+    for (checkpoint_consistent_path, exec_stop_consistent_handle) in [(false, true), (true, false)]
+    {
+        assert!(matches!(
+            runtime_payload_with_observation(
+                LocalExecutableRuntimeKind::CodexExec,
+                Some(runtime_identity(
+                    checkpoint_consistent_path,
+                    exec_stop_consistent_handle,
+                )),
+                Some(runtime_version()),
+            ),
+            Err(AgentStackFingerprintError::InvalidPayloadState)
+        ));
+    }
+}
+
+#[test]
+fn runtime_parser_rejects_version_without_both_identity_consistency_proofs() {
+    let payload = runtime_payload_with_observation(
+        LocalExecutableRuntimeKind::CodexExec,
+        Some(runtime_identity(true, true)),
+        Some(runtime_version()),
+    )
+    .unwrap();
+    let json = AgentStackFingerprintEnvelope::agent_runtime(payload)
+        .unwrap()
+        .to_json_string()
+        .unwrap();
+
+    for field in ["checkpoint_consistent_path", "exec_stop_consistent_handle"] {
+        let invalid = json.replacen(
+            &format!(r#""{field}":true"#),
+            &format!(r#""{field}":false"#),
+            1,
+        );
+        assert_ne!(invalid, json, "fixture did not contain {field}");
+        assert!(matches!(
+            AgentStackFingerprintEnvelope::from_json_str(&invalid),
+            Err(AgentStackFingerprintError::InvalidPayloadState)
+        ));
+    }
 }
 
 #[test]

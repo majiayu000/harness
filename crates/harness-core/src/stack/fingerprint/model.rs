@@ -504,11 +504,15 @@ impl RuntimeExecutableFingerprintPayload {
             && self.failures.windows(2).all(|pair| {
                 (pair[0].phase, pair[0].kind.rank()) < (pair[1].phase, pair[1].kind.rank())
             });
+        let version_has_stable_identity = self.version.is_none()
+            || self.executable.as_ref().is_some_and(|identity| {
+                identity.checkpoint_consistent_path && identity.exec_stop_consistent_handle
+            });
         if self.runtime_kind != self.role_binding.runtime_kind()
             || !attempts_valid
             || !failures_valid
             || !valid_environment(self.runtime_kind, &self.environment)
-            || (self.version.is_some() && self.executable.is_none())
+            || !version_has_stable_identity
         {
             return Err(AgentStackFingerprintError::InvalidPayloadState);
         }
