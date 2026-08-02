@@ -51,6 +51,8 @@ implementation PR or force-push.
       `DescriptorsReady`, at most one bootstrap child per owner may
       transiently inherit the process-wide fd table in addition to an admitted
       target; it performs no workload and is not numerically ledger-bounded.
+      The owner blocks all blockable signals before each fork, restores its
+      mask afterward, and the child resets dispositions before signal delivery.
       The active deadline bounds readiness waiting; rollback uses the cleanup
       deadline, with obligation and permit retained until reap. After readiness one child retains at most 12
       allowlisted references; a post-exec target plus observer retains at most
@@ -64,7 +66,9 @@ implementation PR or force-push.
       streams, a passing post-reap checkpoint, and an empty registry.
       The post-exec guard denies process creation, image execution, executable
       mapping (including x86_64 `uselib`), image mutation, and signalling
-      before execution. The claim is registry-empty plus no executed
+      plus native `init_module`/`finit_module` before execution. Retained-handle
+      hashes use bounded offset-zero `pread`, never a shared sequential offset.
+      The claim is registry-empty plus no executed
       process-creation syscall, never descendant-tree-empty.
       Cwd is retained with `O_PATH | O_DIRECTORY | O_CLOEXEC` and no
       `O_NOFOLLOW`; search-only cwd and pathname replacement are tested.
@@ -91,6 +95,8 @@ implementation PR or force-push.
       exact-pidfd-only cleanup; registry
       emptiness on success; and absence of anchors, PGID signalling,
       membership stages, or descendant-tree claims. It must also cover
+      owner-mask and child-disposition signal isolation; offset-zero `pread`
+      hashing across transferred handles; native `init_module`/`finit_module` denial;
       an unrelated same-session process repeatedly changing process groups
       without entering the registry, being observed/signalled, or changing
       success evidence;
@@ -169,6 +175,7 @@ of silently expanding scope.
       admission and permit lifetime; owner/helper/child fd ledgers; allocation-
       free post-fork work; bounded pre-ready inherited-fd transient and
       foreign-fd isolation at/after `DESCRIPTORS_READY`;
+      pre-fork signal masking, parent restoration, and child disposition reset;
       pre-fork start gates and direct-child rollback; pidfd registration,
       `waitid(P_PIDFD, WNOWAIT)` validation, consuming pidfd reap, bootstrap
       exact-PID fallback, revalidation, handoff, and reap ownership; retained cwd/target descriptors
@@ -177,6 +184,7 @@ of silently expanding scope.
       kernel write denial; W+X/executable-stack rejection; post-exec
       syscall-stop denial of process/image/executable-mapping (including
       x86_64 `uselib`) and existing-executable-mutation transitions,
+      native `init_module`/`finit_module` kernel-module loading,
       target-initiated process signalling, and pre-native x32 rejection;
       legal signal-delivery reinjection and illegal-state rejection;
       retained-handle pre-exec; exact registered-pidfd-only signalling and reap
@@ -194,8 +202,8 @@ of silently expanding scope.
 | B-003, B-011 | `runner_observation_preserves_every_runtime_and_mcp_source_identity`; `runtime_role_sources_are_pairwise_distinct_for_one_base`; `runtime_role_source_preserves_scope_and_exact_source_integrity_or_absence`; `caller_cannot_preencode_or_override_runtime_role_source`; `runtime_role_parser_rejects_missing_malformed_noncanonical_and_wrong_role_suffixes`; `repository_owned_runtime_never_spawns_version_child`; `caller_cannot_promote_repository_source`; `configured_mcp_server_binding_uses_exact_stable_key`; `configured_mcp_server_key_accepts_1024_and_rejects_1025_before_expansion`; `arbitrary_mcp_server_component_is_not_accepted`; `distinct_mcp_server_keys_have_distinct_ids`; `mcp_tool_source_is_injective_for_multiple_tools_on_one_server`; `mcp_tool_source_preserves_scope_and_encodes_exact_utf8_identity`; `mcp_server_and_tool_suffix_mismatches_are_rejected`; `caller_cannot_supply_preencoded_mcp_tool_source` |
 | B-004 | Frozen Unix/Windows command-form and digest vectors; `O_PATH` retained cwd with no `O_NOFOLLOW`; search-only cwd and pathname replacement; raw Unix bytes and Windows UTF-16 units; exact `EACCES` fallback, one 150 ms `ETXTBSY` retry, candidate 65, no shell, and fd-10 execution context; later pre-target outcomes preserve prior reaped attempts while the registry is empty |
 | B-005, B-010 | Closed environment policy, setup-secret exclusion, exact PATH and Claude-directory digest vectors, Unix/Windows key rules, direct/env shebang rejection before target/interpreter creation, and proof that only sanitized PATH reaches an admitted static target |
-| B-006 | Nonblocking retained executable handle, size and strong-identity checkpoints, hard-link authorization, kill-isolated observation helpers, atomic pidfd registration before `GO`, exact observation errors, static ELF/exec-stop verification, path-race rejection, and no in-process blocking worker |
-| B-007 | Eight-owner deadlines; bounded pre-ready inherited-fd transient plus post-ready 28 + 12 retained capacity; two pidfds per owner; capability-child validating/consuming `waitid(P_PIDFD)`, bootstrap exact-PID fallback, then exact-pidfd-only signal/reap; initial/retry `working_directory_enter` and `trace_setup`; process/image/mapping/mutation/signalling denial including x86_64 `uselib`; target reap + complete output + post-reap checkpoint + empty registry success barrier; unrelated same-session `setpgid` churn is never registered/observed/signalled and cannot affect success; no anchor/PGID/membership/descendant-tree claim; non-Linux pre-observation failure |
+| B-006 | Nonblocking retained executable handle, offset-zero `pread` hashing, size and strong-identity checkpoints, hard-link authorization, kill-isolated observation helpers, atomic pidfd registration before `GO`, exact observation errors, static ELF/exec-stop verification, path-race rejection, and no in-process blocking worker |
+| B-007 | Eight-owner deadlines; pre-fork signal masking and child disposition reset; bounded pre-ready inherited-fd transient plus post-ready 28 + 12 retained capacity; two pidfds per owner; capability-child validating/consuming `waitid(P_PIDFD)`, bootstrap exact-PID fallback, then exact-pidfd-only signal/reap; initial/retry `working_directory_enter` and `trace_setup`; process/image/mapping/mutation/kernel-module-loading/signalling denial including x86_64 `uselib` and native `init_module`/`finit_module`; target reap + complete output + post-reap checkpoint + empty registry success barrier; unrelated same-session `setpgid` churn is never registered/observed/signalled and cannot affect success; no anchor/PGID/membership/descendant-tree claim; non-Linux pre-observation failure |
 | B-008 | Closed failure vocabulary and canonical ordering; observation errors remain no-envelope; termination/reap/drain cleanup failures retain exact ownership; removed `lingering_process_group`, anchor, and membership values are rejected |
 | B-009 | Exact Codex/Claude whole-stream grammars and stream selection; capture error precedence; after complete capture signal/nonzero exclusivity; zero-exit-only UTF-8/blank/grammar classification; exact HT/LF/CR/SP blank predicate and success-only output digests |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; `mcp_output_schema_absence_and_presence_are_distinct`; `mcp_annotations_preserve_absent_empty_hints_title_vendor_values_and_ordered_arrays`; `mcp_annotation_hints_do_not_infer_capabilities`; exact-limit and limit-plus-one tool-name/description/annotations fixtures |
@@ -220,7 +228,8 @@ Cross-cutting mandatory runtime tests additionally prove:
 - cwd opens with `O_PATH | O_DIRECTORY | O_CLOEXEC` and no `O_NOFOLLOW`,
   including a search/execute-only directory and pathname replacement;
 - x86_64 x32 dispatch fails before native classification, x86_64 `uselib` is
-  denied as executable mapping, and aarch64 has no fabricated `uselib` entry;
+  denied as executable mapping, aarch64 has no fabricated `uselib` entry, and
+  native `init_module`/`finit_module` is denied on both supported architectures;
 - output overflow/read failure precedes exit classification; fatal delivered
   signals are reinjected and yield only `terminated_by_signal`, caught/ignored
   signals continue, direct `SIGKILL` is semantic only from `AwaitEntry` or

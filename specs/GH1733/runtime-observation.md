@@ -488,18 +488,19 @@ precomputes a collision-free remap schedule; an already-fd-10 retained handle
 keeps its original `O_CLOEXEC`, otherwise the child uses `dup3(..., 10,
 O_CLOEXEC)` before closing the source descriptor.
 
-Immediately after fork and before descriptor isolation completes, the child
-transiently inherits the process-wide fd table. At most one such bootstrap
-child exists per owner in addition to an already admitted target, it performs
-no workload, and its inherited-reference count is not part of the numeric owner
-ledger ceiling. Before waiting on the gate, the child uses only raw
-async-signal-safe `dup2`/`dup3`, segmented `close_range`, `write`, `read`,
-`close`, and `_exit` syscalls. It establishes the frozen stdio/allowlist
-numbers, closes every inherited fd not in that role's allowlist, writes one
-closed bootstrap status, then waits for one-byte `GO`. The closed
-`RuntimeDescriptorBootstrapStatus` values are `DescriptorsReady`,
-`DescriptorIsolationUnavailable`, and `DescriptorIsolationFailed`. This path is
-allocation-free and non-panicking. Before `GO`, the child cannot access cwd or
+Before each fork, the owner saves the calling thread's signal mask and blocks
+every blockable signal; failure returns no-envelope
+`ContainmentUnavailable(SignalIsolationUnavailable)` before fork. The child inherits that mask, and the parent restores its saved mask immediately after
+fork inside the same critical section. While the child transiently owns the
+process-wide fd table, it uses only raw async-signal-safe `rt_sigaction`,
+`rt_sigprocmask`, `dup2`/`dup3`, segmented `close_range`, `write`, `read`,
+`close`, and `_exit`: it resets every catchable disposition to `SIG_DFL`,
+establishes the frozen role mask and fd allowlist, reports status, then waits
+for `GO`. No inherited handler can run with the full fd table; `SIGKILL` and
+`SIGSTOP` can only terminate or stop it. Closed statuses are `DescriptorsReady`,
+`SignalIsolationFailed`, `DescriptorIsolationUnavailable`, and
+`DescriptorIsolationFailed`. This path is allocation-free and non-panicking.
+Before `GO`, the child cannot access cwd or
 any filesystem/proc path, invoke ptrace, inspect a target, or
 exec. Inside one synchronous, non-cancellable parent critical section, the
 owner forks and waits for one closed bootstrap status. Only
@@ -516,7 +517,7 @@ This gate applies to every closed `RuntimeOwnedChildRole`:
 `Observation(RuntimeObservationStage)` (including capability and retained-
 handle/image helpers), `InitialTarget`, and `RetryTarget`.
 The closed `RuntimeChildRegistrationStage` values are `GateCreate`, `Fork`,
-`DescriptorIsolation`, `PidfdOpen`, `RegistryCommit`, and `GateRelease`.
+`SignalIsolation`, `DescriptorIsolation`, `PidfdOpen`, `RegistryCommit`, and `GateRelease`.
 Failure or cancellation before registry commit closes the
 parent gate, so the still-gated direct child exits without workload. Until that
 child is reaped, its exact positive PID cannot be reused; the owner may use only
@@ -564,10 +565,12 @@ only to `ContainmentUnavailable(DescriptorIsolationUnavailable)`. Any other
 initial isolation error emits `DescriptorIsolationFailed` and maps to
 `ChildRegistrationUnavailable { role, DescriptorIsolation }`. After capability
 success, every non-ready isolation status for every role maps only to that
-child-registration variant. A concrete status observed before deadline wins;
+child-registration variant. `SignalIsolationFailed` always maps to
+`ChildRegistrationUnavailable { role, SignalIsolation }`. A concrete status observed before deadline wins;
 deadline is used only before any status, and cancellation emits no visible
 result while the owner performs the same rollback. Descriptor-isolation and
-`pidfd_open` failure are tested at every role.
+signal-isolation and `pidfd_open` failures are tested at every role, including
+owner-mask and child-reset injection.
 
 After `GO`, the helper uses only preallocated
 fixed-size frames, bounded buffers, raw syscalls, and an allocation-free,
@@ -607,7 +610,10 @@ ordinary `File::open` on an unclassified path. Handle `fstat` is authoritative
 after open and rejects a FIFO, socket, directory, device, or any race-swapped
 non-regular target before reading. Symlinks are classified by the opened final
 target. The retained regular handle remains nonblocking, which does not alter
-regular-file reads, and is incrementally hashed in fixed-size chunks. Unix also
+regular-file reads. Every initial and checkpoint hash uses bounded fixed-size
+`pread` from explicit offset zero with checked offset progression, never a
+sequential read or shared `lseek`; an `SCM_RIGHTS` peer therefore cannot move
+the shared open-file-description offset and induce an EOF hash. Unix also
 derives execute permission from handle mode bits. Windows extension/search
 eligibility belongs to resolution and successful OS loading belongs to spawn;
 the producer does not claim that an extension or parsed PE header proves
@@ -681,7 +687,9 @@ ABI gate does the owner reject closed `RuntimeTransitiveExecutionClass`:
   `personality` argument other than the side-effect-free exact
   `0xffff_ffff` query,
   `creat`, or `open`/`openat`/`open_by_handle_at`/`openat2` whose flags request
-  `O_WRONLY`, `O_RDWR`, or `O_TRUNC`; and
+  `O_WRONLY`, `O_RDWR`, or `O_TRUNC`;
+- `KernelModuleLoading`: native `init_module` or `finit_module`, regardless of
+  current capabilities; and
 - `ProcessSignalling`: `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`,
   `rt_tgsigqueueinfo`, or `pidfd_send_signal`, for every target, signal, PID,
   TID, pidfd, zero, negative, process-group, and broadcast form.
@@ -763,7 +771,8 @@ produces `identity_changed`, while post-reap observation unavailability
 produces `identity/metadata_unavailable`; both discard version evidence.
 `path_unusable` remains exclusive to resolution. Immediately
 before spawn and again after the child is reaped, one blocking checkpoint
-re-reads and re-hashes the retained executable handle and reopens the private
+re-hashes the retained executable handle with the same offset-zero `pread`
+contract and reopens the private
 candidate reference to compare strong identity. On Unix both checkpoint reopens use the
 same `O_RDONLY | O_CLOEXEC | O_NONBLOCK` flags and authoritative handle
 classification as the initial open. Absolute references use `open`;

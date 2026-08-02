@@ -680,15 +680,17 @@ review for exact `SandboxSpec` passthrough equivalence, observation-process
 fixed-frame/`SCM_RIGHTS` protocol, pidfd ownership and revalidation,
 bounded pre-ready inherited-fd transient, post-ready descriptor
 allowlists/foreign-fd isolation/start-gate ordering and direct-child rollback,
+pre-fork signal masking with parent restoration and child disposition reset,
 capability-child validating/consuming `waitid(P_PIDFD)` plus unreaped-only
 bootstrap exact-PID fallback, global owner-permit lifetime, owner/helper/child
 descriptor ledgers, bounded launch/environment/setup-secret counting before
 hashing/splitting/joining, allocation-free post-fork work, descriptor ownership,
 `fchdir` ordering and error staging, `FD_CLOEXEC` script rejection, ptrace-stop ordering,
 stopped-image identity/hash validation under kernel write denial,
+offset-zero bounded `pread` hashing that ignores shared open-description offsets,
 W+X/executable-stack rejection, post-exec syscall-stop denial of process
 creation, image execution, executable mappings, and existing executable-image
-mutation,
+mutation plus native `init_module`/`finit_module` kernel-module loading,
 post-capability registered-pidfd-only signalling and reap ordering, legal
 signal-delivery reinjection and illegal-state rejection,
 argument/environment pointers, NUL validation, error

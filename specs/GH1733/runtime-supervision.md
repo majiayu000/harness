@@ -131,6 +131,7 @@ before native-table decoding. Denied classes are:
   `uselib`;
 - `executable_image_mutation`: the closed writable-image and descriptor
   acquisition operations in the product contract;
+- `kernel_module_loading`: native `init_module` and `finit_module`; and
 - `process_signalling`: every closed signal syscall and target form.
 
 The frozen x86_64 syscall table includes `uselib`; aarch64 does not invent an

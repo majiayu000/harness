@@ -349,7 +349,8 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    equal the recorded digest. Resume occurs only under the B-007 syscall-stop
    guard: every later process-creation or image-execution syscall, every
    request for a new executable mapping, and every closed existing-image
-   mutation syscall is stopped before kernel execution and fails closed. Thus
+   mutation or native kernel-module-loading syscall is stopped before kernel
+   execution and fails closed. Thus
    an allowed static target cannot use PATH, cwd, `dlopen`, `/proc/self/mem`,
    asynchronous I/O submission, or a child process to execute
    repository/worktree code.
@@ -450,7 +451,8 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    `PTRACE_SYSCALL` and classifies every syscall-entry stop before execution.
    x86_64 x32 dispatch is rejected before native decoding. Denied classes are
    process creation; image execution; executable mapping, including
-   x86_64 `uselib`; executable-image mutation; and process signalling.
+   x86_64 `uselib`; executable-image mutation; native kernel module loading
+   through `init_module` or `finit_module`; and process signalling.
    `mmap`/native `mmap2`, `mprotect`, `pkey_mprotect`, or `shmat`
    requesting executable access are executable mapping. The frozen native
    x86_64 table additionally classifies `uselib` as executable mapping;
@@ -587,7 +589,7 @@ no-envelope producer errors defined in B-006 and never enter this list.
 | `version_probe` | `handle_execution_unavailable` | Mandatory ptrace containment passed, but the candidate's fully frozen fd-10 `execveat(AT_EMPTY_PATH)` returned exact `ENOSYS`, `EPERM`, or `EINVAL`; every created target helper was reaped and no target instruction ran. |
 | `version_probe` | `supervision_setup_failed` | An initial/retry registered target failed working-directory entry or pre-exec ptrace stop/options setup; the closed stage is exactly `working_directory_enter` or `trace_setup`, the target was reaped, and handle exec was never attempted. |
 | `version_probe` | `spawn_failed` | Direct exec of an inspected candidate failed terminally before start; no selected/executed claim is emitted. |
-| `version_probe` | `transitive_execution_denied` | After the verified initial static image began under syscall-stop supervision, it attempted closed class `process_creation`, `image_execution`, `executable_mapping`, `executable_image_mutation`, or `process_signalling`; the denied syscall never executed, stopped-target cleanup began, cleanup outcome is independent, and no version fact was emitted. |
+| `version_probe` | `transitive_execution_denied` | After the verified initial static image began under syscall-stop supervision, it attempted closed class `process_creation`, `image_execution`, `executable_mapping`, `executable_image_mutation`, `kernel_module_loading`, or `process_signalling`; the denied syscall never executed, stopped-target cleanup began, cleanup outcome is independent, and no version fact was emitted. |
 | `version_probe` | `bare_eacces_exhausted` | Every inspected Unix bare-name exec attempt returned exact `EACCES`; no executable was selected or started. |
 | `version_probe` | `timeout` | The probe deadline expired; cleanup outcome is represented independently. |
 | `version_probe` | `output_limit_exceeded` | Combined stdout/stderr exceeded the inclusive hard byte limit; cleanup outcome is represented independently. |
