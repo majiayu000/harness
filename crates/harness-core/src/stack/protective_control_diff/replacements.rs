@@ -186,13 +186,17 @@ pub(super) fn conflicted_replacement_uncovered_roles(
     before_by_id: &BTreeMap<String, &AgentStackProtectionControl>,
     conflicts: ReplacementCandidateConflicts<'_>,
     conflicting_replacements: &[(&AgentStackProtectionControl, Vec<AgentStackProtectionRole>)],
-    primary_conflicting_component_id: &str,
+    additional_conflicting_replacements: &[&AgentStackProtectionControl],
 ) -> Vec<AgentStackProtectionRole> {
     let mut conflicting_component_ids = conflicting_replacements
         .iter()
         .map(|(candidate, _)| candidate.component.component_id().as_str().to_owned())
         .collect::<BTreeSet<_>>();
-    conflicting_component_ids.insert(primary_conflicting_component_id.to_owned());
+    conflicting_component_ids.extend(
+        additional_conflicting_replacements
+            .iter()
+            .map(|candidate| candidate.component.component_id().as_str().to_owned()),
+    );
     before
         .roles
         .iter()
@@ -297,7 +301,7 @@ pub(super) fn replacement_assignments(
         .map(|(component_id, demand)| (component_id.clone(), demand.full_candidate_ids.clone()))
         .collect();
     let assignment_resolutions = resolve_assignments(&candidate_edges);
-    let partial_contention = partial_candidate_contention(&demands);
+    let partial_contention = partial_candidate_contention(&demands, &assignment_resolutions);
     let resolutions = demands
         .into_iter()
         .map(|(component_id, demand)| {
@@ -406,20 +410,31 @@ fn safe_candidate_ids(
 
 fn partial_candidate_contention(
     demands: &BTreeMap<String, ReplacementDemand>,
+    assignment_resolutions: &BTreeMap<String, AssignmentResolution>,
 ) -> BTreeMap<String, BTreeSet<String>> {
     let mut contention = BTreeMap::<String, BTreeSet<String>>::new();
     for (component_id, demand) in demands {
-        let has_complete_role_plan = demand
-            .per_role_candidate_ids
-            .iter()
-            .all(|candidates| !candidates.is_empty());
+        let unique_full_candidate = match assignment_resolutions.get(component_id) {
+            Some(AssignmentResolution::Unique(candidate_id)) => Some(candidate_id.as_str()),
+            Some(AssignmentResolution::Ambiguous | AssignmentResolution::Missing) | None => None,
+        };
+        let has_complete_role_plan = unique_full_candidate.map_or_else(
+            || {
+                demand
+                    .per_role_candidate_ids
+                    .iter()
+                    .all(|candidates| !candidates.is_empty())
+            },
+            |candidate_id| has_alternative_split_plan(&demand.per_role_candidate_ids, candidate_id),
+        );
         for candidate_id in demand
             .contending_candidate_ids
             .iter()
             .filter(|candidate_id| {
                 !demand.full_candidate_ids.contains(*candidate_id)
                     && (has_complete_role_plan
-                        || demand.same_integrity_candidate_ids.contains(*candidate_id))
+                        || (unique_full_candidate.is_none()
+                            && demand.same_integrity_candidate_ids.contains(*candidate_id)))
             })
         {
             contention

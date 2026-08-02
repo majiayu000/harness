@@ -4,7 +4,6 @@ use super::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
-
 mod existing;
 mod replacements;
 use existing::compare_existing;
@@ -168,7 +167,6 @@ pub struct AgentStackProtectionControlDiff {
     confidence: AgentStackProtectionConfidence,
     reason: AgentStackProtectionControlReason,
 }
-
 struct ComparisonInputs<'before, 'after> {
     after_reports: &'after [AgentStackProtectionControl],
     after_controls: &'after [AgentStackProtectionControl],
@@ -338,7 +336,7 @@ fn compare_removed(
                     after_any: after_conflicting_component_ids,
                 },
                 &replacements.conflicting_replacements,
-                component_id,
+                std::slice::from_ref(&candidate),
             );
             let mut conflicting_replacements = replacements.conflicting_replacements;
             let overlapping_roles = before
@@ -399,15 +397,29 @@ fn compare_removed(
             min_confidence(before.confidence, AgentStackProtectionConfidence::Medium),
             AgentStackProtectionControlReason::PossibleRename,
         ));
-        let uncovered_roles = analyze_role_replacements(
+        let replacements = analyze_role_replacements(
             before,
             before.roles.clone(),
             after,
             before_by_id,
             before_conflicting_component_ids,
             after_conflicting_component_ids,
-        )
-        .uncovered_roles;
+        );
+        let uncovered_roles = conflicted_replacement_uncovered_roles(
+            before,
+            after,
+            inputs.after_reports,
+            before_by_id,
+            ReplacementCandidateConflicts {
+                before_any: before_conflicting_component_ids,
+                after_any: after_conflicting_component_ids,
+            },
+            &replacements.conflicting_replacements,
+            &same_integrity,
+        );
+        for (candidate, roles) in replacements.conflicting_replacements {
+            push_conflicting_duplicate_fact_with_roles(before, Some(candidate), roles, facts);
+        }
         if !uncovered_roles.is_empty() {
             facts.push(AgentStackProtectionControlDiff::new(
                 AgentStackProtectionDiffKind::Removed,
