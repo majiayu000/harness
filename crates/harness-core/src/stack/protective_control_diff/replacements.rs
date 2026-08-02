@@ -195,6 +195,11 @@ pub(super) fn conflicted_replacement_uncovered_roles(
     conflicting_component_ids.extend(
         additional_conflicting_replacements
             .iter()
+            .filter(|candidate| {
+                conflicts
+                    .after_any
+                    .contains(candidate.component.component_id().as_str())
+            })
             .map(|candidate| candidate.component.component_id().as_str().to_owned()),
     );
     before

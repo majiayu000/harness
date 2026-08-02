@@ -255,6 +255,65 @@ fn forced_full_assignment_ignores_unusable_partial_contention() {
     );
 }
 
+#[test]
+fn confidence_only_duplicates_do_not_suppress_multi_rename_removal() {
+    let before = configured_control(
+        Kind::Policy,
+        "rules/legacy.toml",
+        Some(HASH_A),
+        &[Role::Policy],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let high_confidence = configured_control(
+        Kind::Policy,
+        "rules/replacement-a.toml",
+        Some(HASH_A),
+        &[Role::Policy],
+        Confidence::High,
+        ACTIVE_REQUIRED,
+    );
+    let low_confidence = configured_control(
+        Kind::Policy,
+        "rules/replacement-a.toml",
+        Some(HASH_A),
+        &[Role::Policy],
+        Confidence::Low,
+        ACTIVE_REQUIRED,
+    );
+    let disabled = configured_control(
+        Kind::Policy,
+        "rules/replacement-b.toml",
+        Some(HASH_A),
+        &[Role::Policy],
+        Confidence::High,
+        DISABLED_REQUIRED,
+    );
+
+    let original = protective_control_diff(
+        std::slice::from_ref(&before),
+        &[
+            high_confidence.clone(),
+            low_confidence.clone(),
+            disabled.clone(),
+        ],
+    );
+    let reversed = protective_control_diff(&[before], &[disabled, low_confidence, high_confidence]);
+
+    assert_eq!(original, reversed);
+    assert!(original
+        .iter()
+        .any(|fact| fact.reason() == Reason::PossibleRename));
+    assert!(original.iter().any(|fact| {
+        fact.kind() == DiffKind::Removed
+            && fact.reason() == Reason::RemovedWithoutEquivalent
+            && fact.roles() == [Role::Policy]
+    }));
+    assert!(!original
+        .iter()
+        .any(|fact| fact.reason() == Reason::ConflictingDuplicateReport));
+}
+
 fn assert_conflict_and_definite_policy_removal(facts: &[Diff]) {
     assert!(facts
         .iter()
