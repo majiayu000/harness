@@ -352,8 +352,11 @@ attempt vocabularies are normative in `runtime-product.md`.
       cannot promote that source to an executable trust class. Non-repository
       source fixtures resolving inside a repository/worktree boundary do the
       same, while missing or ambiguous target-boundary evidence emits
-      `target_authorization_unavailable`; neither case starts a child or falls
-      through to another PATH candidate. Runtime-role
+      `target_authorization_unavailable`. Registered
+      `Observation(...)` helpers required for retained identity, hash, and
+      authorization evidence may run, but neither case creates an
+      `InitialTarget` or `RetryTarget`, runs a target/loader/interpreter
+      instruction, or falls through to another PATH candidate. Runtime-role
       fixtures prove the three derived IDs are pairwise distinct for one base
       source, preserve scope and identical exact-source integrity or absence,
       and cannot be caller pre-encoded. Strict parser fixtures reject missing,
@@ -565,8 +568,12 @@ attempt vocabularies are normative in `runtime-product.md`.
       `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, and
       `pidfd_send_signal` entry is classified as `process_signalling`, denied
       before kernel execution, and cleaned up without a version. External
-      signal-delivery stops remain execution-verification failures rather than
-      target signalling evidence.
+      fatal `SIGSEGV` and `SIGTERM` delivery is reinjected from
+      `AwaitEntry` and yields `terminated_by_signal`; caught or ignored
+      signals continue normally, and a genuine delivered `SIGTRAP` is
+      distinguished from ptrace traps. Illegal-state delivery, group stops,
+      malformed siginfo, and cleanup-originated signals never become target
+      signalling or semantic exit evidence; capture failure still has priority.
 - [ ] On x86_64, both dangerous and otherwise harmless syscall numbers carrying
       `__X32_SYSCALL_BIT` fail no-envelope execution verification before native
       classification and are never normalized by clearing the bit. Native
@@ -576,19 +583,30 @@ attempt vocabularies are normative in `runtime-product.md`.
       return, cancellation, cleanup-incomplete, and stop/join timeout do not
       release a permit, while actual owner exit with an empty registry does.
       Each owner has exactly two pidfd slots and 28 non-pidfd slots, with
-      retained ceilings of 40 descriptors per fingerprint, 16 pidfds globally,
-      and 320 descriptors globally. There is no anchor, membership helper,
-      member batch, PGID, or membership-transfer slot.
-      Phase accounting proves one pre-`GO` child retains at most 12
-      references, while a post-exec target retains three stdio references and
-      a concurrent exec-stop observer at most five; no other phase has two live
-      child roles.
+      post-`DescriptorsReady` retained ceilings of 40 descriptors per
+      fingerprint, 16 pidfds globally, and 320 descriptors globally. Before
+      readiness, at most one bootstrap child per owner may transiently inherit
+      the process-wide fd table in addition to an admitted target; it performs
+      no workload, has no numeric ledger-derived ceiling, and must reach
+      readiness or exact direct-child rollback by the active deadline. After
+      readiness one child retains at most 12 allowlisted references, while a
+      post-exec target retains three stdio references and a concurrent exec-stop
+      observer at most five; no other phase has two live child roles. There is
+      no anchor, membership helper, member batch, PGID, or membership-transfer
+      slot.
       Two-owner and eight-owner interleavings inspect
       `/proc/<pid>/fd` at `DESCRIPTORS_READY` and find exactly the role
-      allowlist; foreign-fd markers prove one stalled child cannot retain
-      another owner's gate, output, or control descriptors. Owner-side
+      allowlist. A child stalled before readiness may retain a foreign marker
+      only until deadline/rollback; one stalled after readiness retains exactly
+      its allowlist and no other owner's gate, output, or control descriptors.
+      Owner-side
       self-pidfd fixtures cover preflight success and every
-      `pidfd_open`/signal-zero failure before the capability child and cwd.
+      `pidfd_open`/signal-zero failure before the capability child and cwd,
+      then require successful `waitid(P_PIDFD, WEXITED | WNOWAIT)` observation
+      plus consuming `waitid(P_PIDFD, WEXITED)` of the zero-exit capability
+      child. `ENOSYS`, `EINVAL`, `EPERM`, `EACCES`, `ECHILD`, identity,
+      code, and status mismatches exercise exact-PID bootstrap rollback and
+      prove no cwd or later child begins.
       Start-gate fault injection covers the `CapabilityCheck` and every other
       observation stage plus `InitialTarget` and `RetryTarget` roles. No role
       performs workload before `GO`;
@@ -710,7 +728,9 @@ attempt vocabularies are normative in `runtime-product.md`.
 - A repository-owned marker executable would write or access the network if
   invoked; fingerprinting must stop after identity/hash evidence.
 - A user-global binding resolves to a repository executable, or final-target
-  containment cannot be proven; neither case may start a child.
+  containment cannot be proven; observation helpers may derive retained
+  evidence, but neither case may create a target child or execute target,
+  loader, or interpreter instructions.
 - The executable is a symlink, is replaced, is overwritten in place, or is
   changed and restored between observation checkpoints.
 - A candidate path names a FIFO, socket, directory, or device and must return

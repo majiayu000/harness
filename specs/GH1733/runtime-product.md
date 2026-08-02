@@ -375,20 +375,33 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
 
    Each ready owner has two pidfd slots, one for the current target and one for
    the current observation or capability helper. Across eight owners the exact
-   maximum is 16 pidfds. Its non-pidfd ledger has 28 slots. Before `GO`, only
-   one gated child exists and its allowlist is at most 12 references. After
-   target exec, the target retains exactly three stdio references; a concurrent
+   maximum is 16 pidfds. Its non-pidfd ledger has 28 slots. Before
+   `DescriptorsReady`, at most one bootstrap child per owner may transiently
+   inherit the process-wide descriptor table in addition to an admitted
+   target. It performs no workload, has no numeric owner-ledger ceiling, and is
+   bounded by the active deadline plus exact direct-child rollback. After
+   readiness one child has at most 12 allowlisted references. After target
+   exec, the target retains exactly three stdio references; a concurrent
    exec-stop observation helper retains at most five, for eight simultaneous
-   child references. No other phase permits two live child roles. Thus all
-   simultaneous child references are at most 12, and the retained ceiling is
-   28 + 12 = 40 per fingerprint and 320 globally. There is no anchor, membership helper,
+   child references. No other phase permits two live child roles. Thus the
+   post-ready retained ceiling is 28 + 12 = 40 per fingerprint and 320
+   globally. There is no anchor, membership helper,
    membership batch, PGID ledger, or transferred member-pidfd capacity.
    Logical slots are reserved before fd creation, fork, `pidfd_open`, or
    `SCM_RIGHTS`; capacity failure is typed no-envelope and the owner retains
    all prior obligations.
 
-   The owner performs a self-pidfd preflight before the capability helper and
-   before cwd access. It is the sole process creator, parent-side ptrace
+   The owner performs a self-pidfd open/signal preflight before the capability
+   helper and before cwd access. The successful capability child then proves
+   wait and reap by one validating
+   `waitid(P_PIDFD, WEXITED | WNOWAIT)` followed by a consuming
+   `waitid(P_PIDFD, WEXITED)`; both results require its registered identity,
+   `CLD_EXITED`, and status zero. Failure returns
+   `containment_unavailable/pidfd_unavailable` before cwd or later children;
+   solely for this bootstrap, exact positive-PID reap while the pidfd remains
+   held is permitted, and fallback failure retains the owner permit. After
+   success every registered-child wait/reap is pidfd-only. The owner is the
+   sole process creator, parent-side ptrace
    controller, helper spawner, waiter, and reaper; the target pre-exec
    `PTRACE_TRACEME` is the only audited exception. Every capability helper,
    observation helper, initial target, and retry target is created behind a
@@ -398,9 +411,11 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    register the exact pidfd plus reap obligation before releasing `GO` or
    exposing a cancellable lease. Registration failure closes the gate and may
    use only the exact still-unreaped direct-child positive PID for bounded
-   rollback. After registration, all signalling and reap decisions use the
-   registered pidfd identity; no negative PID, PGID, post-reap PID, or
-   `/proc` membership scan is permitted.
+   rollback. After registration, all signalling uses the registered pidfd
+   identity. Wait/reap is pidfd-only after capability success, except for the
+   failed initial capability bootstrap's exact positive-PID reap while its
+   pidfd remains held. No negative PID, PGID, post-reap PID, or `/proc`
+   membership scan is permitted.
 
    A single five-second active deadline begins after owner readiness and before
    cwd observation. It covers capability and observation helpers, retained cwd
@@ -435,8 +450,12 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    x86_64 table additionally classifies `uselib` as executable mapping;
    aarch64 has no fabricated `uselib` entry. A denied syscall never executes,
    produces `transitive_execution_denied`, and starts registered-pidfd
-   cleanup. Missing, surplus, untagged, out-of-order, or unreadable stops
-   return no-envelope `execution_verification_unavailable`.
+   cleanup. A validated signal-delivery stop in `AwaitEntry` is reinjected
+   with `PTRACE_SYSCALL`: caught or ignored signals continue, while complete
+   capture of a fatal signal yields only `terminated_by_signal`. Delivery in
+   another state, malformed siginfo, group, seccomp, event, missing, surplus,
+   untagged, out-of-order, or unreadable stops return no-envelope
+   `execution_verification_unavailable`.
 
    The only setup stages after the capability gate are
    `working_directory_enter` and `trace_setup`. Failure on the initial or
@@ -554,7 +573,7 @@ no-envelope producer errors defined in B-006 and never enter this list.
 | `identity` | `executable_too_large` | The byte ceiling was exceeded before or during hashing. |
 | `identity` | `read_failed` | The opened executable could not be read completely. |
 | `identity` | `identity_changed` | Path strong identity, retained-handle size/content digest, or an already observed link count changed across checkpoints. |
-| `version_probe` | `probe_not_authorized` | Configuration-source or resolved-target repository policy forbids executing this inspected target; the closed reason identifies which and no child was started. |
+| `version_probe` | `probe_not_authorized` | Configuration-source or resolved-target repository policy forbids executing this inspected target; the closed reason identifies which. Registered observation helpers may derive retained evidence, but no target child is created and no target, loader, or interpreter instruction runs. |
 | `version_probe` | `target_authorization_unavailable` | The producer could not prove the opened target is outside every validated repository/worktree boundary or could not prove single-link ownership; the closed reason is `boundary_unprovable`, `link_count_unprovable`, `unlinked_target`, or `multiple_hard_links`. No target instruction ran. Initial/pre-spawn failure permits no target exec; retry failure requires exactly one prior retained-handle exec returning `ETXTBSY`, that helper reaped, and no second helper or exec. |
 | `version_probe` | `interpreter_authorization_unavailable` | The retained executable was not a current-architecture static ELF without `PT_INTERP` or W+X `PT_LOAD` and with exactly one non-executable `PT_GNU_STACK`, or exact retained-handle exec-time `ENOENT`/`ENOTDIR` showed that a late interpreter contract could not be satisfied. No target, loader, or interpreter instruction ran; a late-race setup helper is reaped. |
 | `version_probe` | `handle_execution_unavailable` | Mandatory ptrace containment passed, but the candidate's fully frozen fd-10 `execveat(AT_EMPTY_PATH)` returned exact `ENOSYS`, `EPERM`, or `EINVAL`; every created target helper was reaped and no target instruction ran. |

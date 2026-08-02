@@ -104,9 +104,10 @@ reserves the runtime-independent owner, uses one reserved slot for owner-side
 pidfd, and only then creates the capability child. Any self-preflight syscall
 failure returns no-envelope `ContainmentUnavailable(PidfdUnavailable)` before
 cwd observation; it cannot be reported as a capability-child registration
-failure. Under the already-started active deadline, the capability child then
-proves strong stopped-process/image observation, tagged ptrace guarding, and the
-kill-isolated observation protocol are available. macOS, other Unix,
+failure. This proves open and signalling only. Under the already-started
+active deadline, the capability child then proves strong stopped-process/image
+observation, tagged ptrace guarding, the kill-isolated observation protocol,
+and exact pidfd wait/reap before containment becomes available. macOS, other Unix,
 and Windows return typed no-envelope producer error
 `ContainmentUnavailable(UnsupportedPlatform)` before cwd observation. On
 supported Linux, an observation subprocess opens the directory once with
@@ -487,7 +488,11 @@ precomputes a collision-free remap schedule; an already-fd-10 retained handle
 keeps its original `O_CLOEXEC`, otherwise the child uses `dup3(..., 10,
 O_CLOEXEC)` before closing the source descriptor.
 
-Immediately after fork and before waiting on the gate, the child uses only raw
+Immediately after fork and before descriptor isolation completes, the child
+transiently inherits the process-wide fd table. At most one such bootstrap
+child exists per owner in addition to an already admitted target, it performs
+no workload, and its inherited-reference count is not part of the numeric owner
+ledger ceiling. Before waiting on the gate, the child uses only raw
 async-signal-safe `dup2`/`dup3`, segmented `close_range`, `write`, `read`,
 `close`, and `_exit` syscalls. It establishes the frozen stdio/allowlist
 numbers, closes every inherited fd not in that role's allowlist, writes one
@@ -536,8 +541,19 @@ self-pidfd preflight precedes the initial capability fork; consequently,
 unsupported or policy-blocked `pidfd_open`/`pidfd_send_signal` maps to
 `ContainmentUnavailable(PidfdUnavailable)`, while any per-child `pidfd_open`
 failure after that successful preflight maps to
-`ChildRegistrationUnavailable { role, PidfdOpen }`. For the initial
-the `Observation(CapabilityCheck)` role only, `ENOSYS`, seccomp
+`ChildRegistrationUnavailable { role, PidfdOpen }`. A successfully registered
+`Observation(CapabilityCheck)` child must exit zero, after which the owner
+first observes its terminal event with
+`waitid(P_PIDFD, ..., WEXITED | WNOWAIT)` and then consumes the same event
+with `waitid(P_PIDFD, ..., WEXITED)`. Both results must carry the registered
+child identity, `CLD_EXITED`, and status zero. `ENOSYS`, `EINVAL`, `EPERM`,
+`EACCES`, `ECHILD`, or an identity/code/status mismatch returns
+`ContainmentUnavailable(PidfdUnavailable)` before cwd or any later child.
+Solely on this fail-closed bootstrap path, the still-unreaped direct child may
+be reaped by exact positive PID while its pidfd remains held. Fallback failure
+returns the existing cleanup-incomplete error and retains the owner permit.
+After capability success, every registered-child wait and reap is pidfd-only.
+For the initial `Observation(CapabilityCheck)` role only, `ENOSYS`, seccomp
 `EPERM`/`EACCES`, or unsupported-flag
 `EINVAL` from the validated descriptor-isolation syscall emits
 `DescriptorIsolationUnavailable`; after the child is reaped, that status maps
@@ -688,9 +704,16 @@ The closed trace state begins `AwaitInitialExecExit`: after the already verified
 `execveat` is accepted before `AwaitEntry`. Thereafter an allowed entry moves to
 `AwaitExit`, its matching tagged exit returns to `AwaitEntry`, and only `exit`
 or `exit_group` may terminate directly from their allowed entry without a
-matching exit stop. Signal-delivery, group, seccomp, event, untagged, wrong-op,
-wrong-architecture, and duplicate stops are never treated as syscall progress;
-they return `ExecutionVerificationUnavailable` and start cleanup. The active
+matching exit stop. A validated signal-delivery stop is legal only in
+`AwaitEntry` and never advances syscall state. The owner distinguishes it
+from tagged syscall, ptrace-event, seccomp, and group stops using the full wait
+status plus `PTRACE_GETSIGINFO`, then resumes with `PTRACE_SYSCALL` while
+injecting the same signal. A caught or ignored signal keeps `AwaitEntry`; a
+terminating signal yields only `terminated_by_signal` after complete capture.
+`SIGKILL` may terminate directly with the same semantic result. A delivery
+stop in `AwaitInitialExecExit` or `AwaitExit`, malformed siginfo, a group,
+seccomp, event, untagged, wrong-op, wrong-architecture, or duplicate stop
+returns `ExecutionVerificationUnavailable` and starts cleanup. The active
 deadline covers every trace stop and resume through target exit.
 
 The owner never resumes a denied entry. It kills/reaps the stopped target and
@@ -705,9 +728,10 @@ immutable vDSO are the only executable mappings allowed to run, and target
 code cannot gain a write path to either. PATH/cwd helper launches, dynamic
 loading, JIT mappings, writable executable segments, executable stacks,
 asynchronous syscall submission, processes, and threads are deliberately
-unsupported in v0.1. Target-initiated process signalling is also unsupported;
-signal-delivery stops from outside the target remain abnormal trace transitions
-and never become `ProcessSignalling` evidence.
+unsupported in v0.1. Target-initiated process signalling is also unsupported.
+A validated delivered signal is exit/control-flow evidence, never
+`ProcessSignalling`; cleanup-originated signals preserve the earlier failure
+and cannot become semantic exit evidence.
 
 The retained strong identity is device/inode from handle metadata on Unix and
 volume serial plus 128-bit `FILE_ID_INFO` from the opened handle on Windows.

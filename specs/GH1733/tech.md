@@ -347,7 +347,10 @@ Runtime version-probe authorization is a private conjunction of source and
 opened-target policy. `Repository` source maps to `IdentityOnly`; resolution,
 handle inspection, and hashing may run, but the payload records
 `version_probe/probe_not_authorized` with
-`configuration_source_repository`, and no process is created. `UserGlobal`,
+`configuration_source_repository`. Registered `Observation(...)` helpers
+may derive retained identity/hash/authorization evidence, but no
+`InitialTarget` or `RetryTarget` is created and no target, loader, or
+interpreter instruction runs. `UserGlobal`,
 `Admin`, `System`, `Runtime`, and genuine `Runner` pass only the source half.
 After opening the target, the producer resolves the final handle path and
 compares it, with platform-correct component and case semantics, against every
@@ -675,8 +678,10 @@ show every Rust file below 800 lines. The sandbox parity gate and Linux
 retained-directory/retained-executable path require mandatory human security
 review for exact `SandboxSpec` passthrough equivalence, observation-process
 fixed-frame/`SCM_RIGHTS` protocol, pidfd ownership and revalidation,
-pre-fork descriptor allowlists/foreign-fd isolation/start-gate ordering and
-direct-child rollback, global owner-permit lifetime, owner/helper/child
+bounded pre-ready inherited-fd transient, post-ready descriptor
+allowlists/foreign-fd isolation/start-gate ordering and direct-child rollback,
+capability-child validating/consuming `waitid(P_PIDFD)` plus bootstrap
+exact-PID fallback, global owner-permit lifetime, owner/helper/child
 descriptor ledgers, bounded launch/environment/setup-secret counting before
 hashing/splitting/joining, allocation-free post-fork work, descriptor ownership,
 `fchdir` ordering and error staging, `FD_CLOEXEC` script rejection, ptrace-stop ordering,
@@ -684,7 +689,9 @@ stopped-image identity/hash validation under kernel write denial,
 W+X/executable-stack rejection, post-exec syscall-stop denial of process
 creation, image execution, executable mappings, and existing executable-image
 mutation,
-registered-pidfd-only signalling and reap ordering, argument/environment pointers, NUL validation, error
+post-capability registered-pidfd-only signalling and reap ordering, legal
+signal-delivery reinjection and illegal-state rejection,
+argument/environment pointers, NUL validation, error
 propagation, proof that authorization cannot fall back to a pathname, and proof
 that `ENOEXEC` never starts a shell. Because the repository
 no longer contains the historical SpecRail

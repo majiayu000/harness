@@ -41,13 +41,22 @@ implementation PR or force-push.
       and reaper except for the audited target `PTRACE_TRACEME`. Every child is
       gated until its exact pidfd plus reap obligation is atomically registered.
       Before registry commit, rollback may use only the still-unreaped direct
-      child's positive PID; afterward every signal/reap uses the registered
-      pidfd. There is no anchor, PGID, process-group membership, negative-PID,
+      child's positive PID; afterward every signal uses the registered pidfd,
+      and after capability wait/reap succeeds every later wait/reap is
+      pidfd-only. The sole exception is exact-PID reap of the failed initial
+      capability bootstrap while its pidfd remains held. There is no anchor,
+      PGID, process-group membership, negative-PID,
       post-reap-PID, or descendant-enumeration evidence.
-      Eight owners each reserve two pidfd and 28 non-pidfd slots. One gated
-      child retains at most 12 references; a post-exec target plus observer
-      retains at most eight. No other child-role concurrency is legal, proving
-      40 per fingerprint, 16 pidfds and 320 descriptors globally. The active deadline covers
+      Eight owners each reserve two pidfd and 28 non-pidfd slots. Before
+      `DescriptorsReady`, at most one bootstrap child per owner may
+      transiently inherit the process-wide fd table in addition to an admitted
+      target; it performs no workload and is bounded by deadline/rollback, not
+      the numeric ledger. After readiness one child retains at most 12
+      allowlisted references; a post-exec target plus observer retains at most
+      eight. No other child-role concurrency is legal, proving post-ready
+      ceilings of 40 per fingerprint, 16 pidfds and 320 descriptors globally.
+      Self-pidfd open/signal plus the capability child's validating and
+      consuming `waitid(P_PIDFD)` calls must pass before cwd. The active deadline covers
       retained cwd/target observation, authorization, exec stop, target
       execution/reap, bounded output, and post-reap checkpoint; cleanup has its
       separate deadline. Success requires exact target reap, complete bounded
@@ -76,7 +85,9 @@ implementation PR or force-push.
       finding is re-evaluated on the exact head. Verification must prove
       owner-exclusive process creation/ptrace/wait/reap; atomic pidfd
       registration before `GO`; direct-child rollback before registration;
-      two-pidfd/28-non-pidfd owner ledgers; exact-pidfd-only cleanup; registry
+      two-pidfd/28-non-pidfd owner ledgers; validating and consuming
+      `waitid(P_PIDFD)` on the capability child, bootstrap fallback, then
+      exact-pidfd-only cleanup; registry
       emptiness on success; and absence of anchors, PGID signalling,
       membership stages, or descendant-tree claims. It must also cover
       an unrelated same-session process repeatedly changing process groups
@@ -84,7 +95,8 @@ implementation PR or force-push.
       success evidence;
       `O_PATH` search-only cwd, both setup stages on initial/retry targets,
       x86_64 `uselib` denial without an aarch64 pseudo-entry, output failure
-      precedence, static ELF success and all closed format rejections,
+      precedence, fatal/caught/ignored signal delivery and illegal trace
+      transitions, static ELF success and all closed format rejections,
       exec-stop/hash verification, repository non-execution, platform gates,
       exact digest vectors, `ETXTBSY`, schema dialect behavior, source
       binding, annotation bounds, and unchanged producer-only scope.
@@ -154,15 +166,18 @@ of silently expanding scope.
       fail-closed gate; Linux observation-process fixed-frame/`SCM_RIGHTS`
       protocol; bounded launch/environment/setup-secret counting; eight-owner
       admission and permit lifetime; owner/helper/child fd ledgers; allocation-
-      free post-fork work; foreign-fd isolation before `DESCRIPTORS_READY`;
+      free post-fork work; bounded pre-ready inherited-fd transient and
+      foreign-fd isolation at/after `DESCRIPTORS_READY`;
       pre-fork start gates and direct-child rollback; pidfd registration,
-      revalidation, handoff, and reap ownership; retained cwd/target descriptors
+      `waitid(P_PIDFD, WNOWAIT)` validation, consuming pidfd reap, bootstrap
+      exact-PID fallback, revalidation, handoff, and reap ownership; retained cwd/target descriptors
       and `fchdir`; final-target authorization; `FD_CLOEXEC` shebang rejection;
       ptrace exec-stop/first-instruction ordering and hash/image validation under
       kernel write denial; W+X/executable-stack rejection; post-exec
       syscall-stop denial of process/image/executable-mapping (including
       x86_64 `uselib`) and existing-executable-mutation transitions,
       target-initiated process signalling, and pre-native x32 rejection;
+      legal signal-delivery reinjection and illegal-state rejection;
       retained-handle pre-exec; exact registered-pidfd-only signalling and reap
       ordering; empty-registry success;
       argument/environment pointer ownership; NUL validation; stage-tagged
@@ -179,7 +194,7 @@ of silently expanding scope.
 | B-004 | Frozen Unix/Windows command-form and digest vectors; `O_PATH` retained cwd with no `O_NOFOLLOW`; search-only cwd and pathname replacement; raw Unix bytes and Windows UTF-16 units; exact `EACCES` fallback, one 150 ms `ETXTBSY` retry, candidate 65, no shell, and fd-10 execution context; later pre-target outcomes preserve prior reaped attempts while the registry is empty |
 | B-005, B-010 | Closed environment policy, setup-secret exclusion, exact PATH and Claude-directory digest vectors, Unix/Windows key rules, direct/env shebang rejection before target/interpreter creation, and proof that only sanitized PATH reaches an admitted static target |
 | B-006 | Nonblocking retained executable handle, size and strong-identity checkpoints, hard-link authorization, kill-isolated observation helpers, atomic pidfd registration before `GO`, exact observation errors, static ELF/exec-stop verification, path-race rejection, and no in-process blocking worker |
-| B-007 | Eight-owner deadlines and phase-proven 28 + 12 descriptor capacity; two pidfds per owner; exact-pidfd-only signal/reap; initial/retry `working_directory_enter` and `trace_setup`; process/image/mapping/mutation/signalling denial including x86_64 `uselib`; target reap + complete output + post-reap checkpoint + empty registry success barrier; unrelated same-session `setpgid` churn is never registered/observed/signalled and cannot affect success; no anchor/PGID/membership/descendant-tree claim; non-Linux pre-observation failure |
+| B-007 | Eight-owner deadlines; bounded pre-ready inherited-fd transient plus post-ready 28 + 12 retained capacity; two pidfds per owner; capability-child validating/consuming `waitid(P_PIDFD)`, bootstrap exact-PID fallback, then exact-pidfd-only signal/reap; initial/retry `working_directory_enter` and `trace_setup`; process/image/mapping/mutation/signalling denial including x86_64 `uselib`; target reap + complete output + post-reap checkpoint + empty registry success barrier; unrelated same-session `setpgid` churn is never registered/observed/signalled and cannot affect success; no anchor/PGID/membership/descendant-tree claim; non-Linux pre-observation failure |
 | B-008 | Closed failure vocabulary and canonical ordering; observation errors remain no-envelope; termination/reap/drain cleanup failures retain exact ownership; removed `lingering_process_group`, anchor, and membership values are rejected |
 | B-009 | Exact Codex/Claude whole-stream grammars and stream selection; capture error precedence; after complete capture signal/nonzero exclusivity; zero-exit-only UTF-8/blank/grammar classification; exact HT/LF/CR/SP blank predicate and success-only output digests |
 | B-012 | `mcp_description_preserves_absent_empty_space_tab_and_newline_distinctions`; `mcp_output_schema_absence_and_presence_are_distinct`; `mcp_annotations_preserve_absent_empty_hints_title_vendor_values_and_ordered_arrays`; `mcp_annotation_hints_do_not_infer_capabilities`; exact-limit and limit-plus-one tool-name/description/annotations fixtures |
@@ -194,15 +209,20 @@ Cross-cutting mandatory runtime tests additionally prove:
 - owner admission accepts eight, the ninth fails before work, and permits stay
   held until actual owner exit with an empty registry;
 - exact limits are two pidfds and 28 non-pidfd slots per owner, 16 pidfds and
-  320 retained descriptors globally. Phase accounting freezes at most 12
-  simultaneous child references (or target three plus observer five), with
-  role-exact fd allowlists and no foreign owner descriptors;
+  320 post-`DescriptorsReady` retained descriptors globally. Before readiness
+  one bootstrap child per owner may transiently inherit the process-wide table
+  in addition to an admitted target, performs no workload, and is bounded by
+  deadline/rollback rather than the numeric ledger. After readiness phase
+  accounting freezes at most 12 simultaneous allowlisted child references (or
+  target three plus observer five), with no foreign owner descriptors;
 - cwd opens with `O_PATH | O_DIRECTORY | O_CLOEXEC` and no `O_NOFOLLOW`,
   including a search/execute-only directory and pathname replacement;
 - x86_64 x32 dispatch fails before native classification, x86_64 `uselib` is
   denied as executable mapping, and aarch64 has no fabricated `uselib` entry;
-- output overflow/read failure precedes exit classification; signal and
-  nonzero outcomes do not also emit UTF-8/blank/grammar failures;
+- output overflow/read failure precedes exit classification; fatal delivered
+  signals are reinjected and yield only `terminated_by_signal`, caught/ignored
+  signals continue, illegal delivery transitions fail verification, and signal
+  or nonzero outcomes do not also emit UTF-8/blank/grammar failures;
 - success requires target reap, complete bounded streams, a passing post-reap
   checkpoint, and an empty registry, with no PGID, membership, negative-PID,
   post-reap-PID, or descendant-tree evidence;
@@ -235,13 +255,16 @@ fixed vectors, never values generated by the helper under test.
   environment/setup collections and names are bounded at 1,024. Excluded or
   undeclared values are never read.
 - The owner admits exactly eight fingerprints. Each has two pidfd slots and 28
-  non-pidfd slots; global retained ceilings are 16 pidfds and 320 descriptors.
-  One pre-`GO` child has at most 12 references; post-exec target plus observer
-  has at most eight; no other concurrent roles exist. The permit remains held
-  until the owner exits with an empty exact registry.
+  non-pidfd slots; post-ready global retained ceilings are 16 pidfds and 320
+  descriptors. A pre-ready child may transiently inherit the process table;
+  after readiness one child has at most 12 allowlisted references and a
+  post-exec target plus observer at most eight. No other concurrent roles
+  exist. The permit remains held until the owner exits with an empty registry.
 - Every child is gated until its pidfd plus reap obligation is registered.
   Pre-registration rollback may use only its exact still-unreaped positive PID;
-  post-registration cleanup uses only the registered pidfd.
+  the capability child must prove validating/consuming `waitid(P_PIDFD)`
+  before cwd, with exact-PID reap allowed only for failed bootstrap capability
+  detection. After success all registered-child cleanup uses only pidfds.
 - Success proves registered obligations are empty and the guarded target
   executed no process-creation syscall. It does not claim descendant-tree
   emptiness. Anchors, PGIDs, membership stages, and `/proc` group scans are

@@ -21,18 +21,26 @@ retains the permit until its thread exits and its exact pidfd registry is empty.
 
 The owner reserves exactly two pidfd slots: one current target and one current
 capability or observation helper. Eight owners therefore retain at most 16
-pidfds. Its exact non-pidfd ledger contains 28 slots. Simultaneous child
-descriptor references are frozen by phase:
+pidfds. Its exact non-pidfd ledger contains 28 slots. Before
+`DescriptorsReady`, at most one newly forked bootstrap child per owner may
+transiently retain the process-wide inherited descriptor table in addition to
+an already admitted target role. That transient has no numeric ceiling derived
+from the owner ledger, performs no workload, and is bounded by the active
+deadline plus exact direct-child rollback. After `DescriptorsReady`, foreign
+references are absent and simultaneous allowlisted child references are frozen
+by phase:
 
 | Phase | Live child references |
 | --- | --- |
-| bootstrap or ordinary observation | one gated/helper child, at most 12 |
+| ready bootstrap or ordinary observation | one gated/helper child, at most 12 |
 | target after verified exec, without observer | exactly three stdio references |
 | exec-stop observation | target's three stdio plus at most five observer references, total at most eight |
 
-No other phase permits two live child roles. The all-phase child-reference
-maximum is therefore 12, so retained ceilings are 28 + 12 = 40 per fingerprint
-and 320 globally. There is no process-group anchor, PGID slot,
+No other phase permits two live child roles. The post-ready child-reference
+maximum is therefore 12. The
+post-`DescriptorsReady` retained ceilings are 28 + 12 = 40 per fingerprint
+and 320 globally; they do not bound the transient inherited table. There is no
+process-group anchor, PGID slot,
 membership helper, membership-transfer channel, or member batch. Capacity is
 reserved before an fd, fork, `pidfd_open`, or `SCM_RIGHTS` operation.
 Logical-capacity failure wins over an injected OS allocation failure.
@@ -47,6 +55,12 @@ isolation, owner-side `PTRACE_SEIZE/PTRACE_INTERRUPT`,
 `PTRACE_GET_SYSCALL_INFO`, and strong stopped-image observation. It also
 attempts a write-capable open of `/proc/self/mem`; the owner must classify and
 deny that entry before execution. The helper never calls `PTRACE_TRACEME`.
+Containment is not available until this successful
+`Observation(CapabilityCheck)` child exits and the owner validates its
+terminal event with `waitid(P_PIDFD, ..., WEXITED | WNOWAIT)`, then consumes
+and validates the same event with `waitid(P_PIDFD, ..., WEXITED)`. Both
+results must name the registered child identity with `CLD_EXITED` and status
+zero.
 
 Every capability helper, observation helper, initial target, and retry target
 uses the same creation transaction:
@@ -62,10 +76,17 @@ uses the same creation transaction:
 
 Before step 5 completes, registration failure closes the gate and may signal
 only the exact still-unreaped positive PID of that direct child for bounded
-rollback. After registration, every signal, wait, and reap decision is tied to
-the registered pidfd identity. No operation uses a negative PID, PGID, a PID
-after reap, or `/proc` membership. Cancellation cannot observe a lease before
-the registry commit.
+rollback. After registration, every signal decision is tied to the registered
+pidfd identity. The initial capability child additionally proves pidfd wait and
+reap before that mechanism is trusted. If either `waitid(P_PIDFD)` call is
+unsupported, blocked, or returns the wrong identity/status, the still-unreaped
+direct capability child may, solely for this fail-closed bootstrap, be reaped
+by exact positive PID while its pidfd remains held; PID reuse is impossible
+before reap. Success enables exact-pidfd-only wait/reap for every later
+registered child. Bootstrap fallback failure retains the owner permit and
+returns the existing cleanup-incomplete error. No operation uses a negative
+PID, PGID, a PID after reap, or `/proc` membership. Cancellation cannot
+observe a lease before the registry commit.
 
 One monotonic
 `RUNTIME_FINGERPRINT_PROBE_DEADLINE = Duration::from_millis(5_000)` begins
