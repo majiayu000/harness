@@ -113,6 +113,8 @@ must list at least one matching test. Zero matches fail verification.
     enter the stable projection.
   - Expected probe failures are valid evidence.
   - No-envelope producer errors map exhaustively to `Failed`.
+  - Runtime and MCP producer `Err` values use their wrapper-specific
+    `from_producer_failure` constructors, with no cross-wrapper conversion.
   - GH-1734's count-only strict-envelope wire method matches actual GH-1733
     serialization for every complete vector and optional branch.
   - No schema recanonicalization or `harness-agents` reverse dependency is
