@@ -1,11 +1,14 @@
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::state::AppState;
 use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::task_runner::{TaskKind, TaskPhase, TaskState, TaskStatus};
 use crate::workspace::WorkspaceEntry;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -32,12 +35,46 @@ pub struct WorktreeResponse {
     pub project: Option<String>,
 }
 
-pub async fn worktrees(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum WorktreesResponse {
+    Worktrees(Vec<WorktreeResponse>),
+    Error { error: String },
+}
+
+#[cfg(test)]
+mod response_shape_tests {
+    use super::WorktreesResponse;
+
+    #[test]
+    fn worktrees_response_preserves_array_and_error_shapes() -> anyhow::Result<()> {
+        assert_eq!(
+            serde_json::to_value(WorktreesResponse::Worktrees(Vec::new()))?,
+            serde_json::json!([])
+        );
+        assert_eq!(
+            serde_json::to_value(WorktreesResponse::Error {
+                error: "boom".to_string(),
+            })?,
+            serde_json::json!({ "error": "boom" })
+        );
+        Ok(())
+    }
+}
+
+pub async fn worktrees(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<WorktreesResponse>) {
     match list_worktrees(&state).await {
-        Ok(worktrees) => (StatusCode::OK, Json(json!(worktrees))),
+        Ok(worktrees) => (
+            StatusCode::OK,
+            Json(WorktreesResponse::Worktrees(worktrees)),
+        ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error.to_string() })),
+            Json(WorktreesResponse::Error {
+                error: error.to_string(),
+            }),
         ),
     }
 }

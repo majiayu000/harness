@@ -1,3 +1,4 @@
+use super::rest_contract::LegacyJson as Json;
 use super::AppState;
 use crate::workflow_runtime_submission::{
     RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
@@ -7,7 +8,6 @@ use axum::{
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use harness_workflow::runtime::{
     WorkflowEvidence, WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,

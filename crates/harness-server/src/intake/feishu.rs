@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use dashmap::DashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::AppState;
 use crate::workflow_runtime_submission::{
     runtime_models::{TaskId, TaskStatus},

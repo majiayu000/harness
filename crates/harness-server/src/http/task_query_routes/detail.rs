@@ -2,7 +2,7 @@ use super::*;
 use crate::runtime_projection::{runtime_string_field, RuntimeWorkflowProjection};
 
 #[derive(Serialize)]
-struct RuntimeTaskResponse {
+pub(in crate::http) struct RuntimeTaskResponse {
     id: String,
     task_id: String,
     submission_id: String,

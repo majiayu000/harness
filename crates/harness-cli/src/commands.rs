@@ -91,13 +91,13 @@ pub enum Command {
         actor: Option<String>,
     },
 
-    /// GC Agent commands
+    /// Direct GC commands; bypasses server auth, concurrency, and workflow event logging
     Gc {
         #[command(subcommand)]
         cmd: GcCommand,
     },
 
-    /// Rule engine commands
+    /// Direct rule commands; bypasses server auth/concurrency and may record scan events
     Rule {
         #[command(subcommand)]
         cmd: RuleCommand,
@@ -110,7 +110,7 @@ pub enum Command {
         cmd: ExecPolicyCommand,
     },
 
-    /// Skill system commands
+    /// Direct skill commands; bypasses server auth, concurrency, and workflow event logging
     Skill {
         #[command(subcommand)]
         cmd: SkillCommand,

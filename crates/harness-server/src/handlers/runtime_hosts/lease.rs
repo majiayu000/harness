@@ -1,9 +1,9 @@
+use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use crate::runtime_hosts::RuntimeHostLifecycle;
 use axum::{
-    extract::{rejection::JsonRejection, Path, State},
+    extract::{rejection::JsonRejection, State},
     http::StatusCode,
-    Json,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use harness_workflow::runtime::store::runtime_job_leases::{

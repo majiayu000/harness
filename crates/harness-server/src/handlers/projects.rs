@@ -1,11 +1,8 @@
 use crate::http::builders::intake::effective_issue_project_limits;
+use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use crate::project_registry::{validate_project_root, Project};
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::State, http::StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;

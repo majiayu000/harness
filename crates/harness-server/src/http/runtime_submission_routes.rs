@@ -1,9 +1,9 @@
+use super::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use super::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use harness_core::agent::ApprovalDecision;
 use serde::Serialize;
@@ -11,12 +11,12 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Serialize)]
-struct ApprovalResponse {
+pub(super) struct ApprovalResponse {
     accepted: bool,
 }
 
 #[derive(Debug, Serialize)]
-struct RuntimeSubmissionArtifact {
+pub(super) struct RuntimeSubmissionArtifact {
     task_id: String,
     turn: i64,
     artifact_type: String,
@@ -25,7 +25,7 @@ struct RuntimeSubmissionArtifact {
 }
 
 #[derive(Debug, Serialize)]
-struct RuntimeSubmissionPrompt {
+pub(super) struct RuntimeSubmissionPrompt {
     task_id: String,
     turn: i64,
     phase: String,
