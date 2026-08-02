@@ -612,8 +612,9 @@ attempt vocabularies are normative in `runtime-product.md`.
       child. `WNOWAIT` errors/mismatches and consuming-call errors while the
       child remains unreaped exercise exact-PID bootstrap rollback. A successful
       consuming wait with malformed identity, code, or status proves no later
-      positive-PID operation occurs; every failure returns pidfd-unavailable
-      before cwd or any later child.
+      positive-PID operation occurs. Completed rollback returns pidfd-unavailable;
+      incomplete fallback returns cleanup-incomplete and retains the obligation
+      and permit. Neither case starts cwd or any later child.
       Start-gate fault injection covers the `CapabilityCheck` and every other
       observation stage plus `InitialTarget` and `RetryTarget` roles. No role
       performs workload before `GO`;

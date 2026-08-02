@@ -398,13 +398,14 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    wait and reap by one validating
    `waitid(P_PIDFD, WEXITED | WNOWAIT)` followed by a consuming
    `waitid(P_PIDFD, WEXITED)`; both results require its registered identity,
-   `CLD_EXITED`, and status zero. Failure returns
+   `CLD_EXITED`, and status zero. A completed failure path returns
    `containment_unavailable/pidfd_unavailable` before cwd or later children.
    Solely for this bootstrap, a `WNOWAIT` failure/mismatch or consuming-call
    error while the child remains unreaped permits exact positive-PID reap while
    the pidfd remains held. A successful consuming wait has reaped the child, so
    a malformed identity/code/status result closes and unregisters it without a
-   positive-PID operation. Fallback failure retains the owner permit. After
+   positive-PID operation. Fallback failure returns the existing
+   cleanup-incomplete error and retains the obligation and owner permit. After
    success every registered-child wait/reap is pidfd-only. The owner is the
    sole process creator, parent-side ptrace
    controller, helper spawner, waiter, and reaper; the target pre-exec

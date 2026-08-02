@@ -81,13 +81,14 @@ Before step 5 completes, registration failure closes the gate and may signal
 only the exact still-unreaped positive PID of that direct child for bounded
 rollback. After registration, every signal decision is tied to the registered
 pidfd identity. The initial capability child additionally proves pidfd wait and
-reap before that mechanism is trusted. If either `waitid(P_PIDFD)` call is
-unsupported, blocked, or returns the wrong identity/status, the still-unreaped
-direct capability child may, solely for this fail-closed bootstrap, be reaped
-by exact positive PID while its pidfd remains held; PID reuse is impossible
-before reap. Success enables exact-pidfd-only wait/reap for every later
-registered child. Bootstrap fallback failure retains the owner permit and
-returns the existing cleanup-incomplete error. No operation uses a negative
+reap before that mechanism is trusted. A `WNOWAIT` error/mismatch, or a
+consuming-call error while the child remains unreaped, permits the sole
+fail-closed bootstrap reap by exact positive PID while its pidfd remains held.
+A successful consuming wait has reaped the child, so a malformed result then
+permits no PID operation. Completed rollback returns `PidfdUnavailable`;
+fallback failure returns the existing cleanup-incomplete error and retains the
+obligation and owner permit. Success enables exact-pidfd-only wait/reap for
+every later registered child. No operation uses a negative
 PID, PGID, a PID after reap, or `/proc` membership. Cancellation cannot
 observe a lease before the registry commit.
 
