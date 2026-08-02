@@ -131,6 +131,33 @@ send methods immediately without repeating the handshake.  Sending `initialize`
 again after the server is already initialized returns a `-32600 INVALID_REQUEST`
 error.
 
+## REST DTO ownership
+
+New first-party REST request and response DTOs are defined in
+`harness-protocol::rest`. The protocol crate seals the `RestDto` marker, so a
+server-local type cannot opt into the shared contract.
+
+Harness Server enforces the boundary with typed HTTP adapters:
+
+- `ContractJson`, `ContractQuery`, and `ContractPath` accept only
+  protocol-owned DTOs.
+- `LegacyJson` and `LegacyQuery` accept only the explicit server-local DTOs
+  that predate this boundary. That registry is migration-only and must shrink;
+  adding a new entry is not a supported way to introduce an API contract.
+- `PrimitivePath` is limited to the existing primitive path shapes. A new
+  named path DTO belongs in the protocol crate.
+- Clippy rejects direct use of Axum's `Json`, `Query`, and `Path` types in
+  production server code, so aliases and qualified paths cannot bypass the
+  boundary.
+- A checked-in legacy inventory fingerprints the grandfathered handler use
+  sites, registry roots, and server-local wire nodes. The inventory may only
+  shrink; changing a legacy shape or adding a use site fails the contract test.
+
+Routes that must authenticate a raw signed body may validate the bytes before
+deserializing, but their first-party payload type still belongs in
+`harness-protocol::rest`. Opaque third-party webhook documents may remain
+`serde_json::Value` when Harness does not own their wire schema.
+
 ## Why the split?
 
 The design is intentional:
@@ -162,6 +189,24 @@ The design is intentional:
 | Respond to a live approval request | `POST /api/workflows/runtime/turns/{turn_id}/approvals/{request_id}` (HTTP) |
 | Load rules for an agent to respect | `rule/load` (JSON-RPC) |
 | Record an event from within an agent | `event/log` (JSON-RPC) |
+
+## CLI Direct Commands
+
+`harness gc`, `harness rule`, and `harness skill` are explicit direct CLI
+commands. They link the domain crates directly and do not submit work through
+the Harness server, so they bypass server authentication, workflow runtime
+concurrency limits, and workflow lifecycle event logging. They are not offline
+mode: when configured for PostgreSQL or agent-backed work, they may open the
+configured database, persist scan records, or invoke the configured agent.
+`harness rule check` records scan events through its configured event store,
+but that observability is direct command behavior rather than a server-mediated
+workflow record.
+
+Use the server JSON-RPC methods (`gc/*`, `rule/*`, `skill/*`) when those
+operations must run behind the active server transport, authentication, and
+shared server state. These methods do not generally create workflow runtime
+submissions or lifecycle records; only method-specific handlers that explicitly
+enqueue workflow work participate in the workflow runtime lifecycle.
 
 ## HTTP runtime submission list
 

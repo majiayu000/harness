@@ -1,8 +1,8 @@
 use super::*;
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::task_mutation_routes::{
     reconstruct_runtime_transcript, RuntimeTranscriptReconstructionRequest,
 };
-use axum::Json;
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeKind,
     RuntimeTranscriptRead, WorkflowCommand, WorkflowInstance, WorkflowSubject,

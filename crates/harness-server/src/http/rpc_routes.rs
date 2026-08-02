@@ -2,11 +2,11 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use harness_protocol::methods::RpcRequest;
 use std::sync::Arc;
 
+use super::rest_contract::ContractJson as Json;
 use super::state::AppState;
 use crate::router;
 

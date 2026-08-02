@@ -1,8 +1,8 @@
+use super::rest_contract::LegacyJson as Json;
 use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    Json,
 };
 use serde_json::json;
 use std::path::{Path as StdPath, PathBuf};

@@ -1,3 +1,4 @@
+use super::rest_contract::LegacyJson as Json;
 use super::AppState;
 use crate::{
     http::api_error::ApiError,
@@ -5,7 +6,7 @@ use crate::{
     services::execution::EnqueueTaskError,
     workflow_runtime_submission::{CreateTaskRequest, TaskId},
 };
-use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response};
 use serde_json::json;
 use std::sync::Arc;
 

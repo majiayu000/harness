@@ -1,21 +1,14 @@
+use super::rest_contract::LegacyJson as Json;
 use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    Json,
 };
+use harness_protocol::rest::IngestSignalRequest;
 use serde_json::json;
 use std::sync::Arc;
 
 use super::state::AppState;
-
-#[derive(serde::Deserialize)]
-pub(crate) struct IngestSignalRequest {
-    pub(crate) source: String,
-    #[serde(default)]
-    pub(crate) severity: Option<harness_core::types::Severity>,
-    pub(crate) payload: serde_json::Value,
-}
 
 /// Infer severity from a GitHub webhook payload: CI failure → High, changes_requested → Medium.
 pub(crate) fn infer_github_severity(
