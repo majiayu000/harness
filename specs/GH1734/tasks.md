@@ -40,7 +40,7 @@ must list at least one matching test. Zero matches fail verification.
     The observation value is opaque, and `NotObserved` is available only
     through `not_observed_without_attempt`.
 - Verify:
-  - `cargo test -p harness-core stack::snapshot::model`
+  - `cargo test -p harness-core stack::snapshot::tests::model`
   - `cargo check -p harness-core --all-targets`
 
 ### SP1734-T2 — Implement canonical stable identity
@@ -56,8 +56,8 @@ must list at least one matching test. Zero matches fail verification.
     are pinned.
   - Outer observation time and run ID never enter the hash.
 - Verify:
-  - `cargo test -p harness-core stack::snapshot::canonical`
-  - `cargo test -p harness-core stack::snapshot::stable_id`
+  - `cargo test -p harness-core stack::snapshot::tests::canonical`
+  - `cargo test -p harness-core stack::snapshot::tests::stable_id`
 
 ### SP1734-T3 — Map complete repository inventory evidence
 
@@ -74,7 +74,7 @@ must list at least one matching test. Zero matches fail verification.
   - Every `AgentStackInventoryErrorKind` maps exhaustively to one closed
     producer-failure kind; inventory failure yields no snapshot.
 - Verify:
-  - `cargo test -p harness-core stack::snapshot::repository`
+  - `cargo test -p harness-core stack::snapshot::tests::repository`
   - `cargo test -p harness-core stack::inventory`
 
 ### SP1734-T4 — Map typed runtime-context evidence
@@ -94,7 +94,7 @@ must list at least one matching test. Zero matches fail verification.
   - No automatic snapshot collection is added.
 - Verify:
   - `cargo test -p harness-server context_provenance`
-  - `cargo test -p harness-core stack::snapshot::context`
+  - `cargo test -p harness-core stack::snapshot::tests::context`
   - `cargo check -p harness-server --all-targets`
 
 ### SP1734-T5 — Map validated runtime and MCP fingerprints
@@ -110,7 +110,7 @@ must list at least one matching test. Zero matches fail verification.
   - No schema recanonicalization or `harness-agents` reverse dependency is
     introduced.
 - Verify:
-  - `cargo test -p harness-core stack::snapshot::fingerprint`
+  - `cargo test -p harness-core stack::snapshot::tests::fingerprint`
   - `cargo test -p harness-core fingerprint`
   - `cargo test -p harness-agents runtime_fingerprint`
   - `cargo check -p harness-agents --all-targets`

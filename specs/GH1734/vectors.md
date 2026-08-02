@@ -26,10 +26,11 @@ component-ID order:
 1. `repository:instructions:AGENTS.md`
 2. `runtime:memory:repo_memory/record-00000000-0000-4000-8000-000000000001`
 
-The repository evidence is the exact shape emitted by the current ASC-002
-inventory for `AGENTS.md`: a `regular_file` with executable tag `0x02`,
-integrity `SHA-256("repo")`, and an empty capability list. The context evidence
-has `SHA-256("context")` component integrity, semantic order zero, reason
+On Unix, the repository evidence is the exact shape emitted by the current
+ASC-002 inventory for `AGENTS.md`: a `regular_file` with executable tag `0x02`,
+integrity `SHA-256("repo")`, and an empty capability list. The portable vector
+constructs that same shape from a typed ASC-002 entry fixture. The context
+evidence has `SHA-256("context")` component integrity, semantic order zero, reason
 `repo_memory_selected`, and present metadata: canonical UUID record ID
 `00000000-0000-4000-8000-000000000001`, present evidence reference
 `artifact:7`, and estimated tokens 42.

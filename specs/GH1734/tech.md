@@ -151,11 +151,14 @@ AgentStackSnapshotInputs
   mcp_fingerprint: AgentStackMcpFingerprintObservation
 ```
 
-Only the corresponding runtime or MCP adapter constructs its fingerprint
-observation wrapper. There is no conversion between the wrappers, so the
-snapshot constructor cannot exchange the two slots even though both contain
-the same closed envelope type. A failed observation still carries no domain;
-the wrapper and destination slot determine that domain.
+Each wrapper owns an `observed(Vec<AgentStackFingerprintEnvelope>)` typed
+constructor that validates the required runtime or MCP subject and permits an
+empty vector. This is the supported path for the all-observed empty vector.
+The corresponding producer adapter maps its actual producer `Result` into the
+same wrapper. There is no conversion between the wrappers, so the snapshot
+constructor cannot exchange the two slots even though both contain the same
+closed envelope type. A failed observation still carries no domain; the
+wrapper and destination slot determine that domain.
 
 Harness-core owns one closed `AgentStackContextSelectionReason` enum whose
 variants map one-to-one to the existing runtime constants:
@@ -426,10 +429,13 @@ a70ef74bf084fba3e6d0d12daeebc09b24236ffe76d601a85f89cdc4f1106200
 ```
 
 The independent non-empty vector frozen in `specs/GH1734/vectors.md` is 1,312
-canonical bytes and contains repository plus runtime-context evidence that is
-constructible through the existing ASC-002 inventory and GH-1734 context typed
-inputs. It covers the inventory's empty capability list, executable tag
-`0x02`, present integrity, canonical UUID memory identity, present context
+canonical bytes and contains repository plus runtime-context evidence. Its
+portable test constructs the repository evidence from a typed ASC-002 entry
+fixture and the context evidence from GH-1734 typed inputs. A Unix-only
+integration test constructs the matching repository entry through the real
+ASC-002 inventory; non-Unix inventory retains `unix_executable: None` and is
+covered separately. The vector covers an empty capability list, executable
+tag `0x02`, present integrity, canonical UUID memory identity, present context
 metadata, and present evidence reference. Its expected digest is
 `da375d4cf97e7b01281a18130dacc614706aec719b7611320aa1ccb6b846f49e`.
 The vector document includes the full canonical input hex. Tests first build
@@ -590,9 +596,12 @@ the full envelope for later structural diff while using the verified
 fingerprint digest in the stable projection. It never reparses schema JSON or
 substitutes component integrity for payload identity.
 
-The harness-agents runtime helper accepts the actual
-`Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError>`.
-It exhaustively maps input/component/schema/digest contract errors to
+The runtime wrapper's typed `observed` constructor accepts zero or more
+validated runtime-subject envelopes, including the successful empty case. The
+harness-agents runtime producer adapter accepts the actual
+`Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError>` and
+maps `Ok` to a one-envelope runtime wrapper. It exhaustively maps
+input/component/schema/digest contract errors to
 `invalid_evidence`, resource-limit errors to `limit_exceeded`, explicit caller
 cancellation to `interrupted`, and OS/probe/containment/cleanup/timeout
 unavailability to `source_unavailable`. Expected probe failures that GH-1733
