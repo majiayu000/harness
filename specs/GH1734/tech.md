@@ -144,6 +144,11 @@ AgentStackMcpFingerprintObservation(  // opaque public newtype
   AgentStackDomainObservation<AgentStackFingerprintEnvelope>
 )
 
+AgentStackRuntimeFingerprintObservation::observed(Vec<AgentStackFingerprintEnvelope>)
+AgentStackRuntimeFingerprintObservation::not_observed_without_attempt()
+AgentStackMcpFingerprintObservation::observed(Vec<AgentStackFingerprintEnvelope>)
+AgentStackMcpFingerprintObservation::not_observed_without_attempt()
+
 AgentStackSnapshotInputs
   repository_inventory: AgentStackDomainObservation<AgentStackInventoryEntry>
   runtime_context: AgentStackDomainObservation<AgentStackRuntimeContextEvidence>

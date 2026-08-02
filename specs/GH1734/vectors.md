@@ -29,8 +29,9 @@ component-ID order:
 On Unix, the repository evidence is the exact shape emitted by the current
 ASC-002 inventory for `AGENTS.md`: a `regular_file` with executable tag `0x02`,
 integrity `SHA-256("repo")`, and an empty capability list. The portable vector
-constructs that same shape from a typed ASC-002 entry fixture. The context
-evidence has `SHA-256("context")` component integrity, semantic order zero, reason
+constructs that same shape from the SP1734-T3 typed inventory-entry fixture
+factory. The context evidence has `SHA-256("context")` component integrity,
+semantic order zero, reason
 `repo_memory_selected`, and present metadata: canonical UUID record ID
 `00000000-0000-4000-8000-000000000001`, present evidence reference
 `artifact:7`, and estimated tokens 42.
@@ -43,10 +44,11 @@ The exact intermediate digests are:
 | `context` | `ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4` |
 
 The successful literal vector is portable: its repository component is built
-from a typed `AgentStackInventoryEntry` fixture whose executable tag is
-`0x02`, together with the closed GH-1734 context input and no placeholder
-fingerprint envelopes. The implementation test must require exact equality
-with the literal bytes below and then hash the literal independently. On Unix,
+from the SP1734-T3 `#[cfg(test)] pub(super)` `AgentStackInventoryEntry` fixture
+factory in `stack/inventory/mod.rs`, with executable tag `0x02`, together with
+the closed GH-1734 context input and no placeholder fingerprint envelopes. The
+implementation test must require exact equality with the literal bytes below
+and then hash the literal independently. On Unix,
 a separate integration test must construct the same repository component
 through the real ASC-002 inventory and consume it through the crate-visible
 `into_entries(self)` API. On non-Unix targets the real inventory emits
