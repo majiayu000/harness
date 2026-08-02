@@ -1,8 +1,8 @@
+use super::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use std::collections::BTreeSet;

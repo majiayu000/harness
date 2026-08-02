@@ -1,9 +1,6 @@
+use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::State, http::StatusCode};
 use harness_workflow::runtime::RepoMemoryRecord;
 use serde_json::{json, Value};
 use std::sync::Arc;

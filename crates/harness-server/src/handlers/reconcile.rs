@@ -1,5 +1,6 @@
+use crate::http::rest_contract::{LegacyJson as Json, LegacyQuery as Query};
 use crate::http::AppState;
-use axum::{extract::Query, extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use serde::Deserialize;
 use std::sync::Arc;
 

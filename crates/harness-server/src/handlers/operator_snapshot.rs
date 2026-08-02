@@ -3,8 +3,9 @@
 //! Aggregates retry scheduler state, rate-limit pressure, and recent task
 //! failures into a single low-latency payload suitable for polling every 30 s.
 
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use chrono::Utc;
 use harness_core::types::EventFilters;
 use serde_json::{json, Value};

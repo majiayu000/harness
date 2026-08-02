@@ -1,10 +1,10 @@
 use super::AppState;
+use crate::http::rest_contract::LegacyJson as Json;
 use axum::{
     extract::State,
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use harness_core::config::server::ServerConfig;
 use serde_json::json;

@@ -1,8 +1,8 @@
+use super::rest_contract::{LegacyJson as Json, LegacyQuery as Query};
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use std::future::Future;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use super::state::AppState;
 
 #[path = "misc_routes_runtime_tree.rs"]
-mod runtime_tree;
+pub(super) mod runtime_tree;
 pub(crate) use runtime_tree::get_workflow_runtime_tree;
 
 #[derive(Debug, serde::Deserialize)]

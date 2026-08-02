@@ -1,12 +1,9 @@
+use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use crate::project_registry::{check_allowed_roots, validate_project_root};
 use crate::runtime_hosts::RuntimeHostLifecycle;
 use crate::runtime_project_cache::WatchedProjectInput;
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::State, http::StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;

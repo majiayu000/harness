@@ -31,6 +31,7 @@ pub(crate) mod intake_status_routes;
 mod orphan_reaper;
 pub(crate) mod pr_hygiene_background;
 pub(crate) mod rate_limit;
+pub mod rest_contract;
 pub(crate) mod rpc_routes;
 mod runtime_retention;
 pub(crate) mod runtime_submission_routes;

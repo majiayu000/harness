@@ -7,9 +7,10 @@
 //! store. Metrics that harness does not yet track (runtime CPU/RAM) are
 //! returned as `null` so the UI degrades gracefully.
 
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::AppState;
 use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Duration, Timelike, Utc};
 use harness_core::types::{Decision, Event, EventFilters};
 use harness_observe::quality::QualityGrader;

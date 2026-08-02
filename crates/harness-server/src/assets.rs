@@ -3,8 +3,8 @@
 //! Filenames and bytes come from `OUT_DIR/assets_manifest.rs`, which is
 //! written by `build.rs` after `bun run build` produces `web/dist/`.
 
+use crate::http::rest_contract::PrimitivePath as Path;
 use axum::{
-    extract::Path,
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };

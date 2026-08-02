@@ -1,8 +1,8 @@
+use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use axum::{
-    extract::{rejection::JsonRejection, Path, State},
+    extract::{rejection::JsonRejection, State},
     http::StatusCode,
-    Json,
 };
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{
@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 
-mod lease;
+pub(crate) mod lease;
 pub use lease::renew_runtime_job_lease_for_runtime_host;
 
 #[derive(Debug, Deserialize)]

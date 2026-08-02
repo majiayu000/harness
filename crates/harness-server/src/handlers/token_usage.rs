@@ -1,4 +1,5 @@
-use axum::{extract::State, http::StatusCode, Json};
+use crate::http::rest_contract::LegacyJson as Json;
+use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
