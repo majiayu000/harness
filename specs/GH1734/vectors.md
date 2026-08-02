@@ -26,10 +26,12 @@ component-ID order:
 1. `repository:instructions:AGENTS.md`
 2. `runtime:memory:repo_memory/record-00000000-0000-4000-8000-000000000001`
 
-The repository evidence is the exact shape emitted by the current ASC-002
-inventory for `AGENTS.md`: a `regular_file` with executable tag `0x02`,
-integrity `SHA-256("repo")`, and an empty capability list. The context evidence
-has `SHA-256("context")` component integrity, semantic order zero, reason
+On Unix, the repository evidence is the exact shape emitted by the current
+ASC-002 inventory for `AGENTS.md`: a `regular_file` with executable tag `0x02`,
+integrity `SHA-256("repo")`, and an empty capability list. The portable vector
+constructs that same shape from the SP1734-T3 typed inventory-entry fixture
+factory. The context evidence has `SHA-256("context")` component integrity,
+semantic order zero, reason
 `repo_memory_selected`, and present metadata: canonical UUID record ID
 `00000000-0000-4000-8000-000000000001`, present evidence reference
 `artifact:7`, and estimated tokens 42.
@@ -41,12 +43,17 @@ The exact intermediate digests are:
 | `repo` | `071ca2227754705837aa3ef9748ed59e9f8a015fd765c42f391a4cbc271c6d5e` |
 | `context` | `ea7792a26f405e2ae9c6f49ca93bbe6076ceac0a1fc53d83426c7d7f2d9377e4` |
 
-This fixture is constructible from an ASC-002 `AgentStackInventoryEntry` and
-the closed GH-1734 context input without placeholder fingerprint envelopes. An
-implementation test must build the two entries through those typed inputs,
-consume the inventory through its crate-visible `into_entries(self)` API,
-require exact equality with the literal bytes below, and then hash the literal
-independently. Separate branch-matrix tests cover executable tags
+The successful literal vector is portable: its repository component is built
+from the SP1734-T3 `#[cfg(test)] pub(super)` `AgentStackInventoryEntry` fixture
+factory in `stack/inventory/mod.rs`, with executable tag `0x02`, together with
+the closed GH-1734 context input and no placeholder fingerprint envelopes. The
+implementation test must require exact equality with the literal bytes below
+and then hash the literal independently. On Unix,
+a separate integration test must construct the same repository component
+through the real ASC-002 inventory and consume it through the crate-visible
+`into_entries(self)` API. On non-Unix targets the real inventory emits
+`unix_executable: None` and therefore is not required to reproduce `0x02`.
+Separate branch-matrix tests cover the `None` case, executable tags
 `0x00`/`0x01`, directory presence, absent context metadata/reference,
 `not_observed` coverage, and GH-1733's complete valid runtime/MCP envelope
 vectors.

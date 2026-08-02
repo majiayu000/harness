@@ -136,12 +136,31 @@ DomainObservationState<T>  // private enum
   Observed(Vec<T>)
   Failed(AgentStackProducerFailure)
 
+AgentStackRuntimeFingerprintObservation(AgentStackDomainObservation<AgentStackFingerprintEnvelope>)
+AgentStackMcpFingerprintObservation(AgentStackDomainObservation<AgentStackFingerprintEnvelope>)
+
+AgentStackRuntimeFingerprintObservation::{observed(Vec<AgentStackFingerprintEnvelope>), not_observed_without_attempt(), from_producer_failure(AgentStackProducerFailure)}
+AgentStackMcpFingerprintObservation::{observed(Vec<AgentStackFingerprintEnvelope>), not_observed_without_attempt(), from_producer_failure(AgentStackProducerFailure)}
+
 AgentStackSnapshotInputs
   repository_inventory: AgentStackDomainObservation<AgentStackInventoryEntry>
   runtime_context: AgentStackDomainObservation<AgentStackRuntimeContextEvidence>
-  runtime_fingerprint: AgentStackDomainObservation<AgentStackFingerprintEnvelope>
-  mcp_fingerprint: AgentStackDomainObservation<AgentStackFingerprintEnvelope>
+  runtime_fingerprint: AgentStackRuntimeFingerprintObservation
+  mcp_fingerprint: AgentStackMcpFingerprintObservation
 ```
+
+Each wrapper owns an `observed(Vec<AgentStackFingerprintEnvelope>)` typed
+constructor that validates the required runtime or MCP subject and permits an
+empty vector. This is the supported path for the all-observed empty vector.
+Each wrapper also owns `not_observed_without_attempt()` and
+`from_producer_failure(AgentStackProducerFailure)` delegating constructors.
+They create the wrapped generic state without allowing a runtime wrapper to
+enter the MCP slot or vice versa. Coverage tests exercise both entry points.
+The corresponding producer adapter maps its actual producer `Result` into the
+same wrapper. There is no conversion between the wrappers, so the snapshot
+constructor cannot exchange the two slots even though both contain the same
+closed envelope type. A failed observation still carries no domain; the
+wrapper and destination slot determine that domain.
 
 Harness-core owns one closed `AgentStackContextSelectionReason` enum whose
 variants map one-to-one to the existing runtime constants:
@@ -412,10 +431,13 @@ a70ef74bf084fba3e6d0d12daeebc09b24236ffe76d601a85f89cdc4f1106200
 ```
 
 The independent non-empty vector frozen in `specs/GH1734/vectors.md` is 1,312
-canonical bytes and contains repository plus runtime-context evidence that is
-constructible through the existing ASC-002 inventory and GH-1734 context typed
-inputs. It covers the inventory's empty capability list, executable tag
-`0x02`, present integrity, canonical UUID memory identity, present context
+canonical bytes and contains repository plus runtime-context evidence. Its
+portable test constructs the repository evidence from a typed ASC-002 entry
+fixture and the context evidence from GH-1734 typed inputs. A Unix-only
+integration test constructs the matching repository entry through the real
+ASC-002 inventory; non-Unix inventory retains `unix_executable: None` and is
+covered separately. The vector covers an empty capability list, executable
+tag `0x02`, present integrity, canonical UUID memory identity, present context
 metadata, and present evidence reference. Its expected digest is
 `da375d4cf97e7b01281a18130dacc614706aec719b7611320aa1ccb6b846f49e`.
 The vector document includes the full canonical input hex. Tests first build
@@ -528,16 +550,23 @@ Core adds the narrow consuming API
 `pub(crate) fn into_entries(self) -> Vec<AgentStackInventoryEntry>` to
 `AgentStackInventory` and moves each entry directly; no public iterator or
 clone-based adapter is introduced. The conversion retains the validated
-component and exact `AgentStackEntryClass`. The official
-repository helper accepts
+component and exact `AgentStackEntryClass`. Because `stack/snapshot/tests.rs`
+is a sibling of the inventory module, `AgentStackInventoryEntry` also adds one
+`#[cfg(test)] pub(super)` typed fixture factory in `stack/inventory/mod.rs`.
+It accepts a validated component plus an explicit `AgentStackEntryClass`, is
+absent from production builds, and is the portable construction path for the
+literal `0x02` vector. The official repository helper accepts
 `Result<AgentStackInventory, AgentStackInventoryError>` and maps every current
 error kind exhaustively: `LimitExceeded` becomes `limit_exceeded`;
 `InvalidOptions`, `ConfigParse`, `ConfiguredSourceInvalid`, and
 `ComponentValidation` become `invalid_evidence`; every I/O, race, escape,
 missing-source, cycle, metadata, or unsupported-entry kind becomes
 `source_unavailable`. Adding an inventory error variant breaks the exhaustive
-match. A regular-file executable toggle and file-to-directory-presence change
-have dedicated integration tests.
+match. On Unix, a real-inventory regular-file executable toggle has a dedicated
+integration test. On non-Unix, the real inventory test requires
+`unix_executable: None`; portable typed-fixture tests cover the `0x00`, `0x01`,
+and `0x02` canonical tags on every target. A file-to-directory-presence change
+has a dedicated integration test on every target.
 
 ### Runtime Context
 
@@ -576,9 +605,15 @@ the full envelope for later structural diff while using the verified
 fingerprint digest in the stable projection. It never reparses schema JSON or
 substitutes component integrity for payload identity.
 
-The harness-agents runtime helper accepts the actual
-`Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError>`.
-It exhaustively maps input/component/schema/digest contract errors to
+The runtime wrapper's typed `observed` constructor accepts zero or more
+validated runtime-subject envelopes, including the successful empty case. The
+runtime wrapper's `not_observed_without_attempt()` is the only supported
+no-runtime-producer-attempt path. The
+harness-agents runtime producer adapter accepts the actual
+`Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError>` and
+maps `Ok` through `observed` and `Err` through the runtime wrapper's
+`from_producer_failure`. It exhaustively maps
+input/component/schema/digest contract errors to
 `invalid_evidence`, resource-limit errors to `limit_exceeded`, explicit caller
 cancellation to `interrupted`, and OS/probe/containment/cleanup/timeout
 unavailability to `source_unavailable`. Expected probe failures that GH-1733
@@ -592,7 +627,9 @@ requires every successful envelope to have subject `mcp_tool`, and exhaustively
 maps contract errors to `invalid_evidence` or `limit_exceeded`. A later network
 collector owns its transport-error mapping and cannot claim ASC-005 compliance
 without passing an explicit `Failed` kind. `NotObserved` is available only
-through an explicit no-producer-attempt constructor and accepts no `Result`.
+through the MCP wrapper's explicit `not_observed_without_attempt()` constructor
+and accepts no `Result`; MCP `Err` uses only that wrapper's
+`from_producer_failure`.
 
 ## Minimal Identity Comparison
 
@@ -677,7 +714,9 @@ memory kind/scope/record locator/metadata made inconsistent.
 ### Integration
 
 - The repository helper consumes a real `AgentStackInventory` through
-  `into_entries`; inventory executable-bit changes alter stable identity.
+  `into_entries`. On Unix, real-inventory executable-bit changes alter stable
+  identity; on non-Unix, real inventory retains `unix_executable: None` and
+  the typed fixture proves executable-tag sensitivity.
 - Runtime-context caller-vector reorder is invariant; swapping the explicit
   orders of two otherwise valid entries changes identity, while a one-entry
   gap/duplicate mutation fails.
@@ -695,8 +734,12 @@ memory kind/scope/record locator/metadata made inconsistent.
 
 During implementation:
 
+Before accepting any focused filtered command in this section, run the same
+filter with `-- --list` and require at least one matching test. Zero matches
+fail verification.
+
 ```text
-cargo test -p harness-core stack_snapshot
+cargo test -p harness-core stack::snapshot::tests
 cargo test -p harness-server context_provenance
 cargo check -p harness-core --all-targets
 cargo check -p harness-server --all-targets

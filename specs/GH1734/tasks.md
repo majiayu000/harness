@@ -13,6 +13,9 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
 
 ## Tasks
 
+Every focused `cargo test` filter below must first be run with `-- --list` and
+must list at least one matching test. Zero matches fail verification.
+
 - [ ] `SP1734-T1` Owner: core snapshot model worker | Dependencies: approved GH-1732 remediation, GH-1733, and GH-1734 specs; all three issues ready; both upstream implementations merged | Done when: the closed model and all construction invariants are implemented | Verify: focused model tests and core check below | Covers: B-001, B-002, B-003, B-007, B-008, B-013, B-014, B-016
 - [ ] `SP1734-T2` Owner: canonical identity worker | Dependencies: SP1734-T1 | Done when: framed bounded stable identity and independent vectors are implemented | Verify: focused canonical and stable-ID tests below | Covers: B-004, B-005, B-006, B-009, B-010, B-012, B-013
 - [ ] `SP1734-T3` Owner: repository adapter worker | Dependencies: SP1734-T1 and SP1734-T2 | Done when: complete inventory-entry facts map without loss | Verify: focused repository and inventory tests below | Covers: B-002, B-005, B-010, B-011
@@ -36,8 +39,12 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
   - A failure carries no domain; the constructor derives it from the slot.
     The observation value is opaque, and `NotObserved` is available only
     through `not_observed_without_attempt`.
+  - The runtime- and MCP-fingerprint wrappers each expose their own
+    `not_observed_without_attempt()` delegating constructor, so every B-007
+    coverage combination remains constructible without making the wrappers
+    interchangeable.
 - Verify:
-  - `cargo test -p harness-core stack_snapshot::model`
+  - `cargo test -p harness-core stack::snapshot::tests::model`
   - `cargo check -p harness-core --all-targets`
 
 ### SP1734-T2 — Implement canonical stable identity
@@ -53,8 +60,8 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
     are pinned.
   - Outer observation time and run ID never enter the hash.
 - Verify:
-  - `cargo test -p harness-core stack_snapshot::canonical`
-  - `cargo test -p harness-core stack_snapshot::stable_id`
+  - `cargo test -p harness-core stack::snapshot::tests::canonical`
+  - `cargo test -p harness-core stack::snapshot::tests::stable_id`
 
 ### SP1734-T3 — Map complete repository inventory evidence
 
@@ -63,11 +70,19 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
     accessor and adds exactly one crate-visible consuming `into_entries(self)`
     API for the adapter; typed conversion moves every complete
     `AgentStackInventoryEntry` without cloning.
+  - `AgentStackInventoryEntry` adds one `#[cfg(test)] pub(super)` typed fixture
+    factory in `stack/inventory/mod.rs`, allowing sibling snapshot tests to
+    provide a validated component and explicit entry class without exposing a
+    production constructor.
   - Executable tri-state and directory presence enter the stable projection.
+  - The portable conformance test constructs the literal `0x02` case from a
+    typed inventory-entry fixture. A Unix-only integration test constructs
+    the same case through the real ASC-002 inventory; non-Unix inventory is
+    required to retain `unix_executable: None` instead.
   - Every `AgentStackInventoryErrorKind` maps exhaustively to one closed
     producer-failure kind; inventory failure yields no snapshot.
 - Verify:
-  - `cargo test -p harness-core stack_snapshot::repository`
+  - `cargo test -p harness-core stack::snapshot::tests::repository`
   - `cargo test -p harness-core stack::inventory`
 
 ### SP1734-T4 — Map typed runtime-context evidence
@@ -87,7 +102,7 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
   - No automatic snapshot collection is added.
 - Verify:
   - `cargo test -p harness-server context_provenance`
-  - `cargo test -p harness-core stack_snapshot::context`
+  - `cargo test -p harness-core stack::snapshot::tests::context`
   - `cargo check -p harness-server --all-targets`
 
 ### SP1734-T5 — Map validated runtime and MCP fingerprints
@@ -98,12 +113,14 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
     enter the stable projection.
   - Expected probe failures are valid evidence.
   - No-envelope producer errors map exhaustively to `Failed`.
+  - Runtime and MCP producer `Err` values use their wrapper-specific
+    `from_producer_failure` constructors, with no cross-wrapper conversion.
   - GH-1734's count-only strict-envelope wire method matches actual GH-1733
     serialization for every complete vector and optional branch.
   - No schema recanonicalization or `harness-agents` reverse dependency is
     introduced.
 - Verify:
-  - `cargo test -p harness-core stack_snapshot::fingerprint`
+  - `cargo test -p harness-core stack::snapshot::tests::fingerprint`
   - `cargo test -p harness-core fingerprint`
   - `cargo test -p harness-agents runtime_fingerprint`
   - `cargo check -p harness-agents --all-targets`
@@ -130,7 +147,7 @@ selected after those gates; do not use PR #1859 as an unapproved dependency.
     and only unambiguous identity discontinuity.
   - Every new file remains below 800 lines and no test is weakened.
 - Verify:
-  - `cargo test -p harness-core stack_snapshot`
+  - `cargo test -p harness-core stack::snapshot::tests`
   - `cargo test -p harness-core stack`
   - `cargo test -p harness-server context_provenance`
   - `cargo check --workspace --all-targets`
