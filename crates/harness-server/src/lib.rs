@@ -8,6 +8,8 @@
     clippy::unnecessary_cast,
     clippy::unnecessary_to_owned
 )]
+#![cfg_attr(not(test), deny(clippy::disallowed_types))]
+#![cfg_attr(test, allow(clippy::disallowed_types))]
 
 // Modules extracted to `harness-workflow`; re-exported so existing `crate::*`
 // paths inside this crate continue to resolve without modification.

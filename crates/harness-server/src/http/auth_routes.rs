@@ -1,4 +1,5 @@
-use axum::{extract::State, http::StatusCode, Json};
+use super::rest_contract::LegacyJson as Json;
+use axum::{extract::State, http::StatusCode};
 use serde_json::json;
 use std::sync::Arc;
 

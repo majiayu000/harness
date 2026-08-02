@@ -131,6 +131,30 @@ send methods immediately without repeating the handshake.  Sending `initialize`
 again after the server is already initialized returns a `-32600 INVALID_REQUEST`
 error.
 
+## REST DTO ownership
+
+New first-party REST request and response DTOs are defined in
+`harness-protocol::rest`. The protocol crate seals the `RestDto` marker, so a
+server-local type cannot opt into the shared contract.
+
+Harness Server enforces the boundary with typed HTTP adapters:
+
+- `ContractJson`, `ContractQuery`, and `ContractPath` accept only
+  protocol-owned DTOs.
+- `LegacyJson` and `LegacyQuery` accept only the explicit server-local DTOs
+  that predate this boundary. That registry is migration-only and must shrink;
+  adding a new entry is not a supported way to introduce an API contract.
+- `PrimitivePath` is limited to the existing primitive path shapes. A new
+  named path DTO belongs in the protocol crate.
+- Clippy rejects direct use of Axum's `Json`, `Query`, and `Path` types in
+  production server code, so aliases and qualified paths cannot bypass the
+  boundary.
+
+Routes that must authenticate a raw signed body may validate the bytes before
+deserializing, but their first-party payload type still belongs in
+`harness-protocol::rest`. Opaque third-party webhook documents may remain
+`serde_json::Value` when Harness does not own their wire schema.
+
 ## Why the split?
 
 The design is intentional:

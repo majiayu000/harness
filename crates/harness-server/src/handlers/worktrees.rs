@@ -1,8 +1,9 @@
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::state::AppState;
 use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::task_runner::{TaskKind, TaskPhase, TaskState, TaskStatus};
 use crate::workspace::WorkspaceEntry;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};

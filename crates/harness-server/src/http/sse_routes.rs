@@ -1,12 +1,12 @@
+use super::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use super::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    Json,
 };
 use futures::{stream::BoxStream, StreamExt};
 use harness_core::agent::StreamItem;

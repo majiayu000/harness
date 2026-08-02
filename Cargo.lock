@@ -1485,7 +1485,6 @@ dependencies = [
  "sha2",
  "sqlx",
  "subtle",
- "syn 2.0.117",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",

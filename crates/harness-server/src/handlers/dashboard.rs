@@ -1,5 +1,6 @@
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use harness_core::types::EventFilters;
 use harness_observe::{quality::QualityGrader, stats};
 use serde_json::{json, Value};

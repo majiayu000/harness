@@ -9,6 +9,7 @@ mod activity;
 mod driverless_progress;
 mod sampling;
 
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::AppState;
 use crate::runtime_projection::{
     stopped_action_eligibility_for_workflows, RuntimeStoppedActionEligibility,
@@ -16,7 +17,7 @@ use crate::runtime_projection::{
 };
 use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary};
 use activity::{runtime_workflow_counts, source_activity, RuntimeWorkflowCounts, SourceActivity};
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState};
 use sampling::{dedupe_workflows, list_operator_action_workflows, list_recent_failed_workflows};
