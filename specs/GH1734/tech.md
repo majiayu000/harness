@@ -136,18 +136,11 @@ DomainObservationState<T>  // private enum
   Observed(Vec<T>)
   Failed(AgentStackProducerFailure)
 
-AgentStackRuntimeFingerprintObservation(  // opaque public newtype
-  AgentStackDomainObservation<AgentStackFingerprintEnvelope>
-)
+AgentStackRuntimeFingerprintObservation(AgentStackDomainObservation<AgentStackFingerprintEnvelope>)
+AgentStackMcpFingerprintObservation(AgentStackDomainObservation<AgentStackFingerprintEnvelope>)
 
-AgentStackMcpFingerprintObservation(  // opaque public newtype
-  AgentStackDomainObservation<AgentStackFingerprintEnvelope>
-)
-
-AgentStackRuntimeFingerprintObservation::observed(Vec<AgentStackFingerprintEnvelope>)
-AgentStackRuntimeFingerprintObservation::not_observed_without_attempt()
-AgentStackMcpFingerprintObservation::observed(Vec<AgentStackFingerprintEnvelope>)
-AgentStackMcpFingerprintObservation::not_observed_without_attempt()
+AgentStackRuntimeFingerprintObservation::{observed(Vec<AgentStackFingerprintEnvelope>), not_observed_without_attempt()}
+AgentStackMcpFingerprintObservation::{observed(Vec<AgentStackFingerprintEnvelope>), not_observed_without_attempt()}
 
 AgentStackSnapshotInputs
   repository_inventory: AgentStackDomainObservation<AgentStackInventoryEntry>
