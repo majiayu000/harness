@@ -17,6 +17,17 @@ use crate::runtime::model::{
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::{DecisionValidator, ValidationContext};
 
+/// The declarative definition pin carried in `workflow.data`.
+///
+/// Declarative resolution treats this hash as pinned identity: it decides
+/// which definition — and therefore which validator and which legal
+/// transitions — govern the workflow. It is established when the instance is
+/// created and must never move afterwards, so it is a protected field even
+/// though it lives inside `data` rather than in a column.
+pub(super) fn definition_hash_pin(instance: &WorkflowInstance) -> Option<&serde_json::Value> {
+    instance.data.get("definition_hash")
+}
+
 pub(super) fn ensure_protected_instance_fields_match(
     current: &WorkflowInstance,
     final_instance: &WorkflowInstance,
@@ -27,6 +38,12 @@ pub(super) fn ensure_protected_instance_fields_match(
     }
     if current.definition_version != final_instance.definition_version {
         changed_fields.push("definition_version");
+    }
+    // Covers substitution, removal, and introducing a pin on a workflow that
+    // never had one -- each of them re-points the instance at a different
+    // definition than the one it was validated against.
+    if definition_hash_pin(current) != definition_hash_pin(final_instance) {
+        changed_fields.push("data.definition_hash");
     }
     if current.subject != final_instance.subject {
         changed_fields.push("subject");

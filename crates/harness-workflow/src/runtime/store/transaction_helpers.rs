@@ -458,6 +458,15 @@ fn ensure_instance_identity_fields_match(
     if current.definition_version != target.definition_version {
         changed_fields.push("definition_version");
     }
+    // The declarative pin decides which definition governs the workflow, so it
+    // is identity even though it lives in `data`. Checking it at this
+    // chokepoint covers every row write that compares against a loaded row:
+    // decision commits, same-state writes, recovery, and child start.
+    if super::decision_transitions::definition_hash_pin(current)
+        != super::decision_transitions::definition_hash_pin(target)
+    {
+        changed_fields.push("data.definition_hash");
+    }
     if current.subject != target.subject {
         changed_fields.push("subject");
     }

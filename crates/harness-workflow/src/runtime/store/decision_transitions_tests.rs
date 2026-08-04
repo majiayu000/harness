@@ -325,6 +325,93 @@ async fn apply_decision_transition_treats_a_same_state_stale_snapshot_as_stale(
     Ok(())
 }
 
+/// The declarative pin in `workflow.data` decides which definition — and so
+/// which validator and which legal transitions — govern the instance. A
+/// transition that moves it re-points the workflow at a definition it was
+/// never validated against, so `definition_hash` is protected exactly like the
+/// definition id and version (GH-1864).
+#[tokio::test]
+async fn apply_decision_transition_rejects_definition_hash_substitution() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+
+    let mut initial = instance("gh1864-definition-hash-substitution", "addressing_feedback");
+    initial.set_data_field(
+        "definition_hash",
+        json!("a".repeat(64)),
+        crate::runtime::DataProvenance::Server,
+    )?;
+    store
+        .force_upsert_lifecycle_state_for_test(&initial)
+        .await?;
+
+    let decision = WorkflowDecision::new(
+        &initial.id,
+        "addressing_feedback",
+        "address_feedback",
+        "local_review_gate",
+        "feedback addressed",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "run_local_review",
+        "gh1864-definition-hash-substitution-command",
+    ));
+
+    // Substituting the pin and removing it are both identity changes.
+    let mut substituted = initial.clone();
+    substituted.set_data_field(
+        "definition_hash",
+        json!("b".repeat(64)),
+        crate::runtime::DataProvenance::Server,
+    )?;
+    let mut removed = initial.clone();
+    removed.remove_data_field("definition_hash", crate::runtime::DataProvenance::Server)?;
+
+    for (label, mut final_instance) in [("substituted", substituted), ("removed", removed)] {
+        final_instance.state = decision.next_state.clone();
+        final_instance.version = final_instance.version.saturating_add(1);
+
+        let error = store
+            .apply_decision_transition(
+                WorkflowDecisionTransition {
+                    expected_state: &initial.state,
+                    create_if_missing: None,
+                    event_type: "FeedbackAddressed",
+                    source: "workflow-runtime-test",
+                    payload: json!({}),
+                    decision: &decision,
+                    final_instance: &final_instance,
+                    command_status: WorkflowCommandStatus::Pending,
+                },
+                "workflow-runtime-test",
+            )
+            .await
+            .expect_err("a transition must not move the declarative definition pin");
+        assert!(
+            error.to_string().contains("data.definition_hash"),
+            "the {label} pin must be named in the rejection: {error}"
+        );
+
+        let stored = store
+            .get_instance(&initial.id)
+            .await?
+            .expect("the original instance must remain");
+        assert_eq!(
+            stored.data["definition_hash"],
+            initial.data["definition_hash"]
+        );
+        assert_eq!(stored.state, initial.state);
+        assert_eq!(stored.version, initial.version);
+        assert!(store.events_for(&initial.id).await?.is_empty());
+        assert!(store.decisions_for(&initial.id).await?.is_empty());
+        assert!(store.commands_for(&initial.id).await?.is_empty());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn apply_decision_transition_rejects_definition_substitution() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
