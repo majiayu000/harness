@@ -826,7 +826,7 @@ async fn store_workflow(
     store: &WorkflowRuntimeStore,
     workflow: WorkflowInstance,
 ) -> anyhow::Result<WorkflowInstance> {
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(workflow)
 }
 
@@ -838,7 +838,7 @@ async fn store_stopped_workflow_with_source(
     command: WorkflowCommand,
 ) -> anyhow::Result<WorkflowInstance> {
     let workflow = workflow(state, data).with_id(workflow_id.to_string());
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let workflow = attach_recovery_source_job(store, workflow, command).await?;
     Ok(workflow)
 }
@@ -858,7 +858,7 @@ async fn store_quality_gate_workflow(
     )
     .with_id(workflow_id.to_string())
     .with_server_data(data);
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     attach_recovery_source_job(store, workflow, command).await
 }
 
@@ -883,7 +883,7 @@ async fn attach_recovery_source_job(
         last_stop,
         harness_workflow::runtime::DataProvenance::Server,
     )?;
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(workflow)
 }
 
@@ -912,21 +912,21 @@ async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> an
         )
         .await?,
     );
-    workflow_runtime_store
-        .upsert_instance(
-            &WorkflowInstance::new(
-                QUALITY_GATE_DEFINITION_ID,
-                1,
-                "failed",
-                WorkflowSubject::new("quality_gate", "quality_gate:1"),
-            )
-            .with_id("quality-gate-failed".to_string())
-            .with_server_data(json!({
-                "source": "quality_gate",
-                "repo": "owner/repo",
-            })),
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &workflow_runtime_store,
+        &WorkflowInstance::new(
+            QUALITY_GATE_DEFINITION_ID,
+            1,
+            "failed",
+            WorkflowSubject::new("quality_gate", "quality_gate:1"),
         )
-        .await?;
+        .with_id("quality-gate-failed".to_string())
+        .with_server_data(json!({
+            "source": "quality_gate",
+            "repo": "owner/repo",
+        })),
+    )
+    .await?;
     state.core.workflow_runtime_store = Some(workflow_runtime_store);
 
     let app = Router::new()
@@ -970,21 +970,21 @@ async fn endpoint_includes_config_enabled_stuck_workflows() -> anyhow::Result<()
         )
         .await?,
     );
-    workflow_runtime_store
-        .upsert_instance(
-            &workflow(
-                "awaiting_feedback",
-                json!({
-                    "source": "github",
-                    "repo": "owner/repo",
-                    "issue_number": 44,
-                    "pr_number": 45,
-                    "pr_url": "https://github.com/owner/repo/pull/45",
-                }),
-            )
-            .with_id("stuck-awaiting-feedback".to_string()),
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &workflow_runtime_store,
+        &workflow(
+            "awaiting_feedback",
+            json!({
+                "source": "github",
+                "repo": "owner/repo",
+                "issue_number": 44,
+                "pr_number": 45,
+                "pr_url": "https://github.com/owner/repo/pull/45",
+            }),
         )
-        .await?;
+        .with_id("stuck-awaiting-feedback".to_string()),
+    )
+    .await?;
     sqlx::query(
         "UPDATE workflow_instances SET updated_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
     )
@@ -1263,18 +1263,18 @@ async fn declarative_operator_gate_sampling_uses_registry_progress() -> anyhow::
         Some(&test_helpers::test_database_url()?),
     )
     .await?;
-    store
-        .upsert_instance(
-            &WorkflowInstance::new(
-                DECLARATIVE_VISIBILITY_DEFINITION_ID,
-                definition.definition_version(),
-                "manual_review",
-                WorkflowSubject::new("issue", "issue:manual-review-sample"),
-            )
-            .with_id("declarative-manual-review-sample")
-            .with_server_data(json!({ "definition_hash": definition.definition_hash() })),
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &store,
+        &WorkflowInstance::new(
+            DECLARATIVE_VISIBILITY_DEFINITION_ID,
+            definition.definition_version(),
+            "manual_review",
+            WorkflowSubject::new("issue", "issue:manual-review-sample"),
         )
-        .await?;
+        .with_id("declarative-manual-review-sample")
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() })),
+    )
+    .await?;
 
     let workflows =
         list_operator_action_workflows(&store, &[DECLARATIVE_VISIBILITY_DEFINITION_ID.to_string()])
@@ -1302,18 +1302,18 @@ async fn declarative_definition_instances_are_visible_in_operator_monitor() -> a
     )
     .await?;
 
-    store
-        .upsert_instance(
-            &WorkflowInstance::new(
-                DECLARATIVE_VISIBILITY_DEFINITION_ID,
-                1,
-                "blocked",
-                WorkflowSubject::new("issue", "issue:9001"),
-            )
-            .with_id("declarative-blocked".to_string())
-            .with_server_data(json!({ "repo": "owner/repo", "blocked_reason": "operator gate" })),
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &store,
+        &WorkflowInstance::new(
+            DECLARATIVE_VISIBILITY_DEFINITION_ID,
+            1,
+            "blocked",
+            WorkflowSubject::new("issue", "issue:9001"),
         )
-        .await?;
+        .with_id("declarative-blocked".to_string())
+        .with_server_data(json!({ "repo": "owner/repo", "blocked_reason": "operator gate" })),
+    )
+    .await?;
 
     let workflows = list_runtime_workflows_from_store(&store).await?;
 
@@ -1353,18 +1353,18 @@ async fn declarative_terminal_queries_use_pinned_versions_and_outcomes() -> anyh
         ("current-failure", &current, "rejected"),
         ("current-active", &current, "working"),
     ] {
-        store
-            .upsert_instance(
-                &WorkflowInstance::new(
-                    DECLARATIVE_VISIBILITY_DEFINITION_ID,
-                    definition.definition_version(),
-                    state,
-                    WorkflowSubject::new("issue", format!("issue:{id}")),
-                )
-                .with_id(id.to_string())
-                .with_server_data(json!({ "definition_hash": definition.definition_hash() })),
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+            &store,
+            &WorkflowInstance::new(
+                DECLARATIVE_VISIBILITY_DEFINITION_ID,
+                definition.definition_version(),
+                state,
+                WorkflowSubject::new("issue", format!("issue:{id}")),
             )
-            .await?;
+            .with_id(id.to_string())
+            .with_server_data(json!({ "definition_hash": definition.definition_hash() })),
+        )
+        .await?;
     }
 
     let active = store
@@ -1404,28 +1404,28 @@ async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result
         Some(&test_helpers::test_database_url()?),
     )
     .await?;
-    workflow_runtime_store
-        .upsert_instance(
-            &WorkflowInstance::new(
-                QUALITY_GATE_DEFINITION_ID,
-                1,
-                "failed",
-                WorkflowSubject::new("quality_gate", "quality_gate:old"),
-            )
-            .with_id("old-failed".to_string()),
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &workflow_runtime_store,
+        &WorkflowInstance::new(
+            QUALITY_GATE_DEFINITION_ID,
+            1,
+            "failed",
+            WorkflowSubject::new("quality_gate", "quality_gate:old"),
         )
-        .await?;
-    workflow_runtime_store
-        .upsert_instance(
-            &WorkflowInstance::new(
-                QUALITY_GATE_DEFINITION_ID,
-                1,
-                "failed",
-                WorkflowSubject::new("quality_gate", "quality_gate:recent"),
-            )
-            .with_id("recent-failed".to_string()),
+        .with_id("old-failed".to_string()),
+    )
+    .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &workflow_runtime_store,
+        &WorkflowInstance::new(
+            QUALITY_GATE_DEFINITION_ID,
+            1,
+            "failed",
+            WorkflowSubject::new("quality_gate", "quality_gate:recent"),
         )
-        .await?;
+        .with_id("recent-failed".to_string()),
+    )
+    .await?;
     sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
         .bind("old-failed")
         .bind(Utc::now() - chrono::Duration::hours(1))
@@ -1465,7 +1465,11 @@ async fn operator_action_age_uses_store_updated_at() -> anyhow::Result<()> {
     )
     .with_id("ready-store-age".to_string());
     ready.updated_at = Utc::now() - chrono::Duration::days(2);
-    workflow_runtime_store.upsert_instance(&ready).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &workflow_runtime_store,
+        &ready,
+    )
+    .await?;
     sqlx::query("UPDATE workflow_instances SET updated_at = NOW() WHERE id = $1")
         .bind("ready-store-age")
         .execute(workflow_runtime_store.pool())
@@ -1496,26 +1500,26 @@ async fn runtime_workflow_sampling_fetches_action_states_before_definition_cap(
         Some(&test_helpers::test_database_url()?),
     )
     .await?;
-    workflow_runtime_store
-        .upsert_instance(
-            &workflow(
-                "ready_to_merge",
-                json!({
-                    "source": "github",
-                    "pr_number": 7,
-                    "pr_url": "https://github.com/owner/repo/pull/7",
-                }),
-            )
-            .with_id("older-ready".to_string()),
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &workflow_runtime_store,
+        &workflow(
+            "ready_to_merge",
+            json!({
+                "source": "github",
+                "pr_number": 7,
+                "pr_url": "https://github.com/owner/repo/pull/7",
+            }),
+        )
+        .with_id("older-ready".to_string()),
+    )
+    .await?;
+    for index in 0..500 {
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+            &workflow_runtime_store,
+            &workflow("checking", json!({ "source": "github" }))
+                .with_id(format!("checking-{index}")),
         )
         .await?;
-    for index in 0..500 {
-        workflow_runtime_store
-            .upsert_instance(
-                &workflow("checking", json!({ "source": "github" }))
-                    .with_id(format!("checking-{index}")),
-            )
-            .await?;
     }
     sqlx::query(
         "UPDATE workflow_instances SET updated_at = NOW() - INTERVAL '1 hour' WHERE id = $1",

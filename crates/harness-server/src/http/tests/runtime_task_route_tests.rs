@@ -278,7 +278,8 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
             "submission_id": task_id,
             "task_id": format!("{task_id}-legacy"),
         }));
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
     }
 
     let app = Router::new()
@@ -353,7 +354,7 @@ async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Re
         "pr_url": "https://github.com/owner/repo/pull/126",
         "task_id": "runtime-ready-task-54",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let app = Router::new()
         .route(
             "/api/workflows/runtime/merge",
@@ -472,6 +473,50 @@ async fn workflow_runtime_cancel_endpoint_cancels_issue_workflow() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test]
+async fn workflow_runtime_mutations_share_store_unavailable_contract() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_read_only_route_test_state(dir.path()).await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/merge",
+            post(task_mutation_routes::merge_workflow_runtime),
+        )
+        .route(
+            "/api/workflows/runtime/cancel",
+            post(task_mutation_routes::cancel_workflow_runtime),
+        )
+        .with_state(state);
+
+    for route in [
+        "/api/workflows/runtime/merge",
+        "/api/workflows/runtime/cancel",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "workflow_id": "missing-store" }).to_string(),
+                    ))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await?;
+        assert_eq!(body["error"], "workflow runtime store unavailable");
+    }
+
+    Ok(())
+}
+
 #[rustfmt::skip]
 #[tokio::test]
 async fn workflow_runtime_recovery_endpoints_cover_contract() -> anyhow::Result<()> {
@@ -486,12 +531,16 @@ async fn workflow_runtime_recovery_endpoints_cover_contract() -> anyhow::Result<
         let mut data = serde_json::json!({"issue_number": issue_number});
         if state_name == "failed" { data["error_kind"] = serde_json::json!("timeout"); }
         let workflow = route_issue_workflow(&workflow_id, state_name, issue_number, data.clone());
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
         let original = WorkflowCommand::new(WorkflowCommandType::EnqueueActivity, format!("{workflow_id}-original"), serde_json::json!({"activity": "implement_issue", "repo": "owner/repo", "issue_number": issue_number}));
         let runtime_job_id = enqueue_route_test_runtime_job(store, &workflow.id, &original).await?;
         data["last_stop"] = serde_json::json!({"state": state_name, "activity": "implement_issue", "runtime_job_id": runtime_job_id});
         if state_name == "failed" { data["last_stop"]["error_kind"] = serde_json::json!("timeout"); }
-        store.upsert_instance(&workflow.with_server_data(data)).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+            store,
+            &workflow.with_server_data(data),
+        )
+        .await?;
         let response = post_runtime_recovery(app.clone(), route, &workflow_id).await?;
         let actual = response.status(); let body = response_json(response).await?;
         assert_eq!(actual, StatusCode::OK); assert_eq!(body["status"], status); assert_eq!(body["state"], "implementing"); assert_eq!(store.get_instance(&workflow_id).await?.unwrap().state, "implementing");
@@ -501,12 +550,12 @@ async fn workflow_runtime_recovery_endpoints_cover_contract() -> anyhow::Result<
     }
 
     for (route, workflow_id, state_name, issue_number, last_stop) in [("/api/workflows/runtime/unblock", "runtime-blocked-partial-empty", "blocked", 61, serde_json::json!({})), ("/api/workflows/runtime/unblock", "runtime-blocked-partial-event", "blocked", 62, serde_json::json!({"event_id": 123})), ("/api/workflows/runtime/unblock", "runtime-blocked-partial-null", "blocked", 63, serde_json::json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null})), ("/api/workflows/runtime/retry", "runtime-failed-partial-empty", "failed", 64, serde_json::json!({})), ("/api/workflows/runtime/retry", "runtime-failed-partial-event", "failed", 65, serde_json::json!({"event_id": 123})), ("/api/workflows/runtime/retry", "runtime-failed-partial-null", "failed", 66, serde_json::json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null}))] {
-        let data = serde_json::json!({"issue_number": issue_number, "last_stop": last_stop}); let workflow = route_issue_workflow(workflow_id, state_name, issue_number, data.clone()); store.upsert_instance(&workflow).await?; let response = post_runtime_recovery(app.clone(), route, workflow_id).await?; let actual = response.status(); let body = response_json(response).await?;
+        let data = serde_json::json!({"issue_number": issue_number, "last_stop": last_stop}); let workflow = route_issue_workflow(workflow_id, state_name, issue_number, data.clone()); crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?; let response = post_runtime_recovery(app.clone(), route, workflow_id).await?; let actual = response.status(); let body = response_json(response).await?;
         assert_eq!(actual, StatusCode::CONFLICT); assert_eq!(body["error"], "workflow runtime recovery cannot determine a supported stopped activity"); assert_eq!(body["last_stop_activity"], serde_json::Value::Null); let stored = store.get_instance(workflow_id).await?.unwrap(); assert_eq!(stored.state, state_name); assert_eq!(stored.data, data); assert!(store.commands_for(workflow_id).await?.is_empty());
     }
 
     for workflow in [route_issue_workflow("runtime-blocked-58", "blocked", 58, serde_json::json!({})), route_issue_workflow("runtime-failed-59", "failed", 59, serde_json::json!({"error_kind": "configuration"}))] {
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     }
     for (route, workflow_id, code, error, field, value) in [
         ("/api/workflows/runtime/retry", "runtime-missing-60", StatusCode::NOT_FOUND, "workflow not found", "error", "workflow not found"),
@@ -585,7 +634,7 @@ async fn get_task_runtime_issue_surfaces_failure_reason() -> anyhow::Result<()> 
         "task_ids": ["runtime-task-1299"],
         "failure_reason": "WorktreeCollision: workspace path is managed by another harness session",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let app = Router::new()
         .route(
             "/api/workflows/runtime/submissions/{id}",
@@ -771,13 +820,15 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         "definition_hash": "sha256:declarative-test-definition@1",
         "prompt_summary": "custom declarative submission"
     }));
-    state
-        .core
-        .workflow_runtime_store
-        .as_ref()
-        .expect("workflow runtime store should be configured")
-        .upsert_instance(&declarative)
-        .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .expect("workflow runtime store should be configured"),
+        &declarative,
+    )
+    .await?;
 
     // Keep two newer issue rows ahead of the prompt rows. A kind filter applied
     // after LIMIT would discard both and incorrectly return an empty page.
@@ -797,13 +848,15 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         }));
         issue.created_at = declarative.created_at + chrono::Duration::seconds(offset);
         issue.updated_at = issue.created_at;
-        state
-            .core
-            .workflow_runtime_store
-            .as_ref()
-            .expect("workflow runtime store should be configured")
-            .upsert_instance(&issue)
-            .await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+            state
+                .core
+                .workflow_runtime_store
+                .as_ref()
+                .expect("workflow runtime store should be configured"),
+            &issue,
+        )
+        .await?;
     }
 
     let prompt_page_response = app

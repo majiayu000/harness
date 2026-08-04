@@ -4,9 +4,9 @@ use harness_workflow::runtime::{
     candidate_fanout_from_policy, candidate_fanout_from_value, continuation_value,
     prompt_continuation_state_from_data, CandidateFanoutRequest, DataProvenance, DecisionValidator,
     IssueSubmissionDecisionInput, PromptContinuationPolicy, PromptSubmissionDecisionInput,
-    SubmissionMode, ValidationContext, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    PROMPT_TASK_DEFINITION_ID,
+    SubmissionMode, ValidationContext, WorkflowCommandStatus, WorkflowDecision,
+    WorkflowDecisionTransition, WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
+    WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
@@ -279,7 +279,9 @@ async fn commit_runtime_decision(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
     decision: WorkflowDecision,
-    event_id: String,
+    event_type: &'static str,
+    source: &'static str,
+    event_payload: serde_json::Value,
     accepted_data: Option<serde_json::Value>,
 ) -> anyhow::Result<WorkflowInstance> {
     let validator = decision_validator_for_instance(&instance)?;
@@ -287,7 +289,9 @@ async fn commit_runtime_decision(
         store,
         instance,
         decision,
-        event_id,
+        event_type,
+        source,
+        event_payload,
         accepted_data,
         validator,
         false,
@@ -297,9 +301,11 @@ async fn commit_runtime_decision(
 
 async fn commit_runtime_decision_with_validator(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     decision: WorkflowDecision,
-    event_id: String,
+    event_type: &'static str,
+    source: &'static str,
+    event_payload: serde_json::Value,
     accepted_data: Option<serde_json::Value>,
     validator: DecisionValidator,
     allow_missing_pinned_cancel: bool,
@@ -312,29 +318,47 @@ async fn commit_runtime_decision_with_validator(
     if allow_missing_pinned_cancel {
         validation_context = validation_context.allow_missing_pinned_cancel();
     }
-    if let Err(error) = validator.validate(&instance, &decision, &validation_context) {
-        let reason = error.to_string();
-        let record = WorkflowDecisionRecord::rejected(decision, Some(event_id), &reason);
-        store.record_decision(&record).await?;
-        anyhow::bail!(reason);
+    let expected_state = instance.state.clone();
+    let mut final_instance = instance.clone();
+    final_instance.state = decision.next_state.clone();
+    final_instance.version = final_instance.version.saturating_add(1);
+    classify_submission_data(
+        &mut final_instance,
+        merge_last_decision(
+            accepted_data.unwrap_or_else(|| instance.data.clone()),
+            &decision.decision,
+        ),
+    )?;
+    let record = store
+        .apply_decision_transition_with_validator(
+            WorkflowDecisionTransition {
+                expected_state: &expected_state,
+                create_if_missing: None,
+                event_type,
+                source,
+                payload: event_payload,
+                decision: &decision,
+                final_instance: &final_instance,
+                command_status: WorkflowCommandStatus::Pending,
+            },
+            &validator,
+            validation_context,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow state changed before runtime submission transition could be committed"
+            )
+        })?;
+    if !record.accepted {
+        anyhow::bail!(
+            "{}",
+            record
+                .rejection_reason
+                .unwrap_or_else(|| "decision rejected".to_string())
+        );
     }
-
-    let record = WorkflowDecisionRecord::accepted(decision.clone(), Some(event_id));
-    store.record_decision(&record).await?;
-    for command in &decision.commands {
-        store
-            .enqueue_command(&instance.id, Some(&record.id), command)
-            .await?;
-    }
-    instance.state = decision.next_state.clone();
-    instance.version = instance.version.saturating_add(1);
-    let data = merge_last_decision(
-        accepted_data.unwrap_or_else(|| instance.data.clone()),
-        &decision.decision,
-    );
-    classify_submission_data(&mut instance, data)?;
-    store.upsert_instance(&instance).await?;
-    Ok(instance)
+    Ok(final_instance)
 }
 
 fn decision_validator_for_instance(
@@ -411,6 +435,36 @@ fn prompt_instance(
     )
     .with_id(workflow_id)
     .with_classified_data(json!({ "project_id": project_id }), DataProvenance::Server)
+}
+
+/// Build an updated `workflow.data` document as a plain value.
+///
+/// These stage a document; they do not persist one. Classification happens at
+/// the single commit point, where `classify_submission_data` assigns every
+/// field its provenance before the transition is written. Keeping the staging
+/// step provenance-free means there is exactly one place that decides what a
+/// submission field's origin is.
+pub(super) fn set_data_bool(
+    mut data: serde_json::Value,
+    key: &str,
+    value: bool,
+) -> serde_json::Value {
+    if let Some(object) = data.as_object_mut() {
+        object.insert(key.to_string(), json!(value));
+    }
+    data
+}
+
+/// See [`set_data_bool`].
+pub(super) fn set_data_string(
+    mut data: serde_json::Value,
+    key: &str,
+    value: &str,
+) -> serde_json::Value {
+    if let Some(object) = data.as_object_mut() {
+        object.insert(key.to_string(), json!(value));
+    }
+    data
 }
 
 pub(super) fn classify_submission_data(

@@ -1,4 +1,5 @@
-use axum::{extract::State, Json};
+use super::rest_contract::LegacyJson as Json;
+use axum::extract::State;
 use serde_json::json;
 use std::sync::Arc;
 

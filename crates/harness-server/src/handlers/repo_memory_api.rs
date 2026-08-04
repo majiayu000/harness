@@ -1,9 +1,6 @@
+use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::State, http::StatusCode};
 use harness_workflow::runtime::RepoMemoryRecord;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -13,11 +10,9 @@ pub async fn list_project_repo_memory_route(
     State(state): State<Arc<AppState>>,
     Path(repo): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "workflow runtime store unavailable" })),
-        );
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_status_json(),
     };
     let repo = repo.trim();
     if repo.is_empty() {
@@ -49,11 +44,9 @@ pub async fn delete_repo_memory_record_route(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "workflow runtime store unavailable" })),
-        );
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_status_json(),
     };
     let id = match Uuid::parse_str(id.trim()) {
         Ok(id) => id,

@@ -92,7 +92,7 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
         "pr_number": 77,
         "pr_url": pr_url,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let event = store
         .append_event(
             &workflow.id,
@@ -177,7 +177,7 @@ async fn get_task_proof_rejects_nonterminal_runtime_task() -> anyhow::Result<()>
         "task_id": task_id,
         "project_id": "/project-a",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     let response = runtime_submission_app(state)
         .oneshot(
@@ -425,7 +425,7 @@ pub(super) async fn seed_bound_runtime_pr_workflow(
         "pr_url": format!("https://github.com/{repo}/pull/{pr_number}"),
         "execution_path": "workflow_runtime"
     }));
-    store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &instance).await?;
     Ok((workflow_id, task_id))
 }
 

@@ -1,13 +1,19 @@
+#[cfg(test)]
+use super::force_upsert_lifecycle_state_for_test_tx;
 use super::{
-    command_store, insert_decision_record_tx, insert_event_tx_with_id,
-    insert_instance_if_absent_tx,
+    apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
+    commit_same_state_instance_tx,
+    decision_transitions::ensure_protected_instance_fields_match,
+    insert_decision_record_tx, insert_event_tx_with_id, insert_validated_observed_instance_tx,
     runtime_job_state::{cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation},
-    select_instance_for_update_tx, upsert_instance_tx, WorkflowRuntimeStore,
+    select_instance_for_update_tx,
+    transition_validation::{validate_transition_with_context, TransitionValidation},
+    WorkflowRuntimeStore,
 };
 use crate::runtime::remote_facts::upsert_remote_fact_snapshot_tx;
 use crate::runtime::{
-    RemoteFactSnapshot, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowInstance,
+    RemoteFactSnapshot, ValidationContext, WorkflowCommandStatus, WorkflowDecision,
+    WorkflowDecisionRecord, WorkflowInstance,
 };
 use harness_core::config::isolation::IsolationTrustClass;
 use serde_json::Value;
@@ -36,6 +42,9 @@ pub enum WorkflowCoverageRecoveryOutcome {
     Conflict {
         current: Option<Box<WorkflowInstance>>,
     },
+    Rejected {
+        reason: String,
+    },
     StaleRemoteFact,
 }
 
@@ -50,7 +59,8 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(None);
         };
-        let current = instance
+        let original = instance.clone();
+        let current_trust = instance
             .data
             .get("author_trust_class")
             .map(|value| {
@@ -61,21 +71,21 @@ impl WorkflowRuntimeStore {
                 })
             })
             .transpose()?;
-        let effective = if current == Some(IsolationTrustClass::NonCollaborator)
+        let effective = if current_trust == Some(IsolationTrustClass::NonCollaborator)
             || incoming == IsolationTrustClass::NonCollaborator
         {
             IsolationTrustClass::NonCollaborator
         } else {
             IsolationTrustClass::Trusted
         };
-        if current != Some(effective) {
+        if current_trust != Some(effective) {
             instance.set_data_field(
                 "author_trust_class",
                 serde_json::to_value(effective)?,
                 crate::runtime::DataProvenance::Server,
             )?;
             instance.version = instance.version.saturating_add(1);
-            upsert_instance_tx(&mut tx, &instance).await?;
+            commit_same_state_instance_tx(&mut tx, &original, &instance).await?;
         }
         tx.commit().await?;
         Ok(Some(instance))
@@ -89,6 +99,9 @@ impl WorkflowRuntimeStore {
             || transition.decision.workflow_id != transition.workflow_id
         {
             anyhow::bail!("coverage recovery workflow identifiers do not match");
+        }
+        if transition.final_instance.state != transition.decision.next_state {
+            anyhow::bail!("coverage recovery final instance state does not match decision");
         }
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -109,12 +122,43 @@ impl WorkflowRuntimeStore {
                 current: current.map(Box::new),
             });
         }
-        let expected_version = current.as_ref().map_or(0, |instance| instance.version + 1);
+        if let Some(current) = current.as_ref() {
+            ensure_protected_instance_fields_match(current, transition.final_instance)?;
+        }
+        let expected_version = match current.as_ref() {
+            Some(instance) => instance.version.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "coverage recovery workflow `{}` current version cannot advance",
+                    transition.workflow_id
+                )
+            })?,
+            None => 1,
+        };
         if transition.final_instance.version != expected_version {
             anyhow::bail!("coverage recovery final instance has an invalid version");
         }
+
+        let validation_current = current.clone().unwrap_or_else(|| {
+            coverage_recovery_initial_instance(
+                transition.final_instance,
+                &transition.decision.observed_state,
+            )
+        });
+        let validation_context =
+            ValidationContext::new("reconciliation", chrono::Utc::now()).allow_terminal_reopen();
+        match validate_transition_with_context(
+            &validation_current,
+            transition.decision,
+            &validation_context,
+        ) {
+            TransitionValidation::Accepted => {}
+            TransitionValidation::Rejected(reason) => {
+                tx.rollback().await?;
+                return Ok(WorkflowCoverageRecoveryOutcome::Rejected { reason });
+            }
+        }
         if current.is_none()
-            && !insert_instance_if_absent_tx(&mut tx, transition.final_instance).await?
+            && !insert_validated_observed_instance_tx(&mut tx, &validation_current).await?
         {
             anyhow::bail!("coverage recovery lost its advisory-locked absent insert");
         }
@@ -188,6 +232,7 @@ impl WorkflowRuntimeStore {
         }
 
         let mut command_ids = Vec::new();
+        let mut final_instance = transition.final_instance.clone();
         for command in &transition.decision.commands {
             command_ids.push(
                 command_store::insert_or_reactivate_cancelled_tx(
@@ -195,15 +240,39 @@ impl WorkflowRuntimeStore {
                     transition.workflow_id,
                     Some(&record.id),
                     command,
-                    WorkflowCommandStatus::Pending,
+                    if command.requires_runtime_job() {
+                        WorkflowCommandStatus::Pending
+                    } else {
+                        WorkflowCommandStatus::HandledInline
+                    },
                 )
                 .await?,
             );
+            if !command.requires_runtime_job() {
+                apply_inline_command_side_effect(&mut final_instance, command)?;
+            }
         }
-        upsert_instance_tx(&mut tx, transition.final_instance).await?;
+        commit_decision_instance_tx(
+            &mut tx,
+            &validation_current,
+            &final_instance,
+            &record,
+            false,
+        )
+        .await?;
         tx.commit().await?;
         Ok(WorkflowCoverageRecoveryOutcome::Committed { command_ids })
     }
+}
+
+fn coverage_recovery_initial_instance(
+    final_instance: &WorkflowInstance,
+    observed_state: &str,
+) -> WorkflowInstance {
+    let mut initial = final_instance.clone();
+    initial.state = observed_state.to_string();
+    initial.version = 0;
+    initial
 }
 
 #[cfg(test)]
@@ -216,6 +285,98 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
+    async fn invalid_coverage_final_error(
+        store: &WorkflowRuntimeStore,
+        initial: &WorkflowInstance,
+        final_instance: &WorkflowInstance,
+        fact: &RemoteFactSnapshot,
+        decision: &WorkflowDecision,
+    ) -> anyhow::Error {
+        match store
+            .commit_coverage_recovery_transition(WorkflowCoverageRecoveryTransition {
+                workflow_id: &initial.id,
+                expected: WorkflowCoverageRecoveryExpected::Present {
+                    state: &initial.state,
+                    version: initial.version,
+                },
+                final_instance,
+                selected_remote_fact: fact,
+                event_type: "ClosingPrCoverageRecovered",
+                source: "workflow-runtime-test",
+                payload: json!({}),
+                decision,
+            })
+            .await
+        {
+            Ok(_) => panic!("invalid coverage final instance should fail"),
+            Err(error) => error,
+        }
+    }
+
+    #[tokio::test]
+    async fn coverage_recovery_rejects_identity_substitution_and_invalid_version(
+    ) -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+        let initial = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "discovered",
+            WorkflowSubject::new("issue", "issue:1845"),
+        )
+        .with_id("coverage-recovery-identity-version")
+        .with_parent("parent-workflow");
+        store
+            .force_upsert_lifecycle_state_for_test(&initial)
+            .await?;
+        let fact = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            1845,
+            "open",
+            json!({"head": "abc"}),
+            Utc::now(),
+        );
+        let decision = WorkflowDecision::new(
+            &initial.id,
+            "discovered",
+            "recover_github_pr_coverage",
+            "quality_gate_pending",
+            "recover",
+        )
+        .with_evidence(crate::runtime::WorkflowEvidence::new(
+            "server_pr_snapshot",
+            "GitHub reported an authoritative closing pull request.",
+        ))
+        .with_command(WorkflowCommand::start_child_workflow(
+            "quality_gate",
+            "pr:1845",
+            "quality-gate:1845",
+        ));
+        let mut final_instance = initial.clone();
+        final_instance.state = decision.next_state.clone();
+        final_instance.version = 1;
+
+        let mut substituted = final_instance.clone();
+        substituted.definition_id = "prompt_task".to_string();
+        let error =
+            invalid_coverage_final_error(&store, &initial, &substituted, &fact, &decision).await;
+        assert!(error.to_string().contains("definition_id"));
+
+        let mut invalid_version = final_instance;
+        invalid_version.version = 9;
+        let error =
+            invalid_coverage_final_error(&store, &initial, &invalid_version, &fact, &decision)
+                .await;
+        assert!(error.to_string().contains("invalid version"));
+        assert_eq!(store.get_instance(&initial.id).await?, Some(initial));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn concurrent_recovery_attempts_have_one_atomic_winner() -> anyhow::Result<()> {
         if resolve_database_url(None).is_err() {
@@ -226,7 +387,7 @@ mod tests {
         let store_ref = &store;
         let barrier = Arc::new(Barrier::new(2));
         let run = |suffix: &'static str, barrier: Arc<Barrier>| {
-            let final_instance = WorkflowInstance::new(
+            let mut final_instance = WorkflowInstance::new(
                 "github_issue_pr",
                 1,
                 "quality_gate_pending",
@@ -234,6 +395,7 @@ mod tests {
             )
             .with_id("coverage-race")
             .with_server_data(json!({"winner": suffix}));
+            final_instance.version = 1;
             let fact = RemoteFactSnapshot::new(
                 "github",
                 "owner/repo",
@@ -245,13 +407,18 @@ mod tests {
             );
             let decision = WorkflowDecision::new(
                 "coverage-race",
-                "missing",
-                "recover",
+                "discovered",
+                "recover_github_pr_coverage",
                 "quality_gate_pending",
                 "recover",
             )
-            .with_command(WorkflowCommand::enqueue_activity(
+            .with_evidence(crate::runtime::WorkflowEvidence::new(
+                "server_pr_snapshot",
+                "GitHub reported an authoritative closing pull request.",
+            ))
+            .with_command(WorkflowCommand::start_child_workflow(
                 "quality_gate",
+                "pr:1709",
                 "quality-gate:1709",
             ));
             async move {
@@ -306,7 +473,9 @@ mod tests {
             WorkflowSubject::new("issue", "issue:1707"),
         )
         .with_id("coverage-stale");
-        store.upsert_instance(&initial).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&initial)
+            .await?;
         let newer_command = WorkflowCommand::enqueue_activity("implement_issue", "newer-command");
         let newer_command_id = store
             .enqueue_command(&initial.id, None, &newer_command)
@@ -315,7 +484,9 @@ mod tests {
         newer.state = "implementing".to_string();
         newer.version = 1;
         newer.replace_classified_data(json!({"newer": true}), DataProvenance::Server);
-        store.upsert_instance(&newer).await?;
+        let mut tx = store.pool.begin().await?;
+        force_upsert_lifecycle_state_for_test_tx(&mut tx, &newer).await?;
+        tx.commit().await?;
 
         let mut stale_final = initial.clone();
         stale_final.state = "pr_open".to_string();
@@ -368,6 +539,82 @@ mod tests {
         );
         assert!(store
             .get_remote_fact_snapshot("github", "owner/repo", "pull_request", 1709)
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coverage_recovery_rejects_allowlist_violating_transition() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+        let initial = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "discovered",
+            WorkflowSubject::new("issue", "issue:1784"),
+        )
+        .with_id("coverage-validator-bypass");
+        store
+            .force_upsert_lifecycle_state_for_test(&initial)
+            .await?;
+        let mut final_instance = initial.clone();
+        final_instance.state = "merging".to_string();
+        final_instance.version = 1;
+        let fact = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            1784,
+            "open",
+            json!({"head": "abc"}),
+            Utc::now(),
+        );
+        let decision = WorkflowDecision::new(
+            &initial.id,
+            "discovered",
+            "recover_github_pr_coverage",
+            "merging",
+            "invalid direct coverage transition",
+        )
+        .with_evidence(crate::runtime::WorkflowEvidence::new(
+            "server_pr_snapshot",
+            "GitHub reported an authoritative closing pull request.",
+        ));
+
+        let outcome = store
+            .commit_coverage_recovery_transition(WorkflowCoverageRecoveryTransition {
+                workflow_id: &initial.id,
+                expected: WorkflowCoverageRecoveryExpected::Present {
+                    state: "discovered",
+                    version: 0,
+                },
+                final_instance: &final_instance,
+                selected_remote_fact: &fact,
+                event_type: "ClosingPrCoverageRecovered",
+                source: "test",
+                payload: json!({}),
+                decision: &decision,
+            })
+            .await?;
+
+        assert!(matches!(
+            outcome,
+            WorkflowCoverageRecoveryOutcome::Rejected { .. }
+        ));
+        assert_eq!(
+            store
+                .get_instance(&initial.id)
+                .await?
+                .expect("workflow")
+                .state,
+            "discovered"
+        );
+        assert!(store
+            .get_remote_fact_snapshot("github", "owner/repo", "pull_request", 1784)
             .await?
             .is_none());
         Ok(())

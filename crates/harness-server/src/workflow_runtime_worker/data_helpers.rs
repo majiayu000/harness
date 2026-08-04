@@ -239,9 +239,12 @@ pub(super) struct PrFeedbackChildData<'a> {
     pub issue_number: Option<u64>,
     pub pr_number: u64,
     pub pr_url: Option<&'a str>,
+    pub expected_base_ref: Option<&'a str>,
     pub parent_workflow_id: &'a str,
     pub runtime_job_id: &'a str,
     pub command_id: &'a str,
+    pub remote_fact_hash: Option<&'a str>,
+    pub remote_fact_activity_at: Option<&'a str>,
 }
 
 pub(super) fn merge_pr_feedback_child_data(
@@ -262,6 +265,25 @@ pub(super) fn merge_pr_feedback_child_data(
         ),
         WorkflowDataWrite::set("pr_number", json!(input.pr_number), DataProvenance::Server),
         WorkflowDataWrite::set("pr_url", json!(input.pr_url), DataProvenance::Agent),
+        // Base ref and remote activity time are observed on the remote, so
+        // they stay externally classified. The fact hash is the digest
+        // Harness itself computes over those observations, so it is server
+        // data about external data, not external data.
+        WorkflowDataWrite::set(
+            "expected_base_ref",
+            json!(input.expected_base_ref),
+            DataProvenance::External,
+        ),
+        WorkflowDataWrite::set(
+            "remote_fact_hash",
+            json!(input.remote_fact_hash),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
+            "remote_fact_activity_at",
+            json!(input.remote_fact_activity_at),
+            DataProvenance::External,
+        ),
         WorkflowDataWrite::set(
             "parent_workflow_id",
             json!(input.parent_workflow_id),
@@ -414,6 +436,62 @@ mod tests {
         );
 
         assert_eq!(activity_name(&job), "start_child_workflow");
+    }
+
+    #[test]
+    fn pr_feedback_child_data_preserves_remote_fact_metadata() {
+        let mut child = WorkflowInstance::new(
+            "pr_feedback",
+            1,
+            "inspecting",
+            harness_workflow::runtime::WorkflowSubject::new("pr", "pr:77"),
+        );
+        merge_pr_feedback_child_data(
+            &mut child,
+            PrFeedbackChildData {
+                project_id: "/project",
+                repo: Some("owner/repo"),
+                issue_number: Some(123),
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77"),
+                expected_base_ref: Some("release"),
+                parent_workflow_id: "parent",
+                runtime_job_id: "runtime-job",
+                command_id: "command",
+                remote_fact_hash: Some("sha256:fact"),
+                remote_fact_activity_at: Some("2026-06-10T00:00:00Z"),
+            },
+        )
+        .expect("classified child data write");
+
+        assert_eq!(child.data["remote_fact_hash"], "sha256:fact");
+        assert_eq!(
+            child.data["remote_fact_activity_at"],
+            "2026-06-10T00:00:00Z"
+        );
+        assert_eq!(child.data["expected_base_ref"], "release");
+
+        // The remote-observed fields must not be laundered into server data by
+        // passing through a server-side merge helper.
+        let provenance = child
+            .data_provenance
+            .as_ref()
+            .expect("merged child data carries a provenance sidecar");
+        assert_eq!(
+            provenance.provenance_for("/expected_base_ref"),
+            Some(DataProvenance::External)
+        );
+        assert_eq!(
+            provenance.provenance_for("/remote_fact_activity_at"),
+            Some(DataProvenance::External)
+        );
+        assert_eq!(
+            provenance.provenance_for("/remote_fact_hash"),
+            Some(DataProvenance::Server)
+        );
+        child
+            .validate_data_provenance()
+            .expect("merged child data is persistable");
     }
 
     #[tokio::test]

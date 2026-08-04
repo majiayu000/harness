@@ -1,4 +1,4 @@
-# harness.toml — per-project review type configuration
+# harness.toml.example - per-project review type configuration
 #
 # Each named section shows the .harness/config.toml settings for a project.
 # Copy the relevant section into {project_root}/.harness/config.toml.

@@ -1,8 +1,8 @@
+use crate::http::rest_contract::{LegacyJson as Json, LegacyQuery as Query};
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, Duration, Utc};
 use harness_observe::usage::UsageMetrics;
@@ -50,7 +50,7 @@ pub(crate) struct UsageMonitorQuery {
 }
 
 #[derive(Debug, Serialize)]
-struct UsageMonitorResponse {
+pub(crate) struct UsageMonitorResponse {
     window: UsageWindow,
     cost: CostConfig,
     summary: UsageSummary,
@@ -152,7 +152,8 @@ impl PriceCatalog {
     }
 
     fn from_env() -> Self {
-        let Ok(raw) = std::env::var("HARNESS_USAGE_PRICE_CATALOG_JSON") else {
+        let Ok(raw) = harness_core::config::process_env::var("HARNESS_USAGE_PRICE_CATALOG_JSON")
+        else {
             return Self::default();
         };
         let raw = raw.trim();

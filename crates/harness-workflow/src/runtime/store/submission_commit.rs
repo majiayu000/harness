@@ -1,11 +1,16 @@
 use super::{
-    command_store, insert_decision_record_tx, insert_event_tx_with_id,
-    insert_instance_if_absent_tx, select_instance_for_update_tx, upsert_instance_tx,
+    command_store, commit_decision_instance_tx, commit_rejected_initial_failure_instance_tx,
+    decision_transitions::ensure_protected_instance_fields_match,
+    insert_decision_record_tx, insert_event_tx_with_id, insert_validated_observed_instance_tx,
+    select_instance_for_update_tx,
+    transition_validation::{validate_transition_with_context, TransitionValidation},
     WorkflowRuntimeStore,
 };
 use crate::runtime::{
-    WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowInstance,
+    ValidationContext, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowInstance, WorkflowTerminalState,
 };
+use chrono::Utc;
 use serde_json::Value;
 
 pub struct WorkflowSubmissionDecisionTransition<'a> {
@@ -85,13 +90,70 @@ impl WorkflowRuntimeStore {
 
         let mut tx = self.pool.begin().await?;
         lock_submission_tx(&mut tx, transition.workflow_id).await?;
-        let Some(current) = load_submission_instance_tx(&mut tx, &transition).await? else {
+        let Some((current, created_for_submission)) =
+            load_submission_instance_tx(&mut tx, &transition).await?
+        else {
             return Ok(None);
         };
         if current.state != transition.expected_state
             || current.version != transition.expected_version
         {
             return Ok(None);
+        }
+        let replays_applied_instance = match transition
+            .existing_record
+            .filter(|record| record.accepted)
+        {
+            Some(record) if current.state == record.decision.next_state => true,
+            Some(record) if current.state == record.decision.observed_state => false,
+            Some(record) => {
+                anyhow::bail!(
+                    "stale workflow submission replay `{}` observed current state `{}` outside decision transition `{} -> {}`",
+                    record.id,
+                    current.state,
+                    record.decision.observed_state,
+                    record.decision.next_state
+                );
+            }
+            None => false,
+        };
+        if let Some(final_instance) = transition.final_instance {
+            ensure_protected_instance_fields_match(&current, final_instance)?;
+            let rejected_final = transition.rejection_reason.is_some()
+                || transition
+                    .existing_record
+                    .is_some_and(|record| !record.accepted);
+            if rejected_final {
+                if !created_for_submission
+                    || transition.existing_record.is_some()
+                    || transition.rejection_reason.is_none()
+                {
+                    anyhow::bail!(
+                        "rejected workflow submission final instance is only allowed for a newly created submission"
+                    );
+                }
+                if final_instance.terminal_state() != Some(WorkflowTerminalState::Failed) {
+                    anyhow::bail!(
+                        "rejected workflow submission final instance must use the definition-specific failed terminal state"
+                    );
+                }
+            }
+            let expected_final_version = if replays_applied_instance {
+                current.version
+            } else {
+                current.version.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workflow submission `{}` current version cannot advance",
+                        transition.workflow_id
+                    )
+                })?
+            };
+            if final_instance.version != expected_final_version {
+                anyhow::bail!(
+                    "workflow submission final instance has version `{}` but expected `{expected_final_version}`",
+                    final_instance.version
+                );
+            }
         }
 
         let event_id = if let Some(event_id) = transition.event_id {
@@ -131,11 +193,52 @@ impl WorkflowRuntimeStore {
                 }
             },
         };
+        let validate_as_new_transition = record.accepted
+            && transition
+                .existing_record
+                .is_none_or(|_| current.state == record.decision.observed_state);
+        if validate_as_new_transition {
+            let validation_context = if current.is_terminal() {
+                ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen()
+            } else {
+                ValidationContext::new("workflow-policy", Utc::now())
+            };
+            match validate_transition_with_context(&current, &record.decision, &validation_context)
+            {
+                TransitionValidation::Accepted => {}
+                TransitionValidation::Rejected(reason) if transition.existing_record.is_none() => {
+                    let rejected = WorkflowDecisionRecord::rejected(
+                        record.decision.clone(),
+                        record.event_id.clone(),
+                        reason,
+                    );
+                    insert_decision_record_tx(&mut tx, &rejected).await?;
+                    tx.commit().await?;
+                    return Ok(Some(WorkflowSubmissionDecisionCommit {
+                        record: rejected,
+                        command_ids: Vec::new(),
+                    }));
+                }
+                TransitionValidation::Rejected(reason) => {
+                    anyhow::bail!(
+                        "existing workflow submission decision failed validation: {reason}"
+                    );
+                }
+            }
+        }
         insert_decision_record_tx(&mut tx, &record).await?;
 
         let mut command_ids = Vec::new();
         if let Some(final_instance) = transition.final_instance {
             if record.accepted {
+                if final_instance.state != record.decision.next_state {
+                    anyhow::bail!(
+                        "workflow submission decision `{}` validates next state `{}` but final instance state is `{}`",
+                        record.decision.decision,
+                        record.decision.next_state,
+                        final_instance.state
+                    );
+                }
                 if let Some(prompt_payload) = transition.prompt_payload {
                     upsert_prompt_payload_tx(
                         &mut tx,
@@ -160,7 +263,24 @@ impl WorkflowRuntimeStore {
                     );
                 }
             }
-            upsert_instance_tx(&mut tx, final_instance).await?;
+            if record.accepted {
+                commit_decision_instance_tx(
+                    &mut tx,
+                    &current,
+                    final_instance,
+                    &record,
+                    replays_applied_instance,
+                )
+                .await?;
+            } else {
+                commit_rejected_initial_failure_instance_tx(
+                    &mut tx,
+                    &current,
+                    final_instance,
+                    &record,
+                )
+                .await?;
+            }
         } else if record.accepted {
             anyhow::bail!("accepted workflow submission requires a final instance");
         }
@@ -187,9 +307,9 @@ async fn lock_submission_tx(
 async fn load_submission_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     transition: &WorkflowSubmissionDecisionTransition<'_>,
-) -> anyhow::Result<Option<WorkflowInstance>> {
+) -> anyhow::Result<Option<(WorkflowInstance, bool)>> {
     if let Some(current) = select_instance_for_update_tx(tx, transition.workflow_id).await? {
-        return Ok(Some(current));
+        return Ok(Some((current, false)));
     }
 
     let Some(initial) = transition.create_if_missing else {
@@ -206,10 +326,12 @@ async fn load_submission_instance_tx(
     {
         return Ok(None);
     }
-    if insert_instance_if_absent_tx(tx, initial).await? {
-        return Ok(Some(initial.clone()));
+    if insert_validated_observed_instance_tx(tx, initial).await? {
+        return Ok(Some((initial.clone(), true)));
     }
-    select_instance_for_update_tx(tx, transition.workflow_id).await
+    Ok(select_instance_for_update_tx(tx, transition.workflow_id)
+        .await?
+        .map(|instance| (instance, false)))
 }
 
 async fn upsert_prompt_payload_tx(
@@ -255,6 +377,225 @@ mod tests {
     use harness_core::db::resolve_database_url;
     use serde_json::json;
 
+    fn submission_test_instance(id: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "addressing_feedback",
+            WorkflowSubject::new("pr", "77"),
+        )
+        .with_id(id)
+        .with_server_data(json!({"project_id": "/project-a", "pr_number": 77}))
+    }
+
+    fn submission_test_decision(instance: &WorkflowInstance) -> WorkflowDecision {
+        WorkflowDecision::new(
+            &instance.id,
+            "addressing_feedback",
+            "address_feedback",
+            "local_review_gate",
+            "review feedback was addressed",
+        )
+        .with_command(WorkflowCommand::enqueue_activity(
+            "run_local_review",
+            format!("{}-local-review", instance.id),
+        ))
+    }
+
+    async fn invalid_submission_final_error(
+        store: &WorkflowRuntimeStore,
+        current: &WorkflowInstance,
+        decision: &WorkflowDecision,
+        create_if_missing: Option<&WorkflowInstance>,
+        existing_record: Option<&WorkflowDecisionRecord>,
+        rejection_reason: Option<&str>,
+        final_instance: &WorkflowInstance,
+    ) -> anyhow::Error {
+        match store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &current.id,
+                expected_state: &current.state,
+                expected_version: current.version,
+                create_if_missing,
+                event_id: existing_record.and_then(|record| record.event_id.as_deref()),
+                new_event_id: existing_record
+                    .is_none()
+                    .then_some("invalid-submission-final-event"),
+                event_type: "IssueSubmitted",
+                source: "workflow-runtime-test",
+                payload: json!({}),
+                decision,
+                existing_record,
+                rejection_reason,
+                final_instance: Some(final_instance),
+                command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
+            })
+            .await
+        {
+            Ok(_) => panic!("invalid final instance should fail"),
+            Err(error) => error,
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_submission_rejects_identity_substitution_and_invalid_version(
+    ) -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let initial = submission_test_instance("submission-accepted-identity-version");
+        store
+            .force_upsert_lifecycle_state_for_test(&initial)
+            .await?;
+        let decision = submission_test_decision(&initial);
+        let mut final_instance = initial.clone();
+        final_instance.state = decision.next_state.clone();
+        final_instance.version = 1;
+
+        let mut substituted = final_instance.clone();
+        substituted.definition_version = 2;
+        let error = invalid_submission_final_error(
+            &store,
+            &initial,
+            &decision,
+            None,
+            None,
+            None,
+            &substituted,
+        )
+        .await;
+        assert!(error.to_string().contains("definition_version"));
+
+        let mut invalid_version = final_instance;
+        invalid_version.version = 0;
+        let error = invalid_submission_final_error(
+            &store,
+            &initial,
+            &decision,
+            None,
+            None,
+            None,
+            &invalid_version,
+        )
+        .await;
+        assert!(error.to_string().contains("expected `1`"));
+        assert_eq!(store.get_instance(&initial.id).await?, Some(initial));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_submission_rejects_identity_substitution_and_invalid_version(
+    ) -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let initial = submission_test_instance("submission-rejected-identity-version");
+        let decision = submission_test_decision(&initial);
+        let mut final_instance = initial.clone();
+        final_instance.state = "failed".to_string();
+        final_instance.version = 1;
+
+        let mut substituted = final_instance.clone();
+        substituted.subject = WorkflowSubject::new("issue", "substituted");
+        let error = invalid_submission_final_error(
+            &store,
+            &initial,
+            &decision,
+            Some(&initial),
+            None,
+            Some("rejected"),
+            &substituted,
+        )
+        .await;
+        assert!(error.to_string().contains("subject"));
+
+        let mut invalid_version = final_instance;
+        invalid_version.version = 7;
+        let error = invalid_submission_final_error(
+            &store,
+            &initial,
+            &decision,
+            Some(&initial),
+            None,
+            Some("rejected"),
+            &invalid_version,
+        )
+        .await;
+        assert!(error.to_string().contains("expected `1`"));
+        assert!(store.get_instance(&initial.id).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_replay_rejects_identity_substitution_and_version_advance(
+    ) -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let initial = submission_test_instance("submission-replay-identity-version");
+        let decision = submission_test_decision(&initial);
+        let mut final_instance = initial.clone();
+        final_instance.state = decision.next_state.clone();
+        final_instance.version = 1;
+        let first_commit = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &initial.id,
+                expected_state: &initial.state,
+                expected_version: initial.version,
+                create_if_missing: Some(&initial),
+                event_id: None,
+                new_event_id: Some("submission-replay-identity-version-event"),
+                event_type: "IssueSubmitted",
+                source: "workflow-runtime-test",
+                payload: json!({}),
+                decision: &decision,
+                existing_record: None,
+                rejection_reason: None,
+                final_instance: Some(&final_instance),
+                command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
+            })
+            .await?
+            .expect("initial transition should commit");
+
+        let mut substituted = final_instance.clone();
+        substituted.parent_workflow_id = Some("substituted-parent".to_string());
+        let error = invalid_submission_final_error(
+            &store,
+            &final_instance,
+            &decision,
+            None,
+            Some(&first_commit.record),
+            None,
+            &substituted,
+        )
+        .await;
+        assert!(error.to_string().contains("parent_workflow_id"));
+
+        let mut advanced_version = final_instance.clone();
+        advanced_version.version = 2;
+        let error = invalid_submission_final_error(
+            &store,
+            &final_instance,
+            &decision,
+            None,
+            Some(&first_commit.record),
+            None,
+            &advanced_version,
+        )
+        .await;
+        assert!(error.to_string().contains("expected `1`"));
+        assert_eq!(store.get_instance(&initial.id).await?, Some(final_instance));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn submission_replay_keeps_completed_commands_when_repairing_pending_commands(
     ) -> anyhow::Result<()> {
@@ -279,7 +620,7 @@ mod tests {
             &initial.id,
             "addressing_feedback",
             "address_feedback",
-            "awaiting_feedback",
+            "local_review_gate",
             "review feedback was addressed",
         )
         .with_command(WorkflowCommand::enqueue_activity(
@@ -291,7 +632,7 @@ mod tests {
             "submission-remote-feedback",
         ));
         let mut final_instance = initial.clone();
-        final_instance.state = "awaiting_feedback".to_string();
+        final_instance.state = "local_review_gate".to_string();
         final_instance.version = final_instance.version.saturating_add(1);
         final_instance.replace_classified_data(
             json!({
@@ -369,6 +710,67 @@ mod tests {
                 .expect("pending command should remain present")
                 .status,
             WorkflowCommandStatus::Pending
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_commit_rejects_allowlist_violating_transition() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let initial = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "discovered",
+            WorkflowSubject::new("issue", "issue:1784"),
+        )
+        .with_id("submission-validator-bypass")
+        .with_server_data(json!({"project_id": "/project-a", "issue_number": 1784}));
+        let decision = WorkflowDecision::new(
+            &initial.id,
+            "discovered",
+            "skip_to_merge_gate",
+            "ready_to_merge",
+            "invalid direct promotion",
+        );
+        let mut final_instance = initial.clone();
+        final_instance.state = "ready_to_merge".to_string();
+        final_instance.version = 1;
+
+        let commit = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &initial.id,
+                expected_state: &initial.state,
+                expected_version: initial.version,
+                create_if_missing: Some(&initial),
+                event_id: None,
+                new_event_id: Some("submission-validator-bypass-event"),
+                event_type: "IssueSubmitted",
+                source: "workflow-runtime-test",
+                payload: json!({"task_id": "invalid-submission"}),
+                decision: &decision,
+                existing_record: None,
+                rejection_reason: None,
+                final_instance: Some(&final_instance),
+                command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
+            })
+            .await?
+            .expect("submission decision should be recorded");
+
+        assert!(!commit.record.accepted);
+        assert!(commit.command_ids.is_empty());
+        assert_eq!(
+            store
+                .get_instance(&initial.id)
+                .await?
+                .expect("workflow")
+                .state,
+            "discovered"
         );
         Ok(())
     }

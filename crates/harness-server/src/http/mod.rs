@@ -16,6 +16,7 @@ use axum::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+pub(crate) mod api_error;
 pub(crate) mod auth;
 pub(crate) mod auth_routes;
 pub(crate) mod auto_merge;
@@ -30,6 +31,7 @@ pub(crate) mod intake_status_routes;
 mod orphan_reaper;
 pub(crate) mod pr_hygiene_background;
 pub(crate) mod rate_limit;
+pub mod rest_contract;
 pub(crate) mod rpc_routes;
 mod runtime_retention;
 pub(crate) mod runtime_submission_routes;

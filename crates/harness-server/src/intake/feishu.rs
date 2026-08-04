@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use dashmap::DashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use super::{IncomingIssue, IntakeSource, TaskCompletionResult};
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::AppState;
 use crate::workflow_runtime_submission::{
     runtime_models::{TaskId, TaskStatus},
@@ -42,14 +43,14 @@ impl FeishuIntake {
         self.config
             .app_id
             .clone()
-            .or_else(|| std::env::var("FEISHU_APP_ID").ok())
+            .or_else(|| harness_core::config::process_env::var("FEISHU_APP_ID").ok())
     }
 
     fn app_secret(&self) -> Option<String> {
         self.config
             .app_secret
             .clone()
-            .or_else(|| std::env::var("FEISHU_APP_SECRET").ok())
+            .or_else(|| harness_core::config::process_env::var("FEISHU_APP_SECRET").ok())
     }
 
     async fn get_tenant_access_token(&self) -> anyhow::Result<String> {

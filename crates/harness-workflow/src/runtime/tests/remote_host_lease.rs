@@ -29,7 +29,9 @@ async fn enqueue_remote_lease_job(
         WorkflowSubject::new("issue", format!("issue:{key}")),
     )
     .with_id(format!("remote-lease-{key}"));
-    store.upsert_instance(&workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
     let command = WorkflowCommand::enqueue_activity("remote_check", format!("remote-{key}"));
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     store

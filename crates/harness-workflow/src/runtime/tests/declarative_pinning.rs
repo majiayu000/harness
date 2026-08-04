@@ -406,7 +406,7 @@ mod declarative_pinning {
             "submission_id": "persisted-declarative-terminal",
             "definition_hash": definition.definition_hash(),
         }));
-        store.upsert_instance(&submission).await?;
+        store.force_upsert_lifecycle_state_for_test(&submission).await?;
 
         let active = store
             .list_submission_instances_page(

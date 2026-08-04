@@ -68,8 +68,8 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
         "repo": "owner/repo",
         "issue_number": 123,
     }));
-    store.upsert_instance(&parent).await?;
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     let event = store
         .append_event(
             &child.id,
@@ -256,7 +256,7 @@ async fn workflow_runtime_tree_endpoint_defaults_to_compact_polling_shape() -> a
         "repo": "owner/repo",
         "issue_number": 1165,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     store
         .append_event(
             &workflow.id,
@@ -496,7 +496,8 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
         )
         .with_id(id)
         .with_server_data(data);
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
     }
     let blocked_runtime_job_id = set_recovery_source_job(
         store,
@@ -649,7 +650,7 @@ async fn set_recovery_source_job(
         last_stop,
         harness_workflow::runtime::DataProvenance::Server,
     )?;
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(runtime_job_id)
 }
 
@@ -678,7 +679,7 @@ async fn workflow_runtime_tree_endpoint_returns_summary_only_shape() -> anyhow::
         "repo": "owner/repo",
         "issue_number": 1166,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
         "implement_issue",
         "issue-1166-implement",
@@ -757,7 +758,8 @@ async fn workflow_runtime_tree_summary_only_counts_all_project_workflows_with_ti
             "repo": "owner/repo",
             "issue_number": issue_number,
         }));
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
     }
 
     let response = workflow_runtime_app(state)
@@ -826,7 +828,8 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
             "repo": "owner/repo",
             "issue_number": issue_number,
         }));
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
         let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
             "replan_issue",
             format!("replan-{issue_number}"),
@@ -853,7 +856,8 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
         "repo": "owner/repo",
         "issue_number": 101,
     }));
-    store.upsert_instance(&quality_gate).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &quality_gate)
+        .await?;
     let non_terminal_passed_issue = harness_workflow::runtime::WorkflowInstance::new(
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
@@ -866,7 +870,11 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
         "repo": "owner/repo",
         "issue_number": 103,
     }));
-    store.upsert_instance(&non_terminal_passed_issue).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        store,
+        &non_terminal_passed_issue,
+    )
+    .await?;
 
     let response = workflow_runtime_app(state)
         .oneshot(
@@ -929,7 +937,7 @@ async fn workflow_runtime_tree_endpoint_splits_running_lease_states() -> anyhow:
         "repo": "owner/repo",
         "issue_number": 1170,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     for activity in ["implement_issue", "inspect_pr_feedback"] {
         let command =
@@ -1037,7 +1045,7 @@ async fn workflow_runtime_tree_endpoint_limits_runtime_jobs_per_command() -> any
         "repo": "owner/repo",
         "issue_number": 456,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-456");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;

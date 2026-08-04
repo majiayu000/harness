@@ -1,8 +1,8 @@
+use super::rest_contract::{LegacyJson as Json, LegacyQuery as Query, PrimitivePath as Path};
 use axum::{
-    extract::{rejection::QueryRejection, Path, Query, State},
+    extract::{rejection::QueryRejection, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use crate::workflow_runtime_submission::{
 };
 use harness_core::proof_of_work::{CiStatus, ProofOfWork, QualitySignal, ReviewOutcome};
 
-mod detail;
+pub(super) mod detail;
 mod runtime_submissions;
 pub(crate) use detail::{get_runtime_submission, get_runtime_submission_proof};
 use runtime_submissions::append_runtime_submission_summaries;
@@ -55,7 +55,7 @@ struct RuntimeSubmissionListCursor {
 }
 
 #[derive(Serialize)]
-struct RuntimeSubmissionListResponse {
+pub(super) struct RuntimeSubmissionListResponse {
     data: Vec<RuntimeSubmissionSummaryResponse>,
     page: RuntimeSubmissionListPage,
     counts: RuntimeSubmissionListCounts,
@@ -145,12 +145,8 @@ pub(crate) async fn list_runtime_submissions(
         Ok(query) => query,
         Err(error) => return error.into_response(),
     };
-    if state.core.workflow_runtime_store.is_none() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "workflow runtime store unavailable"})),
-        )
-            .into_response();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
 
     let cursor = query

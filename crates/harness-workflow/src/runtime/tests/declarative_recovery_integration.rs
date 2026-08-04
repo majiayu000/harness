@@ -40,10 +40,7 @@ fn declarative_recovery_definition(
             ("cancelled".to_string(), "cancelled".to_string()),
         ]),
         evidence_required: BTreeMap::from([
-            (
-                "running".to_string(),
-                vec!["operator_ticket".to_string()],
-            ),
+            ("running".to_string(), vec!["operator_ticket".to_string()]),
             ("done".to_string(), vec!["release_report".to_string()]),
         ]),
         recovery_targets: vec!["running".to_string(), "waiting".to_string()],
@@ -56,8 +53,7 @@ fn declarative_recovery_definition(
 }
 
 #[tokio::test]
-async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
-) -> anyhow::Result<()> {
+async fn declarative_recovery_is_atomic_and_persists_exact_driver_status() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
@@ -78,7 +74,9 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
     };
 
     let running = blocked("declarative-recovery-running");
-    store.upsert_instance(&running).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&running)
+        .await?;
     let missing_evidence = store
         .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
             workflow_id: &running.id,
@@ -94,11 +92,20 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
         super::WorkflowRuntimeRecoveryOutcome::MissingRequiredEvidence { ref detail, .. }
             if detail.contains("missing required evidence")
     ));
-    assert_eq!(store.get_instance(&running.id).await?.unwrap().state, "blocked");
+    assert_eq!(
+        store.get_instance(&running.id).await?.unwrap().state,
+        "blocked"
+    );
     let rejection_events = store.events_for(&running.id).await?;
     assert_eq!(rejection_events.len(), 1);
-    assert_eq!(rejection_events[0].event_type, "WorkflowRuntimeRecoveryRejected");
-    assert_eq!(rejection_events[0].event["reason_code"], "missing_required_evidence");
+    assert_eq!(
+        rejection_events[0].event_type,
+        "WorkflowRuntimeRecoveryRejected"
+    );
+    assert_eq!(
+        rejection_events[0].event["reason_code"],
+        "missing_required_evidence"
+    );
     assert!(store.decisions_for(&running.id).await?.is_empty());
     assert!(store.commands_for(&running.id).await?.is_empty());
 
@@ -119,12 +126,20 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
     ));
     let running_commands = store.commands_for(&running.id).await?;
     assert_eq!(running_commands.len(), 1);
-    assert_eq!(running_commands[0].command.command_type, WorkflowCommandType::EnqueueActivity);
+    assert_eq!(
+        running_commands[0].command.command_type,
+        WorkflowCommandType::EnqueueActivity
+    );
     assert_eq!(running_commands[0].status, WorkflowCommandStatus::Pending);
-    assert_eq!(store.decisions_for(&running.id).await?[0].decision.evidence, evidence);
+    assert_eq!(
+        store.decisions_for(&running.id).await?[0].decision.evidence,
+        evidence
+    );
 
     let waiting = blocked("declarative-recovery-waiting");
-    store.upsert_instance(&waiting).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&waiting)
+        .await?;
     store
         .recover_stopped_instance(super::WorkflowRuntimeRecoveryRequest {
             workflow_id: &waiting.id,
@@ -137,9 +152,19 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
         .await?;
     let waiting_commands = store.commands_for(&waiting.id).await?;
     assert_eq!(waiting_commands.len(), 1);
-    assert_eq!(waiting_commands[0].command.command_type, WorkflowCommandType::Wait);
-    assert_eq!(waiting_commands[0].status, WorkflowCommandStatus::HandledInline);
-    assert!(store.pending_commands(10).await?.iter().all(|command| command.workflow_id != waiting.id));
+    assert_eq!(
+        waiting_commands[0].command.command_type,
+        WorkflowCommandType::Wait
+    );
+    assert_eq!(
+        waiting_commands[0].status,
+        WorkflowCommandStatus::HandledInline
+    );
+    assert!(store
+        .pending_commands(10)
+        .await?
+        .iter()
+        .all(|command| command.workflow_id != waiting.id));
 
     let completion = WorkflowInstance::new(
         definition.policy().id.clone(),
@@ -149,7 +174,9 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
     )
     .with_id("declarative-completion-missing-evidence")
     .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
-    store.upsert_instance(&completion).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&completion)
+        .await?;
     let result = ActivityResult::succeeded("run", "completed without the release report");
     let command = WorkflowCommand::enqueue_activity("run", "declarative-completion-command");
     let policy = store
@@ -166,7 +193,10 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
         .expect("completion should persist a blocked policy decision");
     assert!(policy.accepted);
     assert_eq!(policy.decision.decision, "block_invalid_agent_output");
-    assert_eq!(store.get_instance(&completion.id).await?.unwrap().state, "blocked");
+    assert_eq!(
+        store.get_instance(&completion.id).await?.unwrap().state,
+        "blocked"
+    );
     let completion_decisions = store.decisions_for(&completion.id).await?;
     assert_eq!(completion_decisions.len(), 2);
     assert!(!completion_decisions[0].accepted);
@@ -181,8 +211,7 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
         record.status == WorkflowCommandStatus::HandledInline
             && matches!(
                 record.command.command_type,
-                WorkflowCommandType::MarkBlocked
-                    | WorkflowCommandType::RequestOperatorAttention
+                WorkflowCommandType::MarkBlocked | WorkflowCommandType::RequestOperatorAttention
             )
     }));
     Ok(())

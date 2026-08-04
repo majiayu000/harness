@@ -1,8 +1,8 @@
+use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use axum::{
-    extract::{rejection::JsonRejection, Path, State},
+    extract::{rejection::JsonRejection, State},
     http::StatusCode,
-    Json,
 };
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{
@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 
-mod lease;
+pub(crate) mod lease;
 pub use lease::renew_runtime_job_lease_for_runtime_host;
 
 #[derive(Debug, Deserialize)]
@@ -171,10 +171,8 @@ pub async fn deregister_runtime_host(
                 error = %error,
                 "failed to revoke workflow runtime-job leases during deregistration"
             );
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "workflow runtime store unavailable" })),
-            );
+            return crate::http::api_error::ApiError::store_unavailable("workflow runtime store")
+                .into_status_json();
         }
         match store.count_remote_host_runtime_job_leases(&host_id).await {
             Ok(0) => {}
@@ -195,10 +193,10 @@ pub async fn deregister_runtime_host(
                     error = %error,
                     "failed to confirm workflow runtime-job revocation"
                 );
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({ "error": "workflow runtime store unavailable" })),
-                );
+                return crate::http::api_error::ApiError::store_unavailable(
+                    "workflow runtime store",
+                )
+                .into_status_json();
             }
         }
 
@@ -634,12 +632,10 @@ async fn persist_runtime_state(
 fn workflow_runtime_store(
     state: &Arc<AppState>,
 ) -> Result<Arc<WorkflowRuntimeStore>, (StatusCode, Json<serde_json::Value>)> {
-    state.core.workflow_runtime_store.clone().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "workflow runtime store unavailable" })),
-        )
-    })
+    state
+        .workflow_runtime_store()
+        .cloned()
+        .map_err(|error| error.into_status_json())
 }
 
 fn runtime_state_persistence_error_response(

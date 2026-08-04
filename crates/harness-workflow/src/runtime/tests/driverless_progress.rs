@@ -325,7 +325,7 @@ async fn driverless_progress_instance(
     state: &str,
 ) -> anyhow::Result<WorkflowInstance> {
     let instance = issue_instance(state).with_id(format!("driverless-progress-{id}"));
-    store.upsert_instance(&instance).await?;
+    store.force_upsert_lifecycle_state_for_test(&instance).await?;
     Ok(instance)
 }
 

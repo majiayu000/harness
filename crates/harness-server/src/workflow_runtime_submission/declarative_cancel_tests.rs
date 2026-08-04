@@ -92,7 +92,7 @@ async fn missing_registered_pin_can_use_persisted_definition_for_cancellation() 
         "definition_hash": persisted_version.definition_hash(),
         "prompt_ref": "missing-pin-cancel-prompt",
     }));
-    store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &instance).await?;
 
     let outcome = cancel_submission_by_workflow_id(&store, &instance.id).await?;
     let RuntimeSubmissionCancelOutcome::Cancelled(cancelled) = outcome else {

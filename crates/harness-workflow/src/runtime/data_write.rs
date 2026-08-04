@@ -38,6 +38,35 @@ impl WorkflowDataWrite {
 }
 
 impl WorkflowInstance {
+    /// Row-level provenance invariant: `workflow.data` must be fully covered
+    /// by a sidecar whose digests match the data being persisted.
+    ///
+    /// Every path that writes a workflow row must enforce this, including
+    /// test-only writers that deliberately bypass lifecycle validation. A
+    /// sidecar that disagrees with its own data is a corrupt row, and a
+    /// corrupt row is never what a fixture is trying to construct.
+    pub fn validate_data_provenance(&self) -> anyhow::Result<()> {
+        self.data_provenance
+            .as_ref()
+            .context("workflow.data persistence requires a provenance sidecar")?
+            .validate_persisted_data(&self.data)
+    }
+
+    /// Adopt another instance's workflow data together with the provenance
+    /// sidecar that describes it.
+    ///
+    /// Copying `data` alone leaves this instance carrying a sidecar that
+    /// describes different bytes, which fails closed at persistence. The two
+    /// fields are one value and must move together.
+    pub fn adopt_classified_data_from(&mut self, source: &WorkflowInstance) -> anyhow::Result<()> {
+        source
+            .validate_data_provenance()
+            .context("adopted workflow data must carry a coherent provenance sidecar")?;
+        self.data = source.data.clone();
+        self.data_provenance = source.data_provenance.clone();
+        Ok(())
+    }
+
     /// Fixture builder that seeds workflow data already classified as
     /// server-authored.
     ///

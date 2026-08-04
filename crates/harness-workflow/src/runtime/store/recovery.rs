@@ -3,9 +3,9 @@ use super::runtime_job_state::{
     cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation,
 };
 use super::{
-    apply_inline_command_side_effect, command_store, insert_decision_record_tx, insert_event_tx,
-    select_instance_for_update_tx, upsert_instance_tx, workflow_instance_from_persisted_json,
-    WorkflowInstance, WorkflowRuntimeStore,
+    apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
+    insert_decision_record_tx, insert_event_tx, select_instance_for_update_tx,
+    workflow_instance_from_persisted_json, WorkflowInstance, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
@@ -153,6 +153,7 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(unsupported_stopped_activity(&instance, None));
         }
+        let current = instance.clone();
         let (superseded_command_count, superseded_runtime_job_count) =
             skip_superseded_active_commands_tx(&mut tx, &instance.id).await?;
         let previous_state = instance.state.clone();
@@ -226,7 +227,7 @@ impl WorkflowRuntimeStore {
             &plan.target.state,
             &event.id,
         )?;
-        upsert_instance_tx(&mut tx, &instance).await?;
+        commit_decision_instance_tx(&mut tx, &current, &instance, &decision_record, false).await?;
         tx.commit().await?;
 
         Ok(WorkflowRuntimeRecoveryOutcome::Recovered {

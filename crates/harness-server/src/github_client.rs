@@ -15,9 +15,7 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 /// Empty values fall back to the public API; a trailing slash is trimmed so
 /// callers can append `/repos/...` or `/graphql` directly.
 pub(crate) fn github_api_base_url() -> String {
-    std::env::var("HARNESS_GITHUB_API_BASE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    harness_core::config::process_env::non_blank_config_value("HARNESS_GITHUB_API_BASE_URL")
         .unwrap_or_else(|| "https://api.github.com".to_string())
         .trim_end_matches('/')
         .to_string()

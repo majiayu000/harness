@@ -24,7 +24,9 @@ async fn prompt_continuation_completion_persists_context_and_dedupes_attempt_com
         "prompt_ref": "prompt-ref-store",
         "continuation": PromptContinuationState::initial(&policy),
     }));
-    store.upsert_instance(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let result = ActivityResult::succeeded(
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
         "Created the implementation branch.",
@@ -38,13 +40,8 @@ async fn prompt_continuation_completion_persists_context_and_dedupes_attempt_com
         "runtime_job_id": "attempt-1-job",
         "activity_result": result,
     });
-    let event = WorkflowEvent::new(
-        &instance.id,
-        1,
-        RUNTIME_JOB_COMPLETED_EVENT,
-        "runtime-1",
-    )
-    .with_payload(payload.clone());
+    let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
+        .with_payload(payload.clone());
     let decision = reduce_runtime_job_completed(&instance, &event)?
         .expect("active continuation should produce a decision");
 
@@ -72,12 +69,7 @@ async fn prompt_continuation_completion_persists_context_and_dedupes_attempt_com
         .is_some());
 
     let replay = store
-        .commit_runtime_completion_decision_for_test(
-            &instance.id,
-            "runtime-1",
-            payload,
-            &decision,
-        )
+        .commit_runtime_completion_decision_for_test(&instance.id, "runtime-1", payload, &decision)
         .await?
         .expect("replayed completion should remain idempotent");
     assert!(replay.accepted);
@@ -87,13 +79,16 @@ async fn prompt_continuation_completion_persists_context_and_dedupes_attempt_com
         commands[0].command.dedupe_key,
         "prompt-task:prompt-continuation-store:attempt:2"
     );
-    assert_eq!(commands[0].command.command["prompt_ref"], "prompt-ref-store");
+    assert_eq!(
+        commands[0].command.command["prompt_ref"],
+        "prompt-ref-store"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn settled_prompt_missing_completion_evidence_persists_observed_context(
-) -> anyhow::Result<()> {
+async fn settled_prompt_missing_completion_evidence_persists_observed_context() -> anyhow::Result<()>
+{
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
@@ -117,7 +112,9 @@ async fn settled_prompt_missing_completion_evidence_persists_observed_context(
         "prompt_ref": "prompt-ref-missing-evidence",
         "continuation": PromptContinuationState::initial(&policy),
     }));
-    store.upsert_instance(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let result = ActivityResult::succeeded(
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
         "External work settled without completion evidence.",
@@ -131,24 +128,14 @@ async fn settled_prompt_missing_completion_evidence_persists_observed_context(
         "runtime_job_id": "settled-job",
         "activity_result": result,
     });
-    let event = WorkflowEvent::new(
-        &instance.id,
-        1,
-        RUNTIME_JOB_COMPLETED_EVENT,
-        "runtime-1",
-    )
-    .with_payload(payload.clone());
+    let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
+        .with_payload(payload.clone());
     let decision = reduce_runtime_job_completed(&instance, &event)?
         .expect("settled result without evidence should produce a blocked decision");
 
     assert_eq!(decision.decision, "prompt_completion_evidence_missing");
     let committed = store
-        .commit_runtime_completion_decision_for_test(
-            &instance.id,
-            "runtime-1",
-            payload,
-            &decision,
-        )
+        .commit_runtime_completion_decision_for_test(&instance.id, "runtime-1", payload, &decision)
         .await?
         .expect("blocked completion should commit");
     assert!(committed.accepted);
@@ -159,10 +146,7 @@ async fn settled_prompt_missing_completion_evidence_persists_observed_context(
         .expect("blocked continuation should reload");
     assert_eq!(after.state, "blocked");
     assert_eq!(after.data["continuation"]["attempt"], 1);
-    assert_eq!(
-        after.data["continuation"]["last_external_state"],
-        "Done"
-    );
+    assert_eq!(after.data["continuation"]["last_external_state"], "Done");
     assert_eq!(
         after.data["continuation"]["last_summary"],
         "External work settled without completion evidence."
@@ -186,7 +170,9 @@ async fn single_shot_prompt_missing_completion_evidence_still_commits() -> anyho
     )
     .with_id("prompt-single-shot-missing-evidence")
     .with_server_data(json!({ "prompt_ref": "prompt-ref-single-shot" }));
-    store.upsert_instance(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let result = ActivityResult::succeeded(
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
         "Single-shot work omitted completion evidence.",
@@ -196,24 +182,14 @@ async fn single_shot_prompt_missing_completion_evidence_still_commits() -> anyho
         "runtime_job_id": "single-shot-job",
         "activity_result": result,
     });
-    let event = WorkflowEvent::new(
-        &instance.id,
-        1,
-        RUNTIME_JOB_COMPLETED_EVENT,
-        "runtime-1",
-    )
-    .with_payload(payload.clone());
+    let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
+        .with_payload(payload.clone());
     let decision = reduce_runtime_job_completed(&instance, &event)?
         .expect("single-shot result without evidence should produce a blocked decision");
 
     assert_eq!(decision.decision, "prompt_completion_evidence_missing");
     let committed = store
-        .commit_runtime_completion_decision_for_test(
-            &instance.id,
-            "runtime-1",
-            payload,
-            &decision,
-        )
+        .commit_runtime_completion_decision_for_test(&instance.id, "runtime-1", payload, &decision)
         .await?
         .expect("single-shot blocked completion should commit");
     assert!(committed.accepted);

@@ -1,8 +1,8 @@
+use super::rest_contract::{LegacyJson as Json, LegacyQuery as Query};
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use std::future::Future;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use super::state::AppState;
 
 #[path = "misc_routes_runtime_tree.rs"]
-mod runtime_tree;
+pub(super) mod runtime_tree;
 pub(crate) use runtime_tree::get_workflow_runtime_tree;
 
 #[derive(Debug, serde::Deserialize)]
@@ -56,20 +56,13 @@ where
     }
 }
 
-fn workflow_lookup_store_unavailable(entity: &'static str) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({ "error": format!("{entity} store unavailable") })),
-    )
-        .into_response()
-}
-
 pub(crate) async fn get_issue_workflow_by_issue(
     State(state): State<Arc<AppState>>,
     Query(query): Query<IssueWorkflowByIssueQuery>,
 ) -> Response {
-    let Some(store) = state.core.issue_workflow_store.as_ref() else {
-        return workflow_lookup_store_unavailable("issue workflow");
+    let store = match state.issue_workflow_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
     };
     workflow_lookup_response(
         "issue workflow",
@@ -82,8 +75,9 @@ pub(crate) async fn get_issue_workflow_by_pr(
     State(state): State<Arc<AppState>>,
     Query(query): Query<IssueWorkflowByPrQuery>,
 ) -> Response {
-    let Some(store) = state.core.issue_workflow_store.as_ref() else {
-        return workflow_lookup_store_unavailable("issue workflow");
+    let store = match state.issue_workflow_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
     };
     workflow_lookup_response(
         "issue workflow",
@@ -96,8 +90,9 @@ pub(crate) async fn get_project_workflow_by_project(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ProjectWorkflowByProjectQuery>,
 ) -> Response {
-    let Some(store) = state.core.project_workflow_store.as_ref() else {
-        return workflow_lookup_store_unavailable("project workflow");
+    let store = match state.project_workflow_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
     };
     workflow_lookup_response(
         "project workflow",

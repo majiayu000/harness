@@ -207,7 +207,7 @@ async fn test_runtime_job_command_id(
     id: &str,
 ) -> anyhow::Result<String> {
     let workflow = issue_instance("implementing").with_id(format!("status-test-workflow-{id}"));
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("status_test", format!("status-test-{id}"));
     store.enqueue_command(&workflow.id, None, &command).await
 }

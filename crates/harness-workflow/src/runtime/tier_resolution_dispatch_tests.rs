@@ -29,7 +29,9 @@ async fn tier_resolution_runtime_dispatch_records_isolation_evidence() -> anyhow
         "issue_number": 42,
         "author_trust_class": "non_collaborator",
     }));
-    store.upsert_instance(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
 
     let command = WorkflowCommand::enqueue_activity("implement_issue", "tier-resolution-command");
     let command_id = store.enqueue_command(&instance.id, None, &command).await?;

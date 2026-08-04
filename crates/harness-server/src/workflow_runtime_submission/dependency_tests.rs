@@ -45,7 +45,8 @@ async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> a
         .await?
         .expect("dependency workflow should exist");
     dep_workflow.state = "done".to_string();
-    store.upsert_instance(&dep_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &dep_workflow)
+        .await?;
 
     let task_id = TaskId::from_str("runtime-dependent-handle");
     let blocked = record_issue_submission(
@@ -118,7 +119,8 @@ async fn issue_submission_releases_dependency_by_github_issue_handle_when_canoni
         .await?
         .ok_or_else(|| anyhow::anyhow!("dependency workflow should exist"))?;
     dep_workflow.state = "done".to_string();
-    store.upsert_instance(&dep_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &dep_workflow)
+        .await?;
 
     let github_issue_dep_id = TaskId::from_str("github-issue:owner/repo:issue:78");
     assert!(
@@ -202,7 +204,8 @@ async fn issue_submission_keeps_blocked_runtime_dependency_without_closed_eviden
         .await?
         .expect("dependency workflow should exist");
     dep_workflow.state = "blocked".to_string();
-    store.upsert_instance(&dep_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &dep_workflow)
+        .await?;
 
     let task_id = TaskId::from_str("runtime-dependent-on-blocked-no-evidence");
     record_issue_submission(
@@ -280,7 +283,8 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_persisted_clo
         }),
         harness_workflow::runtime::DataProvenance::Server,
     )?;
-    store.upsert_instance(&dep_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &dep_workflow)
+        .await?;
 
     let task_id = TaskId::from_str("runtime-dependent-on-persisted-closed-evidence");
     let blocked = record_issue_submission(
@@ -355,7 +359,8 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_closed_issue_
         .await?
         .expect("dependency workflow should exist");
     dep_workflow.state = "blocked".to_string();
-    store.upsert_instance(&dep_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &dep_workflow)
+        .await?;
     let activity_result = ActivityResult {
         activity: "implement_issue".to_string(),
         status: ActivityStatus::Blocked,
@@ -502,7 +507,8 @@ async fn dependency_release_rotates_waiting_rows_to_prevent_starvation() -> anyh
         .await?
         .expect("ready dependency workflow should exist");
     ready_dep_workflow.state = "done".to_string();
-    store.upsert_instance(&ready_dep_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &ready_dep_workflow)
+        .await?;
     let ready_task_id = TaskId::from_str("ready-waiting-handle");
     let ready = record_issue_submission(
         &store,

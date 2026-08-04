@@ -1,12 +1,12 @@
+use super::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use super::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    Json,
 };
 use futures::{stream::BoxStream, StreamExt};
 use harness_core::agent::StreamItem;
@@ -22,12 +22,8 @@ pub(crate) async fn stream_runtime_submission_sse(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if state.core.workflow_runtime_store.is_none() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "workflow runtime store unavailable"})),
-        )
-            .into_response();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_submission_sse_stream(state, task_id).await {

@@ -1,11 +1,14 @@
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::state::AppState;
 use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::task_runner::{TaskKind, TaskPhase, TaskState, TaskStatus};
 use crate::workspace::WorkspaceEntry;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -32,12 +35,46 @@ pub struct WorktreeResponse {
     pub project: Option<String>,
 }
 
-pub async fn worktrees(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum WorktreesResponse {
+    Worktrees(Vec<WorktreeResponse>),
+    Error { error: String },
+}
+
+#[cfg(test)]
+mod response_shape_tests {
+    use super::WorktreesResponse;
+
+    #[test]
+    fn worktrees_response_preserves_array_and_error_shapes() -> anyhow::Result<()> {
+        assert_eq!(
+            serde_json::to_value(WorktreesResponse::Worktrees(Vec::new()))?,
+            serde_json::json!([])
+        );
+        assert_eq!(
+            serde_json::to_value(WorktreesResponse::Error {
+                error: "boom".to_string(),
+            })?,
+            serde_json::json!({ "error": "boom" })
+        );
+        Ok(())
+    }
+}
+
+pub async fn worktrees(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<WorktreesResponse>) {
     match list_worktrees(&state).await {
-        Ok(worktrees) => (StatusCode::OK, Json(json!(worktrees))),
+        Ok(worktrees) => (
+            StatusCode::OK,
+            Json(WorktreesResponse::Worktrees(worktrees)),
+        ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error.to_string() })),
+            Json(WorktreesResponse::Error {
+                error: error.to_string(),
+            }),
         ),
     }
 }
@@ -596,25 +633,25 @@ mod tests {
             max_turns: Some(8),
             ..Default::default()
         });
-        workflow_runtime_store
-            .upsert_instance(
-                &harness_workflow::runtime::WorkflowInstance::new(
-                    harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-                    1,
-                    "awaiting_feedback",
-                    harness_workflow::runtime::WorkflowSubject::new("issue", "issue:882"),
-                )
-                .with_id(workflow_id.clone())
-                .with_server_data(json!({
-                    "project_id": project_id,
-                    "repo": "owner/repo",
-                    "issue_number": 882,
-                    "submission_id": "route-submission-1",
-                    "task_id": "route-task-1",
-                    "task_ids": ["route-task-1"]
-                })),
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+            &workflow_runtime_store,
+            &harness_workflow::runtime::WorkflowInstance::new(
+                harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+                1,
+                "awaiting_feedback",
+                harness_workflow::runtime::WorkflowSubject::new("issue", "issue:882"),
             )
-            .await?;
+            .with_id(workflow_id.clone())
+            .with_server_data(json!({
+                "project_id": project_id,
+                "repo": "owner/repo",
+                "issue_number": 882,
+                "submission_id": "route-submission-1",
+                "task_id": "route-task-1",
+                "task_ids": ["route-task-1"]
+            })),
+        )
+        .await?;
         state.core.tasks.insert(&task).await;
         state.concurrency.workspace_mgr = Some(manager);
 
@@ -702,22 +739,22 @@ mod tests {
                 _pool_permit: None,
             },
         );
-        workflow_runtime_store
-            .upsert_instance(
-                &harness_workflow::runtime::WorkflowInstance::new(
-                    harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-                    1,
-                    "awaiting_feedback",
-                    harness_workflow::runtime::WorkflowSubject::new("issue", "issue:884"),
-                )
-                .with_id("workflow-1".to_string())
-                .with_server_data(json!({
-                    "submission_id": "runtime-submission-1",
-                    "task_id": "runtime-workspace-1",
-                    "task_ids": ["runtime-workspace-1"]
-                })),
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+            &workflow_runtime_store,
+            &harness_workflow::runtime::WorkflowInstance::new(
+                harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+                1,
+                "awaiting_feedback",
+                harness_workflow::runtime::WorkflowSubject::new("issue", "issue:884"),
             )
-            .await?;
+            .with_id("workflow-1".to_string())
+            .with_server_data(json!({
+                "submission_id": "runtime-submission-1",
+                "task_id": "runtime-workspace-1",
+                "task_ids": ["runtime-workspace-1"]
+            })),
+        )
+        .await?;
         manager.active_paths.insert(workspace_path, task_id);
         state.concurrency.workspace_mgr = Some(manager);
 

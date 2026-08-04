@@ -55,7 +55,7 @@ async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup
         "repo": "owner/repo",
         "issue_number": 1299,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let task_id = crate::task_runner::TaskId::from_str(&format!(
         "runtime-wf-github-issue-pr-{}",
         stable_hash_8_for_test(&workflow.id)

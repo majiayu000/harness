@@ -478,7 +478,9 @@ mod tests {
                 "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
             }));
         for workflow in [&done, &failed, &stalled] {
-            store.upsert_instance(workflow).await?;
+            store
+                .force_upsert_lifecycle_state_for_test(workflow)
+                .await?;
         }
 
         let metrics = store

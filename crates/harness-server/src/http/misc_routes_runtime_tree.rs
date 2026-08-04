@@ -1,8 +1,8 @@
+use crate::http::rest_contract::{LegacyJson as Json, LegacyQuery as Query};
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 #[cfg(test)]
@@ -68,11 +68,11 @@ impl WorkflowRuntimeTreeDetail {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct WorkflowRuntimeTreeResponse {
-    pub workflows: Vec<WorkflowRuntimeTreeNode>,
-    pub total_workflows: usize,
-    pub pagination: WorkflowRuntimeTreePagination,
-    pub summary: WorkflowRuntimeTreeSummary,
+pub(in crate::http) struct WorkflowRuntimeTreeResponse {
+    workflows: Vec<WorkflowRuntimeTreeNode>,
+    total_workflows: usize,
+    pagination: WorkflowRuntimeTreePagination,
+    summary: WorkflowRuntimeTreeSummary,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -169,12 +169,9 @@ pub(crate) async fn get_workflow_runtime_tree(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WorkflowRuntimeTreeQuery>,
 ) -> Response {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "workflow runtime store unavailable" })),
-        )
-            .into_response();
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
     };
     let limit = query
         .limit

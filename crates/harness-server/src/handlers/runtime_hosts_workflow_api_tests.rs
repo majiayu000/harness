@@ -90,7 +90,7 @@ pub(crate) async fn enqueue_runtime_host_test_job(
         WorkflowSubject::new("issue", format!("issue:{key}")),
     )
     .with_id(format!("runtime-host-test-{key}"));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let activity = input
         .get("activity")
         .and_then(serde_json::Value::as_str)

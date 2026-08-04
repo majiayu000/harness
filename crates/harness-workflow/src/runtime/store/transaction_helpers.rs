@@ -78,7 +78,7 @@ pub(super) async fn load_or_insert_initial_instance_tx(
         return Ok(None);
     }
 
-    if insert_instance_if_absent_tx(tx, initial_instance).await? {
+    if insert_validated_observed_instance_tx(tx, initial_instance).await? {
         return Ok(Some(initial_instance.clone()));
     }
 
@@ -165,7 +165,129 @@ pub(super) async fn insert_event_tx_with_id(
     Ok(event)
 }
 
-pub(super) async fn insert_instance_if_absent_tx(
+pub(super) async fn insert_validated_observed_instance_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<bool> {
+    if instance.version != 0 {
+        anyhow::bail!(
+            "initial workflow instance `{}` must start at version 0, got {}",
+            instance.id,
+            instance.version
+        );
+    }
+    if crate::runtime::workflow_state_definition_for_instance(instance, &instance.state).is_none()
+        && !persisted_declarative_state_exists_tx(tx, instance).await?
+    {
+        anyhow::bail!(
+            "initial workflow instance `{}` uses unknown state `{}` for definition `{}` version {}",
+            instance.id,
+            instance.state,
+            instance.definition_id,
+            instance.definition_version
+        );
+    }
+    insert_instance_row_if_absent_tx(tx, instance).await
+}
+
+pub(super) async fn insert_validated_canonical_initial_instance_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<bool> {
+    if instance.version != 0 {
+        anyhow::bail!(
+            "initial workflow instance `{}` must start at version 0, got {}",
+            instance.id,
+            instance.version
+        );
+    }
+    let expected_state = match instance.definition_id.as_str() {
+        crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID => Some("discovered".to_string()),
+        crate::runtime::PROMPT_TASK_DEFINITION_ID => Some("submitted".to_string()),
+        crate::runtime::QUALITY_GATE_DEFINITION_ID => Some("pending".to_string()),
+        crate::runtime::PR_FEEDBACK_DEFINITION_ID => Some("pending".to_string()),
+        _ => persisted_declarative_initial_state_tx(tx, instance).await?,
+    };
+    let Some(expected_state) = expected_state else {
+        anyhow::bail!(
+            "workflow instance `{}` has no canonical initial state for definition `{}` version {}",
+            instance.id,
+            instance.definition_id,
+            instance.definition_version
+        );
+    };
+    if instance.state != expected_state {
+        anyhow::bail!(
+            "workflow instance `{}` must use canonical initial state `{}` for definition `{}` version {}, got `{}`",
+            instance.id,
+            expected_state,
+            instance.definition_id,
+            instance.definition_version,
+            instance.state
+        );
+    }
+    insert_instance_row_if_absent_tx(tx, instance).await
+}
+
+async fn persisted_declarative_state_exists_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<bool> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT data::text
+         FROM workflow_definitions
+         WHERE id = $1 AND version = $2
+         FOR SHARE",
+    )
+    .bind(&instance.definition_id)
+    .bind(instance.definition_version as i64)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((data,)) = row else {
+        return Ok(false);
+    };
+    let definition = serde_json::from_str::<crate::runtime::WorkflowDefinition>(&data)?;
+    let instance_hash = instance.data.get("definition_hash").and_then(Value::as_str);
+    if instance_hash != Some(definition.definition_hash.as_str()) {
+        return Ok(false);
+    }
+    let definition =
+        crate::runtime::declarative_pinning::hydrate_persisted_declarative_definition(&definition)?;
+    Ok(definition
+        .registered()
+        .states
+        .iter()
+        .any(|state| state.key.state.as_ref() == instance.state))
+}
+
+async fn persisted_declarative_initial_state_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT data::text
+         FROM workflow_definitions
+         WHERE id = $1 AND version = $2
+         FOR SHARE",
+    )
+    .bind(&instance.definition_id)
+    .bind(instance.definition_version as i64)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((data,)) = row else {
+        return Ok(None);
+    };
+    let definition = serde_json::from_str::<crate::runtime::WorkflowDefinition>(&data)?;
+    let instance_hash = instance.data.get("definition_hash").and_then(Value::as_str);
+    if instance_hash != Some(definition.definition_hash.as_str()) {
+        return Ok(None);
+    }
+    let definition =
+        crate::runtime::declarative_pinning::hydrate_persisted_declarative_definition(&definition)?;
+    Ok(Some(definition.policy().initial.clone()))
+}
+
+async fn insert_instance_row_if_absent_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<bool> {
@@ -190,7 +312,189 @@ pub(super) async fn insert_instance_if_absent_tx(
     Ok(result.rows_affected() == 1)
 }
 
-pub(super) async fn upsert_instance_tx(
+pub(super) async fn commit_same_state_instance_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    current: &WorkflowInstance,
+    target: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    ensure_instance_identity_fields_match(current, target)?;
+    if current.state != target.state {
+        anyhow::bail!(
+            "same-state workflow write cannot change state from `{}` to `{}`",
+            current.state,
+            target.state
+        );
+    }
+    if current.parent_workflow_id != target.parent_workflow_id {
+        anyhow::bail!("same-state workflow write cannot change parent_workflow_id");
+    }
+    if current.lease != target.lease {
+        anyhow::bail!("same-state workflow write cannot change lease");
+    }
+    require_next_instance_version(current, target)?;
+    upsert_instance_row_tx(tx, target).await
+}
+
+pub(super) async fn commit_parent_attachment_instance_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    current: &WorkflowInstance,
+    target: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    ensure_instance_identity_fields_match(current, target)?;
+    if current.state != target.state || current.data != target.data || current.lease != target.lease
+    {
+        anyhow::bail!("parent attachment write changed fields outside parent_workflow_id");
+    }
+    if current.parent_workflow_id.is_some() || target.parent_workflow_id.is_none() {
+        anyhow::bail!(
+            "parent attachment write requires a missing current parent and a target parent"
+        );
+    }
+    require_next_instance_version(current, target)?;
+    upsert_instance_row_tx(tx, target).await
+}
+
+pub(super) async fn commit_decision_instance_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    current: &WorkflowInstance,
+    target: &WorkflowInstance,
+    record: &WorkflowDecisionRecord,
+    allow_idempotent_replay: bool,
+) -> anyhow::Result<()> {
+    if !record.accepted {
+        anyhow::bail!(
+            "workflow decision `{}` is rejected and cannot authorize an instance write",
+            record.id
+        );
+    }
+    if record.workflow_id != current.id
+        || target.id != current.id
+        || record.decision.workflow_id != current.id
+    {
+        anyhow::bail!("workflow decision instance write identifiers do not match");
+    }
+    if target == current {
+        if allow_idempotent_replay && current.state == record.decision.next_state {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "workflow decision `{}` cannot authorize a no-op instance write",
+            record.decision.decision
+        );
+    }
+    if current.state != record.decision.observed_state {
+        anyhow::bail!(
+            "workflow decision `{}` observed `{}` but current state is `{}`",
+            record.decision.decision,
+            record.decision.observed_state,
+            current.state
+        );
+    }
+    if target.state != record.decision.next_state {
+        anyhow::bail!(
+            "workflow decision `{}` authorizes `{}` but target state is `{}`",
+            record.decision.decision,
+            record.decision.next_state,
+            target.state
+        );
+    }
+    ensure_instance_identity_fields_match(current, target)?;
+    if current.parent_workflow_id != target.parent_workflow_id {
+        anyhow::bail!("workflow decision instance write cannot change parent_workflow_id");
+    }
+    if current.lease != target.lease && target.lease.is_some() {
+        anyhow::bail!("workflow decision instance write can only preserve or release its lease");
+    }
+    require_next_instance_version(current, target)?;
+    upsert_instance_row_tx(tx, target).await
+}
+
+pub(super) async fn commit_rejected_initial_failure_instance_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    current: &WorkflowInstance,
+    target: &WorkflowInstance,
+    record: &WorkflowDecisionRecord,
+) -> anyhow::Result<()> {
+    if record.accepted
+        || record.workflow_id != current.id
+        || target.id != current.id
+        || record.decision.workflow_id != current.id
+    {
+        anyhow::bail!("rejected initial failure instance write is not linked to its decision");
+    }
+    if current.state != record.decision.observed_state {
+        anyhow::bail!(
+            "rejected initial failure decision observed `{}` but current state is `{}`",
+            record.decision.observed_state,
+            current.state
+        );
+    }
+    if current.version != 0
+        || target.terminal_state() != Some(crate::runtime::WorkflowTerminalState::Failed)
+    {
+        anyhow::bail!(
+            "rejected initial failure write requires a version-0 instance and failed target"
+        );
+    }
+    ensure_instance_identity_fields_match(current, target)?;
+    if current.parent_workflow_id != target.parent_workflow_id || current.lease != target.lease {
+        anyhow::bail!("rejected initial failure write changed protected instance fields");
+    }
+    require_next_instance_version(current, target)?;
+    upsert_instance_row_tx(tx, target).await
+}
+
+fn ensure_instance_identity_fields_match(
+    current: &WorkflowInstance,
+    target: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    let mut changed_fields = Vec::new();
+    if current.id != target.id {
+        changed_fields.push("id");
+    }
+    if current.definition_id != target.definition_id {
+        changed_fields.push("definition_id");
+    }
+    if current.definition_version != target.definition_version {
+        changed_fields.push("definition_version");
+    }
+    if current.subject != target.subject {
+        changed_fields.push("subject");
+    }
+    if current.created_at != target.created_at {
+        changed_fields.push("created_at");
+    }
+    if !changed_fields.is_empty() {
+        anyhow::bail!(
+            "workflow instance write changes identity fields: {}",
+            changed_fields.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn require_next_instance_version(
+    current: &WorkflowInstance,
+    target: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    let expected = current.version.checked_add(1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "workflow instance `{}` version cannot advance beyond {}",
+            current.id,
+            current.version
+        )
+    })?;
+    if target.version != expected {
+        anyhow::bail!(
+            "workflow instance `{}` target version {} must equal next version {expected}",
+            current.id,
+            target.version
+        );
+    }
+    Ok(())
+}
+
+async fn upsert_instance_row_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<()> {
@@ -221,6 +525,47 @@ pub(super) async fn upsert_instance_tx(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// Fixture-only writer for a workflow row the public API refuses to produce.
+///
+/// The public `upsert_instance` is insert-only (GH-1784): it cannot move an
+/// existing row to another state or version, so a fixture that needs a
+/// mid-lifecycle row has no validated path to it. This writer exists for
+/// exactly that case.
+///
+/// It bypasses **only** the GH-1784 lifecycle rules — the canonical initial
+/// instance check, the instance-boundary preservation check, and the
+/// insert-only version rule. It does **not** bypass the GH-1771 row-level
+/// provenance invariant: the instance's `workflow.data` must still be fully
+/// covered by a provenance sidecar whose digests match the data being
+/// written. Lifecycle state is what a fixture may fabricate; a sidecar that
+/// lies about its own data is a corrupt row no test needs.
+///
+/// Reach for a classified write API first. Use this only when the row's
+/// *lifecycle position* is what the fixture is constructing.
+#[cfg(test)]
+pub(super) async fn force_upsert_lifecycle_state_for_test_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    super::validate_instance_for_persistence(instance)?;
+    upsert_instance_row_tx(tx, instance).await
+}
+
+#[cfg(test)]
+impl WorkflowRuntimeStore {
+    /// See [`force_upsert_lifecycle_state_for_test_tx`] for what this does and
+    /// does not bypass.
+    pub(crate) async fn force_upsert_lifecycle_state_for_test(
+        &self,
+        instance: &WorkflowInstance,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        force_upsert_lifecycle_state_for_test_tx(&mut tx, instance).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 pub(super) fn apply_inline_command_side_effect(
@@ -280,4 +625,92 @@ fn apply_mark_done_side_effect(
         closed_issue_evidence,
         crate::runtime::DataProvenance::Agent,
     )
+}
+
+#[cfg(test)]
+mod bypass_guardrail_tests {
+    use super::*;
+    use crate::runtime::{DataProvenance, WorkflowSubject};
+    use harness_core::db::resolve_database_url;
+    use serde_json::json;
+
+    fn instance(id: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            "prompt_task",
+            1,
+            "implementing",
+            WorkflowSubject::new("prompt", "task"),
+        )
+        .with_id(id)
+    }
+
+    /// The fixture-only lifecycle writer must keep enforcing the row-level
+    /// provenance invariant.
+    ///
+    /// Without this test, a future change that routes fixtures back through a
+    /// raw bypass would silently strip provenance coverage from every test
+    /// that uses it, and nothing would fail. This pins the one behavior the
+    /// bypass is not allowed to skip.
+    #[tokio::test]
+    async fn lifecycle_bypass_still_rejects_unclassified_and_tampered_data() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+
+        // A lifecycle position the insert-only public API cannot produce is
+        // exactly what the bypass is for, and it is accepted when classified.
+        let mut classified = instance("bypass-classified");
+        classified.state = "awaiting_feedback".to_string();
+        classified.version = 7;
+        classified.replace_classified_data(json!({"marker": "ok"}), DataProvenance::Server);
+        store
+            .force_upsert_lifecycle_state_for_test(&classified)
+            .await?;
+
+        // Unclassified data must still fail closed through the bypass.
+        let mut unclassified = instance("bypass-unclassified");
+        unclassified.data = json!({"historical_summary": "never classified"});
+        let error = store
+            .force_upsert_lifecycle_state_for_test(&unclassified)
+            .await
+            .expect_err("the lifecycle bypass must not accept unclassified workflow data");
+        assert!(
+            error
+                .to_string()
+                .contains("unclassified workflow.data field"),
+            "unexpected error: {error}"
+        );
+
+        // A sidecar that disagrees with its own data must also fail closed.
+        let mut tampered = instance("bypass-tampered");
+        tampered
+            .replace_classified_data(json!({"server_fact": "verified"}), DataProvenance::Server);
+        tampered.data["server_fact"] = json!("tampered");
+        let error = store
+            .force_upsert_lifecycle_state_for_test(&tampered)
+            .await
+            .expect_err("the lifecycle bypass must not accept a sidecar that lies about its data");
+        assert!(
+            error
+                .to_string()
+                .contains("changed outside the classified write API"),
+            "unexpected error: {error}"
+        );
+
+        // A missing sidecar is not a legacy boundary: only rows loaded from
+        // durable storage can be grandfathered.
+        let mut sidecarless = instance("bypass-sidecarless");
+        sidecarless.data_provenance = None;
+        let error = store
+            .force_upsert_lifecycle_state_for_test(&sidecarless)
+            .await
+            .expect_err("the lifecycle bypass must not accept a missing provenance sidecar");
+        assert!(
+            error.to_string().contains("requires a provenance sidecar"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
 }

@@ -47,7 +47,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         }),
         harness_workflow::runtime::DataProvenance::Server,
     );
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -288,7 +288,7 @@ async fn runtime_job_worker_cleans_on_terminal_workspace_after_failed_runtime_at
         }),
         harness_workflow::runtime::DataProvenance::Server,
     );
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
         "implement_issue",
         "impl-1299",
@@ -383,7 +383,7 @@ async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyh
         }),
         harness_workflow::runtime::DataProvenance::Server,
     );
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-125");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;

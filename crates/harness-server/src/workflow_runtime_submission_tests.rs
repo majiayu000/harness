@@ -237,24 +237,24 @@ async fn prompt_resubmission_removes_previous_cached_prompt() -> anyhow::Result<
     let old_prompt_ref = "prompt-memory:test-resubmit-old";
     cache_prompt_submission_prompt(old_prompt_ref, "old sensitive prompt body");
     let workflow_id = prompt_workflow_id(&project_id, Some(external_id), &task_id);
-    store
-        .upsert_instance(
-            &WorkflowInstance::new(
-                PROMPT_TASK_DEFINITION_ID,
-                1,
-                "blocked",
-                WorkflowSubject::new("prompt", external_id),
-            )
-            .with_id(workflow_id)
-            .with_server_data(json!({
-                "project_id": project_id,
-                "task_id": "old-prompt-task",
-                "prompt_ref": old_prompt_ref,
-                "source": "dashboard",
-                "external_id": external_id,
-            })),
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &store,
+        &WorkflowInstance::new(
+            PROMPT_TASK_DEFINITION_ID,
+            1,
+            "blocked",
+            WorkflowSubject::new("prompt", external_id),
         )
-        .await?;
+        .with_id(workflow_id)
+        .with_server_data(json!({
+            "project_id": project_id,
+            "task_id": "old-prompt-task",
+            "prompt_ref": old_prompt_ref,
+            "source": "dashboard",
+            "external_id": external_id,
+        })),
+    )
+    .await?;
 
     let result = record_prompt_submission(
         &store,
@@ -678,7 +678,7 @@ async fn rejected_issue_submission_keeps_existing_runtime_data() -> anyhow::Resu
         harness_workflow::runtime::DataProvenance::Server,
     );
     let original_data = existing.data.clone();
-    store.upsert_instance(&existing).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &existing).await?;
 
     let task_id = TaskId::from_str("new-task");
     let labels = vec!["bug".to_string()];

@@ -212,7 +212,9 @@ mod tests {
             "repo": "owner/repo",
             "issue_number": 1170,
         }));
-        store.upsert_instance(&workflow).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&workflow)
+            .await?;
 
         for activity in ["implement_issue", "inspect_pr_feedback"] {
             let command = WorkflowCommand::enqueue_activity(activity, activity);

@@ -1,5 +1,6 @@
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::AppState;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use harness_core::types::EventFilters;
 use harness_observe::{quality::QualityGrader, stats};
 use serde_json::{json, Value};
@@ -343,12 +344,8 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
-        store
-            .upsert_instance(&runtime_workflow(
-                "implementing",
-                &project_root,
-                "runtime-dashboard-active",
-            ))
+        let workflow = runtime_workflow("implementing", &project_root, "runtime-dashboard-active");
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
             .await?;
 
         let body = dashboard_body(state).await?;
@@ -375,12 +372,8 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
-        store
-            .upsert_instance(&runtime_workflow(
-                "done",
-                &project_root,
-                "runtime-dashboard-terminal",
-            ))
+        let workflow = runtime_workflow("done", &project_root, "runtime-dashboard-terminal");
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
             .await?;
 
         let body = dashboard_body(state).await?;
@@ -409,15 +402,13 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
-        store
-            .upsert_instance(
-                &runtime_workflow("failed", &project_root, "dashboard-stalled-task")
-                    .with_server_data(serde_json::json!({
-                        "project_id": project_root,
-                        "task_id": "dashboard-stalled-task",
-                        "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
-                    })),
-            )
+        let workflow = runtime_workflow("failed", &project_root, "dashboard-stalled-task")
+            .with_server_data(serde_json::json!({
+                "project_id": project_root,
+                "task_id": "dashboard-stalled-task",
+                "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
+            }));
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
             .await?;
 
         let body = dashboard_body(state).await?;
@@ -452,12 +443,8 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
-        store
-            .upsert_instance(&runtime_workflow(
-                "implementing",
-                &project_root,
-                task_id.as_str(),
-            ))
+        let workflow = runtime_workflow("implementing", &project_root, task_id.as_str());
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
             .await?;
 
         let body = dashboard_body(state).await?;

@@ -127,6 +127,15 @@ pub(super) async fn apply_decision(
         })
         .await?
         .ok_or_else(|| submission_commit_conflict(&instance.id))?;
+    if !outcome.record.accepted {
+        return Ok(WorkflowSubmissionRuntimeRecord {
+            workflow_id: instance.id,
+            accepted: false,
+            decision_id: outcome.record.id,
+            command_ids: Vec::new(),
+            rejection_reason: outcome.record.rejection_reason,
+        });
+    }
     Ok(WorkflowSubmissionRuntimeRecord {
         workflow_id: instance.id,
         accepted: true,
@@ -258,6 +267,15 @@ pub(super) async fn apply_prompt_decision(
         })
         .await?
         .ok_or_else(|| submission_commit_conflict(&instance.id))?;
+    if !outcome.record.accepted {
+        return Ok(WorkflowSubmissionRuntimeRecord {
+            workflow_id: instance.id,
+            accepted: false,
+            decision_id: outcome.record.id,
+            command_ids: Vec::new(),
+            rejection_reason: outcome.record.rejection_reason,
+        });
+    }
     if prompt_payload_commits {
         cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
         remove_prompt_submission_prompt(previous_prompt_ref_to_remove);

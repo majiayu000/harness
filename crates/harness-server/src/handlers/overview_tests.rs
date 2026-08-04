@@ -299,7 +299,7 @@ async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::
         "task_id": "overview-stalled-task",
         "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     let app = Router::new()
         .route("/api/overview", get(overview))

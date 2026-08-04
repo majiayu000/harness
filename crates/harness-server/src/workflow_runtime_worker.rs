@@ -52,6 +52,24 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(test)]
+pub(crate) async fn execute_start_prompt_task_child_workflow_for_test(
+    state: &Arc<AppState>,
+    job: &RuntimeJob,
+    parent: Option<&WorkflowInstance>,
+    command: &Value,
+    subject_key: &str,
+) -> anyhow::Result<ActivityResult> {
+    child_workflow_non_issue::execute_start_prompt_task_child_workflow(
+        state,
+        job,
+        parent,
+        command,
+        subject_key,
+    )
+    .await
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RuntimeJobWorkerTick {
     pub succeeded: usize,

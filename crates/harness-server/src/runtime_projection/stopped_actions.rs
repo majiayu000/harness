@@ -429,7 +429,8 @@ mod tests {
                 "error_kind": "timeout",
                 "last_stop": { "state": state, "activity": "implement_issue" },
             }));
-            store.upsert_instance(&workflow).await?;
+            crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+                .await?;
             let command = WorkflowCommand::new(
                 WorkflowCommandType::EnqueueActivity,
                 format!("{id}-source"),
@@ -451,7 +452,8 @@ mod tests {
                 last_stop,
                 harness_workflow::runtime::DataProvenance::Server,
             )?;
-            store.upsert_instance(&workflow).await?;
+            crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+                .await?;
             workflows.push(workflow);
         }
 

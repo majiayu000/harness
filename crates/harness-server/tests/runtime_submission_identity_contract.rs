@@ -56,7 +56,7 @@ async fn runtime_store_resolves_legacy_submission_aliases() -> anyhow::Result<()
     let workflow = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
-        "implementing",
+        "discovered",
         WorkflowSubject::new("issue", "issue:1127"),
     )
     .with_id("identity-contract-workflow")
@@ -100,7 +100,7 @@ async fn runtime_store_uses_explicit_submission_id_as_public_handle() -> anyhow:
     let workflow = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
-        "implementing",
+        "discovered",
         WorkflowSubject::new("issue", "issue:1129"),
     )
     .with_id("explicit-submission-workflow")
