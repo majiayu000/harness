@@ -2,7 +2,7 @@ use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
     build_issue_submission_decision, build_prompt_submission_decision,
     candidate_fanout_from_policy, candidate_fanout_from_value, continuation_value,
-    prompt_continuation_state_from_data, CandidateFanoutRequest, DecisionValidator,
+    prompt_continuation_state_from_data, CandidateFanoutRequest, DataProvenance, DecisionValidator,
     IssueSubmissionDecisionInput, PromptContinuationPolicy, PromptSubmissionDecisionInput,
     SubmissionMode, ValidationContext, WorkflowCommandStatus, WorkflowDecision,
     WorkflowDecisionTransition, WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
@@ -322,10 +322,13 @@ async fn commit_runtime_decision_with_validator(
     let mut final_instance = instance.clone();
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = merge_last_decision(
-        accepted_data.unwrap_or_else(|| instance.data.clone()),
-        &decision.decision,
-    );
+    classify_submission_data(
+        &mut final_instance,
+        merge_last_decision(
+            accepted_data.unwrap_or_else(|| instance.data.clone()),
+            &decision.decision,
+        ),
+    )?;
     let record = store
         .apply_decision_transition_with_validator(
             WorkflowDecisionTransition {
@@ -409,11 +412,14 @@ fn issue_instance(
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id)
-    .with_data(json!({
-        "project_id": project_id,
-        "repo": repo,
-        "issue_number": issue_number,
-    }))
+    .with_classified_data(
+        json!({
+            "project_id": project_id,
+            "repo": repo,
+            "issue_number": issue_number,
+        }),
+        DataProvenance::Server,
+    )
 }
 
 fn prompt_instance(
@@ -428,9 +434,61 @@ fn prompt_instance(
         WorkflowSubject::new("prompt", subject_key),
     )
     .with_id(workflow_id)
-    .with_data(json!({
-        "project_id": project_id,
-    }))
+    .with_classified_data(json!({ "project_id": project_id }), DataProvenance::Server)
+}
+
+/// Build an updated `workflow.data` document as a plain value.
+///
+/// These stage a document; they do not persist one. Classification happens at
+/// the single commit point, where `classify_submission_data` assigns every
+/// field its provenance before the transition is written. Keeping the staging
+/// step provenance-free means there is exactly one place that decides what a
+/// submission field's origin is.
+pub(super) fn set_data_bool(
+    mut data: serde_json::Value,
+    key: &str,
+    value: bool,
+) -> serde_json::Value {
+    if let Some(object) = data.as_object_mut() {
+        object.insert(key.to_string(), json!(value));
+    }
+    data
+}
+
+/// See [`set_data_bool`].
+pub(super) fn set_data_string(
+    mut data: serde_json::Value,
+    key: &str,
+    value: &str,
+) -> serde_json::Value {
+    if let Some(object) = data.as_object_mut() {
+        object.insert(key.to_string(), json!(value));
+    }
+    data
+}
+
+pub(super) fn classify_submission_data(
+    instance: &mut WorkflowInstance,
+    data: serde_json::Value,
+) -> anyhow::Result<()> {
+    instance.replace_data_with_field_provenance(data, submission_field_provenance)
+}
+
+pub(super) fn submission_field_provenance(field: &str) -> DataProvenance {
+    match field {
+        "additional_prompt"
+        | "depends_on"
+        | "continuation"
+        | "external_id"
+        | "labels"
+        | "last_external_state"
+        | "required_depends_on"
+        | "serialization_depends_on"
+        | "source"
+        | "tracker_external_id" => DataProvenance::External,
+        "review_summary" | "summary" => DataProvenance::Agent,
+        _ => DataProvenance::Server,
+    }
 }
 
 pub(crate) fn prompt_workflow_id(
@@ -726,20 +784,6 @@ fn string_array_field(data: &serde_json::Value, field: &str) -> anyhow::Result<V
             })
         })
         .collect()
-}
-
-fn set_data_bool(mut data: serde_json::Value, key: &str, value: bool) -> serde_json::Value {
-    if let Some(object) = data.as_object_mut() {
-        object.insert(key.to_string(), json!(value));
-    }
-    data
-}
-
-fn set_data_string(mut data: serde_json::Value, key: &str, value: &str) -> serde_json::Value {
-    if let Some(object) = data.as_object_mut() {
-        object.insert(key.to_string(), json!(value));
-    }
-    data
 }
 
 #[cfg(test)]

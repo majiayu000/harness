@@ -14,7 +14,7 @@ fn workflow(state: &str, data: Value) -> WorkflowInstance {
         state,
         WorkflowSubject::new("issue", "issue:1"),
     )
-    .with_data(data)
+    .with_server_data(data)
 }
 
 fn github_fetch_failure(id: &str, issue: u64, failed_at: &str) -> RecentFailureTask {
@@ -826,7 +826,7 @@ async fn store_workflow(
     store: &WorkflowRuntimeStore,
     workflow: WorkflowInstance,
 ) -> anyhow::Result<WorkflowInstance> {
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(workflow)
 }
 
@@ -838,7 +838,7 @@ async fn store_stopped_workflow_with_source(
     command: WorkflowCommand,
 ) -> anyhow::Result<WorkflowInstance> {
     let workflow = workflow(state, data).with_id(workflow_id.to_string());
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let workflow = attach_recovery_source_job(store, workflow, command).await?;
     Ok(workflow)
 }
@@ -857,8 +857,8 @@ async fn store_quality_gate_workflow(
         WorkflowSubject::new("quality_gate", workflow_id),
     )
     .with_id(workflow_id.to_string())
-    .with_data(data);
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    .with_server_data(data);
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     attach_recovery_source_job(store, workflow, command).await
 }
 
@@ -876,8 +876,14 @@ async fn attach_recovery_source_job(
             command.command.clone(),
         )
         .await?;
-    workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    let mut last_stop = workflow.data["last_stop"].clone();
+    last_stop["runtime_job_id"] = json!(job.id);
+    workflow.set_data_field(
+        "last_stop",
+        last_stop,
+        harness_workflow::runtime::DataProvenance::Server,
+    )?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(workflow)
 }
 
@@ -906,7 +912,7 @@ async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> an
         )
         .await?,
     );
-    crate::test_helpers::force_upsert_runtime_instance_for_test(
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &workflow_runtime_store,
         &WorkflowInstance::new(
             QUALITY_GATE_DEFINITION_ID,
@@ -915,7 +921,7 @@ async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> an
             WorkflowSubject::new("quality_gate", "quality_gate:1"),
         )
         .with_id("quality-gate-failed".to_string())
-        .with_data(json!({
+        .with_server_data(json!({
             "source": "quality_gate",
             "repo": "owner/repo",
         })),
@@ -964,7 +970,7 @@ async fn endpoint_includes_config_enabled_stuck_workflows() -> anyhow::Result<()
         )
         .await?,
     );
-    crate::test_helpers::force_upsert_runtime_instance_for_test(
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &workflow_runtime_store,
         &workflow(
             "awaiting_feedback",
@@ -1122,7 +1128,7 @@ fn declarative_command_driven_state_counts_as_running() {
         "working",
         WorkflowSubject::new("issue", "issue:declarative-running"),
     )
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
 
     let counts = runtime_workflow_counts(&[workflow]);
 
@@ -1144,7 +1150,7 @@ fn workflow_sample_truncation_preserves_declarative_failed_terminal() {
         WorkflowSubject::new("issue", "issue:declarative-failed"),
     )
     .with_id("declarative-failed")
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     let mut active = WorkflowInstance::new(
         DECLARATIVE_VISIBILITY_DEFINITION_ID,
         definition.definition_version(),
@@ -1152,7 +1158,7 @@ fn workflow_sample_truncation_preserves_declarative_failed_terminal() {
         WorkflowSubject::new("issue", "issue:declarative-active"),
     )
     .with_id("declarative-active")
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     active.updated_at = failed.updated_at + chrono::Duration::seconds(1);
     let mut workflows = vec![active, failed];
 
@@ -1176,7 +1182,7 @@ fn declarative_failed_terminal_populates_failure_and_action_surfaces() {
         WorkflowSubject::new("issue", "issue:declarative-rejected"),
     )
     .with_id("declarative-rejected")
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": definition.definition_hash(),
         "failure_reason": "declarative review rejected"
     }));
@@ -1204,7 +1210,7 @@ fn declarative_operator_gate_uses_registry_progress_for_action_kind() {
         WorkflowSubject::new("issue", "issue:manual-review"),
     )
     .with_id("declarative-manual-review")
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
 
     let actions = operator_actions(&[gate], Utc::now(), &std::collections::HashMap::new());
     assert_eq!(actions.len(), 1);
@@ -1224,7 +1230,7 @@ fn declarative_operator_gate_counts_as_blocked_activity() {
         "manual_review",
         WorkflowSubject::new("issue", "issue:manual-review-counts"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": definition.definition_hash(),
         "source": "github"
     }));
@@ -1257,7 +1263,7 @@ async fn declarative_operator_gate_sampling_uses_registry_progress() -> anyhow::
         Some(&test_helpers::test_database_url()?),
     )
     .await?;
-    crate::test_helpers::force_upsert_runtime_instance_for_test(
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &store,
         &WorkflowInstance::new(
             DECLARATIVE_VISIBILITY_DEFINITION_ID,
@@ -1266,7 +1272,7 @@ async fn declarative_operator_gate_sampling_uses_registry_progress() -> anyhow::
             WorkflowSubject::new("issue", "issue:manual-review-sample"),
         )
         .with_id("declarative-manual-review-sample")
-        .with_data(json!({ "definition_hash": definition.definition_hash() })),
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() })),
     )
     .await?;
 
@@ -1296,7 +1302,7 @@ async fn declarative_definition_instances_are_visible_in_operator_monitor() -> a
     )
     .await?;
 
-    crate::test_helpers::force_upsert_runtime_instance_for_test(
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &store,
         &WorkflowInstance::new(
             DECLARATIVE_VISIBILITY_DEFINITION_ID,
@@ -1305,7 +1311,7 @@ async fn declarative_definition_instances_are_visible_in_operator_monitor() -> a
             WorkflowSubject::new("issue", "issue:9001"),
         )
         .with_id("declarative-blocked".to_string())
-        .with_data(json!({ "repo": "owner/repo", "blocked_reason": "operator gate" })),
+        .with_server_data(json!({ "repo": "owner/repo", "blocked_reason": "operator gate" })),
     )
     .await?;
 
@@ -1347,7 +1353,7 @@ async fn declarative_terminal_queries_use_pinned_versions_and_outcomes() -> anyh
         ("current-failure", &current, "rejected"),
         ("current-active", &current, "working"),
     ] {
-        crate::test_helpers::force_upsert_runtime_instance_for_test(
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
             &store,
             &WorkflowInstance::new(
                 DECLARATIVE_VISIBILITY_DEFINITION_ID,
@@ -1356,7 +1362,7 @@ async fn declarative_terminal_queries_use_pinned_versions_and_outcomes() -> anyh
                 WorkflowSubject::new("issue", format!("issue:{id}")),
             )
             .with_id(id.to_string())
-            .with_data(json!({ "definition_hash": definition.definition_hash() })),
+            .with_server_data(json!({ "definition_hash": definition.definition_hash() })),
         )
         .await?;
     }
@@ -1398,7 +1404,7 @@ async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result
         Some(&test_helpers::test_database_url()?),
     )
     .await?;
-    crate::test_helpers::force_upsert_runtime_instance_for_test(
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &workflow_runtime_store,
         &WorkflowInstance::new(
             QUALITY_GATE_DEFINITION_ID,
@@ -1409,7 +1415,7 @@ async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result
         .with_id("old-failed".to_string()),
     )
     .await?;
-    crate::test_helpers::force_upsert_runtime_instance_for_test(
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &workflow_runtime_store,
         &WorkflowInstance::new(
             QUALITY_GATE_DEFINITION_ID,
@@ -1459,8 +1465,11 @@ async fn operator_action_age_uses_store_updated_at() -> anyhow::Result<()> {
     )
     .with_id("ready-store-age".to_string());
     ready.updated_at = Utc::now() - chrono::Duration::days(2);
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&workflow_runtime_store, &ready)
-        .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &workflow_runtime_store,
+        &ready,
+    )
+    .await?;
     sqlx::query("UPDATE workflow_instances SET updated_at = NOW() WHERE id = $1")
         .bind("ready-store-age")
         .execute(workflow_runtime_store.pool())
@@ -1491,7 +1500,7 @@ async fn runtime_workflow_sampling_fetches_action_states_before_definition_cap(
         Some(&test_helpers::test_database_url()?),
     )
     .await?;
-    crate::test_helpers::force_upsert_runtime_instance_for_test(
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &workflow_runtime_store,
         &workflow(
             "ready_to_merge",
@@ -1505,7 +1514,7 @@ async fn runtime_workflow_sampling_fetches_action_states_before_definition_cap(
     )
     .await?;
     for index in 0..500 {
-        crate::test_helpers::force_upsert_runtime_instance_for_test(
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
             &workflow_runtime_store,
             &workflow("checking", json!({ "source": "github" }))
                 .with_id(format!("checking-{index}")),

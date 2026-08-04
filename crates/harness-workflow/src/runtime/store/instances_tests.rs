@@ -122,12 +122,12 @@ async fn public_upsert_rejects_same_version_data_overwrite() -> anyhow::Result<(
         return Ok(());
     };
     let initial = discovered_instance("public-upsert-same-version-data")
-        .with_data(serde_json::json!({"generation": 1}));
+        .with_server_data(serde_json::json!({"generation": 1}));
     store.upsert_instance(&initial).await?;
 
     let target = initial
         .clone()
-        .with_data(serde_json::json!({"generation": 2}));
+        .with_server_data(serde_json::json!({"generation": 2}));
     let error = store
         .upsert_instance(&target)
         .await

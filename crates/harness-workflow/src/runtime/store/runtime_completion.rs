@@ -20,7 +20,7 @@ use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::{
     ValidationContext, WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
 };
-use anyhow::Context;
+use crate::runtime::{DataProvenance, WorkflowDataWrite};
 use serde_json::{json, Value};
 
 pub(super) fn validator_for_instance(
@@ -415,19 +415,27 @@ fn apply_runtime_completion_data_side_effect(
             .map(ToOwned::to_owned)
     });
     if !instance.data.is_object() {
-        instance.data = json!({});
+        instance.replace_classified_data(json!({}), DataProvenance::Server);
     }
-    let data = instance
-        .data
-        .as_object_mut()
-        .context("workflow instance data is not an object")?;
-    data.insert("remote_fact_hash".to_string(), json!(fact_hash));
-    if let Some(activity_at) = activity_at {
-        data.insert("remote_fact_activity_at".to_string(), json!(activity_at));
-    } else {
-        data.remove("remote_fact_activity_at");
-    }
-    Ok(())
+    // The fact hash is the digest Harness computes over the snapshot, so it is
+    // server data about external data. The activity timestamp is read straight
+    // off the remote and stays externally classified.
+    let mut writes = vec![WorkflowDataWrite::set(
+        "remote_fact_hash",
+        json!(fact_hash),
+        DataProvenance::Server,
+    )];
+    writes.push(match activity_at {
+        Some(activity_at) => WorkflowDataWrite::set(
+            "remote_fact_activity_at",
+            json!(activity_at),
+            DataProvenance::External,
+        ),
+        // Removing through the write API drops the classification with the
+        // field; a raw remove would strand a provenance pointer.
+        None => WorkflowDataWrite::remove("remote_fact_activity_at", DataProvenance::External),
+    });
+    instance.apply_data_writes(writes)
 }
 
 fn pr_feedback_snapshot_from_completion_event(event: &WorkflowEvent) -> Option<&Value> {
@@ -589,15 +597,19 @@ async fn apply_prompt_continuation_side_effect(
             continuation.attempt
         );
     }
-    let data = instance
-        .data
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("prompt task instance data must be a JSON object"))?;
-    data.insert(
-        "continuation".to_string(),
-        serde_json::to_value(continuation)?,
-    );
+    persist_prompt_continuation(instance, continuation)?;
     Ok(PromptContinuationSideEffect::Applied)
+}
+
+fn persist_prompt_continuation(
+    instance: &mut WorkflowInstance,
+    continuation: PromptContinuationState,
+) -> anyhow::Result<()> {
+    instance.set_data_field(
+        "continuation",
+        serde_json::to_value(continuation)?,
+        crate::runtime::DataProvenance::Agent,
+    )
 }
 
 async fn require_durable_continuation_replay(

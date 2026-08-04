@@ -331,7 +331,7 @@ mod tests {
             WorkflowSubject::new("prompt_task", id),
         )
         .with_id(id)
-        .with_data(data)
+        .with_server_data(data)
     }
 
     fn completion_event(workflow_id: &str, result: ActivityResult) -> WorkflowEvent {
@@ -640,7 +640,9 @@ mod tests {
     ) -> anyhow::Result<Option<crate::runtime::store::RuntimeActivityCompletion>> {
         let instance =
             test_prompt_workflow_instance(workflow_id, "implementing", Some("owner/repo"));
-        store.force_upsert_instance_for_test(&instance).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&instance)
+            .await?;
         let command = WorkflowCommand::enqueue_activity(
             PROMPT_TASK_IMPLEMENT_ACTIVITY,
             format!("{workflow_id}:implement"),

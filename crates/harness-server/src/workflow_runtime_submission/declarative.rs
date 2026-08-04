@@ -1,6 +1,7 @@
 use super::{
-    insert_author_trust_class, merge_last_decision, prompt_memory::prompt_ref_for_submission,
-    TaskId, WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
+    classify_submission_data, insert_author_trust_class, merge_last_decision,
+    prompt_memory::prompt_ref_for_submission, submission_field_provenance, TaskId,
+    WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
@@ -151,7 +152,8 @@ async fn persist_new_submission(
     let mut final_instance = instance.clone();
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = merge_last_decision(final_instance.data, &decision.decision);
+    let data = merge_last_decision(std::mem::take(&mut final_instance.data), &decision.decision);
+    classify_submission_data(&mut final_instance, data)?;
     let event_id = uuid::Uuid::new_v4().to_string();
     let Some(outcome) = store
         .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
@@ -239,7 +241,7 @@ pub(super) fn submission_instance(
         ),
     )
     .with_id(workflow_id)
-    .with_data(data)
+    .with_data_field_provenance(data, submission_field_provenance)
 }
 
 async fn persist_definition_metadata(

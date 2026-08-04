@@ -1,5 +1,5 @@
 #[cfg(test)]
-use super::force_upsert_instance_for_test_tx;
+use super::force_upsert_lifecycle_state_for_test_tx;
 use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
     commit_same_state_instance_tx,
@@ -79,13 +79,11 @@ impl WorkflowRuntimeStore {
             IsolationTrustClass::Trusted
         };
         if current_trust != Some(effective) {
-            let data = instance.data.as_object_mut().ok_or_else(|| {
-                anyhow::anyhow!("workflow `{workflow_id}` data must be an object")
-            })?;
-            data.insert(
-                "author_trust_class".to_string(),
+            instance.set_data_field(
+                "author_trust_class",
                 serde_json::to_value(effective)?,
-            );
+                crate::runtime::DataProvenance::Server,
+            )?;
             instance.version = instance.version.saturating_add(1);
             commit_same_state_instance_tx(&mut tx, &original, &instance).await?;
         }
@@ -280,7 +278,7 @@ fn coverage_recovery_initial_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{WorkflowCommand, WorkflowSubject};
+    use crate::runtime::{DataProvenance, WorkflowCommand, WorkflowSubject};
     use chrono::Utc;
     use harness_core::db::resolve_database_url;
     use serde_json::json;
@@ -331,7 +329,9 @@ mod tests {
         )
         .with_id("coverage-recovery-identity-version")
         .with_parent("parent-workflow");
-        store.force_upsert_instance_for_test(&initial).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&initial)
+            .await?;
         let fact = RemoteFactSnapshot::new(
             "github",
             "owner/repo",
@@ -394,7 +394,7 @@ mod tests {
                 WorkflowSubject::new("issue", "issue:1707"),
             )
             .with_id("coverage-race")
-            .with_data(json!({"winner": suffix}));
+            .with_server_data(json!({"winner": suffix}));
             final_instance.version = 1;
             let fact = RemoteFactSnapshot::new(
                 "github",
@@ -473,7 +473,9 @@ mod tests {
             WorkflowSubject::new("issue", "issue:1707"),
         )
         .with_id("coverage-stale");
-        store.force_upsert_instance_for_test(&initial).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&initial)
+            .await?;
         let newer_command = WorkflowCommand::enqueue_activity("implement_issue", "newer-command");
         let newer_command_id = store
             .enqueue_command(&initial.id, None, &newer_command)
@@ -481,9 +483,9 @@ mod tests {
         let mut newer = initial.clone();
         newer.state = "implementing".to_string();
         newer.version = 1;
-        newer.data = json!({"newer": true});
+        newer.replace_classified_data(json!({"newer": true}), DataProvenance::Server);
         let mut tx = store.pool.begin().await?;
-        force_upsert_instance_for_test_tx(&mut tx, &newer).await?;
+        force_upsert_lifecycle_state_for_test_tx(&mut tx, &newer).await?;
         tx.commit().await?;
 
         let mut stale_final = initial.clone();
@@ -556,7 +558,9 @@ mod tests {
             WorkflowSubject::new("issue", "issue:1784"),
         )
         .with_id("coverage-validator-bypass");
-        store.force_upsert_instance_for_test(&initial).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&initial)
+            .await?;
         let mut final_instance = initial.clone();
         final_instance.state = "merging".to_string();
         final_instance.version = 1;

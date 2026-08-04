@@ -1,5 +1,7 @@
 use super::{commit_same_state_instance_tx, select_instance_for_update_tx, WorkflowRuntimeStore};
-use crate::runtime::{WorkflowCommand, WorkflowCommandType, WorkflowInstance};
+use crate::runtime::{
+    DataProvenance, WorkflowCommand, WorkflowCommandType, WorkflowDataWrite, WorkflowInstance,
+};
 use anyhow::Context;
 use serde_json::json;
 
@@ -65,14 +67,15 @@ impl WorkflowRuntimeStore {
 
         let mut target = current.clone();
         if !target.data.is_object() {
-            target.data = json!({});
+            target.replace_classified_data(json!({}), DataProvenance::Server);
         }
-        let data = target
-            .data
-            .as_object_mut()
-            .context("workflow runtime instance data is not an object")?;
-        data.insert("pr_number".to_string(), json!(pr_number));
-        data.insert("pr_url".to_string(), json!(pr_url));
+        // The repaired binding is replayed from a bind_pr command the agent
+        // produced, so it stays agent-classified rather than being laundered
+        // into server data by passing through a server-side repair path.
+        target.apply_data_writes([
+            WorkflowDataWrite::set("pr_number", json!(pr_number), DataProvenance::Agent),
+            WorkflowDataWrite::set("pr_url", json!(pr_url.clone()), DataProvenance::Agent),
+        ])?;
         target.version = target.version.saturating_add(1);
         commit_same_state_instance_tx(&mut tx, &current, &target).await?;
         tx.commit().await?;
@@ -109,7 +112,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
         let instance = workflow("pr-binding-repair");
-        store.force_upsert_instance_for_test(&instance).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&instance)
+            .await?;
 
         assert_eq!(
             store

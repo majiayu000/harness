@@ -1,6 +1,6 @@
 use super::{
-    enum_str, runtime_job_for_command_tx, to_jsonb_string, ClaimedCommandTerminalOutcome,
-    RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
+    enum_str, runtime_job_for_command_tx, to_jsonb_string, workflow_instance_from_persisted_json,
+    ClaimedCommandTerminalOutcome, RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
 };
 use crate::runtime::{
     DispatchClaim, RuntimeJob, RuntimeKind, WorkflowCommand, WorkflowCommandStatus,
@@ -60,7 +60,7 @@ impl WorkflowRuntimeStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let workflow = workflow_data
-            .map(|(data,)| serde_json::from_str::<WorkflowInstance>(&data))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .transpose()?;
         let command_claim: Option<(String, Option<String>, i64)> = sqlx::query_as(
             "SELECT status, dispatch_owner, dispatch_claim_generation
@@ -255,7 +255,7 @@ pub(super) async fn enqueue_runtime_job_for_command(
                 .bind(&workflow_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        row.map(|(data,)| serde_json::from_str::<WorkflowInstance>(&data))
+        row.map(|(data,)| workflow_instance_from_persisted_json(&data))
             .transpose()?
     } else {
         None

@@ -40,7 +40,7 @@ fn issue_instance(state: &str) -> WorkflowInstance {
     )
 }
 
-async fn force_upsert_instance_for_test(
+async fn force_upsert_lifecycle_state_for_test(
     store: &WorkflowRuntimeStore,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<()> {
@@ -102,7 +102,7 @@ fn project_issue_instance(
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(format!("{project_id}::issue:{issue_number}"))
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id,
         "issue_number": issue_number,
     }))
@@ -135,7 +135,7 @@ async fn enqueue_test_runtime_job_with_not_before(
     not_before: Option<DateTime<Utc>>,
 ) -> anyhow::Result<RuntimeJob> {
     let workflow = issue_instance("implementing").with_id(format!("test-workflow-{command_key}"));
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     enqueue_workflow_runtime_job(
         store,
         &workflow.id,

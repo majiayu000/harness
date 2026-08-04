@@ -57,7 +57,9 @@ async fn runtime_graph_rejects_orphan_references() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = issue_instance("implementing").with_id("fk-workflow");
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
     let command = WorkflowCommand::enqueue_activity("fk_activity", "fk-command");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let runtime_job = store
@@ -225,12 +227,14 @@ async fn insert_instance_if_absent_does_not_overwrite_existing_workflow() -> any
     let workflow_id = "insert-if-absent-existing-workflow";
     let existing = issue_instance("implementing")
         .with_id(workflow_id)
-        .with_data(json!({"marker": "real"}));
-    store.force_upsert_instance_for_test(&existing).await?;
+        .with_server_data(json!({"marker": "real"}));
+    store
+        .force_upsert_lifecycle_state_for_test(&existing)
+        .await?;
 
     let fallback = issue_instance("discovered")
         .with_id(workflow_id)
-        .with_data(json!({"marker": "fallback"}));
+        .with_server_data(json!({"marker": "fallback"}));
     let inserted = store.insert_instance_if_absent(&fallback).await?;
 
     assert!(!inserted);
@@ -452,17 +456,21 @@ async fn nonterminal_listing_uses_definition_specific_terminal_states() -> anyho
     let issue_done = project_issue_instance("/project-a", 224, "done");
     let quality_checking = quality_gate_instance("checking")
         .with_id("/project-a::quality:checking")
-        .with_data(json!({ "project_id": "/project-a" }));
+        .with_server_data(json!({ "project_id": "/project-a" }));
     let quality_passed = quality_gate_instance("passed")
         .with_id("/project-a::quality:passed")
-        .with_data(json!({ "project_id": "/project-a" }));
-    store.force_upsert_instance_for_test(&issue_passed).await?;
-    store.force_upsert_instance_for_test(&issue_done).await?;
+        .with_server_data(json!({ "project_id": "/project-a" }));
     store
-        .force_upsert_instance_for_test(&quality_checking)
+        .force_upsert_lifecycle_state_for_test(&issue_passed)
         .await?;
     store
-        .force_upsert_instance_for_test(&quality_passed)
+        .force_upsert_lifecycle_state_for_test(&issue_done)
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&quality_checking)
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&quality_passed)
         .await?;
 
     let issue_ids: std::collections::HashSet<_> = store
@@ -506,7 +514,9 @@ async fn aged_wait_listing_filters_by_age_and_terminal_state() -> anyhow::Result
     let fresh_blocked = project_issue_instance("/project-a", 303, "blocked");
     let old_done = project_issue_instance("/project-a", 304, "done");
     for instance in [&old_blocked, &old_feedback, &fresh_blocked, &old_done] {
-        store.force_upsert_instance_for_test(instance).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(instance)
+            .await?;
     }
     sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = ANY($1::text[])")
         .bind(vec![
@@ -549,8 +559,8 @@ async fn list_instances_by_parent_uses_store_updated_at() -> anyhow::Result<()> 
         .with_id("parent-row-timestamp-child")
         .with_parent(&parent.id);
     child.updated_at = Utc::now() - Duration::days(7);
-    store.force_upsert_instance_for_test(&parent).await?;
-    store.force_upsert_instance_for_test(&child).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
 
     let row_updated_at =
         DateTime::parse_from_rfc3339("2026-07-30T15:50:07.844135Z")?.with_timezone(&Utc);
@@ -594,7 +604,9 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
         &active_parent,
         &active_child,
     ] {
-        store.force_upsert_instance_for_test(instance).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(instance)
+            .await?;
     }
     store
         .append_event(&terminal_parent.id, "TerminalEvent", "test", json!({}))
@@ -668,7 +680,9 @@ async fn dedupe_uses_runtime_job_timestamps_not_uuid_order() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "replanning");
-    store.force_upsert_instance_for_test(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-latest");
     let command_id = store.enqueue_command(&instance.id, None, &command).await?;
     let older = store

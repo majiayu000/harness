@@ -4,8 +4,8 @@ use super::runtime_job_state::{
 };
 use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
-    insert_decision_record_tx, insert_event_tx, select_instance_for_update_tx, WorkflowInstance,
-    WorkflowRuntimeStore,
+    insert_decision_record_tx, insert_event_tx, select_instance_for_update_tx,
+    workflow_instance_from_persisted_json, WorkflowInstance, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
@@ -226,7 +226,7 @@ impl WorkflowRuntimeStore {
             &previous_state,
             &plan.target.state,
             &event.id,
-        );
+        )?;
         commit_decision_instance_tx(&mut tx, &current, &instance, &decision_record, false).await?;
         tx.commit().await?;
 
@@ -248,7 +248,7 @@ fn recovery_command_status(command: &WorkflowCommand) -> WorkflowCommandStatus {
 #[rustfmt::skip]
 async fn select_instance_tx(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, workflow_id: &str) -> anyhow::Result<Option<WorkflowInstance>> {
     let row: Option<(String,)> = sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1").bind(workflow_id).fetch_optional(&mut **tx).await?;
-    row.map(|(data,)| serde_json::from_str(&data)).transpose().map_err(Into::into)
+    row.map(|(data,)| workflow_instance_from_persisted_json(&data)).transpose()
 }
 
 #[rustfmt::skip]
@@ -567,21 +567,33 @@ fn persist_operator_recovery_data(
     previous_state: &str,
     state: &str,
     event_id: &str,
-) {
-    if !instance.data.is_object() {
-        instance.data = json!({});
-    }
-    if let Some(data) = instance.data.as_object_mut() {
-        // A successful recovery ends the stop episode. Stop classification and
-        // auto-recovery state must not leak into later terminal history or keep
-        // recovered transcript dependency families pinned.
-        data.remove("auto_recovery");
-        data.remove("last_stop");
-        data.remove("stop_reason_code");
-        data.remove("reason_class");
-        data.remove("error_kind");
-        data.insert(
-            "last_operator_recovery".to_string(),
+) -> anyhow::Result<()> {
+    // A successful recovery ends the stop episode. Stop classification and
+    // auto-recovery state must not leak into later terminal history or keep
+    // recovered transcript dependency families pinned.
+    instance.apply_data_writes([
+        crate::runtime::WorkflowDataWrite::remove(
+            "auto_recovery",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::remove(
+            "last_stop",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::remove(
+            "stop_reason_code",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::remove(
+            "reason_class",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::remove(
+            "error_kind",
+            crate::runtime::DataProvenance::Server,
+        ),
+        crate::runtime::WorkflowDataWrite::set(
+            "last_operator_recovery",
             json!({
                 "action": action.as_str(),
                 "reason": reason,
@@ -590,8 +602,9 @@ fn persist_operator_recovery_data(
                 "state": state,
                 "event_id": event_id,
             }),
-        );
-    }
+            crate::runtime::DataProvenance::Server,
+        ),
+    ])
 }
 
 fn recovery_dispatch_decision(

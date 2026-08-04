@@ -14,7 +14,7 @@ fn instance(id: &str, state: &str) -> WorkflowInstance {
         WorkflowSubject::new("pr", "4242"),
     )
     .with_id(id)
-    .with_data(json!({ "project_id": "/project-a", "pr_number": 4242 }))
+    .with_server_data(json!({ "project_id": "/project-a", "pr_number": 4242 }))
 }
 
 /// `implementing -> ready_to_merge` is absent from the github_issue_pr
@@ -205,7 +205,9 @@ async fn apply_decision_transition_rejects_a_mismatched_final_state() -> anyhow:
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
 
     let initial = instance("gh1784-final-state-mismatch", "addressing_feedback");
-    store.force_upsert_instance_for_test(&initial).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&initial)
+        .await?;
     let decision = WorkflowDecision::new(
         &initial.id,
         "addressing_feedback",
@@ -263,7 +265,9 @@ async fn apply_decision_transition_treats_a_same_state_stale_snapshot_as_stale(
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
 
     let initial = instance("gh1784-same-state-stale-snapshot", "addressing_feedback");
-    store.force_upsert_instance_for_test(&initial).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&initial)
+        .await?;
     let stale_snapshot = initial.clone();
     store
         .ensure_otel_trace_context(&initial.id)
@@ -330,7 +334,9 @@ async fn apply_decision_transition_rejects_definition_substitution() -> anyhow::
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
 
     let initial = instance("gh1784-definition-substitution", "addressing_feedback");
-    store.force_upsert_instance_for_test(&initial).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&initial)
+        .await?;
     let decision = WorkflowDecision::new(
         &initial.id,
         "addressing_feedback",

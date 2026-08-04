@@ -121,7 +121,7 @@ fn runtime_issue_task_handle_prefers_explicit_submission_id() {
         "implementing",
         WorkflowSubject::new("issue", "issue:1129"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "submission_id": "runtime-submission",
         "task_id": "latest-task",
         "task_ids": ["historical-task", "latest-task"]

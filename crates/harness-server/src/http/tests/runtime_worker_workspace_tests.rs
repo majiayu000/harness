@@ -50,12 +50,12 @@ async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1299"),
     )
     .with_id("issue-1299-missing-workspace")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 1299,
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let task_id = crate::task_runner::TaskId::from_str(&format!(
         "runtime-wf-github-issue-pr-{}",
         stable_hash_8_for_test(&workflow.id)

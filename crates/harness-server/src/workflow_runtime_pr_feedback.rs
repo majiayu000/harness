@@ -9,7 +9,7 @@ use harness_workflow::runtime::{
 };
 use harness_workflow::runtime::{
     build_local_review_request_decision, build_pr_feedback_sweep_decision,
-    build_pr_hygiene_repair_decision, DecisionValidator, LocalReviewDecisionInput,
+    build_pr_hygiene_repair_decision, DataProvenance, DecisionValidator, LocalReviewDecisionInput,
     PrFeedbackSweepDecisionInput, PrHygieneRepairDecisionInput, RemoteFactSnapshot,
     ValidationContext, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
     WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
@@ -152,6 +152,21 @@ fn runtime_task_id_from_instance(instance: &WorkflowInstance) -> String {
         .unwrap_or_else(|| format!("runtime:{}", instance.id))
 }
 
+fn replace_pr_runtime_data(
+    instance: &mut WorkflowInstance,
+    data: serde_json::Value,
+) -> anyhow::Result<()> {
+    instance.replace_data_with_field_provenance(data, pr_runtime_field_provenance)
+}
+
+fn pr_runtime_field_provenance(field: &str) -> DataProvenance {
+    match field {
+        "feedback_summary" | "review_summary" | "summary" => DataProvenance::Agent,
+        "hygiene_context" | "pr_number" | "pr_url" => DataProvenance::External,
+        _ => DataProvenance::Server,
+    }
+}
+
 #[cfg(test)]
 fn pr_lifecycle_failure_instance(
     project_root: &Path,
@@ -183,15 +198,30 @@ fn pr_lifecycle_failure_instance(
             "failed",
         )
     };
-    if let Some(data) = instance.data.as_object_mut() {
-        data.insert("task_id".to_string(), json!(task_id.as_str()));
-        data.insert("pr_number".to_string(), json!(pr_number));
-        data.insert("pr_url".to_string(), json!(pr_url));
-        data.insert(
-            "failure_kind".to_string(),
-            json!("pr_lifecycle_persistence"),
-        );
-    }
+    instance
+        .apply_data_writes([
+            harness_workflow::runtime::WorkflowDataWrite::set(
+                "task_id",
+                json!(task_id.as_str()),
+                DataProvenance::Server,
+            ),
+            harness_workflow::runtime::WorkflowDataWrite::set(
+                "pr_number",
+                json!(pr_number),
+                DataProvenance::External,
+            ),
+            harness_workflow::runtime::WorkflowDataWrite::set(
+                "pr_url",
+                json!(pr_url),
+                DataProvenance::External,
+            ),
+            harness_workflow::runtime::WorkflowDataWrite::set(
+                "failure_kind",
+                json!("pr_lifecycle_persistence"),
+                DataProvenance::Server,
+            ),
+        ])
+        .expect("test PR lifecycle instance uses classified object data");
     instance
 }
 

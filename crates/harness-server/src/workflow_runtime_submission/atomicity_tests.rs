@@ -173,7 +173,8 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
     );
     let mut live_instance = stale_instance.clone();
     live_instance.version = live_instance.version.saturating_add(1);
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &live_instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &live_instance)
+        .await?;
     let ctx = PromptSubmissionRuntimeContext {
         project_root: &project_root,
         task_id: &task_id,

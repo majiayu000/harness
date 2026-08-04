@@ -486,7 +486,7 @@ mod tests {
             state,
             WorkflowSubject::new("issue", "issue:42"),
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "task_id": "runtime-task-42",
             "project_id": "/tmp/project",
             "repo": "owner/repo",
@@ -504,7 +504,7 @@ mod tests {
             state,
             WorkflowSubject::new("prompt", "manual:prompt:42"),
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "task_id": "runtime-prompt-42",
             "project_id": "/tmp/project",
             "prompt_summary": "prompt task",
@@ -520,7 +520,7 @@ mod tests {
             state,
             WorkflowSubject::new("declarative", "github:owner/repo:issue:42"),
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "task_id": "runtime-declarative-42",
             "project_id": "/tmp/project",
             "prompt_summary": "declarative workflow task",
@@ -598,13 +598,19 @@ mod tests {
     #[test]
     fn runtime_submission_completion_task_preserves_review_intake_identity() {
         let mut instance = prompt_instance("done");
-        instance.data["execution_policy"] = json!({
-            "task_kind": "review",
-            "agent": "codex",
-            "turn_timeout_secs": 90,
-            "queue_domain": "review",
-            "priority": 0,
-        });
+        instance
+            .set_data_field(
+                "execution_policy",
+                json!({
+                    "task_kind": "review",
+                    "agent": "codex",
+                    "turn_timeout_secs": 90,
+                    "queue_domain": "review",
+                    "priority": 0,
+                }),
+                harness_workflow::runtime::DataProvenance::Server,
+            )
+            .expect("classified execution policy write");
         let result = ActivityResult::succeeded("implement_prompt", "Review completed.");
 
         let Some(task) = runtime_submission_completion_task(&instance, Some(&result))

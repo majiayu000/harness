@@ -94,9 +94,8 @@ pub(super) async fn select_instance_for_update_tx(
             .bind(workflow_id)
             .fetch_optional(&mut **tx)
             .await?;
-    row.map(|(data,)| serde_json::from_str(&data))
+    row.map(|(data,)| workflow_instance_from_persisted_json(&data))
         .transpose()
-        .map_err(Into::into)
 }
 
 pub(in crate::runtime) async fn insert_event_tx(
@@ -292,6 +291,7 @@ async fn insert_instance_row_if_absent_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<bool> {
+    validate_instance_for_persistence(instance)?;
     let data = to_jsonb_string(instance)?;
     let result = sqlx::query(
         "INSERT INTO workflow_instances
@@ -498,6 +498,7 @@ async fn upsert_instance_row_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<()> {
+    validate_instance_for_persistence(instance)?;
     let data = to_jsonb_string(instance)?;
     sqlx::query(
         "INSERT INTO workflow_instances
@@ -526,22 +527,42 @@ async fn upsert_instance_row_tx(
     Ok(())
 }
 
+/// Fixture-only writer for a workflow row the public API refuses to produce.
+///
+/// The public `upsert_instance` is insert-only (GH-1784): it cannot move an
+/// existing row to another state or version, so a fixture that needs a
+/// mid-lifecycle row has no validated path to it. This writer exists for
+/// exactly that case.
+///
+/// It bypasses **only** the GH-1784 lifecycle rules — the canonical initial
+/// instance check, the instance-boundary preservation check, and the
+/// insert-only version rule. It does **not** bypass the GH-1771 row-level
+/// provenance invariant: the instance's `workflow.data` must still be fully
+/// covered by a provenance sidecar whose digests match the data being
+/// written. Lifecycle state is what a fixture may fabricate; a sidecar that
+/// lies about its own data is a corrupt row no test needs.
+///
+/// Reach for a classified write API first. Use this only when the row's
+/// *lifecycle position* is what the fixture is constructing.
 #[cfg(test)]
-pub(super) async fn force_upsert_instance_for_test_tx(
+pub(super) async fn force_upsert_lifecycle_state_for_test_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<()> {
+    super::validate_instance_for_persistence(instance)?;
     upsert_instance_row_tx(tx, instance).await
 }
 
 #[cfg(test)]
 impl WorkflowRuntimeStore {
-    pub(crate) async fn force_upsert_instance_for_test(
+    /// See [`force_upsert_lifecycle_state_for_test_tx`] for what this does and
+    /// does not bypass.
+    pub(crate) async fn force_upsert_lifecycle_state_for_test(
         &self,
         instance: &WorkflowInstance,
     ) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        upsert_instance_row_tx(&mut tx, instance).await?;
+        force_upsert_lifecycle_state_for_test_tx(&mut tx, instance).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -578,16 +599,18 @@ fn apply_bind_pr_side_effect(
         .and_then(Value::as_str)
         .context("bind_pr command missing pr_url")?;
 
-    if !instance.data.is_object() {
-        instance.data = json!({});
-    }
-    let data = instance
-        .data
-        .as_object_mut()
-        .context("workflow instance data is not an object")?;
-    data.insert("pr_number".to_string(), json!(pr_number));
-    data.insert("pr_url".to_string(), json!(pr_url));
-    Ok(())
+    instance.apply_data_writes([
+        crate::runtime::WorkflowDataWrite::set(
+            "pr_number",
+            json!(pr_number),
+            crate::runtime::DataProvenance::Agent,
+        ),
+        crate::runtime::WorkflowDataWrite::set(
+            "pr_url",
+            json!(pr_url),
+            crate::runtime::DataProvenance::Agent,
+        ),
+    ])
 }
 
 fn apply_mark_done_side_effect(
@@ -597,13 +620,97 @@ fn apply_mark_done_side_effect(
     let Some(closed_issue_evidence) = command.command.get("closed_issue_evidence").cloned() else {
         return Ok(());
     };
-    if !instance.data.is_object() {
-        instance.data = json!({});
+    instance.set_data_field(
+        "closed_issue_evidence",
+        closed_issue_evidence,
+        crate::runtime::DataProvenance::Agent,
+    )
+}
+
+#[cfg(test)]
+mod bypass_guardrail_tests {
+    use super::*;
+    use crate::runtime::{DataProvenance, WorkflowSubject};
+    use harness_core::db::resolve_database_url;
+    use serde_json::json;
+
+    fn instance(id: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            "prompt_task",
+            1,
+            "implementing",
+            WorkflowSubject::new("prompt", "task"),
+        )
+        .with_id(id)
     }
-    let data = instance
-        .data
-        .as_object_mut()
-        .context("workflow instance data is not an object")?;
-    data.insert("closed_issue_evidence".to_string(), closed_issue_evidence);
-    Ok(())
+
+    /// The fixture-only lifecycle writer must keep enforcing the row-level
+    /// provenance invariant.
+    ///
+    /// Without this test, a future change that routes fixtures back through a
+    /// raw bypass would silently strip provenance coverage from every test
+    /// that uses it, and nothing would fail. This pins the one behavior the
+    /// bypass is not allowed to skip.
+    #[tokio::test]
+    async fn lifecycle_bypass_still_rejects_unclassified_and_tampered_data() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+
+        // A lifecycle position the insert-only public API cannot produce is
+        // exactly what the bypass is for, and it is accepted when classified.
+        let mut classified = instance("bypass-classified");
+        classified.state = "awaiting_feedback".to_string();
+        classified.version = 7;
+        classified.replace_classified_data(json!({"marker": "ok"}), DataProvenance::Server);
+        store
+            .force_upsert_lifecycle_state_for_test(&classified)
+            .await?;
+
+        // Unclassified data must still fail closed through the bypass.
+        let mut unclassified = instance("bypass-unclassified");
+        unclassified.data = json!({"historical_summary": "never classified"});
+        let error = store
+            .force_upsert_lifecycle_state_for_test(&unclassified)
+            .await
+            .expect_err("the lifecycle bypass must not accept unclassified workflow data");
+        assert!(
+            error
+                .to_string()
+                .contains("unclassified workflow.data field"),
+            "unexpected error: {error}"
+        );
+
+        // A sidecar that disagrees with its own data must also fail closed.
+        let mut tampered = instance("bypass-tampered");
+        tampered
+            .replace_classified_data(json!({"server_fact": "verified"}), DataProvenance::Server);
+        tampered.data["server_fact"] = json!("tampered");
+        let error = store
+            .force_upsert_lifecycle_state_for_test(&tampered)
+            .await
+            .expect_err("the lifecycle bypass must not accept a sidecar that lies about its data");
+        assert!(
+            error
+                .to_string()
+                .contains("changed outside the classified write API"),
+            "unexpected error: {error}"
+        );
+
+        // A missing sidecar is not a legacy boundary: only rows loaded from
+        // durable storage can be grandfathered.
+        let mut sidecarless = instance("bypass-sidecarless");
+        sidecarless.data_provenance = None;
+        let error = store
+            .force_upsert_lifecycle_state_for_test(&sidecarless)
+            .await
+            .expect_err("the lifecycle bypass must not accept a missing provenance sidecar");
+        assert!(
+            error.to_string().contains("requires a provenance sidecar"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
 }

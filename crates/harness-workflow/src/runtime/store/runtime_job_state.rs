@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::DataProvenance;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkflowCancellationCleanupOutcome {
@@ -348,13 +349,11 @@ impl WorkflowRuntimeStore {
             )));
         }
         if !current.data.is_object() {
-            current.data = json!({});
+            current.replace_classified_data(json!({}), DataProvenance::Server);
         }
-        current
-            .data
-            .as_object_mut()
-            .context("workflow instance data must be an object")?
-            .insert("cancelled".to_string(), Value::Bool(true));
+        // Cancellation is a server decision about the workflow, never agent or
+        // remote input, so the marker is server-classified.
+        current.set_data_field("cancelled", Value::Bool(true), DataProvenance::Server)?;
         if current.data != original.data {
             current.version = current.version.checked_add(1).ok_or_else(|| {
                 anyhow::anyhow!(

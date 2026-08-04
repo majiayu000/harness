@@ -21,7 +21,7 @@ async fn queue_stats_matches_overview_for_runtime_active_work() -> anyhow::Resul
         harness_workflow::runtime::WorkflowSubject::new("prompt", "prompt:queue-stats-running"),
     )
     .with_id("queue-stats-running-workflow")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "task_id": "queue-stats-running-task",
     }));
@@ -32,12 +32,12 @@ async fn queue_stats_matches_overview_for_runtime_active_work() -> anyhow::Resul
         harness_workflow::runtime::WorkflowSubject::new("prompt", "prompt:queue-stats-queued"),
     )
     .with_id("queue-stats-queued-workflow")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "task_id": "queue-stats-queued-task",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &running).await?;
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &queued).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &running).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &queued).await?;
 
     let app = Router::new()
         .route("/projects/queue-stats", get(project_queue_stats))

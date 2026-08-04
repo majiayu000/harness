@@ -104,13 +104,13 @@ fn component_id(entry: &Value) -> &str {
 }
 
 #[test]
-fn v2_packet_and_artifact_share_schema_and_v1_remains_historical() {
+fn v3_packet_and_artifact_share_schema_and_v1_remains_historical() {
     let job = runtime_job("implement_issue");
     let profile = codex_profile();
     let packet = build_packet(&job, &profile, &WorkflowDocument::default(), &[], None);
 
     assert_eq!(packet["schema"], RUNTIME_PROMPT_PACKET_SCHEMA);
-    assert_eq!(packet["schema"], "harness.runtime.prompt_packet.v2");
+    assert_eq!(packet["schema"], "harness.runtime.prompt_packet.v3");
     assert_eq!(
         packet["context_provenance"]["schema"],
         CONTEXT_PROVENANCE_SCHEMA

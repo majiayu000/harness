@@ -1,11 +1,14 @@
 use super::data_helpers::activity_name;
 use super::executor::{is_internal_non_agent_activity, ServerRuntimeJobExecutor};
+use super::prompt_packet::PromptPacketConfigurationError;
 use super::transcript_durability::{
     exact_replay_preflight_result, hydrate_exact_replay_transcript,
     strip_caller_transcript_unavailable_signal,
 };
 use async_trait::async_trait;
-use harness_workflow::runtime::{ActivityResult, RuntimeJob, RuntimeJobExecutor};
+use harness_workflow::runtime::{
+    ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobExecutor,
+};
 
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
@@ -33,11 +36,43 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
         let activity = activity_name(&job);
         match self.execute_inner(job).await {
             Ok(result) => strip_caller_transcript_unavailable_signal(result),
-            Err(error) => ActivityResult::failed(
-                activity,
-                "Runtime job execution failed before the agent completed.",
-                error.to_string(),
-            ),
+            Err(error) => execution_error_result(activity, error),
         }
+    }
+}
+
+fn execution_error_result(activity: String, error: anyhow::Error) -> ActivityResult {
+    let result = ActivityResult::failed(
+        activity,
+        "Runtime job execution failed before the agent completed.",
+        error.to_string(),
+    );
+    if error
+        .downcast_ref::<PromptPacketConfigurationError>()
+        .is_some()
+    {
+        result.with_error_kind(ActivityErrorKind::Configuration)
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_packet_provenance_errors_are_configuration_failures() {
+        let error = anyhow::Error::new(PromptPacketConfigurationError::new(
+            "unclassified workflow.data field `/summary`",
+        ));
+
+        let result = execution_error_result("implement_issue".to_string(), error);
+
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unclassified workflow.data")));
     }
 }

@@ -99,14 +99,14 @@ pub(super) async fn execute_start_child_workflow(
             }
         }
     }
-    child.data = merge_child_issue_data(
-        child.data,
+    merge_child_issue_data(
+        &mut child,
         project_id,
         repo,
         issue_number,
         job.id.as_str(),
         job.command_id.as_str(),
-    );
+    )?;
     if !child_started_by_command || !child_start_event_recorded {
         child = store
             .ensure_child_workflow_started(WorkflowChildStart {

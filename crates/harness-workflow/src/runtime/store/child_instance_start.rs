@@ -227,7 +227,7 @@ async fn persist_existing_child_start_tx(
         return Ok(current);
     }
     let mut target = current.clone();
-    target.data = incoming.data.clone();
+    target.adopt_classified_data_from(incoming)?;
     target.version = current
         .version
         .checked_add(1)
@@ -449,7 +449,7 @@ mod tests {
         )
         .with_id("atomic-child-start")
         .with_parent("atomic-child-parent")
-        .with_data(json!({"started_by_command_id": command_id}));
+        .with_server_data(json!({"started_by_command_id": command_id}));
         let payload = json!({
             "command_id": command_id,
             "runtime_job_id": runtime_job_id,
@@ -484,7 +484,7 @@ mod tests {
 
         let updated = child
             .clone()
-            .with_data(json!({"started_by_command_id": command_id, "attempt": 2}));
+            .with_server_data(json!({"started_by_command_id": command_id, "attempt": 2}));
         let updated = store
             .ensure_child_workflow_started(WorkflowChildStart {
                 instance: &updated,
@@ -532,7 +532,7 @@ mod tests {
         )
         .with_id("concurrent-child-start")
         .with_parent("concurrent-child-parent")
-        .with_data(json!({"started_by_command_id": command_id}));
+        .with_server_data(json!({"started_by_command_id": command_id}));
         let mut second = first.clone();
         second.created_at += chrono::Duration::milliseconds(1);
         second.updated_at = second.created_at;

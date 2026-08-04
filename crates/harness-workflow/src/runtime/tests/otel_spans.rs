@@ -19,7 +19,9 @@ async fn otel_spans_persist_trace_context_on_workflow_row() -> anyhow::Result<()
         WorkflowSubject::new("issue", "issue:1451"),
     )
     .with_id("otel-trace-workflow");
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
 
     let first = store
         .ensure_otel_trace_context(&workflow.id)

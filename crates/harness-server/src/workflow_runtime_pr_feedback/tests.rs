@@ -183,13 +183,13 @@ async fn persistent_pr_lifecycle_persist_failure_preserves_existing_workflow() -
         123,
         "awaiting_feedback",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 123,
         "marker": "real",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &existing).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &existing).await?;
     let _guard =
         set_pr_lifecycle_persist_test_failures(task_id.as_str(), PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS);
 
@@ -554,7 +554,7 @@ async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> any
         123,
         "pr_open",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 123,
@@ -562,7 +562,8 @@ async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> any
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &issue_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &issue_workflow)
+        .await?;
 
     record_pr_feedback(
         Some(&store),
@@ -665,7 +666,7 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
         123,
         "pr_open",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 123,
@@ -673,7 +674,7 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "task-1",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &instance).await?;
 
     let outcome = request_local_review(&store, &workflow_id).await?;
     assert_eq!(

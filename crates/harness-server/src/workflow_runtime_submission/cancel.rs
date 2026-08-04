@@ -351,7 +351,8 @@ mod tests {
             WorkflowSubject::new("prompt", "retry-cancellation-cleanup"),
         )
         .with_id("retry-cancellation-cleanup");
-        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+            .await?;
 
         let activity = WorkflowCommand::enqueue_activity(
             "implement_prompt",
@@ -422,7 +423,8 @@ mod tests {
         let mut reopened = stale_cancelled.clone();
         reopened.state = "planning".to_string();
         reopened.version += 1;
-        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &reopened).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &reopened)
+            .await?;
         let reopened_command =
             WorkflowCommand::enqueue_activity("plan_prompt", "retry-cancellation-cleanup-reopened");
         let reopened_command_id = store
@@ -451,7 +453,8 @@ mod tests {
         let mut completed = reopened;
         completed.state = "done".to_string();
         completed.version += 1;
-        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &completed).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &completed)
+            .await?;
         let outcome = cancel_submission_by_workflow_id(&store, &workflow.id).await?;
         assert!(matches!(
             outcome,

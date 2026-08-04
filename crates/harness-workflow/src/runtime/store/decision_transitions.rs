@@ -8,7 +8,8 @@ use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
     insert_decision_record_tx, insert_event_tx, load_or_insert_initial_instance_tx,
     transition_validation::{validate_transition, TransitionValidation},
-    WorkflowDecisionTransition, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    validate_instance_for_persistence, WorkflowDecisionTransition,
+    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     WorkflowDecision, WorkflowDecisionRecord, WorkflowEvent, WorkflowInstance,
@@ -114,6 +115,7 @@ impl WorkflowRuntimeStore {
                 final_instance.state
             );
         }
+        validate_instance_for_persistence(&final_instance)?;
         let mut tx = self.pool.begin().await?;
         let Some(current) = load_or_insert_initial_instance_tx(
             &mut tx,
@@ -285,7 +287,9 @@ mod submission_guard_tests {
         let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
         for (suffix, state) in [("unrelated", "planning"), ("terminal", "done")] {
             let current = instance(&format!("stale-replay-{suffix}"), state);
-            store.force_upsert_instance_for_test(&current).await?;
+            store
+                .force_upsert_lifecycle_state_for_test(&current)
+                .await?;
             let decision = accepted_decision(&current);
             let record = seed_accepted_record(&store, &decision).await?;
             let mut final_instance = current.clone();

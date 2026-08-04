@@ -1,8 +1,8 @@
 use super::*;
 use crate::workflow_runtime_worker::runtime_profile::resolve_runtime_settings;
 use harness_workflow::runtime::{
-    RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord,
-    RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
+    DataProvenance, RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome,
+    RepoMemoryRecord, RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
     WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowRuntimeRecoveryAction,
     WorkflowRuntimeStore, WorkflowStateDefinition, WorkflowSubject, ISSUE_PLAN_ACTIVITY,
     ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
@@ -510,20 +510,23 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
         WorkflowSubject::new("prompt", "TEAM-123"),
     )
     .with_id("prompt-workflow-1")
-    .with_data(json!({
-        "continuation": {
-            "policy": {
-                "max_attempts": 4,
-                "attempt_delay_secs": 30,
-                "active_states": ["In Progress"],
-                "no_progress_limit": 3
-            },
-            "attempt": 2,
-            "last_external_state": "In Progress",
-            "last_summary": "Created the implementation branch.",
-            "same_state_count": 0
-        }
-    }));
+    .with_classified_data(
+        json!({
+            "continuation": {
+                "policy": {
+                    "max_attempts": 4,
+                    "attempt_delay_secs": 30,
+                    "active_states": ["In Progress"],
+                    "no_progress_limit": 3
+                },
+                "attempt": 2,
+                "last_external_state": "In Progress",
+                "last_summary": "Created the implementation branch.",
+                "same_state_count": 0
+            }
+        }),
+        DataProvenance::Agent,
+    );
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
     let packet = build_runtime_prompt_packet(
         &job,
@@ -539,10 +542,9 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     .expect("continuation prompt packet should build");
 
     assert_eq!(packet["continuation_context"]["attempt"], 2);
-    assert_eq!(
-        packet["continuation_context"]["previous_external_state"],
-        "In Progress"
-    );
+    assert!(packet["continuation_context"]["previous_external_state"]
+        .as_str()
+        .is_some_and(|value| value.contains("<external_data>\nIn Progress\n</external_data>")));
     assert_eq!(
         packet["activity_result_schema"]["continuation_signal_contract"]["required_signal_type"],
         "external_state"
@@ -571,8 +573,11 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     let prompt = build_runtime_job_prompt(&packet, Some("Continue TEAM-123."));
     assert!(prompt.contains("Continuation context:"));
     assert!(prompt.contains("Attempt: 2"));
-    assert!(prompt.contains("Previous external state: In Progress"));
-    assert!(prompt.contains("Previous attempt summary: Created the implementation branch."));
+    assert!(prompt.contains("Previous external state:"));
+    assert!(prompt.contains("<external_data>\nIn Progress\n</external_data>"));
+    assert!(
+        prompt.contains("<external_data>\nCreated the implementation branch.\n</external_data>")
+    );
 }
 
 #[test]

@@ -129,7 +129,7 @@ async fn runtime_pr_feedback_sweep_refreshes_remote_fact_before_child_suppressio
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
     )
     .with_id("issue-226-feedback-refresh")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 226,
@@ -137,7 +137,7 @@ async fn runtime_pr_feedback_sweep_refreshes_remote_fact_before_child_suppressio
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-226",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let child = harness_workflow::runtime::WorkflowInstance::new(
         harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -146,11 +146,11 @@ async fn runtime_pr_feedback_sweep_refreshes_remote_fact_before_child_suppressio
     )
     .with_id("issue-226-feedback-refresh-child")
     .with_parent(workflow.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "remote_fact_hash": "sha256:stale",
         "remote_fact_activity_at": "2026-07-30T00:00:00Z",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 2).await?;
 
     assert_eq!(tick.requested, 1);
@@ -220,7 +220,7 @@ async fn runtime_pr_feedback_sweep_continues_after_refresh_failure() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
     )
     .with_id("issue-227-feedback-refresh-success")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 227,
@@ -228,7 +228,8 @@ async fn runtime_pr_feedback_sweep_continues_after_refresh_failure() -> anyhow::
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-227",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &later_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &later_workflow)
+        .await?;
     let failing_workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
         1,
@@ -236,7 +237,7 @@ async fn runtime_pr_feedback_sweep_continues_after_refresh_failure() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
     )
     .with_id("issue-226-feedback-refresh-fails")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 226,
@@ -244,7 +245,8 @@ async fn runtime_pr_feedback_sweep_continues_after_refresh_failure() -> anyhow::
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-226",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &failing_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &failing_workflow)
+        .await?;
     let later_updated_at =
         chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:01Z")?.with_timezone(&chrono::Utc);
     let failing_updated_at =
@@ -314,7 +316,7 @@ async fn runtime_pr_feedback_sweep_skips_active_driver_without_spending_work_lim
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:228"),
     )
     .with_id("issue-228-pr-open")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 228,
@@ -322,7 +324,8 @@ async fn runtime_pr_feedback_sweep_skips_active_driver_without_spending_work_lim
         "pr_url": "https://github.com/owner/repo/pull/78",
         "task_id": "runtime-task-228",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &older_pr_open).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &older_pr_open)
+        .await?;
 
     let newer_awaiting_feedback = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
@@ -331,7 +334,7 @@ async fn runtime_pr_feedback_sweep_skips_active_driver_without_spending_work_lim
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:229"),
     )
     .with_id("issue-229-active-feedback-driver")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 229,
@@ -339,8 +342,11 @@ async fn runtime_pr_feedback_sweep_skips_active_driver_without_spending_work_lim
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-229",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &newer_awaiting_feedback)
-        .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        store,
+        &newer_awaiting_feedback,
+    )
+    .await?;
     let child = harness_workflow::runtime::WorkflowInstance::new(
         harness_workflow::runtime::PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -349,7 +355,7 @@ async fn runtime_pr_feedback_sweep_skips_active_driver_without_spending_work_lim
     )
     .with_id("issue-229-active-feedback-driver-child")
     .with_parent(newer_awaiting_feedback.id.clone());
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     let inspect = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
         harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
         "issue-229-active-inspection",
@@ -424,7 +430,7 @@ async fn runtime_pr_feedback_sweep_caps_remote_refresh_failures() -> anyhow::Res
             ),
         )
         .with_id(format!("issue-{issue_number}-refresh-failure"))
-        .with_data(serde_json::json!({
+        .with_server_data(serde_json::json!({
             "project_id": project_root.to_string_lossy(),
             "repo": "owner/repo",
             "issue_number": issue_number,
@@ -432,7 +438,8 @@ async fn runtime_pr_feedback_sweep_caps_remote_refresh_failures() -> anyhow::Res
             "pr_url": format!("https://github.com/owner/repo/pull/{issue_number}"),
             "task_id": format!("runtime-task-{issue_number}"),
         }));
-        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
     }
 
     let mut cursor = 0;
@@ -516,7 +523,7 @@ async fn runtime_pr_feedback_sweep_caps_auto_merge_remote_probes() -> anyhow::Re
             ),
         )
         .with_id(format!("issue-{issue_number}-auto-merge-not-ready"))
-        .with_data(serde_json::json!({
+        .with_server_data(serde_json::json!({
             "project_id": project_root.to_string_lossy(),
             "repo": "owner/repo",
             "issue_number": issue_number,
@@ -524,7 +531,8 @@ async fn runtime_pr_feedback_sweep_caps_auto_merge_remote_probes() -> anyhow::Re
             "pr_url": format!("https://github.com/owner/repo/pull/{issue_number}"),
             "task_id": format!("runtime-task-{issue_number}"),
         }));
-        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
     }
 
     let mut cursor = 0;

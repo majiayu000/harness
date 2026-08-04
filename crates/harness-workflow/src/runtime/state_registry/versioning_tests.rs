@@ -67,7 +67,8 @@ fn strict_resolution_distinguishes_all_pin_errors() {
         registry.resolve_declarative_definition(&instance(&definition)),
         DeclarativeDefinitionResolution::PinError(DeclarativeDefinitionPinError::MissingHash)
     ));
-    let invalid = instance(&definition).with_data(json!({ "definition_hash": "SHA256:bad" }));
+    let invalid =
+        instance(&definition).with_server_data(json!({ "definition_hash": "SHA256:bad" }));
     assert!(matches!(
         registry.resolve_declarative_definition(&invalid),
         DeclarativeDefinitionResolution::PinError(DeclarativeDefinitionPinError::InvalidHash)
@@ -77,7 +78,7 @@ fn strict_resolution_distinguishes_all_pin_errors() {
     if other_hash == definition.definition_hash() {
         other_hash.replace_range(other_hash.len() - 1.., "1");
     }
-    let mismatch = instance(&definition).with_data(json!({ "definition_hash": other_hash }));
+    let mismatch = instance(&definition).with_server_data(json!({ "definition_hash": other_hash }));
     assert!(matches!(
         registry.resolve_declarative_definition(&mismatch),
         DeclarativeDefinitionResolution::PinError(DeclarativeDefinitionPinError::HashMismatch)
@@ -88,7 +89,7 @@ fn strict_resolution_distinguishes_all_pin_errors() {
         "running",
         WorkflowSubject::new("test", "missing"),
     )
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     assert!(matches!(
         registry.resolve_declarative_definition(&missing_version),
         DeclarativeDefinitionResolution::PinError(DeclarativeDefinitionPinError::MissingVersion)
@@ -102,8 +103,8 @@ fn strict_resolution_and_validator_use_exact_pinned_definition() {
     registry
         .register_declarative_current(definition.clone())
         .expect("fixture should register");
-    let pinned =
-        instance(&definition).with_data(json!({ "definition_hash": definition.definition_hash() }));
+    let pinned = instance(&definition)
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     assert!(matches!(
         registry.resolve_declarative_definition(&pinned),
         DeclarativeDefinitionResolution::Resolved(resolved)
@@ -135,7 +136,7 @@ fn builtins_ignore_forged_declarative_pin_markers() {
         "discovered",
         WorkflowSubject::new("issue", "one"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }));
     assert!(matches!(

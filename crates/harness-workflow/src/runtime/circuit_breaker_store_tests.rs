@@ -33,7 +33,9 @@ async fn enqueue_breaker_test_job(
         WorkflowSubject::new("issue", format!("issue:{command_key}")),
     )
     .with_id(format!("breaker-test-workflow-{command_key}"));
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
     let command = WorkflowCommand::enqueue_activity("check", format!("breaker-{command_key}"));
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     store

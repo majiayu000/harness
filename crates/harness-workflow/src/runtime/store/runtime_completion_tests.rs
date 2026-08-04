@@ -1,7 +1,9 @@
 use super::*;
 use crate::runtime::model::{WorkflowCommandType, WorkflowEvidence, WorkflowSubject};
+use crate::runtime::{DataProvenance, PromptContinuationPolicy};
 use harness_core::db::resolve_database_url;
 use serde_json::json;
+use std::collections::BTreeSet;
 
 fn pin_error_instance(id: &str) -> WorkflowInstance {
     WorkflowInstance::new(
@@ -11,7 +13,7 @@ fn pin_error_instance(id: &str) -> WorkflowInstance {
         WorkflowSubject::new("test", id),
     )
     .with_id(id)
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }))
 }
@@ -40,6 +42,38 @@ fn pin_safety_decision(instance: &WorkflowInstance) -> WorkflowDecision {
     ))
 }
 
+#[test]
+fn completion_continuation_is_persisted_as_agent_data() -> anyhow::Result<()> {
+    let policy = PromptContinuationPolicy {
+        max_attempts: 3,
+        attempt_delay_secs: 0,
+        active_states: BTreeSet::from(["In Progress".to_string()]),
+        no_progress_limit: 2,
+    };
+    let continuation = PromptContinuationState::initial(&policy);
+    let mut instance = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "continuation-agent"),
+    )
+    .with_classified_data(
+        json!({ "prompt_ref": "prompt-ref" }),
+        DataProvenance::Server,
+    );
+
+    persist_prompt_continuation(&mut instance, continuation)?;
+
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|sidecar| sidecar.provenance_for("/continuation")),
+        Some(DataProvenance::Agent)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn pin_error_safety_decision_persists_blocked_without_current_definition(
 ) -> anyhow::Result<()> {
@@ -55,7 +89,9 @@ async fn pin_error_safety_decision_persists_blocked_without_current_definition(
             crate::runtime::state_registry::DeclarativeDefinitionPinError::MissingVersion
         )
     ));
-    store.force_upsert_instance_for_test(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let record = store
         .commit_runtime_completion_decision_for_test(
             &instance.id,
@@ -85,7 +121,9 @@ async fn pin_error_safety_decision_requires_explicit_context_override() -> anyho
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("pin-safety-context.db")).await?;
     let instance = pin_error_instance("pin-safety-context-rejected");
-    store.force_upsert_instance_for_test(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let mut tx = store.pool.begin().await?;
     let event = insert_event_tx(
         &mut tx,
@@ -126,7 +164,9 @@ async fn pin_error_safety_channel_rejects_any_extra_command() -> anyhow::Result<
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("pin-safety-rejected.db")).await?;
     let instance = pin_error_instance("pin-safety-rejected");
-    store.force_upsert_instance_for_test(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let decision = pin_safety_decision(&instance)
         .with_command(WorkflowCommand::wait("not allowed", "pin:extra"));
     let record = store

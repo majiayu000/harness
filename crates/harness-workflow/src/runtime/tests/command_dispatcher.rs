@@ -8,7 +8,7 @@ async fn runtime_command_dispatcher_enqueues_runtime_job_for_activity_command() 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "replanning");
-    store.force_upsert_instance_for_test(&instance).await?;
+    store.force_upsert_lifecycle_state_for_test(&instance).await?;
     let decision = WorkflowDecision::new(
         instance.id.clone(),
         "replanning",
@@ -81,8 +81,8 @@ async fn runtime_command_dispatcher_prefers_workflow_activity_profile() -> anyho
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let issue = project_issue_instance("/project-a", 123, "replanning");
     let prompt = prompt_task_instance("implementing").with_id("prompt-task-profile");
-    store.force_upsert_instance_for_test(&issue).await?;
-    store.force_upsert_instance_for_test(&prompt).await?;
+    store.force_upsert_lifecycle_state_for_test(&issue).await?;
+    store.force_upsert_lifecycle_state_for_test(&prompt).await?;
 
     let issue_replan_command =
         WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-profile");
@@ -201,7 +201,7 @@ async fn runtime_command_dispatcher_preserves_retry_not_before() -> anyhow::Resu
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "implementing");
-    store.force_upsert_instance_for_test(&instance).await?;
+    store.force_upsert_lifecycle_state_for_test(&instance).await?;
     let not_before = Utc::now() + Duration::seconds(60);
     let command = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
@@ -250,7 +250,7 @@ async fn runtime_command_dispatcher_uses_command_type_activity_key_for_child_wor
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let prompt = prompt_task_instance("implementing").with_id("prompt-task-child");
-    store.force_upsert_instance_for_test(&prompt).await?;
+    store.force_upsert_lifecycle_state_for_test(&prompt).await?;
 
     let child_command = WorkflowCommand::start_child_workflow(
         "github_issue_pr",
@@ -299,7 +299,7 @@ async fn runtime_command_dispatcher_skips_non_runtime_commands() -> anyhow::Resu
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "pr_open");
-    store.force_upsert_instance_for_test(&instance).await?;
+    store.force_upsert_lifecycle_state_for_test(&instance).await?;
     let command = WorkflowCommand::bind_pr(
         77,
         "https://github.com/owner/repo/pull/77",
@@ -345,7 +345,7 @@ async fn runtime_command_dispatcher_skips_terminal_workflow_before_enqueue() -> 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "cancelled");
-    store.force_upsert_instance_for_test(&instance).await?;
+    store.force_upsert_lifecycle_state_for_test(&instance).await?;
     let command =
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-cancelled-implement");
     let command_id = store.enqueue_command(&instance.id, None, &command).await?;

@@ -117,7 +117,7 @@ mod tests {
             "checking",
             WorkflowSubject::new("quality_gate", "pr:1"),
         )
-        .with_data(json!({ "validation_commands": ["cargo fmt --all -- --check"] }));
+        .with_server_data(json!({ "validation_commands": ["cargo fmt --all -- --check"] }));
         assert_eq!(
             validation_commands_for_job(&job, Some(&workflow)),
             vec!["cargo fmt --all -- --check".to_string()]

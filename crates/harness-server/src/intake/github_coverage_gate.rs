@@ -2,10 +2,11 @@ use chrono::Utc;
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::issue_lifecycle::{workflow_id, IssueLifecycleState, IssueWorkflowStore};
 use harness_workflow::runtime::{
-    RemoteFactSnapshot, WorkflowCommand, WorkflowCommandType, WorkflowCoverageRecoveryExpected,
-    WorkflowCoverageRecoveryOutcome, WorkflowCoverageRecoveryTransition, WorkflowDecision,
-    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    DataProvenance, RemoteFactSnapshot, WorkflowCommand, WorkflowCommandType,
+    WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
+    WorkflowCoverageRecoveryTransition, WorkflowDecision, WorkflowDefinition, WorkflowEvidence,
+    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
@@ -372,7 +373,16 @@ async fn persist_recovered_workflow(
         .with_id(id.clone())
     });
     final_instance.state = state.to_string();
-    final_instance.data = data;
+    final_instance.replace_data_with_field_provenance(data, |field| match field {
+        "author_trust_class"
+        | "last_remote_fact_hash"
+        | "project_id"
+        | "repo"
+        | "runtime_retry_policy"
+        | "source"
+        | "task_id" => DataProvenance::Server,
+        _ => DataProvenance::External,
+    })?;
     final_instance.version = existing
         .as_ref()
         .map_or(1, |value| value.version.saturating_add(1));
@@ -679,18 +689,22 @@ mod tests {
             WorkflowSubject::new("issue", format!("issue:{issue_number}")),
         )
         .with_id(workflow_id)
-        .with_data(json!({
-            "project_id": project_id,
-            "repo": repo,
-            "issue_number": issue_number,
-            "error_kind": "timeout",
-            "last_stop": {
-                "state": stopped_state,
-                "activity": "replan_issue",
+        .with_classified_data(
+            json!({
+                "project_id": project_id,
+                "repo": repo,
+                "issue_number": issue_number,
                 "error_kind": "timeout",
-            },
-        }));
-        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+                "last_stop": {
+                    "state": stopped_state,
+                    "activity": "replan_issue",
+                    "error_kind": "timeout",
+                },
+            }),
+            DataProvenance::Server,
+        );
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
 
         let command = WorkflowCommand::enqueue_activity(
             "replan_issue",
@@ -705,8 +719,11 @@ mod tests {
                 command.command,
             )
             .await?;
-        workflow.data["last_stop"]["runtime_job_id"] = json!(runtime_job.id);
-        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+        let mut last_stop = workflow.data["last_stop"].clone();
+        last_stop["runtime_job_id"] = json!(runtime_job.id);
+        workflow.set_data_field("last_stop", last_stop, DataProvenance::Server)?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
         Ok(workflow)
     }
 }

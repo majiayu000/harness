@@ -324,7 +324,7 @@ mod tests {
             state,
             harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1371"),
         )
-        .with_data(serde_json::json!({
+        .with_server_data(serde_json::json!({
             "project_id": project_id,
             "task_id": task_id,
         }))
@@ -345,7 +345,8 @@ mod tests {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
         let workflow = runtime_workflow("implementing", &project_root, "runtime-dashboard-active");
-        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
 
         let body = dashboard_body(state).await?;
 
@@ -372,7 +373,8 @@ mod tests {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
         let workflow = runtime_workflow("done", &project_root, "runtime-dashboard-terminal");
-        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
 
         let body = dashboard_body(state).await?;
 
@@ -401,12 +403,13 @@ mod tests {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
         let workflow = runtime_workflow("failed", &project_root, "dashboard-stalled-task")
-            .with_data(serde_json::json!({
+            .with_server_data(serde_json::json!({
                 "project_id": project_root,
                 "task_id": "dashboard-stalled-task",
                 "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
             }));
-        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
 
         let body = dashboard_body(state).await?;
 
@@ -441,7 +444,8 @@ mod tests {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
         let workflow = runtime_workflow("implementing", &project_root, task_id.as_str());
-        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
 
         let body = dashboard_body(state).await?;
 

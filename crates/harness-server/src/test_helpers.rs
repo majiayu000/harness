@@ -122,11 +122,28 @@ use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
 
+/// Fixture-only writer for a workflow row the public API refuses to produce.
+///
+/// The public `upsert_instance` is insert-only (GH-1784), so a fixture that
+/// needs a mid-lifecycle row has no validated path to it. This is the
+/// harness-server counterpart of the workflow crate's
+/// `force_upsert_lifecycle_state_for_test`, which is not reachable across the
+/// crate boundary.
+///
+/// It bypasses **only** the GH-1784 lifecycle rules. It does **not** bypass
+/// the GH-1771 row-level provenance invariant: the instance's `workflow.data`
+/// must still be fully covered by a provenance sidecar whose digests match
+/// it. Lifecycle position is what a fixture may fabricate; a sidecar that
+/// lies about its own data is a corrupt row no test needs.
+///
+/// Reach for a classified write API first. Use this only when the row's
+/// *lifecycle position* is what the fixture is constructing.
 #[cfg(test)]
-pub async fn force_upsert_runtime_instance_for_test(
+pub async fn force_upsert_runtime_lifecycle_state_for_test(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
     instance: &harness_workflow::runtime::WorkflowInstance,
 ) -> anyhow::Result<()> {
+    instance.validate_data_provenance()?;
     let data = serde_json::to_string(instance)?;
     sqlx::query(
         "INSERT INTO workflow_instances

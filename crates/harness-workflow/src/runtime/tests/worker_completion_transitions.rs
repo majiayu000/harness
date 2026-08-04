@@ -7,13 +7,13 @@ async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> any
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let workflow = project_issue_instance("/project-a", 123, "implementing").with_data(json!({
+    let workflow = project_issue_instance("/project-a", 123, "implementing").with_server_data(json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 123,
         "task_id": "task-123",
     }));
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let job = store
@@ -88,13 +88,13 @@ async fn runtime_worker_blocks_invalid_inline_bind_pr_before_persisting_command(
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let workflow = project_issue_instance("/project-a", 123, "implementing").with_data(json!({
+    let workflow = project_issue_instance("/project-a", 123, "implementing").with_server_data(json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 123,
         "task_id": "task-123",
     }));
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let job = store
@@ -165,13 +165,13 @@ async fn runtime_worker_blocks_implementation_success_without_pr_evidence() -> a
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let workflow = project_issue_instance("/project-a", 124, "implementing").with_data(json!({
+    let workflow = project_issue_instance("/project-a", 124, "implementing").with_server_data(json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 124,
         "task_id": "task-124",
     }));
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("implement_issue", "issue-124-implement");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let job = store
@@ -229,13 +229,13 @@ async fn runtime_worker_finishes_closed_issue_success_without_pr() -> anyhow::Re
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let workflow = project_issue_instance("/project-a", 125, "implementing").with_data(json!({
+    let workflow = project_issue_instance("/project-a", 125, "implementing").with_server_data(json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 125,
         "task_id": "task-125",
     }));
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("implement_issue", "issue-125-implement");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let job = store
@@ -306,12 +306,12 @@ async fn runtime_worker_propagates_pr_feedback_child_completion_to_parent() -> a
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",
         }));
-    store.force_upsert_instance_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -320,7 +320,7 @@ async fn runtime_worker_propagates_pr_feedback_child_completion_to_parent() -> a
     )
     .with_id("pr-feedback-child")
     .with_parent(parent.id.clone());
-    store.force_upsert_instance_for_test(&child).await?;
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
     let command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let command_id = store.enqueue_command(&child.id, None, &command).await?;
@@ -405,12 +405,12 @@ async fn runtime_worker_stamps_pr_feedback_child_with_inspected_remote_fact() ->
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent-pr-feedback-fact-stamp")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",
         }));
-    store.force_upsert_instance_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -419,11 +419,11 @@ async fn runtime_worker_stamps_pr_feedback_child_with_inspected_remote_fact() ->
     )
     .with_id("pr-feedback-child-fact-stamp")
     .with_parent(parent.id.clone())
-    .with_data(json!({
+    .with_server_data(json!({
         "remote_fact_hash": "sha256:pre-inspection",
         "remote_fact_activity_at": "2026-07-30T00:00:00Z",
     }));
-    store.force_upsert_instance_for_test(&child).await?;
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
     let command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let command_id = store.enqueue_command(&child.id, None, &command).await?;
@@ -523,12 +523,12 @@ async fn runtime_store_commits_parent_completion_event_decision_and_command() ->
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent-transaction")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",
         }));
-    store.force_upsert_instance_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
     let result = ActivityResult::succeeded(
         PR_FEEDBACK_INSPECT_ACTIVITY,
         "Runtime child workflow found actionable PR feedback.",
@@ -590,12 +590,12 @@ async fn runtime_store_rolls_back_parent_completion_when_reducer_fails() -> anyh
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent-rollback")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",
         }));
-    store.force_upsert_instance_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
 
     let error = store
         .commit_parent_runtime_completion(

@@ -7,7 +7,7 @@ async fn runtime_worker_blocks_when_profile_max_turns_is_exhausted() -> anyhow::
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = issue_instance("replanning");
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let mut profile = RuntimeProfile::new("codex-budgeted", RuntimeKind::CodexJsonrpc);
     profile.max_turns = Some(1);
 

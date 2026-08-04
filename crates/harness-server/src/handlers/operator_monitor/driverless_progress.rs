@@ -94,7 +94,7 @@ mod tests {
             .await?,
         );
         for id in ["driverless-a", "driverless-b"] {
-            crate::test_helpers::force_upsert_runtime_instance_for_test(
+            crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
                 &store,
                 &WorkflowInstance::new(
                     GITHUB_ISSUE_PR_DEFINITION_ID,

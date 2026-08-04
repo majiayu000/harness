@@ -207,12 +207,14 @@ mod tests {
             WorkflowSubject::new("issue", "issue:1170"),
         )
         .with_id("issue-1170")
-        .with_data(json!({
+        .with_server_data(json!({
             "project_id": "/project-a",
             "repo": "owner/repo",
             "issue_number": 1170,
         }));
-        store.force_upsert_instance_for_test(&workflow).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&workflow)
+            .await?;
 
         for activity in ["implement_issue", "inspect_pr_feedback"] {
             let command = WorkflowCommand::enqueue_activity(activity, activity);

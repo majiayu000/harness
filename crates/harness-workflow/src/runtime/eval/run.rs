@@ -1,4 +1,7 @@
-use super::{manifest::EvalBenchmarkCase, transition_outcome::accepted_transition_record};
+use super::{
+    data::eval_cleanup_data, manifest::EvalBenchmarkCase,
+    transition_outcome::accepted_transition_record,
+};
 use crate::runtime::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeCommandDispatcher,
     RuntimeJobStatus, RuntimeProfile, SubmissionMode, ValidationContext, WorkflowCommand,
@@ -159,7 +162,10 @@ pub async fn enqueue_eval_case_workflow(
     let mut submitted_instance = initial_instance.clone();
     submitted_instance.state = decision.next_state.clone();
     submitted_instance.version = submitted_instance.version.saturating_add(1);
-    submitted_instance.data = eval_case_submitted_data(input, &decision.decision);
+    submitted_instance.replace_classified_data(
+        eval_case_submitted_data(input, &decision.decision),
+        crate::runtime::DataProvenance::Server,
+    );
     let record = accepted_transition_record(
         store
             .apply_decision_transition(
@@ -344,8 +350,13 @@ async fn cancel_eval_workflow_instance(
     let mut final_instance = instance.clone();
     final_instance.state = "cancelled".to_string();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data =
-        eval_cleanup_data(final_instance.data, eval_run_id, &case.case_id, reason);
+    let cleanup_data = eval_cleanup_data(
+        final_instance.data.clone(),
+        eval_run_id,
+        &case.case_id,
+        reason,
+    );
+    final_instance.replace_classified_data(cleanup_data, crate::runtime::DataProvenance::Server);
 
     let decision = WorkflowDecision::new(
         &instance.id,
@@ -443,33 +454,6 @@ async fn collect_remaining_eval_resources(
     Ok(())
 }
 
-fn eval_cleanup_data(mut data: Value, eval_run_id: &str, case_id: &str, reason: &str) -> Value {
-    if !data.is_object() {
-        data = json!({});
-    }
-    let Some(object) = data.as_object_mut() else {
-        return data;
-    };
-    let eval = object
-        .entry("eval".to_string())
-        .or_insert_with(|| json!({}));
-    if !eval.is_object() {
-        *eval = json!({});
-    }
-    if let Some(eval_object) = eval.as_object_mut() {
-        eval_object.insert(
-            "cleanup".to_string(),
-            json!({
-                "status": "cancelled",
-                "eval_run_id": eval_run_id,
-                "case_id": case_id,
-                "reason": reason,
-            }),
-        );
-    }
-    data
-}
-
 fn active_command_status(status: WorkflowCommandStatus) -> bool {
     matches!(
         status,
@@ -498,7 +482,10 @@ pub(super) fn eval_case_initial_instance(input: EvalCaseWorkflowInput<'_>) -> Wo
         input.eval_run_id,
         &input.case.case_id,
     ))
-    .with_data(eval_case_submitted_data(input, "created"))
+    .with_classified_data(
+        eval_case_submitted_data(input, "created"),
+        crate::runtime::DataProvenance::Server,
+    )
 }
 
 fn eval_case_submitted_data(input: EvalCaseWorkflowInput<'_>, last_decision: &str) -> Value {

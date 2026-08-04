@@ -4,7 +4,7 @@ async fn seed_quality_gate_child_job(
     child_id: &str,
 ) -> anyhow::Result<RuntimeJob> {
     let parent = issue_instance("quality_gate_pending").with_id(parent_id);
-    store.force_upsert_instance_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
     let child = WorkflowInstance::new(
         QUALITY_GATE_DEFINITION_ID,
         1,
@@ -13,7 +13,7 @@ async fn seed_quality_gate_child_job(
     )
     .with_id(child_id)
     .with_parent(parent.id.clone());
-    store.force_upsert_instance_for_test(&child).await?;
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
     let command = WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-gate-77");
     let command_id = store.enqueue_command(&child.id, None, &command).await?;
     store
@@ -170,12 +170,12 @@ async fn runtime_worker_does_not_propagate_still_inspecting_pr_feedback_child() 
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent-still-inspecting")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",
         }));
-    store.force_upsert_instance_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -184,7 +184,7 @@ async fn runtime_worker_does_not_propagate_still_inspecting_pr_feedback_child() 
     )
     .with_id("pr-feedback-child-still-inspecting")
     .with_parent(parent.id.clone());
-    store.force_upsert_instance_for_test(&child).await?;
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
     let command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let command_id = store.enqueue_command(&child.id, None, &command).await?;
@@ -240,12 +240,12 @@ async fn runtime_worker_does_not_propagate_retrying_pr_feedback_child() -> anyho
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent-retry")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",
         }));
-    store.force_upsert_instance_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -254,7 +254,7 @@ async fn runtime_worker_does_not_propagate_retrying_pr_feedback_child() -> anyho
     )
     .with_id("pr-feedback-child-retry")
     .with_parent(parent.id.clone())
-    .with_data(json!({
+    .with_server_data(json!({
         "runtime_retry_policy": {
             "activity_retries": {
                 "inspect_pr_feedback": {
@@ -264,7 +264,7 @@ async fn runtime_worker_does_not_propagate_retrying_pr_feedback_child() -> anyho
             }
         }
     }));
-    store.force_upsert_instance_for_test(&child).await?;
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
     let command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let command_id = store.enqueue_command(&child.id, None, &command).await?;
@@ -329,12 +329,12 @@ async fn runtime_worker_does_not_propagate_terminal_pr_feedback_child_failure() 
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent-failed-child")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",
         }));
-    store.force_upsert_instance_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
@@ -343,7 +343,7 @@ async fn runtime_worker_does_not_propagate_terminal_pr_feedback_child_failure() 
     )
     .with_id("pr-feedback-child-failed")
     .with_parent(parent.id.clone());
-    store.force_upsert_instance_for_test(&child).await?;
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
     let command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
     let command_id = store.enqueue_command(&child.id, None, &command).await?;

@@ -4,6 +4,7 @@
 //! through the normal workflow runtime; this module only owns manifest parsing
 //! deterministic scoring primitives, and standard-path eval dispatch helpers.
 
+mod data;
 pub mod evidence;
 pub mod manifest;
 pub mod model;

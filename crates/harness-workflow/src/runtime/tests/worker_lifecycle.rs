@@ -60,7 +60,7 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
         WorkflowSubject::new("issue", "issue:77"),
     )
     .with_id("project-a::owner/repo::issue:77")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-a",
         "repo": "owner/repo",
         "issue_number": 77,
@@ -73,7 +73,7 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
         WorkflowSubject::new("issue", "issue:78"),
     )
     .with_id("project-a::owner/other::issue:78")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-a",
         "repo": "owner/other",
         "issue_number": 78,
@@ -86,15 +86,15 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
         WorkflowSubject::new("issue", "issue:79"),
     )
     .with_id("project-b::owner/repo::issue:79")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-b",
         "repo": "owner/repo",
         "issue_number": 79,
         "pr_number": 880,
     }));
-    store.force_upsert_instance_for_test(&matching).await?;
-    store.force_upsert_instance_for_test(&wrong_repo).await?;
-    store.force_upsert_instance_for_test(&wrong_project).await?;
+    store.force_upsert_lifecycle_state_for_test(&matching).await?;
+    store.force_upsert_lifecycle_state_for_test(&wrong_repo).await?;
+    store.force_upsert_lifecycle_state_for_test(&wrong_project).await?;
 
     let found = store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
@@ -401,7 +401,7 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = issue_instance("replanning");
-    store.force_upsert_instance_for_test(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("replan_issue", "replan-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let job = store

@@ -84,7 +84,7 @@ fn runtime_candidate_accepts_bound_pr_or_issue_only_target() {
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
     .with_id("workflow-1")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "/tmp/project",
         "repo": "owner/repo",
         "issue_number": 42,
@@ -104,7 +104,7 @@ fn runtime_candidate_accepts_bound_pr_or_issue_only_target() {
         "blocked",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
-    .with_data(json!({ "repo": "owner/repo", "issue_number": 42 }));
+    .with_server_data(json!({ "repo": "owner/repo", "issue_number": 42 }));
     let candidate = runtime_candidate_from_instance(&issue_only, chrono::Utc::now())
         .expect("issue-only workflow should reconcile");
     assert_eq!(candidate.issue_number, Some(42));
@@ -116,7 +116,7 @@ fn runtime_candidate_accepts_bound_pr_or_issue_only_target() {
         "done",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
-    .with_data(json!({ "pr_number": 77 }));
+    .with_server_data(json!({ "pr_number": 77 }));
     assert!(runtime_candidate_from_instance(&terminal, chrono::Utc::now()).is_none());
 
     let missing_remote = WorkflowInstance::new(

@@ -61,8 +61,8 @@ async fn seed_stopped_instance(
         WorkflowSubject::new("issue", format!("issue:{id}")),
     )
     .with_id(id.to_string())
-    .with_data(data);
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    .with_server_data(data);
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         format!("{id}-source"),
@@ -77,8 +77,14 @@ async fn seed_stopped_instance(
             command.command,
         )
         .await?;
-    workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    let mut last_stop = workflow.data["last_stop"].clone();
+    last_stop["runtime_job_id"] = json!(job.id);
+    workflow.set_data_field(
+        "last_stop",
+        last_stop,
+        harness_workflow::runtime::DataProvenance::Server,
+    )?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(workflow)
 }
 
@@ -238,8 +244,9 @@ async fn auto_recovery_selects_transient_and_skips_terminal_and_legacy() -> anyh
             WorkflowSubject::new("issue", "issue:ar-select-legacy"),
         )
         .with_id("ar-select-legacy".to_string())
-        .with_data(json!({ "repo": TEST_REPO, "blocked_reason": "legacy free text" }));
-        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
+        .with_server_data(json!({ "repo": TEST_REPO, "blocked_reason": "legacy free text" }));
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+            .await?;
         workflow
     };
 
@@ -660,8 +667,8 @@ async fn auto_recovery_terminal_recheck_outcome_stops_scheduling() -> anyhow::Re
         WorkflowSubject::new("issue", "issue:ar-recheck-1"),
     )
     .with_id("ar-recheck-1".to_string())
-    .with_data(data);
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
+    .with_server_data(data);
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow).await?;
 
     let now = Utc::now();
     let tick = run_auto_recovery_tick(
@@ -746,7 +753,7 @@ async fn auto_recovery_scan_is_not_starved_by_ineligible_backlog() -> anyhow::Re
             WorkflowSubject::new("issue", format!("issue:ar-starve-{index}")),
         )
         .with_id(format!("ar-starve-{index}"))
-        .with_data(json!({
+        .with_server_data(json!({
             "repo": TEST_REPO,
             "stop_reason_code": "maintainer_input_required",
             "reason_class": "terminal",
@@ -756,7 +763,8 @@ async fn auto_recovery_scan_is_not_starved_by_ineligible_backlog() -> anyhow::Re
                 "event_id": format!("episode-{index}"),
             },
         }));
-        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+            .await?;
     }
     // The eligible instance arrives last (newest updated_at).
     let eligible = seed_stopped_instance(

@@ -24,11 +24,11 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-auto-submit-replay")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:129:start",
@@ -74,14 +74,14 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 129,
         "started_by_runtime_job_id": runtime_job.id.clone(),
         "started_by_command_id": command_id.clone(),
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     store
         .append_event(
             &child_id,
@@ -121,12 +121,18 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         .get_instance(&child_id)
         .await?
         .expect("child workflow should exist after submission");
-    if let Some(data) = submitted_child.data.as_object_mut() {
-        data.remove("submission_id");
-        data.remove("task_id");
-        data.remove("task_ids");
-    }
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &submitted_child).await?;
+    // Simulate a child row that never recorded submission bookkeeping. The
+    // removals go through the classified write API so the provenance sidecar
+    // drops the classifications with the fields instead of retaining pointers
+    // into data that no longer exists.
+    submitted_child.apply_data_writes(["submission_id", "task_id", "task_ids"].map(|field| {
+        harness_workflow::runtime::WorkflowDataWrite::remove(
+            field,
+            harness_workflow::runtime::DataProvenance::Server,
+        )
+    }))?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &submitted_child)
+        .await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,
@@ -197,11 +203,11 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-auto-submit-event-only")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:130:start",
@@ -247,14 +253,14 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 130,
         "started_by_runtime_job_id": runtime_job.id.clone(),
         "started_by_command_id": command_id.clone(),
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     store
         .append_event(
             &child_id,
@@ -364,11 +370,11 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-auto-submit-reopen")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let first_command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:131:start:first",
@@ -434,13 +440,13 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
         .await?;
     child.state = "failed".to_string();
     child.version += 1;
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     let mut parent = store
         .get_instance("prompt-task-auto-submit-reopen")
         .await?
         .expect("parent workflow should still exist");
     parent.state = "implementing".to_string();
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let second_command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:issue:131:start:second",

@@ -633,7 +633,7 @@ mod tests {
             max_turns: Some(8),
             ..Default::default()
         });
-        crate::test_helpers::force_upsert_runtime_instance_for_test(
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
             &workflow_runtime_store,
             &harness_workflow::runtime::WorkflowInstance::new(
                 harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
@@ -642,7 +642,7 @@ mod tests {
                 harness_workflow::runtime::WorkflowSubject::new("issue", "issue:882"),
             )
             .with_id(workflow_id.clone())
-            .with_data(json!({
+            .with_server_data(json!({
                 "project_id": project_id,
                 "repo": "owner/repo",
                 "issue_number": 882,
@@ -739,7 +739,7 @@ mod tests {
                 _pool_permit: None,
             },
         );
-        crate::test_helpers::force_upsert_runtime_instance_for_test(
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
             &workflow_runtime_store,
             &harness_workflow::runtime::WorkflowInstance::new(
                 harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
@@ -748,7 +748,7 @@ mod tests {
                 harness_workflow::runtime::WorkflowSubject::new("issue", "issue:884"),
             )
             .with_id("workflow-1".to_string())
-            .with_data(json!({
+            .with_server_data(json!({
                 "submission_id": "runtime-submission-1",
                 "task_id": "runtime-workspace-1",
                 "task_ids": ["runtime-workspace-1"]

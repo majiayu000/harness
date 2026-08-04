@@ -155,7 +155,7 @@ mod tests {
             definition.policy().initial.clone(),
             WorkflowSubject::new("test", "submission"),
         )
-        .with_data(json!({ "definition_hash": definition.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
 
         let decision = build_declarative_submission_decision(&definition, &instance)?;
         assert_eq!(decision.decision, DECLARATIVE_SUBMISSION_DECISION);
@@ -181,7 +181,7 @@ mod tests {
             definition.policy().initial.clone(),
             WorkflowSubject::new("test", "submission-mismatch"),
         )
-        .with_data(json!({ "definition_hash": definition.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
 
         assert!(build_declarative_submission_decision(&definition, &instance).is_err());
     }

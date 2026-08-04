@@ -15,7 +15,7 @@ async fn runtime_store_get_instance_by_pr_prefers_issue_bound_workflow() -> anyh
         WorkflowSubject::new("issue", "issue:77"),
     )
     .with_id("project-a::owner/repo::issue:77")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-a",
         "repo": "owner/repo",
         "issue_number": 77,
@@ -28,14 +28,18 @@ async fn runtime_store_get_instance_by_pr_prefers_issue_bound_workflow() -> anyh
         WorkflowSubject::new("pull_request", "pr:880"),
     )
     .with_id("project-a::owner/repo::pr:880")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-a",
         "repo": "owner/repo",
         "pr_number": 880,
     }));
-    store.force_upsert_instance_for_test(&issue_bound).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&issue_bound)
+        .await?;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    store.force_upsert_instance_for_test(&pr_only).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&pr_only)
+        .await?;
 
     let found = store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
@@ -54,7 +58,9 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("done");
-    store.force_upsert_instance_for_test(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let job = enqueue_workflow_runtime_job(
         &store,
         &instance.id,
@@ -95,7 +101,9 @@ async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Res
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("implementing").with_id("issue-dedupe-refresh");
-    store.force_upsert_instance_for_test(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
 
     let first =
         WorkflowCommand::enqueue_activity("implement_issue", "issue:owner/repo:issue:1200:start");

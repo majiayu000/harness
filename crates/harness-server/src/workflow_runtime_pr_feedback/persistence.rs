@@ -301,7 +301,8 @@ pub(super) async fn persist_pr_feedback(
     )
     .await?;
     if instance.state == "pr_open" {
-        crate::test_helpers::force_upsert_runtime_instance_for_test(store, &instance).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &instance)
+            .await?;
         request_local_review(store, &instance.id).await?;
         return Ok(());
     }
@@ -680,7 +681,8 @@ pub(super) async fn commit_runtime_decision(
     let mut final_instance = instance.clone();
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = merge_last_decision(accepted_data, &decision.decision);
+    let data = merge_last_decision(accepted_data, &decision.decision);
+    replace_pr_runtime_data(&mut final_instance, data)?;
     let create_if_missing = new_instance.then_some(&instance);
     let record = store
         .apply_decision_transition(

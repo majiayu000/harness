@@ -50,7 +50,7 @@ async fn cancelled_recovered_quality_gate_is_reactivated_after_terminal_job() ->
     let mut parent = store.get_instance(&workflow_id).await?.expect("parent");
     parent.state = "cancelled".to_string();
     parent.version += 1;
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &parent).await?;
 
     let second_graphql = ready_pr_server(issue_number, pr_number).await;
     recover_with_urls(

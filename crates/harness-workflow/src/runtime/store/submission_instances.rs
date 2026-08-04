@@ -1,7 +1,7 @@
 use super::instance_helpers::terminal_task_status_rows;
 use super::{
-    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubmissionHourlyDone,
-    WorkflowSubmissionMetrics, WorkflowSubmissionProjectMetrics,
+    workflow_instance_from_persisted_json, WorkflowInstance, WorkflowRuntimeStore,
+    WorkflowSubmissionHourlyDone, WorkflowSubmissionMetrics, WorkflowSubmissionProjectMetrics,
 };
 use crate::runtime::declarative_pinning::DECLARATIVE_DEFINITION_METADATA_KIND;
 use chrono::{DateTime, Utc};
@@ -164,7 +164,7 @@ impl WorkflowRuntimeStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| Ok(serde_json::from_str(&data)?))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .collect()
     }
 
@@ -458,7 +458,7 @@ mod tests {
         let subject = WorkflowSubject::new("issue", "owner/repo#1");
         let done = WorkflowInstance::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, "done", subject.clone())
             .with_id("submission-metrics-done")
-            .with_data(json!({
+            .with_server_data(json!({
                 "submission_id": "submission-metrics-done",
                 "project_id": "/repo",
                 "pr_url": "https://github.com/owner/repo/pull/1"
@@ -466,19 +466,21 @@ mod tests {
         let failed =
             WorkflowInstance::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, "failed", subject.clone())
                 .with_id("submission-metrics-failed")
-                .with_data(json!({
+                .with_server_data(json!({
                     "submission_id": "submission-metrics-failed",
                     "project_id": "/repo"
                 }));
         let stalled = WorkflowInstance::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, "failed", subject)
             .with_id("submission-metrics-stalled")
-            .with_data(json!({
+            .with_server_data(json!({
                 "submission_id": "submission-metrics-stalled",
                 "project_id": "/repo",
                 "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
             }));
         for workflow in [&done, &failed, &stalled] {
-            store.force_upsert_instance_for_test(workflow).await?;
+            store
+                .force_upsert_lifecycle_state_for_test(workflow)
+                .await?;
         }
 
         let metrics = store

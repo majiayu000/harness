@@ -1,9 +1,9 @@
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
-    build_plan_issue_decision, PlanIssueDecisionInput, PlanIssueWorkflowAction, WorkflowCommand,
-    WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition,
-    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition,
-    WorkflowRuntimeStore, WorkflowSubject,
+    build_plan_issue_decision, DataProvenance, PlanIssueDecisionInput, PlanIssueWorkflowAction,
+    WorkflowCommand, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
+    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
 };
 use serde_json::json;
 use std::path::Path;
@@ -65,7 +65,7 @@ async fn persist_plan_issue_decision(
             "GitHub issue PR workflow",
         ))
         .await?;
-    let (mut instance, new_instance) = match store.get_instance(&workflow_id).await? {
+    let (instance, new_instance) = match store.get_instance(&workflow_id).await? {
         Some(instance) => (instance, false),
         None => (
             issue_instance(
@@ -78,16 +78,6 @@ async fn persist_plan_issue_decision(
             true,
         ),
     };
-    instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
-        ctx.project_root,
-        json!({
-        "project_id": project_id,
-        "repo": ctx.repo,
-        "issue_number": ctx.issue_number,
-        "task_id": ctx.task_id.as_str(),
-        "plan_concern": ctx.plan_issue,
-        }),
-    );
     let event_payload = json!({
         "task_id": ctx.task_id.as_str(),
         "issue_number": ctx.issue_number,
@@ -110,17 +100,20 @@ async fn persist_plan_issue_decision(
     let mut final_instance = instance.clone();
     final_instance.state = output.decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
-        ctx.project_root,
-        json!({
-        "project_id": ctx.project_root.to_string_lossy(),
-        "repo": ctx.repo,
-        "issue_number": ctx.issue_number,
-        "task_id": ctx.task_id.as_str(),
-        "plan_concern": ctx.plan_issue,
-        "last_decision": output.decision.decision,
-        }),
-    );
+    replace_plan_issue_data(
+        &mut final_instance,
+        crate::workflow_runtime_policy::merge_runtime_retry_policy(
+            ctx.project_root,
+            json!({
+                "project_id": ctx.project_root.to_string_lossy(),
+                "repo": ctx.repo,
+                "issue_number": ctx.issue_number,
+                "task_id": ctx.task_id.as_str(),
+                "plan_concern": ctx.plan_issue,
+                "last_decision": output.decision.decision,
+            }),
+        ),
+    )?;
     let record = store
         .apply_decision_transition(
             WorkflowDecisionTransition {
@@ -240,16 +233,19 @@ async fn persist_replan_completed(
     let mut final_instance = instance.clone();
     final_instance.state = "implementing".to_string();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
-        project_root,
-        json!({
-        "project_id": project_id,
-        "repo": repo,
-        "issue_number": issue_number,
-        "task_id": task_id.as_str(),
-        "last_event": "ReplanCompleted",
-        }),
-    );
+    replace_plan_issue_data(
+        &mut final_instance,
+        crate::workflow_runtime_policy::merge_runtime_retry_policy(
+            project_root,
+            json!({
+                "project_id": project_id,
+                "repo": repo,
+                "issue_number": issue_number,
+                "task_id": task_id.as_str(),
+                "last_event": "ReplanCompleted",
+            }),
+        ),
+    )?;
     let record = store
         .apply_decision_transition(
             WorkflowDecisionTransition {
@@ -322,14 +318,27 @@ fn issue_instance(
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id)
-    .with_data(crate::workflow_runtime_policy::merge_runtime_retry_policy(
-        Path::new(&project_id),
-        json!({
-            "project_id": project_id,
-            "repo": repo,
-            "issue_number": issue_number,
-        }),
-    ))
+    .with_classified_data(
+        crate::workflow_runtime_policy::merge_runtime_retry_policy(
+            Path::new(&project_id),
+            json!({
+                "project_id": project_id,
+                "repo": repo,
+                "issue_number": issue_number,
+            }),
+        ),
+        DataProvenance::Server,
+    )
+}
+
+fn replace_plan_issue_data(
+    instance: &mut WorkflowInstance,
+    data: serde_json::Value,
+) -> anyhow::Result<()> {
+    instance.replace_data_with_field_provenance(data, |field| match field {
+        "plan_concern" => DataProvenance::Agent,
+        _ => DataProvenance::Server,
+    })
 }
 
 #[cfg(test)]
@@ -497,13 +506,14 @@ Workflow policy
             124,
             "replanning",
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "project_id": project_root.to_string_lossy(),
             "repo": "owner/repo",
             "issue_number": 124,
             "task_id": "current-replan-task",
         }));
-        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &instance).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &instance)
+            .await?;
 
         let error = persist_replan_completed(
             &store,
@@ -552,13 +562,14 @@ Workflow policy
             125,
             "planning",
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "project_id": project_root.to_string_lossy(),
             "repo": "owner/repo",
             "issue_number": 125,
             "task_id": "current-replan-task",
         }));
-        crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &instance).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &instance)
+            .await?;
 
         let error = persist_replan_completed(
             &store,

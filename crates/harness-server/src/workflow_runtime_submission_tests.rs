@@ -211,7 +211,7 @@ fn terminal_prompt_submission_removes_cached_prompt() {
         "done",
         WorkflowSubject::new("prompt", "manual:prompt:cleanup"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "task_id": "runtime-prompt-cleanup",
         "prompt_ref": prompt_ref,
     }));
@@ -237,7 +237,7 @@ async fn prompt_resubmission_removes_previous_cached_prompt() -> anyhow::Result<
     let old_prompt_ref = "prompt-memory:test-resubmit-old";
     cache_prompt_submission_prompt(old_prompt_ref, "old sensitive prompt body");
     let workflow_id = prompt_workflow_id(&project_id, Some(external_id), &task_id);
-    crate::test_helpers::force_upsert_runtime_instance_for_test(
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &store,
         &WorkflowInstance::new(
             PROMPT_TASK_DEFINITION_ID,
@@ -246,7 +246,7 @@ async fn prompt_resubmission_removes_previous_cached_prompt() -> anyhow::Result<
             WorkflowSubject::new("prompt", external_id),
         )
         .with_id(workflow_id)
-        .with_data(json!({
+        .with_server_data(json!({
             "project_id": project_id,
             "task_id": "old-prompt-task",
             "prompt_ref": old_prompt_ref,
@@ -666,16 +666,19 @@ async fn rejected_issue_submission_keeps_existing_runtime_data() -> anyhow::Resu
         42,
     );
     existing.state = "pr_open".to_string();
-    existing.data = serde_json::json!({
-        "project_id": project_root.to_string_lossy(),
-        "repo": "owner/repo",
-        "issue_number": 42,
-        "task_id": "older-task",
-        "pr_url": "https://github.com/owner/repo/pull/99",
-        "last_decision": "bind_pr"
-    });
+    existing.replace_classified_data(
+        serde_json::json!({
+            "project_id": project_root.to_string_lossy(),
+            "repo": "owner/repo",
+            "issue_number": 42,
+            "task_id": "older-task",
+            "pr_url": "https://github.com/owner/repo/pull/99",
+            "last_decision": "bind_pr"
+        }),
+        harness_workflow::runtime::DataProvenance::Server,
+    );
     let original_data = existing.data.clone();
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&store, &existing).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &existing).await?;
 
     let task_id = TaskId::from_str("new-task");
     let labels = vec!["bug".to_string()];

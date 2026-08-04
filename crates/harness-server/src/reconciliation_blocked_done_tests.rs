@@ -45,7 +45,7 @@ async fn blocked_runtime_reconciliation_marks_merged_pr_done() -> anyhow::Result
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:48"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 48,
@@ -53,8 +53,11 @@ async fn blocked_runtime_reconciliation_marks_merged_pr_done() -> anyhow::Result
         "pr_number": 103,
         "pr_url": "https://github.com/owner/repo/pull/103",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&stores.runtime_store, &instance)
-        .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &stores.runtime_store,
+        &instance,
+    )
+    .await?;
 
     let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),
@@ -135,15 +138,18 @@ async fn blocked_runtime_reconciliation_marks_slug_only_merged_pr_done() -> anyh
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:49"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 49,
         "task_id": "task-8",
         "pr_number": 104,
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(&stores.runtime_store, &instance)
-        .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &stores.runtime_store,
+        &instance,
+    )
+    .await?;
 
     let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),

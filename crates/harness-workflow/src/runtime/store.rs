@@ -99,7 +99,7 @@ pub use submission_commit::{
 };
 pub use submission_instances::WorkflowSubmissionFilter;
 #[cfg(test)]
-use transaction_helpers::force_upsert_instance_for_test_tx;
+use transaction_helpers::force_upsert_lifecycle_state_for_test_tx;
 use transaction_helpers::{
     apply_inline_command_side_effect, commit_decision_instance_tx,
     commit_parent_attachment_instance_tx, commit_rejected_initial_failure_instance_tx,
@@ -266,9 +266,27 @@ fn workflow_instance_from_row(
     data: String,
     updated_at: DateTime<Utc>,
 ) -> anyhow::Result<WorkflowInstance> {
-    let mut instance: WorkflowInstance = serde_json::from_str(&data)?;
+    let mut instance = workflow_instance_from_persisted_json(&data)?;
     instance.updated_at = updated_at;
     Ok(instance)
+}
+
+pub(crate) fn workflow_instance_from_persisted_json(
+    data: &str,
+) -> anyhow::Result<WorkflowInstance> {
+    let mut instance: WorkflowInstance = serde_json::from_str(data)?;
+    if instance.data_provenance.is_none() {
+        instance.data_provenance = Some(
+            super::data_provenance::WorkflowDataProvenance::migrated_from_persisted_data(
+                &instance.data,
+            )?,
+        );
+    }
+    Ok(instance)
+}
+
+fn validate_instance_for_persistence(instance: &WorkflowInstance) -> anyhow::Result<()> {
+    instance.validate_data_provenance()
 }
 
 impl WorkflowRuntimeStore {
@@ -306,5 +324,64 @@ impl WorkflowRuntimeStore {
     }
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+}
+
+#[cfg(test)]
+mod persistence_provenance_tests {
+    use super::*;
+    use crate::runtime::{DataProvenance, WorkflowSubject};
+
+    fn instance() -> WorkflowInstance {
+        WorkflowInstance::new(
+            "provenance-test",
+            1,
+            "active",
+            WorkflowSubject::new("test", "provenance-test"),
+        )
+    }
+
+    #[test]
+    fn only_persisted_rows_without_a_sidecar_cross_the_legacy_boundary() {
+        let mut value = serde_json::to_value(instance()).expect("serialize instance");
+        value["data"] = json!({"historical_summary": "legacy"});
+        value
+            .as_object_mut()
+            .expect("instance is an object")
+            .remove("data_provenance");
+
+        let loaded = workflow_instance_from_persisted_json(
+            &serde_json::to_string(&value).expect("serialize persisted row"),
+        )
+        .expect("persisted legacy row should migrate");
+
+        assert!(loaded
+            .data_provenance
+            .as_ref()
+            .is_some_and(|sidecar| sidecar.is_legacy("/historical_summary")));
+        validate_instance_for_persistence(&loaded)
+            .expect("migrated legacy row should be persistable");
+
+        let mut unpersisted = instance();
+        unpersisted.data = json!({"historical_summary": "not persisted"});
+        let error = validate_instance_for_persistence(&unpersisted)
+            .expect_err("new unclassified data must fail closed");
+        assert!(error
+            .to_string()
+            .contains("unclassified workflow.data field"));
+    }
+
+    #[test]
+    fn central_persistence_rejects_raw_overwrite_of_a_classified_value() {
+        let mut instance = instance()
+            .with_classified_data(json!({"server_fact": "verified"}), DataProvenance::Server);
+        instance.data["server_fact"] = json!("tampered");
+
+        let error = validate_instance_for_persistence(&instance)
+            .expect_err("raw mutation must not survive the persistence boundary");
+
+        assert!(error
+            .to_string()
+            .contains("changed outside the classified write API"));
     }
 }

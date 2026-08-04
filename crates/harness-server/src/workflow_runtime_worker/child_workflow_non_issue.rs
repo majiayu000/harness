@@ -16,8 +16,8 @@ use super::child_workflow_replay::{
     decision_for_event, ensure_runtime_job_still_owns_lease,
 };
 use super::data_helpers::{
-    activity_name, merge_json_object, merge_pr_feedback_child_data, optional_string,
-    parse_pr_subject_key, required_string, string_vec, PrFeedbackChildData,
+    activity_name, merge_pr_feedback_child_data, optional_string, parse_pr_subject_key,
+    required_string, string_vec, PrFeedbackChildData,
 };
 use super::workspace::{is_active_pr_feedback_inspect_command, is_pr_feedback_inspect_command};
 
@@ -194,22 +194,59 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
     } else if child.parent_workflow_id.is_none() {
         child.parent_workflow_id = Some(parent.id.clone());
     }
-    merge_json_object(
-        &mut child.data,
-        json!({
-            "project_id": project_id,
-            "repo": repo,
-            "pr_number": pr_number,
-            "pr_url": pr_url.clone(),
-            "parent_workflow_id": parent.id.as_str(),
-            "runtime_job_id": job.id.as_str(),
-            "command_id": job.command_id.as_str(),
-            "started_by_runtime_job_id": job.id.as_str(),
-            "started_by_command_id": job.command_id.as_str(),
-            "validation_commands": validation_commands.clone(),
-        }),
-    );
-    let inherited_trust = inherit_author_trust_class(&mut child.data, &parent.data)?;
+    child.apply_data_writes([
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "project_id",
+            json!(project_id),
+            harness_workflow::runtime::DataProvenance::Server,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "repo",
+            json!(repo),
+            harness_workflow::runtime::DataProvenance::Agent,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "pr_number",
+            json!(pr_number),
+            harness_workflow::runtime::DataProvenance::Server,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "pr_url",
+            json!(pr_url),
+            harness_workflow::runtime::DataProvenance::Agent,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "parent_workflow_id",
+            json!(parent.id),
+            harness_workflow::runtime::DataProvenance::Server,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "runtime_job_id",
+            json!(job.id),
+            harness_workflow::runtime::DataProvenance::Server,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "command_id",
+            json!(job.command_id),
+            harness_workflow::runtime::DataProvenance::Server,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "started_by_runtime_job_id",
+            json!(job.id),
+            harness_workflow::runtime::DataProvenance::Server,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "started_by_command_id",
+            json!(job.command_id),
+            harness_workflow::runtime::DataProvenance::Server,
+        ),
+        harness_workflow::runtime::WorkflowDataWrite::set(
+            "validation_commands",
+            json!(validation_commands),
+            harness_workflow::runtime::DataProvenance::Agent,
+        ),
+    ])?;
+    let inherited_trust = inherit_author_trust_class(&mut child, &parent.data)?;
     if !child_started_by_command || !child_start_event_recorded {
         child = store
             .ensure_child_workflow_started(WorkflowChildStart {
@@ -419,8 +456,8 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
     } else if child.parent_workflow_id.is_none() {
         child.parent_workflow_id = Some(parent.id.clone());
     }
-    child.data = merge_pr_feedback_child_data(
-        child.data,
+    merge_pr_feedback_child_data(
+        &mut child,
         PrFeedbackChildData {
             project_id,
             repo,
@@ -434,8 +471,8 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             remote_fact_hash,
             remote_fact_activity_at,
         },
-    );
-    let inherited_trust = inherit_author_trust_class(&mut child.data, &parent.data)?;
+    )?;
+    let inherited_trust = inherit_author_trust_class(&mut child, &parent.data)?;
     if !child_started_by_command || !child_start_event_recorded {
         child = store
             .ensure_child_workflow_started(WorkflowChildStart {
@@ -603,7 +640,7 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
 }
 
 fn inherit_author_trust_class(
-    child: &mut Value,
+    child: &mut WorkflowInstance,
     parent: &Value,
 ) -> anyhow::Result<Option<harness_core::config::isolation::IsolationTrustClass>> {
     use harness_core::config::isolation::IsolationTrustClass;
@@ -613,10 +650,8 @@ fn inherit_author_trust_class(
     };
     let parent_trust: IsolationTrustClass = serde_json::from_value(value.clone())
         .map_err(|error| anyhow::anyhow!("invalid parent author_trust_class: {error}"))?;
-    let child = child
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("child workflow data must be an object"))?;
     let child_trust = child
+        .data
         .get("author_trust_class")
         .map(|value| {
             serde_json::from_value::<IsolationTrustClass>(value.clone())
@@ -630,10 +665,11 @@ fn inherit_author_trust_class(
     } else {
         IsolationTrustClass::Trusted
     };
-    child.insert(
-        "author_trust_class".to_string(),
+    child.set_data_field(
+        "author_trust_class",
         serde_json::to_value(effective)?,
-    );
+        harness_workflow::runtime::DataProvenance::Server,
+    )?;
     Ok(Some(effective))
 }
 
@@ -643,20 +679,32 @@ mod trust_tests {
 
     #[test]
     fn child_inherits_non_collaborator_trust() -> anyhow::Result<()> {
-        let mut child = json!({});
+        let mut child = WorkflowInstance::new(
+            "pr_feedback",
+            1,
+            "pending",
+            harness_workflow::runtime::WorkflowSubject::new("pr", "pr:1"),
+        );
         inherit_author_trust_class(
             &mut child,
             &json!({"author_trust_class": "non_collaborator"}),
         )?;
-        assert_eq!(child["author_trust_class"], "non_collaborator");
+        assert_eq!(child.data["author_trust_class"], "non_collaborator");
         Ok(())
     }
 
     #[test]
     fn malformed_parent_trust_fails_closed() {
-        let error =
-            inherit_author_trust_class(&mut json!({}), &json!({"author_trust_class": "unknown"}))
-                .expect_err("invalid trust metadata must fail");
+        let error = inherit_author_trust_class(
+            &mut WorkflowInstance::new(
+                "pr_feedback",
+                1,
+                "pending",
+                harness_workflow::runtime::WorkflowSubject::new("pr", "pr:1"),
+            ),
+            &json!({"author_trust_class": "unknown"}),
+        )
+        .expect_err("invalid trust metadata must fail");
         assert!(error
             .to_string()
             .contains("invalid parent author_trust_class"));
@@ -664,19 +712,32 @@ mod trust_tests {
 
     #[test]
     fn trusted_parent_does_not_downgrade_non_collaborator_child() -> anyhow::Result<()> {
-        let mut child = json!({"author_trust_class": "non_collaborator"});
+        let mut child = WorkflowInstance::new(
+            "pr_feedback",
+            1,
+            "pending",
+            harness_workflow::runtime::WorkflowSubject::new("pr", "pr:1"),
+        )
+        .with_data_field_provenance(json!({"author_trust_class": "non_collaborator"}), |_| {
+            harness_workflow::runtime::DataProvenance::Server
+        });
         inherit_author_trust_class(&mut child, &json!({"author_trust_class": "trusted"}))?;
-        assert_eq!(child["author_trust_class"], "non_collaborator");
+        assert_eq!(child.data["author_trust_class"], "non_collaborator");
         Ok(())
     }
 
     #[test]
     fn malformed_child_trust_fails_closed() {
-        let error = inherit_author_trust_class(
-            &mut json!({"author_trust_class": "unknown"}),
-            &json!({"author_trust_class": "trusted"}),
+        let mut child = WorkflowInstance::new(
+            "pr_feedback",
+            1,
+            "pending",
+            harness_workflow::runtime::WorkflowSubject::new("pr", "pr:1"),
         )
-        .expect_err("invalid child trust metadata must fail");
+        .with_server_data(json!({"author_trust_class": "unknown"}));
+        let error =
+            inherit_author_trust_class(&mut child, &json!({"author_trust_class": "trusted"}))
+                .expect_err("invalid child trust metadata must fail");
         assert!(error
             .to_string()
             .contains("invalid child author_trust_class"));

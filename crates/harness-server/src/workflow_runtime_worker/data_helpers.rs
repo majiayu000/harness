@@ -1,7 +1,8 @@
 use anyhow::Context;
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
-    RuntimeJob, WorkflowInstance, WorkflowRuntimeStore, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    DataProvenance, RuntimeJob, WorkflowDataWrite, WorkflowInstance, WorkflowRuntimeStore,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -196,27 +197,40 @@ pub(super) fn parse_pr_subject_key(subject_key: &str) -> Option<u64> {
 }
 
 pub(super) fn merge_child_issue_data(
-    mut data: Value,
+    child: &mut WorkflowInstance,
     project_id: &str,
     repo: Option<&str>,
     issue_number: u64,
     runtime_job_id: &str,
     command_id: &str,
-) -> Value {
-    if !data.is_object() {
-        data = json!({});
-    }
-    if let Some(object) = data.as_object_mut() {
-        object.insert("project_id".to_string(), json!(project_id));
-        object.insert("repo".to_string(), json!(repo));
-        object.insert("issue_number".to_string(), json!(issue_number));
-        object.insert(
-            "started_by_runtime_job_id".to_string(),
+) -> anyhow::Result<()> {
+    let mut writes = vec![
+        WorkflowDataWrite::set("project_id", json!(project_id), DataProvenance::Server),
+        WorkflowDataWrite::set("repo", json!(repo), DataProvenance::Agent),
+        WorkflowDataWrite::set("issue_number", json!(issue_number), DataProvenance::Server),
+        WorkflowDataWrite::set(
+            "started_by_runtime_job_id",
             json!(runtime_job_id),
-        );
-        object.insert("started_by_command_id".to_string(), json!(command_id));
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
+            "started_by_command_id",
+            json!(command_id),
+            DataProvenance::Server,
+        ),
+    ];
+    let merged = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        Path::new(project_id),
+        child.data.clone(),
+    );
+    if let Some(policy) = merged.get("runtime_retry_policy") {
+        writes.push(WorkflowDataWrite::set(
+            "runtime_retry_policy",
+            policy.clone(),
+            DataProvenance::Server,
+        ));
     }
-    crate::workflow_runtime_policy::merge_runtime_retry_policy(Path::new(project_id), data)
+    child.apply_data_writes(writes)
 }
 
 pub(super) struct PrFeedbackChildData<'a> {
@@ -234,53 +248,70 @@ pub(super) struct PrFeedbackChildData<'a> {
 }
 
 pub(super) fn merge_pr_feedback_child_data(
-    mut data: Value,
+    child: &mut WorkflowInstance,
     input: PrFeedbackChildData<'_>,
-) -> Value {
-    if !data.is_object() {
-        data = json!({});
-    }
-    if let Some(object) = data.as_object_mut() {
-        object.insert("project_id".to_string(), json!(input.project_id));
-        object.insert("repo".to_string(), json!(input.repo));
-        object.insert("issue_number".to_string(), json!(input.issue_number));
-        object.insert("pr_number".to_string(), json!(input.pr_number));
-        object.insert("pr_url".to_string(), json!(input.pr_url));
-        object.insert(
-            "expected_base_ref".to_string(),
+) -> anyhow::Result<()> {
+    let mut writes = vec![
+        WorkflowDataWrite::set(
+            "project_id",
+            json!(input.project_id),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set("repo", json!(input.repo), DataProvenance::Agent),
+        WorkflowDataWrite::set(
+            "issue_number",
+            json!(input.issue_number),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set("pr_number", json!(input.pr_number), DataProvenance::Server),
+        WorkflowDataWrite::set("pr_url", json!(input.pr_url), DataProvenance::Agent),
+        // Base ref and remote activity time are observed on the remote, so
+        // they stay externally classified. The fact hash is the digest
+        // Harness itself computes over those observations, so it is server
+        // data about external data, not external data.
+        WorkflowDataWrite::set(
+            "expected_base_ref",
             json!(input.expected_base_ref),
-        );
-        object.insert(
-            "remote_fact_hash".to_string(),
+            DataProvenance::External,
+        ),
+        WorkflowDataWrite::set(
+            "remote_fact_hash",
             json!(input.remote_fact_hash),
-        );
-        object.insert(
-            "remote_fact_activity_at".to_string(),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
+            "remote_fact_activity_at",
             json!(input.remote_fact_activity_at),
-        );
-        object.insert(
-            "parent_workflow_id".to_string(),
+            DataProvenance::External,
+        ),
+        WorkflowDataWrite::set(
+            "parent_workflow_id",
             json!(input.parent_workflow_id),
-        );
-        object.insert(
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
             "started_by_runtime_job_id".to_string(),
             json!(input.runtime_job_id),
-        );
-        object.insert("started_by_command_id".to_string(), json!(input.command_id));
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
+            "started_by_command_id",
+            json!(input.command_id),
+            DataProvenance::Server,
+        ),
+    ];
+    let merged = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        Path::new(input.project_id),
+        child.data.clone(),
+    );
+    if let Some(policy) = merged.get("runtime_retry_policy") {
+        writes.push(WorkflowDataWrite::set(
+            "runtime_retry_policy",
+            policy.clone(),
+            DataProvenance::Server,
+        ));
     }
-    crate::workflow_runtime_policy::merge_runtime_retry_policy(Path::new(input.project_id), data)
-}
-
-pub(super) fn merge_json_object(target: &mut Value, update: Value) {
-    let Some(target_object) = target.as_object_mut() else {
-        return;
-    };
-    let Some(update_object) = update.as_object() else {
-        return;
-    };
-    for (key, value) in update_object {
-        target_object.insert(key.clone(), value.clone());
-    }
+    child.apply_data_writes(writes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,8 +440,14 @@ mod tests {
 
     #[test]
     fn pr_feedback_child_data_preserves_remote_fact_metadata() {
-        let data = merge_pr_feedback_child_data(
-            json!({}),
+        let mut child = WorkflowInstance::new(
+            "pr_feedback",
+            1,
+            "inspecting",
+            harness_workflow::runtime::WorkflowSubject::new("pr", "pr:77"),
+        );
+        merge_pr_feedback_child_data(
+            &mut child,
             PrFeedbackChildData {
                 project_id: "/project",
                 repo: Some("owner/repo"),
@@ -424,11 +461,37 @@ mod tests {
                 remote_fact_hash: Some("sha256:fact"),
                 remote_fact_activity_at: Some("2026-06-10T00:00:00Z"),
             },
-        );
+        )
+        .expect("classified child data write");
 
-        assert_eq!(data["remote_fact_hash"], "sha256:fact");
-        assert_eq!(data["remote_fact_activity_at"], "2026-06-10T00:00:00Z");
-        assert_eq!(data["expected_base_ref"], "release");
+        assert_eq!(child.data["remote_fact_hash"], "sha256:fact");
+        assert_eq!(
+            child.data["remote_fact_activity_at"],
+            "2026-06-10T00:00:00Z"
+        );
+        assert_eq!(child.data["expected_base_ref"], "release");
+
+        // The remote-observed fields must not be laundered into server data by
+        // passing through a server-side merge helper.
+        let provenance = child
+            .data_provenance
+            .as_ref()
+            .expect("merged child data carries a provenance sidecar");
+        assert_eq!(
+            provenance.provenance_for("/expected_base_ref"),
+            Some(DataProvenance::External)
+        );
+        assert_eq!(
+            provenance.provenance_for("/remote_fact_activity_at"),
+            Some(DataProvenance::External)
+        );
+        assert_eq!(
+            provenance.provenance_for("/remote_fact_hash"),
+            Some(DataProvenance::Server)
+        );
+        child
+            .validate_data_provenance()
+            .expect("merged child data is persistable");
     }
 
     #[tokio::test]

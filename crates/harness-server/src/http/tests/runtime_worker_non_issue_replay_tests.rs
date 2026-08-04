@@ -23,11 +23,11 @@ async fn concurrent_prompt_child_start_records_one_provenanced_event() -> anyhow
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-prompt-child-concurrent")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id,
         "repo": "owner/repo",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:pr:1784:feedback",
@@ -149,11 +149,11 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-prompt-child-replay")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:pr:1120:feedback",
@@ -283,7 +283,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
     )
     .with_id("issue-quality-gate-replay-parent")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 227,
@@ -291,7 +291,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         "pr_url": "https://github.com/owner/repo/pull/77",
         "author_trust_class": "non_collaborator",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "quality-gate:issue-227:77",
@@ -335,7 +335,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "pr_number": 77,
@@ -345,7 +345,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         "started_by_command_id": command_id.clone(),
         "validation_commands": ["cargo check"],
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     store
         .append_event(
             &child_id,
@@ -395,7 +395,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
     }
     child.state = "checking".to_string();
     child.version += 1;
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,
@@ -496,14 +496,14 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
     )
     .with_id("issue-pr-feedback-replay-parent")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 226,
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "pr-feedback-sweep:issue-226:77",
@@ -547,7 +547,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 226,
@@ -557,7 +557,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
         "started_by_runtime_job_id": runtime_job.id.clone(),
         "started_by_command_id": command_id.clone(),
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     store
         .append_event(
             &child_id,
@@ -613,7 +613,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
             .await?;
     }
     child.state = "pending".to_string();
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,

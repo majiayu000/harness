@@ -373,7 +373,7 @@ async fn delete_prompt_payload_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{WorkflowCommand, WorkflowCommandRecord, WorkflowSubject};
+    use crate::runtime::{DataProvenance, WorkflowCommand, WorkflowCommandRecord, WorkflowSubject};
     use harness_core::db::resolve_database_url;
     use serde_json::json;
 
@@ -385,7 +385,7 @@ mod tests {
             WorkflowSubject::new("pr", "77"),
         )
         .with_id(id)
-        .with_data(json!({"project_id": "/project-a", "pr_number": 77}))
+        .with_server_data(json!({"project_id": "/project-a", "pr_number": 77}))
     }
 
     fn submission_test_decision(instance: &WorkflowInstance) -> WorkflowDecision {
@@ -447,7 +447,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
         let initial = submission_test_instance("submission-accepted-identity-version");
-        store.force_upsert_instance_for_test(&initial).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&initial)
+            .await?;
         let decision = submission_test_decision(&initial);
         let mut final_instance = initial.clone();
         final_instance.state = decision.next_state.clone();
@@ -610,7 +612,7 @@ mod tests {
             WorkflowSubject::new("pr", "77"),
         )
         .with_id("submission-replay-keeps-completed-commands")
-        .with_data(json!({
+        .with_server_data(json!({
             "project_id": "/project-a",
             "pr_number": 77,
         }));
@@ -632,11 +634,14 @@ mod tests {
         let mut final_instance = initial.clone();
         final_instance.state = "local_review_gate".to_string();
         final_instance.version = final_instance.version.saturating_add(1);
-        final_instance.data = json!({
-            "project_id": "/project-a",
-            "pr_number": 77,
-            "last_decision": "address_feedback",
-        });
+        final_instance.replace_classified_data(
+            json!({
+                "project_id": "/project-a",
+                "pr_number": 77,
+                "last_decision": "address_feedback",
+            }),
+            DataProvenance::Server,
+        );
 
         let first_commit = store
             .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
@@ -724,7 +729,7 @@ mod tests {
             WorkflowSubject::new("issue", "issue:1784"),
         )
         .with_id("submission-validator-bypass")
-        .with_data(json!({"project_id": "/project-a", "issue_number": 1784}));
+        .with_server_data(json!({"project_id": "/project-a", "issue_number": 1784}));
         let decision = WorkflowDecision::new(
             &initial.id,
             "discovered",

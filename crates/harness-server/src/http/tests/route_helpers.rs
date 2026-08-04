@@ -83,7 +83,7 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1111"),
     )
     .with_id("runtime-proof-workflow")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "task_id": task_id,
         "task_ids": [task_id],
         "project_id": "/project-a",
@@ -92,7 +92,7 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
         "pr_number": 77,
         "pr_url": pr_url,
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let event = store
         .append_event(
             &workflow.id,
@@ -173,11 +173,11 @@ async fn get_task_proof_rejects_nonterminal_runtime_task() -> anyhow::Result<()>
         harness_workflow::runtime::WorkflowSubject::new("prompt", "prompt:active"),
     )
     .with_id("runtime-proof-active-workflow")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "task_id": task_id,
         "project_id": "/project-a",
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     let response = runtime_submission_app(state)
         .oneshot(
@@ -415,7 +415,7 @@ pub(super) async fn seed_bound_runtime_pr_workflow(
         harness_workflow::runtime::WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id,
         "repo": repo,
         "issue_number": issue_number,
@@ -425,7 +425,7 @@ pub(super) async fn seed_bound_runtime_pr_workflow(
         "pr_url": format!("https://github.com/{repo}/pull/{pr_number}"),
         "execution_path": "workflow_runtime"
     }));
-    crate::test_helpers::force_upsert_runtime_instance_for_test(store, &instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &instance).await?;
     Ok((workflow_id, task_id))
 }
 
