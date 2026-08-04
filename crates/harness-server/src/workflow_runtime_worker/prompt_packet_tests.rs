@@ -694,6 +694,75 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
 }
 
 #[test]
+fn model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2() {
+    // Fixed inputs, identical to the fixture generation from pre-v2 commit
+    // f55eea8b: fixed job/command IDs, fixed roots/profile/input, no workflow,
+    // no memory, and a non-empty prompt template. The frozen fixture was
+    // rendered by that commit's genuine pre-v2 pipeline; because
+    // WorkflowConfig gained the `runtime_completion` default field after
+    // f55eea8b, generation injected exactly that default block so the fixed
+    // input bytes match the current default configuration.
+    let mut job = RuntimeJob::pending(
+        "command-fixture-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "implement_issue" }),
+    );
+    job.id = "runtime-job-fixture-1".to_string();
+    let workflow_document = WorkflowDocument {
+        prompt_template: "Follow the repository workflow prompt.".to_string(),
+        source_path: Some("/repo/WORKFLOW.md".to_string()),
+        ..Default::default()
+    };
+    let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+    let packet = build_runtime_prompt_packet(
+        &job,
+        None,
+        Path::new("/workspaces/job-1"),
+        Path::new("/repo"),
+        &runtime_profile,
+        &resolved_settings_for_tests(&runtime_profile),
+        &workflow_document,
+        &[],
+        None,
+    )
+    .expect("fixture prompt packet should build");
+
+    // Durable evidence carries the current audit schema and keeps every audit
+    // field and template. The constant is referenced rather than pinned to a
+    // literal: this test exists to freeze the *model-facing* bytes, and the
+    // durable schema is expected to move as audit content evolves.
+    assert_eq!(packet["schema"], RUNTIME_PROMPT_PACKET_SCHEMA);
+    assert!(packet.get("context_provenance").is_some());
+    assert!(packet.get("resolved_runtime_settings").is_some());
+    assert_eq!(
+        packet["workflow_file"]["prompt_template"],
+        "Follow the repository workflow prompt."
+    );
+
+    // The complete rendered prompt matches the independent frozen pre-v2
+    // bytes; the expected value is not derived from the current v2 packet.
+    let prompt = build_runtime_job_prompt(&packet, None);
+    assert_eq!(
+        prompt,
+        include_str!("prompt_packet/fixtures/model_facing_prompt_v1.txt")
+    );
+
+    // The rendered packet JSON is v1, excludes the template and audit fields,
+    // and appends the non-empty template exactly once.
+    assert!(prompt.contains("\"schema\": \"harness.runtime.prompt_packet.v1\""));
+    assert!(!prompt.contains("prompt_template"));
+    assert!(!prompt.contains("context_provenance"));
+    assert!(!prompt.contains("resolved_runtime_settings"));
+    assert_eq!(
+        prompt
+            .matches("Repository workflow prompt template:")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
     let job = RuntimeJob::pending(
         "command-1",

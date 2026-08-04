@@ -1,0 +1,298 @@
+You are executing a Harness workflow runtime job.
+
+Runtime contract:
+- Treat the workflow database as the source of orchestration state, but do not edit workflow tables directly.
+- Harness server only manages lifecycle. You, the agent, perform repository and GitHub work when the activity requires it.
+- Follow the project instructions loaded by the runtime.
+- Use the prompt packet activity_result_schema to shape your final summary.
+- When returning structured activity output, put a JSON object in a final fenced `harness-activity-result` block matching activity_result_schema.
+- The structured result activity field must match this runtime job activity exactly.
+- Return a concise final summary appropriate to the activity. Include changed files and validation commands only when repository code changes were requested; for discovery and planning activities, report inspected inputs, emitted signals, and remaining blockers.
+
+Project root: /workspaces/job-1
+Runtime job id: runtime-job-fixture-1
+Runtime profile: codex-default
+Activity: implement_issue
+
+Prompt packet:
+{
+  "activity_result_schema": {
+    "activity": "implement_issue",
+    "activity_contract": {
+      "accepted_artifacts": [],
+      "accepted_signals": [],
+      "activity": "implement_issue",
+      "empty_success_allowed": true,
+      "explicit_noop_signals": [],
+      "required_artifacts": [],
+      "schema": "harness.runtime.activity_contract.v1",
+      "workflow_definition": "unknown"
+    },
+    "agent_summary_contract": {
+      "must_include": [
+        "summary",
+        "validation commands",
+        "remaining blockers"
+      ],
+      "must_not_include": [
+        "direct workflow table mutations"
+      ]
+    },
+    "allowed_error_kinds": [
+      "retryable",
+      "timeout",
+      "fatal",
+      "configuration",
+      "external_dependency",
+      "unknown"
+    ],
+    "allowed_statuses": [
+      "succeeded",
+      "failed",
+      "blocked",
+      "cancelled"
+    ],
+    "optional_artifacts": {
+      "workflow_decision": {
+        "allowed_confidence": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "description": "A proposed WorkflowDecision. Harness validates it before applying any transition or command.",
+        "required_fields": [
+          "workflow_id",
+          "observed_state",
+          "decision",
+          "next_state",
+          "reason",
+          "confidence"
+        ]
+      }
+    },
+    "optional_fields": [
+      "artifacts",
+      "signals",
+      "validation",
+      "error",
+      "error_kind"
+    ],
+    "required_fields": [
+      "activity",
+      "status",
+      "summary"
+    ],
+    "result_type": "ActivityResult",
+    "schema": "harness.runtime.activity_result.v1",
+    "status_contract": {
+      "blocked": "The activity cannot proceed without external input or budget.",
+      "cancelled": "The activity was intentionally stopped.",
+      "failed": "The activity hit an execution error. Use error_kind=fatal or configuration when retry would not help.",
+      "succeeded": "The activity completed and its output is ready for the workflow reducer."
+    },
+    "transition_contract": {
+      "on_succeeded": {
+        "reason": "No reducer transition is registered for this workflow/activity pair.",
+        "reducer_next_state": "unchanged"
+      }
+    },
+    "wire_format_example": {
+      "_format_rules": [
+        "`artifacts` MUST be a JSON array of {artifact_type, artifact} objects. Never emit it as a map keyed by artifact name.",
+        "`signals` MUST be a JSON array of {signal_type, signal} objects. Never use `kind` or any other discriminator name.",
+        "`validation` MUST be a JSON array of {command, status} objects. Never emit it as a map.",
+        "Inside a `workflow_decision` artifact, the next-step activity MUST be expressed as `commands: [{command_type, dedupe_key, command}]` (plural array). Never use a singular `command` field at the artifact level — that field is silently ignored, leaving the workflow stuck in the new state with no follow-up activity enqueued.",
+        "For `command_type: start_child_workflow`, the nested `command` object MUST include `definition_id` and `subject_key`; for GitHub issue workflows use `definition_id: github_issue_pr` and `subject_key: issue:<number>`.",
+        "Omit `artifacts`, `signals`, or `validation` entirely if there is nothing to report — empty arrays or missing fields are both fine."
+      ],
+      "activity": "implement_issue",
+      "artifacts": [
+        {
+          "artifact": {
+            "commands": [
+              {
+                "command": {
+                  "activity": "<next activity name>",
+                  "note": "All activity-specific payload (repo, issue_number, signals, etc.) goes INSIDE this nested `command` Value. The outer object MUST have exactly the three fields: command_type, dedupe_key, command."
+                },
+                "command_type": "enqueue_activity",
+                "dedupe_key": "<unique stable string for this command>"
+              }
+            ],
+            "confidence": "high",
+            "decision": "...",
+            "next_state": "...",
+            "observed_state": "...",
+            "reason": "...",
+            "workflow_id": "..."
+          },
+          "artifact_type": "workflow_decision"
+        }
+      ],
+      "signals": [
+        {
+          "signal": {
+            "issue_number": 123,
+            "issue_url": "https://example/issues/123",
+            "note": "Per-signal payload goes inside the `signal` object. Do NOT use `kind` as the discriminator; the wire format is `signal_type` + `signal`."
+          },
+          "signal_type": "<one of accepted_signals from transition_contract>"
+        }
+      ],
+      "status": "succeeded",
+      "summary": "Concise description of what the activity did.",
+      "validation": [
+        {
+          "command": "cargo test",
+          "status": "passed"
+        }
+      ]
+    },
+    "workflow_decision_contract": {
+      "available": false,
+      "reason": "No workflow instance was loaded for this runtime job."
+    },
+    "workflow_definition": "unknown"
+  },
+  "command_input": {
+    "activity": "implement_issue"
+  },
+  "project": {
+    "repo": null,
+    "root": "/workspaces/job-1",
+    "source_root": "/repo"
+  },
+  "required_structured_output": {
+    "changed_files": "Files changed by this runtime activity, if any.",
+    "remaining_blockers": "Any blockers that still require follow-up.",
+    "summary": "Concise final activity summary.",
+    "validation_commands": "Validation commands run and their results."
+  },
+  "runtime_contract": {
+    "agent_executes_repository_and_github_work": true,
+    "agent_must_not_edit_workflow_tables": true,
+    "follow_project_instructions": true,
+    "orchestration_source": "workflow_database"
+  },
+  "runtime_job": {
+    "activity": "implement_issue",
+    "command_id": "command-fixture-1",
+    "id": "runtime-job-fixture-1",
+    "runtime_kind": "codex_jsonrpc",
+    "runtime_profile": "codex-default"
+  },
+  "runtime_profile": {
+    "kind": "codex_jsonrpc",
+    "name": "codex-default"
+  },
+  "schema": "harness.runtime.prompt_packet.v1",
+  "workflow": null,
+  "workflow_file": {
+    "config": {
+      "activities": {},
+      "base": {
+        "branch": "main",
+        "remote": "origin",
+        "require_remote_head": true
+      },
+      "candidates": {
+        "enabled": false,
+        "n": 2,
+        "trigger_label": "best-of-n"
+      },
+      "hooks": {
+        "timeout_secs": 60
+      },
+      "issue_workflow": {
+        "auto_replan_on_plan_issue": true,
+        "force_execute_label": "force-execute",
+        "require_human_gate_before_merge": false
+      },
+      "memory": {
+        "enabled": false
+      },
+      "pr_feedback": {
+        "claim_stale_after_secs": 300,
+        "dirty_age_to_comment_secs": 604800,
+        "dirty_age_to_repair_secs": 172800,
+        "enabled": true,
+        "hygiene_batch_limit": 25,
+        "hygiene_enabled": true,
+        "hygiene_interval_secs": 1800,
+        "rebase_needed_label": "rebase-needed",
+        "sweep_interval_secs": 60
+      },
+      "pr_scope_guard": {
+        "enabled": true,
+        "max_files_changed": 30,
+        "max_lines_added": 1500
+      },
+      "runtime_completion": {
+        "quality_gate_validation_timeout_secs": 900
+      },
+      "runtime_dispatch": {
+        "activity_profiles": {},
+        "approval_policy": null,
+        "batch_limit": 25,
+        "defer_backoff_max_secs": 900,
+        "defer_backoff_secs": 30,
+        "enabled": true,
+        "interval_secs": 30,
+        "max_turns": null,
+        "model": null,
+        "reasoning_effort": null,
+        "runtime_kind": null,
+        "runtime_profile": null,
+        "sandbox": null,
+        "timeout_secs": null,
+        "workflow_activity_profiles": {},
+        "workflow_profiles": {}
+      },
+      "runtime_retry_policy": {
+        "activity_retries": {}
+      },
+      "runtime_worker": {
+        "concurrency": 10,
+        "enabled": true,
+        "interval_secs": 5,
+        "lease_ttl_secs": 3900
+      },
+      "source": {
+        "active_labels": [],
+        "ignore_labels": []
+      },
+      "storage": {
+        "orphan_reaper_enabled": true,
+        "orphan_reaper_interval_secs": 3600,
+        "orphan_reaper_legacy_batch": 200,
+        "orphan_reaper_legacy_enabled": true,
+        "runtime_retention_batch_size": 1000,
+        "runtime_retention_days": 30,
+        "runtime_retention_enabled": false,
+        "runtime_retention_interval_secs": 3600,
+        "schema_namespace": "workflow",
+        "task_retention_batch_size": 1000,
+        "task_retention_days": 30,
+        "task_retention_enabled": false,
+        "task_retention_interval_secs": 3600,
+        "workflow_watchdog_age_minutes": 240,
+        "workflow_watchdog_batch_size": 100,
+        "workflow_watchdog_enabled": false,
+        "workflow_watchdog_interval_secs": 300
+      },
+      "workflow": {
+        "version": 1
+      },
+      "workspace": {
+        "branch_prefix": "harness/",
+        "cleanup": "on_terminal",
+        "reuse_existing_workspace": false,
+        "strategy": "worktree"
+      }
+    },
+    "source_path": "/repo/WORKFLOW.md"
+  }
+}
+
+Repository workflow prompt template:
+Follow the repository workflow prompt.
