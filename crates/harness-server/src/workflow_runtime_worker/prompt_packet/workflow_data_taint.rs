@@ -84,13 +84,6 @@ fn render_value(
     provenance: &WorkflowDataProvenance,
     degradation: &mut Vec<Value>,
 ) -> anyhow::Result<RenderedValue> {
-    if empty_container(value) {
-        return Ok(RenderedValue {
-            trusted: Some(value.clone()),
-            untrusted: None,
-        });
-    }
-
     // A more-specific classification always wins over an inherited container
     // classification, so mixed objects and arrays must be partitioned first.
     if provenance.has_descendant_entry(pointer) {
@@ -121,6 +114,18 @@ fn render_value(
         return Ok(RenderedValue {
             trusted: None,
             untrusted: Some(Value::String(fence_untrusted_value(value))),
+        });
+    }
+
+    // An *uncovered* empty container has no fields to classify, so there is
+    // nothing to fence and no writer defect to report. This exception must
+    // stay below the provenance lookups: an explicitly Agent- or
+    // External-classified empty container still belongs behind the fence, and
+    // a legacy one still owes its degradation evidence.
+    if empty_container(value) {
+        return Ok(RenderedValue {
+            trusted: Some(value.clone()),
+            untrusted: None,
         });
     }
 

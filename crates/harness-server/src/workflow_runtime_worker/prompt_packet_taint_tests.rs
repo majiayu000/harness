@@ -247,6 +247,60 @@ fn empty_classified_workflow_data_object_is_valid() {
 }
 
 #[test]
+fn tainted_empty_containers_stay_fenced() {
+    // An empty container carries no content, but it still carries a claim
+    // about where the field came from. An externally sourced field must not
+    // appear as trusted workflow data just because it happens to be empty.
+    let mut workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        WorkflowSubject::new("issue", "issue:1771"),
+    )
+    .with_data_field_provenance(
+        json!({
+            "repo": "owner/repo",
+            "comments": [],
+            "agent_scratch": {},
+        }),
+        |field| match field {
+            "comments" => DataProvenance::External,
+            "agent_scratch" => DataProvenance::Agent,
+            _ => DataProvenance::Server,
+        },
+    );
+
+    let packet = build_packet(&workflow).expect("classified empty containers should render");
+
+    assert!(packet["workflow"]["data"].get("comments").is_none());
+    assert!(packet["workflow"]["data"].get("agent_scratch").is_none());
+    assert_eq!(packet["workflow"]["data"]["repo"], "owner/repo");
+    assert!(packet["workflow"]["untrusted_data"]["fields"]["comments"]
+        .as_str()
+        .is_some_and(|value| value.contains("<external_data>")));
+    // Workflow data fences every untrusted origin with the same marker; the
+    // agent/external split is a command-input distinction.
+    assert!(
+        packet["workflow"]["untrusted_data"]["fields"]["agent_scratch"]
+            .as_str()
+            .is_some_and(|value| value.contains("<external_data>"))
+    );
+
+    // A grandfathered empty container still owes its degradation evidence.
+    workflow.data = json!({"comments": []});
+    workflow.data_provenance = None;
+    let packet = build_packet(&workflow).expect("legacy empty container should render");
+    assert!(packet["workflow"]["data"].get("comments").is_none());
+    assert!(packet["workflow"]["untrusted_data"]["fields"]["comments"]
+        .as_str()
+        .is_some_and(|value| value.contains("<external_data>")));
+    assert_eq!(
+        packet["workflow"]["untrusted_data"]["degradation"][0]["reason"],
+        "legacy_unclassified_workflow_data"
+    );
+}
+
+#[test]
 fn post_sidecar_unclassified_workflow_data_field_fails_closed() {
     let mut workflow = WorkflowInstance::new(
         "github_issue_pr",
