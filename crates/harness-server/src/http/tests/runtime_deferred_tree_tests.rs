@@ -21,7 +21,7 @@ async fn runtime_tree_reports_deferred_command() -> anyhow::Result<()> {
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1601"),
     )
     .with_id("issue-1601-deferred-tree")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id,
         "repo": "owner/repo",
         "issue_number": 1601,

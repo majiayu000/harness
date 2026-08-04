@@ -233,7 +233,7 @@ fn candidate_fanout_issue_plan_completion_uses_persisted_metadata() -> anyhow::R
         trigger_label: "best-of-n".to_string(),
         max_turns_per_candidate: None,
     };
-    let instance = issue_instance("planning").with_data(json!({
+    let instance = issue_instance("planning").with_server_data(json!({
         "candidate_fanout": fanout,
     }));
     let plan_payload = json!({
@@ -461,7 +461,7 @@ fn issue_plan_invalid_payload_blocks_as_missing_plan_evidence() {
 
 #[test]
 fn runtime_completion_reducer_retries_issue_plan_failure_when_policy_allows() {
-    let instance = issue_instance("planning").with_data(json!({
+    let instance = issue_instance("planning").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }

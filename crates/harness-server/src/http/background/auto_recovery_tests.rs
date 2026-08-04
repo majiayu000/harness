@@ -61,7 +61,7 @@ async fn seed_stopped_instance(
         WorkflowSubject::new("issue", format!("issue:{id}")),
     )
     .with_id(id.to_string())
-    .with_data(data);
+    .with_server_data(data);
     store.upsert_instance(&workflow).await?;
     let command = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
@@ -77,7 +77,13 @@ async fn seed_stopped_instance(
             command.command,
         )
         .await?;
-    workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
+    let mut last_stop = workflow.data["last_stop"].clone();
+    last_stop["runtime_job_id"] = json!(job.id);
+    workflow.set_data_field(
+        "last_stop",
+        last_stop,
+        harness_workflow::runtime::DataProvenance::Server,
+    )?;
     store.upsert_instance(&workflow).await?;
     Ok(workflow)
 }
@@ -238,7 +244,7 @@ async fn auto_recovery_selects_transient_and_skips_terminal_and_legacy() -> anyh
             WorkflowSubject::new("issue", "issue:ar-select-legacy"),
         )
         .with_id("ar-select-legacy".to_string())
-        .with_data(json!({ "repo": TEST_REPO, "blocked_reason": "legacy free text" }));
+        .with_server_data(json!({ "repo": TEST_REPO, "blocked_reason": "legacy free text" }));
         store.upsert_instance(&workflow).await?;
         workflow
     };
@@ -660,7 +666,7 @@ async fn auto_recovery_terminal_recheck_outcome_stops_scheduling() -> anyhow::Re
         WorkflowSubject::new("issue", "issue:ar-recheck-1"),
     )
     .with_id("ar-recheck-1".to_string())
-    .with_data(data);
+    .with_server_data(data);
     store.upsert_instance(&workflow).await?;
 
     let now = Utc::now();
@@ -746,7 +752,7 @@ async fn auto_recovery_scan_is_not_starved_by_ineligible_backlog() -> anyhow::Re
             WorkflowSubject::new("issue", format!("issue:ar-starve-{index}")),
         )
         .with_id(format!("ar-starve-{index}"))
-        .with_data(json!({
+        .with_server_data(json!({
             "repo": TEST_REPO,
             "stop_reason_code": "maintainer_input_required",
             "reason_class": "terminal",

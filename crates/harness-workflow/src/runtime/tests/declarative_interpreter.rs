@@ -105,7 +105,7 @@ mod declarative_interpreter {
             WorkflowSubject::new("document", "doc-1"),
         )
         .with_id("declarative-run-1")
-        .with_data(json!({ "definition_hash": definition.definition_hash() }))
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }))
     }
 
     fn completion_event(
@@ -259,7 +259,7 @@ mod declarative_interpreter {
             WorkflowCommandType::MarkFailed
         );
 
-        let retrying = instance.clone().with_data(json!({
+        let retrying = instance.clone().with_server_data(json!({
             "definition_hash": definition.definition_hash(),
             "runtime_retry_policy": {
                 "activity_retries": {
@@ -367,7 +367,7 @@ mod declarative_interpreter {
         assert_eq!(pin_error.decision, "definition_version_missing");
         assert_eq!(pin_error.next_state, "blocked");
 
-        let invalid_hash = instance.clone().with_data(json!({
+        let invalid_hash = instance.clone().with_server_data(json!({
             "definition_hash": "not-a-canonical-hash"
         }));
         let invalid_hash_event = completion_event(&invalid_hash, "review", &result);
@@ -387,7 +387,7 @@ mod declarative_interpreter {
         mismatched_hash.push(replacement);
         let hash_mismatch = instance
             .clone()
-            .with_data(json!({ "definition_hash": mismatched_hash }));
+            .with_server_data(json!({ "definition_hash": mismatched_hash }));
         let hash_mismatch_event = completion_event(&hash_mismatch, "review", &result);
         let hash_mismatch_decision =
             reduce_runtime_job_completed(&hash_mismatch, &hash_mismatch_event)
@@ -405,7 +405,7 @@ mod declarative_interpreter {
             "reviewing",
             WorkflowSubject::new("document", "missing-version"),
         )
-        .with_data(json!({ "definition_hash": definition.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
         let missing_version_event = completion_event(&missing_version, "review", &result);
         let missing_version_decision =
             reduce_runtime_job_completed(&missing_version, &missing_version_event)

@@ -331,7 +331,7 @@ mod tests {
             WorkflowSubject::new("prompt_task", id),
         )
         .with_id(id)
-        .with_data(data)
+        .with_server_data(data)
     }
 
     fn completion_event(workflow_id: &str, result: ActivityResult) -> WorkflowEvent {

@@ -170,7 +170,7 @@ async fn runtime_worker_does_not_propagate_still_inspecting_pr_feedback_child() 
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent-still-inspecting")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",
@@ -240,7 +240,7 @@ async fn runtime_worker_does_not_propagate_retrying_pr_feedback_child() -> anyho
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent-retry")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",
@@ -254,7 +254,7 @@ async fn runtime_worker_does_not_propagate_retrying_pr_feedback_child() -> anyho
     )
     .with_id("pr-feedback-child-retry")
     .with_parent(parent.id.clone())
-    .with_data(json!({
+    .with_server_data(json!({
         "runtime_retry_policy": {
             "activity_retries": {
                 "inspect_pr_feedback": {
@@ -329,7 +329,7 @@ async fn runtime_worker_does_not_propagate_terminal_pr_feedback_child_failure() 
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let parent = issue_instance("awaiting_feedback")
         .with_id("issue-parent-failed-child")
-        .with_data(json!({
+        .with_server_data(json!({
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "task_id": "runtime-task-77",

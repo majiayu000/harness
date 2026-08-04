@@ -10,7 +10,7 @@ fn prompt_contract_fails_closed_for_missing_pinned_definition_history() {
         "running",
         WorkflowSubject::new("test", "one"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }));
     let contract = workflow_decision_contract(Some(&workflow));
@@ -25,7 +25,7 @@ fn forged_pin_marker_never_intercepts_builtin_prompt_contract() {
         "discovered",
         WorkflowSubject::new("issue", "one"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }));
     let contract = workflow_decision_contract(Some(&workflow));

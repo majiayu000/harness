@@ -21,7 +21,7 @@ async fn queue_stats_matches_overview_for_runtime_active_work() -> anyhow::Resul
         harness_workflow::runtime::WorkflowSubject::new("prompt", "prompt:queue-stats-running"),
     )
     .with_id("queue-stats-running-workflow")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "task_id": "queue-stats-running-task",
     }));
@@ -32,7 +32,7 @@ async fn queue_stats_matches_overview_for_runtime_active_work() -> anyhow::Resul
         harness_workflow::runtime::WorkflowSubject::new("prompt", "prompt:queue-stats-queued"),
     )
     .with_id("queue-stats-queued-workflow")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "task_id": "queue-stats-queued-task",
     }));

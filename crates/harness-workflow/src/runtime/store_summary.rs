@@ -207,7 +207,7 @@ mod tests {
             WorkflowSubject::new("issue", "issue:1170"),
         )
         .with_id("issue-1170")
-        .with_data(json!({
+        .with_server_data(json!({
             "project_id": "/project-a",
             "repo": "owner/repo",
             "issue_number": 1170,

@@ -100,7 +100,7 @@ async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyho
         123,
         "awaiting_feedback",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 123,
@@ -183,7 +183,7 @@ async fn explicit_pr_feedback_request_starts_local_review_before_remote_suppress
         Some("https://github.com/owner/repo/pull/77"),
         "awaiting_feedback",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "pr_number": 77,
@@ -273,7 +273,7 @@ async fn failed_pr_feedback_child_respects_disabled_suppression_window() -> anyh
         123,
         "awaiting_feedback",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 123,
@@ -366,7 +366,7 @@ async fn orphan_pending_child_does_not_block_next_feedback_sweep() -> anyhow::Re
         123,
         "awaiting_feedback",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 123,

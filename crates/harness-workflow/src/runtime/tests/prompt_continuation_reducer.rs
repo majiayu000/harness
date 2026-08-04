@@ -130,7 +130,7 @@ fn prompt_scope_too_large_overrides_active_external_state() {
         active_states: std::collections::BTreeSet::from(["In Progress".to_string()]),
         no_progress_limit: 3,
     };
-    let instance = prompt_task_instance("implementing").with_data(json!({
+    let instance = prompt_task_instance("implementing").with_server_data(json!({
         "prompt_ref": "prompt-scope-ref",
         "continuation": PromptContinuationState::initial(&policy),
     }));

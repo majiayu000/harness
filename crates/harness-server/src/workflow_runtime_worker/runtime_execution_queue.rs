@@ -86,7 +86,7 @@ mod tests {
             WorkflowSubject::new("prompt", "review:test"),
         )
         .with_id("runtime-review-policy")
-        .with_data(json!({
+        .with_server_data(json!({
             "project_id": "/tmp/project",
             "execution_policy": {
                 "task_kind": "review",

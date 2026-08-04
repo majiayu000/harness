@@ -269,13 +269,17 @@ async fn issue_submission_releases_blocked_runtime_dependency_with_persisted_clo
         .await?
         .expect("dependency workflow should exist");
     dep_workflow.state = "blocked".to_string();
-    dep_workflow.data["closed_issue_evidence"] = serde_json::json!({
-        "source": "IssueClosed",
-        "issue_number": 86,
-        "state": "closed",
-        "issue_url": "https://github.com/owner/repo/issues/86",
-        "closed": true,
-    });
+    dep_workflow.set_data_field(
+        "closed_issue_evidence",
+        serde_json::json!({
+            "source": "IssueClosed",
+            "issue_number": 86,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/86",
+            "closed": true,
+        }),
+        harness_workflow::runtime::DataProvenance::Server,
+    )?;
     store.upsert_instance(&dep_workflow).await?;
 
     let task_id = TaskId::from_str("runtime-dependent-on-persisted-closed-evidence");

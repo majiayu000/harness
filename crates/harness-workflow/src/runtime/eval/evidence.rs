@@ -417,7 +417,7 @@ mod tests {
             WorkflowSubject::new("issue", "issue:42"),
         )
         .with_id("workflow-1")
-        .with_data(json!({
+        .with_server_data(json!({
             "repo": "owner/repo",
             "issue_number": 42,
             "task_id": "eval-task-1",
@@ -475,7 +475,7 @@ mod tests {
             WorkflowSubject::new("issue", "issue:42"),
         )
         .with_id("workflow-1")
-        .with_data(json!({
+        .with_server_data(json!({
             "repo": "owner/repo",
             "issue_number": 42,
             "task_id": "eval-task-1",

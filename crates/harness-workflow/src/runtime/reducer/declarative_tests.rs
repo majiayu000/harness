@@ -61,7 +61,7 @@ fn declarative_failure_without_route_uses_configured_generic_retry() -> anyhow::
         "working",
         WorkflowSubject::new("test", "generic-retry"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": definition.definition_hash(),
         "runtime_retry_policy": { "max_failed_activity_retries": 1 }
     }));

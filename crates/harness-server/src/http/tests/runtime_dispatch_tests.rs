@@ -26,7 +26,7 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:123"),
     )
     .with_id("issue-123")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 123,
@@ -117,7 +117,7 @@ async fn runtime_command_dispatch_tick_honors_prompt_execution_policy() -> anyho
         harness_workflow::runtime::WorkflowSubject::new("prompt", "periodic-review:test"),
     )
     .with_id("prompt-execution-policy")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "execution_policy": {
             "task_kind": "review",
@@ -206,7 +206,7 @@ async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fall
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:126"),
     )
     .with_id("issue-126")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 126,
@@ -402,7 +402,7 @@ async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> any
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:124"),
     )
     .with_id("issue-124")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 124,
@@ -532,7 +532,7 @@ async fn runtime_command_dispatch_tick_retries_non_workflow_config_errors() -> a
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:125"),
     )
     .with_id("issue-125")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 125,
@@ -595,7 +595,7 @@ async fn runtime_pr_feedback_sweep_tick_enqueues_runtime_command() -> anyhow::Re
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
     )
     .with_id("issue-226")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 226,
@@ -657,7 +657,7 @@ async fn runtime_pr_feedback_sweep_recovers_pr_binding_from_bind_pr_command() ->
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:230"),
     )
     .with_id("issue-230")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 230,
@@ -732,7 +732,7 @@ async fn runtime_pr_feedback_sweep_limit_ignores_skipped_workflows() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
     )
     .with_id("issue-227")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 227,
@@ -748,7 +748,7 @@ async fn runtime_pr_feedback_sweep_limit_ignores_skipped_workflows() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:228"),
     )
     .with_id("issue-228")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 228,
@@ -791,7 +791,7 @@ async fn runtime_pr_feedback_sweep_respects_project_runtime_policy() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:229"),
     )
     .with_id("issue-229")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 229,
@@ -848,7 +848,7 @@ async fn runtime_command_dispatch_tick_uses_command_project_policy_when_server_r
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:224"),
     )
     .with_id("issue-224")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 224,
@@ -908,7 +908,7 @@ async fn runtime_command_dispatch_tick_defers_disabled_policy_without_agent_metr
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:225"),
     )
     .with_id("issue-225")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 225,
@@ -1051,7 +1051,7 @@ fn auto_merge_snapshot_gate_accepts_ready_matching_head() -> anyhow::Result<()> 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:77"),
     )
     .with_id("issue-77")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 77,
         "pr_number": 77,
@@ -1094,7 +1094,7 @@ fn auto_merge_snapshot_gate_accepts_fresh_ready_head_when_stored_head_changed() 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:78"),
     )
     .with_id("issue-78")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 78,
         "pr_number": 78,
@@ -1124,7 +1124,7 @@ fn auto_merge_snapshot_gate_persists_fresh_head_when_workflow_head_missing() -> 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:80"),
     )
     .with_id("issue-80")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 80,
         "pr_number": 80,
@@ -1153,7 +1153,7 @@ fn auto_merge_snapshot_gate_honors_relaxed_policy_fields() -> anyhow::Result<()>
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:79"),
     )
     .with_id("issue-79")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 79,
         "pr_number": 79,
@@ -1200,7 +1200,7 @@ fn auto_merge_snapshot_gate_rejects_wrong_base_ref() -> anyhow::Result<()> {
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:81"),
     )
     .with_id("issue-81")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 81,
         "pr_number": 81,
@@ -1233,7 +1233,7 @@ fn auto_merge_snapshot_gate_allows_unknown_expected_base() -> anyhow::Result<()>
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:82"),
     )
     .with_id("issue-82")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 82,
         "pr_number": 82,

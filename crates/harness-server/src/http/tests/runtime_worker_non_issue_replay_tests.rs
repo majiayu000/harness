@@ -24,7 +24,7 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-prompt-child-replay")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
@@ -156,7 +156,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
     )
     .with_id("issue-quality-gate-replay-parent")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 227,
@@ -208,7 +208,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "pr_number": 77,
@@ -368,7 +368,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
     )
     .with_id("issue-pr-feedback-replay-parent")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 226,
@@ -419,7 +419,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 226,

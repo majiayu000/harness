@@ -24,7 +24,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-auto-submit-replay")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
@@ -74,7 +74,7 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 129,
@@ -121,11 +121,16 @@ async fn runtime_job_worker_replays_auto_submit_without_duplicate_child_side_eff
         .get_instance(&child_id)
         .await?
         .expect("child workflow should exist after submission");
-    if let Some(data) = submitted_child.data.as_object_mut() {
-        data.remove("submission_id");
-        data.remove("task_id");
-        data.remove("task_ids");
-    }
+    // Simulate a child row that never recorded submission bookkeeping. The
+    // removals go through the classified write API so the provenance sidecar
+    // drops the classifications with the fields instead of retaining pointers
+    // into data that no longer exists.
+    submitted_child.apply_data_writes(["submission_id", "task_id", "task_ids"].map(|field| {
+        harness_workflow::runtime::WorkflowDataWrite::remove(
+            field,
+            harness_workflow::runtime::DataProvenance::Server,
+        )
+    }))?;
     store.upsert_instance(&submitted_child).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
@@ -197,7 +202,7 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-auto-submit-event-only")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
@@ -247,7 +252,7 @@ async fn runtime_job_worker_completes_auto_submit_after_issue_submitted_event_on
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 130,
@@ -364,7 +369,7 @@ async fn runtime_job_worker_auto_submit_reopens_after_completed_historical_task_
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-auto-submit-reopen")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));

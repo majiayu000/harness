@@ -605,7 +605,7 @@ mod tests {
                     harness_workflow::runtime::WorkflowSubject::new("issue", "issue:882"),
                 )
                 .with_id(workflow_id.clone())
-                .with_data(json!({
+                .with_server_data(json!({
                     "project_id": project_id,
                     "repo": "owner/repo",
                     "issue_number": 882,
@@ -711,7 +711,7 @@ mod tests {
                     harness_workflow::runtime::WorkflowSubject::new("issue", "issue:884"),
                 )
                 .with_id("workflow-1".to_string())
-                .with_data(json!({
+                .with_server_data(json!({
                     "submission_id": "runtime-submission-1",
                     "task_id": "runtime-workspace-1",
                     "task_ids": ["runtime-workspace-1"]

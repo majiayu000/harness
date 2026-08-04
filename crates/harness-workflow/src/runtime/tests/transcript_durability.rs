@@ -509,7 +509,7 @@ async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyho
 
     let dependent = issue_instance("failed")
         .with_id("missing-pin-dependent")
-        .with_data(json!({
+        .with_server_data(json!({
             "stop_reason_code": "runtime_transcript_lost",
             "last_stop": {"stop_reason_code": "runtime_transcript_lost"},
         }));
@@ -580,7 +580,7 @@ async fn lost_transcript_consumer_and_producer_remain_pinned_until_recovery() ->
 
     let consumer = issue_instance("failed")
         .with_id("lost-family-consumer")
-        .with_data(json!({
+        .with_server_data(json!({
             "stop_reason_code": "runtime_transcript_lost",
             "last_stop": {"stop_reason_code": "runtime_transcript_lost"},
         }));

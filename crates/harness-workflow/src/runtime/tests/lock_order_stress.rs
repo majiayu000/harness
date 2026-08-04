@@ -442,7 +442,7 @@ async fn recovery_and_lease_revoke_lock_runtime_jobs_in_global_id_order() -> any
         "both jobs must be visible to the concurrent lease revocation"
     );
 
-    let stopped = workflow.with_data(json!({
+    let stopped = workflow.with_server_data(json!({
         "last_stop": {
             "state": "blocked",
             "activity": "implement_issue",

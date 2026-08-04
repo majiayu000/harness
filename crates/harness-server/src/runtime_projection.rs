@@ -415,7 +415,7 @@ mod tests {
             state,
             WorkflowSubject::new("issue", "issue:1"),
         )
-        .with_data(data)
+        .with_server_data(data)
     }
 
     #[test]

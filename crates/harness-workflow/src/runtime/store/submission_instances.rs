@@ -458,7 +458,7 @@ mod tests {
         let subject = WorkflowSubject::new("issue", "owner/repo#1");
         let done = WorkflowInstance::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, "done", subject.clone())
             .with_id("submission-metrics-done")
-            .with_data(json!({
+            .with_server_data(json!({
                 "submission_id": "submission-metrics-done",
                 "project_id": "/repo",
                 "pr_url": "https://github.com/owner/repo/pull/1"
@@ -466,13 +466,13 @@ mod tests {
         let failed =
             WorkflowInstance::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, "failed", subject.clone())
                 .with_id("submission-metrics-failed")
-                .with_data(json!({
+                .with_server_data(json!({
                     "submission_id": "submission-metrics-failed",
                     "project_id": "/repo"
                 }));
         let stalled = WorkflowInstance::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, "failed", subject)
             .with_id("submission-metrics-stalled")
-            .with_data(json!({
+            .with_server_data(json!({
                 "submission_id": "submission-metrics-stalled",
                 "project_id": "/repo",
                 "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"

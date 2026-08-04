@@ -199,7 +199,7 @@ fn ready_to_merge_instance(
         harness_workflow::runtime::WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id,
         "repo": "owner/repo",
         "issue_number": issue_number,
@@ -302,7 +302,7 @@ fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
     .with_id("workflow-1")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "/tmp/project",
         "repo": "owner/repo",
         "issue_number": 42,
@@ -322,7 +322,7 @@ fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
         "done",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
-    .with_data(json!({ "pr_number": 77 }));
+    .with_server_data(json!({ "pr_number": 77 }));
     assert!(runtime_candidate_from_instance(&terminal, chrono::Utc::now()).is_none());
 
     let missing_pr = WorkflowInstance::new(
@@ -395,7 +395,7 @@ async fn atomic_stale_reconciliation_does_not_record_issue_side_effects() -> any
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_str(),
         "repo": "owner/repo",
         "issue_number": 42,
@@ -531,7 +531,7 @@ async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 42,
@@ -616,7 +616,7 @@ async fn run_once_reconciles_runtime_closed_pr_workflow() -> anyhow::Result<()> 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:43"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 43,

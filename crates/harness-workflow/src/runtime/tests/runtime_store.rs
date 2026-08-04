@@ -225,12 +225,12 @@ async fn insert_instance_if_absent_does_not_overwrite_existing_workflow() -> any
     let workflow_id = "insert-if-absent-existing-workflow";
     let existing = issue_instance("implementing")
         .with_id(workflow_id)
-        .with_data(json!({"marker": "real"}));
+        .with_server_data(json!({"marker": "real"}));
     store.upsert_instance(&existing).await?;
 
     let fallback = issue_instance("failed")
         .with_id(workflow_id)
-        .with_data(json!({"marker": "fallback"}));
+        .with_server_data(json!({"marker": "fallback"}));
     let inserted = store.insert_instance_if_absent(&fallback).await?;
 
     assert!(!inserted);
@@ -452,10 +452,10 @@ async fn nonterminal_listing_uses_definition_specific_terminal_states() -> anyho
     let issue_done = project_issue_instance("/project-a", 224, "done");
     let quality_checking = quality_gate_instance("checking")
         .with_id("/project-a::quality:checking")
-        .with_data(json!({ "project_id": "/project-a" }));
+        .with_server_data(json!({ "project_id": "/project-a" }));
     let quality_passed = quality_gate_instance("passed")
         .with_id("/project-a::quality:passed")
-        .with_data(json!({ "project_id": "/project-a" }));
+        .with_server_data(json!({ "project_id": "/project-a" }));
     store.upsert_instance(&issue_passed).await?;
     store.upsert_instance(&issue_done).await?;
     store.upsert_instance(&quality_checking).await?;

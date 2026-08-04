@@ -88,7 +88,7 @@ async fn missing_registered_pin_can_use_persisted_definition_for_cancellation() 
         WorkflowSubject::new("declarative", "missing-pin-cancel"),
     )
     .with_id("missing-pin-cancel-workflow")
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": persisted_version.definition_hash(),
         "prompt_ref": "missing-pin-cancel-prompt",
     }));

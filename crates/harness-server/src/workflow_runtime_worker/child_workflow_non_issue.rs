@@ -688,7 +688,7 @@ mod trust_tests {
             "pending",
             harness_workflow::runtime::WorkflowSubject::new("pr", "pr:1"),
         )
-        .with_data(json!({"author_trust_class": "unknown"}));
+        .with_server_data(json!({"author_trust_class": "unknown"}));
         let error =
             inherit_author_trust_class(&mut child, &json!({"author_trust_class": "trusted"}))
                 .expect_err("invalid child trust metadata must fail");

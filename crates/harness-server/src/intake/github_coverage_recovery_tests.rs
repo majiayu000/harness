@@ -133,7 +133,7 @@ async fn recovery_maps_open_pr_facts() -> anyhow::Result<()> {
             WorkflowSubject::new("issue", format!("issue:{issue_number}")),
         )
         .with_id(workflow_id(&project_id, Some(REPO), issue_number))
-        .with_data(json!({
+        .with_server_data(json!({
             "submission_id": format!("existing-handle-{issue_number}"),
             "task_id": format!("github-issue:{REPO}:issue:{issue_number}"),
             "task_ids": [format!("existing-handle-{issue_number}")],

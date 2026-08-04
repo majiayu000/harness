@@ -183,7 +183,7 @@ async fn persistent_pr_lifecycle_persist_failure_preserves_existing_workflow() -
         123,
         "awaiting_feedback",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 123,
@@ -554,7 +554,7 @@ async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> any
         123,
         "pr_open",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 123,
@@ -665,7 +665,7 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
         123,
         "pr_open",
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 123,

@@ -251,7 +251,7 @@ async fn delete_prompt_payload_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{WorkflowCommand, WorkflowCommandRecord, WorkflowSubject};
+    use crate::runtime::{DataProvenance, WorkflowCommand, WorkflowCommandRecord, WorkflowSubject};
     use harness_core::db::resolve_database_url;
     use serde_json::json;
 
@@ -271,7 +271,7 @@ mod tests {
             WorkflowSubject::new("pr", "77"),
         )
         .with_id("submission-replay-keeps-completed-commands")
-        .with_data(json!({
+        .with_server_data(json!({
             "project_id": "/project-a",
             "pr_number": 77,
         }));
@@ -293,11 +293,14 @@ mod tests {
         let mut final_instance = initial.clone();
         final_instance.state = "awaiting_feedback".to_string();
         final_instance.version = final_instance.version.saturating_add(1);
-        final_instance.data = json!({
-            "project_id": "/project-a",
-            "pr_number": 77,
-            "last_decision": "address_feedback",
-        });
+        final_instance.replace_classified_data(
+            json!({
+                "project_id": "/project-a",
+                "pr_number": 77,
+                "last_decision": "address_feedback",
+            }),
+            DataProvenance::Server,
+        );
 
         let first_commit = store
             .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {

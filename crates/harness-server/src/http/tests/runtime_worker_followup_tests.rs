@@ -24,7 +24,7 @@ async fn runtime_job_worker_requeues_pr_feedback_child_inspect_after_stale_dedup
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
     )
     .with_id("issue-pr-feedback-parent-retry")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 227,
@@ -146,7 +146,7 @@ async fn runtime_job_worker_auto_submits_prompt_task_child_workflow() -> anyhow:
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-auto-submit")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
@@ -245,7 +245,7 @@ async fn runtime_job_worker_auto_submits_prompt_task_child_with_dependencies() -
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-auto-submit-deps")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
@@ -352,7 +352,7 @@ async fn runtime_job_worker_applies_runtime_profile_timeout() -> anyhow::Result<
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:125"),
     )
     .with_id("issue-125")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 125,

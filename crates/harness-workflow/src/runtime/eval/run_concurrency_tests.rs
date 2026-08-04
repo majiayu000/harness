@@ -1,6 +1,6 @@
 use super::manifest::EvalBenchmarkCase;
 use super::run::*;
-use crate::runtime::{WorkflowCommandStatus, WorkflowRuntimeStore};
+use crate::runtime::{DataProvenance, WorkflowCommandStatus, WorkflowRuntimeStore};
 use harness_core::db::resolve_database_url;
 use serde_json::json;
 use tokio::time::{sleep, timeout, Duration};
@@ -59,7 +59,11 @@ async fn eval_enqueue_does_not_return_a_plan_for_a_same_state_stale_snapshot() -
     };
     let mut concurrent_instance = eval_case_initial_instance(input);
     concurrent_instance.version = concurrent_instance.version.saturating_add(1);
-    concurrent_instance.data["concurrent_marker"] = json!("preserve-me");
+    concurrent_instance.set_data_field(
+        "concurrent_marker",
+        json!("preserve-me"),
+        DataProvenance::Server,
+    )?;
     store.upsert_instance(&concurrent_instance).await?;
 
     let error = enqueue_eval_case_workflow(&store, input)
@@ -126,7 +130,9 @@ async fn eval_cleanup_reloads_latest_instance_after_a_same_state_stale_transitio
         .version
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("test workflow version overflow"))?;
-    concurrent_instance.data["eval"]["workspace_path"] = json!("/tmp/eval-stale-worktree");
+    let mut eval_section = concurrent_instance.data["eval"].clone();
+    eval_section["workspace_path"] = json!("/tmp/eval-stale-worktree");
+    concurrent_instance.set_data_field("eval", eval_section, DataProvenance::Server)?;
     let concurrent_data = serde_json::to_string(&concurrent_instance)?;
 
     let mut lock_tx = store.pool().begin().await?;
@@ -230,8 +236,10 @@ async fn eval_cleanup_reports_reload_failure_when_the_workflow_disappears() -> a
         .version
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("test workflow version overflow"))?;
-    prior_instance.data["eval"]["workspace_path"] = json!("/tmp/eval-missing-worktree");
-    prior_instance.data["eval"]["pr_number"] = json!(99);
+    let mut eval_section = prior_instance.data["eval"].clone();
+    eval_section["workspace_path"] = json!("/tmp/eval-missing-worktree");
+    eval_section["pr_number"] = json!(99);
+    prior_instance.set_data_field("eval", eval_section, DataProvenance::Server)?;
     store.upsert_instance(&prior_instance).await?;
 
     let mut lock_tx = store.pool().begin().await?;

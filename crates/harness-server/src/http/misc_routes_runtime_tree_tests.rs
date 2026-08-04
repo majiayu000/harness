@@ -111,7 +111,7 @@ fn runtime_tree_projection_exposes_structured_stop_metadata_and_eligibility() {
         "failed",
         WorkflowSubject::new("issue", "issue:1567"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "failure_reason": "Runtime transport timed out.",
         "error_kind": "timeout",
         "retry_hint": "Fix the transient condition, then call retry.",
@@ -127,7 +127,7 @@ fn runtime_tree_projection_exposes_structured_stop_metadata_and_eligibility() {
         "blocked",
         WorkflowSubject::new("issue", "issue:1568"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "blocked_reason": "Waiting for maintainer approval.",
         "unblock_hint": "Post the approval comment, then call unblock.",
         "last_stop": {
@@ -142,7 +142,7 @@ fn runtime_tree_projection_exposes_structured_stop_metadata_and_eligibility() {
         "failed",
         WorkflowSubject::new("issue", "issue:1569"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "failure_reason": "Missing runtime configuration.",
         "error_kind": "configuration",
     }));
@@ -158,7 +158,7 @@ fn runtime_tree_projection_exposes_structured_stop_metadata_and_eligibility() {
         "failed",
         WorkflowSubject::new("issue", "issue:1571"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "previous_error": "Legacy workflow failed before structured metadata shipped.",
     }));
 

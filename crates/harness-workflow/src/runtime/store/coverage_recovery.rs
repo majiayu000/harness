@@ -209,7 +209,7 @@ impl WorkflowRuntimeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{WorkflowCommand, WorkflowSubject};
+    use crate::runtime::{DataProvenance, WorkflowCommand, WorkflowSubject};
     use chrono::Utc;
     use harness_core::db::resolve_database_url;
     use serde_json::json;
@@ -233,7 +233,7 @@ mod tests {
                 WorkflowSubject::new("issue", "issue:1707"),
             )
             .with_id("coverage-race")
-            .with_data(json!({"winner": suffix}));
+            .with_server_data(json!({"winner": suffix}));
             let fact = RemoteFactSnapshot::new(
                 "github",
                 "owner/repo",
@@ -314,7 +314,7 @@ mod tests {
         let mut newer = initial.clone();
         newer.state = "implementing".to_string();
         newer.version = 1;
-        newer.data = json!({"newer": true});
+        newer.replace_classified_data(json!({"newer": true}), DataProvenance::Server);
         store.upsert_instance(&newer).await?;
 
         let mut stale_final = initial.clone();

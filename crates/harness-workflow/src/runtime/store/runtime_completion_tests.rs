@@ -13,7 +13,7 @@ fn pin_error_instance(id: &str) -> WorkflowInstance {
         WorkflowSubject::new("test", id),
     )
     .with_id(id)
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }))
 }

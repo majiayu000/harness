@@ -490,7 +490,7 @@ mod tests {
             "merging",
             WorkflowSubject::new("issue", "issue:77"),
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "repo": "owner/repo",
             "pr_number": 77,
             "merge_method": "squash",

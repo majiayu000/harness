@@ -461,7 +461,7 @@ mod tests {
             "merging",
             harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "repo": "owner/repo",
             "pr_number": 78,
         }));

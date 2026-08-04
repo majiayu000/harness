@@ -475,7 +475,7 @@ mod tests {
             WorkflowSubject::new("prompt", "task-1"),
         )
         .with_id("workflow-1")
-        .with_data(data)
+        .with_server_data(data)
     }
 
     fn event(result: &ActivityResult) -> WorkflowEvent {
@@ -625,7 +625,7 @@ mod tests {
             WorkflowSubject::new("prompt", "task-1"),
         )
         .with_id("workflow-1")
-        .with_data(json!({
+        .with_server_data(json!({
             "continuation": PromptContinuationState::initial(&policy(4, 3)),
         }));
 

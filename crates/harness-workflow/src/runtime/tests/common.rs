@@ -70,7 +70,7 @@ fn project_issue_instance(
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(format!("{project_id}::issue:{issue_number}"))
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id,
         "issue_number": issue_number,
     }))

@@ -130,7 +130,7 @@ fn runtime_workflow_active_counts_match_dashboard_buckets() {
         "implementing",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/repo",
         "task_id": "runtime-1",
     }));
@@ -140,7 +140,7 @@ fn runtime_workflow_active_counts_match_dashboard_buckets() {
         "ready_to_merge",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:2"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/repo",
         "task_id": "runtime-2",
     }));
@@ -150,7 +150,7 @@ fn runtime_workflow_active_counts_match_dashboard_buckets() {
         "done",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:3"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/repo",
         "task_id": "runtime-3",
     }));
@@ -175,7 +175,7 @@ fn planning_runtime_workflow_counts_as_running_work() {
         "planning",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/repo",
         "task_id": "runtime-1",
     }));
@@ -294,7 +294,7 @@ async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::
         "failed",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:overview-stalled"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "task_id": "overview-stalled-task",
         "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"

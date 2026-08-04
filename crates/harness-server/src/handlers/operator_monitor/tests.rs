@@ -14,7 +14,7 @@ fn workflow(state: &str, data: Value) -> WorkflowInstance {
         state,
         WorkflowSubject::new("issue", "issue:1"),
     )
-    .with_data(data)
+    .with_server_data(data)
 }
 
 fn github_fetch_failure(id: &str, issue: u64, failed_at: &str) -> RecentFailureTask {
@@ -857,7 +857,7 @@ async fn store_quality_gate_workflow(
         WorkflowSubject::new("quality_gate", workflow_id),
     )
     .with_id(workflow_id.to_string())
-    .with_data(data);
+    .with_server_data(data);
     store.upsert_instance(&workflow).await?;
     attach_recovery_source_job(store, workflow, command).await
 }
@@ -876,7 +876,13 @@ async fn attach_recovery_source_job(
             command.command.clone(),
         )
         .await?;
-    workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
+    let mut last_stop = workflow.data["last_stop"].clone();
+    last_stop["runtime_job_id"] = json!(job.id);
+    workflow.set_data_field(
+        "last_stop",
+        last_stop,
+        harness_workflow::runtime::DataProvenance::Server,
+    )?;
     store.upsert_instance(&workflow).await?;
     Ok(workflow)
 }
@@ -915,7 +921,7 @@ async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> an
                 WorkflowSubject::new("quality_gate", "quality_gate:1"),
             )
             .with_id("quality-gate-failed".to_string())
-            .with_data(json!({
+            .with_server_data(json!({
                 "source": "quality_gate",
                 "repo": "owner/repo",
             })),
@@ -1122,7 +1128,7 @@ fn declarative_command_driven_state_counts_as_running() {
         "working",
         WorkflowSubject::new("issue", "issue:declarative-running"),
     )
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
 
     let counts = runtime_workflow_counts(&[workflow]);
 
@@ -1144,7 +1150,7 @@ fn workflow_sample_truncation_preserves_declarative_failed_terminal() {
         WorkflowSubject::new("issue", "issue:declarative-failed"),
     )
     .with_id("declarative-failed")
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     let mut active = WorkflowInstance::new(
         DECLARATIVE_VISIBILITY_DEFINITION_ID,
         definition.definition_version(),
@@ -1152,7 +1158,7 @@ fn workflow_sample_truncation_preserves_declarative_failed_terminal() {
         WorkflowSubject::new("issue", "issue:declarative-active"),
     )
     .with_id("declarative-active")
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     active.updated_at = failed.updated_at + chrono::Duration::seconds(1);
     let mut workflows = vec![active, failed];
 
@@ -1176,7 +1182,7 @@ fn declarative_failed_terminal_populates_failure_and_action_surfaces() {
         WorkflowSubject::new("issue", "issue:declarative-rejected"),
     )
     .with_id("declarative-rejected")
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": definition.definition_hash(),
         "failure_reason": "declarative review rejected"
     }));
@@ -1204,7 +1210,7 @@ fn declarative_operator_gate_uses_registry_progress_for_action_kind() {
         WorkflowSubject::new("issue", "issue:manual-review"),
     )
     .with_id("declarative-manual-review")
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
 
     let actions = operator_actions(&[gate], Utc::now(), &std::collections::HashMap::new());
     assert_eq!(actions.len(), 1);
@@ -1224,7 +1230,7 @@ fn declarative_operator_gate_counts_as_blocked_activity() {
         "manual_review",
         WorkflowSubject::new("issue", "issue:manual-review-counts"),
     )
-    .with_data(json!({
+    .with_server_data(json!({
         "definition_hash": definition.definition_hash(),
         "source": "github"
     }));
@@ -1266,7 +1272,7 @@ async fn declarative_operator_gate_sampling_uses_registry_progress() -> anyhow::
                 WorkflowSubject::new("issue", "issue:manual-review-sample"),
             )
             .with_id("declarative-manual-review-sample")
-            .with_data(json!({ "definition_hash": definition.definition_hash() })),
+            .with_server_data(json!({ "definition_hash": definition.definition_hash() })),
         )
         .await?;
 
@@ -1305,7 +1311,7 @@ async fn declarative_definition_instances_are_visible_in_operator_monitor() -> a
                 WorkflowSubject::new("issue", "issue:9001"),
             )
             .with_id("declarative-blocked".to_string())
-            .with_data(json!({ "repo": "owner/repo", "blocked_reason": "operator gate" })),
+            .with_server_data(json!({ "repo": "owner/repo", "blocked_reason": "operator gate" })),
         )
         .await?;
 
@@ -1356,7 +1362,7 @@ async fn declarative_terminal_queries_use_pinned_versions_and_outcomes() -> anyh
                     WorkflowSubject::new("issue", format!("issue:{id}")),
                 )
                 .with_id(id.to_string())
-                .with_data(json!({ "definition_hash": definition.definition_hash() })),
+                .with_server_data(json!({ "definition_hash": definition.definition_hash() })),
             )
             .await?;
     }

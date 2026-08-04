@@ -51,7 +51,7 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
     }));
@@ -63,7 +63,7 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     )
     .with_id("issue-123")
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 123,
@@ -251,7 +251,7 @@ async fn workflow_runtime_tree_endpoint_defaults_to_compact_polling_shape() -> a
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1165"),
     )
     .with_id("issue-1165")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 1165,
@@ -495,7 +495,7 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
             ),
         )
         .with_id(id)
-        .with_data(data);
+        .with_server_data(data);
         store.upsert_instance(&workflow).await?;
     }
     let blocked_runtime_job_id = set_recovery_source_job(
@@ -642,7 +642,13 @@ async fn set_recovery_source_job(
         .get_instance(workflow_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("missing workflow {workflow_id}"))?;
-    workflow.data["last_stop"]["runtime_job_id"] = serde_json::json!(runtime_job_id.clone());
+    let mut last_stop = workflow.data["last_stop"].clone();
+    last_stop["runtime_job_id"] = serde_json::json!(runtime_job_id.clone());
+    workflow.set_data_field(
+        "last_stop",
+        last_stop,
+        harness_workflow::runtime::DataProvenance::Server,
+    )?;
     store.upsert_instance(&workflow).await?;
     Ok(runtime_job_id)
 }
@@ -667,7 +673,7 @@ async fn workflow_runtime_tree_endpoint_returns_summary_only_shape() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1166"),
     )
     .with_id("issue-1166")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 1166,
@@ -746,7 +752,7 @@ async fn workflow_runtime_tree_summary_only_counts_all_project_workflows_with_ti
             ),
         )
         .with_id(id)
-        .with_data(serde_json::json!({
+        .with_server_data(serde_json::json!({
             "project_id": project_id,
             "repo": "owner/repo",
             "issue_number": issue_number,
@@ -815,7 +821,7 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
             ),
         )
         .with_id(id)
-        .with_data(serde_json::json!({
+        .with_server_data(serde_json::json!({
             "project_id": project_id,
             "repo": "owner/repo",
             "issue_number": issue_number,
@@ -842,7 +848,7 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
         harness_workflow::runtime::WorkflowSubject::new("quality_gate", "issue:101"),
     )
     .with_id("quality-gate-101")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 101,
@@ -855,7 +861,7 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:103"),
     )
     .with_id("issue-103")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 103,
@@ -918,7 +924,7 @@ async fn workflow_runtime_tree_endpoint_splits_running_lease_states() -> anyhow:
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1170"),
     )
     .with_id("issue-1170")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 1170,
@@ -1026,7 +1032,7 @@ async fn workflow_runtime_tree_endpoint_limits_runtime_jobs_per_command() -> any
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:456"),
     )
     .with_id("issue-456")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 456,

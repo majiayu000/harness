@@ -117,7 +117,7 @@ fn declarative_submission_decision_validates_against_the_registered_submission_r
         definition.policy().initial.clone(),
         WorkflowSubject::new("declarative", "task:validation"),
     )
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     let decision =
         harness_workflow::runtime::build_declarative_submission_decision(&definition, &instance)
             .expect("submission decision should build");

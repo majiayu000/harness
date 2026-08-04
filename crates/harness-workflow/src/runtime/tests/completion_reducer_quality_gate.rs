@@ -356,7 +356,7 @@ fn runtime_completion_reducer_blocks_quality_gate_invalid_structured_decision_wi
 
 #[test]
 fn runtime_completion_reducer_retries_quality_gate_transient_failure() {
-    let instance = quality_gate_instance("checking").with_data(json!({
+    let instance = quality_gate_instance("checking").with_server_data(json!({
         "runtime_retry_policy": {
             "activity_retries": {
                 "run_quality_gate": {

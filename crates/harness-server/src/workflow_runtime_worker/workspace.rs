@@ -429,7 +429,7 @@ mod tests {
             WorkflowSubject::new("issue", "issue:124"),
         )
         .with_id("/repo/root::repo:owner/repo::issue:124")
-        .with_data(json!({
+        .with_server_data(json!({
             "issue_number": 124,
         }));
         let first_job = RuntimeJob::pending(

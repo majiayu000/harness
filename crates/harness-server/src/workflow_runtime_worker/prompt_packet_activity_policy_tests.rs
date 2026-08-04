@@ -63,7 +63,7 @@ fn declarative_activity_policy_binds_exactly_and_missing_policy_fails_closed() {
         "working",
         WorkflowSubject::new("declarative", "task:policy-test"),
     )
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     let job = RuntimeJob::pending(
         "command-policy",
         RuntimeKind::CodexJsonrpc,

@@ -156,13 +156,13 @@ async fn durable_store_apply_decision_transition_can_create_initial_instance() -
     let mut final_instance = initial.clone();
     final_instance.state = "pr_open".to_string();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = json!({
+    final_instance.replace_classified_data(json!({
         "project_id": "/project-a",
         "issue_number": 123,
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
         "last_decision": "bind_pr",
-    });
+    }), DataProvenance::Server);
 
     let record = store
         .apply_decision_transition(WorkflowDecisionTransition {
@@ -211,12 +211,12 @@ async fn durable_store_apply_decision_transition_does_not_rewind_existing_instan
     let initial = project_issue_instance("/project-a", 124, "implementing");
     let mut existing = initial.clone();
     existing.state = "awaiting_feedback".to_string();
-    existing.data = json!({
+    existing.replace_classified_data(json!({
         "project_id": "/project-a",
         "issue_number": 124,
         "pr_number": 78,
         "last_decision": "record_feedback",
-    });
+    }), DataProvenance::Server);
     store.upsert_instance(&existing).await?;
     let decision = WorkflowDecision::new(
         &initial.id,
@@ -233,13 +233,13 @@ async fn durable_store_apply_decision_transition_does_not_rewind_existing_instan
     let mut final_instance = initial.clone();
     final_instance.state = "pr_open".to_string();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = json!({
+    final_instance.replace_classified_data(json!({
         "project_id": "/project-a",
         "issue_number": 124,
         "pr_number": 79,
         "pr_url": "https://github.com/owner/repo/pull/79",
         "last_decision": "bind_pr",
-    });
+    }), DataProvenance::Server);
 
     let record = store
         .apply_decision_transition(WorkflowDecisionTransition {
@@ -279,7 +279,7 @@ async fn durable_store_lists_workflow_runtime_tree_inputs() -> anyhow::Result<()
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
 
-    let parent = quality_gate_instance("checking").with_data(json!({
+    let parent = quality_gate_instance("checking").with_server_data(json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
     }));
@@ -366,7 +366,7 @@ async fn durable_store_lists_nonterminal_instances_by_definition() -> anyhow::Re
     let active = project_issue_instance("/project-a", 123, "implementing");
     let queued = project_issue_instance("/project-a", 124, "ready_to_merge");
     let terminal = project_issue_instance("/project-a", 125, "done");
-    let other_definition = prompt_task_instance("implementing").with_data(json!({
+    let other_definition = prompt_task_instance("implementing").with_server_data(json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
     }));
@@ -405,7 +405,7 @@ async fn driverless_completion_is_rejected_atomically() -> anyhow::Result<()> {
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("replanning")
         .with_id("issue-driverless-completion")
-        .with_data(json!({ "marker": "must-remain" }));
+        .with_server_data(json!({ "marker": "must-remain" }));
     store.upsert_instance(&instance).await?;
 
     let stale_command = WorkflowCommand::enqueue_activity(
@@ -514,7 +514,7 @@ async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> an
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("replanning")
         .with_id("issue-driverless-production-completion")
-        .with_data(json!({ "marker": "must-remain" }));
+        .with_server_data(json!({ "marker": "must-remain" }));
     store.upsert_instance(&instance).await?;
 
     let state_entry = WorkflowDecision::new(

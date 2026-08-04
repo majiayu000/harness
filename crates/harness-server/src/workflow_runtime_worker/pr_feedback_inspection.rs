@@ -185,7 +185,7 @@ mod tests {
             "inspecting",
             WorkflowSubject::new("pr", "pr:77"),
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "repo": "owner/repo",
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77"

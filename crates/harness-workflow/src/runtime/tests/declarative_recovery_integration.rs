@@ -74,7 +74,7 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
             WorkflowSubject::new("test", id),
         )
         .with_id(id)
-        .with_data(json!({ "definition_hash": definition.definition_hash() }))
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }))
     };
 
     let running = blocked("declarative-recovery-running");
@@ -148,7 +148,7 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status(
         WorkflowSubject::new("test", "declarative-completion-missing-evidence"),
     )
     .with_id("declarative-completion-missing-evidence")
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     store.upsert_instance(&completion).await?;
     let result = ActivityResult::succeeded("run", "completed without the release report");
     let command = WorkflowCommand::enqueue_activity("run", "declarative-completion-command");

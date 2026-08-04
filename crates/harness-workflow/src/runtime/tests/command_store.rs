@@ -136,7 +136,7 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
         WorkflowCommand::enqueue_activity("implement_issue", "already-dispatched-1567");
     let (dispatched_id, runtime_job_id) =
         enqueue_original_runtime_job(&store, &instance.id, &original_command).await?;
-    let instance = instance.with_data(json!({
+    let instance = instance.with_server_data(json!({
         "last_stop": {
             "state": "blocked",
             "activity": "implement_issue",
@@ -205,7 +205,7 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
 async fn runtime_recovery_unblocks_legacy_blocked_without_stop_metadata() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() { return Ok(()); }
     let dir = tempfile::tempdir()?; let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let legacy = project_issue_instance("/project-a", 1693, "blocked").with_data(json!({"project_id": "/project-a", "issue_number": 1693, "blocked_reason": "legacy blocked row without structured stop metadata", "source": "github"}));
+    let legacy = project_issue_instance("/project-a", 1693, "blocked").with_server_data(json!({"project_id": "/project-a", "issue_number": 1693, "blocked_reason": "legacy blocked row without structured stop metadata", "source": "github"}));
     store.upsert_instance(&legacy).await?; let workflow = recovered_workflow(recover(&store, &legacy.id, super::WorkflowRuntimeRecoveryAction::Unblock).await?, "legacy unblock")?; assert_eq!(workflow.state, "implementing"); assert_eq!(workflow.data["blocked_reason"], legacy.data["blocked_reason"]); assert!(workflow.data.get("last_stop").is_none()); assert_operator_recovery_audit(&store, &legacy.id, "WorkflowRuntimeUnblocked", "unblock", "blocked", "implementing").await?;
     let commands = store.commands_for(&legacy.id).await?; assert_eq!(commands.len(), 1); assert_eq!(commands[0].status, WorkflowCommandStatus::Pending); let command = &commands[0].command; assert_eq!(command.command_type, WorkflowCommandType::EnqueueActivity); assert_eq!(command.activity_name(), Some("implement_issue")); assert_eq!(command.command["project_id"], "/project-a"); assert_eq!(command.command["issue_number"], 1693); assert_eq!(command.command["dispatch_gate"]["reason"], "operator_workflow_runtime_unblock"); assert!(command.command["additional_prompt"].as_str().is_some_and(|prompt| prompt.contains("Recovery reason: operator fixed transient failure"))); Ok(())
 }
@@ -214,8 +214,8 @@ async fn runtime_recovery_unblocks_legacy_blocked_without_stop_metadata() -> any
 #[tokio::test]
 async fn runtime_recovery_legacy_fallback_requires_absent_or_null_last_stop() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() { return Ok(()); } let dir = tempfile::tempdir()?; let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?; use super::WorkflowRuntimeRecoveryAction::{Retry, Unblock};
-    for (issue_number, state, action, last_stop) in [(1710, "blocked", Unblock, None), (1711, "blocked", Unblock, Some(json!(null))), (1712, "failed", Retry, None), (1713, "failed", Retry, Some(json!(null)))] { let mut data = json!({"project_id": "/project-a", "issue_number": issue_number, "source": "github"}); if let Some(last_stop) = last_stop { data["last_stop"] = last_stop; } let original = project_issue_instance("/project-a", issue_number, state).with_data(data); store.upsert_instance(&original).await?; let workflow = recovered_workflow(recover(&store, &original.id, action).await?, "legacy absent/null recovery")?; assert_eq!(workflow.state, "implementing"); assert!(workflow.data.get("last_stop").is_none()); let commands = store.commands_for(&original.id).await?; assert_eq!(commands.len(), 1); assert_eq!(commands[0].command.activity_name(), Some("implement_issue")); }
-    for (issue_number, state, action, last_stop) in [(1720, "blocked", Unblock, json!({})), (1721, "blocked", Unblock, json!({"event_id": 123})), (1722, "blocked", Unblock, json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null})), (1723, "failed", Retry, json!({})), (1724, "failed", Retry, json!({"event_id": 123})), (1725, "failed", Retry, json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null}))] { let original = project_issue_instance("/project-a", issue_number, state).with_data(json!({"project_id": "/project-a", "issue_number": issue_number, "source": "github", "last_stop": last_stop})); store.upsert_instance(&original).await?; let outcome = recover(&store, &original.id, action).await?; assert!(matches!(outcome, super::WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity { activity: None, .. })); assert_recovery_left_workflow_unchanged(&store, &original).await?; }
+    for (issue_number, state, action, last_stop) in [(1710, "blocked", Unblock, None), (1711, "blocked", Unblock, Some(json!(null))), (1712, "failed", Retry, None), (1713, "failed", Retry, Some(json!(null)))] { let mut data = json!({"project_id": "/project-a", "issue_number": issue_number, "source": "github"}); if let Some(last_stop) = last_stop { data["last_stop"] = last_stop; } let original = project_issue_instance("/project-a", issue_number, state).with_server_data(data); store.upsert_instance(&original).await?; let workflow = recovered_workflow(recover(&store, &original.id, action).await?, "legacy absent/null recovery")?; assert_eq!(workflow.state, "implementing"); assert!(workflow.data.get("last_stop").is_none()); let commands = store.commands_for(&original.id).await?; assert_eq!(commands.len(), 1); assert_eq!(commands[0].command.activity_name(), Some("implement_issue")); }
+    for (issue_number, state, action, last_stop) in [(1720, "blocked", Unblock, json!({})), (1721, "blocked", Unblock, json!({"event_id": 123})), (1722, "blocked", Unblock, json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null})), (1723, "failed", Retry, json!({})), (1724, "failed", Retry, json!({"event_id": 123})), (1725, "failed", Retry, json!({"state": null, "activity": null, "runtime_job_id": null, "error_kind": null}))] { let original = project_issue_instance("/project-a", issue_number, state).with_server_data(json!({"project_id": "/project-a", "issue_number": issue_number, "source": "github", "last_stop": last_stop})); store.upsert_instance(&original).await?; let outcome = recover(&store, &original.id, action).await?; assert!(matches!(outcome, super::WorkflowRuntimeRecoveryOutcome::UnsupportedStoppedActivity { activity: None, .. })); assert_recovery_left_workflow_unchanged(&store, &original).await?; }
     Ok(())
 }
 
@@ -332,7 +332,7 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
     }
 
     for (issue_number, state, action, data, field) in malformed_stop_metadata_cases() {
-        let malformed = project_issue_instance("/project-a", issue_number, state).with_data(data);
+        let malformed = project_issue_instance("/project-a", issue_number, state).with_server_data(data);
         store.upsert_instance(&malformed).await?;
         let err = recover(
             &store,
@@ -349,7 +349,7 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
         assert!(store.commands_for(&malformed.id).await?.is_empty());
     }
 
-    let legacy = project_issue_instance("/project-a", 1698, "failed").with_data(json!({
+    let legacy = project_issue_instance("/project-a", 1698, "failed").with_server_data(json!({
         "project_id": "/project-a",
         "issue_number": 1698,
         "failure_reason": "legacy failed row without structured stop metadata",
@@ -367,7 +367,7 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].command.activity_name(), Some("implement_issue"));
 
-    let unsupported = project_issue_instance("/project-a", 1699, "failed").with_data(json!({
+    let unsupported = project_issue_instance("/project-a", 1699, "failed").with_server_data(json!({
         "error_kind": "timeout",
         "last_stop": {
             "state": "failed",
@@ -399,9 +399,17 @@ async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::
     let command = WorkflowCommand::enqueue_activity("implement_issue", "lost-transcript-retry");
     let mut instance =
         store_stopped_failed_command(&store, 1704, "implement_issue", &command).await?;
-    instance.data["stop_reason_code"] = json!("runtime_transcript_lost");
-    instance.data["reason_class"] = json!("terminal");
-    instance.data["last_stop"]["stop_reason_code"] = json!("runtime_transcript_lost");
+    let mut last_stop = instance.data["last_stop"].clone();
+    last_stop["stop_reason_code"] = json!("runtime_transcript_lost");
+    instance.apply_data_writes([
+        WorkflowDataWrite::set(
+            "stop_reason_code",
+            json!("runtime_transcript_lost"),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set("reason_class", json!("terminal"), DataProvenance::Server),
+        WorkflowDataWrite::set("last_stop", last_stop, DataProvenance::Server),
+    ])?;
     store.upsert_instance(&instance).await?;
 
     let recovered = recovered_workflow(
@@ -434,7 +442,7 @@ async fn runtime_recovery_locks_instance_before_waiting_on_command() -> anyhow::
         WorkflowCommand::enqueue_activity("implement_issue", "stale-dispatched-1568");
     let (stale_command_id, runtime_job_id) =
         enqueue_original_runtime_job(&store, &instance.id, &original_command).await?;
-    let instance = instance.with_data(json!({
+    let instance = instance.with_server_data(json!({
         "last_stop": {
             "state": "blocked",
             "activity": "implement_issue",
@@ -595,7 +603,7 @@ async fn store_stopped_failed_command(
     store.upsert_instance(&instance).await?;
     let (_command_id, runtime_job_id) =
         enqueue_original_runtime_job(store, &instance.id, command).await?;
-    let instance = instance.with_data(json!({
+    let instance = instance.with_server_data(json!({
         "error_kind": "timeout",
         "last_stop": {
             "state": "failed",

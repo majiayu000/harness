@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -59,7 +59,7 @@ fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
 
 #[test]
 fn runtime_completion_reducer_retries_local_review_failure_when_policy_allows() {
-    let instance = issue_instance("local_review_gate").with_data(json!({
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -111,7 +111,7 @@ fn runtime_completion_reducer_retries_local_review_failure_when_policy_allows() 
 
 #[test]
 fn runtime_completion_reducer_retries_timeout_activity_failure_when_policy_allows() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -156,7 +156,7 @@ fn runtime_completion_reducer_retries_timeout_activity_failure_when_policy_allow
 
 #[test]
 fn runtime_completion_reducer_retries_spawn_failure_when_policy_allows() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -279,7 +279,7 @@ fn runtime_failure_scope_guard_block_carries_structured_stop_metadata() {
 
 #[test]
 fn runtime_failure_does_not_retry_fatal_activity_failure() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 3
         }
@@ -338,7 +338,7 @@ fn runtime_failure_does_not_retry_fatal_activity_failure() {
 
 #[test]
 fn runtime_completion_reducer_fails_after_retry_policy_exhausted() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -390,7 +390,7 @@ fn runtime_completion_reducer_fails_after_retry_policy_exhausted() {
 
 #[test]
 fn runtime_completion_reducer_uses_activity_retry_override() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1,
             "activity_retries": {
@@ -447,7 +447,7 @@ fn runtime_completion_reducer_uses_activity_retry_override() {
 
 #[test]
 fn runtime_completion_reducer_adds_retry_cooldown_metadata() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 3,
             "retry_delay_secs": 30,

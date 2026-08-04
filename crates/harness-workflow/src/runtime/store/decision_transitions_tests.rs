@@ -14,7 +14,7 @@ fn instance(id: &str, state: &str) -> WorkflowInstance {
         WorkflowSubject::new("pr", "4242"),
     )
     .with_id(id)
-    .with_data(json!({ "project_id": "/project-a", "pr_number": 4242 }))
+    .with_server_data(json!({ "project_id": "/project-a", "pr_number": 4242 }))
 }
 
 /// `implementing -> ready_to_merge` is absent from the github_issue_pr

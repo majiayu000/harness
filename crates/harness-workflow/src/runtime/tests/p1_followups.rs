@@ -15,7 +15,7 @@ async fn runtime_store_get_instance_by_pr_prefers_issue_bound_workflow() -> anyh
         WorkflowSubject::new("issue", "issue:77"),
     )
     .with_id("project-a::owner/repo::issue:77")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-a",
         "repo": "owner/repo",
         "issue_number": 77,
@@ -28,7 +28,7 @@ async fn runtime_store_get_instance_by_pr_prefers_issue_bound_workflow() -> anyh
         WorkflowSubject::new("pull_request", "pr:880"),
     )
     .with_id("project-a::owner/repo::pr:880")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-a",
         "repo": "owner/repo",
         "pr_number": 880,

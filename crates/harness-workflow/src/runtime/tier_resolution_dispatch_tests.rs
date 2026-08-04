@@ -23,7 +23,7 @@ async fn tier_resolution_runtime_dispatch_records_isolation_evidence() -> anyhow
         WorkflowSubject::new("issue", "issue:42"),
     )
     .with_id("tier-resolution-workflow")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "/project",
         "repo": "owner/repo",
         "issue_number": 42,

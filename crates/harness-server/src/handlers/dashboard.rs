@@ -323,7 +323,7 @@ mod tests {
             state,
             harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1371"),
         )
-        .with_data(serde_json::json!({
+        .with_server_data(serde_json::json!({
             "project_id": project_id,
             "task_id": task_id,
         }))
@@ -411,13 +411,12 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
         store
             .upsert_instance(
-                &runtime_workflow("failed", &project_root, "dashboard-stalled-task").with_data(
-                    serde_json::json!({
+                &runtime_workflow("failed", &project_root, "dashboard-stalled-task")
+                    .with_server_data(serde_json::json!({
                         "project_id": project_root,
                         "task_id": "dashboard-stalled-task",
                         "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
-                    }),
-                ),
+                    })),
             )
             .await?;
 

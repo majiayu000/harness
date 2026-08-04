@@ -45,7 +45,7 @@ async fn local_review_gate_runtime_reconciliation_marks_merged_pr_done() -> anyh
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:47"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 47,

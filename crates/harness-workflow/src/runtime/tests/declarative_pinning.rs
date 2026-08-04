@@ -163,14 +163,14 @@ mod declarative_pinning {
             "done",
             WorkflowSubject::new("document", "one"),
         )
-        .with_data(json!({ "definition_hash": v1.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": v1.definition_hash() }));
         let v2_instance = WorkflowInstance::new(
             "docs_review",
             v2.definition_version(),
             "done",
             WorkflowSubject::new("document", "two"),
         )
-        .with_data(json!({ "definition_hash": v2.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": v2.definition_hash() }));
         assert_eq!(
             registry
                 .state_definition_for_instance(&v1_instance, "done")
@@ -186,7 +186,7 @@ mod declarative_pinning {
             "done",
             WorkflowSubject::new("document", "mismatch"),
         )
-        .with_data(json!({ "definition_hash": v2.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": v2.definition_hash() }));
         assert!(registry
             .state_definition_for_instance(&mismatched_hash, "done")
             .is_none());
@@ -222,7 +222,7 @@ mod declarative_pinning {
             "done",
             WorkflowSubject::new("issue", "1609"),
         )
-        .with_data(json!({ "definition_hash": "unrelated-business-metadata" }));
+        .with_server_data(json!({ "definition_hash": "unrelated-business-metadata" }));
         assert_eq!(
             workflow_state_definition_for_instance(&builtin_with_unrelated_hash, "done")
                 .and_then(|state| state.terminal_state),
@@ -248,7 +248,7 @@ mod declarative_pinning {
             .is_some());
         let raw_with_unrelated_hash = raw_instance
             .clone()
-            .with_data(json!({ "definition_hash": v1.definition_hash() }));
+            .with_server_data(json!({ "definition_hash": v1.definition_hash() }));
         assert!(matches!(
             raw_registry.resolve_declarative_definition(&raw_with_unrelated_hash),
             DeclarativeDefinitionResolution::NotDeclarative
@@ -402,7 +402,7 @@ mod declarative_pinning {
             WorkflowSubject::new("prompt", "persisted-declarative-terminal"),
         )
         .with_id("persisted-declarative-terminal")
-        .with_data(json!({
+        .with_server_data(json!({
             "submission_id": "persisted-declarative-terminal",
             "definition_hash": definition.definition_hash(),
         }));

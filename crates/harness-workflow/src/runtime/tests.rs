@@ -11,7 +11,7 @@ use super::{
     build_issue_submission_decision, build_plan_issue_decision, build_pr_detected_decision,
     build_pr_feedback_decision, build_pr_feedback_sweep_decision, build_prompt_submission_decision,
     build_quality_gate_run_decision, reduce_runtime_job_completed, CandidateFanoutRequest,
-    CommandDispatchOutcome, DeferClaimedCommandOutcome, DispatchBackoffPolicy,
+    CommandDispatchOutcome, DataProvenance, DeferClaimedCommandOutcome, DispatchBackoffPolicy,
     DispatchBarrierInput, DispatchBarrierReasonCode, DispatchClaim, InMemoryWorkflowBus,
     IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction, PlanIssueDecisionInput,
     PlanIssueWorkflowAction, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
@@ -19,11 +19,12 @@ use super::{
     PromptContinuationState, PromptSubmissionDecisionInput, QualityGateDecisionInput,
     QualityGateWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor,
     RuntimeProfileSelector, RuntimeWorker, SubmissionMode, WorkflowCommandStatus,
-    WorkflowDecisionTransition, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
-    LOCAL_REVIEW_ACTIVITY, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
-    QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL, RUNTIME_JOB_COMPLETED_EVENT, SCOPE_TOO_LARGE_SIGNAL,
+    WorkflowDataWrite, WorkflowDecisionTransition, WorkflowRuntimeStore,
+    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, RUNTIME_JOB_COMPLETED_EVENT,
+    SCOPE_TOO_LARGE_SIGNAL,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Timelike, Utc};

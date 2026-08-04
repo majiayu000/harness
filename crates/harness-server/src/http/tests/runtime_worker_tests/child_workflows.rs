@@ -23,7 +23,7 @@ async fn runtime_job_worker_starts_child_workflow_without_agent_turn() -> anyhow
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
@@ -129,7 +129,7 @@ async fn runtime_job_worker_starts_prompt_child_workflow_for_open_pr_feedback() 
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-pr-feedback")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
@@ -233,7 +233,7 @@ async fn runtime_job_worker_starts_pr_feedback_child_workflow_without_agent_turn
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
     )
     .with_id("issue-pr-feedback-parent")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 226,
@@ -335,7 +335,7 @@ async fn runtime_job_worker_starts_quality_gate_child_workflow_without_agent_tur
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
     )
     .with_id("issue-quality-gate-parent")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 227,

@@ -234,7 +234,7 @@ mod tests {
             "implementing",
             WorkflowSubject::new("prompt", "periodic-review:test"),
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "prompt_summary": "periodic review",
             "external_id": "periodic-review:test",
             "execution_policy": {

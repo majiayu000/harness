@@ -20,7 +20,7 @@ async fn prompt_continuation_completion_persists_context_and_dedupes_attempt_com
         WorkflowSubject::new("prompt", "TEAM-123"),
     )
     .with_id("prompt-continuation-store")
-    .with_data(json!({
+    .with_server_data(json!({
         "prompt_ref": "prompt-ref-store",
         "continuation": PromptContinuationState::initial(&policy),
     }));
@@ -113,7 +113,7 @@ async fn settled_prompt_missing_completion_evidence_persists_observed_context(
         WorkflowSubject::new("prompt", "TEAM-124"),
     )
     .with_id("prompt-continuation-missing-evidence")
-    .with_data(json!({
+    .with_server_data(json!({
         "prompt_ref": "prompt-ref-missing-evidence",
         "continuation": PromptContinuationState::initial(&policy),
     }));
@@ -185,7 +185,7 @@ async fn single_shot_prompt_missing_completion_evidence_still_commits() -> anyho
         WorkflowSubject::new("prompt", "single-shot"),
     )
     .with_id("prompt-single-shot-missing-evidence")
-    .with_data(json!({ "prompt_ref": "prompt-ref-single-shot" }));
+    .with_server_data(json!({ "prompt_ref": "prompt-ref-single-shot" }));
     store.upsert_instance(&instance).await?;
     let result = ActivityResult::succeeded(
         PROMPT_TASK_IMPLEMENT_ACTIVITY,

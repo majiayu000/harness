@@ -371,7 +371,7 @@ mod tests {
             "blocked",
             WorkflowSubject::new("test", "one"),
         )
-        .with_data(json!({ "definition_hash": definition.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
         assert_eq!(
             recovery_targets_for_definition(&pinned, &definition),
             [RuntimeRecoveryTargetProjection {
@@ -425,7 +425,7 @@ mod tests {
                 WorkflowSubject::new("issue", format!("issue:{id}")),
             )
             .with_id(id.to_string())
-            .with_data(json!({
+            .with_server_data(json!({
                 "error_kind": "timeout",
                 "last_stop": { "state": state, "activity": "implement_issue" },
             }));
@@ -444,7 +444,13 @@ mod tests {
                     command.command,
                 )
                 .await?;
-            workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
+            let mut last_stop = workflow.data["last_stop"].clone();
+            last_stop["runtime_job_id"] = json!(job.id);
+            workflow.set_data_field(
+                "last_stop",
+                last_stop,
+                harness_workflow::runtime::DataProvenance::Server,
+            )?;
             store.upsert_instance(&workflow).await?;
             workflows.push(workflow);
         }

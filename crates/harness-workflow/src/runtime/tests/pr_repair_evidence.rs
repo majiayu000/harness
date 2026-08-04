@@ -5,7 +5,7 @@ use crate::runtime::{
 };
 
 fn pr_workflow_state(state: &str) -> WorkflowInstance {
-    issue_instance(state).with_data(json!({
+    issue_instance(state).with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-1",

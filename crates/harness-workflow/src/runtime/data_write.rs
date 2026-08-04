@@ -38,13 +38,19 @@ impl WorkflowDataWrite {
 }
 
 impl WorkflowInstance {
-    /// Preserve the historical builder API while making its legacy boundary
-    /// explicit. This method does not create a migration boundary: only rows
-    /// loaded from durable storage can be grandfathered as legacy data.
-    /// Production callers must classify the value before persistence.
-    pub fn with_data(mut self, data: Value) -> Self {
-        self.data = data;
-        self
+    /// Fixture builder that seeds workflow data already classified as
+    /// server-authored.
+    ///
+    /// The name carries the provenance claim so a fixture can never seed
+    /// agent- or externally-authored data while presenting it to the taint
+    /// fence as server-authored. Fixtures that model untrusted data must use
+    /// [`Self::with_classified_data`] or [`Self::with_data_field_provenance`]
+    /// with the provenance they actually mean.
+    ///
+    /// This is not a migration boundary: only rows loaded from durable
+    /// storage can be grandfathered as legacy data.
+    pub fn with_server_data(self, data: Value) -> Self {
+        self.with_classified_data(data, DataProvenance::Server)
     }
 
     pub fn with_classified_data(mut self, data: Value, provenance: DataProvenance) -> Self {
@@ -174,7 +180,7 @@ mod tests {
     #[test]
     fn first_classified_write_migrates_legacy_fields_atomically() {
         let data = json!({"historical": "value"});
-        let mut workflow = instance().with_data(data.clone());
+        let mut workflow = instance().with_server_data(data.clone());
         workflow.data_provenance = Some(
             WorkflowDataProvenance::migrated_from_persisted_data(&data)
                 .expect("persisted migration"),

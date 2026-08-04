@@ -482,7 +482,7 @@ fn candidate_runtime_row(candidate_index: u32) -> RuntimeUsageRow {
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1449"),
     )
     .with_id("workflow-1449")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "issue_number": 1449,
         "task_id": "workflow-task",
     }));

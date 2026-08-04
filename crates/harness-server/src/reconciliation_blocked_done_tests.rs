@@ -45,7 +45,7 @@ async fn blocked_runtime_reconciliation_marks_merged_pr_done() -> anyhow::Result
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:48"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 48,
@@ -134,7 +134,7 @@ async fn blocked_runtime_reconciliation_marks_slug_only_merged_pr_done() -> anyh
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:49"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 49,
