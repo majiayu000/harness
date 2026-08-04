@@ -68,10 +68,14 @@ impl WorkflowDataProvenance {
                     .legacy_entries
                     .extend(object.keys().map(|key| workflow_data_pointer("", key)));
             }
-            value if !value.is_null() => {
+            // Any non-object document is grandfathered whole, including the
+            // `null` produced by a pre-sidecar row that omitted `data`
+            // entirely. Recording nothing for `null` would leave the root
+            // uncovered, so the row would fail every coverage check and could
+            // never be dispatched, written, or repaired after upgrade.
+            _ => {
                 provenance.legacy_entries.insert(String::new());
             }
-            _ => {}
         }
         provenance.refresh_value_digests(data)?;
         Ok(provenance)
@@ -96,6 +100,52 @@ impl WorkflowDataProvenance {
         self.value_digests
             .retain(|entry, _| entry != &pointer && !entry.starts_with(&descendant_prefix));
         self.entries.insert(pointer.clone(), provenance);
+    }
+
+    /// Copy every classification covering `pointer` into `target`.
+    ///
+    /// Used when a writer replaces the whole `workflow.data` document but
+    /// leaves some fields byte-identical. Those fields were not authored by
+    /// this write, so their existing classification — including a
+    /// grandfathered legacy marker — must survive rather than being reassigned
+    /// by the new writer's field mapping.
+    ///
+    /// Returns `false` when this sidecar has no coverage for the pointer at
+    /// all, in which case the caller must classify it as a fresh write.
+    pub(crate) fn carry_over_coverage_into(&self, pointer: &str, target: &mut Self) -> bool {
+        let descendant_prefix = if pointer.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{pointer}/")
+        };
+        let mut carried = false;
+        for (entry, provenance) in &self.entries {
+            if entry == pointer || entry.starts_with(&descendant_prefix) {
+                target.entries.insert(entry.clone(), *provenance);
+                carried = true;
+            }
+        }
+        for entry in &self.legacy_entries {
+            if entry == pointer || entry.starts_with(&descendant_prefix) {
+                target.legacy_entries.insert(entry.clone());
+                carried = true;
+            }
+        }
+        if carried {
+            return true;
+        }
+        // No exact or descendant entry, so an ancestor covers this field.
+        // Legacy is checked first: when an ancestor is grandfathered, keeping
+        // the field fenced is the conservative reading.
+        if self.is_legacy(pointer) {
+            target.legacy_entries.insert(pointer.to_string());
+            return true;
+        }
+        if let Some(provenance) = self.provenance_for(pointer) {
+            target.entries.insert(pointer.to_string(), provenance);
+            return true;
+        }
+        false
     }
 
     pub(crate) fn remove_classification(&mut self, pointer: &str) {

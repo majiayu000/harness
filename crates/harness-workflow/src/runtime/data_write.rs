@@ -96,6 +96,18 @@ impl WorkflowInstance {
         self.data_provenance = Some(sidecar);
     }
 
+    /// Replace the whole `workflow.data` document, classifying each field the
+    /// write actually authored.
+    ///
+    /// Callers typically stage a new document by cloning the current data and
+    /// editing a few fields, so most fields arrive unchanged. An unchanged
+    /// field was not authored by this write, and reclassifying it would let a
+    /// caller's default arm silently promote grandfathered or externally
+    /// authored history to trusted server data — the value would then be
+    /// rendered outside the untrusted fence. Unchanged fields therefore keep
+    /// whatever coverage they already had, and the migration boundary carries
+    /// forward so later readers can still tell pre-provenance history from a
+    /// post-deployment writer defect.
     pub fn replace_data_with_field_provenance(
         &mut self,
         data: Value,
@@ -104,12 +116,25 @@ impl WorkflowInstance {
         let object = data
             .as_object()
             .context("workflow instance data must be a JSON object")?;
+        let existing = self.data_provenance.clone();
         let mut provenance = WorkflowDataProvenance::new();
-        for field in object.keys() {
-            provenance.classify(
-                workflow_data_pointer("", field),
-                provenance_for(field.as_str()),
-            );
+        if let Some(migrated_at) = existing.as_ref().and_then(|existing| existing.migrated_at) {
+            provenance.migrated_at = Some(migrated_at);
+        }
+        for (field, value) in object {
+            let pointer = workflow_data_pointer("", field);
+            let unchanged = self
+                .data
+                .pointer(&pointer)
+                .is_some_and(|current| current == value);
+            if unchanged
+                && existing.as_ref().is_some_and(|existing| {
+                    existing.carry_over_coverage_into(&pointer, &mut provenance)
+                })
+            {
+                continue;
+            }
+            provenance.classify(pointer, provenance_for(field.as_str()));
         }
         provenance.refresh_value_digests(&data)?;
         provenance.validate_persisted_data(&data)?;
@@ -229,6 +254,104 @@ mod tests {
             sidecar.provenance_for("/continuation"),
             Some(DataProvenance::External)
         );
+    }
+
+    #[test]
+    fn whole_document_replacement_does_not_launder_unchanged_legacy_fields() {
+        // A pre-provenance row: everything it carries is grandfathered.
+        let persisted = json!({
+            "additional_prompt": "hostile historical instruction",
+            "task_id": "task-1",
+        });
+        let mut workflow = instance().with_server_data(persisted.clone());
+        workflow.data_provenance = Some(
+            WorkflowDataProvenance::migrated_from_persisted_data(&persisted)
+                .expect("persisted migration"),
+        );
+        let migrated_at = workflow
+            .data_provenance
+            .as_ref()
+            .and_then(|sidecar| sidecar.migrated_at)
+            .expect("migration boundary timestamp");
+
+        // A later transition stages a new document by cloning the current data
+        // and touching one field. Its mapping would call everything unknown
+        // `Server`.
+        let mut staged = workflow.data.clone();
+        staged["last_decision"] = json!("address_feedback");
+        workflow
+            .replace_data_with_field_provenance(staged, |_| DataProvenance::Server)
+            .expect("classified replacement");
+
+        let sidecar = workflow.data_provenance.as_ref().expect("sidecar");
+        // The untouched historical field must stay fenced, not become trusted
+        // server data just because it rode along in the staged document.
+        assert!(
+            sidecar.is_legacy("/additional_prompt"),
+            "an unchanged grandfathered field must not be reclassified"
+        );
+        assert_eq!(sidecar.provenance_for("/additional_prompt"), None);
+        assert!(sidecar.is_legacy("/task_id"));
+        // Only the field this write authored is newly classified.
+        assert_eq!(
+            sidecar.provenance_for("/last_decision"),
+            Some(DataProvenance::Server)
+        );
+        // The boundary itself survives, so later readers can still tell
+        // pre-provenance history from a writer defect.
+        assert_eq!(sidecar.migrated_at, Some(migrated_at));
+    }
+
+    #[test]
+    fn whole_document_replacement_reclassifies_fields_the_write_changed() {
+        let persisted = json!({"additional_prompt": "old", "task_id": "task-1"});
+        let mut workflow = instance().with_server_data(persisted.clone());
+        workflow.data_provenance = Some(
+            WorkflowDataProvenance::migrated_from_persisted_data(&persisted)
+                .expect("persisted migration"),
+        );
+
+        let mut staged = workflow.data.clone();
+        staged["additional_prompt"] = json!("rewritten by this transition");
+        workflow
+            .replace_data_with_field_provenance(staged, |field| match field {
+                "additional_prompt" => DataProvenance::External,
+                _ => DataProvenance::Server,
+            })
+            .expect("classified replacement");
+
+        let sidecar = workflow.data_provenance.as_ref().expect("sidecar");
+        // This write authored the value, so it leaves the legacy boundary and
+        // takes the writer's classification.
+        assert!(!sidecar.is_legacy("/additional_prompt"));
+        assert_eq!(
+            sidecar.provenance_for("/additional_prompt"),
+            Some(DataProvenance::External)
+        );
+        assert!(sidecar.is_legacy("/task_id"));
+    }
+
+    #[test]
+    fn null_persisted_data_crosses_the_legacy_boundary() {
+        // An older serialized instance that omitted `data` deserializes to
+        // null. It must still be readable, writable, and repairable.
+        let provenance = WorkflowDataProvenance::migrated_from_persisted_data(&Value::Null)
+            .expect("null migration");
+        provenance
+            .validate_persisted_data(&Value::Null)
+            .expect("a migrated null document must be persistable");
+
+        let mut workflow = instance();
+        workflow.data = Value::Null;
+        workflow.data_provenance = Some(provenance);
+        workflow
+            .set_data_field("repo", json!("owner/repo"), DataProvenance::Server)
+            .expect("a null document must accept its first classified write");
+
+        assert_eq!(workflow.data["repo"], "owner/repo");
+        workflow
+            .validate_data_provenance()
+            .expect("the repaired document is persistable");
     }
 
     #[test]
