@@ -71,19 +71,38 @@ async fn cancelled_recovered_quality_gate_is_reactivated_after_terminal_job() ->
         .iter()
         .filter(|record| record.command.requires_runtime_job())
         .collect::<Vec<_>>();
-    assert_eq!(runtime_commands.len(), 1);
-    assert_eq!(runtime_commands[0].id, command.id);
-    assert_eq!(runtime_commands[0].status, WorkflowCommandStatus::Pending);
+    // Recovery re-enqueues the cancelled command as a new attempt rather than
+    // resurrecting the cancelled row, so the cancellation stays in the history
+    // and the retry carries its own identity (GH-1865).
+    assert_eq!(runtime_commands.len(), 2);
+    let superseded = runtime_commands
+        .iter()
+        .find(|record| record.id == command.id)
+        .expect("the cancelled attempt must survive recovery");
+    assert_eq!(superseded.status, WorkflowCommandStatus::Superseded);
+    assert_eq!(superseded.attempt_generation, 1);
+    let retried = runtime_commands
+        .iter()
+        .find(|record| record.id != command.id)
+        .expect("recovery must queue a new attempt");
+    assert_eq!(retried.status, WorkflowCommandStatus::Pending);
+    assert_eq!(retried.attempt_generation, 2);
+    assert_eq!(
+        superseded.superseded_by_command_id.as_deref(),
+        Some(retried.id.as_str())
+    );
     store
         .enqueue_runtime_job_for_pending_command(
-            &command.id,
+            &retried.id,
             RuntimeKind::CodexJsonrpc,
             "codex-default",
             json!({"activity": "start_child_workflow"}),
             None,
         )
         .await?;
-    assert_eq!(store.runtime_jobs_for_command(&command.id).await?.len(), 2);
+    // Each attempt owns its own runtime job; the cancelled one keeps its.
+    assert_eq!(store.runtime_jobs_for_command(&retried.id).await?.len(), 1);
+    assert_eq!(store.runtime_jobs_for_command(&command.id).await?.len(), 1);
     Ok(())
 }
 

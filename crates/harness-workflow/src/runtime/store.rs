@@ -25,6 +25,8 @@ mod activity_completion;
 mod artifacts;
 #[path = "store/child_instance_start.rs"]
 mod child_instance_start;
+#[path = "store/command_attempts.rs"]
+mod command_attempts;
 #[path = "store/command_facade.rs"]
 mod command_facade;
 #[path = "store/commands.rs"]

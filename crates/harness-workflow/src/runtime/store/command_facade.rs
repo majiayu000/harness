@@ -34,7 +34,8 @@ impl WorkflowRuntimeStore {
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
                     dispatch_lease_expires_at, dispatch_not_before,
                     dispatch_attempt_count, dispatch_claim_generation,
-                    dispatch_barrier::text, data::text, created_at, updated_at
+                    dispatch_barrier::text, data::text, created_at, updated_at,
+                    attempt_generation, superseded_by_command_id
                  FROM workflow_commands
                  WHERE workflow_id = $1
                  ORDER BY created_at ASC",
@@ -58,7 +59,8 @@ impl WorkflowRuntimeStore {
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
                     dispatch_lease_expires_at, dispatch_not_before,
                     dispatch_attempt_count, dispatch_claim_generation,
-                    dispatch_barrier::text, data::text, created_at, updated_at
+                    dispatch_barrier::text, data::text, created_at, updated_at,
+                    attempt_generation, superseded_by_command_id
              FROM workflow_commands
              WHERE workflow_id = ANY($1::text[])
              ORDER BY workflow_id ASC, created_at ASC",
@@ -92,14 +94,16 @@ impl WorkflowRuntimeStore {
                     command.dispatch_not_before, command.dispatch_attempt_count,
                     command.dispatch_claim_generation, command.dispatch_barrier,
                     command.data,
-                    command.created_at, command.updated_at
+                    command.created_at, command.updated_at,
+                    command.attempt_generation, command.superseded_by_command_id
              FROM unnest($1::text[]) AS selected(workflow_id)
              JOIN LATERAL (
                  SELECT id, workflow_id, decision_id, status, dispatch_owner,
                         dispatch_lease_expires_at, dispatch_not_before,
                         dispatch_attempt_count, dispatch_claim_generation,
                         dispatch_barrier::text AS dispatch_barrier,
-                        data::text AS data, created_at, updated_at
+                        data::text AS data, created_at, updated_at,
+                        attempt_generation, superseded_by_command_id
                  FROM workflow_commands
                  WHERE workflow_id = selected.workflow_id
                  ORDER BY created_at DESC
@@ -130,7 +134,8 @@ impl WorkflowRuntimeStore {
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
                     dispatch_lease_expires_at, dispatch_not_before,
                     dispatch_attempt_count, dispatch_claim_generation,
-                    dispatch_barrier::text, data::text, created_at, updated_at
+                    dispatch_barrier::text, data::text, created_at, updated_at,
+                    attempt_generation, superseded_by_command_id
              FROM workflow_commands
              WHERE id = $1",
         )
@@ -147,7 +152,8 @@ impl WorkflowRuntimeStore {
                     command.dispatch_owner, command.dispatch_lease_expires_at,
                     command.dispatch_not_before, command.dispatch_attempt_count,
                     command.dispatch_claim_generation, command.dispatch_barrier::text,
-                    command.data::text, command.created_at, command.updated_at
+                    command.data::text, command.created_at, command.updated_at,
+                    command.attempt_generation, command.superseded_by_command_id
              FROM workflow_commands AS command
              JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
              WHERE command.status = 'pending'
@@ -218,7 +224,8 @@ impl WorkflowRuntimeStore {
                        command.dispatch_owner, command.dispatch_lease_expires_at,
                        command.dispatch_not_before, command.dispatch_attempt_count,
                        command.dispatch_claim_generation, command.dispatch_barrier::text,
-                       command.data::text, command.created_at, command.updated_at",
+                       command.data::text, command.created_at, command.updated_at,
+                       command.attempt_generation, command.superseded_by_command_id",
         )
         .bind(owner)
         .bind(expires_at)
@@ -244,12 +251,17 @@ impl WorkflowRuntimeStore {
         Ok(records)
     }
 
+    /// Move a command's dispatch status.
+    ///
+    /// A superseded attempt is history and cannot be moved: reviving it would
+    /// put two live rows on one dedupe key and let a replaced attempt dispatch
+    /// (GH-1865).
     pub async fn mark_command_status(
         &self,
         command_id: &str,
         status: WorkflowCommandStatus,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE workflow_commands
              SET status = $1,
                  dispatch_owner = NULL,
@@ -257,13 +269,31 @@ impl WorkflowRuntimeStore {
                  dispatch_not_before = NULL,
                  dispatch_barrier = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = $2",
+             WHERE id = $2 AND status <> $3",
         )
         .bind(status.as_str())
         .bind(command_id)
+        .bind(WorkflowCommandStatus::Superseded.as_str())
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected()
+            == 1;
+        if updated {
+            return Ok(());
+        }
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM workflow_commands WHERE id = $1")
+                .bind(command_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        match existing {
+            Some((current,)) if current == WorkflowCommandStatus::Superseded.as_str() => {
+                anyhow::bail!(
+                    "workflow command `{command_id}` was superseded by a newer attempt and cannot be moved to `{status}`"
+                )
+            }
+            _ => Ok(()),
+        }
     }
 
     pub async fn mark_pending_command_status(

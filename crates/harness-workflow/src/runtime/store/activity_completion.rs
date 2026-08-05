@@ -199,7 +199,8 @@ impl WorkflowRuntimeStore {
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
                     dispatch_lease_expires_at, dispatch_not_before,
                     dispatch_attempt_count, dispatch_claim_generation,
-                    dispatch_barrier::text, data::text, created_at, updated_at
+                    dispatch_barrier::text, data::text, created_at, updated_at,
+                    attempt_generation, superseded_by_command_id
              FROM workflow_commands
              WHERE id = $1
              FOR UPDATE",

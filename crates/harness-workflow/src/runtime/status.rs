@@ -14,6 +14,10 @@ pub enum WorkflowCommandStatus {
     Blocked,
     Cancelled,
     Skipped,
+    /// A pending or cancelled attempt that a newer attempt replaced. The row
+    /// stays as the historical record of that attempt and is never dispatched
+    /// again (GH-1865).
+    Superseded,
 }
 
 impl WorkflowCommandStatus {
@@ -29,6 +33,7 @@ impl WorkflowCommandStatus {
             Self::Blocked => "blocked",
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
+            Self::Superseded => "superseded",
         }
     }
 }
@@ -60,6 +65,7 @@ impl TryFrom<&str> for WorkflowCommandStatus {
             "blocked" => Ok(Self::Blocked),
             "cancelled" => Ok(Self::Cancelled),
             "skipped" => Ok(Self::Skipped),
+            "superseded" => Ok(Self::Superseded),
             other => anyhow::bail!("unknown workflow command status: {other}"),
         }
     }
