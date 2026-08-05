@@ -58,8 +58,8 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 
 ## PR Workflow
 
-- After creating a PR, wait for Gemini code review bot before merging
-- If Gemini leaves review comments, address valid feedback before merge
+- After creating a PR, wait for the Codex review bot before merging
+- If the review bot leaves comments, address valid feedback before merge
 - If no comments or only false positives, proceed with merge
 
 ## Codex Integration
