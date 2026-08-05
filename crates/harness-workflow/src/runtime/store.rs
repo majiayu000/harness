@@ -31,6 +31,8 @@ mod command_facade;
 mod command_store;
 #[path = "store/coverage_recovery.rs"]
 mod coverage_recovery;
+#[path = "store/decision_provenance.rs"]
+mod decision_provenance;
 #[path = "store/decision_transitions.rs"]
 mod decision_transitions;
 #[path = "store/decisions.rs"]
@@ -83,8 +85,12 @@ pub use coverage_recovery::{
     WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
     WorkflowCoverageRecoveryTransition,
 };
+pub(in crate::runtime) use decision_provenance::insert_decision_record_once_tx;
+pub use decision_provenance::DecisionProvenanceConflict;
 pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};
 pub use pr_binding_repair::WorkflowPrBindingRepairOutcome;
+pub(in crate::runtime) use prompt_payloads::insert_prompt_payload_tx;
+pub use prompt_payloads::PromptPayloadIntegrityError;
 pub use recovery::{
     WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
 };
@@ -103,7 +109,7 @@ use transaction_helpers::force_upsert_lifecycle_state_for_test_tx;
 use transaction_helpers::{
     apply_inline_command_side_effect, commit_decision_instance_tx,
     commit_parent_attachment_instance_tx, commit_rejected_initial_failure_instance_tx,
-    commit_same_state_instance_tx, insert_decision_record_tx, insert_event_tx_with_id,
+    commit_same_state_instance_tx, insert_event_tx_with_id,
     insert_validated_canonical_initial_instance_tx, insert_validated_observed_instance_tx,
     load_or_insert_initial_instance_tx, runtime_job_for_command_tx, select_instance_for_update_tx,
 };

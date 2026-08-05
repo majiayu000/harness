@@ -4,7 +4,7 @@ use super::runtime_job_state::{
 };
 use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
-    insert_decision_record_tx, insert_event_tx, select_instance_for_update_tx,
+    insert_decision_record_once_tx, insert_event_tx, select_instance_for_update_tx,
     workflow_instance_from_persisted_json, WorkflowInstance, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
@@ -199,7 +199,7 @@ impl WorkflowRuntimeStore {
         validator.validate(&instance, &decision, &validation_context)?;
         let decision_record =
             WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()));
-        insert_decision_record_tx(&mut tx, &decision_record).await?;
+        insert_decision_record_once_tx(&mut tx, &decision_record).await?;
         for command in &decision.commands {
             let status = recovery_command_status(command);
             command_store::insert_tx(

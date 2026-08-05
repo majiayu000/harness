@@ -6,7 +6,7 @@
 
 use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
-    insert_decision_record_tx, insert_event_tx, load_or_insert_initial_instance_tx,
+    insert_decision_record_once_tx, insert_event_tx, load_or_insert_initial_instance_tx,
     transition_validation::{validate_transition, TransitionValidation},
     validate_instance_for_persistence, WorkflowDecisionTransition,
     WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
@@ -179,12 +179,12 @@ impl WorkflowRuntimeStore {
             TransitionValidation::Rejected(reason) => {
                 let record =
                     WorkflowDecisionRecord::rejected(decision.clone(), Some(event.id), reason);
-                insert_decision_record_tx(&mut tx, &record).await?;
+                insert_decision_record_once_tx(&mut tx, &record).await?;
                 tx.commit().await?;
                 return Ok(Some(record));
             }
         };
-        insert_decision_record_tx(&mut tx, &record).await?;
+        insert_decision_record_once_tx(&mut tx, &record).await?;
 
         for command in &decision.commands {
             let status = if command.requires_runtime_job() {
@@ -241,7 +241,7 @@ impl WorkflowRuntimeStore {
         .await?;
         let record =
             WorkflowDecisionRecord::rejected(decision.clone(), Some(event.id), transition.reason);
-        insert_decision_record_tx(&mut tx, &record).await?;
+        insert_decision_record_once_tx(&mut tx, &record).await?;
 
         tx.commit().await?;
         Ok(Some(record))
@@ -297,7 +297,7 @@ mod submission_guard_tests {
         )
         .await?;
         let record = WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id));
-        insert_decision_record_tx(&mut tx, &record).await?;
+        insert_decision_record_once_tx(&mut tx, &record).await?;
         tx.commit().await?;
         Ok(record)
     }
