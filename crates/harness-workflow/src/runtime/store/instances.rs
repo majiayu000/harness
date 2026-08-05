@@ -1,5 +1,5 @@
 use super::{
-    commit_parent_attachment_instance_tx, commit_same_state_instance_tx,
+    commit_parent_attachment_instance_tx, commit_same_state_instance_tx, insert_event_tx,
     insert_validated_canonical_initial_instance_tx,
     instance_helpers::{otel_trace_context_from_data, terminal_state_pairs},
     select_instance_for_update_tx, validate_instance_for_persistence,
@@ -9,14 +9,29 @@ use super::{
 use crate::runtime::model::WorkflowInstance;
 use crate::runtime::WorkflowOtelTraceContext;
 use chrono::{DateTime, Utc};
+use serde_json::json;
+
+/// Event recorded when a workflow row is created outside a decision
+/// transition, so no creation is eventless (GH-1864).
+pub const WORKFLOW_INSTANCE_CREATED_EVENT: &str = "WorkflowInstanceCreated";
 
 impl WorkflowRuntimeStore {
+    /// Create a workflow at its canonical initial state if it does not exist.
+    ///
+    /// Creation records a `WorkflowInstanceCreated` event in the same
+    /// transaction, so a row can never appear with no provenance for how it
+    /// came to exist. Decision-driven creation carries its own event and
+    /// decision and does not come through here.
     pub async fn insert_instance_if_absent(
         &self,
         instance: &WorkflowInstance,
     ) -> anyhow::Result<bool> {
+        validate_instance_for_persistence(instance)?;
         let mut tx = self.pool.begin().await?;
         let inserted = insert_validated_canonical_initial_instance_tx(&mut tx, instance).await?;
+        if inserted {
+            record_instance_created_event_tx(&mut tx, instance).await?;
+        }
         tx.commit().await?;
         Ok(inserted)
     }
@@ -27,6 +42,7 @@ impl WorkflowRuntimeStore {
         let current = match select_instance_for_update_tx(&mut tx, &instance.id).await? {
             Some(current) => current,
             None if insert_validated_canonical_initial_instance_tx(&mut tx, instance).await? => {
+                record_instance_created_event_tx(&mut tx, instance).await?;
                 tx.commit().await?;
                 return Ok(());
             }
@@ -687,6 +703,27 @@ impl WorkflowRuntimeStore {
     }
 }
 
+async fn record_instance_created_event_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    insert_event_tx(
+        tx,
+        &instance.id,
+        WORKFLOW_INSTANCE_CREATED_EVENT,
+        "workflow_runtime_store",
+        json!({
+            "definition_id": instance.definition_id,
+            "definition_version": instance.definition_version,
+            "state": instance.state,
+            "subject": instance.subject,
+            "parent_workflow_id": instance.parent_workflow_id,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 fn ensure_public_upsert_preserves_instance_boundary(
     current: &WorkflowInstance,
     target: &WorkflowInstance,
@@ -697,6 +734,11 @@ fn ensure_public_upsert_preserves_instance_boundary(
     }
     if current.definition_version != target.definition_version {
         changed_fields.push("definition_version");
+    }
+    if super::decision_transitions::definition_hash_pin(current)
+        != super::decision_transitions::definition_hash_pin(target)
+    {
+        changed_fields.push("data.definition_hash");
     }
     if current.state != target.state {
         changed_fields.push("state");

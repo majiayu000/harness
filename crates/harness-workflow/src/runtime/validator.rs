@@ -1,4 +1,5 @@
 use super::model::{WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowInstance};
+use super::validator_binding::DecisionValidatorBinding;
 use super::validator_progress;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
@@ -422,6 +423,7 @@ impl std::error::Error for WorkflowDecisionRejection {}
 pub struct DecisionValidator {
     allowlist: TransitionAllowlist,
     kind: DecisionValidatorKind,
+    binding: DecisionValidatorBinding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,11 +434,36 @@ enum DecisionValidatorKind {
 }
 
 impl DecisionValidator {
+    /// A validator over a bare allowlist, bound to no definition. The store
+    /// refuses such a validator; callers that persist transitions must build a
+    /// bound one instead.
     pub fn new(allowlist: TransitionAllowlist) -> Self {
         Self {
             allowlist,
             kind: DecisionValidatorKind::Generic,
+            binding: DecisionValidatorBinding::unbound(),
         }
+    }
+
+    /// A validator bound to the exact declarative definition a pin resolved to.
+    pub fn for_declarative_definition(
+        definition_id: &str,
+        definition_version: u32,
+        definition_hash: &str,
+        allowlist: TransitionAllowlist,
+    ) -> Self {
+        let mut validator = Self::for_definition(definition_id, allowlist);
+        validator.binding = DecisionValidatorBinding::for_declarative(
+            definition_id,
+            definition_version,
+            definition_hash,
+        );
+        validator
+    }
+
+    /// The definition identity this validator was resolved from.
+    pub fn binding(&self) -> &DecisionValidatorBinding {
+        &self.binding
     }
 
     pub fn github_issue_pr() -> Self {
@@ -473,7 +500,11 @@ impl DecisionValidator {
             super::prompt_task::PROMPT_TASK_DEFINITION_ID => DecisionValidatorKind::PromptTask,
             _ => DecisionValidatorKind::Generic,
         };
-        Self { allowlist, kind }
+        Self {
+            allowlist,
+            kind,
+            binding: DecisionValidatorBinding::for_definition(definition_id),
+        }
     }
 
     pub fn validate(

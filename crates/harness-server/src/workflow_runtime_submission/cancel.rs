@@ -238,7 +238,15 @@ async fn resolve_declarative_cancellation(
         let target_state = cancelled_state(definition.policy(), instance)?;
         return Ok(Some(DeclarativeCancellation {
             target_state,
-            validator: DecisionValidator::new(definition.registered().allowlist.clone()),
+            // The pin resolved to this exact definition, so the validator
+            // carries that identity and the store can re-verify at commit that
+            // it still governs the row it locked (GH-1864).
+            validator: DecisionValidator::for_declarative_definition(
+                &instance.definition_id,
+                definition.definition_version(),
+                definition.definition_hash(),
+                definition.registered().allowlist.clone(),
+            ),
             missing_pin: false,
         }));
     }
@@ -305,7 +313,15 @@ async fn resolve_declarative_cancellation(
     }
     Ok(Some(DeclarativeCancellation {
         target_state: cancelled_state(&policy, instance)?,
-        validator: DecisionValidator::new(definition.registered().allowlist.clone()),
+        // Rebuilt from the persisted snapshot, but only after its version and
+        // content hash were checked against the instance pin above, so the
+        // validator may claim that identity (GH-1864).
+        validator: DecisionValidator::for_declarative_definition(
+            &instance.definition_id,
+            definition.definition_version(),
+            definition.definition_hash(),
+            definition.registered().allowlist.clone(),
+        ),
         missing_pin: true,
     }))
 }
