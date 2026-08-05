@@ -171,3 +171,39 @@ async fn public_upsert_rejects_version_jump() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// No workflow row may appear with no record of how it came to exist
+/// (GH-1864). Decision-driven creation carries its own event and decision;
+/// creation through the public insert APIs records a `WorkflowInstanceCreated`
+/// event in the same transaction.
+#[tokio::test]
+async fn public_creation_records_an_initial_event_atomically() -> anyhow::Result<()> {
+    let Some(store) = test_store().await? else {
+        return Ok(());
+    };
+
+    let instance = discovered_instance("gh1864-eventless-creation");
+    assert!(store.insert_instance_if_absent(&instance).await?);
+
+    let events = store.events_for(&instance.id).await?;
+    assert_eq!(
+        events.len(),
+        1,
+        "creation must record exactly one provenance event"
+    );
+    assert_eq!(events[0].event_type, WORKFLOW_INSTANCE_CREATED_EVENT);
+    assert_eq!(events[0].event["definition_id"], instance.definition_id);
+    assert_eq!(events[0].event["state"], instance.state);
+
+    // A losing concurrent insert must not append a second creation event.
+    assert!(!store.insert_instance_if_absent(&instance).await?);
+    assert_eq!(store.events_for(&instance.id).await?.len(), 1);
+
+    // The other public creation entry point is held to the same rule.
+    let upserted = discovered_instance("gh1864-eventless-creation-upsert");
+    store.upsert_instance(&upserted).await?;
+    let events = store.events_for(&upserted.id).await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, WORKFLOW_INSTANCE_CREATED_EVENT);
+    Ok(())
+}

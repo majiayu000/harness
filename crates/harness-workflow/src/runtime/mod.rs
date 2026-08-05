@@ -44,6 +44,7 @@ pub mod terminal_state;
 pub mod tier_resolution;
 pub mod transcript;
 pub mod validator;
+pub mod validator_binding;
 mod validator_progress;
 pub mod worker;
 
@@ -209,6 +210,7 @@ pub use validator::{
     DecisionValidator, TransitionAllowlist, TransitionRule, ValidationContext,
     WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
 };
+pub use validator_binding::DecisionValidatorBinding;
 pub use worker::{
     RuntimeJobClaimDecision, RuntimeJobClaimGuard, RuntimeJobExecutor, RuntimeWorker,
 };

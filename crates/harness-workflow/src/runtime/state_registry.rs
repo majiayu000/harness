@@ -258,9 +258,14 @@ impl WorkflowDefinitionRegistry {
         instance: &WorkflowInstance,
     ) -> Result<Option<DecisionValidator>, DeclarativeDefinitionPinError> {
         match self.resolve_declarative_definition(instance) {
+            // Carry the exact version and content hash the pin resolved to, so
+            // the store can re-verify at commit that this validator still
+            // governs the row it loaded (GH-1864).
             DeclarativeDefinitionResolution::Resolved(definition) => {
-                Ok(Some(DecisionValidator::for_definition(
+                Ok(Some(DecisionValidator::for_declarative_definition(
                     &instance.definition_id,
+                    definition.definition_version(),
+                    definition.definition_hash(),
                     definition.registered().allowlist.clone(),
                 )))
             }
