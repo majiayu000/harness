@@ -30,6 +30,12 @@ pub(super) const CONTEXT_PROVENANCE_SCHEMA: &str = "harness.runtime.context_prov
 const HISTORICAL_PROMPT_PACKET_SCHEMA_V1: &str = "harness.runtime.prompt_packet.v1";
 const HISTORICAL_PROMPT_PACKET_SCHEMA_V2: &str = "harness.runtime.prompt_packet.v2";
 
+/// Job-scoped failure marker consumed only by `cfg(test)` worker tests to
+/// inject the provenance error boundary through the real executor. Production
+/// builds compile no behavior for this input key.
+#[cfg(test)]
+pub(crate) const TEST_PROVENANCE_FAILURE_MARKER: &str = "test_fail_context_provenance";
+
 /// Closed coverage markers for context Harness cannot observe. Absence of a
 /// manifest entry is never proof that such context did not exist.
 const NOT_OBSERVED_BY_HARNESS: [&str; 4] = [
@@ -92,6 +98,15 @@ pub(super) fn apply_context_provenance(
     repo_memory: &[RetrievedRepoMemoryRecord],
     prompt_task_text: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Job-scoped test seam: fail the provenance boundary before any packet
+    // mutation or serialization so worker tests can prove the executor
+    // ordering without global state or parallel-test races.
+    #[cfg(test)]
+    if job.input.get(TEST_PROVENANCE_FAILURE_MARKER).is_some() {
+        anyhow::bail!(
+            "required context provenance construction failed before prompt preparation (injected test marker)"
+        );
+    }
     let provenance = build_context_provenance(resolved_settings, workflow_document, repo_memory)?;
     packet["resolved_runtime_settings"] = serde_json::to_value(resolved_settings)
         .context("failed to serialize resolved runtime settings for the prompt packet")?;
@@ -156,13 +171,19 @@ pub(super) fn validate_prompt_packet_provenance(packet: &Value) -> anyhow::Resul
     Ok(())
 }
 
-/// Remove audit-only sections from the model-facing packet clone so the
-/// agent-visible prompt bytes for unchanged inputs match the v1 rendering.
+/// Remove audit-only sections from the model-facing packet clone and restore
+/// the historical v1 schema so the agent-visible prompt bytes for unchanged
+/// inputs match the pre-v2 rendering. The durable packet is never touched and
+/// keeps the v2 schema; only this rendered clone is v1.
 pub(super) fn strip_model_facing_audit_sections(model_packet: &mut Value) {
     if let Some(object) = model_packet.as_object_mut() {
         object.remove("context_provenance");
         object.remove("resolved_runtime_settings");
         object.remove("prompt_task_request");
+        object.insert(
+            "schema".to_string(),
+            Value::String(HISTORICAL_PROMPT_PACKET_SCHEMA_V1.to_owned()),
+        );
     }
 }
 
@@ -187,6 +208,31 @@ fn build_context_provenance(
     })
 }
 
+/// Deterministic runtime-profile provenance locator (B-015).
+///
+/// The historical `runtime_profile/<exact-name>` locator is tried first so
+/// already-valid identities (including multi-segment names such as
+/// `team/codex`) keep their stable component IDs. Only names that fail
+/// ASC-001 locator validation fall back to the disjoint
+/// `runtime_profile_name_sha256/<digest>` namespace, keyed by the lowercase
+/// SHA-256 of the exact UTF-8 profile-name bytes. The fallback never trims,
+/// case-folds, or Unicode-normalizes the name: equal byte sequences produce
+/// equal locators and byte-distinct names cannot collide. The exact
+/// configured name remains in `resolved_runtime_settings.profile_name`; the
+/// fallback locator is an audit identity, not a replacement for the value.
+fn runtime_profile_source(profile_name: &str) -> anyhow::Result<AgentStackSource> {
+    let historical_locator = format!("runtime_profile/{profile_name}");
+    if let Ok(source) = AgentStackSource::new(AgentStackSourceScope::Runtime, &historical_locator) {
+        return Ok(source);
+    }
+    let name_digest = Sha256Digest::from_bytes(profile_name.as_bytes());
+    AgentStackSource::new(
+        AgentStackSourceScope::Runtime,
+        &format!("runtime_profile_name_sha256/{}", name_digest.as_str()),
+    )
+    .context("hashed runtime profile name fallback locator failed ASC-001 validation")
+}
+
 fn resolved_runtime_settings_entry(
     resolved_settings: &ResolvedRuntimeSettings,
     order: usize,
@@ -195,16 +241,7 @@ fn resolved_runtime_settings_entry(
         &serde_json::to_vec(resolved_settings)
             .context("failed to serialize resolved runtime settings for provenance hashing")?,
     );
-    let source = AgentStackSource::new(
-        AgentStackSourceScope::Runtime,
-        &format!("runtime_profile/{}", resolved_settings.profile_name),
-    )
-    .with_context(|| {
-        format!(
-            "runtime profile name `{}` cannot form a valid provenance source locator",
-            resolved_settings.profile_name
-        )
-    })?;
+    let source = runtime_profile_source(&resolved_settings.profile_name)?;
     provenance_entry(
         AgentStackComponentKind::AgentRuntime,
         source,

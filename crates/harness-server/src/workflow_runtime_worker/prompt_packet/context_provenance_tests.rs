@@ -1,7 +1,6 @@
 use super::*;
 use crate::workflow_runtime_worker::prompt_packet::{
-    build_runtime_job_prompt, build_runtime_prompt_packet, prompt_packet_digest,
-    workflow_prompt_artifact,
+    build_runtime_prompt_packet, prompt_packet_digest, workflow_prompt_artifact,
 };
 use crate::workflow_runtime_worker::runtime_profile::{
     resolve_runtime_settings, ResolvedApprovalPolicy, RuntimeSettingsResolutionError,
@@ -715,35 +714,8 @@ fn provenance_and_packet_digests_are_repeatable_and_order_sensitive() {
 #[test]
 fn invalid_required_provenance_aborts_packet_construction() {
     let job = runtime_job("implement_issue");
-    // A profile name that cannot form a valid ASC-001 locator must abort
-    // packet construction with an error instead of substituting an empty
-    // manifest; the executor therefore never hashes, records, or executes
-    // the incomplete packet.
-    let mut profile = RuntimeProfile::new("bad profile name", RuntimeKind::CodexJsonrpc);
-    profile.timeout_secs = Some(3600);
-    let resolved_settings = resolve_runtime_settings(
-        &profile,
-        RuntimeKind::CodexJsonrpc,
-        None,
-        &AgentsConfig::default(),
-        &ConcurrencyConfig::default(),
-    )
-    .unwrap_or_else(|error| panic!("settings resolve before locator construction: {error}"));
-    let error = build_runtime_prompt_packet(
-        &job,
-        None,
-        Path::new("/workspaces/job-1"),
-        Path::new("/repo"),
-        &profile,
-        &resolved_settings,
-        &WorkflowDocument::default(),
-        &[],
-        None,
-    )
-    .expect_err("invalid provenance must abort packet construction");
-    assert!(error.to_string().contains("provenance source locator"));
-
-    // A corrupted retained source digest is equally fatal.
+    // A corrupted retained source digest aborts packet construction; the
+    // executor never hashes, records, or executes the incomplete packet.
     let broken_document = WorkflowDocument {
         sources: vec![WorkflowSourceObservation {
             role: RepositoryOverride,
@@ -768,31 +740,60 @@ fn invalid_required_provenance_aborts_packet_construction() {
     assert!(error.to_string().contains("content digest"));
 }
 
+const HISTORICAL_PROFILE_ID: &str = "runtime:agent_runtime:runtime_profile/";
+const FALLBACK_PROFILE_ID: &str = "runtime:agent_runtime:runtime_profile_name_sha256/";
+fn profile_locator_component_id(name: &str) -> (String, Value) {
+    let job = runtime_job("implement_issue");
+    let mut profile = RuntimeProfile::new(name, RuntimeKind::CodexJsonrpc);
+    profile.timeout_secs = Some(3600);
+    let packet = build_packet(&job, &profile, &WorkflowDocument::default(), &[], None);
+    let id = component_id(&entries(&packet)[0]).to_owned();
+    let recorded_name = packet["resolved_runtime_settings"]["profile_name"].clone();
+    (id, recorded_name)
+}
 #[test]
-fn model_facing_prompt_strips_audit_sections_but_durable_packet_keeps_them() {
-    let mut job = runtime_job("implement_prompt");
-    job.input = json!({
-        "activity": "implement_prompt",
-        "command": { "prompt_ref": "prompt-1" },
-    });
-    let profile = codex_profile();
-    let task_text = "Implement the requested change.";
-    let packet = build_packet(
-        &job,
-        &profile,
-        &WorkflowDocument::default(),
-        &[],
-        Some(task_text),
-    );
-
-    assert!(packet.get("context_provenance").is_some());
-    assert!(packet.get("resolved_runtime_settings").is_some());
-    assert!(packet.get("prompt_task_request").is_some());
-
-    let prompt = build_runtime_job_prompt(&packet, Some(task_text));
-    assert!(!prompt.contains("context_provenance"));
-    assert!(!prompt.contains("resolved_runtime_settings"));
-    assert!(!prompt.contains("prompt_task_request"));
-    // The prompt-task text still reaches the agent exactly as before.
-    assert!(prompt.contains(task_text));
+fn profile_locator_preserves_valid_identity_and_hashes_invalid_exact_bytes() {
+    // Valid historical locators keep their stable component identity.
+    for name in ["codex-default", "team/codex"] {
+        let (id, recorded_name) = profile_locator_component_id(name);
+        assert_eq!(id, format!("{HISTORICAL_PROFILE_ID}{name}"));
+        assert_eq!(recorded_name, name);
+    }
+    // Invalid names use only the disjoint hashed namespace; digests are
+    // literal SHA-256 vectors over the exact UTF-8 name bytes, independent
+    // of the helper under test.
+    let names: &[&str] = &[
+        "",
+        " lead",
+        "trail ",
+        "Bad Profile",
+        "bad profile",
+        "double//slash",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "caf\u{e9}",
+        "cafe\u{301}",
+    ];
+    let digests: &[&str] = &[
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "e3e3c40cda282470d6ebacec8197e0c06c4334759eb8d5f8616be371fc1772bd",
+        "59413e908f3b72e4ce859bf153fffc8054615bc3e445f7ac5e7b2adb9b8bbe70",
+        "170d61a3efbe0a05dbbe03b14245c800b2ba5d1557cf70bfe2032cd89a671088",
+        "359f7ed65e4220888bd3083e6f29f2c5df1d426dcd4e233ea3ea2c11097dd7bd",
+        "ca063f40d5178dfdcbc72dd0d762745a1c45d1ba9b961d6aa37a0635f1565753",
+        "a3a9e1ed9732cab28868127be00f1ce921acaefdd5c3b23a6e9e0072bd9c1a34",
+        "850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e",
+        "81ef060bcd98adc7824eb5c1ada83c32491b16018e11e79f00ab9d09e04b015a",
+    ];
+    let mut fallbacks = std::collections::BTreeSet::new();
+    for (name, digest) in names.iter().zip(digests) {
+        let (id, recorded_name) = profile_locator_component_id(name);
+        assert_eq!(id, format!("{FALLBACK_PROFILE_ID}{digest}"));
+        assert_eq!(recorded_name, *name); // unhashed name stays byte-for-byte
+        fallbacks.insert(id);
+    }
+    // Distinct byte vectors get distinct fallbacks; equal bytes are stable.
+    assert_eq!(fallbacks.len(), names.len());
+    let repeat_a = profile_locator_component_id(" lead").0;
+    let repeat_b = profile_locator_component_id(" lead").0;
+    assert_eq!(repeat_a, repeat_b);
 }

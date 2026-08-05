@@ -199,14 +199,11 @@ pub(super) fn runtime_dispatch_profile(
         .sandbox
         .clone()
         .or_else(|| base_profile.sandbox.clone());
-    profile.approval_policy = runtime_kind_supports_approval_policy(kind)
-        .then(|| {
-            policy
-                .approval_policy
-                .clone()
-                .or_else(|| base_profile.approval_policy.clone())
-        })
-        .flatten();
+    profile.approval_policy = resolve_dispatch_approval_policy(
+        kind,
+        policy.approval_policy.as_ref(),
+        base_profile.approval_policy.as_ref(),
+    )?;
     profile.max_turns = policy.max_turns.or(base_profile.max_turns);
     profile.timeout_secs = policy.timeout_secs.or(base_profile.timeout_secs);
     Ok(profile)
@@ -227,26 +224,18 @@ fn resolve_runtime_dispatch_profiles(
     inherited_profile: &RuntimeProfile,
 ) -> anyhow::Result<ResolvedRuntimeDispatchProfiles> {
     let default_profile = runtime_dispatch_profile(config, policy, inherited_profile)?;
-    let workflow_profiles = policy
-        .workflow_profiles
-        .iter()
-        .map(|(definition_id, override_policy)| {
-            (
-                definition_id.clone(),
-                apply_runtime_dispatch_profile_override(config, &default_profile, override_policy),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let activity_profiles = policy
-        .activity_profiles
-        .iter()
-        .map(|(activity, override_policy)| {
-            (
-                activity.clone(),
-                apply_runtime_dispatch_profile_override(config, &default_profile, override_policy),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut workflow_profiles = std::collections::BTreeMap::new();
+    for (definition_id, override_policy) in &policy.workflow_profiles {
+        let profile =
+            apply_runtime_dispatch_profile_override(config, &default_profile, override_policy)?;
+        workflow_profiles.insert(definition_id.clone(), profile);
+    }
+    let mut activity_profiles = std::collections::BTreeMap::new();
+    for (activity, override_policy) in &policy.activity_profiles {
+        let profile =
+            apply_runtime_dispatch_profile_override(config, &default_profile, override_policy)?;
+        activity_profiles.insert(activity.clone(), profile);
+    }
     let mut workflow_activity_profiles = std::collections::BTreeMap::new();
     for (definition_id, activity_overrides) in &policy.workflow_activity_profiles {
         for (activity, override_policy) in activity_overrides {
@@ -255,7 +244,7 @@ fn resolve_runtime_dispatch_profiles(
                 .or_else(|| workflow_profiles.get(definition_id))
                 .unwrap_or(&default_profile);
             let profile =
-                apply_runtime_dispatch_profile_override(config, base_profile, override_policy);
+                apply_runtime_dispatch_profile_override(config, base_profile, override_policy)?;
             workflow_activity_profiles
                 .entry(definition_id.clone())
                 .or_insert_with(std::collections::BTreeMap::new)
@@ -351,7 +340,7 @@ fn apply_runtime_dispatch_profile_override(
     config: &harness_core::config::HarnessConfig,
     default_profile: &RuntimeProfile,
     override_policy: &harness_core::config::workflow::RuntimeDispatchProfileOverride,
-) -> RuntimeProfile {
+) -> anyhow::Result<RuntimeProfile> {
     let runtime_kind_profile = override_policy
         .runtime_kind
         .as_deref()
@@ -382,28 +371,46 @@ fn apply_runtime_dispatch_profile_override(
         .sandbox
         .clone()
         .or_else(|| default_profile.sandbox.clone());
-    profile.approval_policy =
-        runtime_dispatch_approval_policy(&runtime_kind_profile, override_policy, kind);
+    profile.approval_policy = resolve_dispatch_approval_policy(
+        kind,
+        override_policy.approval_policy.as_ref(),
+        runtime_kind_profile.approval_policy.as_ref(),
+    )?;
     profile.max_turns = override_policy.max_turns.or(default_profile.max_turns);
     profile.timeout_secs = override_policy
         .timeout_secs
         .or(default_profile.timeout_secs);
-    profile
+    Ok(profile)
 }
 
-fn runtime_dispatch_approval_policy(
-    default_profile: &RuntimeProfile,
-    override_policy: &harness_core::config::workflow::RuntimeDispatchProfileOverride,
+/// Capability-aware dispatch approval-policy resolution (B-016).
+///
+/// An explicitly configured policy for a runtime kind without an
+/// approval-policy contract is invalid operator input and is rejected with a
+/// typed error naming the runtime kind; it is never silently discarded. An
+/// omitted policy inherits the base value only for Codex kinds, so switching
+/// from Codex to a non-Codex kind without declaring a policy does not carry
+/// the Codex-only value and does not report an error.
+fn resolve_dispatch_approval_policy(
     kind: RuntimeKind,
-) -> Option<String> {
-    runtime_kind_supports_approval_policy(kind)
-        .then(|| {
-            override_policy
-                .approval_policy
-                .clone()
-                .or_else(|| default_profile.approval_policy.clone())
-        })
-        .flatten()
+    explicit_policy: Option<&String>,
+    inherited_policy: Option<&String>,
+) -> anyhow::Result<Option<String>> {
+    match explicit_policy {
+        Some(policy) => {
+            if runtime_kind_supports_approval_policy(kind) {
+                Ok(Some(policy.clone()))
+            } else {
+                anyhow::bail!(
+                    "runtime dispatch approval_policy `{policy}` is only supported for Codex runtime kinds, not {}",
+                    kind.as_str()
+                )
+            }
+        }
+        None => Ok(runtime_kind_supports_approval_policy(kind)
+            .then(|| inherited_policy.cloned())
+            .flatten()),
+    }
 }
 
 fn runtime_kind_supports_approval_policy(kind: RuntimeKind) -> bool {
@@ -432,5 +439,112 @@ mod tests {
         assert_eq!(profile.name, "codex-exec-review");
         assert_eq!(profile.timeout_secs, Some(45));
         Ok(())
+    }
+
+    fn dispatch_policy(
+        value: serde_json::Value,
+    ) -> harness_core::config::workflow::RuntimeDispatchPolicy {
+        serde_json::from_value(value).expect("test dispatch policy should deserialize")
+    }
+
+    #[test]
+    fn runtime_dispatch_rejects_explicit_non_codex_approval_policy() {
+        let config = harness_core::config::HarnessConfig::default();
+        let inherited = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+
+        for (kind_config, kind) in [
+            ("claude_code", RuntimeKind::ClaudeCode),
+            ("anthropic_api", RuntimeKind::AnthropicApi),
+            ("remote_host", RuntimeKind::RemoteHost),
+        ] {
+            // Top-level dispatch policy: explicit approval policy is invalid.
+            let policy = dispatch_policy(serde_json::json!({
+                "runtime_kind": kind_config,
+                "approval_policy": "on-request",
+            }));
+            let error = runtime_dispatch_profile(&config, &policy, &inherited)
+                .expect_err("top-level explicit non-Codex approval policy must be rejected");
+            assert!(
+                error.to_string().contains("approval_policy `on-request`"),
+                "the rejection must name the unsupported field: {error}"
+            );
+            assert!(
+                error.to_string().contains(kind.as_str()),
+                "the rejection must name the runtime kind: {error}"
+            );
+
+            // Nested profile override: explicit approval policy is invalid.
+            let override_policy = harness_core::config::workflow::RuntimeDispatchProfileOverride {
+                runtime_kind: Some(kind_config.to_string()),
+                approval_policy: Some("on-request".to_string()),
+                ..Default::default()
+            };
+            let error =
+                apply_runtime_dispatch_profile_override(&config, &inherited, &override_policy)
+                    .expect_err("nested explicit non-Codex approval policy must be rejected");
+            assert!(
+                error.to_string().contains("approval_policy `on-request`"),
+                "the rejection must name the unsupported field: {error}"
+            );
+            assert!(
+                error.to_string().contains(kind.as_str()),
+                "the rejection must name the runtime kind: {error}"
+            );
+        }
+
+        // Explicit Codex approval policy remains accepted on both paths.
+        let policy = dispatch_policy(serde_json::json!({
+            "runtime_kind": "codex_exec",
+            "approval_policy": "never",
+        }));
+        let profile = runtime_dispatch_profile(&config, &policy, &inherited)
+            .expect("explicit Codex approval policy should resolve");
+        assert_eq!(profile.approval_policy.as_deref(), Some("never"));
+        let override_policy = harness_core::config::workflow::RuntimeDispatchProfileOverride {
+            approval_policy: Some("never".to_string()),
+            ..Default::default()
+        };
+        let profile =
+            apply_runtime_dispatch_profile_override(&config, &inherited, &override_policy)
+                .expect("explicit Codex approval policy should resolve");
+        assert_eq!(profile.approval_policy.as_deref(), Some("never"));
+    }
+
+    #[test]
+    fn runtime_dispatch_kind_switch_does_not_inherit_codex_approval_policy() {
+        let config = harness_core::config::HarnessConfig::default();
+        let mut codex_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        codex_profile.approval_policy = Some("on-request".to_string());
+
+        // Nested override: switching from Codex to a non-Codex kind without
+        // declaring a policy drops the Codex-only value without an error.
+        let override_policy = harness_core::config::workflow::RuntimeDispatchProfileOverride {
+            runtime_kind: Some("claude_code".to_string()),
+            ..Default::default()
+        };
+        let profile =
+            apply_runtime_dispatch_profile_override(&config, &codex_profile, &override_policy)
+                .expect("an omitted policy on a kind switch must not error");
+        assert_eq!(profile.kind, RuntimeKind::ClaudeCode);
+        assert_eq!(profile.approval_policy, None);
+
+        // Top-level: selecting a non-Codex runtime kind does not carry the
+        // inherited Codex policy.
+        let policy = dispatch_policy(serde_json::json!({ "runtime_kind": "anthropic_api" }));
+        let profile = runtime_dispatch_profile(&config, &policy, &codex_profile)
+            .expect("an omitted policy on a kind switch must not error");
+        assert_eq!(profile.kind, RuntimeKind::AnthropicApi);
+        assert_eq!(profile.approval_policy, None);
+
+        // Staying on the same Codex kind still inherits the base Codex policy.
+        let override_policy = harness_core::config::workflow::RuntimeDispatchProfileOverride {
+            model: Some("override-model".to_string()),
+            ..Default::default()
+        };
+        let profile =
+            apply_runtime_dispatch_profile_override(&config, &codex_profile, &override_policy)
+                .expect("same-kind Codex inheritance should resolve");
+        assert_eq!(profile.kind, RuntimeKind::CodexJsonrpc);
+        assert_eq!(profile.approval_policy.as_deref(), Some("on-request"));
     }
 }

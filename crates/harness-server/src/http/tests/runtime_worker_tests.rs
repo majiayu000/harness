@@ -349,6 +349,118 @@ async fn runtime_job_worker_cleans_on_terminal_workspace_after_failed_runtime_at
 }
 
 #[tokio::test]
+async fn provenance_failure_prevents_prompt_event_and_agent_start() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nworkspace:\n  strategy: source\n---\n",
+    )?;
+    let agent = RuntimeStreamAgent::new();
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register("codex", agent.clone());
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &project_root,
+        harness_core::config::HarnessConfig::default(),
+        registry,
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1732"),
+    )
+    .with_id("issue-1732")
+    .with_server_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 1732,
+    }));
+    // `implementing` is not the canonical initial state, and the public upsert
+    // is insert-only (GH-1784), so this mid-lifecycle fixture needs the
+    // lifecycle writer. The data stays classified, so the provenance guard is
+    // still active here.
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        "impl-1732",
+    );
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-default",
+        harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+    );
+    runtime_profile.timeout_secs = Some(300);
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": workflow.id,
+                "command_id": command_id,
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key,
+                "command": command.command,
+                "runtime_profile": runtime_profile,
+                // Job-scoped cfg(test) failure marker consumed by
+                // apply_context_provenance before any packet mutation.
+                "test_fail_context_provenance": true,
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.failed, 1);
+    assert_eq!(tick.succeeded, 0);
+    assert_eq!(tick.cancelled, 0);
+    let failed_job = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    assert_eq!(
+        failed_job.status,
+        harness_workflow::runtime::RuntimeJobStatus::Failed
+    );
+    let error = failed_job
+        .error
+        .expect("failed job records the injected provenance error");
+    assert!(
+        error.contains("context provenance"),
+        "job error should carry the provenance failure: {error}"
+    );
+    // The fail-closed ordering holds through the real worker boundary: no
+    // RuntimePromptPrepared event is recorded and no agent prompt is started.
+    let events = store.runtime_events_for(&runtime_job.id).await?;
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != "RuntimePromptPrepared"),
+        "no prompt event may be recorded when provenance construction fails: {events:?}"
+    );
+    assert!(agent.prompts.lock().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

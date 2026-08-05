@@ -37,24 +37,28 @@ pub(super) enum RuntimeSettingsResolutionError {
     MissingTimeout { profile: String },
 }
 
-/// Final approval policy shared by provenance and agent launch.
+/// Final approval policy shared by provenance and agent launch (B-016).
 ///
 /// When a Codex profile omits `approval_policy`, the Codex CLI resolves the
 /// effective policy from configuration Harness does not observe, so the
 /// resolved settings record an explicit unobserved marker instead of a
-/// fabricated final value.
+/// fabricated final value. Claude Code and Anthropic API have no
+/// approval-policy setting at all, so an omitted policy is recorded as
+/// not applicable — a distinct audit claim from unobserved, because no
+/// approval-policy value participates in launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "resolution", rename_all = "snake_case")]
 pub(super) enum ResolvedApprovalPolicy {
     Explicit { value: String },
     UnobservedAgentDefault,
+    NotApplicable,
 }
 
 impl ResolvedApprovalPolicy {
     pub(super) fn explicit_value(&self) -> Option<&str> {
         match self {
             Self::Explicit { value } => Some(value.as_str()),
-            Self::UnobservedAgentDefault => None,
+            Self::UnobservedAgentDefault | Self::NotApplicable => None,
         }
     }
 }
@@ -105,10 +109,7 @@ pub(super) fn resolve_runtime_settings(
         }
     };
     let sandbox_mode = runtime_profile_sandbox_mode(profile)?.unwrap_or(agents.sandbox_mode);
-    let approval_policy = match runtime_profile_approval_policy(profile, runtime_kind)? {
-        Some(value) => ResolvedApprovalPolicy::Explicit { value },
-        None => ResolvedApprovalPolicy::UnobservedAgentDefault,
-    };
+    let approval_policy = resolve_approval_policy(profile, runtime_kind)?;
     Ok(ResolvedRuntimeSettings {
         profile_name: profile.name.clone(),
         runtime_kind,
@@ -184,6 +185,32 @@ fn runtime_profile_sandbox_mode(profile: &RuntimeProfile) -> anyhow::Result<Opti
         other => anyhow::bail!("runtime profile sandbox `{other}` is not supported"),
     };
     Ok(Some(mode))
+}
+
+/// Closed runtime-kind approval resolution (B-016).
+///
+/// An explicit policy is accepted only for Codex runtime kinds and rejected
+/// with a typed error for every other kind — it is never silently discarded.
+/// An omitted policy records `UnobservedAgentDefault` for Codex runtimes
+/// (the effective value is resolved outside Harness) and `NotApplicable` for
+/// runtimes without an approval-policy contract. `RemoteHost` with an omitted
+/// policy resolves to `NotApplicable` here but never produces resolved
+/// settings: model resolution rejects remote-host jobs locally.
+fn resolve_approval_policy(
+    profile: &RuntimeProfile,
+    runtime_kind: RuntimeKind,
+) -> anyhow::Result<ResolvedApprovalPolicy> {
+    match runtime_profile_approval_policy(profile, runtime_kind)? {
+        Some(value) => Ok(ResolvedApprovalPolicy::Explicit { value }),
+        None => Ok(match runtime_kind {
+            RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => {
+                ResolvedApprovalPolicy::UnobservedAgentDefault
+            }
+            RuntimeKind::ClaudeCode | RuntimeKind::AnthropicApi | RuntimeKind::RemoteHost => {
+                ResolvedApprovalPolicy::NotApplicable
+            }
+        }),
+    }
 }
 
 fn runtime_profile_approval_policy(
@@ -287,14 +314,79 @@ mod tests {
 
     #[test]
     fn runtime_profile_approval_policy_rejects_non_codex_runtimes() {
-        let mut profile = RuntimeProfile::new("claude-default", RuntimeKind::ClaudeCode);
-        profile.approval_policy = Some("on-request".to_string());
+        for kind in [
+            RuntimeKind::ClaudeCode,
+            RuntimeKind::AnthropicApi,
+            RuntimeKind::RemoteHost,
+        ] {
+            let mut profile = RuntimeProfile::new("non-codex", kind);
+            profile.approval_policy = Some("on-request".to_string());
 
-        let error = runtime_profile_approval_policy(&profile, RuntimeKind::ClaudeCode)
-            .expect_err("Claude approval policy should fail until it has a contract");
+            let error = runtime_profile_approval_policy(&profile, kind)
+                .expect_err("explicit approval policy must be rejected for non-Codex runtimes");
 
-        assert!(error
-            .to_string()
-            .contains("only supported for Codex runtime kinds"));
+            assert!(error
+                .to_string()
+                .contains("only supported for Codex runtime kinds"));
+            assert!(
+                error.to_string().contains(kind.as_str()),
+                "the rejection must name the unsupported runtime kind: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_policy_resolution_matches_runtime_capability_matrix() {
+        let agents = AgentsConfig::default();
+        let concurrency = ConcurrencyConfig::default();
+
+        // Omitted policy for Codex runtimes: an effective value may still be
+        // selected outside Harness, so it is recorded as unobserved.
+        for kind in [RuntimeKind::CodexExec, RuntimeKind::CodexJsonrpc] {
+            let profile = profile_with_timeout("codex-default", kind);
+            let resolved = resolve_runtime_settings(&profile, kind, None, &agents, &concurrency)
+                .unwrap_or_else(|error| panic!("{kind:?} omitted policy should resolve: {error}"));
+            assert_eq!(
+                resolved.approval_policy,
+                ResolvedApprovalPolicy::UnobservedAgentDefault
+            );
+            assert_eq!(resolved.approval_policy.explicit_value(), None);
+            assert_eq!(
+                serde_json::to_value(&resolved.approval_policy)
+                    .expect("approval policy serializes"),
+                serde_json::json!({ "resolution": "unobserved_agent_default" })
+            );
+        }
+
+        // Omitted policy for runtimes without an approval-policy contract:
+        // not applicable, a distinct audit claim from unobserved.
+        for kind in [RuntimeKind::ClaudeCode, RuntimeKind::AnthropicApi] {
+            let profile = profile_with_timeout("non-codex", kind);
+            let resolved = resolve_runtime_settings(&profile, kind, None, &agents, &concurrency)
+                .unwrap_or_else(|error| panic!("{kind:?} omitted policy should resolve: {error}"));
+            assert_eq!(
+                resolved.approval_policy,
+                ResolvedApprovalPolicy::NotApplicable
+            );
+            assert_eq!(resolved.approval_policy.explicit_value(), None);
+            assert_eq!(
+                serde_json::to_value(&resolved.approval_policy)
+                    .expect("approval policy serializes"),
+                serde_json::json!({ "resolution": "not_applicable" })
+            );
+        }
+
+        // Remote Host remains rejected by local runtime-settings resolution;
+        // it never produces resolved settings.
+        let remote = profile_with_timeout("remote-host-default", RuntimeKind::RemoteHost);
+        let error = resolve_runtime_settings(
+            &remote,
+            RuntimeKind::RemoteHost,
+            None,
+            &agents,
+            &concurrency,
+        )
+        .expect_err("remote_host must be rejected by local settings resolution");
+        assert!(error.to_string().contains("remote_host"));
     }
 }
