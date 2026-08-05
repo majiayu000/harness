@@ -178,12 +178,13 @@ pub use state_registry::{
     WorkflowProgressMode, WorkflowStateDefinition, WorkflowStateKey,
 };
 pub use status::WorkflowCommandStatus;
+pub use store::PromptPayloadIntegrityError;
 pub use store::{
-    cost_usd_from_micros, cost_usd_to_micros, DriverlessProgressInstance,
-    DriverlessProgressProvenanceStatus, RuntimeHistoryPruneSummary, RuntimeUsageMetrics,
-    RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,
-    WorkflowCancellationCleanupOutcome, WorkflowChildStart, WorkflowChildStartOutcome,
-    WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
+    cost_usd_from_micros, cost_usd_to_micros, DecisionProvenanceConflict,
+    DriverlessProgressInstance, DriverlessProgressProvenanceStatus, RuntimeHistoryPruneSummary,
+    RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
+    RuntimeWorkflowUsage, WorkflowCancellationCleanupOutcome, WorkflowChildStart,
+    WorkflowChildStartOutcome, WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
     WorkflowCoverageRecoveryTransition, WorkflowDecisionTransition, WorkflowPrBindingRepairOutcome,
     WorkflowRejectedDecisionTransition, WorkflowRuntimeRecoveryAction,
     WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore,

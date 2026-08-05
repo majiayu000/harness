@@ -1,25 +1,16 @@
 use super::*;
 
 impl WorkflowRuntimeStore {
+    /// Record a decision on its own, outside a larger transition.
+    ///
+    /// Shares the append-only write with every in-transaction writer: a repeat
+    /// of the same row is an idempotent replay, and a repeat that differs is a
+    /// [`DecisionProvenanceConflict`](super::DecisionProvenanceConflict)
+    /// rather than an overwrite (GH-1865).
     pub async fn record_decision(&self, record: &WorkflowDecisionRecord) -> anyhow::Result<()> {
-        let data = to_jsonb_string(record)?;
-        sqlx::query(
-            "INSERT INTO workflow_decisions
-                (id, workflow_id, event_id, accepted, data, rejection_reason)
-             VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-             ON CONFLICT (id) DO UPDATE SET
-                accepted = EXCLUDED.accepted,
-                data = EXCLUDED.data,
-                rejection_reason = EXCLUDED.rejection_reason",
-        )
-        .bind(&record.id)
-        .bind(&record.workflow_id)
-        .bind(&record.event_id)
-        .bind(record.accepted)
-        .bind(&data)
-        .bind(&record.rejection_reason)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        insert_decision_record_once_tx(&mut tx, record).await?;
+        tx.commit().await?;
         Ok(())
     }
 

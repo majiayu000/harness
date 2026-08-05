@@ -1,8 +1,8 @@
 use super::{
     command_store, commit_decision_instance_tx, commit_rejected_initial_failure_instance_tx,
     decision_transitions::ensure_protected_instance_fields_match,
-    insert_decision_record_tx, insert_event_tx_with_id, insert_validated_observed_instance_tx,
-    select_instance_for_update_tx,
+    insert_decision_record_once_tx, insert_event_tx_with_id, insert_prompt_payload_tx,
+    insert_validated_observed_instance_tx, select_instance_for_update_tx,
     transition_validation::{validate_transition_with_context, TransitionValidation},
     WorkflowRuntimeStore,
 };
@@ -212,7 +212,7 @@ impl WorkflowRuntimeStore {
                         record.event_id.clone(),
                         reason,
                     );
-                    insert_decision_record_tx(&mut tx, &rejected).await?;
+                    insert_decision_record_once_tx(&mut tx, &rejected).await?;
                     tx.commit().await?;
                     return Ok(Some(WorkflowSubmissionDecisionCommit {
                         record: rejected,
@@ -226,7 +226,7 @@ impl WorkflowRuntimeStore {
                 }
             }
         }
-        insert_decision_record_tx(&mut tx, &record).await?;
+        insert_decision_record_once_tx(&mut tx, &record).await?;
 
         let mut command_ids = Vec::new();
         if let Some(final_instance) = transition.final_instance {
@@ -240,7 +240,7 @@ impl WorkflowRuntimeStore {
                     );
                 }
                 if let Some(prompt_payload) = transition.prompt_payload {
-                    upsert_prompt_payload_tx(
+                    insert_prompt_payload_tx(
                         &mut tx,
                         prompt_payload.prompt_ref,
                         prompt_payload.prompt,
@@ -332,28 +332,6 @@ async fn load_submission_instance_tx(
     Ok(select_instance_for_update_tx(tx, transition.workflow_id)
         .await?
         .map(|instance| (instance, false)))
-}
-
-async fn upsert_prompt_payload_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    prompt_ref: &str,
-    prompt: &str,
-) -> anyhow::Result<()> {
-    if prompt_ref.trim().is_empty() {
-        anyhow::bail!("workflow prompt payload prompt_ref must not be empty");
-    }
-    sqlx::query(
-        "INSERT INTO workflow_prompt_payloads (prompt_ref, prompt)
-         VALUES ($1, $2)
-         ON CONFLICT (prompt_ref) DO UPDATE SET
-            prompt = EXCLUDED.prompt,
-            updated_at = CURRENT_TIMESTAMP",
-    )
-    .bind(prompt_ref)
-    .bind(prompt)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 async fn delete_prompt_payload_tx(

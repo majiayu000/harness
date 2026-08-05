@@ -4,7 +4,7 @@ use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
     commit_same_state_instance_tx,
     decision_transitions::ensure_protected_instance_fields_match,
-    insert_decision_record_tx, insert_event_tx_with_id, insert_validated_observed_instance_tx,
+    insert_decision_record_once_tx, insert_event_tx_with_id, insert_validated_observed_instance_tx,
     runtime_job_state::{cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation},
     select_instance_for_update_tx,
     transition_validation::{validate_transition_with_context, TransitionValidation},
@@ -179,7 +179,7 @@ impl WorkflowRuntimeStore {
         )
         .await?;
         let record = WorkflowDecisionRecord::accepted(transition.decision.clone(), Some(event.id));
-        insert_decision_record_tx(&mut tx, &record).await?;
+        insert_decision_record_once_tx(&mut tx, &record).await?;
 
         let desired_keys = transition
             .decision

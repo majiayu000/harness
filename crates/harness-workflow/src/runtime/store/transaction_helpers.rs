@@ -29,31 +29,6 @@ pub(super) async fn runtime_job_for_command_tx(
         .map_err(Into::into)
 }
 
-pub(super) async fn insert_decision_record_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    record: &WorkflowDecisionRecord,
-) -> anyhow::Result<()> {
-    let data = to_jsonb_string(record)?;
-    sqlx::query(
-        "INSERT INTO workflow_decisions
-            (id, workflow_id, event_id, accepted, data, rejection_reason)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-         ON CONFLICT (id) DO UPDATE SET
-            accepted = EXCLUDED.accepted,
-            data = EXCLUDED.data,
-            rejection_reason = EXCLUDED.rejection_reason",
-    )
-    .bind(&record.id)
-    .bind(&record.workflow_id)
-    .bind(&record.event_id)
-    .bind(record.accepted)
-    .bind(&data)
-    .bind(&record.rejection_reason)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
 pub(super) async fn load_or_insert_initial_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,

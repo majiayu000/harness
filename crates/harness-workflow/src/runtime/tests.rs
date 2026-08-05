@@ -68,6 +68,7 @@ mod lock_order_stress;
 mod otel_spans;
 mod p1_followups;
 mod pr_repair_evidence;
+mod provenance_immutability;
 mod remote_host_lease;
 mod replay_determinism;
 mod retry;

@@ -1,6 +1,6 @@
 use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
-    insert_decision_record_tx, insert_event_tx, select_instance_for_update_tx,
+    insert_decision_record_once_tx, insert_event_tx, select_instance_for_update_tx,
     WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
@@ -354,7 +354,7 @@ async fn persist_runtime_completion_decision_with_context_tx(
             WorkflowDecisionRecord::rejected(decision, Some(event.id.clone()), error.to_string())
         }
     };
-    insert_decision_record_tx(tx, &record).await?;
+    insert_decision_record_once_tx(tx, &record).await?;
 
     if record.accepted {
         if apply_prompt_continuation_side_effect(tx, &mut instance, &record.decision).await?
