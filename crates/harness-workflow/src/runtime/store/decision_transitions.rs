@@ -96,6 +96,14 @@ impl WorkflowRuntimeStore {
         validation_context: ValidationContext,
     ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
         self.apply_decision_transition_inner(transition, |current, decision, event| {
+            // The caller resolved this validator before the row was locked, so
+            // re-verify under lock that it still governs the instance being
+            // written. A validator from another definition, version, or content
+            // hash authorizes transitions this workflow's own definition never
+            // allowed (GH-1864).
+            if let Err(error) = validator.binding().ensure_governs(current) {
+                return TransitionValidation::Rejected(error.to_string());
+            }
             let mut context = validation_context.clone();
             context.now = event.created_at;
             match validator.validate(current, decision, &context) {
