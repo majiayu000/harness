@@ -170,7 +170,12 @@ async fn runtime_agent_telemetry_for_workflow_returns_outcome_and_agent_usage() 
         WorkflowSubject::new("issue", "issue:1804"),
     )
     .with_id("workflow-1");
-    store.insert_instance_if_absent(&workflow).await?;
+    // Telemetry aggregation only needs the instance row to exist; the
+    // canonical insert path now requires the definition's initial state
+    // (GH-1864), so the fixture uses the test-only raw path.
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
 
     let codex = RuntimeUsageUpsert {
         cost_usd_micros: 750_000,
@@ -260,7 +265,9 @@ async fn runtime_agent_telemetry_for_workflow_returns_outcome_and_agent_usage() 
         WorkflowSubject::new("issue", "issue:1805"),
     )
     .with_id("workflow-zero");
-    store.insert_instance_if_absent(&zero_workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&zero_workflow)
+        .await?;
     let zero_run_id = RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wf")?;
     store
         .upsert_runtime_agent_run(&RuntimeUsageUpsert {
