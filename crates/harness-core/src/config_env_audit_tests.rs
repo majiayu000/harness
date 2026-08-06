@@ -61,7 +61,7 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
     ),
     allowed(
         "crates/harness-core/src/run_id.rs",
-        11,
+        13,
         "run-id process context propagation",
     ),
     allowed(
