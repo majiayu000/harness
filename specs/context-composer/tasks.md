@@ -54,7 +54,7 @@ Dependencies: CC-T2
 
 Done when:
 
-- Manifest schema (v1) rendered per composition and logged through harness-observe as event kind `context_manifest`.
+- Manifest schema (v1) is rendered per composition and returned in the `context/preview` response. It is response-only and is not persisted through harness-observe.
 - Manifests record item ids, sizes, and decisions — never full item content.
 
 Verify:

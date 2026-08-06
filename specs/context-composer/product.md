@@ -48,7 +48,7 @@ Two failure modes, both invisible today:
 - Every excluded or degraded item appears in the manifest with a reason. No silent drops.
 - A count of instruction-bearing items > 15 raises a recorded warning in the manifest.
 - Contract and ExecPlan providers use distinct provider IDs, so manifest attribution is unambiguous.
-- `harness-context` does not depend on crates it does not use.
+- `harness-context` production dependencies are limited to crates used by library code; test-only helpers are kept in dev-dependencies.
 
 ## Decisions
 

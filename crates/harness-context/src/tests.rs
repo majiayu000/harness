@@ -46,6 +46,20 @@ fn compose_config_is_preview_only() {
 }
 
 #[test]
+fn compose_mode_normalizes_legacy_values_to_preview() {
+    for legacy_mode in ["shadow", "enforce"] {
+        let mode: ComposeMode = serde_json::from_str(&format!("\"{legacy_mode}\""))
+            .expect("legacy compose mode remains readable");
+        assert_eq!(mode, ComposeMode::Preview);
+    }
+
+    assert_eq!(
+        serde_json::to_string(&ComposeMode::Preview).expect("preview mode serializes"),
+        "\"preview\""
+    );
+}
+
+#[test]
 fn pipeline_is_deterministic_for_identical_inputs() {
     let items = vec![
         item("rule:b", ItemClass::Rule, 20, Priority::P1),
