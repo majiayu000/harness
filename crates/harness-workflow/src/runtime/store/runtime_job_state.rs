@@ -300,9 +300,15 @@ impl WorkflowRuntimeStore {
                 Ok((id, status, serde_json::from_str::<WorkflowCommand>(&data)?))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        if !commands
-            .iter()
-            .any(|(_, _, command)| command.command_type == WorkflowCommandType::MarkCancelled)
+        // The marker authorizing cleanup must belong to the exact accepted
+        // decision that placed the instance in its current state (GH-1865).
+        // Accepting any historical MarkCancelled row lets a stale generation's
+        // cancellation — or a detached marker with no decision behind it, or a
+        // superseded attempt — authorize cancelling the current generation's
+        // live commands.
+        if !self
+            .cancellation_marker_is_current_tx(&mut tx, &current)
+            .await?
         {
             tx.rollback().await?;
             return Ok(WorkflowCancellationCleanupOutcome::NoCancellationCommand);
@@ -367,6 +373,64 @@ impl WorkflowRuntimeStore {
         Ok(WorkflowCancellationCleanupOutcome::Cleaned(Box::new(
             current,
         )))
+    }
+
+    /// Prove that the workflow's live cancellation marker was minted by the
+    /// exact accepted decision that placed the instance in its current state.
+    ///
+    /// The latest accepted decision must target the instance's current state
+    /// and carry a `MarkCancelled` command, and a live (non-superseded)
+    /// command row linking that decision to the marker's dedupe key must
+    /// exist. Anything weaker lets an older generation's marker — replayed,
+    /// detached, or superseded — speak for the current generation.
+    async fn cancellation_marker_is_current_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        current: &WorkflowInstance,
+    ) -> anyhow::Result<bool> {
+        let latest: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, data::text FROM workflow_decisions
+             WHERE workflow_id = $1 AND accepted
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(&current.id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some((decision_id, data)) = latest else {
+            return Ok(false);
+        };
+        let record: WorkflowDecisionRecord = serde_json::from_str(&data)?;
+        let decision = record.decision;
+        if decision.next_state != current.state {
+            return Ok(false);
+        }
+        let marker_keys: Vec<String> = decision
+            .commands
+            .iter()
+            .filter(|command| command.command_type == WorkflowCommandType::MarkCancelled)
+            .map(|command| command.dedupe_key.clone())
+            .collect();
+        if marker_keys.is_empty() {
+            return Ok(false);
+        }
+        let bound: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM workflow_commands
+             WHERE workflow_id = $1
+               AND decision_id = $2
+               AND command_type = $3
+               AND dedupe_key = ANY($4::text[])
+               AND status <> $5
+             LIMIT 1",
+        )
+        .bind(&current.id)
+        .bind(&decision_id)
+        .bind(WorkflowCommandType::MarkCancelled.as_str())
+        .bind(&marker_keys)
+        .bind(WorkflowCommandStatus::Superseded.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(bound.is_some())
     }
 }
 

@@ -156,3 +156,253 @@ async fn prompt_payload_refs_are_insert_once() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+fn cancellation_marker(dedupe_key: &str) -> WorkflowCommand {
+    WorkflowCommand::new(WorkflowCommandType::MarkCancelled, dedupe_key, json!({}))
+}
+
+fn cancellation_decision(workflow_id: &str, marker: &WorkflowCommand) -> WorkflowDecision {
+    WorkflowDecision::new(
+        workflow_id,
+        "running",
+        "cancel_submission",
+        "cancelled",
+        "operator cancelled the submission",
+    )
+    .with_command(marker.clone())
+}
+
+/// Cleanup may proceed: the live marker was minted by the latest accepted
+/// decision, and that decision is what placed the instance in `cancelled`.
+#[tokio::test]
+async fn cancellation_cleanup_honors_marker_bound_to_current_decision() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = workflow("gh1865-cancel-bound", "cancelled");
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+
+    let marker = cancellation_marker("gh1865-cancel-bound-marker");
+    let record =
+        WorkflowDecisionRecord::accepted(cancellation_decision(&instance.id, &marker), None);
+    store.record_decision(&record).await?;
+    store
+        .enqueue_command(&instance.id, Some(&record.id), &marker)
+        .await?;
+
+    let stored = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("instance must exist");
+    let outcome = store
+        .finish_cancellation_cleanup_if_current(&stored, "test", "cleanup")
+        .await?;
+    let WorkflowCancellationCleanupOutcome::Cleaned(cleaned) = outcome else {
+        panic!("a marker bound to the current decision must authorize cleanup, got: {outcome:?}");
+    };
+    assert_eq!(cleaned.data["cancelled"], true);
+    Ok(())
+}
+
+/// A marker row with no decision behind it proves nothing about what was
+/// authorized, so it must not authorize cancelling the generation's work.
+#[tokio::test]
+async fn cancellation_cleanup_rejects_detached_marker() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = workflow("gh1865-cancel-detached", "cancelled");
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+
+    let activity = WorkflowCommand::enqueue_activity("implement", "gh1865-detached-activity");
+    let activity_id = store.enqueue_command(&instance.id, None, &activity).await?;
+    let marker = cancellation_marker("gh1865-cancel-detached-marker");
+    store.enqueue_command(&instance.id, None, &marker).await?;
+
+    let stored = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("instance must exist");
+    let outcome = store
+        .finish_cancellation_cleanup_if_current(&stored, "test", "cleanup")
+        .await?;
+    assert_eq!(
+        outcome,
+        WorkflowCancellationCleanupOutcome::NoCancellationCommand
+    );
+
+    let activity = store
+        .get_command(&activity_id)
+        .await?
+        .expect("activity command must remain queryable");
+    assert_eq!(
+        activity.status,
+        WorkflowCommandStatus::Pending,
+        "a detached marker must not cancel the generation's live commands"
+    );
+    Ok(())
+}
+
+/// A rejection never authorized anything; a marker pointing at a rejected
+/// decision must not authorize cleanup either.
+#[tokio::test]
+async fn cancellation_cleanup_rejects_marker_for_rejected_decision() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = workflow("gh1865-cancel-rejected", "cancelled");
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+
+    let marker = cancellation_marker("gh1865-cancel-rejected-marker");
+    let record = WorkflowDecisionRecord::rejected(
+        cancellation_decision(&instance.id, &marker),
+        None,
+        "transition is outside the allowlist",
+    );
+    store.record_decision(&record).await?;
+    store
+        .enqueue_command(&instance.id, Some(&record.id), &marker)
+        .await?;
+
+    let stored = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("instance must exist");
+    let outcome = store
+        .finish_cancellation_cleanup_if_current(&stored, "test", "cleanup")
+        .await?;
+    assert_eq!(
+        outcome,
+        WorkflowCancellationCleanupOutcome::NoCancellationCommand
+    );
+    Ok(())
+}
+
+/// The marker belongs to the generation that was cancelled. Once a newer
+/// accepted decision moved the workflow on, the old marker is history and
+/// must not authorize cleaning up the new generation.
+#[tokio::test]
+async fn cancellation_cleanup_rejects_marker_from_older_generation() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = workflow("gh1865-cancel-old-generation", "cancelled");
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+
+    let marker = cancellation_marker("gh1865-cancel-old-generation-marker");
+    let cancelled_record =
+        WorkflowDecisionRecord::accepted(cancellation_decision(&instance.id, &marker), None);
+    store.record_decision(&cancelled_record).await?;
+    store
+        .enqueue_command(&instance.id, Some(&cancelled_record.id), &marker)
+        .await?;
+
+    // A newer accepted decision reopened the workflow; the instance row in
+    // this fixture still says `cancelled`, which is exactly the stale view a
+    // racing cleanup would hold.
+    let mut reopened = WorkflowDecisionRecord::accepted(
+        WorkflowDecision::new(
+            &instance.id,
+            "cancelled",
+            "reopen_submission",
+            "planning",
+            "operator reopened the submission",
+        ),
+        None,
+    );
+    reopened.created_at = cancelled_record.created_at + chrono::Duration::seconds(1);
+    store.record_decision(&reopened).await?;
+
+    let stored = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("instance must exist");
+    let outcome = store
+        .finish_cancellation_cleanup_if_current(&stored, "test", "cleanup")
+        .await?;
+    assert_eq!(
+        outcome,
+        WorkflowCancellationCleanupOutcome::NoCancellationCommand
+    );
+    Ok(())
+}
+
+/// Superseding retires an attempt (GH-1865 W2). A superseded marker is part
+/// of the historical record and must not authorize cleanup, even when it was
+/// bound to an accepted cancellation decision when it was live.
+#[tokio::test]
+async fn cancellation_cleanup_rejects_superseded_marker() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = workflow("gh1865-cancel-superseded", "cancelled");
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+
+    let marker = cancellation_marker("gh1865-cancel-superseded-marker");
+    let cancelled_record =
+        WorkflowDecisionRecord::accepted(cancellation_decision(&instance.id, &marker), None);
+    store.record_decision(&cancelled_record).await?;
+    let marker_id = store
+        .enqueue_command(&instance.id, Some(&cancelled_record.id), &marker)
+        .await?;
+
+    // A newer decision reuses the marker's dedupe key for different work,
+    // superseding the marker attempt.
+    let replacement =
+        WorkflowCommand::enqueue_activity("implement", "gh1865-cancel-superseded-marker");
+    let mut replacement_record = WorkflowDecisionRecord::accepted(
+        WorkflowDecision::new(
+            &instance.id,
+            "cancelled",
+            "schedule_rework",
+            "cancelled",
+            "rework scheduled over the cancelled attempt",
+        )
+        .with_command(replacement.clone()),
+        None,
+    );
+    replacement_record.created_at = cancelled_record.created_at + chrono::Duration::seconds(1);
+    store.record_decision(&replacement_record).await?;
+    store
+        .enqueue_command(&instance.id, Some(&replacement_record.id), &replacement)
+        .await?;
+
+    let marker = store
+        .get_command(&marker_id)
+        .await?
+        .expect("marker command must remain queryable");
+    assert_eq!(marker.status, WorkflowCommandStatus::Superseded);
+
+    let stored = store
+        .get_instance(&instance.id)
+        .await?
+        .expect("instance must exist");
+    let outcome = store
+        .finish_cancellation_cleanup_if_current(&stored, "test", "cleanup")
+        .await?;
+    assert_eq!(
+        outcome,
+        WorkflowCancellationCleanupOutcome::NoCancellationCommand
+    );
+    Ok(())
+}
