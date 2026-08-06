@@ -617,4 +617,12 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                 ON workflow_commands (workflow_id, dedupe_key)
                 WHERE status <> 'superseded'",
     },
+    Migration {
+        version: 25,
+        description: "persist runtime usage agent run ids",
+        sql: "ALTER TABLE runtime_usage_events
+              ADD COLUMN IF NOT EXISTS agent_run_id TEXT;
+              CREATE INDEX IF NOT EXISTS idx_runtime_usage_events_agent_run
+              ON runtime_usage_events (agent_run_id)",
+    },
 ];

@@ -225,6 +225,7 @@ fn runtime_usage_record_becomes_usage_record_with_candidate() -> anyhow::Result<
         command_id: "command-1".to_string(),
         workflow_id: "workflow-1".to_string(),
         turn_id: Some("turn-1".to_string()),
+        agent_run_id: None,
         runtime_kind: "codex_exec".to_string(),
         runtime_profile: "codex-default".to_string(),
         agent: "codex".to_string(),

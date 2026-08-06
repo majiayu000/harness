@@ -98,8 +98,8 @@ pub use recovery::{
 };
 pub use runtime_job_state::WorkflowCancellationCleanupOutcome;
 pub use runtime_usage::{
-    cost_usd_from_micros, cost_usd_to_micros, RuntimeUsageMetrics, RuntimeUsageRecord,
-    RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,
+    cost_usd_from_micros, cost_usd_to_micros, RuntimeAgentTelemetry, RuntimeUsageMetrics,
+    RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,
 };
 pub use submission_commit::{
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,

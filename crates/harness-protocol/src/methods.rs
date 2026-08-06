@@ -1,4 +1,5 @@
 use crate::context::{ContextPreviewItem, ContextPreviewRequest};
+use harness_core::run_id::RunId;
 use harness_core::types::{
     DraftId, Event, EventFilters, ExecPlanId, MetricFilters, ProjectId, SkillId,
 };
@@ -107,6 +108,8 @@ pub enum Method {
     },
     MetricsCollect {
         project_root: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<RunId>,
     },
     MetricsQuery {
         filters: MetricFilters,

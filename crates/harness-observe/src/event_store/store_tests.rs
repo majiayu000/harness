@@ -62,13 +62,13 @@ fn is_db_unavailable(err: &anyhow::Error) -> bool {
     // log_with_unreachable_otel_endpoint_still_persists_event.
 }
 
-struct TestStore {
+pub(super) struct TestStore {
     inner: EventStore,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl TestStore {
-    async fn close(self) {
+    pub(super) async fn close(self) {
         self.inner.close().await;
     }
 }
@@ -80,7 +80,7 @@ impl std::ops::Deref for TestStore {
     }
 }
 
-async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
+pub(super) async fn open_test_store(data_dir: &Path) -> anyhow::Result<Option<TestStore>> {
     if !db_tests_enabled().await {
         return Ok(None);
     }
@@ -161,6 +161,36 @@ async fn log_and_query_roundtrip() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn migrate_from_jsonl_retries_when_store_already_has_rows() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some(store) = open_test_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let existing = make_event("existing", Decision::Pass);
+    store.log(&existing).await?;
+
+    let legacy = make_event("legacy_jsonl", Decision::Warn);
+    let jsonl_path = dir.path().join("events.jsonl");
+    std::fs::write(
+        &jsonl_path,
+        format!("{}\n", serde_json::to_string(&legacy)?),
+    )?;
+
+    store.migrate_from_jsonl().await;
+
+    let results = store.query(&EventFilters::default()).await?;
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|event| event.id == existing.id));
+    assert!(results.iter().any(|event| event.id == legacy.id));
+    assert!(
+        !jsonl_path.exists(),
+        "successful retry should archive JSONL"
+    );
+    store.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn event_metadata_roundtrips() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some(store) = open_test_store(dir.path()).await? else {
@@ -197,40 +227,6 @@ async fn event_metadata_roundtrips() -> anyhow::Result<()> {
             .and_then(|t| t.first_token_latency_ms),
         Some(42)
     );
-    store.close().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn query_deserializes_rows_without_metadata() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(store) = open_test_store(dir.path()).await? else {
-        return Ok(());
-    };
-
-    sqlx::query(
-        "INSERT INTO events
-            (store_key, id, ts, session_id, hook, tool, decision, reason, detail, duration_ms, content, metadata)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-    )
-    .bind(store.store_key())
-    .bind("legacy-event")
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(SessionId::new().as_str())
-    .bind("legacy_hook")
-    .bind("legacy_tool")
-    .bind("pass")
-    .bind(Option::<String>::None)
-    .bind(Option::<String>::None)
-    .bind(Option::<i64>::None)
-    .bind(Option::<String>::None)
-    .bind(Option::<String>::None)
-    .execute(&store.pool)
-    .await?;
-
-    let results = store.query(&EventFilters::default()).await?;
-    assert_eq!(results.len(), 1);
-    assert!(results[0].metadata.is_none());
     store.close().await;
     Ok(())
 }
@@ -772,6 +768,11 @@ async fn migrate_from_jsonl_imports_existing_events() -> anyhow::Result<()> {
     let results = store.query(&EventFilters::default()).await?;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, event.id);
+    assert!(!jsonl_path.exists(), "legacy JSONL should be archived");
+    assert!(
+        dir.path().join("events.jsonl.migrated").exists(),
+        "legacy JSONL archive should remain available"
+    );
     store.close().await;
     Ok(())
 }
@@ -783,165 +784,6 @@ async fn session_renewal_secs_default_is_1800() -> anyhow::Result<()> {
         return Ok(());
     };
     assert_eq!(store.session_renewal_secs(), 1800);
-    store.close().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn purge_old_events_zero_days_is_noop() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(store) = open_test_store(dir.path()).await? else {
-        return Ok(());
-    };
-    store.log(&make_event("hook", Decision::Pass)).await?;
-    let deleted = store.purge_old_events(0).await?;
-    assert_eq!(deleted, 0);
-    let results = store.query(&EventFilters::default()).await?;
-    assert_eq!(results.len(), 1);
-    store.close().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn purge_old_events_removes_stale_and_keeps_recent() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(store) = open_test_store(dir.path()).await? else {
-        return Ok(());
-    };
-
-    let mut old_event = make_event("hook", Decision::Pass);
-    old_event.ts = chrono::Utc::now() - chrono::Duration::days(101);
-    store.log(&old_event).await?;
-
-    let recent_event = make_event("hook", Decision::Pass);
-    store.log(&recent_event).await?;
-
-    let deleted = store.purge_old_events(90).await?;
-    assert_eq!(deleted, 1, "only the old event should be purged");
-
-    let results = store.query(&EventFilters::default()).await?;
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id, recent_event.id);
-    store.close().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn purge_spares_periodic_review_watermarks() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(store) = open_test_store(dir.path()).await? else {
-        return Ok(());
-    };
-
-    let mut old_regular = make_event("pre_tool_use", Decision::Pass);
-    old_regular.ts = chrono::Utc::now() - chrono::Duration::days(101);
-    store.log(&old_regular).await?;
-
-    let mut old_watermark = make_event("periodic_review:my-project", Decision::Pass);
-    old_watermark.ts = chrono::Utc::now() - chrono::Duration::days(101);
-    store.log(&old_watermark).await?;
-
-    let deleted = store.purge_old_events(90).await?;
-    assert_eq!(deleted, 1, "only the regular old event should be purged");
-
-    let results = store.query(&EventFilters::default()).await?;
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].id, old_watermark.id);
-    store.close().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn purge_trims_old_watermarks_keeps_newest() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(store) = open_test_store(dir.path()).await? else {
-        return Ok(());
-    };
-
-    let hook = "periodic_review:my-project";
-
-    let mut wm_old = make_event(hook, Decision::Pass);
-    wm_old.ts = chrono::Utc::now() - chrono::Duration::days(200);
-    store.log(&wm_old).await?;
-
-    let mut wm_mid = make_event(hook, Decision::Pass);
-    wm_mid.ts = chrono::Utc::now() - chrono::Duration::days(100);
-    store.log(&wm_mid).await?;
-
-    let mut wm_new = make_event(hook, Decision::Pass);
-    wm_new.ts = chrono::Utc::now() - chrono::Duration::days(1);
-    store.log(&wm_new).await?;
-
-    let deleted = store.purge_old_events(90).await?;
-    assert_eq!(deleted, 2, "two older watermarks should be trimmed");
-
-    let results = store.query(&EventFilters::default()).await?;
-    assert_eq!(results.len(), 1, "only the newest watermark should remain");
-    assert_eq!(results[0].id, wm_new.id);
-    store.close().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn watermark_returns_none_before_first_set() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(store) = open_test_store(dir.path()).await? else {
-        return Ok(());
-    };
-    let result = store.get_scan_watermark("proj", "gc").await?;
-    assert!(result.is_none());
-    store.close().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn set_then_get_watermark_roundtrip() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(store) = open_test_store(dir.path()).await? else {
-        return Ok(());
-    };
-    let ts = chrono::Utc::now();
-    store.set_scan_watermark("proj", "gc", ts).await?;
-    let retrieved = store
-        .get_scan_watermark("proj", "gc")
-        .await?
-        .expect("watermark must exist after set");
-    assert_eq!(retrieved.timestamp(), ts.timestamp());
-    store.close().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn watermarks_are_per_project_and_agent() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(store) = open_test_store(dir.path()).await? else {
-        return Ok(());
-    };
-    let ts = chrono::Utc::now();
-    store.set_scan_watermark("proj1", "gc", ts).await?;
-    let r1 = store.get_scan_watermark("proj1", "other").await?;
-    assert!(r1.is_none(), "different agent_id must not share watermark");
-    let r2 = store.get_scan_watermark("proj2", "gc").await?;
-    assert!(r2.is_none(), "different project must not share watermark");
-    store.close().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn set_watermark_overwrites_previous() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let Some(store) = open_test_store(dir.path()).await? else {
-        return Ok(());
-    };
-    let ts1 = chrono::Utc::now() - chrono::Duration::hours(1);
-    let ts2 = chrono::Utc::now();
-    store.set_scan_watermark("proj", "gc", ts1).await?;
-    store.set_scan_watermark("proj", "gc", ts2).await?;
-    let retrieved = store
-        .get_scan_watermark("proj", "gc")
-        .await?
-        .expect("watermark must exist");
-    assert_eq!(retrieved.timestamp(), ts2.timestamp());
     store.close().await;
     Ok(())
 }

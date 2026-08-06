@@ -532,6 +532,25 @@ unavailable, the scheduler falls back to the existing agent-side
 See [OTel Trajectory Quickstart](otel-trajectory-quickstart.md) for a local
 Tempo walkthrough.
 
+### Agent Execution Telemetry Query Path
+
+Harness keeps agent execution telemetry in four durable sinks with separate
+ownership:
+
+| Sink | Owner | Contents |
+|------|-------|----------|
+| Runtime logs / thread transcripts | agent adapter and thread manager | Raw streamed agent output and transcript items |
+| Event store | `harness-observe` | Policy-hook, rules, GC, preflight, retry, and external-signal events |
+| Workflow runtime usage | `harness-workflow` | Per-turn token and cost usage keyed by workflow, runtime job, turn, and agent |
+| OTLP trajectory | `harness-observe` exporter | Derived workflow, activity, and agent-turn spans for trace backends |
+
+The event store is the policy-hook store, not the source of truth for full
+agent turns. To answer "what did agent X do in workflow/run Y", query
+`WorkflowRuntimeStore::runtime_agent_telemetry_for_workflow(workflow_id, agent, event_store)`
+for workflow outcome, per-turn usage, and policy-hook events joined by each
+usage record's `agent_run_id`. `signals.jsonl` remains an append-only
+external-signal input and is not the runtime usage path.
+
 ### `[concurrency]`
 
 | Field | Default | Description |

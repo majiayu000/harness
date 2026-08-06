@@ -5,6 +5,7 @@ use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
 use harness_core::config::agents::SandboxMode;
 use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::error::HarnessError;
+use harness_core::run_id::RunIdentity;
 use harness_core::types::{ExecutionPhase, TurnId};
 use harness_protocol::notifications::{Notification, RpcNotification};
 use std::collections::HashMap;
@@ -80,7 +81,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     turn_id: TurnId,
     prompt: String,
     agent_name: String,
-    options: TurnLifecycleOptions,
+    mut options: TurnLifecycleOptions,
 ) {
     let Some(project_root) = server
         .thread_manager
@@ -93,6 +94,16 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         );
         return;
     };
+    match RunIdentity::mint_nested_env_vars(&mut options.env_vars) {
+        Ok(identity) => {
+            if let Some(context) = options.runtime_usage.as_mut() {
+                context.agent_run_id = Some(identity.run_id);
+            }
+        }
+        Err(err) => {
+            tracing::warn!("failed to prepare agent run identity for runtime turn: {err}");
+        }
+    }
 
     let Some(agent) = server.agent_registry.get(&agent_name) else {
         let msg = format!("agent `{agent_name}` not found in registry");
@@ -117,6 +128,16 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         .await;
         return;
     };
+    if let Some(context) = options.runtime_usage.as_ref() {
+        if let Err(error) = context.persist_agent_run_start(&turn_id).await {
+            tracing::error!(
+                runtime_job_id = %context.runtime_job_id,
+                command_id = %context.command_id,
+                workflow_id = %context.workflow_id,
+                "failed to persist workflow runtime agent run start: {error}"
+            );
+        }
+    }
 
     // RAII guard: ensures the adapter is deregistered when the turn scope exits,
     // even if the task is cancelled before reaching the end of this function.
