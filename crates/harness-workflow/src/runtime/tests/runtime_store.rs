@@ -8,7 +8,7 @@ async fn runtime_turn_reservation_is_atomic_and_replay_safe() -> anyhow::Result<
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow_id = "turn-reservation";
-    store.upsert_instance(&issue_instance("implementing").with_id(workflow_id)).await?;
+    store.force_upsert_lifecycle_state_for_test(&issue_instance("implementing").with_id(workflow_id)).await?;
     let mut jobs = Vec::new();
     for key in ["a", "b"] {
         jobs.push(enqueue_workflow_runtime_job(&store, workflow_id, key, RuntimeKind::CodexJsonrpc, "codex-default", json!({"activity": "implement_issue"}), None).await?);
