@@ -63,10 +63,16 @@ Exit code from the process; stdout is a JSONL stream of these events.
 | `usage_update` | `TokenUsage` (input=used, total=size, cost) |
 | `available_commands_update` | ignored |
 
+Note: `usage_update.used`/`size` are the session's current context usage and
+limit, not per-turn consumption — recorded as `input_tokens`/`total_tokens`
+for observability only, not for billing-level accuracy.
+
 Permissions arrive as a `session/request_permission` **JSON-RPC request**
 (the client must respond with its id). Harness surfaces it as
-`AgentEvent::ApprovalRequest` (id = request id as string, command = prompt)
-and responds `{"outcome":"approved"}` / `{"outcome":"rejected","reason":...}`.
+`AgentEvent::ApprovalRequest` (id = request id as string, command = the
+request's `prompt` field — best-effort, the exact field was not exercised in
+the probe environment) and responds `{"outcome":"approved"}` /
+`{"outcome":"rejected","reason":...}`.
 
 Cancellation: `session/cancel` notification; the agent then answers the
 pending `session/prompt` with `stopReason: "cancelled"`.

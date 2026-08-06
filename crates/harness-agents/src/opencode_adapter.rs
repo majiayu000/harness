@@ -583,6 +583,21 @@ impl AgentAdapter for OpenCodeAcpAdapter {
             {
                 match message {
                     ParsedAcpMessage::Response { result, .. } => {
+                        // A JSON-RPC error response (e.g. -32602 invalid
+                        // params) must fail the turn, not be treated as a
+                        // successful completion.
+                        if result.get("error").is_some() || result.get("code").is_some() {
+                            let message = result
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("opencode acp request failed")
+                                .to_string();
+                            if tx.send(AgentEvent::Error { message }).await.is_err() {
+                                receiver_closed = true;
+                            }
+                            turn_completed = true;
+                            break;
+                        }
                         let stop_reason = result.get("stopReason").and_then(Value::as_str);
                         if stop_reason == Some("cancelled")
                             && tx

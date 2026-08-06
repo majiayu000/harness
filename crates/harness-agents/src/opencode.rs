@@ -23,9 +23,18 @@ const OPENCODE_PERMISSION_ENV: &str = "OPENCODE_PERMISSION";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpenCodeRunEvent {
-    Text { text: String },
-    ToolUse { command: String, output: String },
-    StepFinish { reason: String, tokens: TokenUsage },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        command: String,
+        exit_code: Option<i32>,
+        output: String,
+    },
+    StepFinish {
+        reason: String,
+        tokens: TokenUsage,
+    },
 }
 
 /// Parse one line of `opencode run --format json` output.
@@ -57,7 +66,16 @@ pub fn parse_opencode_run_line(line: &str) -> Option<OpenCodeRunEvent> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            Some(OpenCodeRunEvent::ToolUse { command, output })
+            let exit_code = match value.pointer("/part/state/status").and_then(Value::as_str) {
+                Some("completed") => Some(0),
+                Some("error") => Some(1),
+                _ => None,
+            };
+            Some(OpenCodeRunEvent::ToolUse {
+                command,
+                exit_code,
+                output,
+            })
         }
         Some("step_finish") => {
             let reason = value
@@ -101,15 +119,15 @@ fn parse_step_finish_tokens(value: &Value) -> TokenUsage {
 ///
 /// `None` = full profile (opencode `--auto`). An explicitly empty list means
 /// deny-all, mirroring `AgentRequest::allowed_tools` semantics.
-fn permission_env_value(tools: &[String]) -> Option<String> {
+fn permission_env_value(tools: &[String]) -> String {
     if tools.is_empty() {
-        return Some(r#"{"*":"deny"}"#.to_string());
+        return r#"{"*":"deny"}"#.to_string();
     }
     let mut map = serde_json::Map::new();
     for tool in tools {
         map.insert(tool.clone(), Value::String("allow".to_string()));
     }
-    Some(serde_json::Value::Object(map).to_string())
+    serde_json::Value::Object(map).to_string()
 }
 
 pub struct OpenCodeAgent {
@@ -162,18 +180,23 @@ impl OpenCodeAgent {
     fn spawn_env_vars(&self, req: &AgentRequest) -> Vec<(String, String)> {
         let mut vars = Vec::new();
         if let Some(tools) = req.allowed_tools.as_ref() {
-            if let Some(value) = permission_env_value(tools) {
-                vars.push((OPENCODE_PERMISSION_ENV.to_string(), value));
-            }
+            vars.push((
+                OPENCODE_PERMISSION_ENV.to_string(),
+                permission_env_value(tools),
+            ));
         }
         vars
     }
 
     fn item_from_tool_use(&self, event: &OpenCodeRunEvent) -> Option<Item> {
         match event {
-            OpenCodeRunEvent::ToolUse { command, output } => Some(Item::ShellCommand {
+            OpenCodeRunEvent::ToolUse {
+                command,
+                exit_code,
+                output,
+            } => Some(Item::ShellCommand {
                 command: command.clone(),
-                exit_code: Some(0),
+                exit_code: *exit_code,
                 stdout: output.clone(),
                 stderr: String::new(),
             }),
@@ -429,10 +452,14 @@ impl CodeAgent for OpenCodeAgent {
                         break;
                     }
                 }
-                OpenCodeRunEvent::ToolUse { command, output } => {
+                OpenCodeRunEvent::ToolUse {
+                    command,
+                    exit_code,
+                    output,
+                } => {
                     let item = Item::ShellCommand {
                         command: command.clone(),
-                        exit_code: Some(0),
+                        exit_code,
                         stdout: output.clone(),
                         stderr: String::new(),
                     };
@@ -557,7 +584,18 @@ mod tests {
             parse_opencode_run_line(line),
             Some(OpenCodeRunEvent::ToolUse {
                 command: "ls /tmp".to_string(),
+                exit_code: Some(0),
                 output: "a.txt".to_string()
+            })
+        );
+
+        let failed = r#"{"type":"tool_use","part":{"type":"tool","tool":"bash","callID":"c2","state":{"status":"error","input":{"command":"ls /nope"},"output":""}}}"#;
+        assert_eq!(
+            parse_opencode_run_line(failed),
+            Some(OpenCodeRunEvent::ToolUse {
+                command: "ls /nope".to_string(),
+                exit_code: Some(1),
+                output: String::new()
             })
         );
     }
@@ -588,9 +626,9 @@ mod tests {
     #[test]
     fn permission_env_mapping() {
         assert_eq!(
-            permission_env_value(&["bash".to_string(), "edit".to_string()]).unwrap(),
+            permission_env_value(&["bash".to_string(), "edit".to_string()]),
             r#"{"bash":"allow","edit":"allow"}"#
         );
-        assert_eq!(permission_env_value(&[]).unwrap(), r#"{"*":"deny"}"#);
+        assert_eq!(permission_env_value(&[]), r#"{"*":"deny"}"#);
     }
 }
