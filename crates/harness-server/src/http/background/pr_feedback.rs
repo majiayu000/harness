@@ -312,7 +312,11 @@ async fn recover_runtime_pr_binding_from_bind_pr_command(
     workflow: WorkflowInstance,
 ) -> anyhow::Result<Option<WorkflowInstance>> {
     match store
-        .repair_pr_binding_from_latest_command(&workflow.id, workflow.version)
+        .repair_pr_binding_from_latest_command(
+            &workflow.id,
+            workflow.version,
+            "workflow_runtime_pr_feedback",
+        )
         .await?
     {
         WorkflowPrBindingRepairOutcome::Repaired {

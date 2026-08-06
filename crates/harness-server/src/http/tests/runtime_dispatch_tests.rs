@@ -669,10 +669,24 @@ async fn runtime_pr_feedback_sweep_recovers_pr_binding_from_bind_pr_command() ->
         "https://github.com/owner/repo/pull/80",
         "issue-230-bind-pr-80",
     );
+    // Repair only honors bind_pr evidence minted by an accepted decision
+    // (GH-1864), so the fixture commits one the way the production path does.
+    let bind_decision = harness_workflow::runtime::WorkflowDecisionRecord::accepted(
+        harness_workflow::runtime::WorkflowDecision::new(
+            &workflow.id,
+            "pr_open",
+            "bind_pr",
+            "pr_open",
+            "agent reported the pull request",
+        )
+        .with_command(bind_pr.clone()),
+        None,
+    );
+    store.record_decision(&bind_decision).await?;
     store
         .enqueue_command_with_status(
             &workflow.id,
-            None,
+            Some(&bind_decision.id),
             &bind_pr,
             harness_workflow::runtime::WorkflowCommandStatus::Skipped,
         )
