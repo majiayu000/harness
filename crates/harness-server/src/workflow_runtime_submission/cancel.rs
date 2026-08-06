@@ -348,7 +348,8 @@ mod tests {
     use chrono::{Duration, Utc};
     use harness_core::db::resolve_database_url;
     use harness_workflow::runtime::{
-        RuntimeJobStatus, RuntimeKind, WorkflowCommandStatus, WorkflowSubject,
+        RuntimeJobStatus, RuntimeKind, WorkflowCommandStatus, WorkflowDecisionRecord,
+        WorkflowSubject,
     };
 
     #[tokio::test]
@@ -396,8 +397,20 @@ mod tests {
             "retry-cancellation-cleanup-marker",
             json!({}),
         );
+        // Cleanup only honors a marker bound to the accepted cancellation
+        // decision that minted it (GH-1865), so the fixture commits one.
+        let cancellation_decision = WorkflowDecision::new(
+            &workflow.id,
+            "running",
+            "cancel_prompt_submission",
+            "cancelled",
+            "operator cancelled the runtime prompt submission",
+        )
+        .with_command(cancellation.clone());
+        let decision_record = WorkflowDecisionRecord::accepted(cancellation_decision, None);
+        store.record_decision(&decision_record).await?;
         store
-            .enqueue_command(&workflow.id, None, &cancellation)
+            .enqueue_command(&workflow.id, Some(&decision_record.id), &cancellation)
             .await?;
 
         let outcome = cancel_submission_by_workflow_id(&store, &workflow.id).await?;
