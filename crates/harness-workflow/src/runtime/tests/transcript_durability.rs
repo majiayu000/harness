@@ -651,10 +651,12 @@ async fn transcript_dependencies_follow_the_persisted_dedupe_command() -> anyhow
         )
     };
 
-    let command_id = store
+    store
         .enqueue_command(&workflow.id, None, &replay("runtime-transcript:old"))
         .await?;
-    store
+    // The second enqueue supersedes the first attempt, so retention follows the
+    // live attempt and drops the superseded one (GH-1865).
+    let command_id = store
         .enqueue_command(&workflow.id, None, &replay("runtime-transcript:current"))
         .await?;
     let mut dependencies: Vec<(String,)> = sqlx::query_as(

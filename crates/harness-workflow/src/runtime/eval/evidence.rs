@@ -605,6 +605,8 @@ mod tests {
             command,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            attempt_generation: 1,
+            superseded_by_command_id: None,
         }
     }
 }

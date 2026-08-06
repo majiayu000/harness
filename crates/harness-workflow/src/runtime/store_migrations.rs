@@ -593,4 +593,28 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_workflow_artifact_dependencies_workflow
           ON workflow_artifact_dependencies (workflow_id)",
     },
+    Migration {
+        version: 24,
+        description: "supersede workflow command attempts instead of rewriting them",
+        sql: "ALTER TABLE workflow_commands
+                ADD COLUMN IF NOT EXISTS attempt_generation INTEGER NOT NULL DEFAULT 1;
+              ALTER TABLE workflow_commands
+                ADD COLUMN IF NOT EXISTS superseded_by_command_id TEXT;
+              ALTER TABLE workflow_commands
+                DROP CONSTRAINT IF EXISTS workflow_commands_status_check;
+              ALTER TABLE workflow_commands
+                ADD CONSTRAINT workflow_commands_status_check
+                CHECK (status IN (
+                  'pending', 'dispatching', 'deferred', 'dispatched', 'handled_inline',
+                  'completed', 'failed', 'blocked', 'cancelled', 'skipped', 'superseded'
+                ));
+              -- Dedupe identity now covers only live attempts: a superseded row
+              -- keeps its dedupe_key as the record of the attempt it was, while
+              -- the replacement attempt takes over that key.
+              ALTER TABLE workflow_commands
+                DROP CONSTRAINT IF EXISTS workflow_commands_workflow_id_dedupe_key_key;
+              CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_commands_live_dedupe
+                ON workflow_commands (workflow_id, dedupe_key)
+                WHERE status <> 'superseded'",
+    },
 ];

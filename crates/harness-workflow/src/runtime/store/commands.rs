@@ -1,4 +1,5 @@
 use super::{
+    command_attempts::{insert_command_attempt_tx, AttemptReplacement},
     enum_str, runtime_job_for_command_tx, to_jsonb_string, workflow_instance_from_persisted_json,
     ClaimedCommandTerminalOutcome, RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
 };
@@ -9,7 +10,6 @@ use crate::runtime::{
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
-use uuid::Uuid;
 
 impl WorkflowRuntimeStore {
     pub async fn skip_claimed_command_if_owned(
@@ -136,19 +136,15 @@ pub(super) async fn insert_tx(
     command: &WorkflowCommand,
     status: WorkflowCommandStatus,
 ) -> anyhow::Result<String> {
-    let data = to_jsonb_string(command)?;
-    let command_type = enum_str(&command.command_type)?;
-    let (id,): (String,) = sqlx::query_as(insert_sql())
-        .bind(Uuid::new_v4().to_string())
-        .bind(workflow_id)
-        .bind(decision_id)
-        .bind(&command_type)
-        .bind(&command.dedupe_key)
-        .bind(status.as_str())
-        .bind(&data)
-        .bind(WorkflowCommandStatus::Pending.as_str())
-        .fetch_one(&mut **tx)
-        .await?;
+    let id = insert_command_attempt_tx(
+        tx,
+        workflow_id,
+        decision_id,
+        command,
+        status,
+        AttemptReplacement::PendingIntent,
+    )
+    .await?;
     super::artifacts::reconcile_runtime_transcript_dependencies_tx(tx, workflow_id).await?;
     Ok(id)
 }
@@ -160,70 +156,15 @@ pub(super) async fn insert_or_reactivate_cancelled_tx(
     command: &WorkflowCommand,
     status: WorkflowCommandStatus,
 ) -> anyhow::Result<String> {
-    let data = to_jsonb_string(command)?;
-    let command_type = enum_str(&command.command_type)?;
-    let (id,): (String,) = sqlx::query_as(
-        "INSERT INTO workflow_commands
-            (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-         ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
-            decision_id = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.decision_id ELSE workflow_commands.decision_id END,
-            command_type = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.command_type ELSE workflow_commands.command_type END,
-            data = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.data ELSE workflow_commands.data END,
-            status = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.status ELSE workflow_commands.status END,
-            dispatch_owner = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_owner END,
-            dispatch_lease_expires_at = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_lease_expires_at END,
-            dispatch_not_before = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_not_before END,
-            dispatch_barrier = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_barrier END,
-            updated_at = CASE WHEN workflow_commands.status = $8 THEN CURRENT_TIMESTAMP ELSE workflow_commands.updated_at END
-         RETURNING id",
+    insert_command_attempt_tx(
+        tx,
+        workflow_id,
+        decision_id,
+        command,
+        status,
+        AttemptReplacement::ReactivateCancelled,
     )
-    .bind(Uuid::new_v4().to_string())
-    .bind(workflow_id)
-    .bind(decision_id)
-    .bind(command_type)
-    .bind(&command.dedupe_key)
-    .bind(status.as_str())
-    .bind(data)
-    .bind(WorkflowCommandStatus::Cancelled.as_str())
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(id)
-}
-
-fn insert_sql() -> &'static str {
-    "INSERT INTO workflow_commands
-        (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-     ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
-        decision_id = CASE
-            WHEN workflow_commands.status = $8 THEN EXCLUDED.decision_id
-            ELSE workflow_commands.decision_id
-        END,
-        command_type = CASE
-            WHEN workflow_commands.status = $8 THEN EXCLUDED.command_type
-            ELSE workflow_commands.command_type
-        END,
-        data = CASE
-            WHEN workflow_commands.status = $8 THEN EXCLUDED.data
-            ELSE workflow_commands.data
-        END,
-        status = CASE
-            WHEN workflow_commands.status = $8 THEN EXCLUDED.status
-            ELSE workflow_commands.status
-        END,
-        updated_at = CASE
-            WHEN workflow_commands.status = $8
-                 AND (
-                     workflow_commands.status <> EXCLUDED.status
-                     OR workflow_commands.decision_id IS DISTINCT FROM EXCLUDED.decision_id
-                     OR workflow_commands.command_type <> EXCLUDED.command_type
-                     OR workflow_commands.data <> EXCLUDED.data
-                 )
-            THEN CURRENT_TIMESTAMP
-            ELSE workflow_commands.updated_at
-        END
-     RETURNING id"
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

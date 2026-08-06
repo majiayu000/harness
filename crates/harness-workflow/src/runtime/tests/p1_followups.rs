@@ -93,7 +93,7 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Result<()> {
+async fn runtime_store_pending_dedupe_supersedes_instead_of_rewriting() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
@@ -139,23 +139,64 @@ async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Res
     );
     new_decision.id = "decision-new".to_string();
     store.record_decision(&new_decision).await?;
-    let duplicate_id = store
+    let superseding_id = store
         .enqueue_command(&instance.id, Some("decision-new"), &updated)
         .await?;
 
-    assert_eq!(duplicate_id, command_id);
+    // A different intent under the same dedupe key is a new attempt, not a
+    // rewrite of the old row (GH-1865).
+    assert_ne!(superseding_id, command_id);
     let commands = store.commands_for(&instance.id).await?;
-    assert_eq!(commands.len(), 1);
-    let command = &commands[0];
-    assert_eq!(command.id, command_id);
-    assert_eq!(command.status, "pending");
-    assert_eq!(command.decision_id.as_deref(), Some("decision-new"));
+    assert_eq!(commands.len(), 2, "the replaced attempt must survive");
+
+    let superseded = commands
+        .iter()
+        .find(|command| command.id == command_id)
+        .expect("the original attempt must still be readable");
+    assert_eq!(superseded.status, WorkflowCommandStatus::Superseded);
+    assert_eq!(superseded.decision_id.as_deref(), Some("decision-old"));
     assert_eq!(
-        command.command.command_type,
+        superseded.command.command_type,
+        WorkflowCommandType::EnqueueActivity,
+        "the replaced attempt must keep the intent it was minted for"
+    );
+    assert_eq!(superseded.attempt_generation, 1);
+    assert_eq!(
+        superseded.superseded_by_command_id.as_deref(),
+        Some(superseding_id.as_str())
+    );
+
+    let live = commands
+        .iter()
+        .find(|command| command.id == superseding_id)
+        .expect("the new attempt must be readable");
+    assert_eq!(live.status, WorkflowCommandStatus::Pending);
+    assert_eq!(live.decision_id.as_deref(), Some("decision-new"));
+    assert_eq!(
+        live.command.command_type,
         WorkflowCommandType::StartChildWorkflow
     );
-    assert_eq!(command.command.command["definition_id"], "github_issue_pr");
-    assert_eq!(command.command.command["subject_key"], "issue:1200");
+    assert_eq!(live.command.command["definition_id"], "github_issue_pr");
+    assert_eq!(live.command.command["subject_key"], "issue:1200");
+    assert_eq!(live.attempt_generation, 2);
+    assert!(live.superseded_by_command_id.is_none());
+
+    // A replayed enqueue of the live intent stays idempotent.
+    let replayed = store
+        .enqueue_command(&instance.id, Some("decision-new"), &updated)
+        .await?;
+    assert_eq!(replayed, superseding_id);
+    assert_eq!(store.commands_for(&instance.id).await?.len(), 2);
+
+    // A superseded attempt can never be moved back into a dispatchable state.
+    let error = store
+        .mark_command_status(&command_id, WorkflowCommandStatus::Pending)
+        .await
+        .expect_err("a superseded attempt must not be revivable");
+    assert!(
+        error.to_string().contains("superseded"),
+        "unexpected error: {error}"
+    );
     Ok(())
 }
 
