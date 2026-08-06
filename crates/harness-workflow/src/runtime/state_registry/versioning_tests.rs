@@ -128,8 +128,8 @@ fn historical_only_declarative_definition_is_enumerated() {
 }
 
 #[test]
-fn builtins_ignore_forged_declarative_pin_markers() {
-    let registry = WorkflowDefinitionRegistry::new_for_tests();
+fn builtins_resolve_without_requiring_declarative_pin_markers() {
+    let registry = WorkflowDefinitionRegistry::with_builtins();
     let builtin = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
@@ -139,8 +139,9 @@ fn builtins_ignore_forged_declarative_pin_markers() {
     .with_server_data(json!({
         "definition_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }));
+    let resolved = registry.resolve_declarative_definition(&builtin);
     assert!(matches!(
-        registry.resolve_declarative_definition(&builtin),
-        DeclarativeDefinitionResolution::NotDeclarative
+        resolved,
+        DeclarativeDefinitionResolution::Resolved(_)
     ));
 }

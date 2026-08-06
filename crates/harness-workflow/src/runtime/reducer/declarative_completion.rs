@@ -1,3 +1,4 @@
+use super::builtin_completion::reduce_builtin_completion;
 use super::runtime_failure::{
     retry_failed_declarative_activity_decision, runtime_blocked_decision,
 };
@@ -17,6 +18,20 @@ use harness_core::config::workflow::DeclaredProgressMode;
 use serde_json::json;
 
 pub(crate) fn reduce_declarative_completion(
+    definition: &DeclarativeWorkflowDefinition,
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> anyhow::Result<Option<WorkflowDecision>> {
+    if let Some(outcome) = reduce_builtin_completion(instance, event, result) {
+        return outcome;
+    }
+    Ok(Some(reduce_generic_declarative_completion(
+        definition, instance, event, result,
+    )))
+}
+
+fn reduce_generic_declarative_completion(
     definition: &DeclarativeWorkflowDefinition,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
@@ -203,6 +218,11 @@ fn transition_decision(
             WorkflowCommand::enqueue_activity(activity, event_dedupe_key(instance, target, event))
         } else {
             match state.progress {
+                Some(DeclaredProgressMode::CommandDriven) => anyhow::bail!(
+                    "declarative workflow '{}' target state '{}' is command-driven but declares no activity",
+                    policy.id,
+                    target
+                ),
                 Some(DeclaredProgressMode::ExternalWait) => WorkflowCommand::wait(
                     format!("declarative workflow entered external wait state '{target}'"),
                     event_dedupe_key(instance, target, event),
@@ -215,6 +235,11 @@ fn transition_decision(
                         "activity": result.activity,
                         "target_state": target,
                     }),
+                ),
+                Some(DeclaredProgressMode::ParentHandoff) => anyhow::bail!(
+                    "declarative workflow '{}' target state '{}' is parent-handoff driven and cannot be entered by a generic activity completion",
+                    policy.id,
+                    target
                 ),
                 None => anyhow::bail!(
                     "declarative workflow '{}' target state '{}' has no progress driver",

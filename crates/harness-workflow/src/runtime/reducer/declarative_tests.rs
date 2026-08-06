@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::model::{
-    ActivityErrorKind, ActivityResult, WorkflowCommandType, WorkflowEvent, WorkflowInstance,
-    WorkflowSubject,
+    ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowEvent,
+    WorkflowInstance, WorkflowSubject,
 };
 use crate::runtime::validator::ValidationContext;
 use chrono::Utc;

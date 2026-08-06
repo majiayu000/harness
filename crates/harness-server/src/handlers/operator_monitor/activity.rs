@@ -66,19 +66,20 @@ pub(super) fn runtime_workflow_counts(workflows: &[WorkflowInstance]) -> Runtime
 fn workflow_bucket(workflow: &WorkflowInstance) -> WorkflowBucket {
     let projection = RuntimeWorkflowProjection::from_workflow(workflow);
     match projection.task_status {
+        TaskStatus::Pending => return WorkflowBucket::Pending,
         TaskStatus::Failed => return WorkflowBucket::Failed,
         TaskStatus::Done => return WorkflowBucket::Done,
         TaskStatus::AwaitingDeps => return WorkflowBucket::AwaitingDependencies,
         _ => {}
+    }
+    if workflow.state == "ready_to_merge" {
+        return WorkflowBucket::ReadyToMerge;
     }
     if declarative_workflow_definition_for_instance(workflow).is_some()
         && workflow_state_definition_for_instance(workflow, &workflow.state)
             .is_some_and(|state| state.progress_mode == Some(WorkflowProgressMode::OperatorGate))
     {
         return WorkflowBucket::Blocked;
-    }
-    if workflow.state == "ready_to_merge" {
-        return WorkflowBucket::ReadyToMerge;
     }
     if workflow.state == "blocked" {
         return WorkflowBucket::Blocked;

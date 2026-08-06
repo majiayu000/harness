@@ -248,6 +248,9 @@ fn workflow_scheduler_state(
         scheduler.mark_terminal(status);
         return scheduler;
     }
+    if workflow.definition_id == QUALITY_GATE_DEFINITION_ID && workflow.state == "pending" {
+        return TaskSchedulerState::queued();
+    }
     if declarative_workflow_definition_for_instance(workflow).is_some() {
         if let Some(progress_mode) =
             workflow_state_definition_for_instance(workflow, &workflow.state)
@@ -326,6 +329,9 @@ fn workflow_active_bucket(
         || (definition_id == QUALITY_GATE_DEFINITION_ID && state == "pending")
     {
         return None;
+    }
+    if matches!(status, TaskStatus::Pending) {
+        return Some(RuntimeActiveBucket::Queued);
     }
     match scheduler.authority_state {
         SchedulerAuthorityState::Running

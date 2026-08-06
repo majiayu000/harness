@@ -36,6 +36,9 @@ pub(super) fn apply_activity_policy_with_resolver(
             workflow.id
         ),
     };
+    if definition.definition_hash().starts_with("builtin:") {
+        return Ok(());
+    }
     let activity = activity_name(job);
     let expected_activity = definition
         .policy()

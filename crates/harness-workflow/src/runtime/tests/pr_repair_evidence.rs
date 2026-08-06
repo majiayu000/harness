@@ -121,7 +121,7 @@ fn repair_snapshot_artifact() -> ActivityArtifact {
             "pr_url": "https://github.com/owner/repo/pull/77",
             "head_sha": "def456",
             "observed_at": "2026-06-06T00:05:00Z",
-            "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+            "changed_files": ["crates/harness-workflow/src/runtime/reducer/builtin_pr_feedback.rs"],
             "action_taken": "pushed_commit",
             "validation_commands": [
                 {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "passed"}
@@ -348,7 +348,7 @@ fn address_pr_feedback_snapshot_with_failed_validation_blocks() {
             "pr_url": "https://github.com/owner/repo/pull/77",
             "head_sha": "def456",
             "observed_at": "2026-06-06T00:05:00Z",
-            "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+            "changed_files": ["crates/harness-workflow/src/runtime/reducer/builtin_pr_feedback.rs"],
             "action_taken": "pushed_commit",
             "validation_commands": [
                 {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "failed"}
@@ -384,7 +384,7 @@ fn address_pr_feedback_snapshot_with_mixed_validation_blocks() {
             "pr_url": "https://github.com/owner/repo/pull/77",
             "head_sha": "def456",
             "observed_at": "2026-06-06T00:05:00Z",
-            "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+            "changed_files": ["crates/harness-workflow/src/runtime/reducer/builtin_pr_feedback.rs"],
             "action_taken": "pushed_commit",
             "validation_commands": [
                 {"command": "cargo fmt --all -- --check", "status": "passed"},
@@ -425,7 +425,7 @@ fn address_pr_feedback_snapshot_for_different_pr_blocks() {
             "pr_url": "https://github.com/owner/repo/pull/88",
             "head_sha": "def456",
             "observed_at": "2026-06-06T00:05:00Z",
-            "changed_files": ["crates/harness-workflow/src/runtime/reducer/pr_feedback_completion.rs"],
+            "changed_files": ["crates/harness-workflow/src/runtime/reducer/builtin_pr_feedback.rs"],
             "validation_commands": [
                 {"command": "cargo test -p harness-workflow pr_repair_evidence", "status": "passed"}
             ]

@@ -11,8 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
+mod builtins;
 mod evidence_policy;
 mod versioning;
+
+use self::builtins::{builtin_definitions, builtin_registered_definitions};
 
 pub use evidence_policy::{apply_builtin_evidence_enforcement, transition_requires_evidence};
 
@@ -155,10 +158,8 @@ impl WorkflowDefinitionRegistry {
 
     fn with_builtins() -> Self {
         let mut registry = Self::new();
-        for definition in builtin_definitions() {
-            registry
-                .register(definition)
-                .expect("built-in workflow definitions must be unique");
+        if let Err(error) = registry.register_declarative_current_batch(builtin_definitions()) {
+            panic!("built-in workflow definitions must be unique and valid: {error}");
         }
         registry
     }
@@ -257,6 +258,9 @@ impl WorkflowDefinitionRegistry {
         &self,
         instance: &WorkflowInstance,
     ) -> Result<Option<DecisionValidator>, DeclarativeDefinitionPinError> {
+        if is_builtin_definition_id(&instance.definition_id) {
+            return Ok(self.decision_validator_for_definition(&instance.definition_id));
+        }
         match self.resolve_declarative_definition(instance) {
             // Carry the exact version and content hash the pin resolved to, so
             // the store can re-verify at commit that this validator still
@@ -281,6 +285,22 @@ impl WorkflowDefinitionRegistry {
     }
 
     fn terminal_state_selectors(&self, definition_id: &str) -> Vec<WorkflowTerminalStateSelector> {
+        if is_builtin_definition_id(definition_id) {
+            if let Some(definition) = self.definition(definition_id) {
+                return definition
+                    .states
+                    .iter()
+                    .filter_map(|state| {
+                        Some(WorkflowTerminalStateSelector {
+                            definition_version: None,
+                            definition_hash: None,
+                            state: state.key.state.to_string(),
+                            terminal_state: state.terminal_state?,
+                        })
+                    })
+                    .collect();
+            }
+        }
         let mut selectors = self
             .declarative_versions
             .iter()
@@ -321,6 +341,20 @@ impl WorkflowDefinitionRegistry {
         definition_id: &str,
         progress_mode: WorkflowProgressMode,
     ) -> Vec<WorkflowProgressStateSelector> {
+        if is_builtin_definition_id(definition_id) {
+            if let Some(definition) = self.definition(definition_id) {
+                return definition
+                    .states
+                    .iter()
+                    .filter(|state| state.progress_mode == Some(progress_mode))
+                    .map(|state| WorkflowProgressStateSelector {
+                        definition_version: None,
+                        definition_hash: None,
+                        state: state.key.state.to_string(),
+                    })
+                    .collect();
+            }
+        }
         let mut selectors = self
             .declarative_versions
             .iter()
@@ -599,202 +633,12 @@ pub fn workflow_state_terminal_state_for_version(
     workflow_state_definition_for_version(definition_id, definition_version, state)?.terminal_state
 }
 
-fn builtin_definitions() -> [RegisteredWorkflowDefinition; 4] {
+fn is_builtin_definition_id(definition_id: &str) -> bool {
     [
-        github_issue_pr_definition(),
-        prompt_task_definition(),
-        quality_gate_definition(),
-        pr_feedback_definition(),
-    ]
-}
-
-fn github_issue_pr_definition() -> RegisteredWorkflowDefinition {
-    use WorkflowProgressMode::{CommandDriven, ExternalWait, OperatorGate, ParentHandoff};
-
-    definition(
         GITHUB_ISSUE_PR_DEFINITION_ID,
-        vec![
-            active(GITHUB_ISSUE_PR_DEFINITION_ID, "discovered", CommandDriven),
-            active(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                "awaiting_dependencies",
-                ExternalWait,
-            ),
-            active(GITHUB_ISSUE_PR_DEFINITION_ID, "scheduled", CommandDriven),
-            active(GITHUB_ISSUE_PR_DEFINITION_ID, "planning", CommandDriven),
-            active(GITHUB_ISSUE_PR_DEFINITION_ID, "implementing", CommandDriven),
-            active(GITHUB_ISSUE_PR_DEFINITION_ID, "replanning", CommandDriven),
-            active(GITHUB_ISSUE_PR_DEFINITION_ID, "pr_open", ExternalWait),
-            active(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                "local_review_gate",
-                CommandDriven,
-            ),
-            active(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                "awaiting_feedback",
-                ExternalWait,
-            ),
-            active(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                "addressing_feedback",
-                CommandDriven,
-            ),
-            active(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                "quality_gate_pending",
-                ParentHandoff,
-            ),
-            active(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                "ready_to_merge",
-                OperatorGate,
-            ),
-            active(GITHUB_ISSUE_PR_DEFINITION_ID, "merging", CommandDriven),
-            active(GITHUB_ISSUE_PR_DEFINITION_ID, "blocked", OperatorGate),
-            terminal(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                "done",
-                WorkflowTerminalState::Succeeded,
-            ),
-            terminal(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                "failed",
-                WorkflowTerminalState::Failed,
-            ),
-            terminal(
-                GITHUB_ISSUE_PR_DEFINITION_ID,
-                "cancelled",
-                WorkflowTerminalState::Cancelled,
-            ),
-        ],
-        TransitionAllowlist::github_issue_pr_defaults(),
-    )
-}
-
-fn prompt_task_definition() -> RegisteredWorkflowDefinition {
-    use WorkflowProgressMode::{CommandDriven, ExternalWait, OperatorGate};
-
-    definition(
         PROMPT_TASK_DEFINITION_ID,
-        vec![
-            active(PROMPT_TASK_DEFINITION_ID, "submitted", CommandDriven),
-            active(
-                PROMPT_TASK_DEFINITION_ID,
-                "awaiting_dependencies",
-                ExternalWait,
-            ),
-            active(PROMPT_TASK_DEFINITION_ID, "implementing", CommandDriven),
-            active(PROMPT_TASK_DEFINITION_ID, "blocked", OperatorGate),
-            terminal(
-                PROMPT_TASK_DEFINITION_ID,
-                "done",
-                WorkflowTerminalState::Succeeded,
-            ),
-            terminal(
-                PROMPT_TASK_DEFINITION_ID,
-                "failed",
-                WorkflowTerminalState::Failed,
-            ),
-            terminal(
-                PROMPT_TASK_DEFINITION_ID,
-                "cancelled",
-                WorkflowTerminalState::Cancelled,
-            ),
-        ],
-        TransitionAllowlist::prompt_task_defaults(),
-    )
-}
-
-fn quality_gate_definition() -> RegisteredWorkflowDefinition {
-    use WorkflowProgressMode::{CommandDriven, OperatorGate};
-
-    definition(
         QUALITY_GATE_DEFINITION_ID,
-        vec![
-            active(QUALITY_GATE_DEFINITION_ID, "pending", CommandDriven),
-            active(QUALITY_GATE_DEFINITION_ID, "checking", CommandDriven),
-            active(QUALITY_GATE_DEFINITION_ID, "blocked", OperatorGate),
-            terminal(
-                QUALITY_GATE_DEFINITION_ID,
-                "passed",
-                WorkflowTerminalState::Succeeded,
-            ),
-            terminal(
-                QUALITY_GATE_DEFINITION_ID,
-                "failed",
-                WorkflowTerminalState::Failed,
-            ),
-            terminal(
-                QUALITY_GATE_DEFINITION_ID,
-                "cancelled",
-                WorkflowTerminalState::Cancelled,
-            ),
-        ],
-        TransitionAllowlist::quality_gate_defaults(),
-    )
-}
-
-fn pr_feedback_definition() -> RegisteredWorkflowDefinition {
-    use WorkflowProgressMode::{CommandDriven, OperatorGate, ParentHandoff};
-
-    definition(
         PR_FEEDBACK_DEFINITION_ID,
-        vec![
-            active(PR_FEEDBACK_DEFINITION_ID, "pending", CommandDriven),
-            active(PR_FEEDBACK_DEFINITION_ID, "inspecting", CommandDriven),
-            active(PR_FEEDBACK_DEFINITION_ID, "feedback_found", ParentHandoff),
-            active(
-                PR_FEEDBACK_DEFINITION_ID,
-                "no_actionable_feedback",
-                ParentHandoff,
-            ),
-            active(PR_FEEDBACK_DEFINITION_ID, "ready_to_merge", ParentHandoff),
-            active(PR_FEEDBACK_DEFINITION_ID, "blocked", OperatorGate),
-            terminal(
-                PR_FEEDBACK_DEFINITION_ID,
-                "done",
-                WorkflowTerminalState::Succeeded,
-            ),
-            terminal(
-                PR_FEEDBACK_DEFINITION_ID,
-                "failed",
-                WorkflowTerminalState::Failed,
-            ),
-            terminal(
-                PR_FEEDBACK_DEFINITION_ID,
-                "cancelled",
-                WorkflowTerminalState::Cancelled,
-            ),
-        ],
-        TransitionAllowlist::pr_feedback_defaults(),
-    )
+    ]
+    .contains(&definition_id)
 }
-
-fn definition(
-    id: &'static str,
-    states: Vec<WorkflowStateDefinition>,
-    allowlist: TransitionAllowlist,
-) -> RegisteredWorkflowDefinition {
-    RegisteredWorkflowDefinition::new(id, states, allowlist)
-}
-
-fn active(
-    definition_id: &'static str,
-    state: &'static str,
-    progress_mode: WorkflowProgressMode,
-) -> WorkflowStateDefinition {
-    WorkflowStateDefinition::active(definition_id, state, progress_mode)
-}
-
-fn terminal(
-    definition_id: &'static str,
-    state: &'static str,
-    terminal_state: WorkflowTerminalState,
-) -> WorkflowStateDefinition {
-    WorkflowStateDefinition::terminal(definition_id, state, terminal_state)
-}
-
-#[cfg(test)]
-#[path = "state_registry_equivalence_tests.rs"]
-mod equivalence_tests;

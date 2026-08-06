@@ -14,6 +14,8 @@ use crate::runtime::model::{
 use crate::runtime::pr_feedback::{
     LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
+use crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID;
+use crate::runtime::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::state_registry::{
     DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, WorkflowProgressMode,
@@ -101,10 +103,7 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(WorkflowRuntimeRecoveryOutcome::NotFound);
         };
-        let declarative = !matches!(
-            crate::runtime::state_registry::resolve_declarative_definition(&snapshot),
-            DeclarativeDefinitionResolution::NotDeclarative
-        );
+        let declarative = custom_declarative_definition(&snapshot).is_some();
         if let Some(outcome) = recovery_rejection(&snapshot, &request)? {
             if declarative {
                 audit_recovery_rejection_tx(&mut tx, &snapshot, &request, "eligibility_rejected")
@@ -261,21 +260,31 @@ fn recovery_rejection(
     instance: &WorkflowInstance,
     request: &WorkflowRuntimeRecoveryRequest<'_>,
 ) -> anyhow::Result<Option<WorkflowRuntimeRecoveryOutcome>> {
-    match crate::runtime::state_registry::resolve_declarative_definition(instance) {
-        DeclarativeDefinitionResolution::PinError(error) => {
+    match custom_declarative_definition(instance) {
+        Some(Ok(definition)) => {
+            return Ok(declarative_recovery_rejection(
+                instance,
+                request,
+                &definition,
+            ))
+        }
+        Some(Err(error)) => {
             return Ok(Some(WorkflowRuntimeRecoveryOutcome::InvalidDefinitionPin {
                 workflow: instance.clone(),
                 error,
             }));
         }
-        DeclarativeDefinitionResolution::Resolved(definition) => {
-            return Ok(declarative_recovery_rejection(
-                instance,
-                request,
-                &definition,
-            ));
+        None => {}
+    }
+    if let DeclarativeDefinitionResolution::PinError(error) =
+        crate::runtime::state_registry::resolve_declarative_definition(instance)
+    {
+        if !is_builtin_definition_id(&instance.definition_id) {
+            return Ok(Some(WorkflowRuntimeRecoveryOutcome::InvalidDefinitionPin {
+                workflow: instance.clone(),
+                error,
+            }));
         }
-        DeclarativeDefinitionResolution::NotDeclarative => {}
     }
     if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
         return Ok(Some(
@@ -308,6 +317,34 @@ fn recovery_rejection(
     Ok(None)
 }
 
+fn custom_declarative_definition(
+    instance: &WorkflowInstance,
+) -> Option<
+    Result<
+        std::sync::Arc<crate::runtime::declarative::DeclarativeWorkflowDefinition>,
+        DeclarativeDefinitionPinError,
+    >,
+> {
+    if is_builtin_definition_id(&instance.definition_id) {
+        return None;
+    }
+    match crate::runtime::state_registry::resolve_declarative_definition(instance) {
+        DeclarativeDefinitionResolution::PinError(error) => Some(Err(error)),
+        DeclarativeDefinitionResolution::Resolved(definition) => Some(Ok(definition)),
+        DeclarativeDefinitionResolution::NotDeclarative => None,
+    }
+}
+
+fn is_builtin_definition_id(definition_id: &str) -> bool {
+    matches!(
+        definition_id,
+        GITHUB_ISSUE_PR_DEFINITION_ID
+            | PROMPT_TASK_DEFINITION_ID
+            | QUALITY_GATE_DEFINITION_ID
+            | PR_FEEDBACK_DEFINITION_ID
+    )
+}
+
 #[rustfmt::skip]
 fn declarative_recovery_rejection(instance: &WorkflowInstance, request: &WorkflowRuntimeRecoveryRequest<'_>, definition: &crate::runtime::declarative::DeclarativeWorkflowDefinition) -> Option<WorkflowRuntimeRecoveryOutcome> {
     if request.actor != "operator" { return Some(WorkflowRuntimeRecoveryOutcome::OperatorRequired { workflow: instance.clone() }); }
@@ -321,9 +358,7 @@ async fn recovery_dispatch_plan_tx(
     instance: &WorkflowInstance,
     request: &WorkflowRuntimeRecoveryRequest<'_>,
 ) -> anyhow::Result<Result<RecoveryDispatchPlan, Option<String>>> {
-    if let DeclarativeDefinitionResolution::Resolved(definition) =
-        crate::runtime::state_registry::resolve_declarative_definition(instance)
-    {
+    if let Some(Ok(definition)) = custom_declarative_definition(instance) {
         return declarative_recovery_dispatch_plan(request, &definition);
     }
     validate_stopped_metadata(&instance.data)?;

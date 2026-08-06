@@ -444,7 +444,18 @@ async fn declarative_submission_rejects_unknown_and_builtin_ids() -> anyhow::Res
     let store = open_declarative_runtime_store(dir.path()).await?;
     let task_id = TaskId::from_str("declarative-invalid-id");
 
-    for definition_id in ["missing_definition", PROMPT_TASK_DEFINITION_ID] {
+    // Built-in ids are registered declaratively now, so they are rejected by
+    // the project-declaration check; unknown ids still fail resolution.
+    for (definition_id, expected) in [
+        (
+            "missing_definition",
+            "is not a registered declarative definition",
+        ),
+        (
+            PROMPT_TASK_DEFINITION_ID,
+            "does not declare workflow definition",
+        ),
+    ] {
         let error = record_declarative_submission(
             &store,
             DeclarativeSubmissionRuntimeContext {
@@ -464,9 +475,7 @@ async fn declarative_submission_rejects_unknown_and_builtin_ids() -> anyhow::Res
         .await
         .expect_err("non-declarative definitions must be rejected");
         assert!(
-            error
-                .to_string()
-                .contains("is not a registered declarative definition"),
+            error.to_string().contains(expected),
             "unexpected error for {definition_id}: {error}"
         );
     }

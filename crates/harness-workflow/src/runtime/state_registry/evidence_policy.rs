@@ -8,7 +8,8 @@
 //! rollback if agents have not yet caught up with the contract.
 
 use super::{
-    builtin_definitions, registry, RegisteredWorkflowDefinition, WorkflowDefinitionRegistry,
+    builtin_registered_definitions, registry, RegisteredWorkflowDefinition,
+    WorkflowDefinitionRegistry,
 };
 
 /// Apply the completion-evidence enforcement policy to the process-wide
@@ -63,7 +64,7 @@ impl WorkflowDefinitionRegistry {
     /// policy. Disabling enforcement strips the declared evidence requirements
     /// while leaving every other transition rule intact.
     pub fn apply_builtin_evidence_enforcement(&mut self, enforced: bool) -> anyhow::Result<()> {
-        self.apply_evidence_enforcement(builtin_definitions(), enforced)
+        self.apply_evidence_enforcement(builtin_registered_definitions(), enforced)
     }
 
     fn apply_evidence_enforcement(
@@ -101,7 +102,7 @@ impl WorkflowDefinitionRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{builtin_definitions, WorkflowDefinitionRegistry};
+    use super::super::{builtin_registered_definitions, WorkflowDefinitionRegistry};
     use crate::runtime::{
         ValidationContext, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
         WorkflowDecisionRejectionKind, WorkflowInstance, WorkflowSubject,
@@ -110,7 +111,7 @@ mod tests {
     use serde_json::json;
 
     fn required_evidence_kinds(registry: &WorkflowDefinitionRegistry) -> Vec<String> {
-        builtin_definitions()
+        builtin_registered_definitions()
             .iter()
             .filter_map(|builtin| registry.definition(&builtin.id))
             .flat_map(|definition| {
@@ -145,7 +146,7 @@ mod tests {
 
         assert!(required_evidence_kinds(&registry).is_empty());
         // Commands must survive the strip: only evidence is lifted.
-        for builtin in builtin_definitions() {
+        for builtin in builtin_registered_definitions() {
             let registered = registry
                 .definition(&builtin.id)
                 .expect("built-in definition stays registered");
@@ -211,7 +212,7 @@ mod tests {
     #[test]
     fn failed_policy_change_leaves_the_registry_unchanged() {
         let mut registry = WorkflowDefinitionRegistry::with_builtins();
-        let definitions = builtin_definitions();
+        let definitions = builtin_registered_definitions();
         let preserved_id = definitions[0].id.clone();
         let missing_id = definitions[1].id.clone();
         registry.definitions.remove(&missing_id);
@@ -231,7 +232,7 @@ mod tests {
 
     #[test]
     fn non_empty_policy_fixture_rejects_when_enabled_and_accepts_when_disabled() {
-        let mut definition = builtin_definitions()
+        let mut definition = builtin_registered_definitions()
             .into_iter()
             .find(|definition| definition.id == "prompt_task")
             .expect("prompt_task is a built-in definition");

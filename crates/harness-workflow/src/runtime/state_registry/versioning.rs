@@ -103,15 +103,17 @@ impl WorkflowDefinitionRegistry {
                 definition.policy().id
             );
         }
-        let (expected_version, expected_hash) =
-            declarative_definition_identity(definition.policy())?;
-        if definition.definition_version() != expected_version
-            || definition.definition_hash() != expected_hash
-        {
-            anyhow::bail!(
-                "declarative workflow definition '{}' identity does not match its canonical policy",
-                definition.policy().id
-            );
+        if !is_builtin_definition_id(&definition.policy().id) {
+            let (expected_version, expected_hash) =
+                declarative_definition_identity(definition.policy())?;
+            if definition.definition_version() != expected_version
+                || definition.definition_hash() != expected_hash
+            {
+                anyhow::bail!(
+                    "declarative workflow definition '{}' identity does not match its canonical policy",
+                    definition.policy().id
+                );
+            }
         }
         Ok(())
     }
@@ -177,6 +179,9 @@ impl WorkflowDefinitionRegistry {
         &self,
         instance: &WorkflowInstance,
     ) -> Option<Arc<RegisteredWorkflowDefinition>> {
+        if is_builtin_definition_id(&instance.definition_id) {
+            return self.definition(&instance.definition_id);
+        }
         match self.resolve_declarative_definition(instance) {
             DeclarativeDefinitionResolution::Resolved(definition) => {
                 Some(Arc::new(definition.registered().clone()))
@@ -222,6 +227,9 @@ impl WorkflowDefinitionRegistry {
                 DeclarativeDefinitionPinError::MissingVersion,
             );
         };
+        if is_builtin_definition_id(&instance.definition_id) {
+            return DeclarativeDefinitionResolution::Resolved(definition);
+        }
         let Some(expected_hash) = instance.data.get("definition_hash") else {
             return DeclarativeDefinitionResolution::PinError(
                 DeclarativeDefinitionPinError::MissingHash,

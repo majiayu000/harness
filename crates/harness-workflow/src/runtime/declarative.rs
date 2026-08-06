@@ -71,7 +71,7 @@ pub fn build_declarative_definition(
     policy: &WorkflowDefinitionPolicy,
     activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
-    validate_top_level(policy)?;
+    validate_top_level(policy, BuiltinIdPolicy::Reject)?;
 
     let terminal_states = parse_terminal_states(policy)?;
     validate_active_states(policy, activity_policies)?;
@@ -88,6 +88,33 @@ pub fn build_declarative_definition(
         definition_version,
         definition_hash,
     })
+}
+
+pub(crate) fn build_builtin_declarative_definition(
+    policy: &WorkflowDefinitionPolicy,
+    activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
+    allowlist: TransitionAllowlist,
+) -> anyhow::Result<DeclarativeWorkflowDefinition> {
+    validate_top_level(policy, BuiltinIdPolicy::Allow)?;
+
+    let terminal_states = parse_terminal_states(policy)?;
+    validate_active_states(policy, activity_policies)?;
+    validate_targets(policy, &terminal_states)?;
+    validate_reachability(policy, &terminal_states)?;
+
+    let states = compile_states(policy, &terminal_states);
+    Ok(DeclarativeWorkflowDefinition {
+        registered: RegisteredWorkflowDefinition::new(&policy.id, states, allowlist),
+        policy: policy.clone(),
+        definition_version: 1,
+        definition_hash: format!("builtin:{}:v1", policy.id),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltinIdPolicy {
+    Reject,
+    Allow,
 }
 
 /// Converts completed activity artifacts into exact, case-sensitive evidence kinds.
@@ -114,17 +141,21 @@ pub fn workflow_evidence_from_activity_artifacts(
     Ok(evidence)
 }
 
-fn validate_top_level(policy: &WorkflowDefinitionPolicy) -> anyhow::Result<()> {
+fn validate_top_level(
+    policy: &WorkflowDefinitionPolicy,
+    builtin_id_policy: BuiltinIdPolicy,
+) -> anyhow::Result<()> {
     if policy.id.trim().is_empty() {
         anyhow::bail!("declarative workflow definition id must not be empty");
     }
-    if [
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        PROMPT_TASK_DEFINITION_ID,
-        QUALITY_GATE_DEFINITION_ID,
-        PR_FEEDBACK_DEFINITION_ID,
-    ]
-    .contains(&policy.id.as_str())
+    if builtin_id_policy == BuiltinIdPolicy::Reject
+        && [
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            PROMPT_TASK_DEFINITION_ID,
+            QUALITY_GATE_DEFINITION_ID,
+            PR_FEEDBACK_DEFINITION_ID,
+        ]
+        .contains(&policy.id.as_str())
     {
         anyhow::bail!(
             "declarative workflow definition id '{}' collides with a built-in definition",
@@ -447,8 +478,10 @@ fn compile_states(
         .iter()
         .map(|(name, state)| {
             let progress_mode = match state.progress {
+                Some(DeclaredProgressMode::CommandDriven) => WorkflowProgressMode::CommandDriven,
                 Some(DeclaredProgressMode::ExternalWait) => WorkflowProgressMode::ExternalWait,
                 Some(DeclaredProgressMode::OperatorGate) => WorkflowProgressMode::OperatorGate,
+                Some(DeclaredProgressMode::ParentHandoff) => WorkflowProgressMode::ParentHandoff,
                 None => WorkflowProgressMode::CommandDriven,
             };
             WorkflowStateDefinition::active(policy.id.as_str(), name.as_str(), progress_mode)
@@ -556,10 +589,12 @@ fn required_command_for_target(
         WorkflowCommandType::EnqueueActivity
     } else {
         match state.progress {
+            Some(DeclaredProgressMode::CommandDriven) => WorkflowCommandType::EnqueueActivity,
             Some(DeclaredProgressMode::ExternalWait) => WorkflowCommandType::Wait,
             Some(DeclaredProgressMode::OperatorGate) => {
                 WorkflowCommandType::RequestOperatorAttention
             }
+            Some(DeclaredProgressMode::ParentHandoff) => WorkflowCommandType::Wait,
             None => unreachable!("validated active state must declare a progress driver"),
         }
     }
@@ -598,10 +633,17 @@ fn allowed_commands_for_target(
         vec![WorkflowCommandType::EnqueueActivity]
     } else {
         match state.progress {
+            Some(DeclaredProgressMode::CommandDriven) => {
+                vec![
+                    WorkflowCommandType::EnqueueActivity,
+                    WorkflowCommandType::Wait,
+                ]
+            }
             Some(DeclaredProgressMode::ExternalWait) => vec![WorkflowCommandType::Wait],
             Some(DeclaredProgressMode::OperatorGate) => {
                 vec![WorkflowCommandType::RequestOperatorAttention]
             }
+            Some(DeclaredProgressMode::ParentHandoff) => vec![WorkflowCommandType::Wait],
             None => unreachable!("active-state progress contract was validated"),
         }
     }
