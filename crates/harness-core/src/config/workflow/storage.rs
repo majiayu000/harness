@@ -19,9 +19,9 @@ pub struct WorkflowStoragePolicy {
     /// Maximum legacy unregistered path-derived schemas to drop per tick.
     #[serde(default = "default_orphan_reaper_legacy_batch")]
     pub orphan_reaper_legacy_batch: usize,
-    /// Enable workflow-runtime stuck-instance reporting. Off by default so
-    /// existing deployments keep their current background behavior on upgrade.
-    #[serde(default)]
+    /// Enable workflow-runtime stuck-instance reporting. Read-only (reports
+    /// and logs only), so it ships on; disable to silence the signal.
+    #[serde(default = "default_true")]
     pub workflow_watchdog_enabled: bool,
     /// Minimum age, in minutes, before blocked/awaiting-feedback workflows are
     /// reported as stuck.
@@ -33,9 +33,11 @@ pub struct WorkflowStoragePolicy {
     /// Maximum stuck workflow rows scanned/logged per watchdog tick.
     #[serde(default = "default_workflow_watchdog_batch_size")]
     pub workflow_watchdog_batch_size: u32,
-    /// Enable pruning of terminal workflow-runtime history. Off by default
-    /// because deleted runtime history is not recoverable.
-    #[serde(default)]
+    /// Enable pruning of terminal workflow-runtime history. On by default
+    /// with conservative bounds (30 days, 1000 families per hourly tick) so
+    /// tables cannot grow without bound; only terminal families older than
+    /// the age limit are pruned. Set false to keep history indefinitely.
+    #[serde(default = "default_true")]
     pub runtime_retention_enabled: bool,
     /// Terminal workflow families older than this many days are eligible for
     /// retention pruning.
@@ -47,9 +49,11 @@ pub struct WorkflowStoragePolicy {
     /// Interval, in seconds, between runtime-retention prune passes.
     #[serde(default = "default_runtime_retention_interval_secs")]
     pub runtime_retention_interval_secs: u64,
-    /// Enable pruning of terminal task rows and task-owned child rows. Off by
-    /// default because deleted task history is not recoverable.
-    #[serde(default)]
+    /// Enable pruning of terminal task rows and task-owned child rows. On by
+    /// default with conservative bounds (30 days, 1000 rows per hourly tick);
+    /// active, pending, dependency-blocked, and resumable tasks are never
+    /// pruned. Set false to keep task history indefinitely.
+    #[serde(default = "default_true")]
     pub task_retention_enabled: bool,
     /// Terminal tasks older than this many days are eligible for retention
     /// pruning.
@@ -71,15 +75,15 @@ impl Default for WorkflowStoragePolicy {
             orphan_reaper_interval_secs: default_orphan_reaper_interval_secs(),
             orphan_reaper_legacy_enabled: true,
             orphan_reaper_legacy_batch: default_orphan_reaper_legacy_batch(),
-            workflow_watchdog_enabled: false,
+            workflow_watchdog_enabled: true,
             workflow_watchdog_age_minutes: default_workflow_watchdog_age_minutes(),
             workflow_watchdog_interval_secs: default_workflow_watchdog_interval_secs(),
             workflow_watchdog_batch_size: default_workflow_watchdog_batch_size(),
-            runtime_retention_enabled: false,
+            runtime_retention_enabled: true,
             runtime_retention_days: default_runtime_retention_days(),
             runtime_retention_batch_size: default_runtime_retention_batch_size(),
             runtime_retention_interval_secs: default_runtime_retention_interval_secs(),
-            task_retention_enabled: false,
+            task_retention_enabled: true,
             task_retention_days: default_task_retention_days(),
             task_retention_batch_size: default_task_retention_batch_size(),
             task_retention_interval_secs: default_task_retention_interval_secs(),

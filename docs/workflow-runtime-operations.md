@@ -187,7 +187,9 @@ and enqueue the correct follow-up command atomically.
 ## Watchdog And Retention Sweepers
 
 Workflow-runtime watchdog and retention sweepers are configured in
-`WORKFLOW.md` under `storage`. Both are disabled by default on first rollout:
+`WORKFLOW.md` under `storage`. All three sweepers ship on by default with
+conservative bounds (GH-1879); set the `*_enabled` flags to `false` to keep
+the pre-default behavior:
 
 ```yaml
 storage:
@@ -195,15 +197,15 @@ storage:
   orphan_reaper_interval_secs: 3600
   orphan_reaper_legacy_enabled: true
   orphan_reaper_legacy_batch: 200
-  workflow_watchdog_enabled: false
+  workflow_watchdog_enabled: true
   workflow_watchdog_age_minutes: 240
   workflow_watchdog_interval_secs: 300
   workflow_watchdog_batch_size: 100
-  runtime_retention_enabled: false
+  runtime_retention_enabled: true
   runtime_retention_days: 30
   runtime_retention_batch_size: 1000
   runtime_retention_interval_secs: 3600
-  task_retention_enabled: false
+  task_retention_enabled: true
   task_retention_days: 30
   task_retention_batch_size: 1000
   task_retention_interval_secs: 3600
@@ -214,7 +216,7 @@ path-derived schemas with dead owner paths and, in bounded batches, legacy
 unregistered `h<16-hex>` schemas that cannot be matched to a live workspace
 directory or known store path under the configured workspace root.
 
-Enable `workflow_watchdog_enabled` first. It is read-only: aged `blocked` and
+The workflow watchdog is read-only: aged `blocked` and
 `awaiting_feedback` workflow instances appear in `/api/operator-monitor` under
 `stuck_workflows` and are logged at error level.
 
@@ -224,13 +226,17 @@ reports its workflow, definition, state, age, and state-entry provenance without
 changing workflow state or history. Enabling the watchdog also emits these rows
 at error level; recovery remains an explicit operator action.
 
-Enable `runtime_retention_enabled` only after the stuck list is clean. Retention
-deletes terminal workflow families older than `runtime_retention_days` in
-bounded batches and relies on the Postgres runtime-store cascade constraints to
-remove events, decisions, commands, jobs, runtime events, and artifacts. Active
-workflow families are never pruned.
+Runtime retention deletes terminal workflow families older than
+`runtime_retention_days` in bounded batches and relies on the Postgres
+runtime-store cascade constraints to remove events, decisions, commands, jobs,
+runtime events, and artifacts. Active workflow families are never pruned. The
+first sweep after enabling (or upgrading to the on-by-default behavior) is
+bounded by `runtime_retention_batch_size` per tick, so large backlogs drain
+gradually; set `runtime_retention_enabled: false` before upgrading to keep
+history indefinitely.
 
-Enable `task_retention_enabled` only when historical task rows can be deleted.
-Retention deletes terminal tasks older than `task_retention_days` in bounded
-batches, including task-owned artifacts, prompts, and checkpoints. Active,
-pending, dependency-blocked, and resumable tasks are never pruned.
+Task retention deletes terminal tasks older than `task_retention_days` in
+bounded batches, including task-owned artifacts, prompts, and checkpoints.
+Active, pending, dependency-blocked, and resumable tasks are never pruned.
+Set `task_retention_enabled: false` before upgrading to keep task history
+indefinitely.
