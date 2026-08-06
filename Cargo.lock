@@ -1320,7 +1320,6 @@ dependencies = [
 name = "harness-context"
 version = "0.6.34"
 dependencies = [
- "anyhow",
  "harness-core",
  "harness-exec",
  "harness-rules",
