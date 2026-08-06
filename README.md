@@ -85,7 +85,11 @@ The `anthropic-api` adapter is for text generation: it sends the prompt without
 repository context or tools, so it cannot inspect or modify the project in this
 coding example.
 
-Useful flags: `--project <dir>`, `--agent claude|codex|anthropic-api`,
+The `opencode` adapter runs OpenCode (`opencode run` / `opencode acp`), a
+provider-agnostic coding agent. On macOS it must run outside the Seatbelt
+sandbox like Claude Code: `--agent opencode --sandbox-mode danger-full-access`.
+
+Useful flags: `--project <dir>`, `--agent claude|codex|anthropic-api|opencode`,
 `--model <id>`, `--sandbox-mode <mode>`, `--output-file result.md`. Supported
 sandbox modes are `read-only`, `read-only-with-network`, `workspace-write`, and
 `danger-full-access`.

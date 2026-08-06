@@ -7,6 +7,7 @@ fn runtime_kind_from_config(value: &str) -> Option<RuntimeKind> {
         "claude_code" => Some(RuntimeKind::ClaudeCode),
         "anthropic_api" => Some(RuntimeKind::AnthropicApi),
         "remote_host" => Some(RuntimeKind::RemoteHost),
+        "opencode" => Some(RuntimeKind::OpenCode),
         _ => None,
     }
 }
@@ -32,6 +33,13 @@ fn runtime_profile_from_kind(
             profile.model = Some(config.agents.anthropic_api.default_model.clone());
             profile
         }
+        RuntimeKind::OpenCode => {
+            let mut profile = RuntimeProfile::new("opencode-default", kind);
+            if !config.agents.opencode.default_model.is_empty() {
+                profile.model = Some(config.agents.opencode.default_model.clone());
+            }
+            profile
+        }
         RuntimeKind::RemoteHost => RuntimeProfile::new("remote-host-default", kind),
     }
 }
@@ -44,6 +52,7 @@ pub(super) fn runtime_profile_from_agent(
         "codex" => Some(runtime_profile_from_kind(config, RuntimeKind::CodexJsonrpc)),
         "claude" => Some(runtime_profile_from_kind(config, RuntimeKind::ClaudeCode)),
         "anthropic-api" => Some(runtime_profile_from_kind(config, RuntimeKind::AnthropicApi)),
+        "opencode" => Some(runtime_profile_from_kind(config, RuntimeKind::OpenCode)),
         _ => None,
     }
 }
