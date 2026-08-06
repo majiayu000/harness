@@ -258,7 +258,7 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         .as_ref()
         .expect("workflow runtime store should be configured");
     let prompt_ref = "prompt-memory:runtime-worker-structured-output";
-    store.upsert_prompt_payload(prompt_ref, "prompt").await?;
+    store.insert_prompt_payload(prompt_ref, "prompt").await?;
     let workflow = WorkflowInstance::new(
         PROMPT_TASK_DEFINITION_ID,
         1,
@@ -266,13 +266,13 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         WorkflowSubject::new("prompt", "prompt:structured-output"),
     )
     .with_id("prompt-structured-output")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "external_id": "structured-output",
         "source": "manual",
         "prompt_summary": "structured output"
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let mut command =
         WorkflowCommand::enqueue_activity(PROMPT_TASK_IMPLEMENT_ACTIVITY, "impl-prompt-1");
     command.command["prompt_ref"] = serde_json::json!(prompt_ref);

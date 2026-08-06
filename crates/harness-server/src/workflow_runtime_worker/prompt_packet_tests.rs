@@ -707,13 +707,13 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
 
 #[test]
 fn model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2() {
-    // Fixed inputs, identical to the fixture generation from pre-v2 commit
-    // f55eea8b: fixed job/command IDs, fixed roots/profile/input, no workflow,
-    // no memory, and a non-empty prompt template. The frozen fixture was
-    // rendered by that commit's genuine pre-v2 pipeline; because
-    // WorkflowConfig gained the `runtime_completion` default field after
-    // f55eea8b, generation injected exactly that default block so the fixed
-    // input bytes match the current default configuration.
+    // Fixed inputs, identical to the original fixture generation from pre-v2
+    // commit f55eea8b: fixed job/command IDs, fixed roots/profile/input, no
+    // workflow, no memory, and a non-empty prompt template. The frozen fixture
+    // was re-rendered when the ActivityResult contract gained its strict
+    // output-schema form (json_schema, required arrays, nullable error
+    // fields); the fixed input bytes still match the current default
+    // configuration.
     let mut job = RuntimeJob::pending(
         "command-fixture-1",
         RuntimeKind::CodexJsonrpc,

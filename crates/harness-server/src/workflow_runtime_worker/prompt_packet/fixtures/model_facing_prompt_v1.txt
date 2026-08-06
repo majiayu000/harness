@@ -5,7 +5,7 @@ Runtime contract:
 - Harness server only manages lifecycle. You, the agent, perform repository and GitHub work when the activity requires it.
 - Follow the project instructions loaded by the runtime.
 - Use the prompt packet activity_result_schema to shape your final summary.
-- When returning structured activity output, put a JSON object in a final fenced `harness-activity-result` block matching activity_result_schema.
+- When returning structured activity output, return a raw JSON object matching activity_result_schema when your transport enforces output-schema; otherwise put the JSON object in a final fenced `harness-activity-result` block matching activity_result_schema.
 - The structured result activity field must match this runtime job activity exactly.
 - Return a concise final summary appropriate to the activity. Include changed files and validation commands only when repository code changes were requested; for discovery and planning activities, report inspected inputs, emitted signals, and remaining blockers.
 
@@ -52,6 +52,161 @@ Prompt packet:
       "blocked",
       "cancelled"
     ],
+    "empty_array_fields_when_absent": [
+      "artifacts",
+      "signals",
+      "validation"
+    ],
+    "json_schema": {
+      "$defs": {
+        "json_payload": {
+          "additionalProperties": false,
+          "properties": {
+            "encoding": {
+              "const": "harness.runtime.json_payload.v1",
+              "type": "string"
+            },
+            "json": {
+              "description": "Serialized JSON text for the original artifact or signal payload. For a string payload, include the quoted JSON string, e.g. \"No changes were needed\".",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "encoding",
+            "json"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "activity": {
+          "const": "implement_issue",
+          "type": "string"
+        },
+        "artifacts": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "artifact": {
+                "$ref": "#/$defs/json_payload"
+              },
+              "artifact_type": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_type",
+              "artifact"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error_kind": {
+          "enum": [
+            "retryable",
+            "timeout",
+            "fatal",
+            "configuration",
+            "external_dependency",
+            "unknown",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "signal": {
+                "$ref": "#/$defs/json_payload"
+              },
+              "signal_type": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "signal_type",
+              "signal"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "blocked",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "summary": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "validation": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "command",
+              "status",
+              "reason"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "activity",
+        "status",
+        "summary",
+        "artifacts",
+        "signals",
+        "validation",
+        "error",
+        "error_kind"
+      ],
+      "title": "Harness ActivityResult",
+      "type": "object"
+    },
+    "nullable_fields": [
+      "error",
+      "error_kind",
+      "validation[].reason"
+    ],
     "optional_artifacts": {
       "workflow_decision": {
         "allowed_confidence": [
@@ -70,17 +225,16 @@ Prompt packet:
         ]
       }
     },
-    "optional_fields": [
+    "optional_fields": [],
+    "required_fields": [
+      "activity",
+      "status",
+      "summary",
       "artifacts",
       "signals",
       "validation",
       "error",
       "error_kind"
-    ],
-    "required_fields": [
-      "activity",
-      "status",
-      "summary"
     ],
     "result_type": "ActivityResult",
     "schema": "harness.runtime.activity_result.v1",
@@ -100,10 +254,13 @@ Prompt packet:
       "_format_rules": [
         "`artifacts` MUST be a JSON array of {artifact_type, artifact} objects. Never emit it as a map keyed by artifact name.",
         "`signals` MUST be a JSON array of {signal_type, signal} objects. Never use `kind` or any other discriminator name.",
-        "`validation` MUST be a JSON array of {command, status} objects. Never emit it as a map.",
+        "`validation` MUST be a JSON array of {command, status, reason} objects. Use reason=null when there is no reason. Never emit it as a map.",
+        "`artifacts`, `signals`, and `validation` are required; use [] when empty. `error` and `error_kind` are required; use null when absent.",
+        "When output-schema transport is active, `artifact` and `signal` payloads use the schema's harness.runtime.json_payload.v1 {encoding,json} representation; Harness decodes it before reducers.",
+        "The wrapper `json` field MUST be serialized JSON text, not plain prose; for a scalar no_change_rationale payload use {\"encoding\":\"harness.runtime.json_payload.v1\",\"json\":\"\\\"No changes were needed\\\"\"}.",
         "Inside a `workflow_decision` artifact, the next-step activity MUST be expressed as `commands: [{command_type, dedupe_key, command}]` (plural array). Never use a singular `command` field at the artifact level — that field is silently ignored, leaving the workflow stuck in the new state with no follow-up activity enqueued.",
         "For `command_type: start_child_workflow`, the nested `command` object MUST include `definition_id` and `subject_key`; for GitHub issue workflows use `definition_id: github_issue_pr` and `subject_key: issue:<number>`.",
-        "Omit `artifacts`, `signals`, or `validation` entirely if there is nothing to report — empty arrays or missing fields are both fine."
+        "Do not omit required fields from the ActivityResult JSON."
       ],
       "activity": "implement_issue",
       "artifacts": [
@@ -129,6 +286,8 @@ Prompt packet:
           "artifact_type": "workflow_decision"
         }
       ],
+      "error": null,
+      "error_kind": null,
       "signals": [
         {
           "signal": {
@@ -144,6 +303,7 @@ Prompt packet:
       "validation": [
         {
           "command": "cargo test",
+          "reason": null,
           "status": "passed"
         }
       ]
