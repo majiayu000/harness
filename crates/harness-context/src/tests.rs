@@ -38,6 +38,14 @@ fn types_bytes_div_four_estimator_documents_v1_behavior() {
 }
 
 #[test]
+fn compose_config_is_preview_only() {
+    let core_config = harness_core::config::misc::ContextConfig::default();
+
+    assert_eq!(ComposeConfig::default().mode, ComposeMode::Preview);
+    assert_eq!(ComposeConfig::from(&core_config).mode, ComposeMode::Preview);
+}
+
+#[test]
 fn pipeline_is_deterministic_for_identical_inputs() {
     let items = vec![
         item("rule:b", ItemClass::Rule, 20, Priority::P1),
@@ -251,6 +259,8 @@ fn providers_include_active_exec_plans_for_matching_project() {
     let mut request = req();
     request.project = ProjectId::from_path(dir.path());
 
+    assert_eq!(provider.id().as_str(), "exec-plan");
+
     let items = provider.propose(&request).expect("provider succeeds");
 
     assert_eq!(items.len(), 1);
@@ -261,4 +271,22 @@ fn providers_include_active_exec_plans_for_matching_project() {
     assert_eq!(items[0].class, ItemClass::Contract);
     assert_eq!(items[0].priority, Priority::P0);
     assert!(items[0].content.contains("Ship context composer"));
+
+    let composition = match ContextComposer::new(ComposeConfig::default())
+        .with_provider(Box::new(provider))
+        .compose(&request)
+    {
+        Ok(composition) => composition,
+        Err(error) => panic!("composition succeeds: {error}"),
+    };
+    let manifest_item = match composition
+        .manifest
+        .items
+        .iter()
+        .find(|item| item.id.as_str() == format!("contract:exec-plan:{}", plan.id))
+    {
+        Some(item) => item,
+        None => panic!("exec plan appears in manifest"),
+    };
+    assert_eq!(manifest_item.provider_id.as_str(), "exec-plan");
 }

@@ -1323,7 +1323,6 @@ dependencies = [
  "anyhow",
  "harness-core",
  "harness-exec",
- "harness-gc",
  "harness-rules",
  "harness-skills",
  "serde",

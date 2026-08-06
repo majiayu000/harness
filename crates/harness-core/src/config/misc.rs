@@ -316,14 +316,6 @@ pub struct RulesConfig {
     pub hook_enforcement: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextMode {
-    #[default]
-    Shadow,
-    Enforce,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextQuotasConfig {
     #[serde(default = "default_context_rule_quota")]
@@ -372,8 +364,6 @@ impl Default for ContextQuotasConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
-    #[serde(default)]
-    pub mode: ContextMode,
     #[serde(default = "default_context_budget_tokens")]
     pub budget_tokens: u32,
     #[serde(default = "default_context_reserved_headroom")]
@@ -401,7 +391,6 @@ fn default_context_provider_timeout_ms() -> u64 {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            mode: ContextMode::Shadow,
             budget_tokens: default_context_budget_tokens(),
             reserved_headroom: default_context_reserved_headroom(),
             provider_timeout_ms: default_context_provider_timeout_ms(),
