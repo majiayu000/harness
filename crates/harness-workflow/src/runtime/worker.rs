@@ -138,35 +138,23 @@ impl<'a> RuntimeWorker<'a> {
         let consumes_runtime_turn = executor.consumes_runtime_turn(&job);
         let result = match self.terminal_workflow_result(&job).await? {
             Some(result) => result,
-            None => {
-                match self
-                    .max_turns_budget_result(&job, consumes_runtime_turn)
-                    .await?
-                {
-                    Some(result) => result,
-                    None => match executor.preflight_result(&job).await {
-                        Some(result) => result,
-                        None => {
-                            if consumes_runtime_turn {
-                                self.store
-                                    .record_runtime_event(
-                                        &job.id,
-                                        "RuntimeTurnStarted",
-                                        json!({
-                                            "owner": self.owner.as_str(),
-                                        }),
-                                    )
-                                    .await?;
-                            }
-                            let execution = self
-                                .execute_with_lease_renewal(&job, executor, lease_expires_at)
-                                .await?;
-                            lease_expires_at = execution.lease_expires_at;
-                            execution.result
-                        }
-                    },
+            None => match executor.preflight_result(&job).await {
+                Some(result) => result,
+                None => {
+                    if let Some(result) = self
+                        .reserve_runtime_turn_started(&job, consumes_runtime_turn)
+                        .await?
+                    {
+                        result
+                    } else {
+                        let execution = self
+                            .execute_with_lease_renewal(&job, executor, lease_expires_at)
+                            .await?;
+                        lease_expires_at = execution.lease_expires_at;
+                        execution.result
+                    }
                 }
-            }
+            },
         };
         let (result, transcript) = super::transcript::prepare_runtime_transcript(&job, result)?;
         let Some(completion) = self
@@ -342,7 +330,7 @@ impl<'a> RuntimeWorker<'a> {
         Ok(())
     }
 
-    async fn max_turns_budget_result(
+    async fn reserve_runtime_turn_started(
         &self,
         job: &RuntimeJob,
         consumes_runtime_turn: bool,
@@ -350,22 +338,45 @@ impl<'a> RuntimeWorker<'a> {
         if !consumes_runtime_turn {
             return Ok(None);
         }
-        let Some(profile) = runtime_profile_for_job(job)? else {
+        let payload = json!({
+            "owner": self.owner.as_str(),
+            "lease_generation": job.lease_generation,
+            "reservation_key": format!("runtime_worker:{}:{}", job.id, job.lease_generation),
+        });
+        let budget = match runtime_profile_for_job(job)? {
+            Some(profile) => match profile.max_turns {
+                Some(max_turns) => self
+                    .store
+                    .get_command(&job.command_id)
+                    .await?
+                    .map(|command| (command, profile, max_turns)),
+                None => None,
+            },
+            None => None,
+        };
+        let Some((command, profile, max_turns)) = budget else {
+            self.store
+                .record_runtime_event(&job.id, "RuntimeTurnStarted", payload)
+                .await?;
             return Ok(None);
         };
-        let Some(max_turns) = profile.max_turns else {
-            return Ok(None);
-        };
-        let Some(command) = self.store.get_command(&job.command_id).await? else {
-            return Ok(None);
-        };
-        let turns_started = self
+        if self
             .store
-            .runtime_turns_started_for_workflow(&command.workflow_id, Some(&job.id))
-            .await?;
-        if turns_started < i64::from(max_turns) {
+            .reserve_runtime_turn_started_for_workflow(
+                &command.workflow_id,
+                &job.id,
+                max_turns,
+                payload,
+            )
+            .await?
+            .is_some()
+        {
             return Ok(None);
         }
+        let turns_started = self
+            .store
+            .runtime_turns_started_for_workflow(&command.workflow_id, None)
+            .await?;
         Ok(Some(runtime_budget_blocked_result(
             &command,
             &profile,

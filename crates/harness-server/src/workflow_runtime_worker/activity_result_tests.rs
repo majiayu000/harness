@@ -141,19 +141,21 @@ fn activity_result_from_turn_parses_structured_activity_result_block() {
             "activity": "implement_issue"
         }),
     );
+    let final_result = r#"{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"workflow_decision","artifact":{"encoding":"harness.runtime.json_payload.v1","json":"{\"workflow_id\":\"wf-1\",\"observed_state\":\"implementing\",\"decision\":\"continue\",\"next_state\":\"implementing\",\"reason\":\"needs review\",\"confidence\":\"high\",\"commands\":[{\"command_type\":\"enqueue_activity\",\"dedupe_key\":\"wf-1:review\",\"command\":{\"activity\":\"run_local_review\",\"note\":\"nested payload\"}}]}"}},{"artifact_type":"no_change_rationale","artifact":{"encoding":"harness.runtime.json_payload.v1","json":"\"No changes were needed\""}}],"signals":[{"signal_type":"external_state","signal":{"encoding":"harness.runtime.json_payload.v1","json":"{\"state\":\"Done\",\"subject\":{\"issue_number\":1756}}"}}],"validation":[],"error":null,"error_kind":null}"#;
     let items = vec![Item::AgentReasoning {
-        content: r#"Work completed.
+        content: format!(
+            r#"Work completed.
 
 ```harness-activity-result
-{"activity":"implement_issue","status":"succeeded","summary":"stale summary","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":66,"pr_url":"https://github.com/owner/repo/pull/66"}}]}
+{{"activity":"implement_issue","status":"succeeded","summary":"stale summary","artifacts":[{{"artifact_type":"pull_request","artifact":{{"pr_number":66,"pr_url":"https://github.com/owner/repo/pull/66"}}}}]}}
 ```
 
 Final result:
 
 ```harness-activity-result
-{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":77,"pr_url":"https://github.com/owner/repo/pull/77"}}]}
+{final_result}
 ```"#
-            .to_string(),
+        ),
     }];
 
     let result = activity_result_from_turn(
@@ -170,12 +172,21 @@ Final result:
     assert_eq!(result.activity, "implement_issue");
     assert_eq!(result.status, ActivityStatus::Succeeded);
     assert_eq!(result.summary, "Implementation completed.");
-    let pr_artifact = artifact_by_type(&result, "pull_request");
-    assert_eq!(pr_artifact.artifact["pr_number"], 77);
+    let decision = artifact_by_type(&result, "workflow_decision");
     assert_eq!(
-        pr_artifact.artifact["pr_url"],
-        "https://github.com/owner/repo/pull/77"
+        decision.artifact["commands"][0]["command"]["activity"],
+        "run_local_review"
     );
+    let no_change = artifact_by_type(&result, "no_change_rationale");
+    assert_eq!(no_change.artifact, json!("No changes were needed"));
+    let Some(external_state) = result
+        .signals
+        .iter()
+        .find(|signal| signal.signal_type == "external_state")
+    else {
+        panic!("encoded signal payload should round-trip");
+    };
+    assert_eq!(external_state.signal["subject"]["issue_number"], 1756);
     let prompt_artifact = artifact_by_type(&result, "runtime_prompt_packet");
     assert_eq!(prompt_artifact.artifact["digest"], "digest-1");
     let turn_artifact = artifact_by_type(&result, "runtime_turn");
@@ -194,6 +205,59 @@ Final result:
         .signals
         .iter()
         .any(|signal| signal.signal_type == "RuntimeTurnCompleted"));
+}
+
+#[test]
+fn activity_result_from_turn_handles_raw_json_and_schema_path_errors() {
+    for (items, expected_strategy, expected_error) in [
+        (
+            vec![Item::AgentReasoning {
+                content: r#"{"activity":"implement_issue","status":"failed","summary":"failed","error":{"message":"boom"},"error_kind":"configuration"}"#.to_string(),
+            }],
+            "raw_activity_result",
+            "$.error expected string",
+        ),
+        (
+            vec![Item::AgentReasoning {
+                content: r#"```harness-activity-result
+{"activity":"implement_issue","status":"succeeded","summary":"done","validation":[{"command":"cargo test","status":{"passed":true}}]}
+```"#.to_string(),
+            }],
+            "fenced_activity_result",
+            "$.validation[0].status expected string",
+        ),
+    ] {
+        let result = completed_codex_implement_issue_result(items);
+        assert_eq!(result.status, ActivityStatus::Failed);
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(expected_error)));
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "invalid_structured_output");
+        assert_eq!(envelope["extraction_strategy"], expected_strategy);
+        assert_eq!(envelope["extracted_activity"], "implement_issue");
+    }
+}
+
+fn completed_codex_implement_issue_result(items: Vec<Item>) -> ActivityResult {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({"activity": "implement_issue"}),
+    );
+    activity_result_from_turn(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    )
 }
 
 #[test]
@@ -508,7 +572,7 @@ fn activity_result_from_turn_fails_mismatched_structured_activity() {
     assert_eq!(result.summary, "Structured activity result was invalid.");
     assert_eq!(
         result.error.as_deref(),
-        Some("activity result block reported activity `replan_issue`, expected `implement_issue`")
+        Some("activity result JSON reported activity `replan_issue`, expected `implement_issue`")
     );
     assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
     assert!(!result
@@ -570,7 +634,7 @@ Final result:
     assert!(result
         .error
         .as_deref()
-        .is_some_and(|error| error.starts_with("activity result block is invalid JSON:")));
+        .is_some_and(|error| error.starts_with("activity result JSON is invalid:")));
     assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
     assert!(!result
         .artifacts

@@ -496,6 +496,18 @@ fn prompt_task_packet_describes_disjunctive_completion_evidence_contract() {
 }
 
 #[test]
+fn activity_result_json_schema_is_codex_strict_compatible() {
+    let schema = activity_result_json_schema("implement_prompt");
+    assert_eq!(
+        schema["properties"]["signals"]["items"]["properties"]["signal"],
+        json!({"$ref": "#/$defs/json_payload"})
+    );
+    #[rustfmt::skip]
+    fn walk(schema: &Value) { if schema.get("type") == Some(&json!("object")) || schema.get("type").and_then(Value::as_array).is_some_and(|items| items.contains(&json!("object"))) { assert_eq!(schema.get("additionalProperties"), Some(&Value::Bool(false))); let properties = schema["properties"].as_object().unwrap_or_else(|| panic!("object schema must declare properties")); let required = schema["required"].as_array().unwrap_or_else(|| panic!("object schema must declare required")); assert_eq!(required.len(), properties.len()); assert!(properties.keys().all(|key| required.contains(&json!(key)))); } match schema { Value::Array(items) => items.iter().for_each(walk), Value::Object(object) => object.values().for_each(walk), _ => {} } }
+    walk(&schema);
+}
+
+#[test]
 fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     let job = RuntimeJob::pending(
         "command-continue",
@@ -695,13 +707,13 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
 
 #[test]
 fn model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2() {
-    // Fixed inputs, identical to the fixture generation from pre-v2 commit
-    // f55eea8b: fixed job/command IDs, fixed roots/profile/input, no workflow,
-    // no memory, and a non-empty prompt template. The frozen fixture was
-    // rendered by that commit's genuine pre-v2 pipeline; because
-    // WorkflowConfig gained the `runtime_completion` default field after
-    // f55eea8b, generation injected exactly that default block so the fixed
-    // input bytes match the current default configuration.
+    // Fixed inputs, identical to the original fixture generation from pre-v2
+    // commit f55eea8b: fixed job/command IDs, fixed roots/profile/input, no
+    // workflow, no memory, and a non-empty prompt template. The frozen fixture
+    // was re-rendered when the ActivityResult contract gained its strict
+    // output-schema form (json_schema, required arrays, nullable error
+    // fields); the fixed input bytes still match the current default
+    // configuration.
     let mut job = RuntimeJob::pending(
         "command-fixture-1",
         RuntimeKind::CodexJsonrpc,

@@ -1,4 +1,9 @@
 use super::*;
+use harness_workflow::runtime::{
+    ActivityResult, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeTranscriptRead,
+    WorkflowCommand, WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY,
+};
 
 #[tokio::test]
 async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> anyhow::Result<()> {
@@ -201,29 +206,146 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert!(prompts[0].contains("activity_result_schema"));
     assert!(prompts[0].contains("required_structured_output"));
     drop(prompts);
-    let models = agent.models.lock().await;
     assert_eq!(
-        models.as_slice(),
+        agent.models.lock().await.as_slice(),
         &[Some("configured-codex-model".to_string())]
     );
-    drop(models);
-    let reasoning_efforts = agent.reasoning_efforts.lock().await;
     assert_eq!(
-        reasoning_efforts.as_slice(),
+        agent.reasoning_efforts.lock().await.as_slice(),
         &[Some("configured-codex-effort".to_string())]
     );
-    drop(reasoning_efforts);
-    let sandbox_modes = agent.sandbox_modes.lock().await;
     assert_eq!(
-        sandbox_modes.as_slice(),
+        agent.sandbox_modes.lock().await.as_slice(),
         &[Some(SandboxMode::WorkspaceWrite)]
     );
-    drop(sandbox_modes);
-    let approval_policies = agent.approval_policies.lock().await;
     assert_eq!(
-        approval_policies.as_slice(),
+        agent.approval_policies.lock().await.as_slice(),
         &[Some("on-request".to_string())]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nworkspace:\n  strategy: source\n---\n",
+    )?;
+    let agent = RuntimeStreamAgent::new_with_outputs(vec![
+        r#"{"activity":"implement_prompt","status":"failed","summary":"failed","error":{"message":"bad shape"},"error_kind":"configuration"}"#.to_string(),
+        r#"{"activity":"implement_prompt","status":"succeeded","summary":"corrected","artifacts":[{"artifact_type":"validation_report","artifact":[{"command":"cargo check -p harness-server --all-targets","exit_code":0}]}]}"#.to_string(),
+    ]);
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register("codex", agent.clone());
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &project_root,
+        harness_core::config::HarnessConfig::default(),
+        registry,
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let prompt_ref = "prompt-memory:runtime-worker-structured-output";
+    store.insert_prompt_payload(prompt_ref, "prompt").await?;
+    let workflow = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "prompt:structured-output"),
+    )
+    .with_id("prompt-structured-output")
+    .with_server_data(serde_json::json!({
+        "project_id": project_root,
+        "external_id": "structured-output",
+        "source": "manual",
+        "prompt_summary": "structured output"
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let mut command =
+        WorkflowCommand::enqueue_activity(PROMPT_TASK_IMPLEMENT_ACTIVITY, "impl-prompt-1");
+    command.command["prompt_ref"] = serde_json::json!(prompt_ref);
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let mut runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+    runtime_profile.approval_policy = Some("never".to_string());
+    runtime_profile.max_turns = Some(2);
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": workflow.id.clone(),
+                "command_id": command_id.clone(),
+                "command_type": command.command_type,
+                "dedupe_key": command.dedupe_key,
+                "command": command.command,
+                "isolation": {
+                    "tier": "container",
+                    "network_allowlist": ["github.com"]
+                },
+                "runtime_profile": runtime_profile,
+            }),
+        )
+        .await?;
+
+    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+        &state,
+        "worker-test",
+        chrono::Duration::minutes(5),
+    )
+    .await?;
+
+    assert_eq!(tick.succeeded, 1);
+    assert_eq!(tick.failed, 0);
+    let completed = store.get_runtime_job(&runtime_job.id).await?.unwrap();
+    assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
+    let output: ActivityResult = serde_json::from_value(completed.output.unwrap())?;
+    assert!(output
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.artifact_type == "structured_output_correction_retry"));
+    let prompts = agent.prompts.lock().await;
+    assert!(prompts[1].contains("Structured output correction retry"));
+    let env_vars = agent.env_vars.lock().await;
+    assert_eq!(env_vars.len(), 2);
+    assert_eq!(
+        env_vars[1][harness_core::agent::AGENT_ISOLATION_TIER_ENV],
+        "container"
+    );
+    assert!(!env_vars[1].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
+    assert!(matches!(
+        agent.sandbox_modes.lock().await[1],
+        Some(SandboxMode::ReadOnly)
+    ));
+    assert!(matches!(
+        agent.approval_policies.lock().await[1].as_deref(),
+        Some("never")
+    ));
+    assert_eq!(agent.allowed_tools.lock().await[1], Some(Vec::new()));
+    let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&runtime_job.id);
+    let RuntimeTranscriptRead::Verified(record) =
+        store.read_runtime_transcript(&artifact_ref).await?
+    else {
+        anyhow::bail!("runtime transcript must be persisted");
+    };
+    assert!(record.content.contains("bad shape"));
+    assert!(!record.content.contains(r#""summary":"corrected""#));
+    let turns_started = store
+        .runtime_turns_started_for_workflow(&workflow.id, None)
+        .await?;
+    assert_eq!(turns_started, 2);
     Ok(())
 }
 

@@ -4,7 +4,9 @@ use crate::streaming::{
     log_captured_stderr_diagnostics, send_stream_item,
 };
 use async_trait::async_trait;
-use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::agent::{
+    AgentRequest, AgentResponse, CodeAgent, StreamItem, AGENT_OUTPUT_SCHEMA_PATH_ENV,
+};
 use harness_core::config::agents::SandboxMode;
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig};
 use harness_core::types::Capability;
@@ -23,13 +25,20 @@ pub(crate) use self::codex_exec_parser::{
 };
 use self::codex_exec_parser::{parse_codex_exec_output, stream_codex_exec_output};
 
+#[path = "codex_args.rs"]
+mod codex_args;
+#[cfg(test)]
+use self::codex_args::codex_sandbox_mode;
+use self::codex_args::{
+    push_codex_approval_policy_args, push_codex_developer_instructions_args,
+    push_codex_sandbox_args,
+};
+
 #[path = "codex_spawn.rs"]
 mod codex_spawn;
 #[cfg(test)]
 use self::codex_spawn::resolve_program_for_spawn;
 use self::codex_spawn::{codex_spawn_failure_message, log_codex_spawn_attempt};
-
-const READ_ONLY_WITH_NETWORK_PROFILE: &str = "harness_read_only_with_network";
 
 pub struct CodexAgent {
     pub cli_path: PathBuf,
@@ -116,9 +125,22 @@ impl CodexAgent {
             OsString::from("-c"),
             OsString::from(format!("model_reasoning_effort=\"{}\"", reasoning_effort)),
         ];
+        if let Some([]) = req.allowed_tools.as_deref() {
+            args.push(OsString::from("--ignore-user-config"));
+        }
         push_codex_sandbox_args(&mut args, sandbox_mode);
         if let Some(approval_policy) = req.approval_policy.as_deref() {
             push_codex_approval_policy_args(&mut args, approval_policy);
+        }
+        if let Some(schema_path) = req
+            .env_vars
+            .get(AGENT_OUTPUT_SCHEMA_PATH_ENV)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push(OsString::from("--output-schema"));
+            args.push(OsString::from(schema_path));
         }
 
         if self.cloud.enabled {
@@ -126,7 +148,7 @@ impl CodexAgent {
         }
 
         args.push(OsString::from("-C"));
-        args.push(req.project_root.as_os_str().to_os_string());
+        args.push(OsString::from("."));
         args.push(OsString::from(req.prompt.clone()));
         args
     }
@@ -420,6 +442,7 @@ impl CodeAgent for CodexAgent {
             SandboxSpec::new(sandbox_mode, &req.project_root)
         };
         let mut spawn_env_vars = req.env_vars.clone();
+        spawn_env_vars.remove(AGENT_OUTPUT_SCHEMA_PATH_ENV);
         let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
         run_identity.write_env_vars(&mut spawn_env_vars);
         if self.cloud.enabled {
@@ -530,6 +553,7 @@ impl CodeAgent for CodexAgent {
             SandboxSpec::new(sandbox_mode, &req.project_root)
         };
         let mut spawn_env_vars = req.env_vars.clone();
+        spawn_env_vars.remove(AGENT_OUTPUT_SCHEMA_PATH_ENV);
         let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
         run_identity.write_env_vars(&mut spawn_env_vars);
         if self.cloud.enabled {
@@ -652,92 +676,6 @@ impl CodeAgent for CodexAgent {
         }
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
-    }
-}
-
-fn codex_sandbox_mode(mode: SandboxMode) -> &'static str {
-    match mode {
-        SandboxMode::ReadOnly | SandboxMode::ReadOnlyWithNetwork => "read-only",
-        SandboxMode::WorkspaceWrite => "workspace-write",
-        SandboxMode::DangerFullAccess => "danger-full-access",
-    }
-}
-
-fn push_codex_sandbox_args(args: &mut Vec<OsString>, mode: SandboxMode) {
-    if mode == SandboxMode::ReadOnlyWithNetwork {
-        args.push(OsString::from("-c"));
-        args.push(OsString::from(format!(
-            "default_permissions=\"{READ_ONLY_WITH_NETWORK_PROFILE}\""
-        )));
-        args.push(OsString::from("-c"));
-        args.push(OsString::from(format!(
-            "permissions.{READ_ONLY_WITH_NETWORK_PROFILE}.filesystem={{\":minimal\"=\"read\",\":project_roots\"={{\".\"=\"read\"}}}}"
-        )));
-        args.push(OsString::from("-c"));
-        args.push(OsString::from(format!(
-            "permissions.{READ_ONLY_WITH_NETWORK_PROFILE}.network.enabled=true"
-        )));
-        return;
-    }
-
-    args.push(OsString::from("-s"));
-    args.push(OsString::from(codex_sandbox_mode(mode)));
-}
-
-fn push_codex_approval_policy_args(args: &mut Vec<OsString>, approval_policy: &str) {
-    let approval_policy = escape_codex_config_string(approval_policy);
-    args.push(OsString::from("-c"));
-    args.push(OsString::from(format!(
-        "approval_policy=\"{approval_policy}\""
-    )));
-}
-
-fn push_codex_developer_instructions_args(args: &mut Vec<OsString>, instructions: &str) {
-    let instructions = escape_codex_config_string(instructions);
-    args.push(OsString::from("-c"));
-    args.push(OsString::from(format!(
-        "developer_instructions=\"{instructions}\""
-    )));
-}
-
-fn escape_codex_config_string(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\u{08}' => escaped.push_str("\\b"),
-            '\u{0C}' => escaped.push_str("\\f"),
-            ch => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-#[cfg(test)]
-mod approval_policy_arg_tests {
-    use super::push_codex_approval_policy_args;
-
-    #[test]
-    fn approval_policy_args_escape_config_string_delimiters() {
-        let mut args = Vec::new();
-
-        push_codex_approval_policy_args(&mut args, "ask\"me\\first\nnext");
-
-        let args: Vec<String> = args
-            .into_iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            args,
-            vec![
-                "-c".to_string(),
-                "approval_policy=\"ask\\\"me\\\\first\\nnext\"".to_string()
-            ]
-        );
     }
 }
 

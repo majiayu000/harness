@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 pub(super) struct CapturingAgent {
     pub(super) prompts: Mutex<Vec<String>>,
@@ -14,10 +15,13 @@ impl CapturingAgent {
 
 pub(super) struct RuntimeStreamAgent {
     pub(super) prompts: Mutex<Vec<String>>,
+    pub(super) env_vars: Mutex<Vec<HashMap<String, String>>>,
+    outputs: Mutex<Vec<String>>,
     pub(super) models: Mutex<Vec<Option<String>>>,
     pub(super) reasoning_efforts: Mutex<Vec<Option<String>>>,
     pub(super) sandbox_modes: Mutex<Vec<Option<SandboxMode>>>,
     pub(super) approval_policies: Mutex<Vec<Option<String>>>,
+    pub(super) allowed_tools: Mutex<Vec<Option<Vec<String>>>>,
 }
 
 pub(super) struct FailingStreamAgent {
@@ -27,12 +31,19 @@ pub(super) struct FailingStreamAgent {
 
 impl RuntimeStreamAgent {
     pub(super) fn new() -> Arc<Self> {
+        Self::new_with_outputs(Vec::new())
+    }
+
+    pub(super) fn new_with_outputs(outputs: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
             prompts: Mutex::new(Vec::new()),
+            env_vars: Mutex::new(Vec::new()),
+            outputs: Mutex::new(outputs),
             models: Mutex::new(Vec::new()),
             reasoning_efforts: Mutex::new(Vec::new()),
             sandbox_modes: Mutex::new(Vec::new()),
             approval_policies: Mutex::new(Vec::new()),
+            allowed_tools: Mutex::new(Vec::new()),
         })
     }
 }
@@ -135,6 +146,11 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
+        self.allowed_tools
+            .lock()
+            .await
+            .push(req.allowed_tools.clone());
+        self.env_vars.lock().await.push(req.env_vars.clone());
         self.prompts.lock().await.push(req.prompt);
         Ok(successful_agent_response())
     }
@@ -154,24 +170,31 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
-        // Probe the runtime-job activity name from the prompt so the fenced
-        // result block reports the correct `activity`. The activity is the
-        // top `Activity:` line in the prompt packet header. Falling back to
-        // "implement_issue" keeps the existing tests stable when no header
-        // is found.
-        let activity = req
-            .prompt
-            .lines()
-            .find_map(|line| line.strip_prefix("Activity: ").map(str::trim))
-            .unwrap_or("implement_issue")
-            .to_string();
+        self.allowed_tools
+            .lock()
+            .await
+            .push(req.allowed_tools.clone());
+        self.env_vars.lock().await.push(req.env_vars.clone());
+        let mut outputs = self.outputs.lock().await;
+        let content = match (!outputs.is_empty()).then(|| outputs.remove(0)) {
+            Some(content) => content,
+            None => {
+                // Probe the runtime-job activity name from the prompt so the
+                // fenced result block reports the correct `activity`.
+                let activity = req
+                    .prompt
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Activity: ").map(str::trim))
+                    .unwrap_or("implement_issue");
+                format!(
+                    "runtime done\n\n```harness-activity-result\n{{\"activity\":\"{activity}\",\"status\":\"succeeded\",\"summary\":\"runtime done\"}}\n```"
+                )
+            }
+        };
         self.prompts.lock().await.push(req.prompt);
-        let fenced = format!(
-            "runtime done\n\n```harness-activity-result\n{{\"activity\":\"{activity}\",\"status\":\"succeeded\",\"summary\":\"runtime done\"}}\n```"
-        );
         let _ = tx
             .send(StreamItem::ItemCompleted {
-                item: Item::AgentReasoning { content: fenced },
+                item: Item::AgentReasoning { content },
             })
             .await;
         let _ = tx.send(StreamItem::Done).await;

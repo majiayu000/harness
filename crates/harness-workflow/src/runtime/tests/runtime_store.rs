@@ -1,4 +1,30 @@
 use super::*;
+#[rustfmt::skip]
+#[tokio::test]
+async fn runtime_turn_reservation_is_atomic_and_replay_safe() -> anyhow::Result<()> {
+    if harness_core::db::resolve_test_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow_id = "turn-reservation";
+    store.force_upsert_lifecycle_state_for_test(&issue_instance("implementing").with_id(workflow_id)).await?;
+    let mut jobs = Vec::new();
+    for key in ["a", "b"] {
+        jobs.push(enqueue_workflow_runtime_job(&store, workflow_id, key, RuntimeKind::CodexJsonrpc, "codex-default", json!({"activity": "implement_issue"}), None).await?);
+    }
+    store.record_runtime_event(&jobs[0].id, "RuntimeTurnStarted", json!({"owner": "initial"})).await?;
+    let first = store.reserve_runtime_turn_started_for_workflow(workflow_id, &jobs[0].id, 2, json!({"reservation_key": "retry-0"})).await?;
+    let replay = store.reserve_runtime_turn_started_for_workflow(workflow_id, &jobs[0].id, 2, json!({"reservation_key": "retry-0"})).await?;
+    assert_eq!(first.as_ref().map(|event| &event.id), replay.as_ref().map(|event| &event.id));
+    let left = store.reserve_runtime_turn_started_for_workflow(workflow_id, &jobs[0].id, 3, json!({"reservation_key": "retry-race-1"}));
+    let right = store.reserve_runtime_turn_started_for_workflow(workflow_id, &jobs[1].id, 3, json!({"reservation_key": "retry-race-2"}));
+    let (left, right) = tokio::join!(left, right);
+    let granted = [left?, right?].into_iter().filter(Option::is_some).count();
+    assert_eq!(granted, 1);
+    assert_eq!(store.runtime_turns_started_for_workflow(workflow_id, None).await?, 3);
+    Ok(())
+}
 
 #[tokio::test]
 async fn runtime_jobs_accept_typed_status_values() -> anyhow::Result<()> {

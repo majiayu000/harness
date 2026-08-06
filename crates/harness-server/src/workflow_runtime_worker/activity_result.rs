@@ -10,7 +10,10 @@ use super::activity_status_contract::{
     enforce_activity_status_contract, status_contract_blockers_from_result,
 };
 use super::data_helpers::activity_name;
+#[path = "activity_result_parser.rs"]
+mod activity_result_parser;
 use super::prompt_packet::workflow_prompt_artifact;
+use activity_result_parser::parse_activity_result_json;
 
 const CODEX_SKILL_BUDGET_WARNING: &str =
     "Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter.";
@@ -161,6 +164,7 @@ fn activity_result_from_turn(
 #[serde(rename_all = "snake_case")]
 enum ActivityResultExtractionStrategy {
     FencedActivityResult,
+    RawActivityResult,
     NotAttempted,
 }
 
@@ -212,6 +216,7 @@ impl ActivityResultEnvelope {
 
     fn accepted_with_turn_warning(
         raw_status: TurnStatus,
+        extraction_strategy: ActivityResultExtractionStrategy,
         result: ActivityResult,
         warning: String,
         workflow_definition: Option<&str>,
@@ -223,7 +228,7 @@ impl ActivityResultEnvelope {
             ActivityResultEnvelopeOutcome::AcceptedWithTurnWarning
         };
         Self {
-            extraction_strategy: ActivityResultExtractionStrategy::FencedActivityResult,
+            extraction_strategy,
             outcome,
             raw_status,
             extracted_activity: Some(result.activity.clone()),
@@ -293,12 +298,13 @@ impl ActivityResultEnvelope {
 
     fn invalid_structured_output(
         raw_status: TurnStatus,
+        extraction_strategy: ActivityResultExtractionStrategy,
         activity: String,
         error: String,
         extracted_activity: Option<String>,
     ) -> Self {
         Self {
-            extraction_strategy: ActivityResultExtractionStrategy::FencedActivityResult,
+            extraction_strategy,
             outcome: ActivityResultEnvelopeOutcome::InvalidStructuredOutput,
             raw_status,
             extracted_activity,
@@ -366,6 +372,55 @@ impl ActivityResultEnvelope {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StructuredOutputCorrection {
+    pub outcome: String,
+    pub error: String,
+    pub extracted_activity: Option<String>,
+}
+
+pub(super) fn activity_result_envelope_outcome(result: &ActivityResult) -> Option<&str> {
+    activity_result_envelope(result)?
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+}
+
+pub(super) fn structured_output_correction(
+    result: &ActivityResult,
+) -> Option<StructuredOutputCorrection> {
+    let envelope = activity_result_envelope(result)?;
+    let outcome = envelope.get("outcome")?.as_str()?;
+    if !matches!(
+        outcome,
+        "invalid_structured_output" | "missing_structured_output"
+    ) {
+        return None;
+    }
+    let error = envelope
+        .get("extraction_error")
+        .and_then(serde_json::Value::as_str)
+        .or(result.error.as_deref())
+        .unwrap_or("structured activity result was invalid")
+        .to_string();
+    let extracted_activity = envelope
+        .get("extracted_activity")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Some(StructuredOutputCorrection {
+        outcome: outcome.to_string(),
+        error,
+        extracted_activity,
+    })
+}
+
+fn activity_result_envelope(result: &ActivityResult) -> Option<&serde_json::Value> {
+    result
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "activity_result_envelope")
+        .map(|artifact| &artifact.artifact)
+}
+
 fn activity_result_envelope_from_turn(
     status: &TurnStatus,
     items: &[Item],
@@ -375,9 +430,12 @@ fn activity_result_envelope_from_turn(
 ) -> ActivityResultEnvelope {
     match status {
         TurnStatus::Completed => match structured_activity_result(items, activity) {
-            StructuredActivityResult::Parsed(result) => ActivityResultEnvelope::accepted(
+            StructuredActivityResult::Parsed {
+                result,
+                extraction_strategy,
+            } => ActivityResultEnvelope::accepted(
                 *status,
-                ActivityResultExtractionStrategy::FencedActivityResult,
+                extraction_strategy,
                 result,
                 workflow_definition,
             ),
@@ -400,8 +458,10 @@ fn activity_result_envelope_from_turn(
             StructuredActivityResult::Invalid {
                 error,
                 extracted_activity,
+                extraction_strategy,
             } => ActivityResultEnvelope::invalid_structured_output(
                 *status,
+                extraction_strategy,
                 activity.to_string(),
                 error,
                 extracted_activity,
@@ -414,9 +474,13 @@ fn activity_result_envelope_from_turn(
             let error = failed_turn_error(items);
             if let Some(warning) = failed_turn_warning_allows_structured_result(items) {
                 match structured_activity_result(items, activity) {
-                    StructuredActivityResult::Parsed(result) => {
+                    StructuredActivityResult::Parsed {
+                        result,
+                        extraction_strategy,
+                    } => {
                         return ActivityResultEnvelope::accepted_with_turn_warning(
                             *status,
+                            extraction_strategy,
                             result,
                             warning,
                             workflow_definition,
@@ -425,9 +489,11 @@ fn activity_result_envelope_from_turn(
                     StructuredActivityResult::Invalid {
                         error: parse_error,
                         extracted_activity,
+                        extraction_strategy,
                     } => {
                         return ActivityResultEnvelope::invalid_structured_output(
                             *status,
+                            extraction_strategy,
                             activity.to_string(),
                             parse_error,
                             extracted_activity,
@@ -470,7 +536,7 @@ fn agent_activity_summary(items: &[Item]) -> AgentActivitySummary {
             )
             .count(),
         tool_invocations: items.iter().filter(|item| item_is_tool_activity(item)).count(),
-        structured_result_artifacts: usize::from(latest_activity_result_block(items).is_some()),
+        structured_result_artifacts: usize::from(structured_activity_result_candidate(items)),
         total_items: items.len(),
     }
 }
@@ -549,54 +615,53 @@ fn codex_structured_skill_budget_error_allows_structured_result(error: &str) -> 
 
 enum StructuredActivityResult {
     Missing,
-    Parsed(ActivityResult),
+    Parsed {
+        result: ActivityResult,
+        extraction_strategy: ActivityResultExtractionStrategy,
+    },
     Invalid {
         error: String,
         extracted_activity: Option<String>,
+        extraction_strategy: ActivityResultExtractionStrategy,
     },
 }
 
 fn structured_activity_result(items: &[Item], expected_activity: &str) -> StructuredActivityResult {
     if let Some(block) = latest_activity_result_block(items) {
-        return parse_activity_result_block(block, expected_activity);
+        return parse_activity_result_block(
+            block,
+            expected_activity,
+            ActivityResultExtractionStrategy::FencedActivityResult,
+        );
+    }
+
+    if let Some(raw_json) = latest_raw_activity_result_json(items) {
+        return parse_activity_result_block(
+            raw_json,
+            expected_activity,
+            ActivityResultExtractionStrategy::RawActivityResult,
+        );
     }
 
     StructuredActivityResult::Missing
 }
 
-fn parse_activity_result_block(block: &str, expected_activity: &str) -> StructuredActivityResult {
+fn parse_activity_result_block(
+    block: &str,
+    expected_activity: &str,
+    extraction_strategy: ActivityResultExtractionStrategy,
+) -> StructuredActivityResult {
     match parse_activity_result_json(block, expected_activity) {
-        Ok(result) => StructuredActivityResult::Parsed(result),
+        Ok(result) => StructuredActivityResult::Parsed {
+            result,
+            extraction_strategy,
+        },
         Err(error) => StructuredActivityResult::Invalid {
             error: error.error,
             extracted_activity: error.extracted_activity,
+            extraction_strategy,
         },
     }
-}
-
-fn parse_activity_result_json(
-    block: &str,
-    expected_activity: &str,
-) -> Result<ActivityResult, StructuredActivityResultError> {
-    match serde_json::from_str::<ActivityResult>(block) {
-        Ok(result) if result.activity == expected_activity => Ok(result),
-        Ok(result) => Err(StructuredActivityResultError {
-            error: format!(
-                "activity result block reported activity `{}`, expected `{expected_activity}`",
-                result.activity
-            ),
-            extracted_activity: Some(result.activity),
-        }),
-        Err(error) => Err(StructuredActivityResultError {
-            error: format!("activity result block is invalid JSON: {error}"),
-            extracted_activity: None,
-        }),
-    }
-}
-
-struct StructuredActivityResultError {
-    error: String,
-    extracted_activity: Option<String>,
 }
 
 fn latest_activity_result_block(items: &[Item]) -> Option<&str> {
@@ -606,6 +671,21 @@ fn latest_activity_result_block(items: &[Item]) -> Option<&str> {
         }
         _ => None,
     })
+}
+
+fn latest_raw_activity_result_json(items: &[Item]) -> Option<&str> {
+    items.iter().rev().find_map(|item| match item {
+        Item::AgentReasoning { content } => {
+            let content = content.trim();
+            (content.starts_with('{') && content.ends_with('}')).then_some(content)
+        }
+        _ => None,
+    })
+}
+
+fn structured_activity_result_candidate(items: &[Item]) -> bool {
+    latest_activity_result_block(items).is_some()
+        || latest_raw_activity_result_json(items).is_some()
 }
 
 fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
