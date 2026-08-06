@@ -71,8 +71,8 @@ Harness is an agent orchestration layer. It constructs prompts and manages lifec
 
 ## PR Workflow
 
-- After creating a PR, wait for Gemini code review bot before merging
-- If Gemini leaves review comments, address valid feedback before merge
+- After creating a PR, wait for the Codex review bot before merging
+- If the review bot leaves comments, address valid feedback before merge
 - If no comments or only false positives, proceed with merge
 - **Squash-merge only** — enforced via GitHub ruleset (squash is the only allowed merge method; no bypass for anyone)
 - **Required CI** — the `CI Result` status check must pass before merging (enforced via ruleset)
