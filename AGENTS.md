@@ -61,6 +61,8 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 - After creating a PR, wait for the Codex review bot before merging
 - If the review bot leaves comments, address valid feedback before merge
 - If no comments or only false positives, proceed with merge
+- Resolving a review thread does not require separate user approval once its feedback has been verified as addressed.
+- Posting a new comment or reply remains an externally visible action and requires explicit user approval.
 
 ## Codex Integration
 
