@@ -19,7 +19,7 @@ pub(super) fn validate_source_locator(
         | AgentStackSourceScope::Runner => validate_logical_locator(scope, locator),
     }
 }
-fn validate_portable_path(value: &str) -> Result<(), AgentStackComponentError> {
+pub(crate) fn validate_portable_path(value: &str) -> Result<(), AgentStackComponentError> {
     let drive_prefixed = value
         .as_bytes()
         .get(0..2)
@@ -112,7 +112,7 @@ pub(super) fn is_snake_case(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
-fn reject_reserved_segments(value: &str) -> Result<(), AgentStackComponentError> {
+pub(crate) fn reject_reserved_segments(value: &str) -> Result<(), AgentStackComponentError> {
     if value.split('/').any(is_reserved) {
         Err(AgentStackComponentError::InvalidSourceLocator)
     } else {
@@ -216,7 +216,7 @@ fn relative_portable_path_if_within(
     validate_portable_path(&relative)?;
     Ok(Some(relative))
 }
-fn normalize_absolute_path(path: &Path) -> Result<PathBuf, AgentStackComponentError> {
+pub(crate) fn normalize_absolute_path(path: &Path) -> Result<PathBuf, AgentStackComponentError> {
     let key = absolute_path_key(path, true)?;
     let mut result = PathBuf::new();
     #[cfg(unix)]
