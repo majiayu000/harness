@@ -1,3 +1,6 @@
+use super::source_locator::{
+    normalize_absolute_path, reject_reserved_segments, validate_portable_path,
+};
 use super::{
     AgentStackCapability, AgentStackComponent, AgentStackComponentId, AgentStackComponentKind,
     AgentStackSource, AgentStackSourceScope, AgentStackTrustLevel,
@@ -96,7 +99,7 @@ impl AgentStackCapabilityScope {
     }
 
     pub fn path(path: &Path) -> Result<Self, AgentStackCapabilityEvidenceError> {
-        let normalized = super::normalize_absolute_path(path)
+        let normalized = normalize_absolute_path(path)
             .map_err(|_| AgentStackCapabilityEvidenceError::InvalidScope)?;
         let path = normalized
             .to_str()
@@ -120,14 +123,14 @@ impl AgentStackCapabilityScope {
     pub fn validate(&self) -> Result<(), AgentStackCapabilityEvidenceError> {
         match self {
             Self::Component | Self::Host => Ok(()),
-            Self::Repository { locator } => super::validate_portable_path(locator)
-                .and_then(|_| super::reject_reserved_segments(locator))
+            Self::Repository { locator } => validate_portable_path(locator)
+                .and_then(|_| reject_reserved_segments(locator))
                 .map_err(|_| AgentStackCapabilityEvidenceError::InvalidScope),
             Self::Path { path } => {
                 if path.is_empty() || path.contains('\0') || !Path::new(path).is_absolute() {
                     Err(AgentStackCapabilityEvidenceError::InvalidScope)
                 } else {
-                    let normalized = super::normalize_absolute_path(Path::new(path))
+                    let normalized = normalize_absolute_path(Path::new(path))
                         .map_err(|_| AgentStackCapabilityEvidenceError::InvalidScope)?;
                     let normalized = normalized
                         .to_str()
