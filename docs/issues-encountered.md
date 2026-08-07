@@ -648,3 +648,33 @@ This ensures:
 ### Key Lesson
 
 Default-to-success is dangerous in task orchestration. When a task prompt explicitly requests an output artifact (PR, file, report), the absence of that artifact should be treated as a failure, not a no-op success. Silent success hides bugs and makes debugging much harder — the Phase 4/7 ghost completions were only caught by manual inspection of branch diffs.
+
+---
+
+## Issue 14: Self-Runtime Outage Findings (2026-07-29 → 2026-08-03)
+
+> Date: 2026-08-07 (post-hoc)
+> Scope: Operational findings from the `harness-self` run on the dev Mac, recovered from server logs, the workflow database, and pool sessions. Recorded in full on GitHub issue #1883; this entry keeps the local ledger in sync.
+
+### Symptom 1 — Issue implementation chain starvation
+
+41 of 50 issue workflows ended `blocked`. 13 failed jobs cite mutual "upstream dependencies are not ready" (the ASC-1732–#1758 chain blocks itself with no maintainer override), 2 cite "Human readiness gate missing", 9 cite `LocalReviewChangesRequested` downgraded to blocked. The pool had nothing dispatchable from 08-01 onward (runtime jobs/day: 07-30: 1549 → 08-01: 6 → 08-02: 7 → 08-03: 21). No starvation alert exists.
+
+### Symptom 2 — `git worktree add` failures
+
+On 08-03, 4 runtime jobs failed with `git worktree add from origin/main failed ... fatal: 'harness/runtime-wf-github...'`. Unclassified, unretried, untracked.
+
+### Symptom 3 — Quota shutdown without restart plan
+
+Codex quota exhausted on 08-03 05:10/05:28 (reset 08-08 11:33); server SIGTERM'd 14:20 the same day and never restarted. No restart checklist was recorded.
+
+### Symptom 4 — Supporting infrastructure findings
+
+- 4,521 `event_store` log failures on `ts` TEXT vs TIMESTAMPTZ (fix in #1852 was unmerged at run time)
+- 195 residual `memory_*` / `repo_*` schemas after GC (peak 809 on 07-29)
+- 94 failed runtime jobs total (07-29: 37, 07-30: 42, 07-31: 5, 08-01: 1, 08-02: 1, 08-03: 8)
+- "claimed succeeded + reporting blockers" downgrade occurred 24 times (07-29: 11, 07-30: 11, 08-03: 2), mostly on `run_local_review`
+
+### Key Lesson
+
+Unattended mode fails by starvation, not by crash. The chain of issue gates (dependency → human readiness → local review) is safe for supervised operation but deadlocks when no operator exists to approve; without starvation alerts or an override path, the pool idles and the outage is silent until the operator returns.
