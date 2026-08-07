@@ -72,10 +72,10 @@ pub(crate) struct TurnLifecycleOptions {
     pub allowed_tools: Option<Vec<String>>,
     pub env_vars: HashMap<String, String>,
     pub runtime_usage: Option<RuntimeUsageContext>,
-    /// Fired when the owning runtime job lease is lost mid-turn: the turn
-    /// interrupts the agent so the child process terminates and the
-    /// workspace cleanup can run (GH-1877).
-    pub lease_lost: Option<Arc<tokio::sync::Notify>>,
+    /// Stateful lease-lost signal (watch channel): when the owning runtime
+    /// job lease is lost mid-turn, the turn interrupts the agent so the
+    /// child process terminates and the workspace cleanup can run (GH-1877).
+    pub lease_lost: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 pub(crate) async fn run_turn_lifecycle_with_options(
@@ -334,7 +334,17 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             }
             _ = async {
                     match options.lease_lost.as_ref() {
-                        Some(notify) => notify.notified().await,
+                        Some(receiver) => {
+                            let mut receiver = receiver.clone();
+                            loop {
+                                if receiver.changed().await.is_err() {
+                                    return;
+                                }
+                                if *receiver.borrow() {
+                                    return;
+                                }
+                            }
+                        }
                         None => std::future::pending().await,
                     }
                 }, if execution_result.is_none() && !stream_closed => {
@@ -549,6 +559,40 @@ mod tests {
         }
     }
 
+    struct InterruptTrackingAdapter {
+        interrupt_calls: Arc<AtomicUsize>,
+        /// start_turn blocks until interrupt fires, so the lease-lost branch
+        /// of the turn loop deterministically wins the select race.
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentAdapter for InterruptTrackingAdapter {
+        fn name(&self) -> &str {
+            "codex"
+        }
+
+        async fn start_turn(
+            &self,
+            _req: TurnRequest,
+            tx: mpsc::Sender<AgentEvent>,
+        ) -> harness_core::error::Result<()> {
+            self.release.notified().await;
+            tx.send(AgentEvent::TurnCompleted {
+                output: "adapter done after interrupt".to_string(),
+            })
+            .await
+            .map_err(|error| HarnessError::AgentExecution(format!("adapter closed: {error}")))?;
+            Ok(())
+        }
+
+        async fn interrupt(&self) -> harness_core::error::Result<()> {
+            self.interrupt_calls.fetch_add(1, Ordering::AcqRel);
+            self.release.notify_waiters();
+            Ok(())
+        }
+    }
+
     fn server_with_codex_counts(
         root: &std::path::Path,
         agent_calls: Arc<AtomicUsize>,
@@ -676,6 +720,65 @@ mod tests {
             .get_turn(&thread_id, &turn_id)
             .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
         assert_eq!(turn.status, TurnStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let interrupt_calls = Arc::new(AtomicUsize::new(0));
+        let mut config = HarnessConfig::default();
+        config.server.project_root = root.path().to_path_buf();
+        config.agents.default_agent = "codex".to_string();
+        let mut registry = AgentRegistry::new("codex");
+        registry.register("codex", Arc::new(CountingAgent { calls: agent_calls }));
+        let interrupt_calls_for_factory = interrupt_calls.clone();
+        let release_for_factory = Arc::new(tokio::sync::Notify::new());
+        registry
+            .register_adapter_factory_with_strategy(
+                "codex",
+                move || {
+                    Arc::new(InterruptTrackingAdapter {
+                        interrupt_calls: interrupt_calls_for_factory.clone(),
+                        release: release_for_factory.clone(),
+                    })
+                },
+                AdapterExecutionStrategy::ExecuteTurns,
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+        let turn_id = start_test_turn(&server, root.path())?;
+
+        // Fire the lease-lost signal BEFORE the turn loop starts polling: the
+        // watch channel must not lose it (GH-1877).
+        let (lease_lost, receiver) = tokio::sync::watch::channel(false);
+        let _ = lease_lost.send(true);
+        run_test_turn(
+            server.clone(),
+            root.path(),
+            turn_id.clone(),
+            TurnLifecycleOptions {
+                lease_lost: Some(receiver),
+                ..TurnLifecycleOptions::default()
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            interrupt_calls.load(Ordering::Acquire),
+            1,
+            "pre-fired lease-lost must interrupt the agent"
+        );
+        let thread_id = server
+            .thread_manager
+            .find_thread_for_turn(&turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn should belong to a thread"))?;
+        let turn = server
+            .thread_manager
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
+        assert_eq!(turn.status, TurnStatus::Failed);
         Ok(())
     }
 
