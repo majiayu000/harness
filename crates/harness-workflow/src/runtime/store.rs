@@ -353,6 +353,12 @@ impl WorkflowRuntimeStore {
         self.budget_policy = budget_policy;
         self
     }
+    /// The wired budget policy, so mid-turn enforcement (the GH-1770 §4.3
+    /// turn-stream watchdog) applies the same ceiling as the dispatch gate and
+    /// the completion ceiling instead of re-reading config.
+    pub fn budget_policy(&self) -> &RuntimeBudgetPolicy {
+        &self.budget_policy
+    }
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
