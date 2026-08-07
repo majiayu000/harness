@@ -259,8 +259,16 @@ impl QualityTrigger {
                             .await
                             {
                                 Ok(Ok(result)) => {
-                                    report.semantic_verdict = Some(result.final_verdict.clone());
-                                    if result.final_verdict == "NOT_CONVERGED" {
+                                    report.semantic_verdict =
+                                        Some(result.final_verdict.as_str().to_string());
+                                    // Fail closed (GH-1767): both an unconverged
+                                    // review and an unparseable challenger reply
+                                    // downgrade the grade.
+                                    if matches!(
+                                        result.final_verdict,
+                                        crate::handlers::cross_review::CrossReviewVerdict::NotConverged
+                                            | crate::handlers::cross_review::CrossReviewVerdict::ProtocolFailure
+                                    ) {
                                         let original = report.grade;
                                         report.grade = Self::downgrade(report.grade);
                                         tracing::info!(

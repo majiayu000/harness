@@ -8,7 +8,8 @@ pub struct QualityReport {
     pub dimensions: QualityDimensions,
     pub recommended_gc_interval: std::time::Duration,
     /// Semantic verdict from challenger-agent cross-review.
-    /// "APPROVED" | "NOT_CONVERGED" | None (cross-review not run)
+    /// "APPROVED" | "APPROVED_DEGRADED" | "NOT_CONVERGED" | "PROTOCOL_FAILURE"
+    /// | None (cross-review not run)
     pub semantic_verdict: Option<String>,
 }
 

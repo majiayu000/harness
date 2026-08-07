@@ -36,15 +36,65 @@ impl CrossReviewCompressionContext {
     }
 }
 
+/// Whether the challenger round ran under a distinct model or the review
+/// degraded to a single model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CrossReviewMode {
+    CrossModel,
+    SingleModelDegraded,
+}
+
+/// Fail-closed verdict. Serializes as the legacy uppercase strings for RPC
+/// compatibility; `ApprovedDegraded` and `ProtocolFailure` are new wires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CrossReviewVerdict {
+    /// Cross-model review, tags parsed, no consensus issues.
+    Approved,
+    /// Single-model degraded review with no issues — never reported as
+    /// `Approved` so callers can tell the review lacked a challenger.
+    ApprovedDegraded,
+    NotConverged,
+    /// Challenger reply followed none of the protocol tags; the round is
+    /// unparseable and must not read as approval.
+    ProtocolFailure,
+}
+
+impl CrossReviewVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CrossReviewVerdict::Approved => "APPROVED",
+            CrossReviewVerdict::ApprovedDegraded => "APPROVED_DEGRADED",
+            CrossReviewVerdict::NotConverged => "NOT_CONVERGED",
+            CrossReviewVerdict::ProtocolFailure => "PROTOCOL_FAILURE",
+        }
+    }
+}
+
+/// A challenger round whose reply carried no protocol tag at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolFailure {
+    pub round: u32,
+    /// Bounded excerpt of the offending reply.
+    pub excerpt: String,
+}
+
+/// Maximum chars of a protocol-failure reply kept in `ProtocolFailure`.
+const PROTOCOL_FAILURE_EXCERPT_MAX: usize = 280;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossReviewResult {
+    pub mode: CrossReviewMode,
+    pub primary_agent_id: String,
+    pub challenger_agent_id: Option<String>,
     pub primary_review: String,
     pub challenger_review: String,
     pub consensus_issues: Vec<String>,
     pub contested_issues: Vec<String>,
     pub rounds: u32,
-    /// "APPROVED" if no consensus issues; "NOT_CONVERGED" if issues remain.
-    pub final_verdict: String,
+    pub final_verdict: CrossReviewVerdict,
+    pub protocol_failure: Option<ProtocolFailure>,
 }
 
 pub async fn cross_review(
@@ -61,7 +111,7 @@ pub async fn cross_review(
         None => return RpcResponse::error(id, INTERNAL_ERROR, "no agent registered"),
     };
 
-    let challenger = state.core.server.agent_registry.get("codex");
+    let challenger = distinct_challenger(&primary, state.core.server.agent_registry.get("codex"));
     let rounds = max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
 
     let result =
@@ -134,20 +184,30 @@ pub(crate) async fn run_cross_review_with_context(
 
     let challenger = match challenger {
         None => {
-            // Graceful degradation: treat all ISSUE lines as consensus.
+            // Degraded single-model review: treat all ISSUE lines as
+            // consensus, and never report a clean review as fully approved.
             let consensus_issues = harness_core::prompts::extract_review_issues(&primary_review);
-            let verdict = verdict_for(&consensus_issues);
+            let verdict = if consensus_issues.is_empty() {
+                CrossReviewVerdict::ApprovedDegraded
+            } else {
+                CrossReviewVerdict::NotConverged
+            };
             return Ok(CrossReviewResult {
+                mode: CrossReviewMode::SingleModelDegraded,
+                primary_agent_id: primary.id(),
+                challenger_agent_id: None,
                 primary_review,
                 challenger_review: String::new(),
                 consensus_issues,
                 contested_issues: Vec::new(),
                 rounds: 1,
                 final_verdict: verdict,
+                protocol_failure: None,
             });
         }
         Some(c) => c,
     };
+    let challenger_agent_id = challenger.id();
 
     let mut challenger_review = String::new();
     let mut rounds_done = 1u32;
@@ -225,16 +285,44 @@ pub(crate) async fn run_cross_review_with_context(
             .into_iter()
             .chain(extract_tagged(&challenger_review, "MISSED"))
             .collect();
+        let contested = extract_tagged(&challenger_review, "FALSE-POSITIVE");
+
+        // Fail closed (GH-1767): a challenger reply with no protocol tag at
+        // all is unparseable, not an approval. A reply carrying only
+        // FALSE-POSITIVE tags remains a valid approving round.
+        if consensus_issues.is_empty()
+            && contested.is_empty()
+            && !has_any_tag_prefix(&challenger_review)
+        {
+            return Ok(CrossReviewResult {
+                mode: CrossReviewMode::CrossModel,
+                primary_agent_id: primary.id(),
+                challenger_agent_id: Some(challenger_agent_id.clone()),
+                primary_review,
+                challenger_review: challenger_review.clone(),
+                consensus_issues: Vec::new(),
+                contested_issues: Vec::new(),
+                rounds: rounds_done,
+                final_verdict: CrossReviewVerdict::ProtocolFailure,
+                protocol_failure: Some(ProtocolFailure {
+                    round: rounds_done,
+                    excerpt: bounded_excerpt(&challenger_review),
+                }),
+            });
+        }
 
         if consensus_issues.is_empty() {
-            let contested = extract_tagged(&challenger_review, "FALSE-POSITIVE");
             return Ok(CrossReviewResult {
+                mode: CrossReviewMode::CrossModel,
+                primary_agent_id: primary.id(),
+                challenger_agent_id: Some(challenger_agent_id.clone()),
                 primary_review,
                 challenger_review,
                 consensus_issues: Vec::new(),
                 contested_issues: contested,
                 rounds: rounds_done,
-                final_verdict: "APPROVED".to_string(),
+                final_verdict: CrossReviewVerdict::Approved,
+                protocol_failure: None,
             });
         }
     }
@@ -245,22 +333,84 @@ pub(crate) async fn run_cross_review_with_context(
         .collect();
     let contested_issues = extract_tagged(&challenger_review, "FALSE-POSITIVE");
 
+    // `rounds_done == 1` means the loop never ran (max_rounds <= 1): no
+    // challenger reply exists to judge, so this is neither an approval nor a
+    // protocol failure — fall through to NOT_CONVERGED.
+    if rounds_done > 1 && consensus_issues.is_empty() && contested_issues.is_empty() {
+        if !has_any_tag_prefix(&challenger_review) {
+            return Ok(CrossReviewResult {
+                mode: CrossReviewMode::CrossModel,
+                primary_agent_id: primary.id(),
+                challenger_agent_id: Some(challenger_agent_id),
+                primary_review,
+                challenger_review: challenger_review.clone(),
+                consensus_issues: Vec::new(),
+                contested_issues: Vec::new(),
+                rounds: rounds_done,
+                final_verdict: CrossReviewVerdict::ProtocolFailure,
+                protocol_failure: Some(ProtocolFailure {
+                    round: rounds_done,
+                    excerpt: bounded_excerpt(&challenger_review),
+                }),
+            });
+        }
+        // Tags were present but all bodies were empty: parseable reply with
+        // no findings — an approving round, not a failure.
+        return Ok(CrossReviewResult {
+            mode: CrossReviewMode::CrossModel,
+            primary_agent_id: primary.id(),
+            challenger_agent_id: Some(challenger_agent_id),
+            primary_review,
+            challenger_review,
+            consensus_issues: Vec::new(),
+            contested_issues: Vec::new(),
+            rounds: rounds_done,
+            final_verdict: CrossReviewVerdict::Approved,
+            protocol_failure: None,
+        });
+    }
+
     Ok(CrossReviewResult {
+        mode: CrossReviewMode::CrossModel,
+        primary_agent_id: primary.id(),
+        challenger_agent_id: Some(challenger_agent_id),
         primary_review,
         challenger_review,
         consensus_issues,
         contested_issues,
         rounds: rounds_done,
-        final_verdict: "NOT_CONVERGED".to_string(),
+        final_verdict: CrossReviewVerdict::NotConverged,
+        protocol_failure: None,
     })
 }
 
-fn verdict_for(issues: &[String]) -> String {
-    if issues.is_empty() {
-        "APPROVED".to_string()
-    } else {
-        "NOT_CONVERGED".to_string()
+/// Identity guard (GH-1767): a challenger resolving to the same agent
+/// identity as the primary is no challenger at all — degrade instead of
+/// "reviewing" with a single model twice.
+fn distinct_challenger(
+    primary: &Arc<dyn CodeAgent>,
+    challenger: Option<Arc<dyn CodeAgent>>,
+) -> Option<Arc<dyn CodeAgent>> {
+    challenger.filter(|candidate| candidate.id() != primary.id())
+}
+
+/// True when any line carries one of the three protocol tag prefixes, even
+/// with an empty body (which `extract_tagged` filters out).
+fn has_any_tag_prefix(output: &str) -> bool {
+    output.lines().map(str::trim).any(|line| {
+        line.starts_with("CONFIRMED:")
+            || line.starts_with("MISSED:")
+            || line.starts_with("FALSE-POSITIVE:")
+    })
+}
+
+fn bounded_excerpt(reply: &str) -> String {
+    let mut chars = reply.chars();
+    let mut excerpt: String = chars.by_ref().take(PROTOCOL_FAILURE_EXCERPT_MAX).collect();
+    if chars.next().is_some() {
+        excerpt.push('…');
     }
+    excerpt
 }
 
 fn extract_tagged(output: &str, tag: &str) -> Vec<String> {
@@ -480,7 +630,11 @@ mod tests {
 
         assert_eq!(result.consensus_issues, vec!["Missing error handling"]);
         assert_eq!(result.contested_issues, vec!["Unbounded loop"]);
-        assert_eq!(result.final_verdict, "NOT_CONVERGED");
+        assert_eq!(result.final_verdict, CrossReviewVerdict::NotConverged);
+        assert_eq!(result.mode, CrossReviewMode::CrossModel);
+        assert_eq!(result.primary_agent_id, "primary");
+        assert_eq!(result.challenger_agent_id.as_deref(), Some("challenger"));
+        assert!(result.protocol_failure.is_none());
         assert!(result.rounds >= 1);
     }
 
@@ -504,7 +658,9 @@ mod tests {
             result.consensus_issues,
             vec!["Missing error handling", "Unbounded loop"]
         );
-        assert_eq!(result.final_verdict, "NOT_CONVERGED");
+        assert_eq!(result.final_verdict, CrossReviewVerdict::NotConverged);
+        assert_eq!(result.mode, CrossReviewMode::SingleModelDegraded);
+        assert_eq!(result.challenger_agent_id, None);
     }
 
     #[tokio::test]
@@ -521,7 +677,9 @@ mod tests {
         .await
         .expect("lgtm path should succeed");
 
-        assert_eq!(result.final_verdict, "APPROVED");
+        // A clean single-model review degrades; it is never full approval.
+        assert_eq!(result.final_verdict, CrossReviewVerdict::ApprovedDegraded);
+        assert_eq!(result.mode, CrossReviewMode::SingleModelDegraded);
         assert!(result.consensus_issues.is_empty());
     }
 
@@ -683,6 +841,127 @@ mod tests {
         assert_eq!(
             result.primary_review,
             "ISSUE: Missing error handling\nISSUE: Unbounded loop"
+        );
+    }
+    struct TaglessChallenger;
+
+    #[async_trait::async_trait]
+    impl CodeAgent for TaglessChallenger {
+        fn name(&self) -> &str {
+            "tagless-challenger"
+        }
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+        async fn execute(&self, _req: AgentRequest) -> HarnessResult<AgentResponse> {
+            Ok(AgentResponse {
+                output: "The primary review looks mostly fine to me.".to_string(),
+                stderr: String::new(),
+                items: vec![],
+                token_usage: TokenUsage::default(),
+                model: "mock".to_string(),
+                exit_code: Some(0),
+            })
+        }
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: Sender<StreamItem>,
+        ) -> HarnessResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tagless_challenger_reply_is_protocol_failure_not_approval() {
+        let proj = proj_dir();
+        let result = run_cross_review(
+            Arc::new(PrimaryMock),
+            Some(Arc::new(TaglessChallenger)),
+            proj.path().to_path_buf(),
+            "fn foo() {}".to_string(),
+            3,
+            None,
+        )
+        .await
+        .expect("protocol failure is a verdict, not an error");
+
+        assert_eq!(result.final_verdict, CrossReviewVerdict::ProtocolFailure);
+        assert_eq!(result.mode, CrossReviewMode::CrossModel);
+        let failure = result.protocol_failure.expect("failure detail recorded");
+        assert_eq!(failure.round, 2);
+        assert!(failure.excerpt.contains("looks mostly fine"));
+        assert!(result.consensus_issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn false_positive_only_reply_is_a_valid_approving_round() {
+        let proj = proj_dir();
+        let result = run_cross_review(
+            Arc::new(PrimaryMock),
+            Some(Arc::new(CapturingChallenger {
+                prompts: Arc::new(Mutex::new(Vec::new())),
+            })),
+            proj.path().to_path_buf(),
+            "fn foo() {}".to_string(),
+            3,
+            None,
+        )
+        .await
+        .expect("false-positive-only round should succeed");
+
+        assert_eq!(result.final_verdict, CrossReviewVerdict::Approved);
+        assert_eq!(result.contested_issues, vec!["Missing error handling"]);
+        assert!(result.protocol_failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn single_round_with_challenger_is_not_a_protocol_failure() {
+        let proj = proj_dir();
+        let result = run_cross_review(
+            Arc::new(PrimaryMock),
+            Some(Arc::new(ChallengerMock)),
+            proj.path().to_path_buf(),
+            "fn foo() {}".to_string(),
+            1,
+            None,
+        )
+        .await
+        .expect("single-round review should succeed");
+
+        assert_eq!(result.rounds, 1);
+        assert_eq!(result.final_verdict, CrossReviewVerdict::NotConverged);
+        assert!(result.protocol_failure.is_none());
+    }
+
+    #[test]
+    fn identity_guard_drops_same_identity_challenger() {
+        let primary: Arc<dyn CodeAgent> = Arc::new(PrimaryMock);
+        let same: Arc<dyn CodeAgent> = Arc::new(PrimaryMock);
+        let distinct: Arc<dyn CodeAgent> = Arc::new(ChallengerMock);
+
+        assert!(distinct_challenger(&primary, Some(same)).is_none());
+        assert!(distinct_challenger(&primary, Some(distinct)).is_some());
+        assert!(distinct_challenger(&primary, None).is_none());
+    }
+
+    #[test]
+    fn verdict_serializes_as_legacy_uppercase_strings() {
+        assert_eq!(
+            serde_json::to_value(CrossReviewVerdict::Approved).unwrap(),
+            "APPROVED"
+        );
+        assert_eq!(
+            serde_json::to_value(CrossReviewVerdict::ApprovedDegraded).unwrap(),
+            "APPROVED_DEGRADED"
+        );
+        assert_eq!(
+            serde_json::to_value(CrossReviewVerdict::NotConverged).unwrap(),
+            "NOT_CONVERGED"
+        );
+        assert_eq!(
+            serde_json::to_value(CrossReviewVerdict::ProtocolFailure).unwrap(),
+            "PROTOCOL_FAILURE"
         );
     }
 }
