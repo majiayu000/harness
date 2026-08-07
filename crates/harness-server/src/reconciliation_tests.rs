@@ -168,17 +168,11 @@ async fn record_issue_ready_to_merge(
         )
         .await?;
     issue_store
-        .record_ready_to_merge_with_fallback(
+        .record_ready_to_merge(
             project_id,
             Some("owner/repo"),
             pr_number,
             Some("ready to merge before reconciliation"),
-            harness_workflow::issue_lifecycle::ReviewFallbackSnapshot {
-                tier: harness_workflow::issue_lifecycle::ReviewFallbackTier::C,
-                trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger::Silence,
-                active_bot: Some("codex".to_string()),
-                activated_at: chrono::Utc::now(),
-            },
         )
         .await?;
     Ok(())

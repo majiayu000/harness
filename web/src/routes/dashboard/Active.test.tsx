@@ -192,7 +192,6 @@ describe("<Active>", () => {
       workflow: {
         state: "ready_to_merge",
         pr_number: 123,
-        review_fallback: { tier: "c", trigger: "silence", active_bot: "codex", activated_at: "2026-04-30T00:00:00Z" },
       },
     };
     mockUseTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
@@ -200,8 +199,6 @@ describe("<Active>", () => {
     wrap(<Active projectFilter="harness" />);
 
     expect(screen.getByText("wf Ready To Merge")).toBeInTheDocument();
-    expect(screen.getByText("tier C")).toBeInTheDocument();
-    expect(screen.getByText("fallback: silence")).toBeInTheDocument();
     expect(columnCount("Ready")).toBe("1");
 
     expect(screen.queryByRole("button", { name: "Merge" })).not.toBeInTheDocument();

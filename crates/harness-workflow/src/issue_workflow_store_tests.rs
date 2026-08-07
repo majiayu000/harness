@@ -1,8 +1,5 @@
 use super::{with_feedback_claim_event_override, IssueMergeApprovalOutcome, IssueWorkflowStore};
-use crate::issue_lifecycle::{
-    IssueLifecycleEventKind, IssueLifecycleState, ReviewFallbackSnapshot, ReviewFallbackTier,
-    ReviewFallbackTrigger,
-};
+use crate::issue_lifecycle::{IssueLifecycleEventKind, IssueLifecycleState};
 use chrono::Utc;
 
 async fn open_test_store() -> anyhow::Result<Option<IssueWorkflowStore>> {
@@ -519,88 +516,6 @@ async fn issue_workflow_store_reports_illegal_transition() -> anyhow::Result<()>
     Ok(())
 }
 
-#[tokio::test]
-async fn record_ready_to_merge_with_fallback_persists_snapshot() -> anyhow::Result<()> {
-    let Some(store) = open_test_store().await? else {
-        return Ok(());
-    };
-    let project_id = "/tmp/project-ready-fallback";
-    store
-        .record_issue_scheduled(project_id, Some("owner/repo"), 21, "task-1", &[], false)
-        .await?;
-    store
-        .record_pr_detected(
-            project_id,
-            Some("owner/repo"),
-            21,
-            "task-1",
-            121,
-            "https://github.com/owner/repo/pull/121",
-        )
-        .await?;
-    let activated_at = Utc::now();
-    let workflow = store
-        .record_ready_to_merge_with_fallback(
-            project_id,
-            Some("owner/repo"),
-            121,
-            Some("fallback via silence"),
-            fallback_snapshot(ReviewFallbackTrigger::Silence, activated_at),
-        )
-        .await?
-        .expect("workflow");
-
-    assert_eq!(workflow.state, IssueLifecycleState::ReadyToMerge);
-    assert_eq!(
-        workflow.review_fallback,
-        Some(fallback_snapshot(
-            ReviewFallbackTrigger::Silence,
-            activated_at
-        ))
-    );
-    assert_eq!(
-        workflow.last_event.and_then(|event| event.detail),
-        Some("fallback via silence".to_string())
-    );
-    let retried = store
-        .record_ready_to_merge_with_fallback(
-            project_id,
-            Some("owner/repo"),
-            121,
-            Some("retry"),
-            fallback_snapshot(ReviewFallbackTrigger::Silence, Utc::now()),
-        )
-        .await?
-        .expect("workflow");
-    assert_eq!(
-        retried.review_fallback.expect("fallback").activated_at,
-        activated_at
-    );
-    store
-        .record_ready_to_merge_with_fallback(
-            project_id,
-            Some("owner/repo"),
-            121,
-            Some("conflict"),
-            fallback_snapshot(ReviewFallbackTrigger::GeminiQuota, Utc::now()),
-        )
-        .await
-        .expect_err("different fallback identity must fail");
-    Ok(())
-}
-
-fn fallback_snapshot(
-    trigger: ReviewFallbackTrigger,
-    activated_at: chrono::DateTime<Utc>,
-) -> ReviewFallbackSnapshot {
-    ReviewFallbackSnapshot {
-        tier: ReviewFallbackTier::C,
-        trigger,
-        active_bot: Some("codex".into()),
-        activated_at,
-    }
-}
-
 async fn required_test_store() -> anyhow::Result<IssueWorkflowStore> {
     let configured = std::env::var("HARNESS_DATABASE_URL").map_err(|_| {
         anyhow::anyhow!(
@@ -668,15 +583,9 @@ async fn issue_workflow_store_metadata_requires_valid_transition() -> anyhow::Re
         .expect("workflow");
     assert_eq!(after, before);
     store
-        .record_ready_to_merge_with_fallback(
-            project,
-            Some("owner/repo"),
-            201,
-            Some("late fallback"),
-            fallback_snapshot(ReviewFallbackTrigger::AllBotsQuota, Utc::now()),
-        )
+        .record_ready_to_merge(project, Some("owner/repo"), 201, Some("late mergeable"))
         .await
-        .expect_err("fallback metadata must be applied only after transition validation");
+        .expect_err("mergeable event must be rejected on a terminal workflow");
     assert_eq!(
         store
             .get_by_issue(project, Some("owner/repo"), 101)

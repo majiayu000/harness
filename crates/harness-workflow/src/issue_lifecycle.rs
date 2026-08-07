@@ -98,34 +98,6 @@ pub enum IssueMergeMethod {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReviewFallbackSnapshot {
-    pub tier: ReviewFallbackTier,
-    pub trigger: ReviewFallbackTrigger,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_bot: Option<String>,
-    pub activated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ReviewFallbackTier {
-    #[serde(rename = "a")]
-    A,
-    #[serde(rename = "b")]
-    B,
-    #[serde(rename = "c")]
-    C,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewFallbackTrigger {
-    GeminiQuota,
-    CodexQuota,
-    AllBotsQuota,
-    Silence,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssueLifecycleEvent {
     pub kind: IssueLifecycleEventKind,
     pub at: DateTime<Utc>,
@@ -219,8 +191,6 @@ pub struct IssueWorkflowInstance {
     pub plan_concern: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feedback_claimed_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_fallback: Option<ReviewFallbackSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event: Option<IssueLifecycleEvent>,
     pub created_at: DateTime<Utc>,
@@ -252,7 +222,6 @@ impl IssueWorkflowInstance {
             force_execute: false,
             plan_concern: None,
             feedback_claimed_at: None,
-            review_fallback: None,
             last_event: None,
             created_at: now,
             updated_at: now,
@@ -266,31 +235,6 @@ impl IssueWorkflowInstance {
     ) -> Result<(), IssueLifecycleTransitionError> {
         let decision = self.transition_decision(&event)?;
         self.apply_accepted_event(event, decision);
-        Ok(())
-    }
-
-    #[must_use = "state transitions can fail and the resulting error must be handled"]
-    pub(crate) fn apply_event_with_review_fallback(
-        &mut self,
-        event: IssueLifecycleEvent,
-        fallback: ReviewFallbackSnapshot,
-    ) -> Result<(), IssueLifecycleTransitionError> {
-        let decision = self.transition_decision(&event)?;
-        if event.kind != IssueLifecycleEventKind::Mergeable
-            || self
-                .review_fallback
-                .as_ref()
-                .is_some_and(|stored| !stored.has_same_logical_identity(&fallback))
-        {
-            return Err(self.transition_error(
-                event.kind,
-                IssueLifecycleTransitionErrorReason::BindingConflict,
-            ));
-        }
-        self.apply_accepted_event(event, decision);
-        if self.review_fallback.is_none() {
-            self.review_fallback = Some(fallback);
-        }
         Ok(())
     }
 
@@ -439,21 +383,17 @@ impl IssueWorkflowInstance {
         match decision.metadata_effect {
             Effect::DependenciesDetected => {
                 self.active_task_id = None;
-                self.review_fallback = None;
             }
             Effect::IssueScheduled | Effect::ImplementStarted => {
                 fill(&mut self.active_task_id, &event.task_id);
-                self.review_fallback = None;
             }
             Effect::PlanIssueDetected => {
                 fill(&mut self.active_task_id, &event.task_id);
                 self.plan_concern = event.detail.clone();
-                self.review_fallback = None;
             }
             Effect::PrDetected => {
                 fill(&mut self.active_task_id, &event.task_id);
                 self.fill_pr_bindings(&event);
-                self.review_fallback = None;
             }
             Effect::FeedbackFound => {
                 self.active_task_id = None;
@@ -463,13 +403,11 @@ impl IssueWorkflowInstance {
             Effect::FeedbackTaskScheduled => {
                 fill(&mut self.active_task_id, &event.task_id);
                 self.feedback_claimed_at = None;
-                self.review_fallback = None;
                 self.fill_pr_bindings(&event);
             }
             Effect::FeedbackSweepCompleted | Effect::NoFeedbackFound => {
                 self.active_task_id = None;
                 self.feedback_claimed_at = None;
-                self.review_fallback = None;
             }
             Effect::Mergeable => {
                 self.active_task_id = None;
@@ -550,11 +488,6 @@ impl IssueWorkflowInstance {
         fill(&mut self.pr_head_sha, &event.pr_head_sha);
     }
 
-    pub fn set_review_fallback(&mut self, fallback: Option<ReviewFallbackSnapshot>) {
-        self.review_fallback = fallback;
-        self.updated_at = Utc::now();
-    }
-
     pub fn set_issue_url(&mut self, issue_url: Option<String>) {
         self.issue_url = issue_url;
         self.updated_at = Utc::now();
@@ -584,14 +517,6 @@ impl IssueWorkflowInstance {
 impl IssueLifecycleState {
     fn is_nonterminal(self) -> bool {
         !matches!(self, Self::Done | Self::Failed | Self::Cancelled)
-    }
-}
-
-impl ReviewFallbackSnapshot {
-    fn has_same_logical_identity(&self, other: &Self) -> bool {
-        self.tier == other.tier
-            && self.trigger == other.trigger
-            && self.active_bot == other.active_bot
     }
 }
 
@@ -727,33 +652,6 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(wf.state, IssueLifecycleState::Done);
-    }
-
-    #[test]
-    fn mergeable_preserves_existing_review_fallback_snapshot() {
-        let mut wf = IssueWorkflowInstance::new("/tmp/p", Some("owner/repo".to_string()), 4);
-        wf.state = IssueLifecycleState::PrOpen;
-        let activated_at = Utc::now();
-        wf.set_review_fallback(Some(ReviewFallbackSnapshot {
-            tier: ReviewFallbackTier::C,
-            trigger: ReviewFallbackTrigger::Silence,
-            active_bot: Some("codex".to_string()),
-            activated_at,
-        }));
-
-        wf.apply_event(IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable))
-            .unwrap();
-
-        assert_eq!(wf.state, IssueLifecycleState::ReadyToMerge);
-        assert_eq!(
-            wf.review_fallback,
-            Some(ReviewFallbackSnapshot {
-                tier: ReviewFallbackTier::C,
-                trigger: ReviewFallbackTrigger::Silence,
-                active_bot: Some("codex".to_string()),
-                activated_at,
-            })
-        );
     }
 
     #[test]

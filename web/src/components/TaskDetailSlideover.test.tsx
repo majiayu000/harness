@@ -105,12 +105,6 @@ describe("TaskDetailSlideover", () => {
       workflow: {
         state: "ready_to_merge",
         pr_number: 42,
-        review_fallback: {
-          tier: "c",
-          trigger: "all_bots_quota",
-          active_bot: "codex",
-          activated_at: "2026-04-30T00:00:00Z",
-        },
       },
     });
     mockUseTaskDetail.mockReturnValue({ data: task, isLoading: false, isError: false });
@@ -119,9 +113,6 @@ describe("TaskDetailSlideover", () => {
     expect(screen.getAllByText("implementing").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("owner/repo")).toBeInTheDocument();
     expect(screen.getByText("Fix the bug")).toBeInTheDocument();
-    expect(screen.getByText("C")).toBeInTheDocument();
-    expect(screen.getByText("all bots quota")).toBeInTheDocument();
-    expect(screen.getByText("codex")).toBeInTheDocument();
   });
 
   // ── SSE output tab ────────────────────────────────────────────────────────
