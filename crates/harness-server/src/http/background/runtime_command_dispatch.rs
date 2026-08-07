@@ -164,17 +164,14 @@ async fn dispatch_runtime_command_with_project_policy(
     let repo = command_repo_hint(store, &command).await?;
     let activity = command.command.runtime_activity_key().to_string();
     let dispatch_gate_fact_hash = command_dispatch_gate_fact_hash(&command);
+    let workflow_cfg =
+        load_runtime_workflow_config(&project_root, "workflow runtime command dispatcher")?;
     let outcome = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
         .with_isolation_config(isolation_config)
         .with_isolation_availability(state.isolation_availability.clone())
         .with_dispatcher_id(dispatch_owner)
-        .with_defer_backoff(dispatch_backoff(
-            &load_runtime_workflow_config(
-                &project_root,
-                "workflow runtime command dispatcher backoff",
-            )?
-            .runtime_dispatch,
-        )?)
+        .with_defer_backoff(dispatch_backoff(&workflow_cfg.runtime_dispatch)?)
+        .with_budget_policy(workflow_cfg.runtime_budget_policy)
         .dispatch_command(command)
         .await?;
     record_runtime_agent_dispatch_counter(
@@ -491,6 +488,44 @@ fn expand_home_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Pool starvation probe (GH-1895): after N consecutive empty dispatcher
+/// ticks, decide between "no work exists" (idle, log only) and "work exists
+/// but is gated" (starvation: warn and raise `runtime_pool_starved` through
+/// the GH-1582 alerting channel).
+async fn probe_pool_starvation(state: &Arc<AppState>, empty_ticks: u32) {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return;
+    };
+    let snapshot = match store.dispatch_pool_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!("pool starvation probe could not read the dispatch pool: {error}");
+            return;
+        }
+    };
+    if !snapshot.has_gated_work() {
+        tracing::debug!(
+            empty_ticks,
+            "runtime pool has no dispatchable and no gated work (idle)"
+        );
+        return;
+    }
+    tracing::warn!(
+        empty_ticks,
+        deferred_commands = snapshot.deferred_commands,
+        gated_workflows = snapshot.gated_workflows,
+        pending_commands = snapshot.pending_commands,
+        "runtime pool starved: work exists but nothing has dispatched"
+    );
+    state
+        .observability
+        .alerts
+        .raise(crate::alerting::producers::runtime_pool_starved(
+            empty_ticks,
+            &snapshot,
+        ));
+}
+
 pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
     if state.core.workflow_runtime_store.is_none() {
         tracing::debug!("workflow runtime command dispatcher disabled: store unavailable");
@@ -498,6 +533,9 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
     }
 
     let weak_state = Arc::downgrade(state);
+    let mut starvation = crate::alerting::producers::PoolStarvationTracker::new(
+        state.core.server.config.alerting.pool_starvation_ticks,
+    );
     tokio::spawn(async move {
         loop {
             let state = match weak_state.upgrade() {
@@ -556,15 +594,20 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
             )
             .await
             {
-                Ok(tick) if tick.touched_anything() => {
-                    tracing::info!(
-                        enqueued = tick.enqueued,
-                        already_dispatched = tick.already_dispatched,
-                        skipped = tick.skipped,
-                        "workflow runtime command dispatcher tick complete"
-                    );
+                Ok(tick) => {
+                    if tick.touched_anything() {
+                        tracing::info!(
+                            enqueued = tick.enqueued,
+                            already_dispatched = tick.already_dispatched,
+                            skipped = tick.skipped,
+                            "workflow runtime command dispatcher tick complete"
+                        );
+                    }
+                    let dispatched_any = tick.enqueued > 0 || tick.already_dispatched > 0;
+                    if let Some(empty_ticks) = starvation.observe_tick(dispatched_any) {
+                        probe_pool_starvation(&state, empty_ticks).await;
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => {
                     tracing::warn!("workflow runtime command dispatcher tick failed: {e}");
                 }

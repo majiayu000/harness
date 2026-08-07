@@ -24,6 +24,7 @@ pub enum AlertClass {
     ReconciliationAnomaly,
     ReadyToMergeAging,
     NotifyChannelDrop,
+    RuntimePoolStarved,
 }
 
 impl AlertClass {
@@ -37,6 +38,7 @@ impl AlertClass {
             AlertClass::ReconciliationAnomaly => "reconciliation_anomaly",
             AlertClass::ReadyToMergeAging => "ready_to_merge_aging",
             AlertClass::NotifyChannelDrop => "notify_channel_drop",
+            AlertClass::RuntimePoolStarved => "runtime_pool_starved",
         }
     }
 }

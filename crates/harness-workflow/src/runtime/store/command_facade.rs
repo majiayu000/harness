@@ -1,6 +1,50 @@
 use super::*;
 
+/// Point-in-time dispatch pool state used by the starvation probe (GH-1895):
+/// distinguishes "no work exists" from "work exists but is gated".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchPoolSnapshot {
+    pub pending_commands: u64,
+    pub deferred_commands: u64,
+    pub dispatched_commands: u64,
+    pub gated_workflows: u64,
+}
+
+impl DispatchPoolSnapshot {
+    /// True when undispatchable work is sitting in the pool: deferred
+    /// commands behind a dispatch barrier, or workflows parked in a gated
+    /// state. This is the starvation case; an all-zero snapshot is idle.
+    pub fn has_gated_work(&self) -> bool {
+        self.deferred_commands > 0 || self.gated_workflows > 0
+    }
+}
+
 impl WorkflowRuntimeStore {
+    /// Count commands by dispatch status plus workflows parked in gated
+    /// states (`blocked`, `awaiting_feedback`).
+    pub async fn dispatch_pool_snapshot(&self) -> anyhow::Result<DispatchPoolSnapshot> {
+        let (pending, deferred, dispatched): (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE status = 'pending'),
+                    COUNT(*) FILTER (WHERE status = 'deferred'),
+                    COUNT(*) FILTER (WHERE status = 'dispatched')
+             FROM workflow_commands",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let (gated_workflows,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM workflow_instances
+             WHERE state IN ('blocked', 'awaiting_feedback')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(DispatchPoolSnapshot {
+            pending_commands: pending.max(0) as u64,
+            deferred_commands: deferred.max(0) as u64,
+            dispatched_commands: dispatched.max(0) as u64,
+            gated_workflows: gated_workflows.max(0) as u64,
+        })
+    }
+
     pub async fn enqueue_command(
         &self,
         workflow_id: &str,

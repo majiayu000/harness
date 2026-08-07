@@ -45,6 +45,8 @@ mod workspace_create;
 pub(crate) mod workspace_helpers;
 #[path = "workspace_reconcile.rs"]
 mod workspace_reconcile;
+#[path = "workspace_worktree_add.rs"]
+mod workspace_worktree_add;
 
 pub(crate) use workspace_helpers::run_hook;
 use workspace_helpers::*;
