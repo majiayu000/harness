@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::issue_lifecycle::{
     is_feedback_claim_placeholder, legacy_schema_for_path, workflow_id, IssueLifecycleEvent,
-    IssueLifecycleEventKind, IssueLifecycleState, IssueWorkflowInstance, ReviewFallbackSnapshot,
+    IssueLifecycleEventKind, IssueLifecycleState, IssueWorkflowInstance,
     FEEDBACK_CLAIM_TASK_PREFIX,
 };
 
@@ -408,20 +408,19 @@ impl IssueWorkflowStore {
         .await
     }
 
-    pub async fn record_ready_to_merge_with_fallback(
+    pub async fn record_ready_to_merge(
         &self,
         project_id: &str,
         repo: Option<&str>,
         pr_number: u64,
         detail: Option<&str>,
-        fallback: ReviewFallbackSnapshot,
     ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
         self.update_by_pr(project_id, repo, pr_number, |workflow| {
             let mut event = IssueLifecycleEvent::new(IssueLifecycleEventKind::Mergeable);
             if let Some(detail) = detail {
                 event = event.with_detail(detail.to_string());
             }
-            Ok(workflow.apply_event_with_review_fallback(event, fallback)?)
+            Ok(workflow.apply_event(event)?)
         })
         .await
     }

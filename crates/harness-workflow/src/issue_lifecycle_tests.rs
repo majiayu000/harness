@@ -1,9 +1,8 @@
 use crate::issue_lifecycle::{
     IssueLifecycleEvent, IssueLifecycleEventKind, IssueLifecycleState,
-    IssueLifecycleTransitionErrorReason, IssueWorkflowInstance, ReviewFallbackSnapshot,
-    ReviewFallbackTier, ReviewFallbackTrigger,
+    IssueLifecycleTransitionErrorReason, IssueWorkflowInstance,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use std::collections::BTreeSet;
 
 #[test]
@@ -43,7 +42,6 @@ fn issue_lifecycle_transition_matrix() {
 #[test]
 fn illegal_issue_lifecycle_transition_preserves_complete_snapshot() {
     let mut workflow = workflow_in(IssueLifecycleState::Done);
-    workflow.review_fallback = Some(fallback(Utc::now()));
     let before = workflow.clone();
     let error = workflow
         .apply_event(matching_event(IssueLifecycleEventKind::PrDetected).with_pr(2, "other"))
@@ -245,15 +243,6 @@ fn matching_event(kind: IssueLifecycleEventKind) -> IssueLifecycleEvent {
     event
 }
 
-fn fallback(activated_at: DateTime<Utc>) -> ReviewFallbackSnapshot {
-    ReviewFallbackSnapshot {
-        tier: ReviewFallbackTier::C,
-        trigger: ReviewFallbackTrigger::Silence,
-        active_bot: Some("codex".into()),
-        activated_at,
-    }
-}
-
 fn assert_binding_conflict_preserves(
     workflow: &mut IssueWorkflowInstance,
     event: IssueLifecycleEvent,
@@ -336,7 +325,6 @@ fn prepare_metadata_fixture(
     use MetadataPolicy as P;
     workflow.updated_at = Utc::now() - Duration::hours(1);
     workflow.feedback_claimed_at = Some(Utc::now() - Duration::minutes(1));
-    workflow.review_fallback = Some(fallback(Utc::now() - Duration::minutes(2)));
     workflow.labels_snapshot = vec!["preserved".into()];
     workflow.plan_concern = Some("old concern".into());
     workflow.last_remote_fact_hash = Some("old-hash".into());
@@ -397,16 +385,10 @@ fn allowed_mutated_fields(policy: MetadataPolicy) -> BTreeSet<String> {
         ["state", "last_event", "updated_at", "last_remote_fact_hash"].map(str::to_string),
     );
     let specific: &[&str] = match policy {
-        P::DependenciesDetected => &["active_task_id", "review_fallback"],
-        P::IssueScheduled | P::ImplementStarted => &["active_task_id", "review_fallback"],
-        P::PlanIssueDetected => &["active_task_id", "plan_concern", "review_fallback"],
-        P::PrDetected => &[
-            "active_task_id",
-            "pr_number",
-            "pr_url",
-            "pr_head_sha",
-            "review_fallback",
-        ],
+        P::DependenciesDetected => &["active_task_id"],
+        P::IssueScheduled | P::ImplementStarted => &["active_task_id"],
+        P::PlanIssueDetected => &["active_task_id", "plan_concern"],
+        P::PrDetected => &["active_task_id", "pr_number", "pr_url", "pr_head_sha"],
         P::FeedbackFound => &[
             "active_task_id",
             "feedback_claimed_at",
@@ -417,13 +399,12 @@ fn allowed_mutated_fields(policy: MetadataPolicy) -> BTreeSet<String> {
         P::FeedbackTaskScheduled => &[
             "active_task_id",
             "feedback_claimed_at",
-            "review_fallback",
             "pr_number",
             "pr_url",
             "pr_head_sha",
         ],
         P::FeedbackSweepCompleted | P::NoFeedbackFound => {
-            &["active_task_id", "feedback_claimed_at", "review_fallback"]
+            &["active_task_id", "feedback_claimed_at"]
         }
         P::Mergeable => &["active_task_id", "feedback_claimed_at", "pr_head_sha"],
         P::MergeStarted => &[
@@ -454,23 +435,19 @@ fn required_mutated_fields(
         fields.insert("state".into());
     }
     let specific: &[&str] = match policy {
-        P::DependenciesDetected => &["active_task_id", "review_fallback"],
+        P::DependenciesDetected => &["active_task_id"],
         P::IssueScheduled | P::ImplementStarted
             if matches!(source, S::Discovered | S::AwaitingDependencies) =>
         {
-            &["active_task_id", "review_fallback"]
+            &["active_task_id"]
         }
-        P::IssueScheduled | P::ImplementStarted => &["review_fallback"],
-        P::PlanIssueDetected => &["plan_concern", "review_fallback"],
-        P::PrDetected if source == S::PrOpen => &["review_fallback"],
-        P::PrDetected if source == S::Discovered => &[
-            "active_task_id",
-            "pr_number",
-            "pr_url",
-            "pr_head_sha",
-            "review_fallback",
-        ],
-        P::PrDetected => &["pr_number", "pr_url", "pr_head_sha", "review_fallback"],
+        P::IssueScheduled | P::ImplementStarted => &[],
+        P::PlanIssueDetected => &["plan_concern"],
+        P::PrDetected if source == S::PrOpen => &[],
+        P::PrDetected if source == S::Discovered => {
+            &["active_task_id", "pr_number", "pr_url", "pr_head_sha"]
+        }
+        P::PrDetected => &["pr_number", "pr_url", "pr_head_sha"],
         P::FeedbackFound => &[
             "active_task_id",
             "feedback_claimed_at",
@@ -481,13 +458,12 @@ fn required_mutated_fields(
         P::FeedbackTaskScheduled => &[
             "active_task_id",
             "feedback_claimed_at",
-            "review_fallback",
             "pr_number",
             "pr_url",
             "pr_head_sha",
         ],
         P::FeedbackSweepCompleted | P::NoFeedbackFound => {
-            &["active_task_id", "feedback_claimed_at", "review_fallback"]
+            &["active_task_id", "feedback_claimed_at"]
         }
         P::Mergeable => &["active_task_id", "feedback_claimed_at", "pr_head_sha"],
         P::MergeStarted if source == S::Merging => &["feedback_claimed_at"],

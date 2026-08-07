@@ -91,16 +91,6 @@ function shouldShowTask(task: Task): boolean {
   return !TERMINAL_STATUSES.has(task.status);
 }
 
-function fallbackTierLabel(tier?: string | null): string | null {
-  if (!tier) return null;
-  return `tier ${tier.toUpperCase()}`;
-}
-
-function fallbackTriggerLabel(trigger?: string | null): string | null {
-  if (!trigger) return null;
-  return trigger.replaceAll("_", " ");
-}
-
 function commandLabel(command: WorkflowRuntimeCommandNode): string {
   const payload = command.command.command;
   const activity =
@@ -408,11 +398,6 @@ function TaskCard({
                 force-execute
               </span>
             ) : null}
-            {workflow.review_fallback ? (
-              <span className="border border-line-3 bg-bg px-1.5 py-[1px] font-mono text-[10px] text-ink">
-                {fallbackTierLabel(workflow.review_fallback.tier)}
-              </span>
-            ) : null}
           </div>
         )}
         <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
@@ -425,14 +410,6 @@ function TaskCard({
             title={workflow.plan_concern}
           >
             concern: {workflow.plan_concern}
-          </div>
-        )}
-        {workflow?.review_fallback && (
-          <div
-            className="mt-1 block font-mono text-[10px] text-ink-3 truncate"
-            title={fallbackTriggerLabel(workflow.review_fallback.trigger) ?? undefined}
-          >
-            fallback: {fallbackTriggerLabel(workflow.review_fallback.trigger)}
           </div>
         )}
       </button>
