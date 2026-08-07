@@ -48,10 +48,22 @@ use structured_output::{
 };
 pub(super) struct ServerRuntimeJobExecutor<'a> {
     pub(super) state: &'a Arc<AppState>,
+    /// Stateful lease-lost signal: `watch` keeps the latest value, so a
+    /// cancellation that fires before the turn loop starts polling is not
+    /// lost (GH-1877).
+    lease_lost: Arc<tokio::sync::watch::Sender<bool>>,
 }
 impl<'a> ServerRuntimeJobExecutor<'a> {
     pub(super) fn new(state: &'a Arc<AppState>) -> Self {
-        Self { state }
+        let (lease_lost, _) = tokio::sync::watch::channel(false);
+        Self {
+            state,
+            lease_lost: Arc::new(lease_lost),
+        }
+    }
+
+    pub(super) fn cancel_lease_lost(&self) {
+        let _ = self.lease_lost.send(true);
     }
 
     pub(super) async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
@@ -225,6 +237,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         },
                         timeout_secs: Some(resolved_settings.timeout_secs),
                         stall_timeout_secs: Some(resolved_settings.stall_timeout_secs),
+                        lease_lost: Some(self.lease_lost.subscribe()),
                         env_vars,
                         allowed_tools: correction_only.then(Vec::new),
                         force_code_agent: force_code_agent || correction_only,

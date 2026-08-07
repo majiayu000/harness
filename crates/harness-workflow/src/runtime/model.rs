@@ -86,6 +86,10 @@ pub struct WorkflowInstance {
     pub data: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_provenance: Option<super::data_provenance::WorkflowDataProvenance>,
+    /// Informational mutation counter, NOT a concurrency guard. All writes go
+    /// through `SELECT ... FOR UPDATE` with an explicit `expected_state`; do
+    /// not use this field for optimistic locking — a writer that does will
+    /// silently lose updates (GH-1877 Cluster B).
     pub version: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease: Option<WorkflowLease>,
