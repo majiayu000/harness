@@ -216,6 +216,7 @@ mod tests {
         drop(db_setup_guard);
 
         Ok(AppState {
+            background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
             core: crate::http::CoreServices {
                 server: server.clone(),
                 project_root: dir.to_path_buf(),

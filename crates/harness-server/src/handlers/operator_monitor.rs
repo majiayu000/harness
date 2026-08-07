@@ -29,6 +29,10 @@ use std::time::Duration;
 use driverless_progress::{list_driverless_progress, DriverlessProgressEvidence};
 pub(crate) use response::{operator_monitor, OperatorMonitorResponse};
 
+/// A background loop whose last tick is older than this is reported stale and
+/// flags the operator health status as degraded (GH-1880).
+const BACKGROUND_LOOP_STALE_SECS: u64 = 900;
+
 #[cfg(test)]
 use axum::http::StatusCode;
 #[cfg(test)]
@@ -66,6 +70,8 @@ struct OperatorHealth {
     uptime_secs: u64,
     runtime_hosts_online: u64,
     runtime_hosts_total: u64,
+    background_loops: Vec<crate::http::background::loop_health::LoopSnapshot>,
+    config_parse_failure: Option<crate::http::background::loop_health::ConfigFailureSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,7 +227,28 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         sample_limit: WORKFLOW_SAMPLE_LIMIT,
         health: OperatorHealth {
             status: health_status,
-            degraded_subsystems,
+            degraded_subsystems: {
+                let mut subsystems = degraded_subsystems;
+                for loop_snapshot in state.background_loops.snapshot(BACKGROUND_LOOP_STALE_SECS) {
+                    if loop_snapshot.stale {
+                        subsystems.push(match loop_snapshot.name {
+                            "orphan_schema_reaper" => "orphan_schema_reaper_stale",
+                            "workflow_watchdog" => "workflow_watchdog_stale",
+                            "runtime_retention" => "runtime_retention_stale",
+                            "task_retention" => "task_retention_stale",
+                            other => {
+                                // Guards against future loop names missing a
+                                // mapping.
+                                Box::leak(format!("background_loop_{other}_stale").into_boxed_str())
+                            }
+                        });
+                    }
+                }
+                if state.background_loops.config_failure_snapshot().is_some() {
+                    subsystems.push("workflow_config_parse_failure");
+                }
+                subsystems
+            },
             runtime_log_state,
             runtime_log_path: state
                 .core
@@ -236,6 +263,8 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
                 .unwrap_or(0),
             runtime_hosts_online: runtime_hosts.iter().filter(|host| host.online).count() as u64,
             runtime_hosts_total: runtime_hosts.len() as u64,
+            background_loops: state.background_loops.snapshot(BACKGROUND_LOOP_STALE_SECS),
+            config_parse_failure: state.background_loops.config_failure_snapshot(),
         },
         activity: OperatorActivity {
             runtime_workflows,

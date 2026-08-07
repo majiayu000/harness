@@ -183,6 +183,7 @@ async fn make_read_only_route_test_state_with_project_root(
     let execution_svc: Arc<dyn ExecutionService> = Arc::new(ReadOnlyRouteExecutionService);
 
     Ok(Arc::new(AppState {
+        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: CoreServices {
             server: server.clone(),
             project_root: project_root.to_path_buf(),

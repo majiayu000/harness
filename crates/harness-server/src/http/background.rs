@@ -18,10 +18,12 @@ use harness_workflow::runtime::{
 use sha2::{Digest, Sha256};
 
 mod auto_recovery;
+pub(crate) mod loop_health;
 mod pr_feedback;
 mod runtime_command_dispatch;
 mod runtime_profiles;
 mod runtime_workers;
+pub(crate) use loop_health::{BackgroundLoopHealth, LoopHandle};
 use runtime_command_dispatch::workflow_project_root;
 use runtime_profiles::{
     persist_runtime_profile_manifest, runtime_default_profile_for_project,
@@ -43,3 +45,29 @@ pub(super) use runtime_command_dispatch::{
 #[cfg(test)]
 pub(super) use runtime_profiles::runtime_profile_manifest_definition;
 pub(super) use runtime_workers::spawn_runtime_job_workers;
+
+/// Load the workflow config for a background loop, reporting parse failures
+/// into the loop-health registry instead of silently degrading (GH-1880).
+///
+/// Every config-reload failure arm converges on this helper so a malformed
+/// WORKFLOW.md surfaces once, at error level, with the affected loop names —
+/// retention, watchdog, and the reaper can no longer fail silently while the
+/// dispatcher keeps running.
+pub(crate) async fn load_workflow_config_for_loop(
+    state: &Arc<crate::http::AppState>,
+    handle: &LoopHandle,
+) -> anyhow::Result<harness_core::config::workflow::WorkflowConfig> {
+    match harness_core::config::workflow::load_workflow_config(&state.core.project_root) {
+        Ok(config) => {
+            handle.tick_ok();
+            // Config recovered: clear the aggregated failure so operators see
+            // the loop return to a healthy state.
+            state.background_loops.clear_config_failure();
+            Ok(config)
+        }
+        Err(error) => {
+            handle.config_failure(&error.to_string());
+            Err(error)
+        }
+    }
+}

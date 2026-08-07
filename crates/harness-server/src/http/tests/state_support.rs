@@ -339,6 +339,7 @@ pub(super) async fn make_test_state_with_project_root(
     );
     drop(db_state_guard);
     Ok(Arc::new(AppState {
+        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: crate::http::CoreServices {
             server,
             project_root: project_root.to_path_buf(),
@@ -474,6 +475,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         vec![],
     );
     Ok(Arc::new(AppState {
+        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: crate::http::CoreServices {
             server: state.core.server.clone(),
             project_root: state.core.project_root.clone(),
