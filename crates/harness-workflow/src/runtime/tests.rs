@@ -53,6 +53,7 @@ include!("tests/worker_limits.rs");
 include!("tests/durable_store.rs");
 include!("tests/prompt_continuation_store.rs");
 include!("tests/command_dispatcher.rs");
+include!("tests/command_dispatcher_budget.rs");
 include!("tests/command_store.rs");
 include!("tests/deferred_dispatch.rs");
 include!("tests/deferred_dispatch_review.rs");

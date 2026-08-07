@@ -58,6 +58,7 @@ pub enum DispatchBarrierReasonCode {
     RuntimePolicyDisabled,
     WorkflowConfigInvalid,
     IsolationTierUnavailable,
+    WorkflowBudgetExhausted,
 }
 
 impl DispatchBarrierReasonCode {
@@ -66,6 +67,7 @@ impl DispatchBarrierReasonCode {
             Self::RuntimePolicyDisabled => "runtime_policy_disabled",
             Self::WorkflowConfigInvalid => "workflow_config_invalid",
             Self::IsolationTierUnavailable => "isolation_tier_unavailable",
+            Self::WorkflowBudgetExhausted => "workflow_budget_exhausted",
         }
     }
 }
@@ -213,6 +215,7 @@ impl DispatchBarrier {
             }
             DispatchBarrierReasonCode::RuntimePolicyDisabled
             | DispatchBarrierReasonCode::WorkflowConfigInvalid
+            | DispatchBarrierReasonCode::WorkflowBudgetExhausted
                 if self.required_tier.is_some() || self.trust_class.is_some() =>
             {
                 anyhow::bail!("non-isolation barrier must not include isolation evidence")
@@ -444,6 +447,35 @@ mod tests {
             Utc::now(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn budget_barrier_rejects_isolation_evidence() {
+        let result = DispatchBarrier::new(
+            DispatchBarrierReasonCode::WorkflowBudgetExhausted,
+            "spent 15.00 of 15.00 USD",
+            "/project",
+            "command",
+            "workflow",
+            Some("container".to_string()),
+            None,
+            "owner",
+            1,
+            1,
+            Utc::now(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn budget_barrier_reason_code_serializes_as_workflow_budget_exhausted() {
+        assert_eq!(
+            DispatchBarrierReasonCode::WorkflowBudgetExhausted.as_str(),
+            "workflow_budget_exhausted"
+        );
+        let json = serde_json::to_string(&DispatchBarrierReasonCode::WorkflowBudgetExhausted)
+            .expect("reason code serializes");
+        assert_eq!(json, "\"workflow_budget_exhausted\"");
     }
 
     #[test]

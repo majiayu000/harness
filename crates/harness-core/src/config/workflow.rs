@@ -3,12 +3,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod budget;
 mod candidates;
 mod defaults;
 mod intake_binding;
 mod reserved_keys;
 mod runtime_completion;
 mod storage;
+pub use budget::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 pub use candidates::WorkflowCandidatesPolicy;
 use defaults::*;
 pub use intake_binding::{IntakeFilterPolicy, WorkflowDefinitionIntakePolicy};
@@ -366,6 +368,8 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub runtime_retry_policy: RuntimeRetryPolicy,
     #[serde(default)]
+    pub runtime_budget_policy: RuntimeBudgetPolicy,
+    #[serde(default)]
     pub memory: WorkflowMemoryPolicy,
     #[serde(default)]
     pub candidates: WorkflowCandidatesPolicy,
@@ -708,6 +712,7 @@ pub(super) fn load_workflow_document_with_base(
         definition.validate_identifiers()?;
     }
     config.runtime_dispatch.apply_default_activity_profiles();
+    config.runtime_budget_policy.validate()?;
     let defer_floor = config.runtime_dispatch.defer_backoff_secs;
     let defer_ceiling = config.runtime_dispatch.defer_backoff_max_secs;
     let chrono_seconds = |seconds: u64| {

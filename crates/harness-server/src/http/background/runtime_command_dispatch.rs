@@ -157,17 +157,14 @@ async fn dispatch_runtime_command_with_project_policy(
     let repo = command_repo_hint(store, &command).await?;
     let activity = command.command.runtime_activity_key().to_string();
     let dispatch_gate_fact_hash = command_dispatch_gate_fact_hash(&command);
+    let workflow_cfg =
+        load_runtime_workflow_config(&project_root, "workflow runtime command dispatcher")?;
     let outcome = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
         .with_isolation_config(isolation_config)
         .with_isolation_availability(state.isolation_availability.clone())
         .with_dispatcher_id(dispatch_owner)
-        .with_defer_backoff(dispatch_backoff(
-            &load_runtime_workflow_config(
-                &project_root,
-                "workflow runtime command dispatcher backoff",
-            )?
-            .runtime_dispatch,
-        )?)
+        .with_defer_backoff(dispatch_backoff(&workflow_cfg.runtime_dispatch)?)
+        .with_budget_policy(workflow_cfg.runtime_budget_policy)
         .dispatch_command(command)
         .await?;
     record_runtime_agent_dispatch_counter(
