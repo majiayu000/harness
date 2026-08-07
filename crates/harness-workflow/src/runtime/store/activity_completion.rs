@@ -377,3 +377,56 @@ fn command_status_for_activity(status: ActivityStatus) -> WorkflowCommandStatus 
         ActivityStatus::Cancelled => WorkflowCommandStatus::Cancelled,
     }
 }
+
+impl WorkflowRuntimeStore {
+    /// Durably record a completed activity result that the worker can no
+    /// longer commit because its job lease expired or was reclaimed
+    /// (GH-1878). The payload — result plus optional transcript — lands in
+    /// `runtime_job_completions_dlq` instead of being dropped, so no finished
+    /// agent work vanishes silently; reconciliation can decide later whether
+    /// the result is still applicable or the job must re-run.
+    pub async fn record_lease_expired_completion(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        lease_expires_at: DateTime<Utc>,
+        result: &ActivityResult,
+        transcript: Option<&crate::runtime::transcript::PendingRuntimeTranscript>,
+    ) -> anyhow::Result<()> {
+        let transcript_json = transcript
+            .map(|pending| serde_json::to_value(&pending.record))
+            .transpose()?;
+        // The DLQ holds at most one record per job (id = runtime_job_id):
+        // a later re-expiry of the same job keeps the first record, which
+        // represents the same turn's final result, and reconciliation sees
+        // exactly one pending decision per job.
+        let inserted = sqlx::query(
+            "INSERT INTO runtime_job_completions_dlq
+                (id, runtime_job_id, owner, lease_expires_at, result, transcript)
+             VALUES ($1, $1, $2, $3, $4::jsonb, $5::jsonb)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(runtime_job_id)
+        .bind(owner)
+        .bind(lease_expires_at)
+        .bind(serde_json::to_value(result)?)
+        .bind(transcript_json)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Ok(());
+        }
+        self.record_runtime_event(
+            runtime_job_id,
+            "LeaseExpiredCompletionRecorded",
+            serde_json::json!({
+                "owner": owner,
+                "lease_expires_at": lease_expires_at,
+                "applied": false,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+}

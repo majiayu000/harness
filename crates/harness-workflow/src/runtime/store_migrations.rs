@@ -625,4 +625,22 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               CREATE INDEX IF NOT EXISTS idx_runtime_usage_events_agent_run
               ON runtime_usage_events (agent_run_id)",
     },
+    Migration {
+        version: 26,
+        description: "dead-letter completed activity results rejected by lease ownership",
+        sql: "CREATE TABLE IF NOT EXISTS runtime_job_completions_dlq (
+                id TEXT PRIMARY KEY,
+                runtime_job_id TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                lease_expires_at TIMESTAMPTZ NOT NULL,
+                result JSONB NOT NULL,
+                transcript JSONB,
+                recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                applied BOOLEAN NOT NULL DEFAULT FALSE
+              );
+              CREATE INDEX IF NOT EXISTS idx_runtime_job_completions_dlq_job
+              ON runtime_job_completions_dlq (runtime_job_id);
+              CREATE INDEX IF NOT EXISTS idx_runtime_job_completions_dlq_unapplied
+              ON runtime_job_completions_dlq (applied, recorded_at)",
+    },
 ];
