@@ -5,6 +5,45 @@ use harness_workflow::runtime::{
 };
 use serde_json::{json, Value};
 
+/// Reconciles `succeeded`-claimed activity results that simultaneously report
+/// blockers (GH-1897). The blocker vocabulary below is the explicit contract:
+/// every entry forces the `succeeded_with_blockers` reconciliation, which
+/// downgrades the effective status to `blocked` and records the evidence in
+/// an `activity_status_contract` artifact.
+///
+/// Per-signal dispositions are declared here, not implied by parsing. Today
+/// every recognized blocker blocks; if a class ever warrants a different
+/// disposition (e.g. auto-remediable merge states), it moves out of these
+/// tables into its own path rather than growing a special case inside the
+/// parser.
+const BLOCKING_SIGNAL_TYPES: &[&str] = &[
+    "ChangesRequested",
+    "ChecksFailed",
+    "LocalReviewChangesRequested",
+    "LocalReviewBlocked",
+    "QualityBlocked",
+    "QualityFailed",
+];
+
+/// Structured artifact fields whose non-empty/non-zero value reports a blocker.
+const BLOCKING_COUNT_FIELDS: &[&str] = &[
+    "open_review_threads",
+    "unresolved_review_threads",
+    "pending_checks",
+    "failing_checks",
+    "failed_checks",
+    "requested_changes",
+    "blocking_reviews",
+    "mergeability_blockers",
+    "blockers",
+];
+
+/// `merge_state_status` values that report a blocker.
+const BLOCKING_MERGE_STATES: &[&str] = &["blocked", "dirty", "unknown", "unstable", "behind"];
+
+/// The reconciled outcome name recorded in the contract artifact.
+const RECONCILED_OUTCOME: &str = "succeeded_with_blockers";
+
 pub(super) fn enforce_activity_status_contract(
     workflow_definition: Option<&str>,
     mut result: ActivityResult,
@@ -33,6 +72,7 @@ pub(super) fn enforce_activity_status_contract(
             "schema": "harness.runtime.activity_status_contract.v1",
             "claimed_status": "succeeded",
             "effective_status": "blocked",
+            "reconciled_outcome": RECONCILED_OUTCOME,
             "claimed_summary": claimed_summary,
             "blocker_signals": blockers,
         }),
@@ -42,6 +82,7 @@ pub(super) fn enforce_activity_status_contract(
         json!({
             "claimed_status": "succeeded",
             "effective_status": "blocked",
+            "reconciled_outcome": RECONCILED_OUTCOME,
         }),
     ));
 
@@ -72,16 +113,8 @@ fn activity_status_contract_blockers(
     let mut blockers = Vec::new();
 
     for signal in &result.signals {
-        match signal.signal_type.as_str() {
-            "ChangesRequested"
-            | "ChecksFailed"
-            | "LocalReviewChangesRequested"
-            | "LocalReviewBlocked"
-            | "QualityBlocked"
-            | "QualityFailed" => {
-                push_unique(&mut blockers, format!("signal:{}", signal.signal_type));
-            }
-            _ => {}
+        if BLOCKING_SIGNAL_TYPES.contains(&signal.signal_type.as_str()) {
+            push_unique(&mut blockers, format!("signal:{}", signal.signal_type));
         }
     }
 
@@ -112,35 +145,20 @@ fn collect_structured_blockers(value: &Value, blockers: &mut Vec<String>) {
         Value::Object(object) => {
             for (key, value) in object {
                 let normalized_key = key.to_ascii_lowercase();
-                match normalized_key.as_str() {
-                    "open_review_threads"
-                    | "unresolved_review_threads"
-                    | "pending_checks"
-                    | "failing_checks"
-                    | "failed_checks"
-                    | "requested_changes"
-                    | "blocking_reviews"
-                    | "mergeability_blockers"
-                    | "blockers"
-                        if json_value_reports_blocker(value) =>
-                    {
+                if BLOCKING_COUNT_FIELDS.contains(&normalized_key.as_str()) {
+                    if json_value_reports_blocker(value) {
                         push_unique(blockers, format!("field:{normalized_key}"));
                     }
-                    "review_decision" if json_string_equals(value, "changes_requested") => {
+                } else if normalized_key == "review_decision" {
+                    if json_string_equals(value, "changes_requested") {
                         push_unique(blockers, "field:review_decision_changes_requested");
                     }
-                    "merge_state_status"
-                        if json_string_is_one_of(
-                            value,
-                            &["blocked", "dirty", "unknown", "unstable", "behind"],
-                        ) =>
-                    {
+                } else if normalized_key == "merge_state_status" {
+                    if json_string_is_one_of(value, BLOCKING_MERGE_STATES) {
                         push_unique(blockers, "field:merge_state_status_blocked");
                     }
-                    "mergeable" if value.as_bool() == Some(false) => {
-                        push_unique(blockers, "field:mergeable_false");
-                    }
-                    _ => {}
+                } else if normalized_key == "mergeable" && value.as_bool() == Some(false) {
+                    push_unique(blockers, "field:mergeable_false");
                 }
                 collect_structured_blockers(value, blockers);
             }
@@ -263,6 +281,155 @@ mod tests {
                 "exit_code": exit_code,
             }]),
         ))
+    }
+
+    #[test]
+    fn every_blocking_signal_type_downgrades_claimed_success() {
+        for signal_type in BLOCKING_SIGNAL_TYPES {
+            let claimed = ActivityResult::succeeded("run_local_review", "All good.")
+                .with_signal(ActivitySignal::new(*signal_type, json!({})));
+
+            let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+            assert!(changed, "signal {signal_type} must downgrade");
+            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec![format!("signal:{signal_type}")]
+            );
+        }
+    }
+
+    #[test]
+    fn every_blocking_count_field_downgrades_claimed_success() {
+        for field in BLOCKING_COUNT_FIELDS {
+            let claimed = ActivityResult::succeeded("run_local_review", "All good.").with_artifact(
+                ActivityArtifact::new("review_summary", json!({ *field: 2 })),
+            );
+
+            let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+            assert!(changed, "field {field} must downgrade");
+            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec![format!("field:{field}")]
+            );
+        }
+    }
+
+    #[test]
+    fn every_blocking_merge_state_downgrades_claimed_success() {
+        for merge_state in BLOCKING_MERGE_STATES {
+            let claimed = ActivityResult::succeeded("inspect_pr", "PR inspected.").with_artifact(
+                ActivityArtifact::new("pr_state", json!({ "merge_state_status": *merge_state })),
+            );
+
+            let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+            assert!(changed, "merge state {merge_state} must downgrade");
+            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec!["field:merge_state_status_blocked"]
+            );
+        }
+
+        let clean = ActivityResult::succeeded("inspect_pr", "PR inspected.").with_artifact(
+            ActivityArtifact::new("pr_state", json!({ "merge_state_status": "clean" })),
+        );
+        let (changed, result) = enforce_activity_status_contract(None, clean);
+        assert!(!changed);
+        assert_eq!(result.status, ActivityStatus::Succeeded);
+    }
+
+    #[test]
+    fn review_decision_and_mergeable_false_downgrade_claimed_success() {
+        let changes_requested = ActivityResult::succeeded("inspect_pr", "PR inspected.")
+            .with_artifact(ActivityArtifact::new(
+                "pr_state",
+                json!({ "review_decision": "CHANGES_REQUESTED" }),
+            ));
+        let (changed, result) = enforce_activity_status_contract(None, changes_requested);
+        assert!(changed);
+        assert_eq!(
+            status_contract_blockers_from_result(&result),
+            vec!["field:review_decision_changes_requested"]
+        );
+
+        let unmergeable = ActivityResult::succeeded("inspect_pr", "PR inspected.").with_artifact(
+            ActivityArtifact::new("pr_state", json!({ "mergeable": false })),
+        );
+        let (changed, result) = enforce_activity_status_contract(None, unmergeable);
+        assert!(changed);
+        assert_eq!(
+            status_contract_blockers_from_result(&result),
+            vec!["field:mergeable_false"]
+        );
+    }
+
+    #[test]
+    fn reconciliation_records_explicit_outcome_evidence() {
+        let claimed = ActivityResult::succeeded("run_local_review", "Review done.").with_signal(
+            ActivitySignal::new("LocalReviewChangesRequested", json!({})),
+        );
+
+        let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+        assert!(changed);
+        let artifact = result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "activity_status_contract")
+            .expect("contract artifact");
+        assert_eq!(
+            artifact.artifact.get("reconciled_outcome"),
+            Some(&json!(RECONCILED_OUTCOME))
+        );
+        assert_eq!(
+            artifact.artifact.get("claimed_summary"),
+            Some(&json!("Review done."))
+        );
+        let downgrade_signal = result
+            .signals
+            .iter()
+            .find(|signal| signal.signal_type == "ActivityStatusContractDowngraded")
+            .expect("downgrade signal");
+        assert_eq!(
+            downgrade_signal.signal.get("reconciled_outcome"),
+            Some(&json!(RECONCILED_OUTCOME))
+        );
+    }
+
+    #[test]
+    fn negated_textual_blockers_do_not_downgrade() {
+        let claimed = ActivityResult::succeeded(
+            "run_local_review",
+            "Merged cleanly with no failing checks and no unresolved review threads.",
+        );
+
+        let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+        assert!(!changed);
+        assert_eq!(result.status, ActivityStatus::Succeeded);
+    }
+
+    #[test]
+    fn non_succeeded_results_are_left_untouched() {
+        let blocked = ActivityResult {
+            status: ActivityStatus::Blocked,
+            ..ActivityResult::succeeded("run_local_review", "Blocked upstream.")
+        }
+        .with_signal(ActivitySignal::new(
+            "LocalReviewChangesRequested",
+            json!({}),
+        ));
+
+        let (changed, result) = enforce_activity_status_contract(None, blocked);
+
+        assert!(!changed);
+        assert_eq!(result.status, ActivityStatus::Blocked);
+        assert!(status_contract_blockers_from_result(&result).is_empty());
     }
 
     #[test]
