@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 
 /// Reconciles `succeeded`-claimed activity results that simultaneously report
 /// blockers (GH-1897). The blocker vocabulary below is the explicit contract:
-/// every entry forces the `succeeded_with_blockers` reconciliation, which
-/// downgrades the effective status to `blocked` and records the evidence in
+/// every entry forces the first-class `ActivityStatus::SucceededWithBlockers`
+/// outcome (routed like `blocked` everywhere) and records the evidence in
 /// an `activity_status_contract` artifact.
 ///
 /// Per-signal dispositions are declared here, not implied by parsing. Today
@@ -63,7 +63,7 @@ pub(super) fn enforce_activity_status_contract(
         blockers.join("; ")
     );
 
-    result.status = ActivityStatus::Blocked;
+    result.status = ActivityStatus::SucceededWithBlockers;
     result.summary = format!("Activity blocked by status contract. {reason}");
     result.error = Some(reason);
     result.artifacts.push(ActivityArtifact::new(
@@ -71,7 +71,7 @@ pub(super) fn enforce_activity_status_contract(
         json!({
             "schema": "harness.runtime.activity_status_contract.v1",
             "claimed_status": "succeeded",
-            "effective_status": "blocked",
+            "effective_status": RECONCILED_OUTCOME,
             "reconciled_outcome": RECONCILED_OUTCOME,
             "claimed_summary": claimed_summary,
             "blocker_signals": blockers,
@@ -81,7 +81,7 @@ pub(super) fn enforce_activity_status_contract(
         "ActivityStatusContractDowngraded",
         json!({
             "claimed_status": "succeeded",
-            "effective_status": "blocked",
+            "effective_status": RECONCILED_OUTCOME,
             "reconciled_outcome": RECONCILED_OUTCOME,
         }),
     ));
@@ -292,7 +292,7 @@ mod tests {
             let (changed, result) = enforce_activity_status_contract(None, claimed);
 
             assert!(changed, "signal {signal_type} must downgrade");
-            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
             assert_eq!(
                 status_contract_blockers_from_result(&result),
                 vec![format!("signal:{signal_type}")]
@@ -310,7 +310,7 @@ mod tests {
             let (changed, result) = enforce_activity_status_contract(None, claimed);
 
             assert!(changed, "field {field} must downgrade");
-            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
             assert_eq!(
                 status_contract_blockers_from_result(&result),
                 vec![format!("field:{field}")]
@@ -328,7 +328,7 @@ mod tests {
             let (changed, result) = enforce_activity_status_contract(None, claimed);
 
             assert!(changed, "merge state {merge_state} must downgrade");
-            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
             assert_eq!(
                 status_contract_blockers_from_result(&result),
                 vec!["field:merge_state_status_blocked"]
@@ -440,7 +440,7 @@ mod tests {
         );
 
         assert!(changed);
-        assert_eq!(result.status, ActivityStatus::Blocked);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
         assert_eq!(
             status_contract_blockers_from_result(&result),
             vec!["text:failing_checks"]
@@ -458,7 +458,7 @@ mod tests {
             enforce_activity_status_contract(Some(PROMPT_TASK_DEFINITION_ID), claimed);
 
         assert!(changed);
-        assert_eq!(result.status, ActivityStatus::Blocked);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
         assert_eq!(
             status_contract_blockers_from_result(&result),
             vec!["signal:ChecksFailed"]
@@ -474,7 +474,7 @@ mod tests {
             );
 
             assert!(changed);
-            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
             assert_eq!(
                 status_contract_blockers_from_result(&result),
                 vec!["text:failing_checks"]

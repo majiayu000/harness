@@ -98,7 +98,7 @@ fn reduce_generic_declarative_completion(
 
     let route = match result.status {
         ActivityStatus::Succeeded => success_route(source, result),
-        ActivityStatus::Blocked => {
+        ActivityStatus::Blocked | ActivityStatus::SucceededWithBlockers => {
             if let Some(target) = source.on_blocked.as_deref() {
                 Some((target, "on_blocked".to_string()))
             } else {

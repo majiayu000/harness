@@ -291,18 +291,21 @@ fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
     );
 
     assert_eq!(result.activity, "implement_issue");
-    assert_eq!(result.status, ActivityStatus::Blocked);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
     assert!(result
         .error
         .as_deref()
         .is_some_and(|error| error.contains("claimed succeeded")));
     assert!(result.signals.iter().any(|signal| {
         signal.signal_type == "ActivityStatusContractDowngraded"
-            && signal.signal["effective_status"] == "blocked"
+            && signal.signal["effective_status"] == "succeeded_with_blockers"
     }));
     let contract = artifact_by_type(&result, "activity_status_contract");
     assert_eq!(contract.artifact["claimed_status"], "succeeded");
-    assert_eq!(contract.artifact["effective_status"], "blocked");
+    assert_eq!(
+        contract.artifact["effective_status"],
+        "succeeded_with_blockers"
+    );
     assert!(contract.artifact["blocker_signals"]
         .as_array()
         .is_some_and(|signals| signals.iter().any(|signal| signal == "text:pending_ci")));
@@ -318,7 +321,10 @@ fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
             .any(|signal| signal == "text:not_merge_ready")));
     let envelope = envelope_artifact(&result);
     assert_eq!(envelope["outcome"], "status_contract_downgraded");
-    assert_eq!(envelope["final_result"]["status"], "blocked");
+    assert_eq!(
+        envelope["final_result"]["status"],
+        "succeeded_with_blockers"
+    );
 }
 
 #[test]
@@ -393,7 +399,7 @@ fn activity_result_from_turn_downgrades_succeeded_with_structured_blockers() {
         "digest-1",
     );
 
-    assert_eq!(result.status, ActivityStatus::Blocked);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
     let contract = artifact_by_type(&result, "activity_status_contract");
     let Some(blockers) = contract.artifact["blocker_signals"].as_array() else {
         panic!("blocker signals should be recorded");

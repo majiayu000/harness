@@ -240,6 +240,33 @@ fn runtime_failure_blocked_decision_carries_structured_stop_metadata() {
 }
 
 #[test]
+fn runtime_succeeded_with_blockers_routes_like_blocked() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult {
+        activity: "implement_issue".to_string(),
+        status: ActivityStatus::SucceededWithBlockers,
+        summary: "Implementation finished but review threads remain unresolved.".to_string(),
+        artifacts: Vec::new(),
+        signals: Vec::new(),
+        validation: Vec::new(),
+        error: Some("Unresolved review threads block completion.".to_string()),
+        error_kind: None,
+    };
+    let event = runtime_completion_event(&instance, "implement_issue", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("succeeded-with-blockers activity should block the workflow");
+
+    assert_eq!(decision.decision, "block_after_runtime_activity");
+    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(
+        decision.commands[0].command["blocked_reason"],
+        "Unresolved review threads block completion."
+    );
+}
+
+#[test]
 fn runtime_failure_scope_guard_block_carries_structured_stop_metadata() {
     let instance = issue_instance("implementing");
     let result = ActivityResult {
