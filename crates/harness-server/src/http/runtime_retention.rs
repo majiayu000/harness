@@ -14,6 +14,10 @@ pub(super) fn spawn_runtime_retention(state: &Arc<AppState>) {
 
     let weak_state = Arc::downgrade(state);
     tokio::spawn(async move {
+        // Dry-run passes report what would be deleted without deleting, so
+        // first activation on an existing deployment cannot surprise
+        // operators (GH-1879).
+        let mut dry_run_passes_remaining: Option<u32> = None;
         loop {
             let Some(state) = weak_state.upgrade() else {
                 break;
@@ -37,30 +41,54 @@ pub(super) fn spawn_runtime_retention(state: &Arc<AppState>) {
                     workflow_cfg.storage.runtime_retention_days,
                     state.core.server.config.observe.log_retention_days.into(),
                 );
+                let dry_run_remaining = dry_run_passes_remaining
+                    .get_or_insert(workflow_cfg.storage.runtime_retention_dry_run_passes);
                 if let Some(store) = state.core.workflow_runtime_store.as_ref() {
                     let cutoff = Utc::now()
                         - chrono::Duration::days(
                             workflow_cfg.storage.runtime_retention_days as i64,
                         );
-                    match store
-                        .prune_terminal_runtime_history(
-                            cutoff,
-                            workflow_cfg.storage.runtime_retention_batch_size as i64,
-                        )
-                        .await
-                    {
-                        Ok(summary) if !summary.is_empty() => tracing::info!(
-                            workflow_instances = summary.workflow_instances_deleted,
-                            workflow_events = summary.workflow_events_deleted,
-                            workflow_decisions = summary.workflow_decisions_deleted,
-                            workflow_commands = summary.workflow_commands_deleted,
-                            runtime_jobs = summary.runtime_jobs_deleted,
-                            runtime_events = summary.runtime_events_deleted,
-                            workflow_artifacts = summary.workflow_artifacts_deleted,
-                            "runtime retention pruned terminal workflow history"
-                        ),
-                        Ok(_) => {}
-                        Err(error) => tracing::warn!("runtime retention tick failed: {error}"),
+                    if *dry_run_remaining > 0 {
+                        *dry_run_remaining -= 1;
+                        match store
+                            .count_terminal_history_candidates(
+                                cutoff,
+                                workflow_cfg.storage.runtime_retention_batch_size as i64,
+                            )
+                            .await
+                        {
+                            Ok(candidates) if candidates > 0 => tracing::info!(
+                                dry_run_passes_remaining = *dry_run_remaining,
+                                candidate_root_families = candidates,
+                                retention_days = workflow_cfg.storage.runtime_retention_days,
+                                "runtime retention dry-run: next passes will prune this many terminal workflow families"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::warn!("runtime retention dry-run count failed: {error}")
+                            }
+                        }
+                    } else {
+                        match store
+                            .prune_terminal_runtime_history(
+                                cutoff,
+                                workflow_cfg.storage.runtime_retention_batch_size as i64,
+                            )
+                            .await
+                        {
+                            Ok(summary) if !summary.is_empty() => tracing::info!(
+                                workflow_instances = summary.workflow_instances_deleted,
+                                workflow_events = summary.workflow_events_deleted,
+                                workflow_decisions = summary.workflow_decisions_deleted,
+                                workflow_commands = summary.workflow_commands_deleted,
+                                runtime_jobs = summary.runtime_jobs_deleted,
+                                runtime_events = summary.runtime_events_deleted,
+                                workflow_artifacts = summary.workflow_artifacts_deleted,
+                                "runtime retention pruned terminal workflow history"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!("runtime retention tick failed: {error}"),
+                        }
                     }
                 }
             } else {

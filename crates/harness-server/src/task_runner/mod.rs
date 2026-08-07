@@ -97,6 +97,19 @@ impl TaskStore {
         }
         Ok(summary)
     }
+
+    /// Count terminal tasks eligible for retention pruning without deleting,
+    /// mirroring the batch bound of `prune_terminal_tasks_before`.
+    pub async fn count_terminal_tasks_before(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        batch_size: u32,
+    ) -> anyhow::Result<u64> {
+        record_task_runner_usage();
+        self.db
+            .count_terminal_tasks_before(cutoff, batch_size)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +198,42 @@ mod usage_probe_tests {
         assert_eq!(summary.tasks_deleted, 1);
         assert!(store.get(&task_id).is_none());
         assert!(store.db.get(task_id.as_str()).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_terminal_tasks_before_matches_prune_batch() -> anyhow::Result<()> {
+        let _lock = crate::test_helpers::HOME_LOCK.lock().await;
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = TaskStore::open(&dir.path().join("tasks.db")).await?;
+        let old_terminal = TaskId::from_str("count-terminal-old");
+        let mut old = TaskState::new(old_terminal.clone());
+        old.status = TaskStatus::Done;
+        old.scheduler.mark_terminal(&TaskStatus::Done);
+        store.insert(&old).await;
+        let recent_terminal = TaskId::from_str("count-terminal-recent");
+        let mut recent = TaskState::new(recent_terminal.clone());
+        recent.status = TaskStatus::Done;
+        recent.scheduler.mark_terminal(&TaskStatus::Done);
+        store.insert(&recent).await;
+        store
+            .db
+            .overwrite_updated_at_for_test(
+                old_terminal.as_str(),
+                chrono::Utc::now() - chrono::Duration::days(45),
+            )
+            .await?;
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        assert_eq!(store.count_terminal_tasks_before(cutoff, 10).await?, 1);
+        assert_eq!(store.count_terminal_tasks_before(cutoff, 0).await?, 0);
+
+        let summary = store.prune_terminal_tasks_before(cutoff, 10).await?;
+        assert_eq!(summary.tasks_deleted, 1);
+        assert_eq!(store.count_terminal_tasks_before(cutoff, 10).await?, 0);
         Ok(())
     }
 }
