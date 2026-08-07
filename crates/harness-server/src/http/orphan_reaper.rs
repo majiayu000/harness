@@ -66,6 +66,7 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
                 tracing::debug!(
                     "orphan schema reaper disabled by config; re-checking next interval"
                 );
+                handle.tick_ok();
             } else if let Some(store) = state.core.workflow_runtime_store.as_ref() {
                 let workspace_roots =
                     workspace_roots_for_reaper(state.concurrency.workspace_mgr.as_deref());
@@ -111,6 +112,7 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
                         }
                     }
                     Err(error) => {
+                        handle.tick_failed(&error.to_string());
                         tracing::warn!("orphan schema reaper tick failed: {error}");
                     }
                 }

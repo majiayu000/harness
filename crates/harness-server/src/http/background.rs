@@ -53,13 +53,15 @@ pub(super) use runtime_workers::spawn_runtime_job_workers;
 /// WORKFLOW.md surfaces once, at error level, with the affected loop names —
 /// retention, watchdog, and the reaper can no longer fail silently while the
 /// dispatcher keeps running.
+///
+/// Config load success is not a completed tick: each loop reports its own
+/// tick outcome via `LoopHandle` at the point where the tick's work is done.
 pub(crate) async fn load_workflow_config_for_loop(
     state: &Arc<crate::http::AppState>,
     handle: &LoopHandle,
 ) -> anyhow::Result<harness_core::config::workflow::WorkflowConfig> {
     match harness_core::config::workflow::load_workflow_config(&state.core.project_root) {
         Ok(config) => {
-            handle.tick_ok();
             // Config recovered: clear the aggregated failure so operators see
             // the loop return to a healthy state.
             state.background_loops.clear_config_failure();

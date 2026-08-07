@@ -105,10 +105,6 @@ impl BackgroundLoopHealth {
     /// Record a workflow-config parse failure affecting `name`. Aggregated so
     /// every consumer reports into one operator-visible signal.
     pub(crate) fn record_config_failure(&self, name: &'static str, error: &str) {
-        self.record_config_failure_inner(name, error);
-    }
-
-    fn record_config_failure_inner(&self, name: &'static str, error: &str) {
         let now = Utc::now();
         let mut guard = self
             .config_failure
