@@ -59,9 +59,11 @@ pub(super) fn reduce_builtin_completion(
     }
     let decision = match result.status {
         ActivityStatus::Succeeded => reduce_success(instance, event, result),
-        ActivityStatus::Blocked => github_issue_closed_decision(instance, event, result)
-            .or_else(|| scope_too_large_decision(instance, event, result))
-            .or_else(|| Some(runtime_blocked_decision(instance, event, result))),
+        ActivityStatus::Blocked | ActivityStatus::SucceededWithBlockers => {
+            github_issue_closed_decision(instance, event, result)
+                .or_else(|| scope_too_large_decision(instance, event, result))
+                .or_else(|| Some(runtime_blocked_decision(instance, event, result)))
+        }
         ActivityStatus::Failed => {
             if let Some(command) = event_workflow_command(event) {
                 if let Some(decision) =
