@@ -405,8 +405,9 @@ fn has_any_tag_prefix(output: &str) -> bool {
 }
 
 fn bounded_excerpt(reply: &str) -> String {
-    let mut excerpt: String = reply.chars().take(PROTOCOL_FAILURE_EXCERPT_MAX).collect();
-    if reply.chars().count() > PROTOCOL_FAILURE_EXCERPT_MAX {
+    let mut chars = reply.chars();
+    let mut excerpt: String = chars.by_ref().take(PROTOCOL_FAILURE_EXCERPT_MAX).collect();
+    if chars.next().is_some() {
         excerpt.push('…');
     }
     excerpt
