@@ -815,3 +815,85 @@ async fn dedupe_uses_runtime_job_timestamps_not_uuid_order() -> anyhow::Result<(
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = enqueue_test_runtime_job(
+        &store,
+        "command-dlq",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
+
+    let first_claim = store
+        .claim_next_runtime_job("worker-a", Utc::now() + Duration::minutes(5))
+        .await?
+        .expect("runtime job should be claimable");
+    let first_lease_expires_at = first_claim
+        .lease
+        .as_ref()
+        .expect("lease should exist")
+        .expires_at;
+
+    let result = ActivityResult::succeeded("check", "Completed work from a stale lease.");
+    store
+        .record_lease_expired_completion(
+            &first_claim.id,
+            "worker-a",
+            first_lease_expires_at,
+            &result,
+            None,
+        )
+        .await?;
+
+    let (dlq_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&first_claim.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        dlq_count, 1,
+        "lease-expired completion must be durable in the DLQ"
+    );
+
+    let (result_payload, applied): (serde_json::Value, bool) = sqlx::query_as(
+        "SELECT result, applied FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&first_claim.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        result_payload["summary"],
+        "Completed work from a stale lease."
+    );
+    assert!(!applied, "DLQ record must start unapplied");
+
+    let (event_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_events
+         WHERE runtime_job_id = $1 AND event_type = 'LeaseExpiredCompletionRecorded'",
+    )
+    .bind(&first_claim.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        event_count, 1,
+        "DLQ recording must be surfaced as a runtime event"
+    );
+
+    let job_now = store.get_runtime_job(&job.id).await?.expect("job exists");
+    assert_eq!(
+        job_now.status,
+        RuntimeJobStatus::Running,
+        "job must remain reclaimable"
+    );
+    Ok(())
+}
