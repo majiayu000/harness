@@ -733,11 +733,12 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
     assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
 
     let summary = store.prune_terminal_runtime_history(cutoff, 1).await?;
-    assert_eq!(summary.workflow_instances_deleted, 2);
+    assert_eq!(summary.workflow_instances_deleted, 1);
     assert_eq!(
         store.count_terminal_history_candidates(cutoff, 100).await?,
-        0
+        1
     );
+    assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
     assert!(store.get_instance(&terminal_a.id).await?.is_none());
     assert!(store.get_instance(&active.id).await?.is_some());
     Ok(())

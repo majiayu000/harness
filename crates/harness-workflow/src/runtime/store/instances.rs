@@ -499,12 +499,12 @@ impl WorkflowRuntimeStore {
             return Ok(RuntimeHistoryPruneSummary::default());
         }
 
-        let rows: Vec<(String,)> = sqlx::query_as(
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
             "{PRUNE_ELIGIBLE_ROOTS_CTE} SELECT family.id
              FROM family
              JOIN eligible_roots ON eligible_roots.root_id = family.root_id
-             ORDER BY family.root_id ASC, family.id ASC",
-        )
+             ORDER BY family.root_id ASC, family.id ASC"
+        ))
         .bind(&terminal_definition_ids)
         .bind(&terminal_states)
         .bind(terminal_before)
