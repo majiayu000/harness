@@ -26,6 +26,15 @@ pub struct RuntimeBudgetPolicy {
     /// spec, so unlike the workflow ceiling there is no built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daily_profile_cap_usd: Option<f64>,
+    /// Fraction of `daily_profile_cap_usd` at which a profile enters the
+    /// throttle band. Inside the band the profile still runs, but its commands
+    /// yield the dispatch slot to profiles that are under their own threshold.
+    /// Ignored when no daily cap is configured.
+    #[serde(
+        default = "default_daily_throttle_ratio",
+        skip_serializing_if = "is_default_daily_throttle_ratio"
+    )]
+    pub daily_throttle_ratio: f64,
 }
 
 impl Default for RuntimeBudgetPolicy {
@@ -35,6 +44,7 @@ impl Default for RuntimeBudgetPolicy {
             enforcement: RuntimeBudgetEnforcement::default(),
             unlimited: false,
             daily_profile_cap_usd: None,
+            daily_throttle_ratio: default_daily_throttle_ratio(),
         }
     }
 }
@@ -56,8 +66,23 @@ impl RuntimeBudgetPolicy {
                     "runtime_budget_policy.daily_profile_cap_usd must be a positive finite number when set"
                 );
             }
+            if !self.daily_throttle_ratio.is_finite()
+                || self.daily_throttle_ratio <= 0.0
+                || self.daily_throttle_ratio > 1.0
+            {
+                anyhow::bail!(
+                    "runtime_budget_policy.daily_throttle_ratio must be within (0, 1] when a daily cap is set"
+                );
+            }
         }
         Ok(())
+    }
+
+    /// USD spend at which a profile enters the throttle band, or `None` when
+    /// no daily cap is configured.
+    pub fn daily_throttle_threshold_usd(&self) -> Option<f64> {
+        self.daily_profile_cap_usd
+            .map(|cap| cap * self.daily_throttle_ratio)
     }
 }
 
@@ -82,6 +107,16 @@ impl RuntimeBudgetEnforcement {
 
 fn default_workflow_budget_usd() -> f64 {
     15.0
+}
+
+fn default_daily_throttle_ratio() -> f64 {
+    0.8
+}
+
+/// The built-in ratio is not rendered back into config, so an unchanged policy
+/// serializes exactly as it did before the throttle band existed.
+fn is_default_daily_throttle_ratio(ratio: &f64) -> bool {
+    *ratio == default_daily_throttle_ratio()
 }
 
 #[cfg(test)]
@@ -127,6 +162,10 @@ mod tests {
             !rendered.contains("daily_profile_cap_usd"),
             "absent cap must not appear in rendered config: {rendered}"
         );
+        assert!(
+            !rendered.contains("daily_throttle_ratio"),
+            "the built-in throttle ratio must not appear in rendered config: {rendered}"
+        );
     }
 
     #[test]
@@ -143,6 +182,39 @@ mod tests {
             ..RuntimeBudgetPolicy::default()
         };
         policy.validate().expect("positive cap validates");
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_throttle_ratio() {
+        for ratio in [0.0, -0.5, 1.5, f64::NAN, f64::INFINITY] {
+            let policy = RuntimeBudgetPolicy {
+                daily_profile_cap_usd: Some(200.0),
+                daily_throttle_ratio: ratio,
+                ..RuntimeBudgetPolicy::default()
+            };
+            assert!(policy.validate().is_err(), "ratio {ratio} must be rejected");
+        }
+        // Without a daily cap the ratio is inert and must not fail validation.
+        let policy = RuntimeBudgetPolicy {
+            daily_profile_cap_usd: None,
+            daily_throttle_ratio: 5.0,
+            ..RuntimeBudgetPolicy::default()
+        };
+        policy.validate().expect("ratio is ignored without a cap");
+    }
+
+    #[test]
+    fn throttle_threshold_defaults_to_eighty_percent_of_the_cap() {
+        let policy = RuntimeBudgetPolicy {
+            daily_profile_cap_usd: Some(200.0),
+            ..RuntimeBudgetPolicy::default()
+        };
+        assert_eq!(policy.daily_throttle_ratio, 0.8);
+        assert_eq!(policy.daily_throttle_threshold_usd(), Some(160.0));
+        assert_eq!(
+            RuntimeBudgetPolicy::default().daily_throttle_threshold_usd(),
+            None
+        );
     }
 
     #[test]

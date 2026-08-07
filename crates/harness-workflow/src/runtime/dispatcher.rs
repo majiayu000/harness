@@ -1,3 +1,4 @@
+use super::dispatcher_throttle::{daily_throttle_breach, ThrottleBandRequest};
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord, WorkflowInstance};
 use super::store::{
     cost_usd_from_micros, cost_usd_to_micros, ClaimedCommandTerminalOutcome,
@@ -467,6 +468,29 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                             "profile_spent_usd_today": profile_spent_usd,
                             "daily_profile_cap_usd": cap_usd,
                         }),
+                    )
+                    .await;
+            }
+            // Throttle band (GH-1770 §4.1): deprioritize, do not block.
+            if let Some(breach) = daily_throttle_breach(ThrottleBandRequest {
+                store: self.store,
+                profile_selector: &self.profile_selector,
+                budget_policy: &self.budget_policy,
+                runtime_profile_name,
+                profile_spent_usd_micros: profile_spent_micros,
+                cap_usd,
+                utc_day_start,
+                peek_limit: self.batch_limit,
+            })
+            .await?
+            {
+                return self
+                    .budget_breach_outcome(
+                        instance,
+                        command,
+                        DispatchBarrierReasonCode::ProfileDailyThrottled,
+                        breach.reason,
+                        breach.evidence,
                     )
                     .await;
             }

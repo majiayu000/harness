@@ -18,6 +18,7 @@ mod declarative_interpreter;
 mod declarative_pinning;
 mod dispatch_barrier;
 pub mod dispatcher;
+mod dispatcher_throttle;
 pub mod errors;
 pub mod eval;
 mod job_claim;

@@ -214,27 +214,21 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
-    pub async fn claim_pending_commands(
-        &self,
-        owner: &str,
-        expires_at: DateTime<Utc>,
-        limit: i64,
-    ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
-        let limit = limit.clamp(1, 500);
-        let mut tx = self.pool.begin().await?;
-        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
-            "WITH candidates AS (
-                 SELECT command.id
-                 FROM workflow_commands AS command
-                 JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
-             WHERE command.status = $3
+    /// The single definition of "claimable now" (B-001): a pending command, a
+    /// dispatching command whose lease expired, or a deferred command whose
+    /// backoff elapsed with an intact barrier. `claim_pending_commands` and
+    /// `peek_claimable_commands` must not drift apart, so both render this
+    /// fragment with their own bind indices.
+    fn claimable_command_predicate(pending: u8, dispatching: u8, deferred: u8) -> String {
+        format!(
+            "command.status = ${pending}
                     OR (
-                        command.status = $4
+                        command.status = ${dispatching}
                         AND COALESCE(command.dispatch_lease_expires_at, '-infinity'::timestamptz)
                             <= CURRENT_TIMESTAMP
                     )
                     OR (
-                        command.status = $5
+                        command.status = ${deferred}
                         AND command.dispatch_not_before <= CURRENT_TIMESTAMP
                         AND command.dispatch_owner IS NULL
                         AND command.dispatch_lease_expires_at IS NULL
@@ -253,7 +247,56 @@ impl WorkflowRuntimeStore {
                             = command.dispatch_claim_generation
                         AND (command.dispatch_barrier->>'next_dispatch_at')::TIMESTAMPTZ
                             = command.dispatch_not_before
-                    )
+                    )"
+        )
+    }
+
+    /// Claimable commands without claiming them — the throttle band needs to
+    /// know whether other work could run instead (GH-1770 §4.1).
+    pub async fn peek_claimable_commands(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(&format!(
+            "SELECT command.id, command.workflow_id, command.decision_id, command.status,
+                    command.dispatch_owner, command.dispatch_lease_expires_at,
+                    command.dispatch_not_before, command.dispatch_attempt_count,
+                    command.dispatch_claim_generation, command.dispatch_barrier::text,
+                    command.data::text, command.created_at, command.updated_at,
+                    command.attempt_generation, command.superseded_by_command_id
+             FROM workflow_commands AS command
+             JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+             WHERE {}
+             ORDER BY command.created_at ASC
+             LIMIT $4",
+            Self::claimable_command_predicate(1, 2, 3)
+        ))
+        .bind(WorkflowCommandStatus::Pending.as_str())
+        .bind(WorkflowCommandStatus::Dispatching.as_str())
+        .bind(WorkflowCommandStatus::Deferred.as_str())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(workflow_command_record_from_row)
+            .collect()
+    }
+
+    pub async fn claim_pending_commands(
+        &self,
+        owner: &str,
+        expires_at: DateTime<Utc>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
+        let limit = limit.clamp(1, 500);
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(&format!(
+            "WITH candidates AS (
+                 SELECT command.id
+                 FROM workflow_commands AS command
+                 JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+                 WHERE {}
                  ORDER BY command.created_at ASC
                  LIMIT $6
                  FOR UPDATE OF command SKIP LOCKED
@@ -272,7 +315,8 @@ impl WorkflowRuntimeStore {
                        command.dispatch_claim_generation, command.dispatch_barrier::text,
                        command.data::text, command.created_at, command.updated_at,
                        command.attempt_generation, command.superseded_by_command_id",
-        )
+            Self::claimable_command_predicate(3, 4, 5)
+        ))
         .bind(owner)
         .bind(expires_at)
         .bind(WorkflowCommandStatus::Pending.as_str())
