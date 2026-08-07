@@ -546,84 +546,20 @@ impl WorkspaceManager {
             _decision = WorkspaceAcquireDecision::RecreatedStale;
         }
 
-        // Create git worktree based on remote/base_branch (latest upstream).
-        // Falls back to local base_branch only when strict remote-head
-        // admission is disabled.
-        let output = match git_command()
-            .args([
-                "-C",
-                &source_repo.to_string_lossy(),
-                "worktree",
-                "add",
-                "-B",
-                &branch,
-                &workspace_path.to_string_lossy(),
-                &remote_ref,
-            ])
-            .output()
-            .await
+        // Create git worktree based on remote/base_branch (latest upstream),
+        // with class-targeted recovery for stale admin entries and lock
+        // contention (GH-1886). Falls back to local base_branch only when
+        // strict remote-head admission is disabled.
+        if let Err(error) = workspace_worktree_add::worktree_add_with_recovery(
+            source_repo,
+            &branch,
+            &workspace_path,
+            &remote_ref,
+        )
+        .await
         {
-            Ok(output) => output,
-            Err(e) => {
-                if let Err(cleanup_err) = self
-                    .cleanup_created_workspace_then_release(
-                        task_id,
-                        source_repo,
-                        &workspace_path,
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "failed to cleanup partial worktree after worktree-add spawn failure: {cleanup_err}"
-                    );
-                }
-                return Err(WorkspaceLifecycleError::CreateFailed {
-                    message: format!("git worktree add failed for task {}: {e}", task_id.0),
-                });
-            }
-        };
-
-        if !output.status.success() {
-            if options.require_remote_head {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                if let Err(cleanup_err) = self
-                    .cleanup_created_workspace_then_release(
-                        task_id,
-                        source_repo,
-                        &workspace_path,
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "failed to cleanup partial worktree after worktree-add failure: {cleanup_err}"
-                    );
-                }
-                return Err(WorkspaceLifecycleError::CreateFailed {
-                    message: format!(
-                        "git worktree add from {remote_ref} failed for task {}: {}",
-                        task_id.0, stderr
-                    ),
-                });
-            }
-            // Fallback: try local base_branch (useful for repos without remotes, e.g. tests).
-            let fallback = match git_command()
-                .args([
-                    "-C",
-                    &source_repo.to_string_lossy(),
-                    "worktree",
-                    "add",
-                    "-B",
-                    &branch,
-                    &workspace_path.to_string_lossy(),
-                    base_branch,
-                ])
-                .output()
-                .await
-            {
-                Ok(output) => output,
-                Err(e) => {
+            match error {
+                workspace_worktree_add::WorktreeAddError::Spawn(e) => {
                     if let Err(cleanup_err) = self
                         .cleanup_created_workspace_then_release(
                             task_id,
@@ -634,36 +570,74 @@ impl WorkspaceManager {
                         .await
                     {
                         tracing::warn!(
-                            "failed to cleanup partial worktree after fallback worktree-add spawn failure: {cleanup_err}"
+                            "failed to cleanup partial worktree after worktree-add spawn failure: {cleanup_err}"
                         );
                     }
                     return Err(WorkspaceLifecycleError::CreateFailed {
-                        message: format!(
-                            "git worktree add fallback failed for task {}: {e}",
-                            task_id.0
-                        ),
+                        message: format!("git worktree add failed for task {}: {e}", task_id.0),
                     });
                 }
-            };
-
-            if !fallback.status.success() {
-                let stderr = String::from_utf8_lossy(&fallback.stderr).trim().to_string();
-                if let Err(cleanup_err) = self
-                    .cleanup_created_workspace_then_release(
-                        task_id,
+                workspace_worktree_add::WorktreeAddError::Failed(failure) => {
+                    if options.require_remote_head {
+                        if let Err(cleanup_err) = self
+                            .cleanup_created_workspace_then_release(
+                                task_id,
+                                source_repo,
+                                &workspace_path,
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "failed to cleanup partial worktree after worktree-add failure: {cleanup_err}"
+                            );
+                        }
+                        return Err(WorkspaceLifecycleError::CreateFailed {
+                            message: format!(
+                                "git worktree add from {remote_ref} failed for task {}: {}",
+                                task_id.0,
+                                failure.evidence()
+                            ),
+                        });
+                    }
+                    // Fallback: try local base_branch (useful for repos without remotes, e.g. tests).
+                    if let Err(fallback_error) = workspace_worktree_add::worktree_add_with_recovery(
                         source_repo,
+                        &branch,
                         &workspace_path,
-                        None,
+                        base_branch,
                     )
                     .await
-                {
-                    tracing::warn!(
-                        "failed to cleanup partial worktree after fallback worktree-add failure: {cleanup_err}"
-                    );
+                    {
+                        if let Err(cleanup_err) = self
+                            .cleanup_created_workspace_then_release(
+                                task_id,
+                                source_repo,
+                                &workspace_path,
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "failed to cleanup partial worktree after fallback worktree-add failure: {cleanup_err}"
+                            );
+                        }
+                        let message = match fallback_error {
+                            workspace_worktree_add::WorktreeAddError::Spawn(e) => format!(
+                                "git worktree add fallback failed for task {}: {e}",
+                                task_id.0
+                            ),
+                            workspace_worktree_add::WorktreeAddError::Failed(failure) => {
+                                format!(
+                                    "git worktree add failed for task {}: {}",
+                                    task_id.0,
+                                    failure.evidence()
+                                )
+                            }
+                        };
+                        return Err(WorkspaceLifecycleError::CreateFailed { message });
+                    }
                 }
-                return Err(WorkspaceLifecycleError::CreateFailed {
-                    message: format!("git worktree add failed for task {}: {}", task_id.0, stderr),
-                });
             }
         }
 
