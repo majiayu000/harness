@@ -97,6 +97,19 @@ impl TaskStore {
         }
         Ok(summary)
     }
+
+    /// Count terminal tasks eligible for retention pruning without deleting,
+    /// mirroring the batch bound of `prune_terminal_tasks_before`.
+    pub async fn count_terminal_tasks_before(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        batch_size: u32,
+    ) -> anyhow::Result<u64> {
+        record_task_runner_usage();
+        self.db
+            .count_terminal_tasks_before(cutoff, batch_size)
+            .await
+    }
 }
 
 #[cfg(test)]

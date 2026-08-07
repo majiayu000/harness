@@ -695,6 +695,54 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
     Ok(())
 }
 
+#[tokio::test]
+async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let terminal_a = project_issue_instance("/project-a", 501, "done");
+    let terminal_b = project_issue_instance("/project-a", 502, "done");
+    let active = project_issue_instance("/project-a", 503, "done");
+    let active_child = quality_gate_instance("checking")
+        .with_id("active-family-child-503")
+        .with_parent(&active.id);
+    for instance in [&terminal_a, &terminal_b, &active, &active_child] {
+        store
+            .force_upsert_lifecycle_state_for_test(instance)
+            .await?;
+    }
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = ANY($1::text[])")
+        .bind(vec![
+            terminal_a.id.clone(),
+            terminal_b.id.clone(),
+            active.id.clone(),
+            active_child.id.clone(),
+        ])
+        .bind(Utc::now() - Duration::days(45))
+        .execute(store.pool())
+        .await?;
+
+    let cutoff = Utc::now() - Duration::days(30);
+    assert_eq!(
+        store.count_terminal_history_candidates(cutoff, 100).await?,
+        2
+    );
+    assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
+
+    let summary = store.prune_terminal_runtime_history(cutoff, 1).await?;
+    assert_eq!(summary.workflow_instances_deleted, 2);
+    assert_eq!(
+        store.count_terminal_history_candidates(cutoff, 100).await?,
+        0
+    );
+    assert!(store.get_instance(&terminal_a.id).await?.is_none());
+    assert!(store.get_instance(&active.id).await?.is_some());
+    Ok(())
+}
+
 include!("runtime_store_support.rs");
 
 #[tokio::test]

@@ -62,15 +62,17 @@ storage:
   orphan_reaper_interval_secs: 3600
   orphan_reaper_legacy_enabled: true
   orphan_reaper_legacy_batch: 200
-  workflow_watchdog_enabled: false
+  workflow_watchdog_enabled: true
   workflow_watchdog_age_minutes: 240
   workflow_watchdog_interval_secs: 300
   workflow_watchdog_batch_size: 100
-  runtime_retention_enabled: false
+  runtime_retention_enabled: true
+  runtime_retention_dry_run_passes: 1
   runtime_retention_days: 30
   runtime_retention_batch_size: 1000
   runtime_retention_interval_secs: 3600
-  task_retention_enabled: false
+  task_retention_enabled: true
+  task_retention_dry_run_passes: 1
   task_retention_days: 30
   task_retention_batch_size: 1000
   task_retention_interval_secs: 3600

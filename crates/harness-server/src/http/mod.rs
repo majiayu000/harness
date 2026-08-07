@@ -40,6 +40,7 @@ pub(crate) mod sse_routes;
 pub(crate) mod state;
 pub(crate) mod task_mutation_routes;
 pub(crate) mod task_query_routes;
+mod task_retention;
 pub(crate) mod task_routes;
 pub(crate) mod workflow_routes;
 mod workflow_watchdog;
@@ -208,6 +209,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Periodically prune terminal workflow-runtime history when explicitly
     // enabled by workflow storage policy.
     runtime_retention::spawn_runtime_retention(&state);
+
+    // Periodically prune terminal task rows and task-owned child rows.
+    task_retention::spawn_task_retention(&state);
 
     // Convert workflow command outbox rows into runtime jobs when the workflow
     // policy keeps the dispatcher enabled.
