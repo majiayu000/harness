@@ -83,6 +83,7 @@ mod transaction_helpers;
 #[path = "store/transition_validation.rs"]
 mod transition_validation;
 pub use child_instance_start::{WorkflowChildStart, WorkflowChildStartOutcome};
+pub use command_facade::DispatchPoolSnapshot;
 pub use coverage_recovery::{
     WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
     WorkflowCoverageRecoveryTransition,

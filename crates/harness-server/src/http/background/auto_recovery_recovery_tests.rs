@@ -120,6 +120,7 @@ async fn auto_recovery_state_attempt_bound_survives_restart_and_exhaustion_is_id
             backoff_base_ms: 1,
         }],
         heartbeat: Default::default(),
+        pool_starvation_ticks: 20,
     };
     let alerts = crate::alerting::spawn_alerting(&alerting_config, None, events, transport.clone());
 
