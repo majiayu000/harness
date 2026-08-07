@@ -712,8 +712,9 @@ fn model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2
     // workflow, no memory, and a non-empty prompt template. The frozen fixture
     // was re-rendered when the ActivityResult contract gained its strict
     // output-schema form (json_schema, required arrays, nullable error
-    // fields); the fixed input bytes still match the current default
-    // configuration.
+    // fields), and again when WorkflowConfig gained the runtime_budget_policy
+    // section (GH-1770); the fixed input bytes still match the current
+    // default configuration.
     let mut job = RuntimeJob::pending(
         "command-fixture-1",
         RuntimeKind::CodexJsonrpc,

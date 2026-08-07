@@ -387,6 +387,11 @@ Prompt packet:
         "max_files_changed": 30,
         "max_lines_added": 1500
       },
+      "runtime_budget_policy": {
+        "default_workflow_budget_usd": 15.0,
+        "enforcement": "shadow",
+        "unlimited": false
+      },
       "runtime_completion": {
         "quality_gate_validation_timeout_secs": 900
       },
