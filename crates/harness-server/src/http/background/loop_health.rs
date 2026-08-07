@@ -17,12 +17,13 @@ pub(crate) struct BackgroundLoopHealth {
     config_failure: Mutex<Option<ConfigFailure>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct LoopStatus {
     tick_count: u64,
     failure_count: u64,
     last_tick_at: Option<Instant>,
     last_success_at: Option<Instant>,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub(crate) struct LoopSnapshot {
     pub(crate) failure_count: u64,
     pub(crate) last_tick_secs_ago: Option<u64>,
     pub(crate) last_success_secs_ago: Option<u64>,
+    pub(crate) last_error: Option<String>,
     pub(crate) stale: bool,
 }
 
@@ -87,12 +89,16 @@ impl BackgroundLoopHealth {
 
     /// Record that `name` failed a tick (warn-and-continue loops report this
     /// so the failure is visible even though the loop keeps running).
-    pub(crate) fn record_tick_failure(&self, name: &'static str, _error: &str) {
+    ///
+    /// Only successful ticks advance `tick_count`; a failed tick advances
+    /// `failure_count` and keeps the last error, so operators see both the
+    /// success/failure split and the reason.
+    pub(crate) fn record_tick_failure(&self, name: &'static str, error: &str) {
         let mut loops = self.loops.lock().expect("loop health mutex poisoned");
         if let Some(status) = loops.get_mut(name) {
-            status.tick_count = status.tick_count.saturating_add(1);
             status.failure_count = status.failure_count.saturating_add(1);
             status.last_tick_at = Some(Instant::now());
+            status.last_error = Some(error.to_string());
         }
     }
 
@@ -151,6 +157,7 @@ impl BackgroundLoopHealth {
                 last_success_secs_ago: status
                     .last_success_at
                     .map(|t| now.duration_since(t).as_secs()),
+                last_error: status.last_error.clone(),
                 stale: status
                     .last_tick_at
                     .map(|t| now.duration_since(t).as_secs() > max_stale_secs)
@@ -217,8 +224,12 @@ mod tests {
         handle.tick_failed("boom");
         let snapshot = health.snapshot(60);
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].tick_count, 3);
+        assert_eq!(
+            snapshot[0].tick_count, 2,
+            "failed ticks do not count as successes"
+        );
         assert_eq!(snapshot[0].failure_count, 1);
+        assert_eq!(snapshot[0].last_error.as_deref(), Some("boom"));
         assert!(!snapshot[0].stale);
     }
 

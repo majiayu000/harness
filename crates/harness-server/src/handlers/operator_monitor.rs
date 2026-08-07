@@ -236,10 +236,11 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
                             "workflow_watchdog" => "workflow_watchdog_stale",
                             "runtime_retention" => "runtime_retention_stale",
                             "task_retention" => "task_retention_stale",
-                            other => {
+                            _ => {
                                 // Guards against future loop names missing a
-                                // mapping.
-                                Box::leak(format!("background_loop_{other}_stale").into_boxed_str())
+                                // mapping without leaking a string per snapshot;
+                                // the precise name is in `background_loops`.
+                                "background_loop_stale"
                             }
                         });
                     }
