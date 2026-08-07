@@ -7,6 +7,8 @@ mod cloud_setup;
 pub mod codex;
 pub mod codex_adapter;
 pub mod compress_model;
+pub mod opencode;
+pub mod opencode_adapter;
 pub mod provider_backpressure;
 pub mod registry;
 pub mod runtime_fingerprint;

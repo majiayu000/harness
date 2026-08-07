@@ -14,6 +14,8 @@
 use crate::claude::ClaudeCodeAgent;
 use crate::codex::CodexAgent;
 use crate::codex_adapter::CodexAdapter;
+use crate::opencode::OpenCodeAgent;
+use crate::opencode_adapter::OpenCodeAcpAdapter;
 use crate::provider_backpressure::ProviderBackpressureGate;
 use crate::registry::{AdapterExecutionStrategy, AgentRegistry};
 use async_trait::async_trait;
@@ -154,6 +156,27 @@ pub fn registry_from_config(
             AdapterExecutionStrategy::ExecuteTurns,
         )
         .map_err(|error| anyhow::anyhow!("failed to attach the codex adapter: {error}"))?;
+
+    registry.register(
+        "opencode",
+        Arc::new(
+            OpenCodeAgent::from_config(config.opencode.clone(), sandbox_mode)
+                .with_stream_timeout(config.stream_timeout_secs),
+        ),
+    );
+    let opencode_config = config.opencode.clone();
+    registry
+        .register_adapter_factory_with_strategy(
+            "opencode",
+            move || {
+                Arc::new(OpenCodeAcpAdapter::from_config(
+                    opencode_config.clone(),
+                    sandbox_mode,
+                ))
+            },
+            AdapterExecutionStrategy::ExecuteTurns,
+        )
+        .map_err(|error| anyhow::anyhow!("failed to attach the opencode adapter: {error}"))?;
 
     if let Ok(api_key) = harness_core::config::process_env::var(ANTHROPIC_API_KEY_ENV) {
         registry.register(

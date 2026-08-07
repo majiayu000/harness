@@ -461,6 +461,7 @@ pub enum RuntimeKind {
     ClaudeCode,
     AnthropicApi,
     RemoteHost,
+    OpenCode,
 }
 
 impl RuntimeKind {
@@ -471,6 +472,7 @@ impl RuntimeKind {
             Self::ClaudeCode => "claude_code",
             Self::AnthropicApi => "anthropic_api",
             Self::RemoteHost => "remote_host",
+            Self::OpenCode => "opencode",
         }
     }
 }

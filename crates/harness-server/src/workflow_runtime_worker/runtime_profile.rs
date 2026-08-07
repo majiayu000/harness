@@ -11,6 +11,7 @@ pub(super) fn agent_name_for_runtime_kind(kind: RuntimeKind) -> anyhow::Result<&
         RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => Ok("codex"),
         RuntimeKind::ClaudeCode => Ok("claude"),
         RuntimeKind::AnthropicApi => Ok("anthropic-api"),
+        RuntimeKind::OpenCode => Ok("opencode"),
         RuntimeKind::RemoteHost => {
             anyhow::bail!("remote_host runtime jobs must be claimed by an external runtime host")
         }
@@ -146,6 +147,16 @@ fn resolve_model(
             _ => agents.claude.default_model.clone(),
         }),
         RuntimeKind::AnthropicApi => Ok(agents.anthropic_api.default_model.clone()),
+        RuntimeKind::OpenCode => {
+            let model = agents.opencode.default_model.clone();
+            if model.is_empty() {
+                // OpenCode resolves its own default model when none is
+                // configured; record the agent name as the audit placeholder.
+                Ok("opencode".to_string())
+            } else {
+                Ok(model)
+            }
+        }
         RuntimeKind::RemoteHost => {
             anyhow::bail!("remote_host runtime jobs are not resolved by this server")
         }
@@ -168,8 +179,9 @@ fn resolve_reasoning_effort(
             .clone()
             .or_else(|| execution_phase.map(|phase| phase.effort_level().to_string())),
         // The Anthropic API runtime has no reasoning-effort contract, so no
-        // effort value is recorded for it.
-        RuntimeKind::AnthropicApi | RuntimeKind::RemoteHost => None,
+        // effort value is recorded for it. OpenCode's ACP v1 has no
+        // reasoning-effort option either.
+        RuntimeKind::AnthropicApi | RuntimeKind::OpenCode | RuntimeKind::RemoteHost => None,
     }
 }
 
@@ -206,9 +218,10 @@ fn resolve_approval_policy(
             RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => {
                 ResolvedApprovalPolicy::UnobservedAgentDefault
             }
-            RuntimeKind::ClaudeCode | RuntimeKind::AnthropicApi | RuntimeKind::RemoteHost => {
-                ResolvedApprovalPolicy::NotApplicable
-            }
+            RuntimeKind::ClaudeCode
+            | RuntimeKind::AnthropicApi
+            | RuntimeKind::OpenCode
+            | RuntimeKind::RemoteHost => ResolvedApprovalPolicy::NotApplicable,
         }),
     }
 }

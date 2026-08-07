@@ -103,6 +103,8 @@ pub struct AgentsConfig {
     pub codex: CodexAgentConfig,
     pub anthropic_api: AnthropicApiConfig,
     #[serde(default)]
+    pub opencode: OpenCodeAgentConfig,
+    #[serde(default)]
     pub review: AgentReviewConfig,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
@@ -157,6 +159,7 @@ impl Default for AgentsConfig {
             claude: ClaudeAgentConfig::default(),
             codex: CodexAgentConfig::default(),
             anthropic_api: AnthropicApiConfig::default(),
+            opencode: OpenCodeAgentConfig::default(),
             review: AgentReviewConfig::default(),
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
@@ -746,6 +749,23 @@ pub struct AnthropicApiConfig {
     pub default_model: String,
     #[serde(default = "default_anthropic_api_max_tokens")]
     pub max_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenCodeAgentConfig {
+    pub cli_path: PathBuf,
+    /// Empty string means "use opencode's own configured default model".
+    #[serde(default)]
+    pub default_model: String,
+}
+
+impl Default for OpenCodeAgentConfig {
+    fn default() -> Self {
+        Self {
+            cli_path: PathBuf::from("opencode"),
+            default_model: String::new(),
+        }
+    }
 }
 
 fn default_anthropic_api_max_tokens() -> u32 {
