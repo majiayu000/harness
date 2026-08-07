@@ -14,6 +14,7 @@ pub(super) fn runtime_usage_context(
     source_project_root: &Path,
 ) -> Option<RuntimeUsageContext> {
     let store = state.core.workflow_runtime_store.as_ref()?.clone();
+    let budget_policy = store.budget_policy().clone();
     let workflow_id = workflow
         .map(|workflow| workflow.id.clone())
         .or_else(|| optional_string(&job.input, "workflow_id"))
@@ -43,6 +44,7 @@ pub(super) fn runtime_usage_context(
         candidate_id: candidate.and_then(|value| optional_string(value, "candidate_id")),
         candidate_index: candidate.and_then(|value| optional_u32_value(value, "candidate_index")),
         candidate_count: candidate.and_then(|value| optional_u32_value(value, "candidate_count")),
+        budget_policy,
     })
 }
 

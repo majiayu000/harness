@@ -12,3 +12,6 @@ mod stall_tests;
 
 #[cfg(test)]
 mod terminal_error_tests;
+
+#[cfg(test)]
+mod turn_lifecycle_tests;
