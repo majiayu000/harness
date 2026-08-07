@@ -82,7 +82,9 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
                             }
                         }
                         Err(error) => {
-                            tick_error = Some(error.to_string());
+                            if tick_error.is_none() {
+                                tick_error = Some(error.to_string());
+                            }
                             tracing::warn!("workflow watchdog tick failed: {error}")
                         }
                     }
@@ -107,7 +109,9 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
                             }
                         }
                         Err(error) => {
-                            tick_error = Some(error.to_string());
+                            if tick_error.is_none() {
+                                tick_error = Some(error.to_string());
+                            }
                             tracing::error!(
                                 "workflow watchdog driverless-progress scan failed: {error}"
                             );
@@ -180,7 +184,9 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
                                 }
                             }
                             Err(error) => {
-                                tick_error = Some(error.to_string());
+                                if tick_error.is_none() {
+                                    tick_error = Some(error.to_string());
+                                }
                                 tracing::warn!("workflow alert scan failed: {error}")
                             }
                         }
