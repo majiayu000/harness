@@ -296,6 +296,25 @@ impl WorkflowRuntimeStore {
         }))
     }
 
+    /// Total adapter-reported spend (micro-dollars) for one runtime profile
+    /// since `since` — the daily-profile-cap input for the GH-1770 gate.
+    pub async fn runtime_usage_cost_for_profile_since(
+        &self,
+        runtime_profile: &str,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<u64> {
+        let (cost_usd_micros,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd_micros), 0)::BIGINT
+             FROM runtime_usage_events
+             WHERE runtime_profile = $1 AND reported_at >= $2",
+        )
+        .bind(runtime_profile)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        i64_to_u64(cost_usd_micros, "cost_usd_micros")
+    }
+
     /// Single durable query path for "what did agent X do in workflow/run Y?"
     ///
     /// This returns the workflow outcome from `workflow_instances` plus the

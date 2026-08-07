@@ -320,7 +320,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             );
         }
         if let Some(outcome) = self
-            .budget_gate_outcome(instance.as_ref(), &command)
+            .budget_gate_outcome(instance.as_ref(), &command, &runtime_profile.name)
             .await?
         {
             return Ok(outcome);
@@ -407,13 +407,14 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         &self,
         instance: Option<&WorkflowInstance>,
         command: &WorkflowCommandRecord,
+        runtime_profile_name: &str,
     ) -> anyhow::Result<Option<CommandDispatchOutcome>> {
         if self.budget_policy.unlimited {
             return Ok(None);
         }
-        let budget_usd = self.budget_policy.default_workflow_budget_usd;
         // Compare in integer micro-dollars: spend is stored in micros, and a
         // float comparison could flip the gate at the boundary.
+        let budget_usd = self.budget_policy.default_workflow_budget_usd;
         let budget_usd_micros = cost_usd_to_micros(budget_usd)?;
         let spent_usd_micros = self
             .store
@@ -421,40 +422,92 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             .await?
             .map(|usage| usage.cost_usd_micros)
             .unwrap_or(0);
-        if spent_usd_micros < budget_usd_micros {
-            return Ok(None);
+        if spent_usd_micros >= budget_usd_micros {
+            let spent_usd = cost_usd_from_micros(spent_usd_micros);
+            return self
+                .budget_breach_outcome(
+                    instance,
+                    command,
+                    DispatchBarrierReasonCode::WorkflowBudgetExhausted,
+                    format!(
+                        "workflow {} spent {spent_usd:.2} USD, reaching its {budget_usd:.2} USD budget",
+                        command.workflow_id
+                    ),
+                    json!({
+                        "spent_usd": spent_usd,
+                        "budget_usd": budget_usd,
+                    }),
+                )
+                .await;
         }
-        let spent_usd = cost_usd_from_micros(spent_usd_micros);
+        if let Some(cap_usd) = self.budget_policy.daily_profile_cap_usd {
+            let cap_usd_micros = cost_usd_to_micros(cap_usd)?;
+            let utc_day_start = Utc::now()
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .map(|day_start| day_start.and_utc())
+                .context("failed to compute UTC day start for the daily profile cap")?;
+            let profile_spent_micros = self
+                .store
+                .runtime_usage_cost_for_profile_since(runtime_profile_name, utc_day_start)
+                .await?;
+            if profile_spent_micros >= cap_usd_micros {
+                let profile_spent_usd = cost_usd_from_micros(profile_spent_micros);
+                return self
+                    .budget_breach_outcome(
+                        instance,
+                        command,
+                        DispatchBarrierReasonCode::ProfileDailyCapReached,
+                        format!(
+                            "runtime profile {runtime_profile_name} spent {profile_spent_usd:.2} USD \
+                             today, reaching its {cap_usd:.2} USD daily cap",
+                        ),
+                        json!({
+                            "runtime_profile": runtime_profile_name,
+                            "profile_spent_usd_today": profile_spent_usd,
+                            "daily_profile_cap_usd": cap_usd,
+                        }),
+                    )
+                    .await;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Shared shadow/enforce disposition for a breached budget ceiling.
+    /// Shadow records a `BudgetShadowDecision` runtime event and dispatches;
+    /// enforce defers the command with the given barrier reason.
+    async fn budget_breach_outcome(
+        &self,
+        instance: Option<&WorkflowInstance>,
+        command: &WorkflowCommandRecord,
+        reason_code: DispatchBarrierReasonCode,
+        reason: String,
+        mut evidence: Value,
+    ) -> anyhow::Result<Option<CommandDispatchOutcome>> {
         match self.budget_policy.enforcement {
             RuntimeBudgetEnforcement::Shadow => {
+                if let Some(evidence) = evidence.as_object_mut() {
+                    evidence.insert("command_id".to_string(), json!(command.id));
+                    evidence.insert("decision".to_string(), json!("would_defer"));
+                    evidence.insert(
+                        "barrier_reason_code".to_string(),
+                        json!(reason_code.as_str()),
+                    );
+                }
                 self.store
                     .append_event(
                         &command.workflow_id,
                         "BudgetShadowDecision",
                         "workflow_runtime_command_dispatcher",
-                        json!({
-                            "command_id": command.id,
-                            "decision": "would_defer",
-                            "barrier_reason_code":
-                                DispatchBarrierReasonCode::WorkflowBudgetExhausted.as_str(),
-                            "spent_usd": spent_usd,
-                            "budget_usd": budget_usd,
-                        }),
+                        evidence,
                     )
                     .await?;
                 Ok(None)
             }
             RuntimeBudgetEnforcement::Enforce => {
-                let reason = format!(
-                    "workflow {} spent {spent_usd:.2} USD, reaching its {budget_usd:.2} USD budget",
-                    command.workflow_id
-                );
                 let project_id = command_project_id(instance, command)?;
-                let barrier = DispatchBarrierInput::new(
-                    DispatchBarrierReasonCode::WorkflowBudgetExhausted,
-                    reason,
-                    project_id,
-                );
+                let barrier = DispatchBarrierInput::new(reason_code, reason, project_id);
                 dispatch_deferral_outcome(
                     command,
                     self.store

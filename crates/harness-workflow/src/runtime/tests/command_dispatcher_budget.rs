@@ -24,11 +24,31 @@ fn budget_usage_upsert(workflow_id: &str, cost_usd_micros: u64) -> RuntimeUsageU
     }
 }
 
+fn profile_usage_upsert(
+    workflow_id: &str,
+    runtime_profile: &str,
+    cost_usd_micros: u64,
+) -> RuntimeUsageUpsert {
+    RuntimeUsageUpsert {
+        runtime_profile: runtime_profile.to_string(),
+        ..budget_usage_upsert(workflow_id, cost_usd_micros)
+    }
+}
+
+fn daily_cap_policy(cap_usd: f64, enforcement: RuntimeBudgetEnforcement) -> RuntimeBudgetPolicy {
+    RuntimeBudgetPolicy {
+        enforcement,
+        daily_profile_cap_usd: Some(cap_usd),
+        ..RuntimeBudgetPolicy::default()
+    }
+}
+
 fn enforce_budget_policy(budget_usd: f64) -> RuntimeBudgetPolicy {
     RuntimeBudgetPolicy {
         default_workflow_budget_usd: budget_usd,
         enforcement: RuntimeBudgetEnforcement::Enforce,
         unlimited: false,
+        daily_profile_cap_usd: None,
     }
 }
 
@@ -202,6 +222,136 @@ async fn budget_gate_unlimited_skips_check() -> anyhow::Result<()> {
     );
     assert!(store
         .events_for(&instance.id)
+        .await?
+        .iter()
+        .all(|event| event.event_type != "BudgetShadowDecision"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn daily_profile_cap_shadow_records_event_and_dispatches() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let (instance, _) = issue_with_pending_command(&store, 505).await?;
+    // The cap aggregates today's spend across workflows for the profile the
+    // dispatcher selects ("codex-high" here), not just this workflow.
+    store
+        .upsert_runtime_usage(&profile_usage_upsert(
+            "other-workflow",
+            "codex-high",
+            cost_usd_to_micros(9.0)?,
+        ))
+        .await?;
+    store
+        .upsert_runtime_usage(&profile_usage_upsert(
+            &instance.id,
+            "codex-high",
+            cost_usd_to_micros(2.0)?,
+        ))
+        .await?;
+
+    let dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-high", RuntimeKind::CodexJsonrpc),
+    )
+    .with_budget_policy(daily_cap_policy(10.0, RuntimeBudgetEnforcement::Shadow));
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should dispatch");
+
+    assert!(
+        matches!(outcome, CommandDispatchOutcome::Enqueued { .. }),
+        "shadow mode must dispatch despite the breached daily cap: {outcome:?}"
+    );
+    let events = store.events_for(&instance.id).await?;
+    let shadow = events
+        .iter()
+        .find(|event| event.event_type == "BudgetShadowDecision")
+        .expect("shadow mode records a BudgetShadowDecision event");
+    assert_eq!(shadow.event["decision"], "would_defer");
+    assert_eq!(
+        shadow.event["barrier_reason_code"],
+        "profile_daily_cap_reached"
+    );
+    assert_eq!(shadow.event["runtime_profile"], "codex-high");
+    assert_eq!(shadow.event["daily_profile_cap_usd"], 10.0);
+    assert_eq!(shadow.event["profile_spent_usd_today"], 11.0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn daily_profile_cap_enforce_defers_and_ignores_other_profiles() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let (_instance, command_id) = issue_with_pending_command(&store, 506).await?;
+    store
+        .upsert_runtime_usage(&profile_usage_upsert(
+            "other-workflow",
+            "codex-high",
+            cost_usd_to_micros(10.0)?,
+        ))
+        .await?;
+    // Spend on a different profile must not count toward this cap.
+    store
+        .upsert_runtime_usage(&profile_usage_upsert(
+            "unrelated-workflow",
+            "codex-low",
+            cost_usd_to_micros(100.0)?,
+        ))
+        .await?;
+
+    let dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-high", RuntimeKind::CodexJsonrpc),
+    )
+    .with_budget_policy(daily_cap_policy(10.0, RuntimeBudgetEnforcement::Enforce));
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should dispatch");
+
+    let barrier = match outcome {
+        CommandDispatchOutcome::Deferred {
+            command_id: id,
+            barrier,
+        } => {
+            assert_eq!(id, command_id);
+            barrier
+        }
+        other => panic!("enforce mode must defer past the daily cap: {other:?}"),
+    };
+    assert_eq!(
+        barrier.reason_code,
+        DispatchBarrierReasonCode::ProfileDailyCapReached
+    );
+    assert!(barrier.reason.contains("codex-high"), "{}", barrier.reason);
+
+    // Under the cap on a fresh profile, the same policy dispatches.
+    let (under_instance, _) = issue_with_pending_command(&store, 507).await?;
+    let under_dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-fresh", RuntimeKind::CodexJsonrpc),
+    )
+    .with_budget_policy(daily_cap_policy(10.0, RuntimeBudgetEnforcement::Enforce));
+    let under_outcome = under_dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should dispatch");
+    assert!(
+        matches!(under_outcome, CommandDispatchOutcome::Enqueued { .. }),
+        "fresh profile under the cap must dispatch: {under_outcome:?}"
+    );
+    assert!(store
+        .events_for(&under_instance.id)
         .await?
         .iter()
         .all(|event| event.event_type != "BudgetShadowDecision"));
