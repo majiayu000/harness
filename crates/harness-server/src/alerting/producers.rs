@@ -106,6 +106,58 @@ pub fn ready_to_merge_aging(
     })
 }
 
+/// Runtime pool starvation (GH-1895): nothing dispatchable for N consecutive
+/// dispatcher ticks while gated work sits in the pool. A genuinely idle pool
+/// (no commands, no gated workflows) never raises.
+pub fn runtime_pool_starved(
+    empty_ticks: u32,
+    snapshot: &harness_workflow::runtime::store::DispatchPoolSnapshot,
+) -> AlertPayload {
+    AlertPayload::new(
+        AlertClass::RuntimePoolStarved,
+        AlertSeverity::Error,
+        format!(
+            "runtime pool starved: 0 dispatched commands across {empty_ticks} dispatcher ticks \
+             while work is gated (deferred_commands={}, gated_workflows={}, pending_commands={})",
+            snapshot.deferred_commands, snapshot.gated_workflows, snapshot.pending_commands
+        ),
+        AlertPayload::dedup_key_for(AlertClass::RuntimePoolStarved, "runtime"),
+    )
+    .with_subject(AlertSubject {
+        entity: Some("runtime_command_dispatcher".to_string()),
+        ..AlertSubject::default()
+    })
+}
+
+/// Counts consecutive dispatcher ticks that dispatched nothing and decides
+/// when the starvation probe should run. Pure bookkeeping so the contract is
+/// unit-testable without a store.
+pub struct PoolStarvationTracker {
+    threshold: u32,
+    empty_ticks: u32,
+}
+
+impl PoolStarvationTracker {
+    pub fn new(threshold: u32) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            empty_ticks: 0,
+        }
+    }
+
+    /// Record a tick. Returns the consecutive empty-tick count when the
+    /// starvation probe should run (once per threshold window), `None`
+    /// otherwise. Any dispatched command resets the window.
+    pub fn observe_tick(&mut self, dispatched_any: bool) -> Option<u32> {
+        if dispatched_any {
+            self.empty_ticks = 0;
+            return None;
+        }
+        self.empty_ticks = self.empty_ticks.saturating_add(1);
+        (self.empty_ticks % self.threshold == 0).then_some(self.empty_ticks)
+    }
+}
+
 fn notify_channel_drop(delta: u64, total: u64) -> AlertPayload {
     AlertPayload::new(
         AlertClass::NotifyChannelDrop,
@@ -170,6 +222,48 @@ mod tests {
             aging.dedup_key,
             "ready_to_merge_aging:https://github.com/o/r/pull/1"
         );
+    }
+
+    #[test]
+    fn starvation_tracker_fires_once_per_threshold_window_and_resets_on_dispatch() {
+        let mut tracker = PoolStarvationTracker::new(3);
+        assert_eq!(tracker.observe_tick(false), None);
+        assert_eq!(tracker.observe_tick(false), None);
+        assert_eq!(tracker.observe_tick(false), Some(3));
+        assert_eq!(tracker.observe_tick(false), None);
+        assert_eq!(tracker.observe_tick(false), None);
+        assert_eq!(tracker.observe_tick(false), Some(6));
+        assert_eq!(tracker.observe_tick(true), None);
+        assert_eq!(tracker.observe_tick(false), None);
+        assert_eq!(tracker.observe_tick(false), None);
+        assert_eq!(tracker.observe_tick(false), Some(3));
+    }
+
+    #[test]
+    fn starvation_tracker_clamps_zero_threshold() {
+        let mut tracker = PoolStarvationTracker::new(0);
+        assert_eq!(tracker.observe_tick(false), Some(1));
+    }
+
+    #[test]
+    fn runtime_pool_starved_payload_carries_gated_evidence() {
+        let snapshot = harness_workflow::runtime::store::DispatchPoolSnapshot {
+            pending_commands: 1,
+            deferred_commands: 4,
+            dispatched_commands: 0,
+            gated_workflows: 41,
+        };
+        assert!(snapshot.has_gated_work());
+        let payload = runtime_pool_starved(20, &snapshot);
+        assert_eq!(payload.event_class, AlertClass::RuntimePoolStarved);
+        assert_eq!(payload.severity, AlertSeverity::Error);
+        assert_eq!(payload.dedup_key, "runtime_pool_starved:runtime");
+        assert!(payload.message.contains("20 dispatcher ticks"));
+        assert!(payload.message.contains("deferred_commands=4"));
+        assert!(payload.message.contains("gated_workflows=41"));
+
+        let idle = harness_workflow::runtime::store::DispatchPoolSnapshot::default();
+        assert!(!idle.has_gated_work());
     }
 
     #[test]
