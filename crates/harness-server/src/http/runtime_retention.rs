@@ -61,14 +61,18 @@ pub(super) fn spawn_runtime_retention(state: &Arc<AppState>) {
                             )
                             .await
                         {
-                            Ok(candidates) if candidates > 0 => tracing::info!(
-                                dry_run_passes_remaining = *dry_run_remaining,
-                                candidate_root_families = candidates,
-                                retention_days = workflow_cfg.storage.runtime_retention_days,
-                                "runtime retention dry-run: next passes will prune this many terminal workflow families"
-                            ),
-                            Ok(_) => {}
+                            Ok(candidates) if candidates > 0 => {
+                                handle.tick_ok();
+                                tracing::info!(
+                                    dry_run_passes_remaining = *dry_run_remaining,
+                                    candidate_root_families = candidates,
+                                    retention_days = workflow_cfg.storage.runtime_retention_days,
+                                    "runtime retention dry-run: next passes will prune this many terminal workflow families"
+                                )
+                            }
+                            Ok(_) => handle.tick_ok(),
                             Err(error) => {
+                                handle.tick_failed(&error.to_string());
                                 tracing::warn!("runtime retention dry-run count failed: {error}")
                             }
                         }
@@ -80,17 +84,20 @@ pub(super) fn spawn_runtime_retention(state: &Arc<AppState>) {
                             )
                             .await
                         {
-                            Ok(summary) if !summary.is_empty() => tracing::info!(
-                                workflow_instances = summary.workflow_instances_deleted,
-                                workflow_events = summary.workflow_events_deleted,
-                                workflow_decisions = summary.workflow_decisions_deleted,
-                                workflow_commands = summary.workflow_commands_deleted,
-                                runtime_jobs = summary.runtime_jobs_deleted,
-                                runtime_events = summary.runtime_events_deleted,
-                                workflow_artifacts = summary.workflow_artifacts_deleted,
-                                "runtime retention pruned terminal workflow history"
-                            ),
-                            Ok(_) => {}
+                            Ok(summary) if !summary.is_empty() => {
+                                handle.tick_ok();
+                                tracing::info!(
+                                    workflow_instances = summary.workflow_instances_deleted,
+                                    workflow_events = summary.workflow_events_deleted,
+                                    workflow_decisions = summary.workflow_decisions_deleted,
+                                    workflow_commands = summary.workflow_commands_deleted,
+                                    runtime_jobs = summary.runtime_jobs_deleted,
+                                    runtime_events = summary.runtime_events_deleted,
+                                    workflow_artifacts = summary.workflow_artifacts_deleted,
+                                    "runtime retention pruned terminal workflow history"
+                                )
+                            }
+                            Ok(_) => handle.tick_ok(),
                             Err(error) => {
                                 handle.tick_failed(&error.to_string());
                                 tracing::warn!("runtime retention tick failed: {error}")
@@ -100,6 +107,7 @@ pub(super) fn spawn_runtime_retention(state: &Arc<AppState>) {
                 }
             } else {
                 tracing::debug!("runtime retention disabled by config; re-checking next interval");
+                handle.tick_ok();
             }
 
             drop(state);

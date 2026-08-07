@@ -221,6 +221,8 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         .workspace_mgr
         .as_deref()
         .map(|manager| manager.live_count());
+    let loop_snapshots = state.background_loops.snapshot(BACKGROUND_LOOP_STALE_SECS);
+    let config_parse_failure = state.background_loops.config_failure_snapshot();
 
     Ok(OperatorMonitorPayload {
         generated_at: generated_at.to_rfc3339(),
@@ -229,7 +231,7 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
             status: health_status,
             degraded_subsystems: {
                 let mut subsystems = degraded_subsystems;
-                for loop_snapshot in state.background_loops.snapshot(BACKGROUND_LOOP_STALE_SECS) {
+                for loop_snapshot in &loop_snapshots {
                     if loop_snapshot.stale {
                         subsystems.push(match loop_snapshot.name {
                             "orphan_schema_reaper" => "orphan_schema_reaper_stale",
@@ -245,7 +247,7 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
                         });
                     }
                 }
-                if state.background_loops.config_failure_snapshot().is_some() {
+                if config_parse_failure.is_some() {
                     subsystems.push("workflow_config_parse_failure");
                 }
                 subsystems
@@ -264,8 +266,8 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
                 .unwrap_or(0),
             runtime_hosts_online: runtime_hosts.iter().filter(|host| host.online).count() as u64,
             runtime_hosts_total: runtime_hosts.len() as u64,
-            background_loops: state.background_loops.snapshot(BACKGROUND_LOOP_STALE_SECS),
-            config_parse_failure: state.background_loops.config_failure_snapshot(),
+            background_loops: loop_snapshots,
+            config_parse_failure,
         },
         activity: OperatorActivity {
             runtime_workflows,

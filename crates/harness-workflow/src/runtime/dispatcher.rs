@@ -1,5 +1,8 @@
-use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord};
-use super::store::{ClaimedCommandTerminalOutcome, RuntimeJobEnqueueOutcome, WorkflowRuntimeStore};
+use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord, WorkflowInstance};
+use super::store::{
+    cost_usd_from_micros, cost_usd_to_micros, ClaimedCommandTerminalOutcome,
+    RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
+};
 use super::tier_resolution::{
     resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution,
 };
@@ -12,6 +15,7 @@ use chrono::{DateTime, Duration, Utc};
 use harness_core::config::isolation::{
     IsolationAvailability, IsolationConfig, IsolationTrustClass,
 };
+use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -121,6 +125,7 @@ pub struct RuntimeCommandDispatcher<'a> {
     dispatcher_id: String,
     lease_duration: Duration,
     defer_backoff: DispatchBackoffPolicy,
+    budget_policy: RuntimeBudgetPolicy,
 }
 
 impl<'a> RuntimeCommandDispatcher<'a> {
@@ -141,6 +146,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             dispatcher_id: format!("dispatcher:{}", Uuid::new_v4()),
             lease_duration: Duration::seconds(30),
             defer_backoff: DispatchBackoffPolicy::default(),
+            budget_policy: RuntimeBudgetPolicy::default(),
         }
     }
 
@@ -174,6 +180,11 @@ impl<'a> RuntimeCommandDispatcher<'a> {
 
     pub fn with_defer_backoff(mut self, defer_backoff: DispatchBackoffPolicy) -> Self {
         self.defer_backoff = defer_backoff;
+        self
+    }
+
+    pub fn with_budget_policy(mut self, budget_policy: RuntimeBudgetPolicy) -> Self {
+        self.budget_policy = budget_policy;
         self
     }
 
@@ -308,6 +319,12 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                     .await?,
             );
         }
+        if let Some(outcome) = self
+            .budget_gate_outcome(instance.as_ref(), &command)
+            .await?
+        {
+            return Ok(outcome);
+        }
         let not_before = retry_not_before_for_command(&command)?;
         match self
             .store
@@ -378,6 +395,82 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                 Some(command.command.runtime_activity_key()),
             )
             .clone())
+    }
+
+    /// Pre-dispatch budget gate (GH-1770). Returns `Some(outcome)` when the
+    /// command was deferred; `None` when dispatch may proceed.
+    ///
+    /// Shadow enforcement records the would-block decision as a
+    /// `BudgetShadowDecision` runtime event and lets the command through;
+    /// enforce defers it with the `workflow_budget_exhausted` barrier.
+    async fn budget_gate_outcome(
+        &self,
+        instance: Option<&WorkflowInstance>,
+        command: &WorkflowCommandRecord,
+    ) -> anyhow::Result<Option<CommandDispatchOutcome>> {
+        if self.budget_policy.unlimited {
+            return Ok(None);
+        }
+        let budget_usd = self.budget_policy.default_workflow_budget_usd;
+        // Compare in integer micro-dollars: spend is stored in micros, and a
+        // float comparison could flip the gate at the boundary.
+        let budget_usd_micros = cost_usd_to_micros(budget_usd)?;
+        let spent_usd_micros = self
+            .store
+            .runtime_usage_for_workflow(&command.workflow_id)
+            .await?
+            .map(|usage| usage.cost_usd_micros)
+            .unwrap_or(0);
+        if spent_usd_micros < budget_usd_micros {
+            return Ok(None);
+        }
+        let spent_usd = cost_usd_from_micros(spent_usd_micros);
+        match self.budget_policy.enforcement {
+            RuntimeBudgetEnforcement::Shadow => {
+                self.store
+                    .append_event(
+                        &command.workflow_id,
+                        "BudgetShadowDecision",
+                        "workflow_runtime_command_dispatcher",
+                        json!({
+                            "command_id": command.id,
+                            "decision": "would_defer",
+                            "barrier_reason_code":
+                                DispatchBarrierReasonCode::WorkflowBudgetExhausted.as_str(),
+                            "spent_usd": spent_usd,
+                            "budget_usd": budget_usd,
+                        }),
+                    )
+                    .await?;
+                Ok(None)
+            }
+            RuntimeBudgetEnforcement::Enforce => {
+                let reason = format!(
+                    "workflow {} spent {spent_usd:.2} USD, reaching its {budget_usd:.2} USD budget",
+                    command.workflow_id
+                );
+                let project_id = command_project_id(instance, command)?;
+                let barrier = DispatchBarrierInput::new(
+                    DispatchBarrierReasonCode::WorkflowBudgetExhausted,
+                    reason,
+                    project_id,
+                );
+                dispatch_deferral_outcome(
+                    command,
+                    self.store
+                        .defer_claimed_command_if_owned(
+                            &command.id,
+                            &self.dispatcher_id,
+                            command.dispatch_claim_generation,
+                            barrier,
+                            Utc::now(),
+                            self.defer_backoff,
+                        )
+                        .await?,
+                )
+                .map(Some)
+            }
+        }
     }
 }
 

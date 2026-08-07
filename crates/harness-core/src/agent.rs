@@ -15,6 +15,13 @@ pub const AGENT_OUTPUT_SCHEMA_PATH_ENV: &str = "HARNESS_AGENT_OUTPUT_SCHEMA_PATH
 #[async_trait]
 pub trait CodeAgent: Send + Sync {
     fn name(&self) -> &str;
+    /// Stable identity used to detect "primary == challenger" misconfigurations
+    /// in cross-review. Defaults to the registry key (`name`); implementations
+    /// that wrap multiple backends should include the backend/model so two
+    /// registry entries backed by the same model compare equal.
+    fn id(&self) -> String {
+        self.name().to_string()
+    }
     fn capabilities(&self) -> Vec<Capability>;
     async fn execute(&self, req: AgentRequest) -> crate::error::Result<AgentResponse>;
     async fn execute_stream(
