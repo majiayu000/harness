@@ -352,6 +352,7 @@ impl WorkflowRuntimeStore {
             &command.workflow_id,
             owner,
             &event,
+            &self.budget_policy,
         )
         .await?;
 

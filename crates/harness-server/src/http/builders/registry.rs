@@ -48,6 +48,10 @@ pub(crate) async fn build_registry(
                 project_root.display()
             )
         })?;
+    // Cloned before `storage` is moved out: the runtime store enforces the
+    // same policy at activity completion that the dispatcher enforces
+    // pre-dispatch (GH-1770).
+    let runtime_budget_policy = workflow_config.runtime_budget_policy.clone();
     let workflow_ns = workflow_config.storage.schema_namespace;
     let mut startup_results = Vec::new();
     let plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>> = Arc::new(DashMap::new());
@@ -269,7 +273,8 @@ pub(crate) async fn build_registry(
                     &context,
                     &setup_pool,
                 )
-                .await?;
+                .await?
+                .with_budget_policy(runtime_budget_policy.clone());
                 let historical_definitions = store.list_persisted_declarative_definitions().await?;
                 harness_workflow::runtime::register_historical_declarative_workflow_definitions(
                     historical_definitions,
