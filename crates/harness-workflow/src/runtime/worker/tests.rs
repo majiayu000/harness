@@ -287,3 +287,85 @@ fn prompt_task_instance() -> WorkflowInstance {
         WorkflowSubject::new("p", "1"),
     )
 }
+
+struct LeaseLostExecutor {
+    cancel_calls: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl RuntimeJobExecutor for LeaseLostExecutor {
+    async fn execute(&self, _job: RuntimeJob) -> ActivityResult {
+        self.release.notified().await;
+        ActivityResult::cancelled("check", "cancelled after lease lost")
+    }
+
+    async fn cancel_execution(&self, _job: &RuntimeJob) {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+#[tokio::test]
+async fn lease_lost_cancels_execution_and_waits_for_cleanup() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = enqueue_test_runtime_job(
+        &store,
+        "lease-lost-cancel",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
+
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let executor = LeaseLostExecutor {
+        cancel_calls: Arc::clone(&cancel_calls),
+        release: Arc::clone(&release),
+    };
+    // Short lease so the renewal loop hits the tampered lease quickly; the
+    // tamper task steals ownership while execute is still blocked.
+    let worker =
+        RuntimeWorker::new(&store, "lease-lost-worker").with_lease_ttl(Duration::seconds(4));
+    let pool = store.pool().clone();
+    let tamper_job_id = job.id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        sqlx::query(
+            r#"UPDATE runtime_jobs
+               SET data = jsonb_set(data, '{lease,owner}', '"other-worker"')
+               WHERE id = $1"#,
+        )
+        .bind(&tamper_job_id)
+        .execute(&pool)
+        .await
+        .expect("lease tamper should apply");
+    });
+
+    let completed = worker.run_once(&executor).await?;
+
+    assert_eq!(
+        cancel_calls.load(Ordering::SeqCst),
+        1,
+        "executor cancel must be invoked"
+    );
+    assert!(completed.is_none(), "lease-lost completion must not commit");
+
+    let (dlq_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&job.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        dlq_count, 1,
+        "lease-lost result must land in the dead-letter"
+    );
+    Ok(())
+}

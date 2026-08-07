@@ -20,6 +20,12 @@ pub trait RuntimeJobExecutor: Send + Sync {
     }
 
     async fn execute(&self, job: RuntimeJob) -> ActivityResult;
+
+    /// Cancel the in-flight execution of `job`: the executor interrupts the
+    /// agent process and releases its workspace so a reclaimer never runs
+    /// against a dirty tree (GH-1877). The `execute` future then resolves to
+    /// a cancelled/failed result shortly after.
+    async fn cancel_execution(&self, _job: &RuntimeJob) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,12 +278,26 @@ impl<'a> RuntimeWorker<'a> {
                         )
                         .await?
                     else {
-                        return Ok(RuntimeJobExecution {
-                            result: ActivityResult::failed(
+                        // Lease lost mid-turn: cancel the in-flight agent and
+                        // wait for the executor's cleanup (agent termination +
+                        // workspace release) so a reclaimer never sees a
+                        // dirty tree. Bounded by a grace period; if cleanup
+                        // does not finish, the future is dropped and the
+                        // workspace reaper is the backstop (GH-1877).
+                        executor.cancel_execution(job).await;
+                        let cleanup_grace = std::time::Duration::from_secs(30);
+                        let result = match tokio::time::timeout(cleanup_grace, &mut execution)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => ActivityResult::failed(
                                 activity,
                                 "Runtime job lease was lost before the agent completed.",
-                                "Another runtime worker reclaimed the job after this worker's lease expired.",
+                                "Another runtime worker reclaimed the job after this worker's lease expired; agent cleanup exceeded the grace period.",
                             ),
+                        };
+                        return Ok(RuntimeJobExecution {
+                            result,
                             lease_expires_at,
                         });
                     };

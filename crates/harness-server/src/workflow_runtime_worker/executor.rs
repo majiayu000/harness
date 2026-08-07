@@ -48,10 +48,20 @@ use structured_output::{
 };
 pub(super) struct ServerRuntimeJobExecutor<'a> {
     pub(super) state: &'a Arc<AppState>,
+    /// Fired when the owning runtime job lease is lost mid-turn so the turn
+    /// loop interrupts the agent and the workspace cleanup can run (GH-1877).
+    lease_lost: Arc<tokio::sync::Notify>,
 }
 impl<'a> ServerRuntimeJobExecutor<'a> {
     pub(super) fn new(state: &'a Arc<AppState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            lease_lost: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(super) fn cancel_lease_lost(&self) {
+        self.lease_lost.notify_waiters();
     }
 
     pub(super) async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
@@ -225,6 +235,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         },
                         timeout_secs: Some(resolved_settings.timeout_secs),
                         stall_timeout_secs: Some(resolved_settings.stall_timeout_secs),
+                        lease_lost: Some(Arc::clone(&self.lease_lost)),
                         env_vars,
                         allowed_tools: correction_only.then(Vec::new),
                         force_code_agent: force_code_agent || correction_only,

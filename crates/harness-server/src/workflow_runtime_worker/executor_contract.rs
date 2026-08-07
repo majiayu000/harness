@@ -39,6 +39,13 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
             Err(error) => execution_error_result(activity, error),
         }
     }
+
+    async fn cancel_execution(&self, _job: &RuntimeJob) {
+        // The turn loop watches this notification and interrupts the agent,
+        // which terminates the child process and lets the workspace cleanup
+        // run before execute returns (GH-1877).
+        self.cancel_lease_lost();
+    }
 }
 
 fn execution_error_result(activity: String, error: anyhow::Error) -> ActivityResult {

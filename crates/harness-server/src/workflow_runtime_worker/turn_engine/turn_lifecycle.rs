@@ -72,6 +72,10 @@ pub(crate) struct TurnLifecycleOptions {
     pub allowed_tools: Option<Vec<String>>,
     pub env_vars: HashMap<String, String>,
     pub runtime_usage: Option<RuntimeUsageContext>,
+    /// Fired when the owning runtime job lease is lost mid-turn: the turn
+    /// interrupts the agent so the child process terminates and the
+    /// workspace cleanup can run (GH-1877).
+    pub lease_lost: Option<Arc<tokio::sync::Notify>>,
 }
 
 pub(crate) async fn run_turn_lifecycle_with_options(
@@ -326,6 +330,31 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     "Agent stream stalled: no output for {}s",
                     stall_timeout.as_secs()
                 ))));
+                break 'outer;
+            }
+            _ = async {
+                    match options.lease_lost.as_ref() {
+                        Some(notify) => notify.notified().await,
+                        None => std::future::pending().await,
+                    }
+                }, if execution_result.is_none() && !stream_closed => {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    "runtime job lease lost mid-turn; interrupting agent"
+                );
+                if let Some(adapter) = adapter_opt.as_ref() {
+                    if let Err(error) = adapter.interrupt().await {
+                        tracing::warn!(
+                            thread_id = %thread_id,
+                            turn_id = %turn_id,
+                            "failed to interrupt agent after lease loss: {error}"
+                        );
+                    }
+                }
+                execution_result = Some(Err(HarnessError::AgentExecution(
+                    "Runtime job lease was lost before the agent completed; turn interrupted.".to_string(),
+                )));
                 break 'outer;
             }
             _ = &mut execution_timeout, if execution_result.is_none() => {
