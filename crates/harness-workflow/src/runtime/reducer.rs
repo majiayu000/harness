@@ -26,7 +26,9 @@ use self::declarative_completion::{
     definition_pin_blocked_decision, reduce_declarative_completion,
 };
 pub(crate) use self::prompt_completion_evidence::first_valid_prompt_validation_report;
-pub(crate) use self::support::invalid_agent_output_blocked_decision;
+pub(crate) use self::support::{
+    budget_exhausted_blocked_decision, invalid_agent_output_blocked_decision,
+};
 use super::model::{ActivityResult, WorkflowDecision, WorkflowEvent, WorkflowInstance};
 use super::state_registry::{resolve_declarative_definition, DeclarativeDefinitionResolution};
 use serde_json::Value;

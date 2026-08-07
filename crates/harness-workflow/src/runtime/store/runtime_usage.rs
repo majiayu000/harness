@@ -317,6 +317,9 @@ impl WorkflowRuntimeStore {
 
     /// Single durable query path for "what did agent X do in workflow/run Y?"
     ///
+    /// (see [`runtime_usage_cost_for_workflow_tx`] for the transaction-scoped
+    /// spend read used by the completion-time budget ceiling)
+    ///
     /// This returns the workflow outcome from `workflow_instances` plus the
     /// per-turn usage rows for one persisted runtime agent plus policy-hook
     /// events linked by the persisted runtime usage `agent_run_id`.
@@ -391,6 +394,24 @@ impl WorkflowRuntimeStore {
             })
             .collect()
     }
+}
+
+/// Adapter-reported spend (micro-dollars) for one workflow, read inside the
+/// activity-completion transaction so the hard budget ceiling (GH-1770 spec
+/// §4.4) sees the spend of the activity it is committing.
+pub(super) async fn runtime_usage_cost_for_workflow_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+) -> anyhow::Result<u64> {
+    let (cost_usd_micros,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(cost_usd_micros), 0)::BIGINT
+         FROM runtime_usage_events
+         WHERE workflow_id = $1",
+    )
+    .bind(workflow_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    i64_to_u64(cost_usd_micros, "cost_usd_micros")
 }
 
 async fn policy_events_for_usage_records(

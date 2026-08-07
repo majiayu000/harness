@@ -2,7 +2,9 @@ use crate::runtime::model::{
     ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
-use crate::runtime::reason_class::{classify_stop, STOP_REASON_INVALID_AGENT_OUTPUT};
+use crate::runtime::reason_class::{
+    classify_stop, STOP_REASON_BUDGET_EXHAUSTED, STOP_REASON_INVALID_AGENT_OUTPUT,
+};
 use serde_json::{json, Value};
 
 pub(crate) fn invalid_agent_output_blocked_decision(
@@ -32,6 +34,45 @@ pub(crate) fn invalid_agent_output_blocked_decision(
             "reason": reason,
             "activity": result.activity,
             "runtime_job_id": event_field_string(event, "runtime_job_id"),
+        }),
+    ))
+    .with_evidence(runtime_completion_evidence(event, result))
+    .high_confidence()
+}
+
+/// Hard workflow budget ceiling (GH-1770 spec §4.4): the completed activity
+/// pushed the instance past its USD budget, so the workflow stops instead of
+/// scheduling more work. Recovery is the existing operator path — unblock
+/// after raising the budget — so no new lifecycle state is introduced.
+pub(crate) fn budget_exhausted_blocked_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    reason: &str,
+    evidence: Value,
+) -> WorkflowDecision {
+    WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "block_budget_exhausted",
+        "blocked",
+        reason,
+    )
+    .with_command(runtime_blocked_command(
+        reason,
+        Some(STOP_REASON_BUDGET_EXHAUSTED),
+        format!("runtime-completion:{}:budget-exhausted:block", event.id),
+        event,
+        result,
+    ))
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::RequestOperatorAttention,
+        format!("runtime-completion:{}:budget-exhausted:operator", event.id),
+        json!({
+            "reason": reason,
+            "activity": result.activity,
+            "runtime_job_id": event_field_string(event, "runtime_job_id"),
+            "budget": evidence,
         }),
     ))
     .with_evidence(runtime_completion_evidence(event, result))

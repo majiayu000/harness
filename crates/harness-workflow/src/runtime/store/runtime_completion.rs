@@ -1,7 +1,8 @@
+use super::runtime_completion_budget::budget_ceiling_blocked_decision;
 use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
     insert_decision_record_once_tx, insert_event_tx, select_instance_for_update_tx,
-    WorkflowRuntimeStore,
+    RuntimeBudgetPolicy, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowDecision, WorkflowDecisionRecord,
@@ -58,9 +59,14 @@ impl WorkflowRuntimeStore {
             payload,
         )
         .await?;
-        let decision =
-            apply_runtime_completion_decision_for_instance_tx(&mut tx, instance, source, &event)
-                .await?;
+        let decision = apply_runtime_completion_decision_for_instance_tx(
+            &mut tx,
+            instance,
+            source,
+            &event,
+            &self.budget_policy,
+        )
+        .await?;
         tx.commit().await?;
         if let Some(decision) = decision.as_ref() {
             self.record_terminal_repo_memory_for_completion(&event, decision)
@@ -102,11 +108,13 @@ pub(super) async fn apply_runtime_completion_decision_tx(
     workflow_id: &str,
     source: &str,
     event: &WorkflowEvent,
+    budget_policy: &RuntimeBudgetPolicy,
 ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
     let Some(instance) = select_instance_for_update_tx(tx, workflow_id).await? else {
         return Ok(None);
     };
-    apply_runtime_completion_decision_for_instance_tx(tx, instance, source, event).await
+    apply_runtime_completion_decision_for_instance_tx(tx, instance, source, event, budget_policy)
+        .await
 }
 
 async fn apply_runtime_completion_decision_for_instance_tx(
@@ -114,11 +122,29 @@ async fn apply_runtime_completion_decision_for_instance_tx(
     instance: WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
+    budget_policy: &RuntimeBudgetPolicy,
 ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
     let driverless_decision = driverless_structured_completion_decision(&instance, source, event)?;
     let Some(decision) = reduce_runtime_job_completed(&instance, event)? else {
         return Ok(None);
     };
+    // Hard workflow budget ceiling (GH-1770 §4.4). Checked before the policy
+    // fallbacks below: those already stop the workflow, so a budget block on
+    // top of them would only mask the real reason.
+    if let Some(budget_decision) =
+        budget_ceiling_blocked_decision(tx, budget_policy, &instance, source, event, &decision)
+            .await?
+    {
+        return persist_runtime_completion_decision_tx(
+            tx,
+            instance,
+            source,
+            event,
+            budget_decision,
+        )
+        .await
+        .map(Some);
+    }
     // Preserve the requested liveness rejection only when the reducer found no
     // authoritative domain outcome and would apply its generic invalid-output policy.
     // The separate blocked policy decision remains the committed outcome, so the

@@ -12,6 +12,7 @@ use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
 use super::transcript::PendingRuntimeTranscript;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 use harness_core::db::PgStoreContext;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -62,6 +63,8 @@ mod prompt_payloads;
 mod recovery;
 #[path = "store/runtime_completion.rs"]
 mod runtime_completion;
+#[path = "store/runtime_completion_budget.rs"]
+mod runtime_completion_budget;
 #[path = "store/runtime_job_leases.rs"]
 pub mod runtime_job_leases;
 #[path = "store/runtime_job_queries.rs"]
@@ -119,6 +122,10 @@ use transaction_helpers::{
 pub(super) use transaction_helpers::{enum_str, insert_event_tx, to_jsonb_string};
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
+    /// Hard workflow budget ceiling policy (GH-1770 spec §4.4), applied when a
+    /// completed activity commits its decision. Defaults to shadow enforcement
+    /// so a store opened without explicit wiring only records decisions.
+    pub(super) budget_policy: RuntimeBudgetPolicy,
 }
 pub struct WorkflowInstancePage {
     pub instances: Vec<WorkflowInstance>,
@@ -310,7 +317,10 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool(WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            budget_policy: RuntimeBudgetPolicy::default(),
+        })
     }
     pub async fn open_with_database_url_and_schema(
         configured_database_url: Option<&str>,
@@ -320,7 +330,10 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool(WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            budget_policy: RuntimeBudgetPolicy::default(),
+        })
     }
     pub async fn open_with_context(
         context: &PgStoreContext,
@@ -329,7 +342,16 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            budget_policy: RuntimeBudgetPolicy::default(),
+        })
+    }
+    /// Wire the runtime budget policy that governs the hard workflow ceiling
+    /// applied when an activity completion commits its decision (GH-1770).
+    pub fn with_budget_policy(mut self, budget_policy: RuntimeBudgetPolicy) -> Self {
+        self.budget_policy = budget_policy;
+        self
     }
     pub fn pool(&self) -> &PgPool {
         &self.pool
