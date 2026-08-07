@@ -1,7 +1,7 @@
 use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord, WorkflowInstance};
 use super::store::{
-    cost_usd_from_micros, ClaimedCommandTerminalOutcome, RuntimeJobEnqueueOutcome,
-    WorkflowRuntimeStore,
+    cost_usd_from_micros, cost_usd_to_micros, ClaimedCommandTerminalOutcome,
+    RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
 };
 use super::tier_resolution::{
     resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution,
@@ -412,15 +412,19 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             return Ok(None);
         }
         let budget_usd = self.budget_policy.default_workflow_budget_usd;
-        let spent_usd = self
+        // Compare in integer micro-dollars: spend is stored in micros, and a
+        // float comparison could flip the gate at the boundary.
+        let budget_usd_micros = cost_usd_to_micros(budget_usd)?;
+        let spent_usd_micros = self
             .store
             .runtime_usage_for_workflow(&command.workflow_id)
             .await?
-            .map(|usage| cost_usd_from_micros(usage.cost_usd_micros))
-            .unwrap_or(0.0);
-        if spent_usd < budget_usd {
+            .map(|usage| usage.cost_usd_micros)
+            .unwrap_or(0);
+        if spent_usd_micros < budget_usd_micros {
             return Ok(None);
         }
+        let spent_usd = cost_usd_from_micros(spent_usd_micros);
         match self.budget_policy.enforcement {
             RuntimeBudgetEnforcement::Shadow => {
                 self.store
