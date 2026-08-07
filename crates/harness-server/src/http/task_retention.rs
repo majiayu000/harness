@@ -13,6 +13,7 @@ const CONFIG_RETRY_SECS: u64 = 30;
 /// process start run in dry-run mode, reporting what would be deleted, so
 /// activation on existing deployments cannot surprise operators (GH-1879).
 pub(super) fn spawn_task_retention(state: &Arc<AppState>) {
+    let handle = state.background_loops.register_loop("task_retention");
     let weak_state = Arc::downgrade(state);
     tokio::spawn(async move {
         let mut dry_run_passes_remaining: Option<u32> = None;
@@ -20,17 +21,20 @@ pub(super) fn spawn_task_retention(state: &Arc<AppState>) {
             let Some(state) = weak_state.upgrade() else {
                 break;
             };
-            let workflow_cfg = match harness_core::config::workflow::load_workflow_config(
-                &state.core.project_root,
-            ) {
-                Ok(config) => config,
-                Err(error) => {
-                    tracing::warn!("task retention config load failed: {error}");
-                    drop(state);
-                    tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RETRY_SECS)).await;
-                    continue;
-                }
-            };
+            let workflow_cfg =
+                match crate::http::background::load_workflow_config_for_loop(&state, &handle).await
+                {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::error!(
+                            loop_name = handle.name(),
+                            "task retention config load failed: {error}"
+                        );
+                        drop(state);
+                        tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RETRY_SECS)).await;
+                        continue;
+                    }
+                };
             let interval = std::time::Duration::from_secs(
                 workflow_cfg.storage.task_retention_interval_secs.max(1),
             );
@@ -77,7 +81,10 @@ pub(super) fn spawn_task_retention(state: &Arc<AppState>) {
                             "task retention pruned terminal task history"
                         ),
                         Ok(_) => {}
-                        Err(error) => tracing::warn!("task retention tick failed: {error}"),
+                        Err(error) => {
+                            handle.tick_failed(&error.to_string());
+                            tracing::warn!("task retention tick failed: {error}")
+                        }
                     }
                 }
             } else {

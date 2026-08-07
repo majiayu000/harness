@@ -43,6 +43,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
         vec![],
     );
     Ok(AppState {
+        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: crate::http::CoreServices {
             server: server.clone(),
             project_root: dir.to_path_buf(),

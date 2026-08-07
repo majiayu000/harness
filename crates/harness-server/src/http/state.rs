@@ -250,6 +250,8 @@ pub struct GitHubTokenDispatchCounterSnapshot {
 
 pub struct AppState {
     pub core: CoreServices,
+    /// Health registry for background orchestration loops (GH-1880).
+    pub(crate) background_loops: Arc<crate::http::background::BackgroundLoopHealth>,
     pub engines: EngineServices,
     pub observability: ObservabilityServices,
     pub concurrency: ConcurrencyServices,

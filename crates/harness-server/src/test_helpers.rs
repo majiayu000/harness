@@ -332,6 +332,7 @@ async fn make_state_inner(
         vec![],
     );
     Ok(AppState {
+        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: crate::http::CoreServices {
             server,
             project_root: project_root.to_path_buf(),

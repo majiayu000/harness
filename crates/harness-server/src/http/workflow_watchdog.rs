@@ -13,6 +13,7 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
         return;
     }
 
+    let handle = state.background_loops.register_loop("workflow_watchdog");
     let weak_state = Arc::downgrade(state);
     tokio::spawn(async move {
         // workflow_id -> last observed stopped state; alerts fire on the
@@ -25,17 +26,20 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
             let Some(state) = weak_state.upgrade() else {
                 break;
             };
-            let workflow_cfg = match harness_core::config::workflow::load_workflow_config(
-                &state.core.project_root,
-            ) {
-                Ok(config) => config,
-                Err(error) => {
-                    tracing::warn!("workflow watchdog config load failed: {error}");
-                    drop(state);
-                    tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RETRY_SECS)).await;
-                    continue;
-                }
-            };
+            let workflow_cfg =
+                match crate::http::background::load_workflow_config_for_loop(&state, &handle).await
+                {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::error!(
+                            loop_name = handle.name(),
+                            "workflow watchdog config load failed: {error}"
+                        );
+                        drop(state);
+                        tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RETRY_SECS)).await;
+                        continue;
+                    }
+                };
             let interval = std::time::Duration::from_secs(
                 workflow_cfg.storage.workflow_watchdog_interval_secs.max(1),
             );
