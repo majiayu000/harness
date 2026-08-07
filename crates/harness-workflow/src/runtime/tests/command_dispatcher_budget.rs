@@ -49,6 +49,7 @@ fn enforce_budget_policy(budget_usd: f64) -> RuntimeBudgetPolicy {
         enforcement: RuntimeBudgetEnforcement::Enforce,
         unlimited: false,
         daily_profile_cap_usd: None,
+        daily_throttle_ratio: 0.8,
     }
 }
 
@@ -352,6 +353,205 @@ async fn daily_profile_cap_enforce_defers_and_ignores_other_profiles() -> anyhow
     );
     assert!(store
         .events_for(&under_instance.id)
+        .await?
+        .iter()
+        .all(|event| event.event_type != "BudgetShadowDecision"));
+    Ok(())
+}
+
+// Throttle band (GH-1770 §4.1): inside the band a profile yields the dispatch
+// slot to a profile under its own threshold, but is never starved when it is
+// the only claimable work.
+
+fn throttle_policy(cap_usd: f64, enforcement: RuntimeBudgetEnforcement) -> RuntimeBudgetPolicy {
+    RuntimeBudgetPolicy {
+        enforcement,
+        daily_profile_cap_usd: Some(cap_usd),
+        daily_throttle_ratio: 0.8,
+        ..RuntimeBudgetPolicy::default()
+    }
+}
+
+/// Selector where `replan_issue` keeps the (throttled) default profile and
+/// `implement_issue` resolves to a second, cheaper profile.
+fn throttle_profile_selector() -> RuntimeProfileSelector {
+    RuntimeProfileSelector::new(RuntimeProfile::new("codex-high", RuntimeKind::CodexJsonrpc))
+        .with_activity_profile(
+            "implement_issue",
+            RuntimeProfile::new("codex-low", RuntimeKind::CodexJsonrpc),
+        )
+}
+
+async fn issue_with_pending_activity(
+    store: &WorkflowRuntimeStore,
+    issue_number: u64,
+    activity: &str,
+) -> anyhow::Result<(WorkflowInstance, String)> {
+    let instance = project_issue_instance("/project-a", issue_number, "replanning");
+    store.force_upsert_lifecycle_state_for_test(&instance).await?;
+    let command = WorkflowCommand::enqueue_activity(
+        activity,
+        format!("issue-{issue_number}-{activity}-throttle"),
+    );
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    Ok((instance, command_id))
+}
+
+#[tokio::test]
+async fn throttle_band_yields_to_a_profile_under_its_threshold() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    // Claimed first (oldest): the throttled profile's command.
+    let (throttled_instance, throttled_command_id) =
+        issue_with_pending_activity(&store, 511, "replan_issue").await?;
+    issue_with_pending_activity(&store, 512, "implement_issue").await?;
+    // 8.50 of a 10.00 cap: inside the band (threshold 8.00), under the cap.
+    store
+        .upsert_runtime_usage(&profile_usage_upsert(
+            &throttled_instance.id,
+            "codex-high",
+            cost_usd_to_micros(8.5)?,
+        ))
+        .await?;
+
+    let dispatcher =
+        RuntimeCommandDispatcher::with_profile_selector(&store, throttle_profile_selector())
+            .with_budget_policy(throttle_policy(10.0, RuntimeBudgetEnforcement::Enforce));
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should dispatch");
+
+    let barrier = match outcome {
+        CommandDispatchOutcome::Deferred {
+            command_id: id,
+            barrier,
+        } => {
+            assert_eq!(id, throttled_command_id);
+            barrier
+        }
+        other => panic!("throttled profile must yield the slot: {other:?}"),
+    };
+    assert_eq!(
+        barrier.reason_code,
+        DispatchBarrierReasonCode::ProfileDailyThrottled
+    );
+    assert!(barrier.reason.contains("codex-low"), "{}", barrier.reason);
+    Ok(())
+}
+
+#[tokio::test]
+async fn throttle_band_dispatches_when_it_is_the_only_claimable_work() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let (instance, _) = issue_with_pending_activity(&store, 513, "replan_issue").await?;
+    // A second command on the same throttled profile is not an alternative:
+    // yielding to it would leave both deferred forever.
+    issue_with_pending_activity(&store, 514, "replan_issue").await?;
+    store
+        .upsert_runtime_usage(&profile_usage_upsert(
+            &instance.id,
+            "codex-high",
+            cost_usd_to_micros(8.5)?,
+        ))
+        .await?;
+
+    let dispatcher =
+        RuntimeCommandDispatcher::with_profile_selector(&store, throttle_profile_selector())
+            .with_budget_policy(throttle_policy(10.0, RuntimeBudgetEnforcement::Enforce));
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should dispatch");
+
+    assert!(
+        matches!(outcome, CommandDispatchOutcome::Enqueued { .. }),
+        "a throttled profile with no better alternative must still run: {outcome:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn throttle_band_shadow_records_the_decision_and_dispatches() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let (instance, _) = issue_with_pending_activity(&store, 515, "replan_issue").await?;
+    issue_with_pending_activity(&store, 516, "implement_issue").await?;
+    store
+        .upsert_runtime_usage(&profile_usage_upsert(
+            &instance.id,
+            "codex-high",
+            cost_usd_to_micros(8.5)?,
+        ))
+        .await?;
+
+    let dispatcher =
+        RuntimeCommandDispatcher::with_profile_selector(&store, throttle_profile_selector())
+            .with_budget_policy(throttle_policy(10.0, RuntimeBudgetEnforcement::Shadow));
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should dispatch");
+
+    assert!(
+        matches!(outcome, CommandDispatchOutcome::Enqueued { .. }),
+        "shadow mode must dispatch inside the throttle band: {outcome:?}"
+    );
+    let events = store.events_for(&instance.id).await?;
+    let shadow = events
+        .iter()
+        .find(|event| event.event_type == "BudgetShadowDecision")
+        .expect("shadow mode records a BudgetShadowDecision event");
+    assert_eq!(shadow.event["barrier_reason_code"], "profile_daily_throttled");
+    assert_eq!(shadow.event["daily_throttle_threshold_usd"], 8.0);
+    assert_eq!(shadow.event["yielded_to_runtime_profile"], "codex-low");
+    Ok(())
+}
+
+#[tokio::test]
+async fn throttle_band_is_inert_below_the_threshold() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let (instance, _) = issue_with_pending_activity(&store, 517, "replan_issue").await?;
+    issue_with_pending_activity(&store, 518, "implement_issue").await?;
+    store
+        .upsert_runtime_usage(&profile_usage_upsert(
+            &instance.id,
+            "codex-high",
+            cost_usd_to_micros(7.99)?,
+        ))
+        .await?;
+
+    let dispatcher =
+        RuntimeCommandDispatcher::with_profile_selector(&store, throttle_profile_selector())
+            .with_budget_policy(throttle_policy(10.0, RuntimeBudgetEnforcement::Enforce));
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should dispatch");
+
+    assert!(
+        matches!(outcome, CommandDispatchOutcome::Enqueued { .. }),
+        "below the threshold the band must not engage: {outcome:?}"
+    );
+    assert!(store
+        .events_for(&instance.id)
         .await?
         .iter()
         .all(|event| event.event_type != "BudgetShadowDecision"));

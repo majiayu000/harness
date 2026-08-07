@@ -11,6 +11,7 @@ fn ceiling_store_policy(
         enforcement,
         unlimited: false,
         daily_profile_cap_usd: None,
+        daily_throttle_ratio: 0.8,
     }
 }
 
