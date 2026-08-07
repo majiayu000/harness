@@ -21,7 +21,9 @@ impl DispatchPoolSnapshot {
 
 impl WorkflowRuntimeStore {
     /// Count commands by dispatch status plus workflows parked in gated
-    /// states (`blocked`, `awaiting_feedback`).
+    /// states (`blocked`, `awaiting_feedback`, `awaiting_dependencies` —
+    /// the last one is how the 08-01 mutual-dependency starvation presented
+    /// while nothing was dispatching, GH-1885).
     pub async fn dispatch_pool_snapshot(&self) -> anyhow::Result<DispatchPoolSnapshot> {
         let (pending, deferred, dispatched): (i64, i64, i64) = sqlx::query_as(
             "SELECT COUNT(*) FILTER (WHERE status = 'pending'),
@@ -33,7 +35,7 @@ impl WorkflowRuntimeStore {
         .await?;
         let (gated_workflows,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM workflow_instances
-             WHERE state IN ('blocked', 'awaiting_feedback')",
+             WHERE state IN ('blocked', 'awaiting_feedback', 'awaiting_dependencies')",
         )
         .fetch_one(&self.pool)
         .await?;
