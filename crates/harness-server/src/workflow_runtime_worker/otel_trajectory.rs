@@ -146,6 +146,7 @@ fn retry_attempt(job: &RuntimeJob) -> Option<u64> {
 fn activity_status_label(status: ActivityStatus) -> &'static str {
     match status {
         ActivityStatus::Succeeded => "succeeded",
+        ActivityStatus::SucceededWithBlockers => "succeeded_with_blockers",
         ActivityStatus::Failed => "failed",
         ActivityStatus::Blocked => "blocked",
         ActivityStatus::Cancelled => "cancelled",

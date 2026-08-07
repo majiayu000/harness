@@ -374,7 +374,9 @@ fn command_status_for_activity(status: ActivityStatus) -> WorkflowCommandStatus 
     match status {
         ActivityStatus::Succeeded => WorkflowCommandStatus::Completed,
         ActivityStatus::Failed => WorkflowCommandStatus::Failed,
-        ActivityStatus::Blocked => WorkflowCommandStatus::Blocked,
+        ActivityStatus::Blocked | ActivityStatus::SucceededWithBlockers => {
+            WorkflowCommandStatus::Blocked
+        }
         ActivityStatus::Cancelled => WorkflowCommandStatus::Cancelled,
     }
 }

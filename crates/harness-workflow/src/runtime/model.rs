@@ -597,6 +597,7 @@ impl RuntimeJob {
     pub fn complete(&mut self, result: &ActivityResult) -> anyhow::Result<()> {
         self.status = match result.status {
             ActivityStatus::Succeeded => RuntimeJobStatus::Succeeded,
+            ActivityStatus::SucceededWithBlockers => RuntimeJobStatus::Failed,
             ActivityStatus::Failed => RuntimeJobStatus::Failed,
             ActivityStatus::Blocked => RuntimeJobStatus::Failed,
             ActivityStatus::Cancelled => RuntimeJobStatus::Cancelled,
@@ -643,6 +644,7 @@ impl RuntimeEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ActivityStatus {
     Succeeded,
+    SucceededWithBlockers,
     Failed,
     Blocked,
     Cancelled,

@@ -82,12 +82,16 @@ pub(super) fn terminal_result_disposition(result: &ActivityResult) -> TerminalRe
     match result.status {
         ActivityStatus::Succeeded => TerminalResultDisposition::ReadRuntimeTurn,
         ActivityStatus::Cancelled => TerminalResultDisposition::Ignore,
-        ActivityStatus::Failed | ActivityStatus::Blocked
+        ActivityStatus::Failed
+        | ActivityStatus::Blocked
+        | ActivityStatus::SucceededWithBlockers
             if result.summary.trim() == "REVIEW_SKIPPED" =>
         {
             TerminalResultDisposition::Return("REVIEW_SKIPPED".to_string())
         }
-        ActivityStatus::Failed | ActivityStatus::Blocked => TerminalResultDisposition::Failed(
+        ActivityStatus::Failed
+        | ActivityStatus::Blocked
+        | ActivityStatus::SucceededWithBlockers => TerminalResultDisposition::Failed(
             result
                 .error
                 .clone()
