@@ -54,14 +54,20 @@ pub(super) fn spawn_task_retention(state: &Arc<AppState>) {
                         )
                         .await
                     {
-                        Ok(candidates) if candidates > 0 => tracing::info!(
-                            dry_run_passes_remaining = *dry_run_remaining,
-                            candidate_tasks = candidates,
-                            retention_days = workflow_cfg.storage.task_retention_days,
-                            "task retention dry-run: next passes will prune this many terminal tasks"
-                        ),
-                        Ok(_) => {}
-                        Err(error) => tracing::warn!("task retention dry-run count failed: {error}"),
+                        Ok(candidates) if candidates > 0 => {
+                            handle.tick_ok();
+                            tracing::info!(
+                                    dry_run_passes_remaining = *dry_run_remaining,
+                                    candidate_tasks = candidates,
+                                    retention_days = workflow_cfg.storage.task_retention_days,
+                                    "task retention dry-run: next passes will prune this many terminal tasks"
+                                )
+                        }
+                        Ok(_) => handle.tick_ok(),
+                        Err(error) => {
+                            handle.tick_failed(&error.to_string());
+                            tracing::warn!("task retention dry-run count failed: {error}")
+                        }
                     }
                 } else {
                     match state
@@ -73,14 +79,17 @@ pub(super) fn spawn_task_retention(state: &Arc<AppState>) {
                         )
                         .await
                     {
-                        Ok(summary) if !summary.pruned_task_ids.is_empty() => tracing::info!(
-                            tasks = summary.tasks_deleted,
-                            artifacts = summary.artifacts_deleted,
-                            prompts = summary.prompts_deleted,
-                            checkpoints = summary.checkpoints_deleted,
-                            "task retention pruned terminal task history"
-                        ),
-                        Ok(_) => {}
+                        Ok(summary) if !summary.pruned_task_ids.is_empty() => {
+                            handle.tick_ok();
+                            tracing::info!(
+                                tasks = summary.tasks_deleted,
+                                artifacts = summary.artifacts_deleted,
+                                prompts = summary.prompts_deleted,
+                                checkpoints = summary.checkpoints_deleted,
+                                "task retention pruned terminal task history"
+                            )
+                        }
+                        Ok(_) => handle.tick_ok(),
                         Err(error) => {
                             handle.tick_failed(&error.to_string());
                             tracing::warn!("task retention tick failed: {error}")
@@ -89,6 +98,7 @@ pub(super) fn spawn_task_retention(state: &Arc<AppState>) {
                 }
             } else {
                 tracing::debug!("task retention disabled by config; re-checking next interval");
+                handle.tick_ok();
             }
 
             drop(state);
