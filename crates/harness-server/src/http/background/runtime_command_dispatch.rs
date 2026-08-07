@@ -41,12 +41,19 @@ pub(in crate::http) async fn run_runtime_command_dispatch_tick(
     let prompt_release =
         crate::workflow_runtime_submission::release_ready_prompt_dependencies(store, batch_limit)
             .await?;
-    if release.released > 0 || release.failed > 0 || release.skipped > 0 {
+    if release.deadlocked > 0 {
+        tracing::warn!(
+            deadlocked = release.deadlocked,
+            "issue dependency cycles detected and failed with evidence"
+        );
+    }
+    if release.released > 0 || release.failed > 0 || release.skipped > 0 || release.deadlocked > 0 {
         tracing::info!(
             released = release.released,
             failed = release.failed,
             waiting = release.waiting,
             skipped = release.skipped,
+            deadlocked = release.deadlocked,
             "workflow runtime dependency release tick complete"
         );
     }
