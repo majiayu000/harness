@@ -21,6 +21,11 @@ pub struct RuntimeBudgetPolicy {
     /// unlimited; only this flag does.
     #[serde(default)]
     pub unlimited: bool,
+    /// Per-runtime-profile spend cap in USD over the current UTC day.
+    /// `None` = no daily cap; daily caps roll out last per the GH-1770
+    /// spec, so unlike the workflow ceiling there is no built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_profile_cap_usd: Option<f64>,
 }
 
 impl Default for RuntimeBudgetPolicy {
@@ -29,6 +34,7 @@ impl Default for RuntimeBudgetPolicy {
             default_workflow_budget_usd: default_workflow_budget_usd(),
             enforcement: RuntimeBudgetEnforcement::default(),
             unlimited: false,
+            daily_profile_cap_usd: None,
         }
     }
 }
@@ -43,6 +49,13 @@ impl RuntimeBudgetPolicy {
             anyhow::bail!(
                 "runtime_budget_policy.default_workflow_budget_usd must be a positive finite number"
             );
+        }
+        if let Some(cap) = self.daily_profile_cap_usd {
+            if !cap.is_finite() || cap <= 0.0 {
+                anyhow::bail!(
+                    "runtime_budget_policy.daily_profile_cap_usd must be a positive finite number when set"
+                );
+            }
         }
         Ok(())
     }
@@ -103,6 +116,33 @@ mod tests {
             serde_yaml::to_string(&RuntimeBudgetEnforcement::Enforce).unwrap(),
             "enforce\n"
         );
+    }
+
+    #[test]
+    fn daily_cap_defaults_off_and_is_not_serialized() {
+        let policy = RuntimeBudgetPolicy::default();
+        assert_eq!(policy.daily_profile_cap_usd, None);
+        let rendered = serde_yaml::to_string(&policy).expect("serialize");
+        assert!(
+            !rendered.contains("daily_profile_cap_usd"),
+            "absent cap must not appear in rendered config: {rendered}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_daily_cap() {
+        for cap in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            let policy = RuntimeBudgetPolicy {
+                daily_profile_cap_usd: Some(cap),
+                ..RuntimeBudgetPolicy::default()
+            };
+            assert!(policy.validate().is_err(), "cap {cap} must be rejected");
+        }
+        let policy = RuntimeBudgetPolicy {
+            daily_profile_cap_usd: Some(200.0),
+            ..RuntimeBudgetPolicy::default()
+        };
+        policy.validate().expect("positive cap validates");
     }
 
     #[test]

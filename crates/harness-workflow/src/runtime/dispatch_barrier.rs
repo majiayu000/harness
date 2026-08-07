@@ -59,6 +59,7 @@ pub enum DispatchBarrierReasonCode {
     WorkflowConfigInvalid,
     IsolationTierUnavailable,
     WorkflowBudgetExhausted,
+    ProfileDailyCapReached,
 }
 
 impl DispatchBarrierReasonCode {
@@ -68,6 +69,7 @@ impl DispatchBarrierReasonCode {
             Self::WorkflowConfigInvalid => "workflow_config_invalid",
             Self::IsolationTierUnavailable => "isolation_tier_unavailable",
             Self::WorkflowBudgetExhausted => "workflow_budget_exhausted",
+            Self::ProfileDailyCapReached => "profile_daily_cap_reached",
         }
     }
 }
