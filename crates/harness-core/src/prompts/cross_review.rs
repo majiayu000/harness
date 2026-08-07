@@ -25,7 +25,9 @@ pub fn challenger_prompt(safe_primary: &str, outstanding: &str) -> String {
          CONFIRMED: <issue>  — the issue is a real problem\n\
          FALSE-POSITIVE: <issue>  — the issue is wrong or not applicable\n\
          Also list any issues the primary review missed as:\n\
-         MISSED: <new issue>{outstanding}"
+         MISSED: <new issue>\n\
+         Protocol: your reply MUST contain at least one CONFIRMED:, FALSE-POSITIVE:, or MISSED: line. \
+         A reply with none is a protocol failure and fails the review.{outstanding}"
     )
 }
 
@@ -48,7 +50,8 @@ mod tests {
         assert!(prompt.contains("CONFIRMED:"));
         assert!(prompt.contains("FALSE-POSITIVE:"));
         assert!(prompt.contains("MISSED:"));
-        assert!(prompt.ends_with("MISSED: <new issue>"));
+        assert!(prompt.contains("protocol failure"));
+        assert!(prompt.ends_with("fails the review."));
     }
 
     #[test]
