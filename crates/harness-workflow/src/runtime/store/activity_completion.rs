@@ -1,5 +1,4 @@
 use super::*;
-use uuid::Uuid;
 
 impl WorkflowRuntimeStore {
     pub async fn complete_runtime_job_if_owned(
@@ -397,19 +396,27 @@ impl WorkflowRuntimeStore {
         let transcript_json = transcript
             .map(|pending| serde_json::to_value(&pending.record))
             .transpose()?;
-        sqlx::query(
+        // The DLQ holds at most one record per job (id = runtime_job_id):
+        // a later re-expiry of the same job keeps the first record, which
+        // represents the same turn's final result, and reconciliation sees
+        // exactly one pending decision per job.
+        let inserted = sqlx::query(
             "INSERT INTO runtime_job_completions_dlq
                 (id, runtime_job_id, owner, lease_expires_at, result, transcript)
-             VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)",
+             VALUES ($1, $1, $2, $3, $4::jsonb, $5::jsonb)
+             ON CONFLICT (id) DO NOTHING",
         )
-        .bind(Uuid::new_v4().to_string())
         .bind(runtime_job_id)
         .bind(owner)
         .bind(lease_expires_at)
         .bind(serde_json::to_value(result)?)
         .bind(transcript_json)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Ok(());
+        }
         self.record_runtime_event(
             runtime_job_id,
             "LeaseExpiredCompletionRecorded",

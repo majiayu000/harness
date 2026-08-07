@@ -895,5 +895,95 @@ async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result
         RuntimeJobStatus::Running,
         "job must remain reclaimable"
     );
+
+    // A later re-expiry of the same job must not duplicate the DLQ record.
+    store
+        .record_lease_expired_completion(
+            &first_claim.id,
+            "worker-a",
+            first_lease_expires_at,
+            &result,
+            None,
+        )
+        .await?;
+    let (dlq_count_after,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&first_claim.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(dlq_count_after, 1, "DLQ must keep one record per job");
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_expired_completion_persists_transcript_payload() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow =
+        crate::runtime::tests::issue_instance("implementing").with_id("dlq-transcript-workflow");
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "command-dlq-transcript");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexExec,
+            "codex-default",
+            json!({
+                "workflow_id": workflow.id,
+                "activity": "implement_issue",
+                "command": {"activity": "implement_issue"},
+            }),
+        )
+        .await?;
+    let lease_expires_at = Utc::now() + Duration::minutes(5);
+    let claimed = store
+        .claim_next_runtime_job("worker-a", lease_expires_at)
+        .await?
+        .expect("runtime job should be claimable");
+
+    let result = ActivityResult::succeeded("implement_issue", "opened pull request").with_artifact(
+        ActivityArtifact::new(
+            crate::runtime::transcript::RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT,
+            json!({
+                "content": "{\"messages\":[]}",
+                "content_format": "harness.turn.v1+json",
+                "turn_id": "dlq-turn-1",
+            }),
+        ),
+    );
+    let (result, pending) =
+        crate::runtime::transcript::prepare_runtime_transcript(&claimed, result)?;
+
+    store
+        .record_lease_expired_completion(
+            &claimed.id,
+            "worker-a",
+            lease_expires_at,
+            &result,
+            pending.as_ref(),
+        )
+        .await?;
+
+    let (transcript_json,): (Option<serde_json::Value>,) = sqlx::query_as(
+        "SELECT transcript FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&claimed.id)
+    .fetch_one(store.pool())
+    .await?;
+    let transcript = transcript_json.expect("transcript must be persisted in the DLQ");
+    assert_eq!(transcript["schema"], "harness.runtime.transcript.v1");
+    assert_eq!(
+        transcript["reference"]["producer_runtime_job_id"],
+        claimed.id
+    );
+    assert_eq!(transcript["workflow_id"], "dlq-transcript-workflow");
     Ok(())
 }
