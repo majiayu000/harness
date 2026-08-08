@@ -82,6 +82,66 @@ fn container_state_root(cloud: &CodexCloudConfig, project_root: &Path) -> PathBu
         .join(setup_cache_key(cloud, project_root))
 }
 
+fn create_container_state_dir(
+    project_root: &Path,
+    path: &Path,
+    #[cfg_attr(not(unix), allow(unused_variables))] unix_mode: u32,
+) -> harness_core::error::Result<()> {
+    let relative = path.strip_prefix(project_root).map_err(|_| {
+        HarnessError::AgentExecution(format!(
+            "container state path `{}` is outside project root `{}`",
+            path.display(),
+            project_root.display()
+        ))
+    })?;
+    let mut current = project_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(HarnessError::AgentExecution(format!(
+                    "container state path `{}` must not contain symbolic links",
+                    current.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(HarnessError::AgentExecution(format!(
+                    "container state path `{}` is not a directory",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|error| {
+                    HarnessError::AgentExecution(format!(
+                        "failed to create persistent cloud setup state `{}`: {error}",
+                        current.display()
+                    ))
+                })?;
+            }
+            Err(error) => {
+                return Err(HarnessError::AgentExecution(format!(
+                    "failed to inspect persistent cloud setup state `{}`: {error}",
+                    current.display()
+                )));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(unix_mode)).map_err(|error| {
+            HarnessError::AgentExecution(format!(
+                "failed to make persistent cloud setup state `{}` container-writable: {error}",
+                path.display()
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn apply_container_state(
     cloud: &CodexCloudConfig,
     project_root: &Path,
@@ -101,14 +161,8 @@ pub(crate) fn apply_container_state(
     let state_root = container_state_root(cloud, project_root);
     let home = state_root.join("home");
     let temporary = state_root.join("tmp");
-    for path in [&home, &temporary] {
-        fs::create_dir_all(path).map_err(|error| {
-            HarnessError::AgentExecution(format!(
-                "failed to create persistent cloud setup state `{}`: {error}",
-                path.display()
-            ))
-        })?;
-    }
+    create_container_state_dir(project_root, &home, 0o777)?;
+    create_container_state_dir(project_root, &temporary, 0o1777)?;
 
     for (key, value) in [
         ("HOME", CONTAINER_CLOUD_HOME),
@@ -631,6 +685,18 @@ mod tests {
         assert!(mounts
             .iter()
             .all(|mount| mount.source.starts_with(project.path())));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&mounts[0].source)?.permissions().mode() & 0o777,
+                0o777
+            );
+            assert_eq!(
+                fs::metadata(&mounts[1].source)?.permissions().mode() & 0o1777,
+                0o1777
+            );
+        }
         Ok(())
     }
 
