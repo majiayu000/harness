@@ -35,11 +35,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "serialized run-id env fixture",
     ),
     allowed(
-        "crates/harness-cli/src/cmd/pr.rs",
-        1,
-        "agent review child env propagation",
-    ),
-    allowed(
         "crates/harness-cli/src/commands/exec.rs",
         3,
         "operator identity and sudo process checks",
