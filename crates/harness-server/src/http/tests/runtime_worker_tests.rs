@@ -365,7 +365,12 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         env_vars[1][harness_core::agent::AGENT_ISOLATION_TIER_ENV],
         "container"
     );
-    assert!(!env_vars[1].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
+    for attempt_env in env_vars.iter() {
+        assert_eq!(
+            attempt_env[harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV],
+            "github.com"
+        );
+    }
     assert!(matches!(
         agent.sandbox_modes.lock().await[1],
         Some(SandboxMode::ReadOnly)
@@ -386,6 +391,20 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         serde_json::json!([])
     );
     assert_eq!(permission_artifact.artifact["correction_only"], true);
+    let egress_artifact = output
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "agent_egress_enforcement")
+        .expect("corrected output should record egress enforcement");
+    assert_eq!(egress_artifact.artifact["mode"], "first_party_proxy");
+    assert_eq!(
+        egress_artifact.artifact["verification_result"],
+        "verified_at_dispatch"
+    );
+    assert_eq!(
+        egress_artifact.artifact["network_allowlist"],
+        serde_json::json!(["github.com"])
+    );
     let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&runtime_job.id);
     let RuntimeTranscriptRead::Verified(record) =
         store.read_runtime_transcript(&artifact_ref).await?
