@@ -406,7 +406,7 @@ capability_profile = "standard"
 default_tier = "container"
 # Exact hosts only. Scoped mode with an empty list denies agent networking.
 # Linux allowlisted tasks require the container tier; macOS also supports host.
-network_allowlist = ["github.com", "api.github.com", "api.openai.com"]
+network_allowlist = ["github.com", "api.github.com", "api.openai.com", "api.anthropic.com"]
 
 [agents.claude]
 cli_path = "claude"
