@@ -136,6 +136,11 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         "scoped"
     );
     assert_eq!(
+        prompt_event.event["prompt_packet"]["resolved_runtime_settings"]
+            ["tool_allowlist_enforcement"],
+        "not_enforced_by_harness"
+    );
+    assert_eq!(
         prompt_event.event["prompt_packet"]["required_structured_output"]["validation_commands"],
         "Validation commands run and their results."
     );
@@ -215,6 +220,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
             "configured_capability_profile": "standard",
             "permission_mode": "scoped",
             "allowed_tools": ["Read", "Write", "Edit", "Bash"],
+            "tool_allowlist_enforcement": "not_enforced_by_harness",
             "correction_only": false,
         })
     );

@@ -399,7 +399,7 @@ project_root = "."
 default_agent = "auto"
 # complexity_preferred_agents = ["codex", "claude"]
 sandbox_mode = "danger-full-access"
-# Standard restricts agent tools. Set "full" only for an explicit unrestricted opt-up.
+# Claude enforces Standard tools. Set "full" only for an explicit unrestricted opt-up.
 capability_profile = "standard"
 
 [agents.claude]

@@ -209,6 +209,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 let permission_profile = RuntimePermissionProfile::resolve(
                     resolved_settings.permission_mode,
                     resolved_settings.allowed_tools.clone(),
+                    resolved_settings.tool_allowlist_enforcement,
                     correction_only,
                 );
                 if correction_only { env_vars.retain(|key, _| key == AGENT_ISOLATION_TIER_ENV); }

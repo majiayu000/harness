@@ -57,6 +57,26 @@ pub(super) enum ResolvedApprovalPolicy {
     NotApplicable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ToolAllowlistEnforcement {
+    ClaudeCli,
+    NotEnforcedByHarness,
+}
+
+impl ToolAllowlistEnforcement {
+    fn for_runtime_kind(runtime_kind: RuntimeKind) -> Self {
+        match runtime_kind {
+            RuntimeKind::ClaudeCode => Self::ClaudeCli,
+            RuntimeKind::CodexExec
+            | RuntimeKind::CodexJsonrpc
+            | RuntimeKind::AnthropicApi
+            | RuntimeKind::RemoteHost
+            | RuntimeKind::OpenCode => Self::NotEnforcedByHarness,
+        }
+    }
+}
+
 impl ResolvedApprovalPolicy {
     pub(super) fn explicit_value(&self) -> Option<&str> {
         match self {
@@ -83,6 +103,7 @@ pub(super) struct ResolvedRuntimeSettings {
     pub(super) capability_profile: CapabilityProfile,
     pub(super) permission_mode: AgentPermissionMode,
     pub(super) allowed_tools: Option<Vec<String>>,
+    pub(super) tool_allowlist_enforcement: ToolAllowlistEnforcement,
     pub(super) max_turns: Option<u32>,
     pub(super) timeout_secs: u64,
     pub(super) stall_timeout_secs: u64,
@@ -127,6 +148,7 @@ pub(super) fn resolve_runtime_settings(
         capability_profile: agents.capability_profile,
         permission_mode: agents.resolve_permission_mode(),
         allowed_tools: agents.resolve_allowed_tools(),
+        tool_allowlist_enforcement: ToolAllowlistEnforcement::for_runtime_kind(runtime_kind),
         max_turns: profile.max_turns,
         timeout_secs,
         stall_timeout_secs: normalize_stall_timeout_secs(
@@ -307,6 +329,10 @@ mod tests {
         assert_eq!(resolved.capability_profile, CapabilityProfile::Standard);
         assert_eq!(resolved.permission_mode, AgentPermissionMode::Scoped);
         assert_eq!(
+            resolved.tool_allowlist_enforcement,
+            ToolAllowlistEnforcement::NotEnforcedByHarness
+        );
+        assert_eq!(
             resolved.allowed_tools,
             Some(vec![
                 "Read".to_string(),
@@ -351,6 +377,10 @@ mod tests {
         assert_eq!(resolved.capability_profile, CapabilityProfile::Full);
         assert_eq!(resolved.permission_mode, AgentPermissionMode::Full);
         assert!(resolved.allowed_tools.is_none());
+        assert_eq!(
+            resolved.tool_allowlist_enforcement,
+            ToolAllowlistEnforcement::ClaudeCli
+        );
     }
 
     #[test]

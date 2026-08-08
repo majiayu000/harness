@@ -35,7 +35,7 @@ current implementation is weakest.
 | Orchestration-table write prohibition | `prompt_packet.rs:76` (`agent_must_not_edit_workflow_tables: true`) | Contract statement in the packet; enforced socially, not mechanically. |
 | Filesystem sandbox with `.git`/`.harness` write-deny | `crates/harness-sandbox/src/lib.rs:11` (`PROTECTED_RELATIVE_PATHS`); Seatbelt policy generation emits the protected-path `(deny file-write* ...)` rules at `lib.rs:184-188`; Landlock/bwrap equivalents | Prevents an injected agent from rewriting git history or harness-local state directly. |
 | Read-only sandbox modes for review/inspect profiles | `workflow_runtime_worker/runtime_profile.rs:27-38` maps a runtime profile's `sandbox: "read-only-with-network"` to `SandboxMode::ReadOnlyWithNetwork`. The mode flows agent-agnostically: `workflow_runtime_worker/executor.rs:99-101` resolves it (falling back to the `agents.sandbox_mode` config default) and passes it through `TurnLifecycleOptions` (`executor.rs:197`; forwarded at `turn_engine/turn_lifecycle.rs:227` and `:243`). Claude spawns enforce it at the OS level — `claude_adapter.rs:104-109` and `claude.rs:85`, `:184-189`, `:313-318` build `SandboxSpec`s enforced by harness-sandbox Seatbelt/Landlock; the codex paths translate it to CLI sandbox config (`codex.rs:667-676`, `codex_adapter.rs:566-580`). | Filesystem sandboxing is real for Claude spawns. The residual gap is the *tool-permission flag surface*: `--dangerously-skip-permissions` is orthogonal to the sandbox mode and stays permissive even under a write-restricted sandbox. |
-| Scoped tool profile (default) | `crates/harness-core/src/config/agents/permissions.rs`; `crates/harness-agents/src/claude.rs`; `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs` | `standard` is the default capability profile. It resolves to `Read,Write,Edit,Bash`; `full` is an explicit opt-up. The resolved mode and allowlist are recorded in runtime provenance and the final `agent_permission_profile` artifact. |
+| Scoped tool profile (default) | `crates/harness-core/src/config/agents/permissions.rs`; `crates/harness-agents/src/claude.rs`; `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs` | `standard` is the default capability profile. Claude enforces `Read,Write,Edit,Bash`; `full` is an explicit opt-up. Runtime provenance and the final `agent_permission_profile` artifact record both the resolved request and whether Harness enforces the allowlist for that backend. |
 | Context provenance recording (spec) | `specs/GH1732/` (merged spec, prompt packet v2) | Records which sources were selected into a packet, with per-entry trust level. Observational: it proves what went in; it does not change how untrusted entries are framed. |
 
 ## Gaps
@@ -82,11 +82,15 @@ allowlist is present. An explicit allowlist always wins over Full, and an
 empty list remains deny-all.
 
 The resolved settings participate in prompt-provenance hashing, and every
-runtime result carries an `agent_permission_profile` artifact. Structured
-output correction turns narrow further to scoped deny-all. This closes the
-implicit `allowed_tools = None` to unrestricted-access coupling. Per-activity
-profiles remain a possible future refinement, but the global default is now
-fail-closed and auditable.
+runtime result carries an `agent_permission_profile` artifact. Its
+`tool_allowlist_enforcement` field distinguishes Claude CLI enforcement from
+backends where Harness records the requested profile but does not enforce that
+tool list. Structured-output correction turns request scoped deny-all; the
+same enforcement field prevents that request from being misreported as a hard
+tool boundary on unsupported backends. This closes Claude's implicit
+`allowed_tools = None` to unrestricted-access coupling without overstating the
+guarantee for other runtimes. Per-activity profiles remain a possible future
+refinement.
 
 ### G3 — Egress control is delegated to infrastructure that is not shipped
 
