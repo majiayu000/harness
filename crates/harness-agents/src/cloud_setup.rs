@@ -54,6 +54,13 @@ fn setup_cache_ttl(cloud: &CodexCloudConfig) -> Duration {
     Duration::from_secs(cloud.cache_ttl_hours.saturating_mul(3600))
 }
 
+fn setup_sandbox_mode(mode: SandboxMode) -> SandboxMode {
+    match mode {
+        SandboxMode::ReadOnly | SandboxMode::ReadOnlyWithNetwork => SandboxMode::WorkspaceWrite,
+        mode => mode,
+    }
+}
+
 pub(crate) fn setup_cache_key(cloud: &CodexCloudConfig, project_root: &Path) -> String {
     let fingerprint = serde_json::json!({
         "layout_version": SETUP_CACHE_LAYOUT_VERSION,
@@ -186,11 +193,12 @@ async fn run_setup_command(
     secret_state: Option<&container_state::SecretContainerState>,
 ) -> harness_core::error::Result<crate::BoundedOutput> {
     crate::spawn_supervisor::validate_capability_token(context.capability_token)?;
+    let setup_sandbox_mode = setup_sandbox_mode(context.sandbox_mode);
     let sandbox_spec = if let Some(token) = context.capability_token {
-        SandboxSpec::new(context.sandbox_mode, context.project_root)
+        SandboxSpec::new(setup_sandbox_mode, context.project_root)
             .with_allowed_write_paths(token.allowed_write_paths.clone())
     } else {
-        SandboxSpec::new(context.sandbox_mode, context.project_root)
+        SandboxSpec::new(setup_sandbox_mode, context.project_root)
     };
     let mut env_vars = setup_spawn_env(cloud, context);
     let container_bind_mounts = if let Some(state) = secret_state {
@@ -425,6 +433,18 @@ mod tests {
         assert_eq!(
             setup_cache_key(&first, project_root),
             setup_cache_key(&second, project_root)
+        );
+    }
+
+    #[test]
+    fn trusted_setup_can_write_for_read_only_agent_modes() {
+        assert_eq!(
+            setup_sandbox_mode(SandboxMode::ReadOnly),
+            SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            setup_sandbox_mode(SandboxMode::ReadOnlyWithNetwork),
+            SandboxMode::WorkspaceWrite
         );
     }
 
