@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "macos", test))]
 use harness_core::config::agents::SandboxMode;
 #[cfg(any(target_os = "linux", test))]
 use harness_core::error::SandboxError;
@@ -35,6 +36,7 @@ impl NetworkPolicy {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn seatbelt_rules(self, mode: SandboxMode) -> Vec<String> {
         match (self, mode) {
             (Self::Deny, SandboxMode::DangerFullAccess) => {
