@@ -784,10 +784,18 @@ mod container_spawn_tests {
             Some(&"/tmp/target".to_string())
         );
         assert!(!spawn.process_env.contains_key(AGENT_ISOLATION_TIER_ENV));
-        assert_eq!(spawn.program, PathBuf::from("/usr/bin/sandbox-exec"));
-        assert!(string_args(&spawn)
-            .iter()
-            .any(|arg| arg.contains("(deny network-outbound)")));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(spawn.program, PathBuf::from("/usr/bin/sandbox-exec"));
+            assert!(string_args(&spawn)
+                .iter()
+                .any(|arg| arg.contains("(deny network-outbound)")));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(spawn.program, PathBuf::from("/usr/bin/bwrap"));
+            assert!(string_args(&spawn).contains(&"--unshare-net".to_string()));
+        }
         Ok(())
     }
 }

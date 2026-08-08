@@ -671,8 +671,16 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
             {"uses": "dtolnay/rust-toolchain@stable"},
             {"uses": "Swatinem/rust-cache@v2"},
             {
-                "name": "Install Linux sandbox dependency",
-                "run": "sudo apt-get update && sudo apt-get install --yes --no-install-recommends bubblewrap",
+                "name": "Configure Linux sandbox dependency",
+                "run": block(
+                    """\
+                    sudo apt-get update
+                    sudo apt-get install --yes --no-install-recommends bubblewrap
+                    if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+                      sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+                    fi
+                    """
+                ),
             },
             {
                 "uses": "actions/download-artifact@v4",
