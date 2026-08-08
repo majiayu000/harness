@@ -179,6 +179,14 @@ impl CodeAgent for ClaudeCodeAgent {
 
         let model = self.resolve_model(&req).to_string();
         let base_args = self.base_args(&req);
+        let _provider_permit = self
+            .provider_gate
+            .acquire(
+                req.execution_phase,
+                req.prompt.chars().count(),
+                req.prompt.len(),
+            )
+            .await?;
 
         // Narrow sandbox write paths to token scope when present.
         let sandbox_mode = self.effective_sandbox_mode(&req);
@@ -210,15 +218,6 @@ impl CodeAgent for ClaudeCodeAgent {
             model = %self.resolve_model(&req),
             "spawning claude agent"
         );
-
-        let _provider_permit = self
-            .provider_gate
-            .acquire(
-                req.execution_phase,
-                req.prompt.chars().count(),
-                req.prompt.len(),
-            )
-            .await?;
 
         let spawn_project_root = req.project_root.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(
@@ -299,6 +298,13 @@ impl CodeAgent for ClaudeCodeAgent {
         }
 
         let base_args = self.base_args(&req);
+        let provider_permit =
+            acquire_provider_permit_with_stream_heartbeat(&self.provider_gate, &req, &tx).await?;
+        tracing::debug!(
+            phase = provider_permit.phase().label(),
+            waited_ms = provider_permit.waited_ms(),
+            "claude execute_stream admitted by provider gate"
+        );
         let sandbox_mode = self.effective_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
             SandboxSpec::new(sandbox_mode, &req.project_root)
@@ -343,14 +349,6 @@ impl CodeAgent for ClaudeCodeAgent {
             prompt_len = req.prompt.len(),
             args = %args_debug.join(" | "),
             "claude execute_stream: full command args"
-        );
-
-        let provider_permit =
-            acquire_provider_permit_with_stream_heartbeat(&self.provider_gate, &req, &tx).await?;
-        tracing::debug!(
-            phase = provider_permit.phase().label(),
-            waited_ms = provider_permit.waited_ms(),
-            "claude execute_stream admitted by provider gate"
         );
 
         let spawn_project_root = req.project_root.clone();
