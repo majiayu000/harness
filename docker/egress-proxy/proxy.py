@@ -12,6 +12,7 @@ import urllib.parse
 
 
 HEADER_LIMIT = 65_536
+TLS_CLIENT_HELLO_LIMIT = 65_536
 IO_TIMEOUT_SECONDS = 15
 TUNNEL_IDLE_TIMEOUT_SECONDS = 300
 CANARY_HOST = "harness-egress-canary.invalid"
@@ -176,6 +177,118 @@ def rewrite_http_request(header_block, method, target, version, allowlist):
     return host, port, b"\r\n".join(request)
 
 
+def receive_tls_client_hello(connection, buffered_data=b""):
+    wire_data = bytearray(buffered_data)
+    handshake_data = bytearray()
+    offset = 0
+    expected_handshake_size = None
+
+    while expected_handshake_size is None or len(handshake_data) < expected_handshake_size:
+        while len(wire_data) - offset < 5:
+            chunk = connection.recv(8192)
+            if not chunk:
+                raise ProxyRefusal(403, "CONNECT tunnel did not provide a TLS ClientHello")
+            wire_data.extend(chunk)
+            if len(wire_data) > TLS_CLIENT_HELLO_LIMIT:
+                raise ProxyRefusal(431, "TLS ClientHello is too large")
+
+        content_type = wire_data[offset]
+        legacy_major = wire_data[offset + 1]
+        record_size = int.from_bytes(wire_data[offset + 3 : offset + 5], "big")
+        record_end = offset + 5 + record_size
+        if content_type != 22 or legacy_major != 3 or record_size == 0:
+            raise ProxyRefusal(403, "CONNECT tunnel requires a TLS ClientHello")
+        if record_end > TLS_CLIENT_HELLO_LIMIT:
+            raise ProxyRefusal(431, "TLS ClientHello is too large")
+        while len(wire_data) < record_end:
+            chunk = connection.recv(min(8192, record_end - len(wire_data)))
+            if not chunk:
+                raise ProxyRefusal(400, "incomplete TLS ClientHello")
+            wire_data.extend(chunk)
+            if len(wire_data) > TLS_CLIENT_HELLO_LIMIT:
+                raise ProxyRefusal(431, "TLS ClientHello is too large")
+
+        handshake_data.extend(wire_data[offset + 5 : record_end])
+        offset = record_end
+        if len(handshake_data) >= 4 and expected_handshake_size is None:
+            if handshake_data[0] != 1:
+                raise ProxyRefusal(403, "CONNECT tunnel requires a TLS ClientHello")
+            expected_handshake_size = 4 + int.from_bytes(handshake_data[1:4], "big")
+            if expected_handshake_size > TLS_CLIENT_HELLO_LIMIT:
+                raise ProxyRefusal(431, "TLS ClientHello is too large")
+
+    return bytes(wire_data), bytes(handshake_data[:expected_handshake_size])
+
+
+def tls_client_hello_server_name(handshake):
+    if len(handshake) < 4 or handshake[0] != 1:
+        raise ProxyRefusal(400, "invalid TLS ClientHello")
+    declared_size = int.from_bytes(handshake[1:4], "big")
+    if declared_size != len(handshake) - 4:
+        raise ProxyRefusal(400, "invalid TLS ClientHello length")
+
+    body = memoryview(handshake)[4:]
+    offset = 34
+    if len(body) < offset + 1:
+        raise ProxyRefusal(400, "invalid TLS ClientHello")
+    session_id_size = body[offset]
+    offset += 1 + session_id_size
+    if len(body) < offset + 2:
+        raise ProxyRefusal(400, "invalid TLS ClientHello")
+    cipher_suites_size = int.from_bytes(body[offset : offset + 2], "big")
+    offset += 2 + cipher_suites_size
+    if len(body) < offset + 1:
+        raise ProxyRefusal(400, "invalid TLS ClientHello")
+    compression_methods_size = body[offset]
+    offset += 1 + compression_methods_size
+    if len(body) < offset + 2:
+        raise ProxyRefusal(403, "TLS ClientHello is missing SNI")
+    extensions_size = int.from_bytes(body[offset : offset + 2], "big")
+    offset += 2
+    extensions_end = offset + extensions_size
+    if extensions_end != len(body):
+        raise ProxyRefusal(400, "invalid TLS ClientHello extensions")
+
+    server_name = None
+    while offset < extensions_end:
+        if extensions_end - offset < 4:
+            raise ProxyRefusal(400, "invalid TLS ClientHello extension")
+        extension_type = int.from_bytes(body[offset : offset + 2], "big")
+        extension_size = int.from_bytes(body[offset + 2 : offset + 4], "big")
+        offset += 4
+        extension_end = offset + extension_size
+        if extension_end > extensions_end:
+            raise ProxyRefusal(400, "invalid TLS ClientHello extension")
+        if extension_type == 0:
+            if server_name is not None:
+                raise ProxyRefusal(400, "duplicate TLS SNI extension")
+            extension = body[offset:extension_end]
+            if len(extension) < 5:
+                raise ProxyRefusal(400, "invalid TLS SNI extension")
+            names_size = int.from_bytes(extension[:2], "big")
+            if names_size != len(extension) - 2 or extension[2] != 0:
+                raise ProxyRefusal(400, "invalid TLS SNI extension")
+            name_size = int.from_bytes(extension[3:5], "big")
+            if name_size != len(extension) - 5:
+                raise ProxyRefusal(400, "invalid TLS SNI hostname")
+            try:
+                server_name = normalize_dns_name(bytes(extension[5:]).decode("ascii"))
+            except (UnicodeDecodeError, ValueError) as error:
+                raise ProxyRefusal(403, "TLS SNI hostname is invalid") from error
+        offset = extension_end
+    if server_name is None:
+        raise ProxyRefusal(403, "TLS ClientHello is missing SNI")
+    return server_name
+
+
+def validate_connect_tls_identity(connection, buffered_data, expected_host):
+    wire_data, handshake = receive_tls_client_hello(connection, buffered_data)
+    server_name = tls_client_hello_server_name(handshake)
+    if server_name != expected_host:
+        raise ProxyRefusal(403, "TLS SNI does not match CONNECT target")
+    return wire_data
+
+
 def relay_bidirectionally(client, upstream):
     sockets = {client, upstream}
     last_activity = time.monotonic()
@@ -230,8 +343,8 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         host = require_allowed_host(host, self.server.allowlist)
         with connect_upstream(host, port, self.server.allow_rfc2544_dns) as upstream:
             self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            if buffered_body:
-                upstream.sendall(buffered_body)
+            client_hello = validate_connect_tls_identity(self.request, buffered_body, host)
+            upstream.sendall(client_hello)
             relay_bidirectionally(self.request, upstream)
 
     def handle_http(self, header_block, buffered_body, method, target, version):

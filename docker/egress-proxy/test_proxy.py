@@ -23,6 +23,7 @@ class RecordingHandler(socketserver.BaseRequestHandler):
 class EchoHandler(socketserver.BaseRequestHandler):
     def handle(self):
         payload = self.request.recv(65_536)
+        self.server.received = payload
         self.request.sendall(payload)
 
 
@@ -46,6 +47,32 @@ def request_proxy(server, request):
         while chunk := client.recv(65_536):
             response.extend(chunk)
         return bytes(response)
+
+
+def tls_record(payload):
+    return b"\x16\x03\x01" + len(payload).to_bytes(2, "big") + payload
+
+
+def tls_client_hello(server_name, record_split=None):
+    extensions = b""
+    if server_name is not None:
+        encoded_name = server_name.encode("ascii")
+        name = b"\x00" + len(encoded_name).to_bytes(2, "big") + encoded_name
+        name_list = len(name).to_bytes(2, "big") + name
+        extensions = b"\x00\x00" + len(name_list).to_bytes(2, "big") + name_list
+    body = (
+        b"\x03\x03"
+        + bytes(32)
+        + b"\x00"
+        + b"\x00\x02\x13\x01"
+        + b"\x01\x00"
+        + len(extensions).to_bytes(2, "big")
+        + extensions
+    )
+    handshake = b"\x01" + len(body).to_bytes(3, "big") + body
+    if record_split is None:
+        return tls_record(handshake)
+    return tls_record(handshake[:record_split]) + tls_record(handshake[record_split:])
 
 
 class AllowlistTests(unittest.TestCase):
@@ -114,6 +141,28 @@ class AllowlistTests(unittest.TestCase):
         with mock.patch("socket.create_connection", return_value=connection):
             self.assertTrue(proxy.run_canary("127.0.0.1", 8080))
 
+    def test_tls_client_hello_parser_accepts_fragmented_records_and_reads(self):
+        hello = tls_client_hello("Example.COM", record_split=17)
+        connection = mock.Mock()
+        connection.recv.side_effect = [hello[2:9], hello[9:31], hello[31:]]
+
+        wire_data, handshake = proxy.receive_tls_client_hello(connection, hello[:2])
+
+        self.assertEqual(wire_data, hello)
+        self.assertEqual(proxy.tls_client_hello_server_name(handshake), "example.com")
+
+    def test_connect_tls_identity_rejects_mismatched_sni(self):
+        with self.assertRaisesRegex(proxy.ProxyRefusal, "SNI does not match"):
+            proxy.validate_connect_tls_identity(
+                mock.Mock(), tls_client_hello("denied.invalid"), "example.com"
+            )
+
+    def test_connect_tls_identity_rejects_client_hello_without_sni(self):
+        with self.assertRaisesRegex(proxy.ProxyRefusal, "missing SNI"):
+            proxy.validate_connect_tls_identity(
+                mock.Mock(), tls_client_hello(None), "example.com"
+            )
+
 
 class ProxyIntegrationTests(unittest.TestCase):
     def proxy_server(self, allowlist=frozenset({"example.com"})):
@@ -130,7 +179,7 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertTrue(response.startswith(b"HTTP/1.1 403 Forbidden\r\n"))
         resolver.assert_not_called()
 
-    def test_connect_tunnels_only_to_the_resolved_allowed_endpoint(self):
+    def test_connect_tunnels_matching_tls_sni_to_the_resolved_allowed_endpoint(self):
         upstream = OneShotTcpServer(("127.0.0.1", 0), EchoHandler)
         endpoint = upstream.server_address
         with running_server(upstream), running_server(self.proxy_server()) as server:
@@ -145,8 +194,29 @@ class ProxyIntegrationTests(unittest.TestCase):
                         b"Host: example.com:443\r\n\r\n"
                     )
                     self.assertTrue(client.recv(4096).startswith(b"HTTP/1.1 200"))
-                    client.sendall(b"tunnel-payload")
-                    self.assertEqual(client.recv(4096), b"tunnel-payload")
+                    client_hello = tls_client_hello("example.com")
+                    client.sendall(client_hello)
+                    self.assertEqual(client.recv(4096), client_hello)
+        self.assertEqual(upstream.received, client_hello)
+
+    def test_connect_rejects_denied_sni_before_forwarding_tunnel_bytes(self):
+        upstream = OneShotTcpServer(("127.0.0.1", 0), EchoHandler)
+        endpoint = upstream.server_address
+        with running_server(upstream), running_server(self.proxy_server()) as server:
+            with mock.patch.object(
+                proxy,
+                "resolve_public_endpoints",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, endpoint)],
+            ):
+                with socket.create_connection(server.server_address, timeout=2) as client:
+                    client.sendall(
+                        b"CONNECT example.com:443 HTTP/1.1\r\n"
+                        b"Host: example.com:443\r\n\r\n"
+                    )
+                    self.assertTrue(client.recv(4096).startswith(b"HTTP/1.1 200"))
+                    client.sendall(tls_client_hello("denied.invalid"))
+                    self.assertTrue(client.recv(4096).startswith(b"HTTP/1.1 403"))
+        self.assertEqual(upstream.received, b"")
 
     def test_http_proxy_rewrites_absolute_uri_and_strips_proxy_headers(self):
         upstream = OneShotTcpServer(("127.0.0.1", 0), RecordingHandler)
