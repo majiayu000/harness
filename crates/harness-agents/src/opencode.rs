@@ -170,7 +170,7 @@ impl OpenCodeAgent {
             args.push(OsString::from("--model"));
             args.push(OsString::from(model));
         }
-        if req.allowed_tools.is_none() {
+        if req.uses_dangerously_skip_permissions() {
             args.push(OsString::from("--auto"));
         }
         args.push(OsString::from(req.prompt.clone()));
@@ -179,10 +179,11 @@ impl OpenCodeAgent {
 
     fn spawn_env_vars(&self, req: &AgentRequest) -> Vec<(String, String)> {
         let mut vars = Vec::new();
-        if let Some(tools) = req.allowed_tools.as_ref() {
+        if !req.uses_dangerously_skip_permissions() {
+            let tools = req.scoped_allowed_tools();
             vars.push((
                 OPENCODE_PERMISSION_ENV.to_string(),
-                permission_env_value(tools),
+                permission_env_value(&tools),
             ));
         }
         vars

@@ -1,5 +1,7 @@
 use anyhow::Context;
-use harness_core::config::agents::{AgentsConfig, SandboxMode};
+use harness_core::config::agents::{
+    AgentPermissionMode, AgentsConfig, CapabilityProfile, SandboxMode,
+};
 use harness_core::config::concurrency::ConcurrencyConfig;
 use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::types::ExecutionPhase;
@@ -78,6 +80,9 @@ pub(super) struct ResolvedRuntimeSettings {
     pub(super) reasoning_effort: Option<String>,
     pub(super) sandbox_mode: SandboxMode,
     pub(super) approval_policy: ResolvedApprovalPolicy,
+    pub(super) capability_profile: CapabilityProfile,
+    pub(super) permission_mode: AgentPermissionMode,
+    pub(super) allowed_tools: Option<Vec<String>>,
     pub(super) max_turns: Option<u32>,
     pub(super) timeout_secs: u64,
     pub(super) stall_timeout_secs: u64,
@@ -119,6 +124,9 @@ pub(super) fn resolve_runtime_settings(
         reasoning_effort: resolve_reasoning_effort(profile, runtime_kind, execution_phase, agents),
         sandbox_mode,
         approval_policy,
+        capability_profile: agents.capability_profile,
+        permission_mode: agents.resolve_permission_mode(),
+        allowed_tools: agents.resolve_allowed_tools(),
         max_turns: profile.max_turns,
         timeout_secs,
         stall_timeout_secs: normalize_stall_timeout_secs(
@@ -296,6 +304,17 @@ mod tests {
             resolved.reasoning_effort.as_deref(),
             Some("configured-effort")
         );
+        assert_eq!(resolved.capability_profile, CapabilityProfile::Standard);
+        assert_eq!(resolved.permission_mode, AgentPermissionMode::Scoped);
+        assert_eq!(
+            resolved.allowed_tools,
+            Some(vec![
+                "Read".to_string(),
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Bash".to_string(),
+            ])
+        );
 
         let mut profile = profile;
         profile.model = Some("profile-model".to_string());
@@ -310,6 +329,28 @@ mod tests {
         .expect("explicit overrides should resolve");
         assert_eq!(resolved.model, "profile-model");
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("profile-effort"));
+    }
+
+    #[test]
+    fn resolved_settings_require_explicit_full_capability_profile() {
+        let agents = AgentsConfig {
+            capability_profile: CapabilityProfile::Full,
+            ..AgentsConfig::default()
+        };
+        let profile = profile_with_timeout("claude-default", RuntimeKind::ClaudeCode);
+
+        let resolved = resolve_runtime_settings(
+            &profile,
+            RuntimeKind::ClaudeCode,
+            None,
+            &agents,
+            &ConcurrencyConfig::default(),
+        )
+        .expect("explicit Full profile should resolve");
+
+        assert_eq!(resolved.capability_profile, CapabilityProfile::Full);
+        assert_eq!(resolved.permission_mode, AgentPermissionMode::Full);
+        assert!(resolved.allowed_tools.is_none());
     }
 
     #[test]

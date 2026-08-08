@@ -162,6 +162,7 @@ fn turn_request_uses_same_claude_layer_split() {
         prompt: "static\ncontext\ndynamic\n".to_string(),
         prompt_layers: Some(AgentPromptLayers::new("static\n", "context\n", "dynamic\n")),
         project_root: PathBuf::from("/tmp/project"),
+        permission_mode: crate::config::agents::AgentPermissionMode::Scoped,
         model: None,
         reasoning_effort: None,
         execution_phase: None,
@@ -176,4 +177,32 @@ fn turn_request_uses_same_claude_layer_split() {
 
     assert_eq!(request.claude_system_prompt(), Some("static\n"));
     assert_eq!(request.claude_main_prompt(), "context\ndynamic\n");
+}
+
+#[test]
+fn default_agent_request_is_scoped_to_standard_tools() {
+    let request = AgentRequest::default();
+
+    assert!(!request.uses_dangerously_skip_permissions());
+    assert_eq!(
+        request.scoped_allowed_tools(),
+        vec!["Read", "Write", "Edit", "Bash"]
+    );
+}
+
+#[test]
+fn explicit_full_agent_request_is_unrestricted_only_without_an_allowlist() {
+    let full = AgentRequest {
+        permission_mode: crate::config::agents::AgentPermissionMode::Full,
+        allowed_tools: None,
+        ..AgentRequest::default()
+    };
+    assert!(full.uses_dangerously_skip_permissions());
+
+    let restricted = AgentRequest {
+        allowed_tools: Some(vec!["Read".to_string()]),
+        ..full
+    };
+    assert!(!restricted.uses_dangerously_skip_permissions());
+    assert_eq!(restricted.scoped_allowed_tools(), vec!["Read"]);
 }

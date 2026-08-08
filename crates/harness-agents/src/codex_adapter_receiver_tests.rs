@@ -43,6 +43,7 @@ async fn closed_event_receiver_kills_and_reaps_app_server_process_group() -> any
         prompt: "ping".into(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
+        permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
         execution_phase: None,

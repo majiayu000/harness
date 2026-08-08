@@ -1,5 +1,5 @@
 use crate::capability::CapabilityToken;
-use crate::config::agents::SandboxMode;
+use crate::config::agents::{AgentPermissionMode, CapabilityProfile, SandboxMode};
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -40,9 +40,14 @@ pub struct AgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_layers: Option<AgentPromptLayers>,
     pub project_root: PathBuf,
+    /// Explicit permission mode. `Full` is the only value that may select an
+    /// unrestricted backend invocation, and only when no allowlist is present.
+    #[serde(default)]
+    pub permission_mode: AgentPermissionMode,
     /// Tool restriction for the agent invocation.
     ///
-    /// - `None`  → Full profile: no restriction, CLI uses `--dangerously-skip-permissions`.
+    /// - `None` in scoped mode → the Standard profile tool list.
+    /// - `None` in full mode → no restriction.
     /// - `Some(tools)` → Restricted: CLI uses `--allowedTools <list>`.
     ///   An explicitly empty `Some(vec![])` means deny-all at the CLI boundary.
     ///
@@ -79,16 +84,22 @@ pub struct AgentRequest {
 }
 
 impl AgentRequest {
-    /// Returns `true` when no tool restriction is set (Full profile).
+    /// Returns `true` only for an explicit Full request without an allowlist.
     ///
     /// When `true`, the CLI adapter should use `--dangerously-skip-permissions`.
     /// When `false`, the adapter should use `--allowedTools <list>` instead —
     /// these flags are mutually exclusive in Claude CLI 2.1.70+.
     ///
-    /// `None` means "no restriction configured" (Full profile).
-    /// `Some(_)` means an explicit allowlist was provided, even if empty (deny-all).
     pub fn uses_dangerously_skip_permissions(&self) -> bool {
-        self.allowed_tools.is_none()
+        self.permission_mode == AgentPermissionMode::Full && self.allowed_tools.is_none()
+    }
+
+    /// Resolve the tool list enforced by scoped backends. A missing list no
+    /// longer means unrestricted access; it resolves to the Standard profile.
+    pub fn scoped_allowed_tools(&self) -> Vec<String> {
+        self.allowed_tools
+            .clone()
+            .unwrap_or_else(default_scoped_tools)
     }
 
     pub fn from_prompt_layers(prompt_layers: AgentPromptLayers, project_root: PathBuf) -> Self {
@@ -124,7 +135,8 @@ impl Default for AgentRequest {
             prompt: String::new(),
             prompt_layers: None,
             project_root: PathBuf::from("."),
-            allowed_tools: None,
+            permission_mode: AgentPermissionMode::default(),
+            allowed_tools: CapabilityProfile::default().tools(),
             model: None,
             reasoning_effort: None,
             sandbox_mode: None,
@@ -319,14 +331,14 @@ pub struct TurnRequest {
     pub prompt: String,
     pub prompt_layers: Option<AgentPromptLayers>,
     pub project_root: PathBuf,
+    pub permission_mode: AgentPermissionMode,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub execution_phase: Option<ExecutionPhase>,
     pub sandbox_mode: Option<SandboxMode>,
     pub approval_policy: Option<String>,
-    /// `None` = full profile (no tool restriction). `Some(list)` = restricted
-    /// profile — an empty list means deny-all and must NOT be promoted to full
-    /// permissions (mirrors `AgentRequest::allowed_tools`).
+    /// `None` uses the Standard tool list in scoped mode. `Some(list)` is an
+    /// explicit restriction; an empty list means deny-all.
     pub allowed_tools: Option<Vec<String>>,
     pub context: Vec<ContextItem>,
     pub timeout_secs: Option<u64>,
@@ -350,12 +362,23 @@ impl TurnRequest {
             .and_then(AgentPromptLayers::static_system_prompt_for_cache)
     }
 
-    /// True when no tool restriction applies (full profile). Mirrors
-    /// `AgentRequest::uses_dangerously_skip_permissions`: a `Some` list — even
-    /// an empty one — is a restricted profile.
+    /// True only when the request explicitly opts into Full and carries no
+    /// allowlist. Mirrors `AgentRequest::uses_dangerously_skip_permissions`.
     pub fn uses_dangerously_skip_permissions(&self) -> bool {
-        self.allowed_tools.is_none()
+        self.permission_mode == AgentPermissionMode::Full && self.allowed_tools.is_none()
     }
+
+    pub fn scoped_allowed_tools(&self) -> Vec<String> {
+        self.allowed_tools
+            .clone()
+            .unwrap_or_else(default_scoped_tools)
+    }
+}
+
+fn default_scoped_tools() -> Vec<String> {
+    CapabilityProfile::Standard
+        .tools()
+        .expect("Standard capability profile must declare an allowlist")
 }
 
 /// Streaming agent adapter — coexists with legacy CodeAgent trait.
