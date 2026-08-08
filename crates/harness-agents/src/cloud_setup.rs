@@ -608,6 +608,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_agent_context_allows_setup_workspace_write() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("setup-complete");
+        let cloud = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 0,
+            setup_commands: vec![format!("touch '{}'", marker.display())],
+            setup_secret_env: Vec::new(),
+        };
+        let env_vars = HashMap::new();
+
+        run_setup_phase(
+            &cloud,
+            CloudSetupContext {
+                project_root: dir.path(),
+                sandbox_mode: SandboxMode::ReadOnly,
+                permission_mode: AgentPermissionMode::Full,
+                env_vars: &env_vars,
+                capability_token: None,
+            },
+        )
+        .await?;
+
+        assert!(marker.is_file());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn run_setup_phase_rejects_chaining_command() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let cloud = CodexCloudConfig {

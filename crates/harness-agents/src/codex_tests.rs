@@ -553,7 +553,7 @@ fn cloud_mode_uses_workspace_write_approval_and_ephemeral() {
 }
 
 #[tokio::test]
-async fn cloud_setup_phase_writes_and_caches_with_read_only_agent() -> anyhow::Result<()> {
+async fn cloud_setup_phase_uses_cache_within_ttl() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let marker = dir.path().join("setup-runs.log");
     let setup = format!("echo run >> \"{}\"", marker.display());
@@ -564,8 +564,11 @@ async fn cloud_setup_phase_writes_and_caches_with_read_only_agent() -> anyhow::R
         setup_secret_env: Vec::new(),
     };
 
-    let agent =
-        CodexAgent::with_cloud(PathBuf::from("/usr/bin/true"), cloud, SandboxMode::ReadOnly);
+    let agent = CodexAgent::with_cloud(
+        PathBuf::from("/usr/bin/true"),
+        cloud,
+        SandboxMode::DangerFullAccess,
+    );
     let request = AgentRequest {
         prompt: "ping".to_string(),
         project_root: dir.path().to_path_buf(),
