@@ -107,6 +107,31 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 pub(crate) struct ContainerBindMount {
     pub(crate) source: PathBuf,
     pub(crate) destination: PathBuf,
+    scope: ContainerBindMountScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerBindMountScope {
+    Workspace,
+    HarnessTemp,
+}
+
+impl ContainerBindMount {
+    pub(crate) fn workspace(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            source,
+            destination,
+            scope: ContainerBindMountScope::Workspace,
+        }
+    }
+
+    pub(crate) fn harness_temp(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            source,
+            destination,
+            scope: ContainerBindMountScope::HarnessTemp,
+        }
+    }
 }
 
 pub(crate) struct AgentSpawnInput<'a> {
@@ -243,7 +268,14 @@ impl AgentSpawnContract for ContainerSpawn {
         }
         args.push(OsString::from(workspace_mount));
         for mount in input.container_bind_mounts {
-            let source = canonical_container_bind_source(&project_root, &mount.source)?;
+            let source = match mount.scope {
+                ContainerBindMountScope::Workspace => {
+                    canonical_container_bind_source(&project_root, &mount.source)?
+                }
+                ContainerBindMountScope::HarnessTemp => {
+                    canonical_harness_temp_bind_source(&mount.source)?
+                }
+            };
             if !mount.destination.is_absolute() || mount.destination == Path::new("/") {
                 return Err(HarnessError::AgentExecution(format!(
                     "container bind destination must be a specific absolute path: {}",
@@ -440,6 +472,35 @@ fn canonical_container_bind_source(
     if !source.starts_with(project_root) {
         return Err(HarnessError::AgentExecution(format!(
             "container bind source must remain inside the task workspace: {}",
+            source.display()
+        )));
+    }
+    Ok(source)
+}
+
+fn canonical_harness_temp_bind_source(source: &Path) -> Result<PathBuf, HarnessError> {
+    let temp_root = std::fs::canonicalize(std::env::temp_dir()).map_err(|error| {
+        HarnessError::AgentExecution(format!("failed to resolve temporary directory: {error}"))
+    })?;
+    let source = std::fs::canonicalize(source).map_err(|error| {
+        HarnessError::AgentExecution(format!(
+            "failed to resolve container bind source {}: {error}",
+            source.display()
+        ))
+    })?;
+    let trusted = source
+        .strip_prefix(&temp_root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .starts_with("harness-cloud-setup-")
+        });
+    if !trusted {
+        return Err(HarnessError::AgentExecution(format!(
+            "container temporary bind source is not Harness-owned: {}",
             source.display()
         )));
     }

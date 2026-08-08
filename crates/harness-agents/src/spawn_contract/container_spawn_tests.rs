@@ -158,10 +158,10 @@ fn container_spawn_adds_workspace_scoped_state_mounts() -> anyhow::Result<()> {
         "container".to_string(),
     )]);
     let sandbox_spec = SandboxSpec::new(SandboxMode::ReadOnly, root.path());
-    let mounts = [ContainerBindMount {
-        source: state_home.clone(),
-        destination: PathBuf::from("/harness-cloud-home"),
-    }];
+    let mounts = [ContainerBindMount::workspace(
+        state_home.clone(),
+        PathBuf::from("/harness-cloud-home"),
+    )];
 
     let spawn = ContainerSpawn.prepare(
         AgentSpawnInput {
@@ -194,10 +194,10 @@ fn container_spawn_rejects_state_mount_outside_workspace() -> anyhow::Result<()>
         "container".to_string(),
     )]);
     let sandbox_spec = SandboxSpec::new(SandboxMode::ReadOnly, root.path());
-    let mounts = [ContainerBindMount {
-        source: outside.path().to_path_buf(),
-        destination: PathBuf::from("/harness-cloud-home"),
-    }];
+    let mounts = [ContainerBindMount::workspace(
+        outside.path().to_path_buf(),
+        PathBuf::from("/harness-cloud-home"),
+    )];
 
     let error = ContainerSpawn
         .prepare(
@@ -219,6 +219,46 @@ fn container_spawn_rejects_state_mount_outside_workspace() -> anyhow::Result<()>
     assert!(error
         .to_string()
         .contains("container bind source must remain inside the task workspace"));
+    Ok(())
+}
+
+#[test]
+fn container_spawn_accepts_harness_owned_temporary_mount() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let temporary = tempfile::Builder::new()
+        .prefix("harness-cloud-setup-")
+        .tempdir()?;
+    let home = temporary.path().join("home");
+    std::fs::create_dir(&home)?;
+    let env_vars = HashMap::from([(
+        AGENT_ISOLATION_TIER_ENV.to_string(),
+        "container".to_string(),
+    )]);
+    let sandbox_spec = SandboxSpec::new(SandboxMode::ReadOnly, root.path());
+    let mounts = [ContainerBindMount::harness_temp(
+        home.clone(),
+        PathBuf::from("/harness-cloud-home"),
+    )];
+
+    let spawn = ContainerSpawn.prepare(
+        AgentSpawnInput {
+            program: Path::new("codex"),
+            args: &[],
+            project_root: root.path(),
+            sandbox_spec: &sandbox_spec,
+            env_vars: &env_vars,
+            secret_env_keys: &[],
+            container_bind_mounts: &mounts,
+            permission_mode: AgentPermissionMode::Scoped,
+            forward_stdin: false,
+        },
+        None,
+    )?;
+
+    assert!(string_args(&spawn).contains(&format!(
+        "type=bind,src={},dst=/harness-cloud-home",
+        std::fs::canonicalize(home)?.display()
+    )));
     Ok(())
 }
 
