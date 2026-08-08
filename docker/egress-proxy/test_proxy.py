@@ -163,6 +163,33 @@ class AllowlistTests(unittest.TestCase):
                 mock.Mock(), tls_client_hello(None), "example.com"
             )
 
+    def test_http_body_reader_collects_only_the_declared_body(self):
+        connection = mock.Mock()
+        connection.recv.side_effect = [b"st"]
+
+        body = proxy.read_http_request_body(connection, b"te", 4)
+
+        self.assertEqual(body, b"test")
+        connection.recv.assert_called_once_with(2)
+
+    def test_http_rewrite_rejects_oversized_declared_body(self):
+        header_block = (
+            b"POST http://example.com/ HTTP/1.1\r\n"
+            b"Host: example.com\r\n"
+            + f"Content-Length: {proxy.HTTP_BODY_LIMIT + 1}\r\n\r\n".encode()
+        )
+
+        with self.assertRaisesRegex(proxy.ProxyRefusal, "body is too large") as refusal:
+            proxy.rewrite_http_request(
+                header_block,
+                "POST",
+                "http://example.com/",
+                "HTTP/1.1",
+                frozenset({"example.com"}),
+            )
+
+        self.assertEqual(refusal.exception.status, 413)
+
 
 class ProxyIntegrationTests(unittest.TestCase):
     def proxy_server(self, allowlist=frozenset({"example.com"})):
@@ -238,6 +265,71 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertTrue(upstream.received.startswith(b"GET /api?q=1 HTTP/1.1\r\n"))
         self.assertNotIn(b"Proxy-Authorization", upstream.received)
         self.assertNotIn(b"Proxy-Connection", upstream.received)
+
+    def test_http_proxy_rejects_pipelined_request_before_connecting(self):
+        with running_server(self.proxy_server()) as server:
+            with mock.patch.object(proxy, "resolve_public_endpoints") as resolver:
+                response = request_proxy(
+                    server,
+                    b"GET http://example.com/allowed HTTP/1.1\r\n"
+                    b"Host: example.com\r\n\r\n"
+                    b"GET http://denied.invalid/ HTTP/1.1\r\n"
+                    b"Host: denied.invalid\r\n\r\n",
+                )
+
+        self.assertTrue(response.startswith(b"HTTP/1.1 400 Bad Request\r\n"))
+        resolver.assert_not_called()
+
+    def test_http_proxy_rejects_ambiguous_request_framing(self):
+        requests = [
+            (
+                b"POST http://example.com/ HTTP/1.1\r\n"
+                b"Host: example.com\r\n"
+                b"Content-Length: 4\r\n"
+                b"Content-Length: 4\r\n\r\ntest"
+            ),
+            (
+                b"POST http://example.com/ HTTP/1.1\r\n"
+                b"Host: example.com\r\n"
+                b"Content-Length: 4\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\ntest"
+            ),
+            (
+                b"POST http://example.com/ HTTP/1.1\r\n"
+                b"Host: example.com\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n"
+            ),
+        ]
+        for request in requests:
+            with self.subTest(request=request):
+                with running_server(self.proxy_server()) as server:
+                    with mock.patch.object(
+                        proxy, "resolve_public_endpoints"
+                    ) as resolver:
+                        response = request_proxy(server, request)
+                self.assertTrue(
+                    response.startswith(b"HTTP/1.1 400 Bad Request\r\n")
+                )
+                resolver.assert_not_called()
+
+    def test_http_proxy_forwards_exact_declared_body(self):
+        upstream = OneShotTcpServer(("127.0.0.1", 0), RecordingHandler)
+        endpoint = upstream.server_address
+        with running_server(upstream), running_server(self.proxy_server()) as server:
+            with mock.patch.object(
+                proxy,
+                "resolve_public_endpoints",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, endpoint)],
+            ):
+                response = request_proxy(
+                    server,
+                    b"POST http://example.com/api HTTP/1.1\r\n"
+                    b"Host: example.com\r\nContent-Length: 4\r\n\r\ntest",
+                )
+
+        self.assertTrue(response.startswith(b"HTTP/1.1 204 No Content\r\n"))
+        self.assertTrue(upstream.received.startswith(b"POST /api HTTP/1.1\r\n"))
+        self.assertTrue(upstream.received.endswith(b"\r\n\r\ntest"))
 
 
 if __name__ == "__main__":

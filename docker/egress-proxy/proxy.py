@@ -12,14 +12,19 @@ import urllib.parse
 
 
 HEADER_LIMIT = 65_536
+HTTP_BODY_LIMIT = 64 * 1024 * 1024
 TLS_CLIENT_HELLO_LIMIT = 65_536
 IO_TIMEOUT_SECONDS = 15
 TUNNEL_IDLE_TIMEOUT_SECONDS = 300
 CANARY_HOST = "harness-egress-canary.invalid"
+HTTP_TOKEN_CHARACTERS = frozenset(
+    b"!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
 RFC2544_SYNTHETIC_DNS = ipaddress.ip_network("198.18.0.0/15")
 STATUS_REASONS = {
     400: "Bad Request",
     403: "Forbidden",
+    413: "Content Too Large",
     431: "Request Header Fields Too Large",
     502: "Bad Gateway",
 }
@@ -158,23 +163,82 @@ def rewrite_http_request(header_block, method, target, version, allowlist):
         raise ProxyRefusal(400, "HTTP proxy requests require an absolute http URI")
     host = require_allowed_host(parsed.hostname, allowlist)
     path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
-    headers = []
+    parsed_headers = []
+    connection_headers = set()
+    content_length = None
     for raw_line in header_block.split(b"\r\n")[1:]:
         if not raw_line:
             continue
+        if raw_line[:1] in {b" ", b"\t"}:
+            raise ProxyRefusal(400, "folded proxy headers are not supported")
         if b":" not in raw_line:
             raise ProxyRefusal(400, "invalid proxy header")
         name, value = raw_line.split(b":", 1)
-        normalized_name = name.strip().lower()
-        if normalized_name in {b"host", b"proxy-authorization", b"proxy-connection", b"connection"}:
+        name = name.strip()
+        normalized_name = name.lower()
+        if not name or any(
+            character not in HTTP_TOKEN_CHARACTERS for character in name
+        ):
+            raise ProxyRefusal(400, "invalid proxy header name")
+        if any(
+            (character < 32 and character != 9) or character == 127
+            for character in value
+        ):
+            raise ProxyRefusal(400, "invalid proxy header value")
+        if normalized_name == b"transfer-encoding":
+            raise ProxyRefusal(400, "Transfer-Encoding is not supported")
+        if normalized_name == b"content-length":
+            raw_length = value.strip()
+            if content_length is not None or not raw_length or not raw_length.isdigit():
+                raise ProxyRefusal(400, "ambiguous Content-Length framing")
+            content_length = int(raw_length)
+            if content_length > HTTP_BODY_LIMIT:
+                raise ProxyRefusal(413, "HTTP request body is too large")
             continue
-        headers.append(name.strip() + b":" + value)
+        if normalized_name == b"expect":
+            raise ProxyRefusal(400, "Expect is not supported")
+        if normalized_name == b"connection":
+            for token in value.split(b","):
+                token = token.strip().lower()
+                if token:
+                    connection_headers.add(token)
+        parsed_headers.append((normalized_name, name, value))
+    hop_by_hop_headers = {
+        b"connection",
+        b"host",
+        b"keep-alive",
+        b"proxy-authorization",
+        b"proxy-connection",
+        b"te",
+        b"trailer",
+        b"upgrade",
+    }
+    hop_by_hop_headers.update(connection_headers)
+    headers = [
+        name + b":" + value
+        for normalized_name, name, value in parsed_headers
+        if normalized_name not in hop_by_hop_headers
+    ]
     authority = host if port == 80 else f"{host}:{port}"
     request = [f"{method} {path} {version}".encode("ascii")]
     request.append(f"Host: {authority}".encode("ascii"))
     request.extend(headers)
+    if content_length is not None:
+        request.append(f"Content-Length: {content_length}".encode("ascii"))
     request.extend([b"Connection: close", b"", b""])
-    return host, port, b"\r\n".join(request)
+    return host, port, b"\r\n".join(request), content_length or 0
+
+
+def read_http_request_body(connection, buffered_body, content_length):
+    if len(buffered_body) > content_length:
+        raise ProxyRefusal(400, "unexpected bytes after HTTP request body")
+    body = bytearray(buffered_body)
+    while len(body) < content_length:
+        chunk = connection.recv(min(8192, content_length - len(body)))
+        if not chunk:
+            raise ProxyRefusal(400, "incomplete HTTP request body")
+        body.extend(chunk)
+    return bytes(body)
 
 
 def receive_tls_client_hello(connection, buffered_data=b""):
@@ -312,6 +376,21 @@ def relay_bidirectionally(client, upstream):
             last_activity = time.monotonic()
 
 
+def relay_http_response(client, upstream):
+    last_activity = time.monotonic()
+    while True:
+        readable, _, _ = select.select([upstream], [], [], 1)
+        if not readable:
+            if time.monotonic() - last_activity >= TUNNEL_IDLE_TIMEOUT_SECONDS:
+                return
+            continue
+        data = upstream.recv(65_536)
+        if not data:
+            return
+        client.sendall(data)
+        last_activity = time.monotonic()
+
+
 class ThreadingProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -348,14 +427,13 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             relay_bidirectionally(self.request, upstream)
 
     def handle_http(self, header_block, buffered_body, method, target, version):
-        host, port, rewritten = rewrite_http_request(
+        host, port, rewritten, content_length = rewrite_http_request(
             header_block, method, target, version, self.server.allowlist
         )
+        body = read_http_request_body(self.request, buffered_body, content_length)
         with connect_upstream(host, port, self.server.allow_rfc2544_dns) as upstream:
-            upstream.sendall(rewritten)
-            if buffered_body:
-                upstream.sendall(buffered_body)
-            relay_bidirectionally(self.request, upstream)
+            upstream.sendall(rewritten + body)
+            relay_http_response(self.request, upstream)
 
     def send_error(self, status, reason):
         body = f"{status} {reason}\n".encode("utf-8")
