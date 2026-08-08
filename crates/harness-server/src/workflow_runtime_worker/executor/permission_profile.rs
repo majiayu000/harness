@@ -21,7 +21,10 @@ impl RuntimePermissionProfile {
     ) -> Self {
         if correction_only {
             return Self {
-                permission_mode: AgentPermissionMode::Scoped,
+                // Keep the original mode for egress resolution. An explicit
+                // empty tool list prevents Full from enabling unrestricted
+                // agent tools while still allowing provider network access.
+                permission_mode,
                 allowed_tools: Some(Vec::new()),
                 tool_allowlist_enforcement,
                 correction_only: true,
@@ -57,7 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn correction_retry_is_scoped_deny_all() {
+    fn full_correction_retry_preserves_egress_mode_and_denies_tools() {
         let profile = RuntimePermissionProfile::resolve(
             AgentPermissionMode::Full,
             None,
@@ -65,13 +68,13 @@ mod tests {
             true,
         );
 
-        assert_eq!(profile.permission_mode, AgentPermissionMode::Scoped);
+        assert_eq!(profile.permission_mode, AgentPermissionMode::Full);
         assert_eq!(profile.allowed_tools, Some(Vec::new()));
         assert_eq!(
             profile.artifact(CapabilityProfile::Full).artifact,
             json!({
                 "configured_capability_profile": "full",
-                "permission_mode": "scoped",
+                "permission_mode": "full",
                 "allowed_tools": [],
                 "tool_allowlist_enforcement": "not_enforced_by_harness",
                 "correction_only": true,
@@ -91,5 +94,18 @@ mod tests {
 
         assert_eq!(profile.permission_mode, AgentPermissionMode::Scoped);
         assert_eq!(profile.allowed_tools, tools);
+    }
+
+    #[test]
+    fn scoped_correction_retry_remains_scoped_deny_all() {
+        let profile = RuntimePermissionProfile::resolve(
+            AgentPermissionMode::Scoped,
+            Some(vec!["Read".to_string()]),
+            ToolAllowlistEnforcement::ClaudeCli,
+            true,
+        );
+
+        assert_eq!(profile.permission_mode, AgentPermissionMode::Scoped);
+        assert_eq!(profile.allowed_tools, Some(Vec::new()));
     }
 }
