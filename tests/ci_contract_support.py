@@ -671,6 +671,10 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
             {"uses": "dtolnay/rust-toolchain@stable"},
             {"uses": "Swatinem/rust-cache@v2"},
             {
+                "name": "Install Linux sandbox dependency",
+                "run": "sudo apt-get update && sudo apt-get install --yes --no-install-recommends bubblewrap",
+            },
+            {
                 "uses": "actions/download-artifact@v4",
                 "with": {"name": "web-dist", "path": "web/dist"},
             },
