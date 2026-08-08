@@ -16,7 +16,7 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
     ),
     allowed(
         "crates/harness-agents/src/cloud_setup.rs",
-        3,
+        1,
         "agent cloud setup secret passthrough",
     ),
     allowed(
