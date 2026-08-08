@@ -63,7 +63,7 @@ fn host_proxy_route_exposes_only_a_local_port() {
 }
 
 fn docker_test_env() -> HashMap<String, String> {
-    let image = match std::env::var("HARNESS_EGRESS_TEST_PROXY_IMAGE") {
+    let image = match harness_core::config::process_env::var("HARNESS_EGRESS_TEST_PROXY_IMAGE") {
         Ok(image) => image,
         Err(_) => "harness-egress-proxy:gh1771".to_string(),
     };

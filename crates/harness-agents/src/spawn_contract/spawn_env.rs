@@ -77,7 +77,7 @@ pub(super) fn container_env_vars(env_vars: &HashMap<String, String>) -> Containe
 }
 
 pub(super) fn docker_process_env(secret: BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut env = std::env::var("PATH")
+    let mut env = harness_core::config::process_env::var("PATH")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(|path| BTreeMap::from([("PATH".to_string(), path)]))

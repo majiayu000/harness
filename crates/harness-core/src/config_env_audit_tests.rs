@@ -35,11 +35,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "serialized run-id env fixture",
     ),
     allowed(
-        "crates/harness-agents/src/spawn_contract.rs",
-        1,
-        "PATH passthrough for child process env",
-    ),
-    allowed(
         "crates/harness-cli/src/cmd/pr.rs",
         1,
         "agent review child env propagation",
