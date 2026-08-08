@@ -279,11 +279,20 @@ async fn run_setup_command(
     })?;
     let mut child = crate::ManagedChild::new(child, "codex cloud setup")
         .with_egress_proxy_lease(spawn.egress_proxy_lease.clone());
+    let secret_values: Vec<String> = cloud
+        .setup_secret_env
+        .iter()
+        .filter_map(|key| harness_core::config::process_env::var(key).ok())
+        .filter(|value| !value.is_empty())
+        .collect();
     child
-        .wait_with_output(&crate::OutputLimits {
-            idle_timeout: None,
-            max_captured_bytes: SETUP_CAPTURE_MAX_BYTES,
-        })
+        .wait_with_redacted_output(
+            &crate::OutputLimits {
+                idle_timeout: None,
+                max_captured_bytes: SETUP_CAPTURE_MAX_BYTES,
+            },
+            &secret_values,
+        )
         .await
         .map_err(|error| {
             HarnessError::AgentExecution(format!(

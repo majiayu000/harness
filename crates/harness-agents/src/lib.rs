@@ -22,7 +22,7 @@ use harness_core::run_id::RunIdentity;
 #[cfg(test)]
 use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
 use harness_core::run_registry::{append_binding_nonblocking, BindingRecord};
-use output_capture::TailBuffer;
+use output_capture::OutputCapture;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -211,10 +211,19 @@ impl ManagedChild {
         &mut self,
         limits: &OutputLimits,
     ) -> std::io::Result<BoundedOutput> {
+        self.wait_with_redacted_output(limits, &[]).await
+    }
+
+    /// Wait while redacting configured values before bounded tail capture.
+    pub(crate) async fn wait_with_redacted_output(
+        &mut self,
+        limits: &OutputLimits,
+        secret_values: &[String],
+    ) -> std::io::Result<BoundedOutput> {
         let mut stdout_pipe = self.child_mut().stdout.take();
         let mut stderr_pipe = self.child_mut().stderr.take();
-        let mut stdout_buf = TailBuffer::new(limits.max_captured_bytes);
-        let mut stderr_buf = TailBuffer::new(limits.max_captured_bytes);
+        let mut stdout_buf = OutputCapture::new(limits.max_captured_bytes, secret_values);
+        let mut stderr_buf = OutputCapture::new(limits.max_captured_bytes, secret_values);
         let mut stdout_chunk = vec![0u8; OUTPUT_READ_CHUNK_BYTES];
         let mut stderr_chunk = vec![0u8; OUTPUT_READ_CHUNK_BYTES];
 
@@ -266,6 +275,9 @@ impl ManagedChild {
             }
         }
 
+        stdout_buf.finish();
+        stderr_buf.finish();
+
         let status = match exit_status {
             Some(status) => status,
             None => {
@@ -283,20 +295,20 @@ impl ManagedChild {
             }
         };
 
-        if stdout_buf.truncated || stderr_buf.truncated {
+        if stdout_buf.truncated() || stderr_buf.truncated() {
             tracing::warn!(
                 agent_process = self.label,
                 max_captured_bytes = limits.max_captured_bytes,
-                stdout_truncated = stdout_buf.truncated,
-                stderr_truncated = stderr_buf.truncated,
+                stdout_truncated = stdout_buf.truncated(),
+                stderr_truncated = stderr_buf.truncated(),
                 "agent output exceeded the capture limit; kept only the tail"
             );
         }
 
         Ok(BoundedOutput {
             status,
-            stdout: stdout_buf.data,
-            stderr: stderr_buf.data,
+            stdout: stdout_buf.into_data(),
+            stderr: stderr_buf.into_data(),
         })
     }
 
@@ -630,6 +642,22 @@ mod managed_child_tests {
             output.stdout.ends_with(b"END-MARKER"),
             "the trailing bytes must survive truncation"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_with_redacted_output_masks_before_tail_capture() -> anyhow::Result<()> {
+        let secret = "TOP-SECRET-TOKEN".to_string();
+        let mut child = spawn_shell("printf 'prefix-TOP-SECRET-TOKEN-tail'");
+        let limits = OutputLimits {
+            idle_timeout: Some(std::time::Duration::from_secs(10)),
+            max_captured_bytes: 12,
+        };
+
+        let output = child.wait_with_redacted_output(&limits, &[secret]).await?;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"fix-***-tail");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
