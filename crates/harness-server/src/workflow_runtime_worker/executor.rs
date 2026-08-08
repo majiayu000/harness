@@ -1,12 +1,9 @@
 use crate::http::AppState;
-use harness_core::agent::{
-    AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV, AGENT_OUTPUT_SCHEMA_PATH_ENV,
-};
+use harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV;
 use harness_core::config::workflow::WorkflowConfig;
 use harness_core::types::AgentId;
 use harness_workflow::runtime::{ActivityArtifact, ActivityResult, RuntimeJob, WorkflowInstance};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -43,6 +40,9 @@ use runtime_timeout::runtime_profile_with_timeout_fallback;
 #[path = "executor/permission_profile.rs"]
 mod permission_profile;
 use permission_profile::RuntimePermissionProfile;
+#[path = "executor/spawn_env.rs"]
+mod spawn_env;
+use spawn_env::{correction_spawn_env_vars, isolation_spawn_env_vars};
 #[path = "executor/structured_output.rs"]
 mod structured_output;
 use structured_output::{
@@ -204,15 +204,18 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                             turn_id.clone(),
                         )
                     });
-                let mut env_vars = isolation_spawn_env_vars(&job);
                 let correction_only = attempt > 0 && correction_retry.is_some();
+                let mut env_vars = if correction_only {
+                    correction_spawn_env_vars(&job)
+                } else {
+                    isolation_spawn_env_vars(&job)
+                };
                 let permission_profile = RuntimePermissionProfile::resolve(
                     resolved_settings.permission_mode,
                     resolved_settings.allowed_tools.clone(),
                     resolved_settings.tool_allowlist_enforcement,
                     correction_only,
                 );
-                if correction_only { env_vars.retain(|key, _| key == AGENT_ISOLATION_TIER_ENV); }
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
                         AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
@@ -469,37 +472,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
 pub(super) fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
     is_builtin_lifecycle_activity(job) || is_server_owned_pr_feedback_inspection(job)
 }
-fn isolation_spawn_env_vars(job: &RuntimeJob) -> HashMap<String, String> {
-    let mut env_vars = HashMap::new();
-    let Some(isolation) = job.input.get("isolation").and_then(Value::as_object) else {
-        return env_vars;
-    };
-    if let Some(tier) = isolation
-        .get("tier")
-        .and_then(Value::as_str)
-        .filter(|tier| !tier.trim().is_empty())
-    {
-        env_vars.insert(AGENT_ISOLATION_TIER_ENV.to_string(), tier.to_string());
-    }
-    let allowlist = isolation
-        .get("network_allowlist")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    if !allowlist.is_empty() {
-        env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
-    }
-    harness_core::agent::inherit_agent_spawn_control_env(&mut env_vars);
-    env_vars
-}
 fn runtime_worker_disabled_result_for_config(
     activity: &str,
     project_root: &Path,
@@ -568,21 +540,6 @@ mod tests {
             "codex-default",
             json!({ "activity": activity }),
         )
-    }
-    #[test]
-    fn isolation_spawn_env_vars_extracts_tier_and_allowlist() {
-        let mut job = runtime_job("implement_issue");
-        job.input = json!({
-            "activity": "implement_issue",
-            "isolation": {
-                "tier": "container",
-                "trust_class": "non_collaborator",
-                "network_allowlist": ["github.com", " api.com ", ""],
-            }
-        });
-        let env_vars = isolation_spawn_env_vars(&job);
-        assert_eq!(env_vars[AGENT_ISOLATION_TIER_ENV], "container");
-        assert_eq!(env_vars[AGENT_NETWORK_ALLOWLIST_ENV], "github.com,api.com");
     }
     fn workflow(definition_id: &str) -> WorkflowInstance {
         WorkflowInstance::new(
