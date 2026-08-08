@@ -52,6 +52,7 @@ pub(crate) struct AgentSpawnInput<'a> {
     pub(crate) project_root: &'a Path,
     pub(crate) sandbox_spec: &'a SandboxSpec,
     pub(crate) env_vars: &'a HashMap<String, String>,
+    pub(crate) secret_env_keys: &'a [String],
     pub(crate) permission_mode: AgentPermissionMode,
     /// The caller pipes the prompt through the child's stdin. The container
     /// tier must keep stdin open (`docker run -i`) or the prompt is silently
@@ -199,7 +200,8 @@ impl AgentSpawnContract for ContainerSpawn {
                 .and_then(EgressProxyRoute::container_network)
                 .ok_or_else(|| missing_proxy_route(IsolationTier::Container))?,
         }));
-        let ContainerEnv { plain, secret } = container_env_vars(input.env_vars);
+        let ContainerEnv { plain, secret } =
+            container_env_vars(input.env_vars, input.secret_env_keys);
         for (key, value) in plain {
             args.push(OsString::from("--env"));
             args.push(OsString::from(format!("{key}={value}")));
@@ -375,6 +377,7 @@ mod container_spawn_tests {
             project_root,
             sandbox_spec,
             env_vars,
+            secret_env_keys: &[],
             permission_mode: AgentPermissionMode::Scoped,
             forward_stdin: false,
         }

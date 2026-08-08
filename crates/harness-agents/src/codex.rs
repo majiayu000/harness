@@ -13,7 +13,9 @@ use harness_core::types::Capability;
 use harness_sandbox::SandboxSpec;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
@@ -97,8 +99,35 @@ impl CodexAgent {
         self
     }
 
-    async fn run_setup_phase(&self, project_root: &Path) -> harness_core::error::Result<()> {
-        cloud_setup::run_setup_phase(&self.cloud, project_root).await
+    async fn run_setup_phase(&self, req: &AgentRequest) -> harness_core::error::Result<()> {
+        cloud_setup::run_setup_phase(
+            &self.cloud,
+            cloud_setup::CloudSetupContext {
+                project_root: &req.project_root,
+                sandbox_mode: self.effective_sandbox_mode(req),
+                permission_mode: req.permission_mode,
+                env_vars: &req.env_vars,
+                capability_token: req.capability_token.as_ref(),
+            },
+        )
+        .await
+    }
+
+    async fn run_review_setup_phase(
+        &self,
+        req: &CodexReviewRequest,
+    ) -> harness_core::error::Result<()> {
+        cloud_setup::run_setup_phase(
+            &self.cloud,
+            cloud_setup::CloudSetupContext {
+                project_root: &req.project_root,
+                sandbox_mode: req.sandbox_mode,
+                permission_mode: req.permission_mode,
+                env_vars: &req.env_vars,
+                capability_token: None,
+            },
+        )
+        .await
     }
 
     fn effective_reasoning_effort<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
@@ -233,6 +262,7 @@ impl CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                secret_env_keys: &[],
                 permission_mode: req.permission_mode,
                 forward_stdin: review_uses_stdin_prompt(req),
             })
@@ -244,7 +274,7 @@ impl CodexAgent {
         &self,
         req: CodexReviewRequest,
     ) -> harness_core::error::Result<AgentResponse> {
-        self.run_setup_phase(&req.project_root).await?;
+        self.run_review_setup_phase(&req).await?;
 
         let use_stdin_prompt = review_uses_stdin_prompt(&req);
         let (prepared_spawn, run_identity) = self.prepare_review_spawn(&req).await?;
@@ -434,7 +464,7 @@ impl CodeAgent for CodexAgent {
             }
         }
 
-        self.run_setup_phase(&req.project_root).await?;
+        self.run_setup_phase(&req).await?;
 
         let base_args = self.base_args(&req);
         let sandbox_mode = self.effective_sandbox_mode(&req);
@@ -460,6 +490,7 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                secret_env_keys: &[],
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
             })
@@ -547,7 +578,7 @@ impl CodeAgent for CodexAgent {
             }
         }
 
-        self.run_setup_phase(&req.project_root).await?;
+        self.run_setup_phase(&req).await?;
 
         let base_args = self.base_args(&req);
         let sandbox_mode = self.effective_sandbox_mode(&req);
@@ -573,6 +604,7 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                secret_env_keys: &[],
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
             })

@@ -1,14 +1,33 @@
-use harness_core::{config::agents::CodexCloudConfig, error::HarnessError};
+use harness_core::agent::{
+    AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV,
+    AGENT_NETWORK_ALLOWLIST_ENV,
+};
+use harness_core::capability::CapabilityToken;
+use harness_core::config::agents::{AgentPermissionMode, CodexCloudConfig, SandboxMode};
+use harness_core::error::HarnessError;
+use harness_sandbox::SandboxSpec;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 const SETUP_OUTPUT_MAX_BYTES: usize = 512;
+const SETUP_CAPTURE_MAX_BYTES: usize = 4096;
 pub(crate) const SETUP_ENV_ALLOWLIST: [&str; 10] = [
     "PATH", "HOME", "USER", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
 ];
+
+pub(crate) struct CloudSetupContext<'a> {
+    pub(crate) project_root: &'a Path,
+    pub(crate) sandbox_mode: SandboxMode,
+    pub(crate) permission_mode: AgentPermissionMode,
+    pub(crate) env_vars: &'a HashMap<String, String>,
+    pub(crate) capability_token: Option<&'a CapabilityToken>,
+}
 
 /// Reject setup commands that contain shell operators enabling injection.
 ///
@@ -121,31 +140,107 @@ fn write_setup_cache_stamp(
     Ok(())
 }
 
-fn apply_setup_environment(cmd: &mut Command, cloud: &CodexCloudConfig) {
-    cmd.env_clear();
-
-    for key in SETUP_ENV_ALLOWLIST {
-        if let Ok(value) = std::env::var(key) {
-            cmd.env(key, value);
+fn setup_spawn_env(
+    cloud: &CodexCloudConfig,
+    context: &CloudSetupContext<'_>,
+) -> HashMap<String, String> {
+    let mut env_vars = HashMap::new();
+    let container_tier = context
+        .env_vars
+        .get(AGENT_ISOLATION_TIER_ENV)
+        .is_some_and(|tier| tier.trim() == "container");
+    if !container_tier {
+        for key in SETUP_ENV_ALLOWLIST {
+            if let Ok(value) = harness_core::config::process_env::var(key) {
+                env_vars.insert(key.to_string(), value);
+            }
         }
     }
-
+    for key in [
+        AGENT_ISOLATION_TIER_ENV,
+        AGENT_NETWORK_ALLOWLIST_ENV,
+        AGENT_CONTAINER_IMAGE_ENV,
+        AGENT_EGRESS_PROXY_IMAGE_ENV,
+    ] {
+        if let Some(value) = context.env_vars.get(key) {
+            env_vars.insert(key.to_string(), value.clone());
+        }
+    }
     for key in &cloud.setup_secret_env {
-        if let Ok(value) = std::env::var(key) {
-            cmd.env(key, value);
+        if let Ok(value) = harness_core::config::process_env::var(key) {
+            env_vars.insert(key.clone(), value);
         }
     }
+    env_vars
+}
+
+async fn run_setup_command(
+    cloud: &CodexCloudConfig,
+    context: &CloudSetupContext<'_>,
+    setup_command: &str,
+) -> harness_core::error::Result<crate::BoundedOutput> {
+    crate::spawn_supervisor::validate_capability_token(context.capability_token)?;
+    let sandbox_spec = if let Some(token) = context.capability_token {
+        SandboxSpec::new(context.sandbox_mode, context.project_root)
+            .with_allowed_write_paths(token.allowed_write_paths.clone())
+    } else {
+        SandboxSpec::new(context.sandbox_mode, context.project_root)
+    };
+    let env_vars = setup_spawn_env(cloud, context);
+    let args = [OsString::from("-lc"), OsString::from(setup_command)];
+    let mut spawn =
+        crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+            program: Path::new("sh"),
+            args: &args,
+            project_root: context.project_root,
+            sandbox_spec: &sandbox_spec,
+            env_vars: &env_vars,
+            secret_env_keys: &cloud.setup_secret_env,
+            permission_mode: context.permission_mode,
+            forward_stdin: false,
+        })
+        .await?;
+    spawn.clear_inherited_env = true;
+
+    let mut cmd = Command::new(&spawn.program);
+    cmd.args(&spawn.args)
+        .current_dir(&spawn.current_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    crate::set_process_group(&mut cmd);
+    crate::spawn_contract::apply_process_env(&mut cmd, &spawn);
+    let child = cmd.spawn().map_err(|error| {
+        HarnessError::AgentExecution(format!(
+            "failed to run cloud setup command `{setup_command}`: {error}"
+        ))
+    })?;
+    let mut child = crate::ManagedChild::new(child, "codex cloud setup")
+        .with_egress_proxy_lease(spawn.egress_proxy_lease.clone());
+    child
+        .wait_with_output(&crate::OutputLimits {
+            idle_timeout: None,
+            max_captured_bytes: SETUP_CAPTURE_MAX_BYTES,
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::AgentExecution(format!(
+                "failed to wait for cloud setup command `{setup_command}`: {error}"
+            ))
+        })
 }
 
 pub(crate) async fn run_setup_phase(
     cloud: &CodexCloudConfig,
-    project_root: &Path,
+    context: CloudSetupContext<'_>,
 ) -> harness_core::error::Result<()> {
     if !cloud.enabled || cloud.setup_commands.is_empty() {
         return Ok(());
     }
 
-    if setup_cache_is_fresh(cloud, project_root)? {
+    if setup_cache_is_fresh(cloud, context.project_root)? {
         return Ok(());
     }
 
@@ -158,18 +253,14 @@ pub(crate) async fn run_setup_phase(
             return Err(HarnessError::AgentExecution(msg));
         }
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-lc").arg(setup_command).current_dir(project_root);
-        apply_setup_environment(&mut cmd, cloud);
-
-        let output = cmd.output().await.map_err(|err| {
-            HarnessError::AgentExecution(format!(
-                "failed to run cloud setup command `{setup_command}`: {err}"
-            ))
-        })?;
+        let output = run_setup_command(cloud, &context, setup_command).await?;
 
         if !output.status.success() {
-            let detail = command_output_summary(&output, &cloud.setup_secret_env);
+            let detail = command_output_summary_bytes(
+                &output.stdout,
+                &output.stderr,
+                &cloud.setup_secret_env,
+            );
             return Err(HarnessError::AgentExecution(format!(
                 "cloud setup command `{setup_command}` failed with {}: {detail}",
                 output.status
@@ -177,7 +268,7 @@ pub(crate) async fn run_setup_phase(
         }
     }
 
-    write_setup_cache_stamp(cloud, project_root)?;
+    write_setup_cache_stamp(cloud, context.project_root)?;
     Ok(())
 }
 
@@ -203,24 +294,27 @@ fn truncate_to_max_bytes(mut text: String, max_bytes: usize) -> String {
     text
 }
 
-pub(crate) fn command_output_summary(
-    output: &std::process::Output,
-    secret_env: &[String],
-) -> String {
+#[cfg(test)]
+fn command_output_summary(output: &std::process::Output, secret_env: &[String]) -> String {
+    command_output_summary_bytes(&output.stdout, &output.stderr, secret_env)
+}
+
+fn command_output_summary_bytes(stdout: &[u8], stderr: &[u8], secret_env: &[String]) -> String {
     let secret_values: Vec<String> = secret_env
         .iter()
         .filter_map(|key| std::env::var(key).ok())
         .filter(|value| !value.is_empty())
         .collect();
-    command_output_summary_with_secret_values(output, &secret_values)
+    command_output_summary_with_secret_values(stdout, stderr, &secret_values)
 }
 
 fn command_output_summary_with_secret_values(
-    output: &std::process::Output,
+    stdout: &[u8],
+    stderr: &[u8],
     secret_values: &[String],
 ) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
     let summary = if !stderr.is_empty() {
         stderr
     } else if !stdout.is_empty() {
@@ -316,8 +410,11 @@ mod tests {
             stderr: format!("failed with token={secret_value}").into_bytes(),
         };
 
-        let summary =
-            command_output_summary_with_secret_values(&output, &[secret_value.to_string()]);
+        let summary = command_output_summary_with_secret_values(
+            &output.stdout,
+            &output.stderr,
+            &[secret_value.to_string()],
+        );
 
         assert!(!summary.contains(secret_value));
         assert!(summary.contains("***"));
@@ -397,6 +494,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn setup_environment_preserves_only_spawn_controls_for_container_requests() {
+        let cloud = CodexCloudConfig::default();
+        let request_env = HashMap::from([
+            (
+                AGENT_ISOLATION_TIER_ENV.to_string(),
+                "container".to_string(),
+            ),
+            (
+                AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
+                "api.openai.com".to_string(),
+            ),
+            (
+                "REQUEST_ONLY_VALUE".to_string(),
+                "not-for-setup".to_string(),
+            ),
+        ]);
+        let context = CloudSetupContext {
+            project_root: Path::new("/tmp/project"),
+            sandbox_mode: SandboxMode::ReadOnly,
+            permission_mode: AgentPermissionMode::Scoped,
+            env_vars: &request_env,
+            capability_token: None,
+        };
+
+        let setup_env = setup_spawn_env(&cloud, &context);
+
+        assert_eq!(setup_env[AGENT_ISOLATION_TIER_ENV], "container");
+        assert_eq!(setup_env[AGENT_NETWORK_ALLOWLIST_ENV], "api.openai.com");
+        assert!(!setup_env.contains_key("REQUEST_ONLY_VALUE"));
+        assert!(!setup_env.contains_key("PATH"));
+    }
+
     #[tokio::test]
     async fn run_setup_phase_noop_when_cloud_disabled() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -410,7 +540,7 @@ mod tests {
             setup_secret_env: Vec::new(),
         };
 
-        run_setup_phase(&cloud, dir.path()).await?;
+        run_test_setup(&cloud, dir.path()).await?;
 
         assert!(!marker.exists(), "setup command must not run when disabled");
         Ok(())
@@ -426,7 +556,7 @@ mod tests {
             setup_secret_env: Vec::new(),
         };
 
-        run_setup_phase(&cloud, dir.path()).await?;
+        run_test_setup(&cloud, dir.path()).await?;
         Ok(())
     }
 
@@ -440,8 +570,24 @@ mod tests {
             setup_secret_env: Vec::new(),
         };
 
-        let result = run_setup_phase(&cloud, dir.path()).await;
+        let result = run_test_setup(&cloud, dir.path()).await;
         assert!(result.is_err(), "chaining command must be rejected");
+        Ok(())
+    }
+
+    async fn run_test_setup(cloud: &CodexCloudConfig, project_root: &Path) -> anyhow::Result<()> {
+        let env_vars = HashMap::new();
+        run_setup_phase(
+            cloud,
+            CloudSetupContext {
+                project_root,
+                sandbox_mode: SandboxMode::DangerFullAccess,
+                permission_mode: AgentPermissionMode::Full,
+                env_vars: &env_vars,
+                capability_token: None,
+            },
+        )
+        .await?;
         Ok(())
     }
 }

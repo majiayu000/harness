@@ -50,6 +50,7 @@ async fn prepare_app_server_spawn(
         project_root: &req.project_root,
         sandbox_spec: &sandbox_spec,
         env_vars: &req.env_vars,
+        secret_env_keys: &[],
         permission_mode: req.permission_mode,
         // The app-server protocol is driven over the child's stdin.
         forward_stdin: true,
@@ -461,7 +462,17 @@ impl AgentAdapter for CodexAdapter {
     ) -> harness_core::error::Result<()> {
         let req = self.effective_turn_request(req);
         crate::spawn_supervisor::validate_capability_token(req.capability_token.as_ref())?;
-        crate::cloud_setup::run_setup_phase(&self.cloud, &req.project_root).await?;
+        crate::cloud_setup::run_setup_phase(
+            &self.cloud,
+            crate::cloud_setup::CloudSetupContext {
+                project_root: &req.project_root,
+                sandbox_mode: req.sandbox_mode.unwrap_or(self.sandbox_mode),
+                permission_mode: req.permission_mode,
+                env_vars: &req.env_vars,
+                capability_token: req.capability_token.as_ref(),
+            },
+        )
+        .await?;
         let mut state = self.state.lock().await;
         self.ensure_child(&req, &mut state).await?;
 

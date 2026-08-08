@@ -71,16 +71,25 @@ pub(super) struct ContainerEnv {
     pub(super) secret: BTreeMap<String, String>,
 }
 
-pub(super) fn container_env_vars(env_vars: &HashMap<String, String>) -> ContainerEnv {
+pub(super) fn container_env_vars(
+    env_vars: &HashMap<String, String>,
+    secret_env_keys: &[String],
+) -> ContainerEnv {
     let plain = env_vars
         .iter()
         .filter(|(key, _)| !is_spawn_control_env(key))
         .filter(|(key, _)| !is_nested_session_env(key))
         .filter(|(key, _)| key.as_str() != SCOPED_GITHUB_TOKEN_ENV)
+        .filter(|(key, _)| !secret_env_keys.contains(key))
         .filter(|(key, _)| !is_operator_secret_env(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut secret = BTreeMap::new();
+    for key in secret_env_keys {
+        if let Some(value) = env_vars.get(key) {
+            secret.insert(key.clone(), value.clone());
+        }
+    }
     if let Some(scoped_token) = env_vars
         .get(SCOPED_GITHUB_TOKEN_ENV)
         .map(String::as_str)
@@ -134,4 +143,23 @@ pub(super) fn container_image(env_vars: &HashMap<String, String>) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_AGENT_CONTAINER_IMAGE)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_container_secret_is_passed_by_name_without_plain_argv_value() {
+        let secret_name = "NPM_TOKEN".to_string();
+        let secret_value = "setup-secret-value".to_string();
+        let env_vars = HashMap::from([(secret_name.clone(), secret_value.clone())]);
+
+        let container_env = container_env_vars(&env_vars, std::slice::from_ref(&secret_name));
+
+        assert!(!container_env.plain.contains_key(&secret_name));
+        assert_eq!(container_env.secret[&secret_name], secret_value);
+        let docker_env = docker_process_env(container_env.secret);
+        assert_eq!(docker_env[&secret_name], "setup-secret-value");
+    }
 }
