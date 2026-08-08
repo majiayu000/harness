@@ -59,3 +59,15 @@ fn linux_proxy_only_policy_fails_closed() {
         SandboxError::UnsupportedNetworkPolicy { .. }
     ));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_network_only_bwrap_isolates_the_process_tree() {
+    let spec = SandboxSpec::new(SandboxMode::DangerFullAccess, "/tmp/project")
+        .with_network_policy(NetworkPolicy::Deny);
+
+    let args = linux_network_only_bwrap_args(Path::new("/usr/bin/env"), &[], &spec);
+
+    assert!(args.contains(&OsString::from("--unshare-pid")));
+    assert!(args.contains(&OsString::from("--die-with-parent")));
+}

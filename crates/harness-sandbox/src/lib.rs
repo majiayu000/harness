@@ -398,6 +398,7 @@ mod tests {
         let spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, "/tmp/project");
         let command_args = vec![OsString::from("--flag"), OsString::from("value")];
         let args = linux_bwrap_args(Path::new("/usr/bin/claude"), &command_args, &spec).unwrap();
+        assert!(args.contains(&OsString::from("--unshare-pid")));
         assert!(!args.contains(&OsString::from("--unshare-net")));
         let project_occurrences = args
             .iter()

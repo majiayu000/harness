@@ -63,6 +63,7 @@ pub(super) fn linux_bwrap_args(
     let mut wrapped_args = vec![
         OsString::from("--die-with-parent"),
         OsString::from("--new-session"),
+        OsString::from("--unshare-pid"),
         OsString::from("--ro-bind"),
         OsString::from("/"),
         OsString::from("/"),
@@ -130,6 +131,7 @@ pub(super) fn linux_network_only_bwrap_args(
     let mut wrapped_args = vec![
         OsString::from("--die-with-parent"),
         OsString::from("--new-session"),
+        OsString::from("--unshare-pid"),
         OsString::from("--bind"),
         OsString::from("/"),
         OsString::from("/"),
