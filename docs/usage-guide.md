@@ -429,6 +429,8 @@ available at all times, including while a recheck is pending.
 | `complexity_preferred_agents` | `[]` | Optional ordered list for complex/critical routing (for example `["codex","claude"]`) |
 | `sandbox_mode` | `"danger-full-access"` | Sandbox policy: `read-only`, `read-only-with-network`, `workspace-write`, `danger-full-access` |
 | `approval_policy` | `"auto-edit"` | Approval policy for agent actions |
+| `capability_profile` | `"standard"` | Agent tool profile: `read-only`, `standard`, or explicit unrestricted opt-up `full` |
+| `allowed_tools` | — | Optional explicit tool allowlist; overrides `capability_profile` and keeps the request scoped, including an empty deny-all list |
 
 ### `[agents.claude]`
 

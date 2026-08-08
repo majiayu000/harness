@@ -35,7 +35,7 @@ current implementation is weakest.
 | Orchestration-table write prohibition | `prompt_packet.rs:76` (`agent_must_not_edit_workflow_tables: true`) | Contract statement in the packet; enforced socially, not mechanically. |
 | Filesystem sandbox with `.git`/`.harness` write-deny | `crates/harness-sandbox/src/lib.rs:11` (`PROTECTED_RELATIVE_PATHS`); Seatbelt policy generation emits the protected-path `(deny file-write* ...)` rules at `lib.rs:184-188`; Landlock/bwrap equivalents | Prevents an injected agent from rewriting git history or harness-local state directly. |
 | Read-only sandbox modes for review/inspect profiles | `workflow_runtime_worker/runtime_profile.rs:27-38` maps a runtime profile's `sandbox: "read-only-with-network"` to `SandboxMode::ReadOnlyWithNetwork`. The mode flows agent-agnostically: `workflow_runtime_worker/executor.rs:99-101` resolves it (falling back to the `agents.sandbox_mode` config default) and passes it through `TurnLifecycleOptions` (`executor.rs:197`; forwarded at `turn_engine/turn_lifecycle.rs:227` and `:243`). Claude spawns enforce it at the OS level — `claude_adapter.rs:104-109` and `claude.rs:85`, `:184-189`, `:313-318` build `SandboxSpec`s enforced by harness-sandbox Seatbelt/Landlock; the codex paths translate it to CLI sandbox config (`codex.rs:667-676`, `codex_adapter.rs:566-580`). | Filesystem sandboxing is real for Claude spawns. The residual gap is the *tool-permission flag surface*: `--dangerously-skip-permissions` is orthogonal to the sandbox mode and stays permissive even under a write-restricted sandbox. |
-| Scoped tool profile (exists, non-default) | `crates/harness-agents/src/claude.rs:115-131` | `allowed_tools = Some(...)` produces `--allowedTools`; the mechanism is built and mutually exclusive with the skip-permissions flag. |
+| Scoped tool profile (default) | `crates/harness-core/src/config/agents/permissions.rs`; `crates/harness-agents/src/claude.rs`; `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs` | `standard` is the default capability profile. It resolves to `Read,Write,Edit,Bash`; `full` is an explicit opt-up. The resolved mode and allowlist are recorded in runtime provenance and the final `agent_permission_profile` artifact. |
 | Context provenance recording (spec) | `specs/GH1732/` (merged spec, prompt packet v2) | Records which sources were selected into a packet, with per-entry trust level. Observational: it proves what went in; it does not change how untrusted entries are framed. |
 
 ## Gaps
@@ -71,21 +71,22 @@ but it is an implicit trust decision that is nowhere declared or gated by the
 tier system (`tier_resolution.rs` classifies submitter trust, not repo-file
 trust).
 
-### G2 — Default agent profile is maximally permissive
+### G2 — Default agent profile is scoped (resolved)
 
-Both spawn paths pass `--dangerously-skip-permissions` whenever
-`allowed_tools` is unset — the "Full profile" is the default:
+The default `CapabilityProfile` is now `standard`, and the workflow runtime
+resolves the effective `permission_mode` and `allowed_tools` once before it
+constructs either agent request surface. Claude receives `--allowedTools`
+with `Read,Write,Edit,Bash`; `--dangerously-skip-permissions` is emitted only
+when configuration explicitly selects `capability_profile = "full"` and no
+allowlist is present. An explicit allowlist always wins over Full, and an
+empty list remains deny-all.
 
-- `crates/harness-agents/src/claude.rs:115-131` (batch CodeAgent)
-- `crates/harness-agents/src/claude_adapter.rs:87-93` (streaming adapter;
-  `claude_adapter.rs:316-320` additionally documents that approvals are
-  auto-granted and mid-turn input is impossible)
-
-Consequence: any successful injection executes with every tool the CLI
-offers. The scoped mechanism exists and is tested; it is simply not the
-default, and nothing in the workflow runtime chooses a profile per activity
-(a read-only activity like triage runs with the same full profile as
-implementation).
+The resolved settings participate in prompt-provenance hashing, and every
+runtime result carries an `agent_permission_profile` artifact. Structured
+output correction turns narrow further to scoped deny-all. This closes the
+implicit `allowed_tools = None` to unrestricted-access coupling. Per-activity
+profiles remain a possible future refinement, but the global default is now
+fail-closed and auditable.
 
 ### G3 — Egress control is delegated to infrastructure that is not shipped
 
