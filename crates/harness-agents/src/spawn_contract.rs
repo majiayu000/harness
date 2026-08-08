@@ -46,6 +46,12 @@ const DEFAULT_AGENT_CONTAINER_IMAGE: &str = "harness-agent:latest";
 const CONTAINER_WORKSPACE: &str = "/workspace";
 pub(crate) const REVIEW_GIT_SAFE_WORKSPACE_ENV: &str = "HARNESS_AGENT_REVIEW_GIT_SAFE_WORKSPACE";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerBindMount {
+    pub(crate) source: PathBuf,
+    pub(crate) destination: PathBuf,
+}
+
 pub(crate) struct AgentSpawnInput<'a> {
     pub(crate) program: &'a Path,
     pub(crate) args: &'a [OsString],
@@ -53,6 +59,7 @@ pub(crate) struct AgentSpawnInput<'a> {
     pub(crate) sandbox_spec: &'a SandboxSpec,
     pub(crate) env_vars: &'a HashMap<String, String>,
     pub(crate) secret_env_keys: &'a [String],
+    pub(crate) container_bind_mounts: &'a [ContainerBindMount],
     pub(crate) permission_mode: AgentPermissionMode,
     /// The caller pipes the prompt through the child's stdin. The container
     /// tier must keep stdin open (`docker run -i`) or the prompt is silently
@@ -178,6 +185,21 @@ impl AgentSpawnContract for ContainerSpawn {
             workspace_mount.push_str(",readonly");
         }
         args.push(OsString::from(workspace_mount));
+        for mount in input.container_bind_mounts {
+            let source = canonical_container_bind_source(&project_root, &mount.source)?;
+            if !mount.destination.is_absolute() || mount.destination == Path::new("/") {
+                return Err(HarnessError::AgentExecution(format!(
+                    "container bind destination must be a specific absolute path: {}",
+                    mount.destination.display()
+                )));
+            }
+            args.push(OsString::from("--mount"));
+            args.push(OsString::from(format!(
+                "type=bind,src={},dst={}",
+                source.display(),
+                mount.destination.display()
+            )));
+        }
         if let Some(layout) = &review_layout {
             for mount in &layout.git_mounts {
                 args.push(OsString::from("--mount"));
@@ -346,6 +368,25 @@ fn canonical_workspace(project_root: &Path) -> Result<PathBuf, HarnessError> {
             project_root.display()
         ))
     })
+}
+
+fn canonical_container_bind_source(
+    project_root: &Path,
+    source: &Path,
+) -> Result<PathBuf, HarnessError> {
+    let source = std::fs::canonicalize(source).map_err(|error| {
+        HarnessError::AgentExecution(format!(
+            "failed to resolve container bind source {}: {error}",
+            source.display()
+        ))
+    })?;
+    if !source.starts_with(project_root) {
+        return Err(HarnessError::AgentExecution(format!(
+            "container bind source must remain inside the task workspace: {}",
+            source.display()
+        )));
+    }
+    Ok(source)
 }
 
 fn container_program(program: &Path) -> OsString {

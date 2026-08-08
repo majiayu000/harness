@@ -15,6 +15,7 @@ fn input<'a>(
         sandbox_spec,
         env_vars,
         secret_env_keys: &[],
+        container_bind_mounts: &[],
         permission_mode: AgentPermissionMode::Scoped,
         forward_stdin: false,
     }
@@ -84,6 +85,80 @@ fn container_spawn_mounts_only_task_workspace() -> anyhow::Result<()> {
     )));
     assert!(args.contains(&"/harness-output-schema/activity-result-schema.json".to_string()));
     assert!(!args.contains(&schema_path.display().to_string()));
+    Ok(())
+}
+
+#[test]
+fn container_spawn_adds_workspace_scoped_state_mounts() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let state_home = root.path().join(".harness/cloud-setup-state/test/home");
+    std::fs::create_dir_all(&state_home)?;
+    let env_vars = HashMap::from([(
+        AGENT_ISOLATION_TIER_ENV.to_string(),
+        "container".to_string(),
+    )]);
+    let sandbox_spec = SandboxSpec::new(SandboxMode::ReadOnly, root.path());
+    let mounts = [ContainerBindMount {
+        source: state_home.clone(),
+        destination: PathBuf::from("/harness-cloud-home"),
+    }];
+
+    let spawn = ContainerSpawn.prepare(
+        AgentSpawnInput {
+            program: Path::new("codex"),
+            args: &[],
+            project_root: root.path(),
+            sandbox_spec: &sandbox_spec,
+            env_vars: &env_vars,
+            secret_env_keys: &[],
+            container_bind_mounts: &mounts,
+            permission_mode: AgentPermissionMode::Scoped,
+            forward_stdin: false,
+        },
+        None,
+    )?;
+
+    assert!(string_args(&spawn).contains(&format!(
+        "type=bind,src={},dst=/harness-cloud-home",
+        std::fs::canonicalize(state_home)?.display()
+    )));
+    Ok(())
+}
+
+#[test]
+fn container_spawn_rejects_state_mount_outside_workspace() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    let env_vars = HashMap::from([(
+        AGENT_ISOLATION_TIER_ENV.to_string(),
+        "container".to_string(),
+    )]);
+    let sandbox_spec = SandboxSpec::new(SandboxMode::ReadOnly, root.path());
+    let mounts = [ContainerBindMount {
+        source: outside.path().to_path_buf(),
+        destination: PathBuf::from("/harness-cloud-home"),
+    }];
+
+    let error = ContainerSpawn
+        .prepare(
+            AgentSpawnInput {
+                program: Path::new("codex"),
+                args: &[],
+                project_root: root.path(),
+                sandbox_spec: &sandbox_spec,
+                env_vars: &env_vars,
+                secret_env_keys: &[],
+                container_bind_mounts: &mounts,
+                permission_mode: AgentPermissionMode::Scoped,
+                forward_stdin: false,
+            },
+            None,
+        )
+        .expect_err("state mount outside the task workspace must fail closed");
+
+    assert!(error
+        .to_string()
+        .contains("container bind source must remain inside the task workspace"));
     Ok(())
 }
 

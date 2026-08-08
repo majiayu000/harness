@@ -142,6 +142,38 @@ async fn review_spawn_uses_container_isolation() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn container_review_reuses_cloud_setup_home_and_tmp() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    mark_standard_git_repository(dir.path())?;
+    let cloud = CodexCloudConfig {
+        enabled: true,
+        cache_ttl_hours: 12,
+        setup_commands: vec!["cargo fetch".to_string()],
+        setup_secret_env: Vec::new(),
+    };
+    let agent = CodexAgent::with_cloud(PathBuf::from("codex"), cloud, SandboxMode::WorkspaceWrite);
+
+    let (spawn, _) = agent
+        .prepare_review_spawn(&container_review_request(
+            dir.path(),
+            Some("origin/main"),
+            vec![],
+        ))
+        .await?;
+
+    let args = spawn_args(&spawn);
+    assert!(args.contains(&"HOME=/harness-cloud-home".to_string()));
+    assert!(args.contains(&"TMPDIR=/tmp".to_string()));
+    assert!(args
+        .iter()
+        .any(|arg| { arg.starts_with("type=bind,") && arg.ends_with(",dst=/harness-cloud-home") }));
+    assert!(args
+        .iter()
+        .any(|arg| arg.starts_with("type=bind,") && arg.ends_with(",dst=/tmp")));
+    Ok(())
+}
+
+#[tokio::test]
 async fn container_review_rejects_legacy_external_proxy() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     mark_standard_git_repository(dir.path())?;

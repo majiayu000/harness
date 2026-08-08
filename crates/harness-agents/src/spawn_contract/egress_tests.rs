@@ -198,6 +198,7 @@ if curl --silent --noproxy '*' --max-time 2 https://example.com/ >/dev/null 2>&1
         sandbox_spec: &sandbox_spec,
         env_vars: &env_vars,
         secret_env_keys: &[],
+        container_bind_mounts: &[],
         permission_mode: AgentPermissionMode::Scoped,
         forward_stdin: false,
     })

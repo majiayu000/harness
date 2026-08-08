@@ -177,6 +177,7 @@ async fn prepare_acp_spawn(
         sandbox_spec: &sandbox_spec,
         env_vars: &req.env_vars,
         secret_env_keys: &[],
+        container_bind_mounts: &[],
         permission_mode: req.permission_mode,
         forward_stdin: true,
     })

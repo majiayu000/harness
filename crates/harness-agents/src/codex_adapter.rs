@@ -30,6 +30,7 @@ use self::protocol::{
 use self::protocol::{sandbox_mode_value, sandbox_policy_value};
 async fn prepare_app_server_spawn(
     cli_path: &std::path::Path,
+    cloud: &CodexCloudConfig,
     req: &TurnRequest,
 ) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
     let args = [
@@ -44,13 +45,17 @@ async fn prepare_app_server_spawn(
     } else {
         SandboxSpec::new(sandbox_mode, &req.project_root)
     };
+    let mut spawn_env_vars = req.env_vars.clone();
+    let container_bind_mounts =
+        crate::cloud_setup::apply_container_state(cloud, &req.project_root, &mut spawn_env_vars)?;
     crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
         program: cli_path,
         args: &args,
         project_root: &req.project_root,
         sandbox_spec: &sandbox_spec,
-        env_vars: &req.env_vars,
+        env_vars: &spawn_env_vars,
         secret_env_keys: &[],
+        container_bind_mounts: &container_bind_mounts,
         permission_mode: req.permission_mode,
         // The app-server protocol is driven over the child's stdin.
         forward_stdin: true,
@@ -288,7 +293,7 @@ impl CodexAdapter {
         }
 
         let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let prepared_spawn = prepare_app_server_spawn(&self.cli_path, req).await?;
+        let prepared_spawn = prepare_app_server_spawn(&self.cli_path, &self.cloud, req).await?;
         let spawn_project_root = req.project_root.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(
             crate::spawn_supervisor::AgentSpawnPlan {

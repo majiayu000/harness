@@ -17,6 +17,8 @@ use tokio::process::Command;
 
 const SETUP_OUTPUT_MAX_BYTES: usize = 512;
 const SETUP_CAPTURE_MAX_BYTES: usize = 4096;
+const CONTAINER_CLOUD_HOME: &str = "/harness-cloud-home";
+const CONTAINER_CLOUD_TMP: &str = "/tmp";
 pub(crate) const SETUP_ENV_ALLOWLIST: [&str; 10] = [
     "PATH", "HOME", "USER", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
 ];
@@ -71,6 +73,62 @@ fn setup_cache_stamp_path(cloud: &CodexCloudConfig, project_root: &Path) -> Path
         .join(".harness")
         .join("cloud-setup-cache")
         .join(format!("{key}.stamp"))
+}
+
+fn container_state_root(cloud: &CodexCloudConfig, project_root: &Path) -> PathBuf {
+    project_root
+        .join(".harness")
+        .join("cloud-setup-state")
+        .join(setup_cache_key(cloud, project_root))
+}
+
+pub(crate) fn apply_container_state(
+    cloud: &CodexCloudConfig,
+    project_root: &Path,
+    env_vars: &mut HashMap<String, String>,
+) -> harness_core::error::Result<Vec<crate::spawn_contract::ContainerBindMount>> {
+    let container_tier = env_vars
+        .get(AGENT_ISOLATION_TIER_ENV)
+        .is_some_and(|tier| tier.trim() == "container");
+    let has_setup_commands = cloud
+        .setup_commands
+        .iter()
+        .any(|command| !command.trim().is_empty());
+    if !cloud.enabled || !container_tier || !has_setup_commands {
+        return Ok(Vec::new());
+    }
+
+    let state_root = container_state_root(cloud, project_root);
+    let home = state_root.join("home");
+    let temporary = state_root.join("tmp");
+    for path in [&home, &temporary] {
+        fs::create_dir_all(path).map_err(|error| {
+            HarnessError::AgentExecution(format!(
+                "failed to create persistent cloud setup state `{}`: {error}",
+                path.display()
+            ))
+        })?;
+    }
+
+    for (key, value) in [
+        ("HOME", CONTAINER_CLOUD_HOME),
+        ("TMPDIR", CONTAINER_CLOUD_TMP),
+        ("TMP", CONTAINER_CLOUD_TMP),
+        ("TEMP", CONTAINER_CLOUD_TMP),
+    ] {
+        env_vars.insert(key.to_string(), value.to_string());
+    }
+
+    Ok(vec![
+        crate::spawn_contract::ContainerBindMount {
+            source: home,
+            destination: PathBuf::from(CONTAINER_CLOUD_HOME),
+        },
+        crate::spawn_contract::ContainerBindMount {
+            source: temporary,
+            destination: PathBuf::from(CONTAINER_CLOUD_TMP),
+        },
+    ])
 }
 
 fn setup_cache_is_fresh(
@@ -186,7 +244,8 @@ async fn run_setup_command(
     } else {
         SandboxSpec::new(context.sandbox_mode, context.project_root)
     };
-    let env_vars = setup_spawn_env(cloud, context);
+    let mut env_vars = setup_spawn_env(cloud, context);
+    let container_bind_mounts = apply_container_state(cloud, context.project_root, &mut env_vars)?;
     let args = [OsString::from("-lc"), OsString::from(setup_command)];
     let mut spawn =
         crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
@@ -196,6 +255,7 @@ async fn run_setup_command(
             sandbox_spec: &sandbox_spec,
             env_vars: &env_vars,
             secret_env_keys: &cloud.setup_secret_env,
+            container_bind_mounts: &container_bind_mounts,
             permission_mode: context.permission_mode,
             forward_stdin: false,
         })
@@ -525,6 +585,66 @@ mod tests {
         assert_eq!(setup_env[AGENT_NETWORK_ALLOWLIST_ENV], "api.openai.com");
         assert!(!setup_env.contains_key("REQUEST_ONLY_VALUE"));
         assert!(!setup_env.contains_key("PATH"));
+    }
+
+    #[test]
+    fn container_setup_state_is_shared_through_workspace_mounts() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let cloud = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["cargo fetch".to_string()],
+            setup_secret_env: Vec::new(),
+        };
+        let mut env_vars = HashMap::from([(
+            AGENT_ISOLATION_TIER_ENV.to_string(),
+            "container".to_string(),
+        )]);
+
+        let mounts = apply_container_state(&cloud, project.path(), &mut env_vars)?;
+
+        assert_eq!(env_vars["HOME"], CONTAINER_CLOUD_HOME);
+        assert_eq!(env_vars["TMPDIR"], CONTAINER_CLOUD_TMP);
+        assert_eq!(env_vars["TMP"], CONTAINER_CLOUD_TMP);
+        assert_eq!(env_vars["TEMP"], CONTAINER_CLOUD_TMP);
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.iter().all(|mount| mount.source.is_dir()));
+        assert_eq!(
+            mounts
+                .iter()
+                .map(|mount| mount.destination.as_path())
+                .collect::<Vec<_>>(),
+            [
+                Path::new(CONTAINER_CLOUD_HOME),
+                Path::new(CONTAINER_CLOUD_TMP)
+            ]
+        );
+        assert!(mounts
+            .iter()
+            .all(|mount| mount.source.starts_with(project.path())));
+        Ok(())
+    }
+
+    #[test]
+    fn container_setup_state_is_not_created_without_setup_commands() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let cloud = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: Vec::new(),
+            setup_secret_env: Vec::new(),
+        };
+        let mut env_vars = HashMap::from([(
+            AGENT_ISOLATION_TIER_ENV.to_string(),
+            "container".to_string(),
+        )]);
+
+        let mounts = apply_container_state(&cloud, project.path(), &mut env_vars)?;
+
+        assert!(mounts.is_empty());
+        assert!(!env_vars.contains_key("HOME"));
+        assert!(!project.path().join(".harness/cloud-setup-state").exists());
+        Ok(())
     }
 
     #[tokio::test]

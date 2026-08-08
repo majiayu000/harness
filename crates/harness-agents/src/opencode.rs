@@ -256,6 +256,7 @@ impl CodeAgent for OpenCodeAgent {
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
                 secret_env_keys: &[],
+                container_bind_mounts: &[],
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
             })
@@ -379,6 +380,7 @@ impl CodeAgent for OpenCodeAgent {
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
                 secret_env_keys: &[],
+                container_bind_mounts: &[],
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
             })

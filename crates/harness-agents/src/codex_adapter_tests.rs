@@ -438,7 +438,8 @@ async fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow:
         capability_token: None,
     };
 
-    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request).await?;
+    let cloud = harness_core::config::agents::CodexCloudConfig::default();
+    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &cloud, &request).await?;
     let args = spawn
         .args
         .iter()
@@ -460,7 +461,8 @@ async fn app_server_spawn_keeps_host_workspace_path() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let request = test_turn_request(root.path().to_path_buf());
 
-    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request).await?;
+    let cloud = harness_core::config::agents::CodexCloudConfig::default();
+    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &cloud, &request).await?;
 
     assert_eq!(spawn.child_workspace, root.path());
     assert_eq!(

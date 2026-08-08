@@ -254,6 +254,11 @@ impl CodexAgent {
                 spawn_env_vars.remove(key);
             }
         }
+        let container_bind_mounts = cloud_setup::apply_container_state(
+            &self.cloud,
+            &req.project_root,
+            &mut spawn_env_vars,
+        )?;
 
         let prepared_spawn =
             crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
@@ -263,6 +268,7 @@ impl CodexAgent {
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
                 secret_env_keys: &[],
+                container_bind_mounts: &container_bind_mounts,
                 permission_mode: req.permission_mode,
                 forward_stdin: review_uses_stdin_prompt(req),
             })
@@ -483,6 +489,11 @@ impl CodeAgent for CodexAgent {
                 spawn_env_vars.remove(key);
             }
         }
+        let container_bind_mounts = cloud_setup::apply_container_state(
+            &self.cloud,
+            &req.project_root,
+            &mut spawn_env_vars,
+        )?;
         let prepared_spawn =
             crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
                 program: &self.cli_path,
@@ -491,6 +502,7 @@ impl CodeAgent for CodexAgent {
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
                 secret_env_keys: &[],
+                container_bind_mounts: &container_bind_mounts,
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
             })
@@ -597,6 +609,11 @@ impl CodeAgent for CodexAgent {
                 spawn_env_vars.remove(key);
             }
         }
+        let container_bind_mounts = cloud_setup::apply_container_state(
+            &self.cloud,
+            &req.project_root,
+            &mut spawn_env_vars,
+        )?;
         let prepared_spawn =
             crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
                 program: &self.cli_path,
@@ -605,6 +622,7 @@ impl CodeAgent for CodexAgent {
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
                 secret_env_keys: &[],
+                container_bind_mounts: &container_bind_mounts,
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
             })

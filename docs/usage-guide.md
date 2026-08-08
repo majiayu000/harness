@@ -479,6 +479,11 @@ On Linux, any non-empty allowlist requires `default_tier = "container"`.
 | `setup_commands` | `[]` | Commands run during cloud setup phase |
 | `setup_secret_env` | `[]` | Env vars available during setup but removed for agent execution |
 
+For container-isolated Codex runs with setup commands, Harness creates a project-local
+state directory under `.harness/cloud-setup-state/`. Every setup command and the final
+Codex process share its writable `HOME` and temporary directory mounts, so installed
+tools and caches remain available across the otherwise ephemeral containers.
+
 ### `[agents.review]`
 
 | Field | Default | Description |
