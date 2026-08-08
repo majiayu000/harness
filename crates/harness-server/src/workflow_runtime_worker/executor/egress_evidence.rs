@@ -88,11 +88,11 @@ impl AgentEgressEvidence {
             RecordedEgressMode::DenyAll | RecordedEgressMode::Unrestricted => {
                 EgressVerificationResult::NotRequired
             }
-            RecordedEgressMode::FirstPartyProxy if has_egress_error(items) => {
-                EgressVerificationResult::Failed
-            }
             RecordedEgressMode::FirstPartyProxy if verified_at_dispatch => {
                 EgressVerificationResult::VerifiedAtDispatch
+            }
+            RecordedEgressMode::FirstPartyProxy if has_egress_error(items) => {
+                EgressVerificationResult::Failed
             }
             RecordedEgressMode::FirstPartyProxy => EgressVerificationResult::Unverified,
         };
@@ -206,6 +206,28 @@ mod tests {
                 &[Item::Error {
                     code: -1,
                     message: "agent protocol closed unexpectedly".to_string(),
+                }],
+                true,
+            )["verification_result"],
+            "verified_at_dispatch"
+        );
+    }
+
+    #[test]
+    fn runtime_egress_error_preserves_dispatch_verification() {
+        let env_vars = HashMap::from([(
+            AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
+            "api.openai.com".to_string(),
+        )]);
+
+        assert_eq!(
+            artifact_value(
+                RuntimeKind::CodexJsonrpc,
+                AgentPermissionMode::Scoped,
+                env_vars,
+                &[Item::Error {
+                    code: -1,
+                    message: "egress proxy connection closed during the turn".to_string(),
                 }],
                 true,
             )["verification_result"],
