@@ -117,8 +117,8 @@ fn parse_step_finish_tokens(value: &Value) -> TokenUsage {
 
 /// Build the permission env value for an explicit allowlist.
 ///
-/// `None` = full profile (opencode `--auto`). An explicitly empty list means
-/// deny-all, mirroring `AgentRequest::allowed_tools` semantics.
+/// An explicitly empty list means deny-all, mirroring
+/// `AgentRequest::allowed_tools` semantics. Full mode bypasses this helper.
 fn permission_env_value(tools: &[String]) -> String {
     if tools.is_empty() {
         return r#"{"*":"deny"}"#.to_string();

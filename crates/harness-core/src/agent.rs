@@ -376,9 +376,7 @@ impl TurnRequest {
 }
 
 fn default_scoped_tools() -> Vec<String> {
-    CapabilityProfile::Standard
-        .tools()
-        .expect("Standard capability profile must declare an allowlist")
+    CapabilityProfile::standard_tools()
 }
 
 /// Streaming agent adapter — coexists with legacy CodeAgent trait.

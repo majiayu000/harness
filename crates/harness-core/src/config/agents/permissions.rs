@@ -14,6 +14,13 @@ pub enum CapabilityProfile {
 }
 
 impl CapabilityProfile {
+    pub fn standard_tools() -> Vec<String> {
+        ["Read", "Write", "Edit", "Bash"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Returns the explicit tool list for this profile, or `None` for `Full`
     /// (meaning no restriction is applied to the CLI invocation).
     pub fn tools(self) -> Option<Vec<String>> {
@@ -23,12 +30,7 @@ impl CapabilityProfile {
                 "Grep".to_string(),
                 "Glob".to_string(),
             ]),
-            CapabilityProfile::Standard => Some(vec![
-                "Read".to_string(),
-                "Write".to_string(),
-                "Edit".to_string(),
-                "Bash".to_string(),
-            ]),
+            CapabilityProfile::Standard => Some(Self::standard_tools()),
             CapabilityProfile::Full => None,
         }
     }
