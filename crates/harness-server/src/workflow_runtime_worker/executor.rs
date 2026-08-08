@@ -497,6 +497,7 @@ fn isolation_spawn_env_vars(job: &RuntimeJob) -> HashMap<String, String> {
     if !allowlist.is_empty() {
         env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
     }
+    harness_core::agent::inherit_agent_spawn_control_env(&mut env_vars);
     env_vars
 }
 fn runtime_worker_disabled_result_for_config(

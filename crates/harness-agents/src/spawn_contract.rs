@@ -1,4 +1,7 @@
-use harness_core::agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
+use harness_core::agent::{
+    AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV,
+    AGENT_NETWORK_ALLOWLIST_ENV,
+};
 use harness_core::config::agents::AgentPermissionMode;
 use harness_core::config::isolation::IsolationTier;
 use harness_core::error::HarnessError;
@@ -17,7 +20,7 @@ mod output_schema;
 mod review_git;
 mod spawn_env;
 use egress::{
-    EgressPolicy, EgressProxyLease, EgressProxyRoute, EGRESS_PROXY_IMAGE_ENV,
+    container_canary_command, EgressPolicy, EgressProxyLease, EgressProxyRoute,
     LEGACY_EGRESS_PROXY_ENV,
 };
 use spawn_env::{
@@ -41,7 +44,6 @@ pub(crate) const NESTED_SESSION_ENV_KEYS: [&str; 5] = [
 ];
 
 const DEFAULT_AGENT_CONTAINER_IMAGE: &str = "harness-agent:latest";
-const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
 const CONTAINER_WORKSPACE: &str = "/workspace";
 pub(crate) const REVIEW_GIT_SAFE_WORKSPACE_ENV: &str = "HARNESS_AGENT_REVIEW_GIT_SAFE_WORKSPACE";
 
@@ -237,7 +239,10 @@ impl AgentSpawnContract for ContainerSpawn {
         }
         args.push(OsString::from(image));
         if egress_route.is_some_and(EgressProxyRoute::requires_container_canary) {
-            args.extend(container_canary_command(input.program, child_args));
+            args.extend(container_canary_command(
+                container_program(input.program),
+                child_args,
+            ));
         } else {
             args.push(container_program(input.program));
             args.extend(child_args);
@@ -265,7 +270,7 @@ pub(crate) fn prepare_agent_spawn(
         .is_some_and(|value| !value.trim().is_empty())
     {
         return Err(HarnessError::AgentExecution(format!(
-            "{LEGACY_EGRESS_PROXY_ENV} is no longer accepted because external proxy URLs cannot prove allowlist enforcement; configure {EGRESS_PROXY_IMAGE_ENV} instead"
+            "{LEGACY_EGRESS_PROXY_ENV} is no longer accepted because external proxy URLs cannot prove allowlist enforcement; configure {AGENT_EGRESS_PROXY_IMAGE_ENV} instead"
         )));
     }
     let tier = isolation_tier(input.env_vars)?;
@@ -325,7 +330,7 @@ fn is_spawn_control_env(key: &str) -> bool {
             | AGENT_NETWORK_ALLOWLIST_ENV
             | AGENT_CONTAINER_IMAGE_ENV
             | LEGACY_EGRESS_PROXY_ENV
-            | EGRESS_PROXY_IMAGE_ENV
+            | AGENT_EGRESS_PROXY_IMAGE_ENV
             | SCOPED_GITHUB_TOKEN_ENV
             | REVIEW_GIT_SAFE_WORKSPACE_ENV
     ) || proxy_env_keys().contains(&key)
@@ -347,21 +352,6 @@ fn apply_proxy_env(env: &mut BTreeMap<String, String>, proxy_url: &str) {
         env.insert(key.to_string(), proxy_url.to_string());
     }
     env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
-}
-
-fn container_canary_command(program: &Path, child_args: Vec<OsString>) -> Vec<OsString> {
-    const SCRIPT: &str = r#"status="$(curl --silent --show-error --noproxy '' --proxy "$HTTP_PROXY" --output /dev/null --write-out '%{http_code}' --max-time 5 http://harness-egress-canary.invalid/)" || { echo 'first-party egress proxy canary was unreachable' >&2; exit 70; }
-if [ "$status" != "403" ]; then echo "first-party egress proxy canary returned $status instead of 403" >&2; exit 70; fi
-exec "$@""#;
-    let mut args = vec![
-        OsString::from("sh"),
-        OsString::from("-c"),
-        OsString::from(SCRIPT),
-        OsString::from("harness-egress-canary"),
-        container_program(program),
-    ];
-    args.extend(child_args);
-    args
 }
 
 fn missing_proxy_route(tier: IsolationTier) -> HarnessError {

@@ -206,3 +206,64 @@ fn explicit_full_agent_request_is_unrestricted_only_without_an_allowlist() {
     assert!(!restricted.uses_dangerously_skip_permissions());
     assert_eq!(restricted.scoped_allowed_tools(), vec!["Read"]);
 }
+
+#[test]
+fn configured_policy_overrides_direct_request_permissions_and_isolation() {
+    let mut config = crate::config::HarnessConfig::default();
+    config.agents.capability_profile = crate::config::agents::CapabilityProfile::Full;
+    config.isolation.default_tier = crate::config::isolation::IsolationTier::Container;
+    config.isolation.network_allowlist = vec![
+        " github.com ".to_string(),
+        String::new(),
+        "api.openai.com".to_string(),
+    ];
+    let mut request = AgentRequest::default();
+
+    request.apply_configured_policy(&config);
+
+    assert_eq!(
+        request.permission_mode,
+        crate::config::agents::AgentPermissionMode::Full
+    );
+    assert_eq!(request.allowed_tools, None);
+    assert_eq!(
+        request.env_vars.get(crate::agent::AGENT_ISOLATION_TIER_ENV),
+        Some(&"container".to_string())
+    );
+    assert_eq!(
+        request
+            .env_vars
+            .get(crate::agent::AGENT_NETWORK_ALLOWLIST_ENV),
+        Some(&"github.com,api.openai.com".to_string())
+    );
+}
+
+#[test]
+fn spawn_control_env_inherits_only_declared_non_blank_image_settings() {
+    let process_env = HashMap::from([
+        (
+            crate::agent::AGENT_CONTAINER_IMAGE_ENV.to_string(),
+            "example/agent@sha256:test".to_string(),
+        ),
+        (
+            crate::agent::AGENT_EGRESS_PROXY_IMAGE_ENV.to_string(),
+            "example/proxy@sha256:test".to_string(),
+        ),
+        ("OPERATOR_SECRET".to_string(), "secret".to_string()),
+    ]);
+    let mut env_vars = HashMap::new();
+
+    crate::agent::inherit_agent_spawn_control_env_with(&mut env_vars, |key| {
+        process_env.get(key).cloned()
+    });
+
+    assert_eq!(env_vars.len(), 2);
+    assert_eq!(
+        env_vars.get(crate::agent::AGENT_CONTAINER_IMAGE_ENV),
+        Some(&"example/agent@sha256:test".to_string())
+    );
+    assert_eq!(
+        env_vars.get(crate::agent::AGENT_EGRESS_PROXY_IMAGE_ENV),
+        Some(&"example/proxy@sha256:test".to_string())
+    );
+}

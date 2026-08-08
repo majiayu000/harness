@@ -348,12 +348,13 @@ pub async fn run(
     enforce_exec_privilege_policy(drop_sudo, unprivileged_user.as_deref())?;
     let runtime_sandbox_mode = sandbox_mode.to_sandbox_mode();
 
-    let req = harness_core::agent::AgentRequest {
+    let mut req = harness_core::agent::AgentRequest {
         prompt: apply_sandbox_hint(prompt, sandbox_mode),
         project_root: project_root.clone(),
         model,
         ..Default::default()
     };
+    req.apply_configured_policy(&config);
 
     // `exec` resolves the sandbox mode from its own flags, so it passes that
     // rather than `config.agents.sandbox_mode`.

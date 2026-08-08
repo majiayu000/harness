@@ -1,11 +1,13 @@
 use super::{
-    is_nested_session_env, is_spawn_control_env, AGENT_CONTAINER_IMAGE_ENV,
-    DEFAULT_AGENT_CONTAINER_IMAGE, REVIEW_GIT_SAFE_WORKSPACE_ENV,
+    is_nested_session_env, is_spawn_control_env, DEFAULT_AGENT_CONTAINER_IMAGE,
+    REVIEW_GIT_SAFE_WORKSPACE_ENV,
 };
 use crate::scoped_token::{
     CONTAINER_GH_TOKEN_ENV, CONTAINER_GITHUB_TOKEN_ENV, SCOPED_GITHUB_TOKEN_ENV,
 };
-use harness_core::agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
+use harness_core::agent::{
+    AGENT_CONTAINER_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV,
+};
 use harness_core::config::isolation::IsolationTier;
 use harness_core::error::HarnessError;
 use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};

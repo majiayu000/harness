@@ -1,5 +1,6 @@
 use crate::capability::CapabilityToken;
 use crate::config::agents::{AgentPermissionMode, CapabilityProfile, SandboxMode};
+use crate::config::HarnessConfig;
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,8 @@ use std::path::PathBuf;
 pub const AGENT_ISOLATION_TIER_ENV: &str = "HARNESS_AGENT_ISOLATION_TIER";
 pub const AGENT_NETWORK_ALLOWLIST_ENV: &str = "HARNESS_AGENT_NETWORK_ALLOWLIST";
 pub const AGENT_OUTPUT_SCHEMA_PATH_ENV: &str = "HARNESS_AGENT_OUTPUT_SCHEMA_PATH";
+pub const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
+pub const AGENT_EGRESS_PROXY_IMAGE_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY_IMAGE";
 
 /// Core trait for all code agents (Claude Code, Codex, Anthropic API, etc.)
 #[async_trait]
@@ -84,6 +87,15 @@ pub struct AgentRequest {
 }
 
 impl AgentRequest {
+    /// Apply operator-configured permissions and isolation to a direct agent
+    /// request. Workflow-runtime requests resolve these fields per job and do
+    /// not use this helper.
+    pub fn apply_configured_policy(&mut self, config: &HarnessConfig) {
+        self.permission_mode = config.agents.resolve_permission_mode();
+        self.allowed_tools = config.agents.resolve_allowed_tools();
+        self.env_vars.extend(configured_agent_spawn_env(config));
+    }
+
     /// Returns `true` only for an explicit Full request without an allowlist.
     ///
     /// When `true`, the CLI adapter should use `--dangerously-skip-permissions`.
@@ -126,6 +138,44 @@ impl AgentRequest {
         self.effective_prompt_layers()
             .and_then(AgentPromptLayers::static_system_prompt_for_cache)
             .map(Cow::Borrowed)
+    }
+}
+
+pub fn configured_agent_spawn_env(config: &HarnessConfig) -> HashMap<String, String> {
+    let mut env_vars = HashMap::from([(
+        AGENT_ISOLATION_TIER_ENV.to_string(),
+        config.isolation.default_tier.as_str().to_string(),
+    )]);
+    let allowlist = config
+        .isolation
+        .network_allowlist
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !allowlist.is_empty() {
+        env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
+    }
+    inherit_agent_spawn_control_env(&mut env_vars);
+    env_vars
+}
+
+pub fn inherit_agent_spawn_control_env(env_vars: &mut HashMap<String, String>) {
+    inherit_agent_spawn_control_env_with(env_vars, |key| {
+        crate::config::process_env::non_blank_config_value(key)
+    });
+}
+
+pub(crate) fn inherit_agent_spawn_control_env_with(
+    env_vars: &mut HashMap<String, String>,
+    mut read_process_env: impl FnMut(&str) -> Option<String>,
+) {
+    for key in [AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV] {
+        if let Some(value) = read_process_env(key).filter(|value| !value.trim().is_empty()) {
+            env_vars.insert(key.to_string(), value);
+        }
     }
 }
 

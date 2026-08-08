@@ -67,7 +67,10 @@ fn docker_test_env() -> HashMap<String, String> {
         Ok(image) => image,
         Err(_) => "harness-egress-proxy:gh1771".to_string(),
     };
-    HashMap::from([(super::egress::EGRESS_PROXY_IMAGE_ENV.to_string(), image)])
+    HashMap::from([(
+        harness_core::agent::AGENT_EGRESS_PROXY_IMAGE_ENV.to_string(),
+        image,
+    )])
 }
 
 #[test]

@@ -1,6 +1,9 @@
 use harness_agents::codex::{CodexAgent, CodexReviewRequest};
 use harness_core::{
-    agent::{AgentRequest, CodeAgent, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV},
+    agent::{
+        AgentRequest, CodeAgent, AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV,
+        AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV,
+    },
     config::{agents::SandboxMode, HarnessConfig},
     prompts,
     review::{parse_review_report, ReviewDecision, ReviewProviderKind},
@@ -10,13 +13,13 @@ use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 
 const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
-const CODEX_REVIEW_PROCESS_SPAWN_CONTROL_ENV: [&str; 2] = [
-    "HARNESS_AGENT_CONTAINER_IMAGE",
-    "HARNESS_AGENT_EGRESS_PROXY_IMAGE",
-];
+const CODEX_REVIEW_PROCESS_SPAWN_CONTROL_ENV: [&str; 2] =
+    [AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV];
 
 fn codex_review_spawn_env(config: &HarnessConfig) -> HashMap<String, String> {
-    codex_review_spawn_env_with(config, |key| std::env::var(key).ok())
+    codex_review_spawn_env_with(config, |key| {
+        harness_core::config::process_env::non_blank_config_value(key)
+    })
 }
 
 fn codex_review_spawn_env_with(
@@ -64,10 +67,11 @@ pub async fn fix(
 
     println!("[harness] Round 1 — Implementing issue #{issue} and creating PR");
 
-    let req = AgentRequest::from_prompt_layers(
+    let mut req = AgentRequest::from_prompt_layers(
         prompts::implement_from_issue(issue, None, None).into(),
         project.clone(),
     );
+    req.apply_configured_policy(config);
 
     let resp = agent.execute(req).await?;
     println!("{}", resp.output);
@@ -80,6 +84,7 @@ pub async fn fix(
     println!("[harness] PR #{pr_number} created: {pr_url}");
 
     run_review_loop(
+        config,
         &agent,
         &project,
         ReviewLoopOptions {
@@ -107,6 +112,7 @@ pub async fn loop_pr(
     println!("[harness] Starting review loop for PR #{pr}");
 
     run_review_loop(
+        config,
         &agent,
         &project,
         ReviewLoopOptions {
@@ -255,6 +261,7 @@ struct ReviewLoopOptions<'a> {
 }
 
 async fn run_review_loop(
+    config: &HarnessConfig,
     agent: &impl CodeAgent,
     project: &PathBuf,
     options: ReviewLoopOptions<'_>,
@@ -285,7 +292,7 @@ async fn run_review_loop(
 
         println!("[harness] Review round {round}/{max_rounds}, PR #{pr}");
 
-        let req = AgentRequest {
+        let mut req = AgentRequest {
             prompt: prompts::review_prompt(
                 issue,
                 pr,
@@ -299,6 +306,7 @@ async fn run_review_loop(
             project_root: project.clone(),
             ..Default::default()
         };
+        req.apply_configured_policy(config);
 
         let resp = agent.execute(req).await?;
         println!("{}", resp.output);

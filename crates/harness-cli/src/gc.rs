@@ -53,7 +53,8 @@ pub async fn run_gc(
                 signal_detector,
                 draft_store,
                 project.root.clone(),
-            );
+            )
+            .with_agent_env_vars(harness_core::agent::configured_agent_spawn_env(config));
 
             let agent_registry = build_agent_registry(config)?;
             let agent = agent_registry.default_agent().ok_or_else(|| {

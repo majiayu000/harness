@@ -1,7 +1,9 @@
+use harness_core::agent::AGENT_EGRESS_PROXY_IMAGE_ENV;
 use harness_core::config::agents::AgentPermissionMode;
 use harness_core::config::isolation::IsolationTier;
 use harness_core::error::HarnessError;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::process::{Command, Output};
@@ -9,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(super) const LEGACY_EGRESS_PROXY_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY";
-pub(super) const EGRESS_PROXY_IMAGE_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY_IMAGE";
 const DEFAULT_EGRESS_PROXY_IMAGE: &str = "harness-egress-proxy:latest";
 const PROXY_PORT: u16 = 8080;
 const PROXY_ALIAS: &str = "egress-proxy";
@@ -17,6 +18,24 @@ const PROXY_HEALTH_ATTEMPTS: usize = 50;
 const PROXY_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 const PROXY_CANARY_TIMEOUT: Duration = Duration::from_secs(2);
 static EGRESS_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+pub(super) fn container_canary_command(
+    program: OsString,
+    child_args: Vec<OsString>,
+) -> Vec<OsString> {
+    const SCRIPT: &str = r#"status="$(curl --silent --show-error --noproxy '' --proxy "$HTTP_PROXY" --output /dev/null --write-out '%{http_code}' --max-time 5 http://harness-egress-canary.invalid/)" || { echo 'first-party egress proxy canary was unreachable' >&2; exit 70; }
+if [ "$status" != "403" ]; then echo "first-party egress proxy canary returned $status instead of 403" >&2; exit 70; fi
+exec "$@""#;
+    let mut args = vec![
+        OsString::from("sh"),
+        OsString::from("-c"),
+        OsString::from(SCRIPT),
+        OsString::from("harness-egress-canary"),
+        program,
+    ];
+    args.extend(child_args);
+    args
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EgressPolicy {
@@ -97,11 +116,11 @@ impl EgressProxyLease {
             .is_some()
         {
             return Err(agent_error(format!(
-                "{LEGACY_EGRESS_PROXY_ENV} is no longer accepted because external proxy URLs cannot prove allowlist enforcement; configure {EGRESS_PROXY_IMAGE_ENV} instead"
+                "{LEGACY_EGRESS_PROXY_ENV} is no longer accepted because external proxy URLs cannot prove allowlist enforcement; configure {AGENT_EGRESS_PROXY_IMAGE_ENV} instead"
             )));
         }
         let image = env_vars
-            .get(EGRESS_PROXY_IMAGE_ENV)
+            .get(AGENT_EGRESS_PROXY_IMAGE_ENV)
             .map(String::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
