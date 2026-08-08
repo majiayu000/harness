@@ -147,7 +147,7 @@ pub(super) fn resolve_runtime_settings(
         approval_policy,
         capability_profile: agents.capability_profile,
         permission_mode: agents.resolve_permission_mode(),
-        allowed_tools: agents.resolve_allowed_tools(),
+        allowed_tools: resolve_activity_allowed_tools(agents, execution_phase),
         tool_allowlist_enforcement: ToolAllowlistEnforcement::for_runtime_kind(runtime_kind),
         max_turns: profile.max_turns,
         timeout_secs,
@@ -157,6 +157,31 @@ pub(super) fn resolve_runtime_settings(
         )
         .effective_secs,
     })
+}
+
+fn resolve_activity_allowed_tools(
+    agents: &AgentsConfig,
+    execution_phase: Option<ExecutionPhase>,
+) -> Option<Vec<String>> {
+    if agents.allowed_tools.is_some()
+        || agents.resolve_permission_mode() == AgentPermissionMode::Full
+        || agents.capability_profile == CapabilityProfile::ReadOnly
+    {
+        return agents.resolve_allowed_tools();
+    }
+
+    match execution_phase {
+        Some(ExecutionPhase::Execution | ExecutionPhase::Rebase) => {
+            CapabilityProfile::Standard.tools()
+        }
+        Some(
+            ExecutionPhase::Planning
+            | ExecutionPhase::Validation
+            | ExecutionPhase::SimpleReview
+            | ExecutionPhase::Triage,
+        )
+        | None => CapabilityProfile::ReadOnly.tools(),
+    }
 }
 
 fn resolve_model(
@@ -332,15 +357,7 @@ mod tests {
             resolved.tool_allowlist_enforcement,
             ToolAllowlistEnforcement::NotEnforcedByHarness
         );
-        assert_eq!(
-            resolved.allowed_tools,
-            Some(vec![
-                "Read".to_string(),
-                "Write".to_string(),
-                "Edit".to_string(),
-                "Bash".to_string(),
-            ])
-        );
+        assert_eq!(resolved.allowed_tools, CapabilityProfile::ReadOnly.tools());
 
         let mut profile = profile;
         profile.model = Some("profile-model".to_string());
@@ -355,6 +372,77 @@ mod tests {
         .expect("explicit overrides should resolve");
         assert_eq!(resolved.model, "profile-model");
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("profile-effort"));
+    }
+
+    #[test]
+    fn scoped_defaults_derive_tools_from_the_activity_phase() {
+        let agents = AgentsConfig::default();
+        let profile = profile_with_timeout("claude-default", RuntimeKind::ClaudeCode);
+        let concurrency = ConcurrencyConfig::default();
+
+        for phase in [
+            None,
+            Some(ExecutionPhase::Planning),
+            Some(ExecutionPhase::Validation),
+            Some(ExecutionPhase::SimpleReview),
+            Some(ExecutionPhase::Triage),
+        ] {
+            let resolved = resolve_runtime_settings(
+                &profile,
+                RuntimeKind::ClaudeCode,
+                phase,
+                &agents,
+                &concurrency,
+            )
+            .expect("read-class activity settings should resolve");
+            assert_eq!(resolved.allowed_tools, CapabilityProfile::ReadOnly.tools());
+        }
+
+        for phase in [ExecutionPhase::Execution, ExecutionPhase::Rebase] {
+            let resolved = resolve_runtime_settings(
+                &profile,
+                RuntimeKind::ClaudeCode,
+                Some(phase),
+                &agents,
+                &concurrency,
+            )
+            .expect("implementation-class activity settings should resolve");
+            assert_eq!(resolved.allowed_tools, CapabilityProfile::Standard.tools());
+        }
+    }
+
+    #[test]
+    fn explicit_tool_and_full_profiles_override_activity_defaults() {
+        let profile = profile_with_timeout("claude-default", RuntimeKind::ClaudeCode);
+        let concurrency = ConcurrencyConfig::default();
+        let explicit_tools = AgentsConfig {
+            allowed_tools: Some(vec!["Read".to_string(), "Bash".to_string()]),
+            ..AgentsConfig::default()
+        };
+        let resolved = resolve_runtime_settings(
+            &profile,
+            RuntimeKind::ClaudeCode,
+            Some(ExecutionPhase::Planning),
+            &explicit_tools,
+            &concurrency,
+        )
+        .expect("explicit tools should resolve");
+        assert_eq!(resolved.allowed_tools, explicit_tools.allowed_tools);
+
+        let full = AgentsConfig {
+            capability_profile: CapabilityProfile::Full,
+            ..AgentsConfig::default()
+        };
+        let resolved = resolve_runtime_settings(
+            &profile,
+            RuntimeKind::ClaudeCode,
+            Some(ExecutionPhase::Planning),
+            &full,
+            &concurrency,
+        )
+        .expect("explicit Full profile should resolve");
+        assert_eq!(resolved.permission_mode, AgentPermissionMode::Full);
+        assert!(resolved.allowed_tools.is_none());
     }
 
     #[test]
