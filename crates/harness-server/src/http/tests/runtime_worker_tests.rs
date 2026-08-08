@@ -128,6 +128,19 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         "configured-codex-model"
     );
     assert_eq!(
+        prompt_event.event["prompt_packet"]["resolved_runtime_settings"]["capability_profile"],
+        "standard"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["resolved_runtime_settings"]["permission_mode"],
+        "scoped"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["resolved_runtime_settings"]
+            ["tool_allowlist_enforcement"],
+        "not_enforced_by_harness"
+    );
+    assert_eq!(
         prompt_event.event["prompt_packet"]["required_structured_output"]["validation_commands"],
         "Validation commands run and their results."
     );
@@ -196,6 +209,21 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         prompt_artifact.artifact["schema"],
         "harness.runtime.prompt_packet.v3"
     );
+    let permission_artifact = output
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "agent_permission_profile")
+        .expect("runtime output should record the effective permission profile");
+    assert_eq!(
+        permission_artifact.artifact,
+        serde_json::json!({
+            "configured_capability_profile": "standard",
+            "permission_mode": "scoped",
+            "allowed_tools": ["Read", "Write", "Edit", "Bash"],
+            "tool_allowlist_enforcement": "not_enforced_by_harness",
+            "correction_only": false,
+        })
+    );
     let prompts = agent.prompts.lock().await;
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].contains("You are executing a Harness workflow runtime job."));
@@ -221,6 +249,19 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(
         agent.approval_policies.lock().await.as_slice(),
         &[Some("on-request".to_string())]
+    );
+    assert_eq!(
+        agent.permission_modes.lock().await.as_slice(),
+        &[harness_core::config::agents::AgentPermissionMode::Scoped]
+    );
+    assert_eq!(
+        agent.allowed_tools.lock().await.as_slice(),
+        &[Some(vec![
+            "Read".to_string(),
+            "Write".to_string(),
+            "Edit".to_string(),
+            "Bash".to_string(),
+        ])]
     );
     Ok(())
 }
@@ -334,6 +375,17 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         Some("never")
     ));
     assert_eq!(agent.allowed_tools.lock().await[1], Some(Vec::new()));
+    let permission_artifact = output
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "agent_permission_profile")
+        .expect("corrected output should record deny-all permissions");
+    assert_eq!(permission_artifact.artifact["permission_mode"], "scoped");
+    assert_eq!(
+        permission_artifact.artifact["allowed_tools"],
+        serde_json::json!([])
+    );
+    assert_eq!(permission_artifact.artifact["correction_only"], true);
     let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&runtime_job.id);
     let RuntimeTranscriptRead::Verified(record) =
         store.read_runtime_transcript(&artifact_ref).await?

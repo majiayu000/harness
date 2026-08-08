@@ -72,6 +72,8 @@ default_agent = "codex"
 # Optional: preferred routing order for complex/critical tasks.
 complexity_preferred_agents = ["codex"]
 sandbox_mode = "danger-full-access"
+# Claude enforces Standard by default. Use "full" only as an explicit unrestricted opt-up.
+capability_profile = "standard"
 
 [agents.claude]
 cli_path = "claude"

@@ -2,7 +2,7 @@ use super::helpers::{
     emit_runtime_notification, mark_turn_failed, process_stream_item, RuntimeUsageContext,
 };
 use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
-use harness_core::config::agents::SandboxMode;
+use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::error::HarnessError;
 use harness_core::run_id::RunIdentity;
@@ -69,6 +69,7 @@ pub(crate) struct TurnLifecycleOptions {
     pub timeout_secs: Option<u64>,
     pub stall_timeout_secs: Option<u64>,
     pub force_code_agent: bool,
+    pub permission_mode: AgentPermissionMode,
     pub allowed_tools: Option<Vec<String>>,
     pub env_vars: HashMap<String, String>,
     pub runtime_usage: Option<RuntimeUsageContext>,
@@ -247,6 +248,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             prompt,
             prompt_layers: None,
             project_root,
+            permission_mode: options.permission_mode,
             model: options.model.clone(),
             reasoning_effort: options.reasoning_effort.clone(),
             execution_phase: options.execution_phase,
@@ -263,6 +265,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         let req = AgentRequest {
             prompt,
             project_root,
+            permission_mode: options.permission_mode,
             model: options.model.clone(),
             reasoning_effort: options.reasoning_effort.clone(),
             execution_phase: options.execution_phase,

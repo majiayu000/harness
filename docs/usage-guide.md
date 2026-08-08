@@ -429,6 +429,26 @@ available at all times, including while a recheck is pending.
 | `complexity_preferred_agents` | `[]` | Optional ordered list for complex/critical routing (for example `["codex","claude"]`) |
 | `sandbox_mode` | `"danger-full-access"` | Sandbox policy: `read-only`, `read-only-with-network`, `workspace-write`, `danger-full-access` |
 | `approval_policy` | `"auto-edit"` | Approval policy for agent actions |
+| `capability_profile` | `"standard"` | Agent tool profile: `read-only`, `standard`, or explicit unrestricted opt-up `full`; Claude enforces the allowlist at its CLI boundary, while other backends retain their backend-specific sandbox/permission model |
+| `allowed_tools` | — | Optional explicit tool allowlist; overrides `capability_profile` and keeps the request scoped, including an empty deny-all list |
+
+When `capability_profile` is omitted, Harness emits a migration warning and
+uses the scoped `standard` profile. Set `full` explicitly only when unrestricted
+tool permissions are required.
+
+### `[isolation]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `default_tier` | `"host"` | Default isolation tier: `host` or `container`; `microvm` is reserved and rejected at startup |
+| `network_allowlist` | `[]` | Exact DNS hostnames allowed through Harness's first-party proxy; scoped mode with an empty list denies network access |
+| `rules` | `[]` | Trust-class routing overrides such as `non_collaborator` to `container` |
+
+The bundled proxy image defaults to `harness-egress-proxy:latest`; production
+deployments should set `HARNESS_AGENT_EGRESS_PROXY_IMAGE` to an immutable image
+digest. `HARNESS_AGENT_EGRESS_PROXY` is rejected. See the
+[container tier operator guide](container-tier-operator-guide.md) for build,
+canary, fail-closed, and Linux host behavior.
 
 ### `[agents.claude]`
 

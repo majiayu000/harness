@@ -252,6 +252,7 @@ fn review_fixture_with_constructor(
                 reasoning_effort: Some(review_config.reasoning_effort),
                 sandbox_mode: {request_sandbox},
                 approval_policy: {approval_policy},
+                permission_mode: Default::default(),
                 env_vars: Default::default(),
             }}).await
         }}

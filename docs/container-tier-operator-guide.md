@@ -5,7 +5,7 @@ tier. The container tier runs the agent CLI through Docker with only the task
 workspace mounted, no inherited operator secrets, and the scoped GitHub token
 mapped to `GITHUB_TOKEN` and `GH_TOKEN` inside the container.
 
-## Build The Agent Image
+## Build The Images
 
 Use the reference image in `docker/agent/Dockerfile`. The Dockerfile pins the
 Node base image by digest and pins the default Codex and Claude CLI packages.
@@ -39,6 +39,18 @@ HARNESS_AGENT_CONTAINER_IMAGE=ghcr.io/OWNER/harness-agent@sha256:... \
   scripts/verify-agent-container-image.sh
 ```
 
+Build and publish the bundled allowlist proxy separately. Its base image is
+digest-pinned, it runs as a non-root user, and it accepts exact DNS hostnames
+only. Use an immutable registry digest in production:
+
+```bash
+docker build -f docker/egress-proxy/Dockerfile \
+  -t ghcr.io/OWNER/harness-egress-proxy:2026-08-09 docker/egress-proxy
+docker push ghcr.io/OWNER/harness-egress-proxy:2026-08-09
+docker buildx imagetools inspect ghcr.io/OWNER/harness-egress-proxy:2026-08-09
+export HARNESS_AGENT_EGRESS_PROXY_IMAGE=ghcr.io/OWNER/harness-egress-proxy@sha256:...
+```
+
 ## Enable Container Routing
 
 Set an isolation rule for untrusted intake. Keep trusted work on `host` unless a
@@ -59,22 +71,27 @@ trust = "non_collaborator"
 tier = "container"
 ```
 
-Start the server with the pinned image in the environment:
+Start the server with both pinned images in the environment:
 
 ```bash
 export HARNESS_AGENT_CONTAINER_IMAGE=ghcr.io/OWNER/harness-agent@sha256:...
+export HARNESS_AGENT_EGRESS_PROXY_IMAGE=ghcr.io/OWNER/harness-egress-proxy@sha256:...
 harness --config harness.toml serve
 ```
 
-If container tasks need network access, set an explicit egress proxy:
+`network_allowlist` is an exact-host allowlist. Harness starts one bundled
+proxy container per agent and puts the agent on a unique internal Docker
+network. The proxy alone is also attached to Docker's bridge network. The
+agent therefore cannot bypass the proxy by ignoring `HTTP_PROXY`.
 
-```bash
-export HARNESS_AGENT_EGRESS_PROXY=http://127.0.0.1:8080
-```
+- Scoped mode with an empty allowlist has no network access.
+- Any non-empty allowlist uses the first-party proxy, including when the tool
+  capability profile is `full`.
+- Only explicit `capability_profile = "full"` with an empty allowlist keeps
+  unrestricted networking.
 
-Without `HARNESS_AGENT_EGRESS_PROXY`, Harness keeps the container network closed
-even when an allowlist is configured. The allowlist is still passed into the
-container as `HARNESS_AGENT_EGRESS_ALLOWLIST` for proxy-side enforcement.
+`HARNESS_AGENT_EGRESS_PROXY` is no longer accepted. Harness refuses that
+legacy external-proxy configuration because it cannot prove enforcement.
 
 ## Health And Refusal Behavior
 
@@ -82,6 +99,18 @@ On startup, Harness probes Docker. If a configured rule requires `container`
 and Docker is unavailable, health reports the `isolation` subsystem as degraded.
 Dispatch refuses matching untrusted intake instead of silently downgrading it to
 `host`.
+
+For allowlisted dispatches, Harness also waits for the proxy image healthcheck.
+Container dispatch starts with an in-container canary request to a deliberately
+non-allowlisted hostname and requires a `403` response before the agent command
+runs. A missing image, unhealthy proxy, failed canary, or missing proxy route is
+a spawn error; Harness never falls back to open networking.
+
+On macOS host isolation, scoped allowlisted agents are restricted by Seatbelt to
+the proxy's loopback port. On Linux host isolation, deny-all networking is
+supported, but proxy-only host networking is rejected because Landlock and
+bubblewrap cannot express that boundary safely. Use the container tier for
+Linux tasks that need allowlisted network access.
 
 Check health before enabling the rule broadly:
 

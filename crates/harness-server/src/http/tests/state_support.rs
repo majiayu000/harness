@@ -21,6 +21,7 @@ pub(super) struct RuntimeStreamAgent {
     pub(super) reasoning_efforts: Mutex<Vec<Option<String>>>,
     pub(super) sandbox_modes: Mutex<Vec<Option<SandboxMode>>>,
     pub(super) approval_policies: Mutex<Vec<Option<String>>>,
+    pub(super) permission_modes: Mutex<Vec<harness_core::config::agents::AgentPermissionMode>>,
     pub(super) allowed_tools: Mutex<Vec<Option<Vec<String>>>>,
 }
 
@@ -43,6 +44,7 @@ impl RuntimeStreamAgent {
             reasoning_efforts: Mutex::new(Vec::new()),
             sandbox_modes: Mutex::new(Vec::new()),
             approval_policies: Mutex::new(Vec::new()),
+            permission_modes: Mutex::new(Vec::new()),
             allowed_tools: Mutex::new(Vec::new()),
         })
     }
@@ -146,6 +148,7 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
+        self.permission_modes.lock().await.push(req.permission_mode);
         self.allowed_tools
             .lock()
             .await
@@ -170,6 +173,7 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
+        self.permission_modes.lock().await.push(req.permission_mode);
         self.allowed_tools
             .lock()
             .await

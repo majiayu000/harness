@@ -399,6 +399,13 @@ project_root = "."
 default_agent = "auto"
 # complexity_preferred_agents = ["codex", "claude"]
 sandbox_mode = "danger-full-access"
+# Claude enforces Standard tools. Set "full" only for an explicit unrestricted opt-up.
+capability_profile = "standard"
+
+[isolation]
+default_tier = "host"
+# Exact hosts only. Scoped mode with an empty list denies agent networking.
+network_allowlist = ["github.com", "api.github.com", "api.openai.com"]
 
 [agents.claude]
 cli_path = "claude"

@@ -40,6 +40,9 @@ use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 #[path = "executor/runtime_timeout.rs"]
 mod runtime_timeout;
 use runtime_timeout::runtime_profile_with_timeout_fallback;
+#[path = "executor/permission_profile.rs"]
+mod permission_profile;
+use permission_profile::RuntimePermissionProfile;
 #[path = "executor/structured_output.rs"]
 mod structured_output;
 use structured_output::{
@@ -203,6 +206,12 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     });
                 let mut env_vars = isolation_spawn_env_vars(&job);
                 let correction_only = attempt > 0 && correction_retry.is_some();
+                let permission_profile = RuntimePermissionProfile::resolve(
+                    resolved_settings.permission_mode,
+                    resolved_settings.allowed_tools.clone(),
+                    resolved_settings.tool_allowlist_enforcement,
+                    correction_only,
+                );
                 if correction_only { env_vars.retain(|key, _| key == AGENT_ISOLATION_TIER_ENV); }
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
@@ -239,7 +248,8 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         stall_timeout_secs: Some(resolved_settings.stall_timeout_secs),
                         lease_lost: Some(self.lease_lost.subscribe()),
                         env_vars,
-                        allowed_tools: correction_only.then(Vec::new),
+                        permission_mode: permission_profile.permission_mode,
+                        allowed_tools: permission_profile.allowed_tools.clone(),
                         force_code_agent: force_code_agent || correction_only,
                         runtime_usage: runtime_usage_context(
                             self.state,
@@ -320,7 +330,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         result,
                         transcript_turn.as_ref().unwrap_or(&turn),
                     )?
-                    .with_artifact(repo_memory_config_artifact(memory_enabled));
+                    .with_artifact(repo_memory_config_artifact(memory_enabled))
+                    .with_artifact(
+                        permission_profile.artifact(resolved_settings.capability_profile),
+                    );
                 let result = if let Some(degradation) = repo_memory.degradation.clone() {
                     result.with_artifact(degradation)
                 } else {

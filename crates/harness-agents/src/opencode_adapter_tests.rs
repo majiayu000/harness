@@ -137,6 +137,7 @@ fn test_turn_request() -> TurnRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp"),
+        permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
         execution_phase: None,

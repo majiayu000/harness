@@ -114,8 +114,8 @@ impl ClaudeCodeAgent {
         }
 
         // Hard tool enforcement at the CLI boundary (issue #514):
-        //   Full profile  (allowed_tools = None)    → --dangerously-skip-permissions
-        //   Restricted profile (allowed_tools set)  → --permission-mode bypassPermissions
+        //   Explicit Full mode without an allowlist → --dangerously-skip-permissions
+        //   Scoped mode or an explicit allowlist    → --permission-mode bypassPermissions
         //                                              --allowedTools <comma-list>
         //
         // --allowedTools and --dangerously-skip-permissions are mutually exclusive
@@ -135,7 +135,7 @@ impl ClaudeCodeAgent {
             base_args.push(OsString::from("--permission-mode"));
             base_args.push(OsString::from("bypassPermissions"));
             base_args.push(OsString::from("--allowedTools"));
-            let tools = req.allowed_tools.as_deref().unwrap_or(&[]);
+            let tools = req.scoped_allowed_tools();
             base_args.push(OsString::from(tools.join(",")));
         }
 
@@ -198,6 +198,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                permission_mode: req.permission_mode,
                 forward_stdin: false,
             })?;
 
@@ -313,6 +314,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                permission_mode: req.permission_mode,
                 forward_stdin: false,
             })?;
 
@@ -476,6 +478,10 @@ mod tests;
 #[cfg(test)]
 #[path = "claude_prompt_layer_tests.rs"]
 mod prompt_layer_tests;
+
+#[cfg(test)]
+#[path = "claude_permission_tests.rs"]
+mod permission_tests;
 
 #[cfg(test)]
 mod compatibility_tests {

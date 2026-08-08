@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use harness_core::agent::{
     AgentRequest, AgentResponse, CodeAgent, StreamItem, AGENT_OUTPUT_SCHEMA_PATH_ENV,
 };
-use harness_core::config::agents::SandboxMode;
+use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig};
 use harness_core::types::Capability;
 use harness_sandbox::SandboxSpec;
@@ -60,6 +60,7 @@ pub struct CodexReviewRequest {
     pub reasoning_effort: Option<String>,
     pub sandbox_mode: SandboxMode,
     pub approval_policy: Option<String>,
+    pub permission_mode: AgentPermissionMode,
     pub env_vars: HashMap<String, String>,
 }
 
@@ -232,6 +233,7 @@ impl CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                permission_mode: req.permission_mode,
                 forward_stdin: review_uses_stdin_prompt(req),
             })?;
         Ok((prepared_spawn, run_identity))
@@ -457,6 +459,7 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                permission_mode: req.permission_mode,
                 forward_stdin: false,
             })?;
 
@@ -568,6 +571,7 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                permission_mode: req.permission_mode,
                 forward_stdin: false,
             })?;
 
