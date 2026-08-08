@@ -83,14 +83,14 @@ def resolve_public_endpoints(host, port, allow_rfc2544_dns=False):
         raise ProxyRefusal(502, "allowlisted target did not resolve") from error
     endpoints = []
     seen = set()
-    for _family, _kind, _protocol, _canonical, address in answers:
+    for family, kind, protocol, _canonical, address in answers:
         ip = ipaddress.ip_address(address[0])
         if not ip.is_global and not (allow_rfc2544_dns and ip in RFC2544_SYNTHETIC_DNS):
             raise ProxyRefusal(403, "allowlisted target resolved to a non-global address")
         key = (str(ip), address[1])
         if key not in seen:
             seen.add(key)
-            endpoints.append(address)
+            endpoints.append((family, kind, protocol, address))
     if not endpoints:
         raise ProxyRefusal(502, "allowlisted target had no usable address")
     return endpoints
@@ -98,10 +98,16 @@ def resolve_public_endpoints(host, port, allow_rfc2544_dns=False):
 
 def connect_upstream(host, port, allow_rfc2544_dns=False):
     errors = []
-    for endpoint in resolve_public_endpoints(host, port, allow_rfc2544_dns):
+    for family, kind, protocol, address in resolve_public_endpoints(
+        host, port, allow_rfc2544_dns
+    ):
+        upstream = socket.socket(family, kind, protocol)
+        upstream.settimeout(IO_TIMEOUT_SECONDS)
         try:
-            return socket.create_connection(endpoint, timeout=IO_TIMEOUT_SECONDS)
+            upstream.connect(address)
+            return upstream
         except OSError as error:
+            upstream.close()
             errors.append(error)
     raise ProxyRefusal(502, "allowlisted target was unreachable") from errors[-1]
 
@@ -260,7 +266,13 @@ def run_canary(host, port):
     ).encode("ascii")
     with socket.create_connection((host, port), timeout=IO_TIMEOUT_SECONDS) as connection:
         connection.sendall(request)
-        response = connection.recv(4096)
+        response = bytearray()
+        expected = b"HTTP/1.1 403 Forbidden\r\n"
+        while len(response) < len(expected):
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
     return response.startswith(b"HTTP/1.1 403 Forbidden\r\n")
 
 

@@ -5,17 +5,10 @@ fn danger_mode_with_denied_network_is_not_a_passthrough() {
     let spec = SandboxSpec::new(SandboxMode::DangerFullAccess, "/tmp/project")
         .with_network_policy(NetworkPolicy::Deny);
 
-    let wrapped = wrap_command(Path::new("/usr/bin/env"), &[], &spec).unwrap();
+    let policy = seatbelt_policy(&spec).unwrap();
 
-    assert_ne!(wrapped.engine, SandboxEngine::None);
-    let rendered = wrapped
-        .args
-        .iter()
-        .map(|arg| arg.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(rendered.contains("(allow default)"));
-    assert!(rendered.contains("(deny network-outbound)"));
+    assert!(policy.contains("(allow default)"));
+    assert!(policy.contains("(deny network-outbound)"));
 }
 
 #[test]

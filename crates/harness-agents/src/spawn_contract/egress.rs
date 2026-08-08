@@ -226,7 +226,7 @@ fn start_proxy_container(
 }
 
 fn docker_runtime_name() -> Result<String, HarnessError> {
-    let output = run_docker(&["info", "--format", "{{.Name}}"])?;
+    let output = run_docker(&["info", "--format", "{{.OperatingSystem}}"])?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
@@ -278,17 +278,31 @@ fn verify_proxy_canary(port: u16) -> Result<(), HarnessError> {
             b"GET http://harness-egress-canary.invalid/ HTTP/1.1\r\nHost: harness-egress-canary.invalid\r\nConnection: close\r\n\r\n",
         )
         .map_err(|error| agent_error(format!("egress proxy canary write failed: {error}")))?;
-    let mut response = [0_u8; 128];
-    let size = stream
-        .read(&mut response)
-        .map_err(|error| agent_error(format!("egress proxy canary read failed: {error}")))?;
-    if response[..size].starts_with(b"HTTP/1.1 403 Forbidden\r\n") {
+    let response = read_canary_response(&mut stream)?;
+    if response.starts_with(b"HTTP/1.1 403 Forbidden\r\n") {
         Ok(())
     } else {
         Err(agent_error(
             "egress proxy canary did not return the required 403 refusal",
         ))
     }
+}
+
+fn read_canary_response(reader: &mut impl Read) -> Result<Vec<u8>, HarnessError> {
+    let mut response = vec![0_u8; 128];
+    let mut total_read = 0;
+    let expected = b"HTTP/1.1 403 Forbidden\r\n";
+    while total_read < expected.len() {
+        let size = reader
+            .read(&mut response[total_read..])
+            .map_err(|error| agent_error(format!("egress proxy canary read failed: {error}")))?;
+        if size == 0 {
+            break;
+        }
+        total_read += size;
+    }
+    response.truncate(total_read);
+    Ok(response)
 }
 
 fn run_docker(args: &[&str]) -> Result<Output, HarnessError> {
@@ -350,4 +364,40 @@ fn unique_suffix() -> String {
 
 fn agent_error(message: impl Into<String>) -> HarnessError {
     HarnessError::AgentExecution(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_canary_response;
+    use std::io::{self, Read};
+
+    struct ChunkedReader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+        chunk_size: usize,
+    }
+
+    impl Read for ChunkedReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let remaining = &self.bytes[self.offset..];
+            let size = remaining.len().min(buffer.len()).min(self.chunk_size);
+            buffer[..size].copy_from_slice(&remaining[..size]);
+            self.offset += size;
+            Ok(size)
+        }
+    }
+
+    #[test]
+    fn canary_reader_collects_a_fragmented_status_line() -> Result<(), Box<dyn std::error::Error>> {
+        let mut reader = ChunkedReader {
+            bytes: b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            offset: 0,
+            chunk_size: 3,
+        };
+
+        let response = read_canary_response(&mut reader)?;
+
+        assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+        Ok(())
+    }
 }

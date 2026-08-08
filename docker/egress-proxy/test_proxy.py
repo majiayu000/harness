@@ -88,7 +88,31 @@ class AllowlistTests(unittest.TestCase):
             endpoints = proxy.resolve_public_endpoints(
                 "example.com", 443, allow_rfc2544_dns=True
             )
-        self.assertEqual(endpoints, [("198.18.0.11", 443)])
+        self.assertEqual(
+            endpoints,
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, ("198.18.0.11", 443))],
+        )
+
+    def test_connect_uses_the_resolved_ipv6_socket_family_and_address(self):
+        endpoint = ("2001:4860:4860::8888", 443, 0, 0)
+        fake_socket = mock.Mock()
+        with mock.patch.object(
+            proxy,
+            "resolve_public_endpoints",
+            return_value=[(socket.AF_INET6, socket.SOCK_STREAM, 6, endpoint)],
+        ), mock.patch("socket.socket", return_value=fake_socket) as socket_factory:
+            connected = proxy.connect_upstream("example.com", 443)
+
+        self.assertIs(connected, fake_socket)
+        socket_factory.assert_called_once_with(socket.AF_INET6, socket.SOCK_STREAM, 6)
+        fake_socket.connect.assert_called_once_with(endpoint)
+
+    def test_canary_accepts_a_fragmented_status_line(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.side_effect = [b"HTTP/1.1 403", b" Forbidden\r\n"]
+        with mock.patch("socket.create_connection", return_value=connection):
+            self.assertTrue(proxy.run_canary("127.0.0.1", 8080))
 
 
 class ProxyIntegrationTests(unittest.TestCase):
@@ -110,7 +134,11 @@ class ProxyIntegrationTests(unittest.TestCase):
         upstream = OneShotTcpServer(("127.0.0.1", 0), EchoHandler)
         endpoint = upstream.server_address
         with running_server(upstream), running_server(self.proxy_server()) as server:
-            with mock.patch.object(proxy, "resolve_public_endpoints", return_value=[endpoint]):
+            with mock.patch.object(
+                proxy,
+                "resolve_public_endpoints",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, endpoint)],
+            ):
                 with socket.create_connection(server.server_address, timeout=2) as client:
                     client.sendall(
                         b"CONNECT example.com:443 HTTP/1.1\r\n"
@@ -124,7 +152,11 @@ class ProxyIntegrationTests(unittest.TestCase):
         upstream = OneShotTcpServer(("127.0.0.1", 0), RecordingHandler)
         endpoint = upstream.server_address
         with running_server(upstream), running_server(self.proxy_server()) as server:
-            with mock.patch.object(proxy, "resolve_public_endpoints", return_value=[endpoint]):
+            with mock.patch.object(
+                proxy,
+                "resolve_public_endpoints",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, endpoint)],
+            ):
                 response = request_proxy(
                     server,
                     b"GET http://example.com/api?q=1 HTTP/1.1\r\n"

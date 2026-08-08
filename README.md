@@ -403,8 +403,9 @@ sandbox_mode = "danger-full-access"
 capability_profile = "standard"
 
 [isolation]
-default_tier = "host"
+default_tier = "container"
 # Exact hosts only. Scoped mode with an empty list denies agent networking.
+# Linux allowlisted tasks require the container tier; macOS also supports host.
 network_allowlist = ["github.com", "api.github.com", "api.openai.com"]
 
 [agents.claude]

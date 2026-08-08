@@ -124,8 +124,17 @@ fn permission_env_value(tools: &[String]) -> String {
         return r#"{"*":"deny"}"#.to_string();
     }
     let mut map = serde_json::Map::new();
+    map.insert("*".to_string(), Value::String("deny".to_string()));
     for tool in tools {
-        map.insert(tool.clone(), Value::String("allow".to_string()));
+        let permission = match tool.as_str() {
+            "Read" => "read",
+            "Write" | "Edit" => "edit",
+            "Bash" => "bash",
+            "Grep" => "grep",
+            "Glob" => "glob",
+            custom => custom,
+        };
+        map.insert(permission.to_string(), Value::String("allow".to_string()));
     }
     serde_json::Value::Object(map).to_string()
 }
@@ -627,11 +636,22 @@ mod tests {
     }
 
     #[test]
-    fn permission_env_mapping() {
+    fn permission_env_mapping() -> Result<(), serde_json::Error> {
         assert_eq!(
-            permission_env_value(&["bash".to_string(), "edit".to_string()]),
-            r#"{"bash":"allow","edit":"allow"}"#
+            serde_json::from_str::<Value>(&permission_env_value(&[
+                "Read".to_string(),
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Bash".to_string(),
+            ]))?,
+            serde_json::json!({
+                "*": "deny",
+                "read": "allow",
+                "edit": "allow",
+                "bash": "allow",
+            })
         );
         assert_eq!(permission_env_value(&[]), r#"{"*":"deny"}"#);
+        Ok(())
     }
 }
