@@ -208,6 +208,28 @@ fn explicit_full_agent_request_is_unrestricted_only_without_an_allowlist() {
 }
 
 #[test]
+fn egress_mode_is_fail_closed_and_allowlist_driven() {
+    use crate::agent::AgentEgressMode;
+    use crate::config::agents::AgentPermissionMode;
+
+    assert_eq!(
+        AgentEgressMode::resolve(AgentPermissionMode::Scoped, &[]),
+        AgentEgressMode::DenyAll
+    );
+    assert_eq!(
+        AgentEgressMode::resolve(AgentPermissionMode::Full, &[]),
+        AgentEgressMode::Unrestricted
+    );
+    let allowlist = vec!["api.openai.com".to_string()];
+    for permission_mode in [AgentPermissionMode::Scoped, AgentPermissionMode::Full] {
+        assert_eq!(
+            AgentEgressMode::resolve(permission_mode, &allowlist),
+            AgentEgressMode::FirstPartyProxy
+        );
+    }
+}
+
+#[test]
 fn configured_policy_overrides_direct_request_permissions_and_isolation() {
     let mut config = crate::config::HarnessConfig::default();
     config.agents.capability_profile = crate::config::agents::CapabilityProfile::Full;

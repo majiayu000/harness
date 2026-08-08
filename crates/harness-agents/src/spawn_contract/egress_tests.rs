@@ -1,7 +1,7 @@
-use super::egress::{EgressPolicy, EgressProxyRoute};
+use super::egress::EgressProxyRoute;
 use super::{prepare_agent_spawn, AgentSpawnInput};
 use anyhow::Context;
-use harness_core::agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
+use harness_core::agent::{AgentEgressMode, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
 use harness_core::config::agents::AgentPermissionMode;
 use harness_core::config::agents::SandboxMode;
 use harness_core::config::isolation::IsolationTier;
@@ -14,16 +14,16 @@ use std::process::Command;
 #[test]
 fn scoped_without_allowlist_denies_network() {
     assert_eq!(
-        EgressPolicy::resolve(AgentPermissionMode::Scoped, &[]),
-        EgressPolicy::Deny
+        AgentEgressMode::resolve(AgentPermissionMode::Scoped, &[]),
+        AgentEgressMode::DenyAll
     );
 }
 
 #[test]
 fn explicit_full_without_allowlist_is_unrestricted() {
     assert_eq!(
-        EgressPolicy::resolve(AgentPermissionMode::Full, &[]),
-        EgressPolicy::Unrestricted
+        AgentEgressMode::resolve(AgentPermissionMode::Full, &[]),
+        AgentEgressMode::Unrestricted
     );
 }
 
@@ -31,12 +31,12 @@ fn explicit_full_without_allowlist_is_unrestricted() {
 fn allowlist_always_requires_the_first_party_proxy() {
     let allowlist = ["github.com".to_string()];
     assert_eq!(
-        EgressPolicy::resolve(AgentPermissionMode::Scoped, &allowlist),
-        EgressPolicy::Proxy
+        AgentEgressMode::resolve(AgentPermissionMode::Scoped, &allowlist),
+        AgentEgressMode::FirstPartyProxy
     );
     assert_eq!(
-        EgressPolicy::resolve(AgentPermissionMode::Full, &allowlist),
-        EgressPolicy::Proxy
+        AgentEgressMode::resolve(AgentPermissionMode::Full, &allowlist),
+        AgentEgressMode::FirstPartyProxy
     );
 }
 

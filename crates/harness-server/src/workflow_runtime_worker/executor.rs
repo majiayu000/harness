@@ -37,6 +37,9 @@ use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 #[path = "executor/runtime_timeout.rs"]
 mod runtime_timeout;
 use runtime_timeout::runtime_profile_with_timeout_fallback;
+#[path = "executor/egress_evidence.rs"]
+mod egress_evidence;
+use egress_evidence::AgentEgressEvidence;
 #[path = "executor/permission_profile.rs"]
 mod permission_profile;
 use permission_profile::RuntimePermissionProfile;
@@ -216,6 +219,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     resolved_settings.tool_allowlist_enforcement,
                     correction_only,
                 );
+                let egress_evidence = AgentEgressEvidence::from_spawn_env(
+                    permission_profile.permission_mode,
+                    &env_vars,
+                );
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
                         AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
@@ -336,7 +343,8 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     .with_artifact(repo_memory_config_artifact(memory_enabled))
                     .with_artifact(
                         permission_profile.artifact(resolved_settings.capability_profile),
-                    );
+                    )
+                    .with_artifact(egress_evidence.artifact(turn.status, &turn.items));
                 let result = if let Some(degradation) = repo_memory.degradation.clone() {
                     result.with_artifact(degradation)
                 } else {

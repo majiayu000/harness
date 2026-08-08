@@ -14,6 +14,26 @@ pub const AGENT_OUTPUT_SCHEMA_PATH_ENV: &str = "HARNESS_AGENT_OUTPUT_SCHEMA_PATH
 pub const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
 pub const AGENT_EGRESS_PROXY_IMAGE_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY_IMAGE";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEgressMode {
+    DenyAll,
+    FirstPartyProxy,
+    Unrestricted,
+}
+
+impl AgentEgressMode {
+    pub fn resolve(permission_mode: AgentPermissionMode, allowlist: &[String]) -> Self {
+        if !allowlist.is_empty() {
+            Self::FirstPartyProxy
+        } else if permission_mode == AgentPermissionMode::Full {
+            Self::Unrestricted
+        } else {
+            Self::DenyAll
+        }
+    }
+}
+
 /// Core trait for all code agents (Claude Code, Codex, Anthropic API, etc.)
 #[async_trait]
 pub trait CodeAgent: Send + Sync {

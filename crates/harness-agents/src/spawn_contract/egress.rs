@@ -1,5 +1,4 @@
 use harness_core::agent::AGENT_EGRESS_PROXY_IMAGE_ENV;
-use harness_core::config::agents::AgentPermissionMode;
 use harness_core::config::isolation::IsolationTier;
 use harness_core::error::HarnessError;
 use std::collections::{BTreeMap, HashMap};
@@ -55,25 +54,6 @@ exec "$@""#;
     args
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum EgressPolicy {
-    Unrestricted,
-    Deny,
-    Proxy,
-}
-
-impl EgressPolicy {
-    pub(super) fn resolve(permission_mode: AgentPermissionMode, allowlist: &[String]) -> Self {
-        if !allowlist.is_empty() {
-            Self::Proxy
-        } else if permission_mode == AgentPermissionMode::Full {
-            Self::Unrestricted
-        } else {
-            Self::Deny
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressProxyRoute {
     proxy_url: String,
@@ -118,6 +98,12 @@ impl EgressProxyRoute {
 #[derive(Debug)]
 pub(crate) struct EgressProxyLease {
     route: EgressProxyRoute,
+    container_name: String,
+    network_name: Option<String>,
+}
+
+#[derive(Debug)]
+struct EgressCleanupRequest {
     container_name: String,
     network_name: Option<String>,
 }
@@ -215,10 +201,31 @@ impl EgressProxyLease {
 
 impl Drop for EgressProxyLease {
     fn drop(&mut self) {
-        cleanup_container(&self.container_name);
-        if let Some(network_name) = &self.network_name {
-            cleanup_network(network_name);
-        }
+        schedule_cleanup(EgressCleanupRequest {
+            container_name: std::mem::take(&mut self.container_name),
+            network_name: self.network_name.take(),
+        });
+    }
+}
+
+fn schedule_cleanup(request: EgressCleanupRequest) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn_blocking(move || cleanup_resources(request));
+    } else {
+        // Synchronous callers have no async worker to protect, and completing
+        // cleanup here prevents short-lived CLI processes from leaking Docker
+        // resources during process exit.
+        cleanup_resources(request);
+    }
+}
+
+fn cleanup_resources(request: EgressCleanupRequest) {
+    if request.container_name.is_empty() {
+        return;
+    }
+    cleanup_container(&request.container_name);
+    if let Some(network_name) = request.network_name {
+        cleanup_network(&network_name);
     }
 }
 

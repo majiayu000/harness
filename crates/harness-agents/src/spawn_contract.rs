@@ -1,4 +1,4 @@
-use harness_core::agent::AGENT_EGRESS_PROXY_IMAGE_ENV;
+use harness_core::agent::{AgentEgressMode, AGENT_EGRESS_PROXY_IMAGE_ENV};
 #[cfg(test)]
 use harness_core::agent::{
     AGENT_CONTAINER_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV,
@@ -19,8 +19,8 @@ mod output_schema;
 mod review_git;
 mod spawn_env;
 use egress::{
-    apply_proxy_env, container_canary_command, proxy_env_keys, EgressPolicy, EgressProxyLease,
-    EgressProxyRoute, LEGACY_EGRESS_PROXY_ENV,
+    apply_proxy_env, container_canary_command, proxy_env_keys, EgressProxyLease, EgressProxyRoute,
+    LEGACY_EGRESS_PROXY_ENV,
 };
 use spawn_env::{
     container_env_vars, container_image, docker_process_env, host_process_env, isolation_tier,
@@ -89,11 +89,11 @@ impl AgentSpawnContract for HostSpawn {
         egress_route: Option<&EgressProxyRoute>,
     ) -> Result<PreparedAgentSpawn, HarnessError> {
         let allowlist = network_allowlist(input.env_vars);
-        let egress_policy = EgressPolicy::resolve(input.permission_mode, &allowlist);
+        let egress_policy = AgentEgressMode::resolve(input.permission_mode, &allowlist);
         let network_policy = match egress_policy {
-            EgressPolicy::Unrestricted => NetworkPolicy::InheritSandboxMode,
-            EgressPolicy::Deny => NetworkPolicy::Deny,
-            EgressPolicy::Proxy => NetworkPolicy::LocalProxy {
+            AgentEgressMode::Unrestricted => NetworkPolicy::InheritSandboxMode,
+            AgentEgressMode::DenyAll => NetworkPolicy::Deny,
+            AgentEgressMode::FirstPartyProxy => NetworkPolicy::LocalProxy {
                 port: egress_route
                     .and_then(EgressProxyRoute::local_proxy_port)
                     .ok_or_else(|| missing_proxy_route(IsolationTier::Host))?,
@@ -142,7 +142,7 @@ impl AgentSpawnContract for ContainerSpawn {
         }
 
         let allowlist = network_allowlist(input.env_vars);
-        let egress_policy = EgressPolicy::resolve(input.permission_mode, &allowlist);
+        let egress_policy = AgentEgressMode::resolve(input.permission_mode, &allowlist);
         let image = container_image(input.env_vars);
         let review_layout = review_git_safe_workspace(input.env_vars)
             .then(|| review_git::plan(&project_root))
@@ -193,9 +193,9 @@ impl AgentSpawnContract for ContainerSpawn {
         }
         args.push(OsString::from("--network"));
         args.push(OsString::from(match egress_policy {
-            EgressPolicy::Unrestricted => "bridge",
-            EgressPolicy::Deny => "none",
-            EgressPolicy::Proxy => egress_route
+            AgentEgressMode::Unrestricted => "bridge",
+            AgentEgressMode::DenyAll => "none",
+            AgentEgressMode::FirstPartyProxy => egress_route
                 .and_then(EgressProxyRoute::container_network)
                 .ok_or_else(|| missing_proxy_route(IsolationTier::Container))?,
         }));
@@ -279,8 +279,8 @@ pub(crate) async fn prepare_agent_spawn(
         ));
     }
     let allowlist = network_allowlist(input.env_vars);
-    let egress_policy = EgressPolicy::resolve(input.permission_mode, &allowlist);
-    let lease = if egress_policy == EgressPolicy::Proxy {
+    let egress_policy = AgentEgressMode::resolve(input.permission_mode, &allowlist);
+    let lease = if egress_policy == AgentEgressMode::FirstPartyProxy {
         let env_vars = input.env_vars.clone();
         let lease = tokio::task::spawn_blocking(move || {
             EgressProxyLease::start(tier, &allowlist, &env_vars)
