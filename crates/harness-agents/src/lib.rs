@@ -9,6 +9,7 @@ pub mod codex_adapter;
 pub mod compress_model;
 pub mod opencode;
 pub mod opencode_adapter;
+mod output_capture;
 pub mod provider_backpressure;
 pub mod registry;
 pub mod runtime_fingerprint;
@@ -21,6 +22,7 @@ use harness_core::run_id::RunIdentity;
 #[cfg(test)]
 use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
 use harness_core::run_registry::{append_binding_nonblocking, BindingRecord};
+use output_capture::TailBuffer;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -380,39 +382,6 @@ pub(crate) struct BoundedOutput {
     pub(crate) stderr: Vec<u8>,
 }
 
-/// Fixed-capacity byte buffer that keeps the most recent bytes pushed into it.
-struct TailBuffer {
-    data: Vec<u8>,
-    cap: usize,
-    truncated: bool,
-}
-
-impl TailBuffer {
-    fn new(cap: usize) -> Self {
-        Self {
-            data: Vec::new(),
-            cap,
-            truncated: false,
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) {
-        if chunk.len() >= self.cap {
-            self.truncated = self.truncated || !self.data.is_empty() || chunk.len() > self.cap;
-            self.data.clear();
-            self.data
-                .extend_from_slice(&chunk[chunk.len() - self.cap..]);
-            return;
-        }
-        let overflow = (self.data.len() + chunk.len()).saturating_sub(self.cap);
-        if overflow > 0 {
-            self.data.drain(..overflow);
-            self.truncated = true;
-        }
-        self.data.extend_from_slice(chunk);
-    }
-}
-
 enum PipeRead {
     Stdout(std::io::Result<usize>),
     Stderr(std::io::Result<usize>),
@@ -620,22 +589,6 @@ mod managed_child_tests {
             cmd.spawn().expect("spawn shell child"),
             "managed child test",
         )
-    }
-
-    #[test]
-    fn tail_buffer_keeps_only_most_recent_bytes() {
-        let mut buf = TailBuffer::new(4);
-        buf.push(b"ab");
-        assert_eq!(buf.data, b"ab");
-        assert!(!buf.truncated);
-        buf.push(b"cdef");
-        assert_eq!(buf.data, b"cdef");
-        assert!(buf.truncated);
-
-        let mut big = TailBuffer::new(4);
-        big.push(b"0123456789");
-        assert_eq!(big.data, b"6789");
-        assert!(big.truncated);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
