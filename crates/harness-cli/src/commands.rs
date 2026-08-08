@@ -367,8 +367,8 @@ fn configured_skill_store(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfigSource {
-    Flag(PathBuf),
-    Discovered(PathBuf),
+    Flag(PathBuf, bool),
+    Discovered(PathBuf, bool),
     BuiltInDefaults,
 }
 
@@ -376,8 +376,15 @@ impl ConfigSource {
     /// Path of the loaded config file, if any (built-in defaults have none).
     fn config_path(&self) -> Option<&Path> {
         match self {
-            ConfigSource::Flag(path) | ConfigSource::Discovered(path) => Some(path.as_path()),
+            ConfigSource::Flag(path, _) | ConfigSource::Discovered(path, _) => Some(path.as_path()),
             ConfigSource::BuiltInDefaults => None,
+        }
+    }
+
+    fn capability_profile_defaulted(&self) -> bool {
+        match self {
+            ConfigSource::Flag(_, defaulted) | ConfigSource::Discovered(_, defaulted) => *defaulted,
+            ConfigSource::BuiltInDefaults => true,
         }
     }
 }
@@ -442,25 +449,41 @@ fn load_config(
     if let Some(config_path) = config_path {
         let content = fs::read_to_string(config_path)?;
         let mut config: harness_core::config::HarnessConfig = toml::from_str(&content)?;
+        let capability_profile_defaulted = capability_profile_defaulted(&content)?;
         if let Some(dir) = config_path.parent() {
             config.rebase_relative_paths(dir);
         }
-        return Ok((config, ConfigSource::Flag(config_path.to_path_buf())));
+        return Ok((
+            config,
+            ConfigSource::Flag(config_path.to_path_buf(), capability_profile_defaulted),
+        ));
     }
 
     if let Some(discovered) = harness_core::config::dirs::find_config_file() {
         let content = fs::read_to_string(&discovered)?;
         let mut config: harness_core::config::HarnessConfig = toml::from_str(&content)?;
+        let capability_profile_defaulted = capability_profile_defaulted(&content)?;
         if let Some(dir) = discovered.parent() {
             config.rebase_relative_paths(dir);
         }
-        return Ok((config, ConfigSource::Discovered(discovered)));
+        return Ok((
+            config,
+            ConfigSource::Discovered(discovered, capability_profile_defaulted),
+        ));
     }
 
     Ok((
         harness_core::config::HarnessConfig::default(),
         ConfigSource::BuiltInDefaults,
     ))
+}
+
+fn capability_profile_defaulted(content: &str) -> anyhow::Result<bool> {
+    let document: toml::Value = toml::from_str(content)?;
+    Ok(document
+        .get("agents")
+        .and_then(|agents| agents.get("capability_profile"))
+        .is_none())
 }
 
 fn init_tracing(bootstrap: &LoggingBootstrap) -> anyhow::Result<()> {
@@ -481,10 +504,10 @@ fn init_tracing(bootstrap: &LoggingBootstrap) -> anyhow::Result<()> {
 
 fn log_config_source(source: &ConfigSource) {
     match source {
-        ConfigSource::Flag(path) => {
+        ConfigSource::Flag(path, _) => {
             tracing::info!("config loaded from --config flag: {}", path.display());
         }
-        ConfigSource::Discovered(path) => {
+        ConfigSource::Discovered(path, _) => {
             tracing::info!("config loaded from {}", path.display());
         }
         ConfigSource::BuiltInDefaults => {
@@ -747,6 +770,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let logging = prepare_logging(&cli.command, &config);
     init_tracing(&logging)?;
     log_config_source(&config_source);
+    if config_source.capability_profile_defaulted() {
+        tracing::warn!(
+            effective_capability_profile = "standard",
+            permission_mode = "scoped",
+            "agents.capability_profile is not configured; the scoped standard default is active; set capability_profile = \"full\" only for an explicit unrestricted opt-up"
+        );
+    }
     log_runtime_log_status(&logging);
 
     // Register the central base WORKFLOW.md (sibling of the loaded config file,
@@ -1049,6 +1079,18 @@ mod tests {
         ExecSandboxMode,
     };
     use std::path::Path;
+
+    #[test]
+    fn capability_profile_migration_warning_only_applies_when_field_is_absent() -> anyhow::Result<()>
+    {
+        assert!(capability_profile_defaulted(
+            "[agents]\ndefault_agent = \"auto\"\n"
+        )?);
+        assert!(!capability_profile_defaulted(
+            "[agents]\ncapability_profile = \"full\"\n"
+        )?);
+        Ok(())
+    }
 
     #[test]
     fn sandbox_mode_parse_accepts_supported_values() {

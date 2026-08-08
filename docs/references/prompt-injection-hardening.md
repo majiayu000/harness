@@ -92,27 +92,27 @@ tool boundary on unsupported backends. This closes Claude's implicit
 guarantee for other runtimes. Per-activity profiles remain a possible future
 refinement.
 
-### G3 — Egress control is delegated to infrastructure that is not shipped
+### G3 — First-party fail-closed egress floor (resolved)
 
-`crates/harness-agents/src/spawn_contract.rs:16-17` defines
-`HARNESS_AGENT_EGRESS_PROXY` / `HARNESS_AGENT_EGRESS_ALLOWLIST`. For the
-container tier, `container_network_mode` (`spawn_contract.rs:249-258`)
-returns `"none"` unless an allowlist **and** a proxy URL are both configured;
-with both, the container gets `--network bridge` plus proxy env vars
-(`spawn_contract.rs:100-107`) and the allowlist is exported as an env var
-(`spawn_contract.rs:96`) for the *external* proxy to enforce. Harness itself
-never filters a single packet, and no proxy is bundled in `docker/` or
-`docker-compose.yml`.
+Harness now ships `docker/egress-proxy`, an exact-DNS-host allowlist proxy with
+public-address validation to prevent allowlisted DNS names from reaching local
+or private endpoints. A non-empty `network_allowlist` starts a per-agent proxy
+lease; proxy health must pass before spawn, and container agents must receive a
+`403` for a deliberately non-allowlisted canary before the agent command runs.
 
-Practical outcomes:
+Container agents use a unique internal Docker network whose only egress path is
+the dual-homed proxy sidecar, so ignoring proxy environment variables does not
+open a bypass. Scoped agents with an empty allowlist use `--network none`.
+Explicit Full mode with an empty allowlist is the only unrestricted container
+route. External `HARNESS_AGENT_EGRESS_PROXY` URLs are rejected rather than
+treated as a verified boundary.
 
-- Container tier without proxy config: `--network none` — safe but breaks
-  any activity needing GitHub, so operators are pushed toward the host tier.
-- Container tier with proxy: enforcement quality is whatever the operator
-  deployed; harness cannot verify it.
-- Host tier (the default and the worktree workhorse): no network control at
-  all. An injected agent can exfiltrate the GitHub token or repo contents to
-  any host.
+On macOS host isolation, Seatbelt denies general outbound traffic and permits
+only the first-party proxy's loopback port. Linux supports deny-all host
+networking, but rejects proxy-only host policies because the current Landlock
+and bubblewrap helpers cannot safely express them; operators must use container
+isolation for allowlisted Linux workloads. Proxy setup and canary failures are
+typed spawn failures and never downgrade to open networking.
 
 ### G4 — Contract-only enforcement of orchestration-table integrity
 
