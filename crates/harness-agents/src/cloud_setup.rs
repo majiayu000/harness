@@ -17,6 +17,7 @@ use tokio::process::Command;
 
 const SETUP_OUTPUT_MAX_BYTES: usize = 512;
 const SETUP_CAPTURE_MAX_BYTES: usize = 4096;
+const SETUP_CACHE_LAYOUT_VERSION: u8 = 1;
 const CONTAINER_CLOUD_HOME: &str = "/harness-cloud-home";
 const CONTAINER_CLOUD_TMP: &str = "/tmp";
 pub(crate) const SETUP_ENV_ALLOWLIST: [&str; 10] = [
@@ -54,6 +55,7 @@ fn setup_cache_ttl(cloud: &CodexCloudConfig) -> Duration {
 
 pub(crate) fn setup_cache_key(cloud: &CodexCloudConfig, project_root: &Path) -> String {
     let fingerprint = serde_json::json!({
+        "layout_version": SETUP_CACHE_LAYOUT_VERSION,
         "project_root": project_root.to_string_lossy(),
         "setup_commands": cloud.setup_commands,
         "setup_secret_env": cloud.setup_secret_env,
