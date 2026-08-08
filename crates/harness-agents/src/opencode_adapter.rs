@@ -369,7 +369,14 @@ impl OpenCodeAcpAdapter {
         if state.child_ready()
             && state.spawn_policy_fingerprint.as_ref() == Some(&requested_fingerprint)
         {
-            return Ok(());
+            if let Some(child) = state.child.as_ref() {
+                match child.validate_egress_proxy().await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => tracing::warn!(
+                        "opencode acp egress proxy is unavailable; restarting before starting a new turn: {error}"
+                    ),
+                }
+            }
         }
         if state.child.is_some() {
             tracing::warn!("opencode acp spawn policy changed or state is incomplete; restarting before starting a new turn");

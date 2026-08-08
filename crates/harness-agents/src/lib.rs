@@ -163,6 +163,19 @@ impl ManagedChild {
         self
     }
 
+    pub(crate) async fn validate_egress_proxy(&self) -> harness_core::error::Result<()> {
+        let Some(lease) = self.egress_proxy_lease.clone() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || lease.validate_health())
+            .await
+            .map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "egress proxy health check task failed: {error}"
+                ))
+            })?
+    }
+
     fn child_mut(&mut self) -> &mut tokio::process::Child {
         self.child
             .as_mut()

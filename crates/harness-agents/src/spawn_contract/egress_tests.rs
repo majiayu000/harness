@@ -105,6 +105,24 @@ fn docker_host_proxy_enforces_allowlist() -> anyhow::Result<()> {
 }
 
 #[test]
+#[ignore = "requires Docker and the first-party proxy fixture image"]
+fn docker_proxy_health_rejects_terminated_lease() -> anyhow::Result<()> {
+    let lease = super::egress::EgressProxyLease::start(
+        IsolationTier::Host,
+        &["example.com".to_string()],
+        &docker_test_env(),
+    )?;
+    lease.validate_health()?;
+
+    let status = Command::new("docker")
+        .args(["rm", "--force", lease.container_name()])
+        .status()?;
+    assert!(status.success());
+    assert!(lease.validate_health().is_err());
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires Docker, Ubuntu fixture image, and the proxy fixture image"]
 fn docker_container_network_forces_all_egress_through_proxy() -> anyhow::Result<()> {
     let lease = super::egress::EgressProxyLease::start(

@@ -207,6 +207,22 @@ impl EgressProxyLease {
     pub(super) fn route(&self) -> &EgressProxyRoute {
         &self.route
     }
+
+    pub(crate) fn validate_health(&self) -> Result<(), HarnessError> {
+        let status = proxy_health_status(&self.container_name)?;
+        if status == "running healthy" {
+            Ok(())
+        } else {
+            Err(agent_error(format!(
+                "first-party egress proxy is not healthy for adapter reuse: {status}"
+            )))
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn container_name(&self) -> &str {
+        &self.container_name
+    }
 }
 
 impl Drop for EgressProxyLease {
@@ -286,14 +302,8 @@ fn docker_runtime_name() -> Result<String, HarnessError> {
 
 fn wait_for_proxy_health(container_name: &str) -> Result<(), HarnessError> {
     for _ in 0..PROXY_HEALTH_ATTEMPTS {
-        let output = run_docker(&[
-            "inspect",
-            "--format",
-            "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
-            container_name,
-        ])?;
-        let status = String::from_utf8_lossy(&output.stdout);
-        match status.trim() {
+        let status = proxy_health_status(container_name)?;
+        match status.as_str() {
             "running healthy" => return Ok(()),
             value if value.starts_with("exited ") || value.ends_with(" unhealthy") => {
                 return Err(agent_error(format!(
@@ -306,6 +316,16 @@ fn wait_for_proxy_health(container_name: &str) -> Result<(), HarnessError> {
     Err(agent_error(
         "first-party egress proxy did not become healthy before dispatch",
     ))
+}
+
+fn proxy_health_status(container_name: &str) -> Result<String, HarnessError> {
+    let output = run_docker(&[
+        "inspect",
+        "--format",
+        "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
+        container_name,
+    ])?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn published_proxy_port(container_name: &str) -> Result<u16, HarnessError> {
