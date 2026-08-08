@@ -217,8 +217,10 @@ impl AgentSpawnContract for ContainerSpawn {
                 args.push(OsString::from("--env"));
                 args.push(OsString::from(format!("{key}={}", route.proxy_url())));
             }
-            args.push(OsString::from("--env"));
-            args.push(OsString::from("NO_PROXY=localhost,127.0.0.1"));
+            for key in ["NO_PROXY", "no_proxy"] {
+                args.push(OsString::from("--env"));
+                args.push(OsString::from(format!("{key}=localhost,127.0.0.1")));
+            }
         }
         if review_git_safe_workspace(input.env_vars) {
             for (key, value) in [

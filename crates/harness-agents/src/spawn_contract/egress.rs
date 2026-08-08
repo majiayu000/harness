@@ -33,7 +33,9 @@ pub(super) fn apply_proxy_env(env: &mut BTreeMap<String, String>, proxy_url: &st
     for key in proxy_env_keys() {
         env.insert(key.to_string(), proxy_url.to_string());
     }
-    env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
+    for key in ["NO_PROXY", "no_proxy"] {
+        env.insert(key.to_string(), "localhost,127.0.0.1".to_string());
+    }
 }
 
 pub(super) fn container_canary_command(
@@ -412,7 +414,8 @@ fn agent_error(message: impl Into<String>) -> HarnessError {
 
 #[cfg(test)]
 mod tests {
-    use super::read_canary_response;
+    use super::{apply_proxy_env, read_canary_response};
+    use std::collections::BTreeMap;
     use std::io::{self, Read};
 
     struct ChunkedReader<'a> {
@@ -443,5 +446,18 @@ mod tests {
 
         assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
         Ok(())
+    }
+
+    #[test]
+    fn proxy_environment_overrides_both_no_proxy_casings() {
+        let mut env = BTreeMap::from([
+            ("NO_PROXY".to_string(), "api.openai.com".to_string()),
+            ("no_proxy".to_string(), "api.anthropic.com".to_string()),
+        ]);
+
+        apply_proxy_env(&mut env, "http://127.0.0.1:18080");
+
+        assert_eq!(env["NO_PROXY"], "localhost,127.0.0.1");
+        assert_eq!(env["no_proxy"], "localhost,127.0.0.1");
     }
 }
