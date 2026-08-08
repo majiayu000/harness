@@ -176,6 +176,10 @@ impl ManagedChild {
             })?
     }
 
+    pub(crate) fn has_egress_proxy(&self) -> bool {
+        self.egress_proxy_lease.is_some()
+    }
+
     fn child_mut(&mut self) -> &mut tokio::process::Child {
         self.child
             .as_mut()

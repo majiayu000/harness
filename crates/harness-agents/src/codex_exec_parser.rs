@@ -275,6 +275,7 @@ pub(crate) async fn stream_codex_exec_output(
         );
         for item in emitted_items {
             let item_label = match &item {
+                StreamItem::EgressVerifiedAtDispatch => "egress_verification",
                 StreamItem::ItemStarted { .. } => "item_started",
                 StreamItem::MessageDelta { .. } => "message_delta",
                 StreamItem::ToolOutputDelta { .. } => "tool_output_delta",

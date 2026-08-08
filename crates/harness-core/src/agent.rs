@@ -312,6 +312,7 @@ pub struct AgentResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamItem {
+    EgressVerifiedAtDispatch,
     ItemStarted { item: Item },
     MessageDelta { text: String },
     ToolOutputDelta { item_id: String, text: String },
@@ -347,6 +348,7 @@ pub enum TaskComplexity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    EgressVerifiedAtDispatch,
     TurnStarted,
     ItemStarted {
         item_type: String,

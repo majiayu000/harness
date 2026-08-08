@@ -413,6 +413,15 @@ impl CodeAgent for OpenCodeAgent {
         )
         .await?;
         let mut child = supervised.child;
+        if child.has_egress_proxy() {
+            send_stream_item(
+                &tx,
+                StreamItem::EgressVerifiedAtDispatch,
+                self.name(),
+                "egress verification",
+            )
+            .await?;
+        }
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;

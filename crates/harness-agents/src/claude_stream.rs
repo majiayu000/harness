@@ -136,7 +136,8 @@ fn apply_claude_stream_event(
                 },
             });
         }
-        AgentEvent::TurnStarted
+        AgentEvent::EgressVerifiedAtDispatch
+        | AgentEvent::TurnStarted
         | AgentEvent::ItemStarted { .. }
         | AgentEvent::ItemCompleted
         | AgentEvent::TokenUsage { .. } => {}
@@ -156,6 +157,7 @@ pub(crate) fn parse_claude_stream_output(stdout: &str) -> ParsedClaudeStreamOutp
 
 fn stream_item_label(item: &StreamItem) -> &'static str {
     match item {
+        StreamItem::EgressVerifiedAtDispatch => "egress_verification",
         StreamItem::ItemStarted { .. } => "item_started",
         StreamItem::MessageDelta { .. } => "message_delta",
         StreamItem::ToolOutputDelta { .. } => "tool_output_delta",

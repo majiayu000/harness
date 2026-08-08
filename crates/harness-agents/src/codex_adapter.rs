@@ -493,6 +493,19 @@ impl AgentAdapter for CodexAdapter {
         .await?;
         let mut state = self.state.lock().await;
         self.ensure_child(&req, &mut state).await?;
+        if state
+            .child
+            .as_ref()
+            .is_some_and(crate::ManagedChild::has_egress_proxy)
+        {
+            tx.send(AgentEvent::EgressVerifiedAtDispatch)
+                .await
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "codex app-server event receiver closed after egress verification: {error}"
+                    ))
+                })?;
+        }
 
         let thread_id = state.thread_id.clone().ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(

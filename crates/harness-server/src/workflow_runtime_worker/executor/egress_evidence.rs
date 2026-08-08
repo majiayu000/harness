@@ -1,6 +1,6 @@
 use harness_core::agent::{AgentEgressMode, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
 use harness_core::config::agents::AgentPermissionMode;
-use harness_core::types::{Item, TurnStatus};
+use harness_core::types::Item;
 use harness_workflow::runtime::{ActivityArtifact, RuntimeKind};
 use serde::Serialize;
 use serde_json::json;
@@ -77,7 +77,7 @@ impl AgentEgressEvidence {
         }
     }
 
-    pub(super) fn artifact(&self, status: TurnStatus, items: &[Item]) -> ActivityArtifact {
+    pub(super) fn artifact(&self, items: &[Item], verified_at_dispatch: bool) -> ActivityArtifact {
         let verification_result = match self.mode {
             RecordedEgressMode::NotApplicable => EgressVerificationResult::NotApplicable,
             RecordedEgressMode::DenyAll | RecordedEgressMode::Unrestricted => {
@@ -86,7 +86,7 @@ impl AgentEgressEvidence {
             RecordedEgressMode::FirstPartyProxy if has_egress_error(items) => {
                 EgressVerificationResult::Failed
             }
-            RecordedEgressMode::FirstPartyProxy if status == TurnStatus::Completed => {
+            RecordedEgressMode::FirstPartyProxy if verified_at_dispatch => {
                 EgressVerificationResult::VerifiedAtDispatch
             }
             RecordedEgressMode::FirstPartyProxy => EgressVerificationResult::Unverified,
@@ -122,11 +122,11 @@ mod tests {
         runtime_kind: RuntimeKind,
         permission_mode: AgentPermissionMode,
         env_vars: HashMap<String, String>,
-        status: TurnStatus,
         items: &[Item],
+        verified_at_dispatch: bool,
     ) -> Value {
         AgentEgressEvidence::from_spawn_env(runtime_kind, permission_mode, &env_vars)
-            .artifact(status, items)
+            .artifact(items, verified_at_dispatch)
             .artifact
     }
 
@@ -148,8 +148,8 @@ mod tests {
                 RuntimeKind::CodexJsonrpc,
                 AgentPermissionMode::Scoped,
                 env_vars,
-                TurnStatus::Completed,
                 &[],
+                true,
             ),
             json!({
                 "mode": "first_party_proxy",
@@ -177,15 +177,15 @@ mod tests {
                 RuntimeKind::CodexJsonrpc,
                 AgentPermissionMode::Scoped,
                 env_vars,
-                TurnStatus::Failed,
                 &items,
+                false,
             )["verification_result"],
             "failed"
         );
     }
 
     #[test]
-    fn unrelated_proxy_turn_failure_does_not_claim_verification() {
+    fn unrelated_proxy_turn_failure_preserves_dispatch_verification() {
         let env_vars = HashMap::from([(
             AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
             "api.openai.com".to_string(),
@@ -196,11 +196,33 @@ mod tests {
                 RuntimeKind::CodexJsonrpc,
                 AgentPermissionMode::Scoped,
                 env_vars,
-                TurnStatus::Failed,
+                &[Item::Error {
+                    code: -1,
+                    message: "agent protocol closed unexpectedly".to_string(),
+                }],
+                true,
+            )["verification_result"],
+            "verified_at_dispatch"
+        );
+    }
+
+    #[test]
+    fn proxy_spawn_failure_remains_unverified() {
+        let env_vars = HashMap::from([(
+            AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
+            "api.openai.com".to_string(),
+        )]);
+
+        assert_eq!(
+            artifact_value(
+                RuntimeKind::CodexJsonrpc,
+                AgentPermissionMode::Scoped,
+                env_vars,
                 &[Item::Error {
                     code: -1,
                     message: "agent executable was not found".to_string(),
                 }],
+                false,
             )["verification_result"],
             "unverified"
         );
@@ -216,8 +238,8 @@ mod tests {
                 RuntimeKind::CodexJsonrpc,
                 permission_mode,
                 HashMap::new(),
-                TurnStatus::Failed,
                 &[],
+                false,
             );
             assert_eq!(artifact["mode"], expected_mode);
             assert_eq!(artifact["verification_result"], "not_required");
@@ -236,8 +258,8 @@ mod tests {
             RuntimeKind::AnthropicApi,
             AgentPermissionMode::Scoped,
             env_vars,
-            TurnStatus::Completed,
             &[],
+            false,
         );
 
         assert_eq!(artifact["mode"], "not_applicable");

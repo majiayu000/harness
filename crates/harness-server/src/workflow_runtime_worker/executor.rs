@@ -5,7 +5,10 @@ use harness_core::types::AgentId;
 use harness_workflow::runtime::{ActivityArtifact, ActivityResult, RuntimeJob, WorkflowInstance};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use super::activity_result::{
     activity_result_from_turn_with_workflow, structured_output_correction,
@@ -224,6 +227,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     permission_profile.permission_mode,
                     &env_vars,
                 );
+                let egress_verified_at_dispatch = Arc::new(AtomicBool::new(false));
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
                         AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
@@ -270,6 +274,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                             agent_name,
                             &source_project_root,
                         ),
+                        egress_verified_at_dispatch: Some(Arc::clone(
+                            &egress_verified_at_dispatch,
+                        )),
                     },
                 )
                 .await;
@@ -345,7 +352,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     .with_artifact(
                         permission_profile.artifact(resolved_settings.capability_profile),
                     )
-                    .with_artifact(egress_evidence.artifact(turn.status, &turn.items));
+                    .with_artifact(egress_evidence.artifact(
+                        &turn.items,
+                        egress_verified_at_dispatch.load(Ordering::Acquire),
+                    ));
                 let result = if let Some(degradation) = repo_memory.degradation.clone() {
                     result.with_artifact(degradation)
                 } else {

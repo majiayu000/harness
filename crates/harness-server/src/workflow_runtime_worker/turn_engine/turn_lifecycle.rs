@@ -9,7 +9,10 @@ use harness_core::run_id::RunIdentity;
 use harness_core::types::{ExecutionPhase, TurnId};
 use harness_protocol::notifications::{Notification, RpcNotification};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
@@ -19,6 +22,7 @@ pub(super) fn bridge_agent_event(
     emitted_agent_completion: &mut bool,
 ) -> Option<StreamItem> {
     match event {
+        AgentEvent::EgressVerifiedAtDispatch => Some(StreamItem::EgressVerifiedAtDispatch),
         AgentEvent::ItemStartedPayload { item } => Some(StreamItem::ItemStarted { item }),
         AgentEvent::MessageDelta { text } => {
             output_buf.push_str(&text);
@@ -73,6 +77,10 @@ pub(crate) struct TurnLifecycleOptions {
     pub allowed_tools: Option<Vec<String>>,
     pub env_vars: HashMap<String, String>,
     pub runtime_usage: Option<RuntimeUsageContext>,
+    /// Set when the agent confirms that its first-party egress proxy was
+    /// established before dispatch. The marker is consumed here and is not
+    /// persisted as a transcript item.
+    pub egress_verified_at_dispatch: Option<Arc<AtomicBool>>,
     /// Stateful lease-lost signal (watch channel): when the owning runtime
     /// job lease is lost mid-turn, the turn interrupts the agent so the
     /// child process terminates and the workspace cleanup can run (GH-1877).
@@ -298,6 +306,12 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             }
             incoming = stream_rx.recv(), if !stream_closed => {
                 match incoming {
+                    Some(StreamItem::EgressVerifiedAtDispatch) => {
+                        last_activity = Instant::now();
+                        if let Some(verified) = options.egress_verified_at_dispatch.as_ref() {
+                            verified.store(true, Ordering::Release);
+                        }
+                    }
                     Some(item) => {
                         last_activity = Instant::now();
                         if let StreamItem::Error { message } = &item {
