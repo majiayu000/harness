@@ -754,6 +754,9 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         env_vars: HashMap::new(),
         capability_token: None,
     };
+    adapter.state.lock().await.spawn_policy_fingerprint = Some(
+        crate::spawn_contract::adapter_spawn_policy_fingerprint(&req, adapter.sandbox_mode),
+    );
     let (tx, mut rx) = mpsc::channel(4);
 
     let error = adapter

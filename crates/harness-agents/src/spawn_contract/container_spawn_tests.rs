@@ -29,6 +29,66 @@ fn string_args(spawn: &PreparedAgentSpawn) -> Vec<String> {
         .collect()
 }
 
+fn policy_request() -> TurnRequest {
+    TurnRequest {
+        prompt: "first prompt".to_string(),
+        prompt_layers: None,
+        project_root: PathBuf::from("/tmp/project"),
+        permission_mode: AgentPermissionMode::Full,
+        model: Some("model-a".to_string()),
+        reasoning_effort: None,
+        execution_phase: None,
+        sandbox_mode: Some(SandboxMode::DangerFullAccess),
+        approval_policy: None,
+        allowed_tools: None,
+        context: Vec::new(),
+        timeout_secs: Some(30),
+        env_vars: HashMap::new(),
+        capability_token: None,
+    }
+}
+
+#[test]
+fn adapter_spawn_policy_changes_with_process_security_controls() {
+    let request = policy_request();
+    let baseline = adapter_spawn_policy_fingerprint(&request, SandboxMode::ReadOnly);
+
+    let mut scoped = request.clone();
+    scoped.permission_mode = AgentPermissionMode::Scoped;
+    assert!(baseline != adapter_spawn_policy_fingerprint(&scoped, SandboxMode::ReadOnly));
+
+    let mut allowlisted = request.clone();
+    allowlisted.env_vars.insert(
+        AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
+        "api.openai.com".to_string(),
+    );
+    assert!(baseline != adapter_spawn_policy_fingerprint(&allowlisted, SandboxMode::ReadOnly));
+
+    let mut sandboxed = request.clone();
+    sandboxed.sandbox_mode = Some(SandboxMode::WorkspaceWrite);
+    assert!(baseline != adapter_spawn_policy_fingerprint(&sandboxed, SandboxMode::ReadOnly));
+}
+
+#[test]
+fn adapter_spawn_policy_ignores_turn_only_fields() {
+    let request = policy_request();
+    let baseline = adapter_spawn_policy_fingerprint(&request, SandboxMode::ReadOnly);
+    let mut next_turn = request;
+    next_turn.prompt = "second prompt".to_string();
+    next_turn.model = Some("model-b".to_string());
+    next_turn.timeout_secs = Some(90);
+    next_turn.env_vars.insert(
+        AGENT_RUN_ID_ENV.to_string(),
+        "ar-01j00000000000000000000000".to_string(),
+    );
+    next_turn.env_vars.insert(
+        AGENT_RUN_PARENT_ENV.to_string(),
+        "ar-01j00000000000000000000001".to_string(),
+    );
+
+    assert!(baseline == adapter_spawn_policy_fingerprint(&next_turn, SandboxMode::ReadOnly));
+}
+
 #[test]
 fn container_spawn_mounts_only_task_workspace() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;

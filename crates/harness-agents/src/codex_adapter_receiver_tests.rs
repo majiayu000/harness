@@ -55,6 +55,9 @@ async fn closed_event_receiver_kills_and_reaps_app_server_process_group() -> any
         env_vars: HashMap::new(),
         capability_token: None,
     };
+    adapter.state.lock().await.spawn_policy_fingerprint = Some(
+        crate::spawn_contract::adapter_spawn_policy_fingerprint(&request, adapter.sandbox_mode),
+    );
     let (tx, rx) = mpsc::channel(1);
     drop(rx);
 

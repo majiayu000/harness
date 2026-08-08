@@ -1,18 +1,20 @@
-use harness_core::agent::{AgentEgressMode, AGENT_EGRESS_PROXY_IMAGE_ENV};
+use harness_core::agent::{AgentEgressMode, TurnRequest, AGENT_EGRESS_PROXY_IMAGE_ENV};
 #[cfg(test)]
 use harness_core::agent::{
     AGENT_CONTAINER_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV,
 };
 use harness_core::config::agents::AgentPermissionMode;
+use harness_core::config::agents::SandboxMode;
 use harness_core::config::isolation::IsolationTier;
 use harness_core::error::HarnessError;
-#[cfg(test)]
-use harness_core::run_id::AGENT_RUN_ID_ENV;
+use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
 use harness_sandbox::{wrap_command, NetworkPolicy, SandboxEngine, SandboxSpec};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
 
 pub(crate) mod egress;
 mod output_schema;
@@ -45,6 +47,61 @@ pub(crate) const NESTED_SESSION_ENV_KEYS: [&str; 5] = [
 const DEFAULT_AGENT_CONTAINER_IMAGE: &str = "harness-agent:latest";
 const CONTAINER_WORKSPACE: &str = "/workspace";
 pub(crate) const REVIEW_GIT_SAFE_WORKSPACE_ENV: &str = "HARNESS_AGENT_REVIEW_GIT_SAFE_WORKSPACE";
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AdapterSpawnPolicyFingerprint([u8; 32]);
+
+pub(crate) fn adapter_spawn_policy_fingerprint(
+    req: &TurnRequest,
+    default_sandbox_mode: SandboxMode,
+) -> AdapterSpawnPolicyFingerprint {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"adapter-spawn-policy/v1");
+    hash_field(&mut hasher, req.project_root.as_os_str().as_encoded_bytes());
+    hash_field(
+        &mut hasher,
+        &[match req.permission_mode {
+            AgentPermissionMode::Scoped => 0,
+            AgentPermissionMode::Full => 1,
+        }],
+    );
+    hash_field(
+        &mut hasher,
+        &[match req.sandbox_mode.unwrap_or(default_sandbox_mode) {
+            SandboxMode::ReadOnly => 0,
+            SandboxMode::ReadOnlyWithNetwork => 1,
+            SandboxMode::WorkspaceWrite => 2,
+            SandboxMode::DangerFullAccess => 3,
+        }],
+    );
+
+    let mut env_vars: Vec<_> = req
+        .env_vars
+        .iter()
+        .filter(|(key, _)| key.as_str() != AGENT_RUN_ID_ENV && key.as_str() != AGENT_RUN_PARENT_ENV)
+        .collect();
+    env_vars.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (key, value) in env_vars {
+        hash_field(&mut hasher, key.as_bytes());
+        hash_field(&mut hasher, value.as_bytes());
+    }
+
+    if let Some(token) = &req.capability_token {
+        hash_field(&mut hasher, b"capability");
+        for path in &token.allowed_write_paths {
+            hash_field(&mut hasher, path.as_os_str().as_encoded_bytes());
+        }
+    } else {
+        hash_field(&mut hasher, b"no-capability");
+    }
+
+    AdapterSpawnPolicyFingerprint(hasher.finalize().into())
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContainerBindMount {

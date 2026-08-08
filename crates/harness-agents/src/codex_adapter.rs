@@ -78,6 +78,7 @@ struct AdapterState {
     thread_id: Option<String>,
     active_turn_id: Option<String>,
     child_workspace: Option<PathBuf>,
+    spawn_policy_fingerprint: Option<crate::spawn_contract::AdapterSpawnPolicyFingerprint>,
 }
 impl AdapterState {
     fn new() -> Self {
@@ -89,6 +90,7 @@ impl AdapterState {
             thread_id: None,
             active_turn_id: None,
             child_workspace: None,
+            spawn_policy_fingerprint: None,
         }
     }
     fn next_request_id(&mut self) -> u64 {
@@ -111,6 +113,7 @@ impl AdapterState {
         self.thread_id = None;
         self.active_turn_id = None;
         self.child_workspace = None;
+        self.spawn_policy_fingerprint = None;
     }
 }
 
@@ -282,13 +285,15 @@ impl CodexAdapter {
         req: &TurnRequest,
         state: &mut AdapterState,
     ) -> harness_core::error::Result<()> {
-        if state.child_ready() {
+        let requested_fingerprint =
+            crate::spawn_contract::adapter_spawn_policy_fingerprint(req, self.sandbox_mode);
+        if state.child_ready()
+            && state.spawn_policy_fingerprint.as_ref() == Some(&requested_fingerprint)
+        {
             return Ok(());
         }
         if state.child.is_some() {
-            tracing::warn!(
-                "codex app-server state is incomplete; restarting before starting a new turn"
-            );
+            tracing::warn!("codex app-server spawn policy changed or state is incomplete; restarting before starting a new turn");
             state.reset_child().await;
         }
 
@@ -439,6 +444,7 @@ impl CodexAdapter {
         match protocol_result {
             Ok(()) => {
                 state.stdout_lines = Some(lines);
+                state.spawn_policy_fingerprint = Some(requested_fingerprint);
                 Ok(())
             }
             Err(error) => {
@@ -649,6 +655,69 @@ impl AgentAdapter for CodexAdapter {
 #[cfg(test)]
 #[path = "codex_adapter_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod spawn_policy_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn ready_child_restarts_when_spawn_policy_changes() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let adapter = CodexAdapter::new(project.path().join("missing-codex"));
+        let request = TurnRequest {
+            prompt: "ping".to_string(),
+            prompt_layers: None,
+            project_root: project.path().to_path_buf(),
+            permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
+            model: None,
+            reasoning_effort: None,
+            execution_phase: None,
+            sandbox_mode: Some(SandboxMode::DangerFullAccess),
+            approval_policy: None,
+            allowed_tools: None,
+            context: Vec::new(),
+            timeout_secs: None,
+            env_vars: HashMap::new(),
+            capability_token: None,
+        };
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("60")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        crate::set_process_group(&mut command);
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing stdout"))?;
+        let mut state = AdapterState::new();
+        state.stdin = Some(stdin);
+        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.child = Some(crate::ManagedChild::new(child, "codex policy test"));
+        state.spawn_policy_fingerprint = Some(
+            crate::spawn_contract::adapter_spawn_policy_fingerprint(&request, adapter.sandbox_mode),
+        );
+
+        adapter.ensure_child(&request, &mut state).await?;
+        let mut scoped = request;
+        scoped.permission_mode = harness_core::config::agents::AgentPermissionMode::Scoped;
+        adapter
+            .ensure_child(&scoped, &mut state)
+            .await
+            .expect_err("changed policy must attempt a fresh spawn");
+
+        assert!(state.child.is_none());
+        assert!(state.spawn_policy_fingerprint.is_none());
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 #[path = "codex_adapter_receiver_tests.rs"]
