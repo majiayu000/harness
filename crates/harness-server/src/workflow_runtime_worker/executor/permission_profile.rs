@@ -41,10 +41,12 @@ impl RuntimePermissionProfile {
     pub(super) fn artifact(
         &self,
         configured_capability_profile: CapabilityProfile,
+        attempt: u32,
     ) -> ActivityArtifact {
         ActivityArtifact::new(
             "agent_permission_profile",
             json!({
+                "attempt": attempt,
                 "configured_capability_profile": configured_capability_profile,
                 "permission_mode": self.permission_mode,
                 "allowed_tools": self.allowed_tools,
@@ -71,8 +73,9 @@ mod tests {
         assert_eq!(profile.permission_mode, AgentPermissionMode::Full);
         assert_eq!(profile.allowed_tools, Some(Vec::new()));
         assert_eq!(
-            profile.artifact(CapabilityProfile::Full).artifact,
+            profile.artifact(CapabilityProfile::Full, 1).artifact,
             json!({
+                "attempt": 1,
                 "configured_capability_profile": "full",
                 "permission_mode": "full",
                 "allowed_tools": [],

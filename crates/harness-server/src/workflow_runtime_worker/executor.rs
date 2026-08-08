@@ -176,6 +176,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 build_runtime_job_prompt(&prompt_packet, prompt_task_request.prompt_text());
             let mut correction_retry = None;
             let mut transcript_turn = None;
+            let mut attempt_enforcement_artifacts = Vec::new();
             for attempt in 0..=1 {
                 record_runtime_prompt_input(
                     self.state,
@@ -287,6 +288,16 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     .thread_manager
                     .get_turn(&thread_id, &turn_id)
                     .ok_or_else(|| anyhow::anyhow!("runtime turn disappeared before completion"))?;
+                let attempt_number = attempt + 1;
+                attempt_enforcement_artifacts.push(permission_profile.artifact(
+                    resolved_settings.capability_profile,
+                    attempt_number,
+                ));
+                attempt_enforcement_artifacts.push(egress_evidence.artifact(
+                    &turn.items,
+                    egress_verified_at_dispatch.load(Ordering::Acquire),
+                    attempt_number,
+                ));
                 let mut result = activity_result_from_turn_with_workflow(
                     &job,
                     &turn.status,
@@ -348,14 +359,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         result,
                         transcript_turn.as_ref().unwrap_or(&turn),
                     )?
-                    .with_artifact(repo_memory_config_artifact(memory_enabled))
-                    .with_artifact(
-                        permission_profile.artifact(resolved_settings.capability_profile),
-                    )
-                    .with_artifact(egress_evidence.artifact(
-                        &turn.items,
-                        egress_verified_at_dispatch.load(Ordering::Acquire),
-                    ));
+                    .with_artifact(repo_memory_config_artifact(memory_enabled));
+                let result = attempt_enforcement_artifacts
+                    .into_iter()
+                    .fold(result, |result, artifact| result.with_artifact(artifact));
                 let result = if let Some(degradation) = repo_memory.degradation.clone() {
                     result.with_artifact(degradation)
                 } else {

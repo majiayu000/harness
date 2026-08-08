@@ -77,7 +77,12 @@ impl AgentEgressEvidence {
         }
     }
 
-    pub(super) fn artifact(&self, items: &[Item], verified_at_dispatch: bool) -> ActivityArtifact {
+    pub(super) fn artifact(
+        &self,
+        items: &[Item],
+        verified_at_dispatch: bool,
+        attempt: u32,
+    ) -> ActivityArtifact {
         let verification_result = match self.mode {
             RecordedEgressMode::NotApplicable => EgressVerificationResult::NotApplicable,
             RecordedEgressMode::DenyAll | RecordedEgressMode::Unrestricted => {
@@ -94,6 +99,7 @@ impl AgentEgressEvidence {
         ActivityArtifact::new(
             "agent_egress_enforcement",
             json!({
+                "attempt": attempt,
                 "mode": self.mode,
                 "verification_result": verification_result,
                 "network_allowlist": self.network_allowlist,
@@ -126,7 +132,7 @@ mod tests {
         verified_at_dispatch: bool,
     ) -> Value {
         AgentEgressEvidence::from_spawn_env(runtime_kind, permission_mode, &env_vars)
-            .artifact(items, verified_at_dispatch)
+            .artifact(items, verified_at_dispatch, 1)
             .artifact
     }
 
@@ -152,6 +158,7 @@ mod tests {
                 true,
             ),
             json!({
+                "attempt": 1,
                 "mode": "first_party_proxy",
                 "verification_result": "verified_at_dispatch",
                 "network_allowlist": ["api.openai.com", "github.com"],

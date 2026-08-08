@@ -217,6 +217,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(
         permission_artifact.artifact,
         serde_json::json!({
+            "attempt": 1,
             "configured_capability_profile": "standard",
             "permission_mode": "scoped",
             "allowed_tools": ["Read", "Write", "Edit", "Bash"],
@@ -386,31 +387,44 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
             harness_core::config::agents::AgentPermissionMode::Full,
         ]
     );
-    let permission_artifact = output
+    let permission_artifacts = output
         .artifacts
         .iter()
-        .find(|artifact| artifact.artifact_type == "agent_permission_profile")
-        .expect("corrected output should record deny-all permissions");
-    assert_eq!(permission_artifact.artifact["permission_mode"], "full");
+        .filter(|artifact| artifact.artifact_type == "agent_permission_profile")
+        .collect::<Vec<_>>();
+    assert_eq!(permission_artifacts.len(), 2);
+    assert_eq!(permission_artifacts[0].artifact["attempt"], 1);
+    assert_eq!(permission_artifacts[0].artifact["permission_mode"], "full");
     assert_eq!(
-        permission_artifact.artifact["allowed_tools"],
+        permission_artifacts[0].artifact["allowed_tools"],
+        serde_json::Value::Null
+    );
+    assert_eq!(permission_artifacts[0].artifact["correction_only"], false);
+    assert_eq!(permission_artifacts[1].artifact["attempt"], 2);
+    assert_eq!(permission_artifacts[1].artifact["permission_mode"], "full");
+    assert_eq!(
+        permission_artifacts[1].artifact["allowed_tools"],
         serde_json::json!([])
     );
-    assert_eq!(permission_artifact.artifact["correction_only"], true);
-    let egress_artifact = output
+    assert_eq!(permission_artifacts[1].artifact["correction_only"], true);
+    let egress_artifacts = output
         .artifacts
         .iter()
-        .find(|artifact| artifact.artifact_type == "agent_egress_enforcement")
-        .expect("corrected output should record egress enforcement");
-    assert_eq!(egress_artifact.artifact["mode"], "unrestricted");
-    assert_eq!(
-        egress_artifact.artifact["verification_result"],
-        "not_required"
-    );
-    assert_eq!(
-        egress_artifact.artifact["network_allowlist"],
-        serde_json::json!([])
-    );
+        .filter(|artifact| artifact.artifact_type == "agent_egress_enforcement")
+        .collect::<Vec<_>>();
+    assert_eq!(egress_artifacts.len(), 2);
+    for (index, egress_artifact) in egress_artifacts.iter().enumerate() {
+        assert_eq!(egress_artifact.artifact["attempt"], index + 1);
+        assert_eq!(egress_artifact.artifact["mode"], "unrestricted");
+        assert_eq!(
+            egress_artifact.artifact["verification_result"],
+            "not_required"
+        );
+        assert_eq!(
+            egress_artifact.artifact["network_allowlist"],
+            serde_json::json!([])
+        );
+    }
     let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&runtime_job.id);
     let RuntimeTranscriptRead::Verified(record) =
         store.read_runtime_transcript(&artifact_ref).await?
