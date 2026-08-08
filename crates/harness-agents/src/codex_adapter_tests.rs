@@ -414,16 +414,12 @@ async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()
 }
 
 #[test]
-fn app_server_spawn_honors_container_isolation() -> anyhow::Result<()> {
+fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let mut env_vars = HashMap::new();
     env_vars.insert(
         harness_core::agent::AGENT_ISOLATION_TIER_ENV.to_string(),
         "container".to_string(),
-    );
-    env_vars.insert(
-        harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
-        "github.com".to_string(),
     );
     let request = TurnRequest {
         prompt: "ping".to_string(),

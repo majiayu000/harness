@@ -8,6 +8,14 @@ fn danger_mode_with_denied_network_is_not_a_passthrough() {
     let wrapped = wrap_command(Path::new("/usr/bin/env"), &[], &spec).unwrap();
 
     assert_ne!(wrapped.engine, SandboxEngine::None);
+    let rendered = wrapped
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(rendered.contains("(allow default)"));
+    assert!(rendered.contains("(deny network-outbound)"));
 }
 
 #[test]

@@ -198,6 +198,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                permission_mode: req.permission_mode,
                 forward_stdin: false,
             })?;
 
@@ -313,6 +314,7 @@ impl CodeAgent for ClaudeCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                permission_mode: req.permission_mode,
                 forward_stdin: false,
             })?;
 

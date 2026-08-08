@@ -138,6 +138,7 @@ pub(crate) struct ManagedChild {
     process_group_id: Option<u32>,
     label: &'static str,
     cleanup_disarmed: bool,
+    egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
 }
 
 impl ManagedChild {
@@ -148,7 +149,16 @@ impl ManagedChild {
             process_group_id,
             label,
             cleanup_disarmed: false,
+            egress_proxy_lease: None,
         }
+    }
+
+    pub(crate) fn with_egress_proxy_lease(
+        mut self,
+        lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
+    ) -> Self {
+        self.egress_proxy_lease = lease;
+        self
     }
 
     fn child_mut(&mut self) -> &mut tokio::process::Child {

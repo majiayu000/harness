@@ -88,15 +88,16 @@ pub fn wrap_command(
     }
 
     let owned;
-    let spec: &SandboxSpec = if spec.mode == SandboxMode::DangerFullAccess {
-        owned = SandboxSpec {
-            mode: SandboxMode::WorkspaceWrite,
-            ..spec.clone()
+    let spec: &SandboxSpec =
+        if spec.mode == SandboxMode::DangerFullAccess && spec.allowed_write_paths.is_some() {
+            owned = SandboxSpec {
+                mode: SandboxMode::WorkspaceWrite,
+                ..spec.clone()
+            };
+            &owned
+        } else {
+            spec
         };
-        &owned
-    } else {
-        spec
-    };
 
     #[cfg(target_os = "macos")]
     {

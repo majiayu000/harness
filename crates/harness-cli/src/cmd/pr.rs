@@ -12,7 +12,7 @@ use tokio::time::{sleep, Duration};
 const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
 const CODEX_REVIEW_PROCESS_SPAWN_CONTROL_ENV: [&str; 2] = [
     "HARNESS_AGENT_CONTAINER_IMAGE",
-    "HARNESS_AGENT_EGRESS_PROXY",
+    "HARNESS_AGENT_EGRESS_PROXY_IMAGE",
 ];
 
 fn codex_review_spawn_env(config: &HarnessConfig) -> HashMap<String, String> {
@@ -165,6 +165,7 @@ pub async fn review(
             reasoning_effort: Some(review_config.reasoning_effort),
             sandbox_mode: SandboxMode::ReadOnlyWithNetwork,
             approval_policy: Some("never".to_string()),
+            permission_mode: config.agents.resolve_permission_mode(),
             env_vars: codex_review_spawn_env(config),
         }),
     )
@@ -347,6 +348,10 @@ mod tests {
                 "http://review-proxy.local:8080".to_string(),
             ),
             (
+                "HARNESS_AGENT_EGRESS_PROXY_IMAGE".to_string(),
+                "example/egress-proxy:sha256-test".to_string(),
+            ),
+            (
                 "OPERATOR_API_KEY".to_string(),
                 "operator-secret".to_string(),
             ),
@@ -372,10 +377,11 @@ mod tests {
         );
         assert_eq!(
             env_vars
-                .get("HARNESS_AGENT_EGRESS_PROXY")
+                .get("HARNESS_AGENT_EGRESS_PROXY_IMAGE")
                 .map(String::as_str),
-            Some("http://review-proxy.local:8080")
+            Some("example/egress-proxy:sha256-test")
         );
+        assert!(!env_vars.contains_key("HARNESS_AGENT_EGRESS_PROXY"));
         assert!(!env_vars.contains_key("OPERATOR_API_KEY"));
         assert!(!env_vars.values().any(|value| value == "operator-secret"));
     }
