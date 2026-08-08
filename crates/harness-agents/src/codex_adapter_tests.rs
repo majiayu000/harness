@@ -413,8 +413,8 @@ async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()
     Ok(())
 }
 
-#[test]
-fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow::Result<()> {
+#[tokio::test]
+async fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let mut env_vars = HashMap::new();
     env_vars.insert(
@@ -438,7 +438,7 @@ fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow::Resul
         capability_token: None,
     };
 
-    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request)?;
+    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request).await?;
     let args = spawn
         .args
         .iter()
@@ -455,12 +455,12 @@ fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow::Resul
     Ok(())
 }
 
-#[test]
-fn app_server_spawn_keeps_host_workspace_path() -> anyhow::Result<()> {
+#[tokio::test]
+async fn app_server_spawn_keeps_host_workspace_path() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let request = test_turn_request(root.path().to_path_buf());
 
-    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request)?;
+    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request).await?;
 
     assert_eq!(spawn.child_workspace, root.path());
     assert_eq!(

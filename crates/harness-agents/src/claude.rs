@@ -200,7 +200,8 @@ impl CodeAgent for ClaudeCodeAgent {
                 env_vars: &spawn_env_vars,
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         tracing::debug!(
             cli = %prepared_spawn.program.display(),
@@ -316,7 +317,8 @@ impl CodeAgent for ClaudeCodeAgent {
                 env_vars: &spawn_env_vars,
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         // Dump full args (truncate each to 120 chars) so we can diagnose
         // exactly what is being passed to the Claude CLI process.

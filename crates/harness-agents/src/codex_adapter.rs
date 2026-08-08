@@ -28,7 +28,7 @@ use self::protocol::{
 };
 #[cfg(test)]
 use self::protocol::{sandbox_mode_value, sandbox_policy_value};
-fn prepare_app_server_spawn(
+async fn prepare_app_server_spawn(
     cli_path: &std::path::Path,
     req: &TurnRequest,
 ) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
@@ -54,6 +54,7 @@ fn prepare_app_server_spawn(
         // The app-server protocol is driven over the child's stdin.
         forward_stdin: true,
     })
+    .await
 }
 pub struct CodexAdapter {
     cli_path: PathBuf,
@@ -286,7 +287,7 @@ impl CodexAdapter {
         }
 
         let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let prepared_spawn = prepare_app_server_spawn(&self.cli_path, req)?;
+        let prepared_spawn = prepare_app_server_spawn(&self.cli_path, req).await?;
         let spawn_project_root = req.project_root.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(
             crate::spawn_supervisor::AgentSpawnPlan {

@@ -156,7 +156,7 @@ fn stall_timeout_for(req: &TurnRequest) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn prepare_acp_spawn(
+async fn prepare_acp_spawn(
     cli_path: &std::path::Path,
     req: &TurnRequest,
 ) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
@@ -179,6 +179,7 @@ fn prepare_acp_spawn(
         permission_mode: req.permission_mode,
         forward_stdin: true,
     })
+    .await
 }
 
 pub struct OpenCodeAcpAdapter {
@@ -369,7 +370,7 @@ impl OpenCodeAcpAdapter {
         }
 
         let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let prepared_spawn = prepare_acp_spawn(&self.cli_path, req)?;
+        let prepared_spawn = prepare_acp_spawn(&self.cli_path, req).await?;
         let spawn_project_root = req.project_root.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(
             crate::spawn_supervisor::AgentSpawnPlan {

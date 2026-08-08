@@ -1,6 +1,7 @@
+use harness_core::agent::AGENT_EGRESS_PROXY_IMAGE_ENV;
+#[cfg(test)]
 use harness_core::agent::{
-    AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV,
-    AGENT_NETWORK_ALLOWLIST_ENV,
+    AGENT_CONTAINER_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV,
 };
 use harness_core::config::agents::AgentPermissionMode;
 use harness_core::config::isolation::IsolationTier;
@@ -13,15 +14,13 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::scoped_token::SCOPED_GITHUB_TOKEN_ENV;
-
 pub(crate) mod egress;
 mod output_schema;
 mod review_git;
 mod spawn_env;
 use egress::{
-    container_canary_command, EgressPolicy, EgressProxyLease, EgressProxyRoute,
-    LEGACY_EGRESS_PROXY_ENV,
+    apply_proxy_env, container_canary_command, proxy_env_keys, EgressPolicy, EgressProxyLease,
+    EgressProxyRoute, LEGACY_EGRESS_PROXY_ENV,
 };
 use spawn_env::{
     container_env_vars, container_image, docker_process_env, host_process_env, isolation_tier,
@@ -261,7 +260,7 @@ impl AgentSpawnContract for ContainerSpawn {
     }
 }
 
-pub(crate) fn prepare_agent_spawn(
+pub(crate) async fn prepare_agent_spawn(
     input: AgentSpawnInput<'_>,
 ) -> Result<PreparedAgentSpawn, HarnessError> {
     if input
@@ -282,11 +281,15 @@ pub(crate) fn prepare_agent_spawn(
     let allowlist = network_allowlist(input.env_vars);
     let egress_policy = EgressPolicy::resolve(input.permission_mode, &allowlist);
     let lease = if egress_policy == EgressPolicy::Proxy {
-        Some(Arc::new(EgressProxyLease::start(
-            tier,
-            &allowlist,
-            input.env_vars,
-        )?))
+        let env_vars = input.env_vars.clone();
+        let lease = tokio::task::spawn_blocking(move || {
+            EgressProxyLease::start(tier, &allowlist, &env_vars)
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::AgentExecution(format!("egress proxy setup task failed: {error}"))
+        })??;
+        Some(Arc::new(lease))
     } else {
         None
     };
@@ -317,41 +320,6 @@ pub(crate) fn strip_nested_session_env(cmd: &mut tokio::process::Command) {
     for key in NESTED_SESSION_ENV_KEYS {
         cmd.env_remove(key);
     }
-}
-
-fn is_nested_session_env(key: &str) -> bool {
-    NESTED_SESSION_ENV_KEYS.contains(&key)
-}
-
-fn is_spawn_control_env(key: &str) -> bool {
-    matches!(
-        key,
-        AGENT_ISOLATION_TIER_ENV
-            | AGENT_NETWORK_ALLOWLIST_ENV
-            | AGENT_CONTAINER_IMAGE_ENV
-            | LEGACY_EGRESS_PROXY_ENV
-            | AGENT_EGRESS_PROXY_IMAGE_ENV
-            | SCOPED_GITHUB_TOKEN_ENV
-            | REVIEW_GIT_SAFE_WORKSPACE_ENV
-    ) || proxy_env_keys().contains(&key)
-}
-
-fn proxy_env_keys() -> [&'static str; 6] {
-    [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ]
-}
-
-fn apply_proxy_env(env: &mut BTreeMap<String, String>, proxy_url: &str) {
-    for key in proxy_env_keys() {
-        env.insert(key.to_string(), proxy_url.to_string());
-    }
-    env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
 }
 
 fn missing_proxy_route(tier: IsolationTier) -> HarnessError {
@@ -686,8 +654,8 @@ mod container_spawn_tests {
         Ok(())
     }
 
-    #[test]
-    fn host_spawn_filters_injected_nested_session_markers() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn host_spawn_filters_injected_nested_session_markers() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut env_vars = HashMap::new();
         for key in NESTED_SESSION_ENV_KEYS {
@@ -702,7 +670,8 @@ mod container_spawn_tests {
             root.path(),
             &sandbox_spec,
             &env_vars,
-        ))?;
+        ))
+        .await?;
 
         for key in NESTED_SESSION_ENV_KEYS {
             assert!(
@@ -751,8 +720,8 @@ mod container_spawn_tests {
         Ok(())
     }
 
-    #[test]
-    fn host_spawn_filters_spawn_control_env() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn host_spawn_filters_spawn_control_env() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let mut env_vars = HashMap::new();
         env_vars.insert(AGENT_ISOLATION_TIER_ENV.to_string(), "host".to_string());
@@ -766,7 +735,8 @@ mod container_spawn_tests {
             root.path(),
             &sandbox_spec,
             &env_vars,
-        ))?;
+        ))
+        .await?;
 
         assert!(!spawn.clear_inherited_env);
         assert_eq!(

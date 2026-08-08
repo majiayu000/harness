@@ -2,7 +2,7 @@ use harness_core::agent::AGENT_EGRESS_PROXY_IMAGE_ENV;
 use harness_core::config::agents::AgentPermissionMode;
 use harness_core::config::isolation::IsolationTier;
 use harness_core::error::HarnessError;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
@@ -18,6 +18,24 @@ const PROXY_HEALTH_ATTEMPTS: usize = 50;
 const PROXY_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 const PROXY_CANARY_TIMEOUT: Duration = Duration::from_secs(2);
 static EGRESS_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+pub(super) fn proxy_env_keys() -> [&'static str; 6] {
+    [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]
+}
+
+pub(super) fn apply_proxy_env(env: &mut BTreeMap<String, String>, proxy_url: &str) {
+    for key in proxy_env_keys() {
+        env.insert(key.to_string(), proxy_url.to_string());
+    }
+    env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
+}
 
 pub(super) fn container_canary_command(
     program: OsString,

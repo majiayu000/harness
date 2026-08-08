@@ -163,9 +163,9 @@ fn docker_container_network_forces_all_egress_through_proxy() -> anyhow::Result<
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires Docker plus the reference agent and proxy fixture images"]
-fn docker_prepared_spawn_runs_canary_and_agent_behind_proxy() -> anyhow::Result<()> {
+async fn docker_prepared_spawn_runs_canary_and_agent_behind_proxy() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let mut env_vars = docker_test_env();
     env_vars.insert(
@@ -199,7 +199,8 @@ if curl --silent --noproxy '*' --max-time 2 https://example.com/ >/dev/null 2>&1
         env_vars: &env_vars,
         permission_mode: AgentPermissionMode::Scoped,
         forward_stdin: false,
-    })?;
+    })
+    .await?;
 
     let mut command = Command::new(&spawn.program);
     command

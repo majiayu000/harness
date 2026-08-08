@@ -257,7 +257,8 @@ impl CodeAgent for OpenCodeAgent {
                 env_vars: &spawn_env_vars,
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         let spawn_error_req = req.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(
@@ -378,7 +379,8 @@ impl CodeAgent for OpenCodeAgent {
                 env_vars: &spawn_env_vars,
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         let spawn_error_req = req.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(

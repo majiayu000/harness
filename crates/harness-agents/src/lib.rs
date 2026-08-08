@@ -440,6 +440,7 @@ impl Drop for ManagedChild {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        let egress_proxy_lease = self.egress_proxy_lease.take();
         let child_reaped = match child.try_wait() {
             Ok(Some(_)) => true,
             Ok(None) => false,
@@ -480,9 +481,20 @@ impl Drop for ManagedChild {
         let process_group_id = self.process_group_id;
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(reap_killed_child(child, label, process_group_id));
+                handle.spawn(reap_killed_child(
+                    child,
+                    label,
+                    process_group_id,
+                    egress_proxy_lease,
+                ));
             }
-            Err(_) => drain_killed_child_blocking(child, child_reaped, label, process_group_id),
+            Err(_) => drain_killed_child_blocking(
+                child,
+                child_reaped,
+                label,
+                process_group_id,
+                egress_proxy_lease,
+            ),
         }
     }
 }
@@ -494,6 +506,7 @@ async fn reap_killed_child(
     mut child: tokio::process::Child,
     label: &'static str,
     process_group_id: Option<u32>,
+    _egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
 ) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     match tokio::time::timeout_at(deadline, child.wait()).await {
@@ -540,6 +553,7 @@ fn drain_killed_child_blocking(
     mut child_reaped: bool,
     label: &'static str,
     process_group_id: Option<u32>,
+    _egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
 ) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {

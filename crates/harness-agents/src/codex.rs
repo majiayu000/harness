@@ -203,7 +203,7 @@ impl CodexAgent {
     /// Calling `wrap_command` directly (as this path used to) skipped container
     /// isolation and the operator-secret env filtering that
     /// `prepare_agent_spawn` applies.
-    fn prepare_review_spawn(
+    async fn prepare_review_spawn(
         &self,
         req: &CodexReviewRequest,
     ) -> harness_core::error::Result<(
@@ -235,7 +235,8 @@ impl CodexAgent {
                 env_vars: &spawn_env_vars,
                 permission_mode: req.permission_mode,
                 forward_stdin: review_uses_stdin_prompt(req),
-            })?;
+            })
+            .await?;
         Ok((prepared_spawn, run_identity))
     }
 
@@ -246,7 +247,7 @@ impl CodexAgent {
         self.run_setup_phase(&req.project_root).await?;
 
         let use_stdin_prompt = review_uses_stdin_prompt(&req);
-        let (prepared_spawn, run_identity) = self.prepare_review_spawn(&req)?;
+        let (prepared_spawn, run_identity) = self.prepare_review_spawn(&req).await?;
 
         tracing::debug!(
             agent = "codex",
@@ -461,7 +462,8 @@ impl CodeAgent for CodexAgent {
                 env_vars: &spawn_env_vars,
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         log_codex_spawn_attempt(
             &prepared_spawn.program,
@@ -573,7 +575,8 @@ impl CodeAgent for CodexAgent {
                 env_vars: &spawn_env_vars,
                 permission_mode: req.permission_mode,
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         log_codex_spawn_attempt(
             &prepared_spawn.program,

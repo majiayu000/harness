@@ -1,17 +1,35 @@
+use super::egress::{proxy_env_keys, LEGACY_EGRESS_PROXY_ENV};
 use super::{
-    is_nested_session_env, is_spawn_control_env, DEFAULT_AGENT_CONTAINER_IMAGE,
-    REVIEW_GIT_SAFE_WORKSPACE_ENV,
+    DEFAULT_AGENT_CONTAINER_IMAGE, NESTED_SESSION_ENV_KEYS, REVIEW_GIT_SAFE_WORKSPACE_ENV,
 };
 use crate::scoped_token::{
     CONTAINER_GH_TOKEN_ENV, CONTAINER_GITHUB_TOKEN_ENV, SCOPED_GITHUB_TOKEN_ENV,
 };
 use harness_core::agent::{
-    AGENT_CONTAINER_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV,
+    AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV,
+    AGENT_NETWORK_ALLOWLIST_ENV,
 };
 use harness_core::config::isolation::IsolationTier;
 use harness_core::error::HarnessError;
 use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
 use std::collections::{BTreeMap, HashMap};
+
+fn is_nested_session_env(key: &str) -> bool {
+    NESTED_SESSION_ENV_KEYS.contains(&key)
+}
+
+fn is_spawn_control_env(key: &str) -> bool {
+    matches!(
+        key,
+        AGENT_ISOLATION_TIER_ENV
+            | AGENT_NETWORK_ALLOWLIST_ENV
+            | AGENT_CONTAINER_IMAGE_ENV
+            | LEGACY_EGRESS_PROXY_ENV
+            | AGENT_EGRESS_PROXY_IMAGE_ENV
+            | SCOPED_GITHUB_TOKEN_ENV
+            | REVIEW_GIT_SAFE_WORKSPACE_ENV
+    ) || proxy_env_keys().contains(&key)
+}
 
 pub(super) fn isolation_tier(
     env_vars: &HashMap<String, String>,
