@@ -220,6 +220,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     correction_only,
                 );
                 let egress_evidence = AgentEgressEvidence::from_spawn_env(
+                    job.runtime_kind,
                     permission_profile.permission_mode,
                     &env_vars,
                 );

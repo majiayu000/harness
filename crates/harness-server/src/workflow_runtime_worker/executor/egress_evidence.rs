@@ -1,7 +1,7 @@
 use harness_core::agent::{AgentEgressMode, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
 use harness_core::config::agents::AgentPermissionMode;
 use harness_core::types::{Item, TurnStatus};
-use harness_workflow::runtime::ActivityArtifact;
+use harness_workflow::runtime::{ActivityArtifact, RuntimeKind};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -13,17 +13,39 @@ enum EgressVerificationResult {
     Failed,
     Unverified,
     NotRequired,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecordedEgressMode {
+    DenyAll,
+    FirstPartyProxy,
+    Unrestricted,
+    NotApplicable,
+}
+
+impl From<AgentEgressMode> for RecordedEgressMode {
+    fn from(mode: AgentEgressMode) -> Self {
+        match mode {
+            AgentEgressMode::DenyAll => Self::DenyAll,
+            AgentEgressMode::FirstPartyProxy => Self::FirstPartyProxy,
+            AgentEgressMode::Unrestricted => Self::Unrestricted,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AgentEgressEvidence {
-    mode: AgentEgressMode,
+    runtime_kind: RuntimeKind,
+    mode: RecordedEgressMode,
     network_allowlist: Vec<String>,
     isolation_tier: String,
 }
 
 impl AgentEgressEvidence {
     pub(super) fn from_spawn_env(
+        runtime_kind: RuntimeKind,
         permission_mode: AgentPermissionMode,
         env_vars: &HashMap<String, String>,
     ) -> Self {
@@ -44,7 +66,12 @@ impl AgentEgressEvidence {
             .unwrap_or("host")
             .to_string();
         Self {
-            mode: AgentEgressMode::resolve(permission_mode, &network_allowlist),
+            runtime_kind,
+            mode: if runtime_kind == RuntimeKind::AnthropicApi {
+                RecordedEgressMode::NotApplicable
+            } else {
+                AgentEgressMode::resolve(permission_mode, &network_allowlist).into()
+            },
             network_allowlist,
             isolation_tier,
         }
@@ -52,16 +79,17 @@ impl AgentEgressEvidence {
 
     pub(super) fn artifact(&self, status: TurnStatus, items: &[Item]) -> ActivityArtifact {
         let verification_result = match self.mode {
-            AgentEgressMode::DenyAll | AgentEgressMode::Unrestricted => {
+            RecordedEgressMode::NotApplicable => EgressVerificationResult::NotApplicable,
+            RecordedEgressMode::DenyAll | RecordedEgressMode::Unrestricted => {
                 EgressVerificationResult::NotRequired
             }
-            AgentEgressMode::FirstPartyProxy if has_egress_error(items) => {
+            RecordedEgressMode::FirstPartyProxy if has_egress_error(items) => {
                 EgressVerificationResult::Failed
             }
-            AgentEgressMode::FirstPartyProxy if status == TurnStatus::Completed => {
+            RecordedEgressMode::FirstPartyProxy if status == TurnStatus::Completed => {
                 EgressVerificationResult::VerifiedAtDispatch
             }
-            AgentEgressMode::FirstPartyProxy => EgressVerificationResult::Unverified,
+            RecordedEgressMode::FirstPartyProxy => EgressVerificationResult::Unverified,
         };
         ActivityArtifact::new(
             "agent_egress_enforcement",
@@ -70,6 +98,7 @@ impl AgentEgressEvidence {
                 "verification_result": verification_result,
                 "network_allowlist": self.network_allowlist,
                 "isolation_tier": self.isolation_tier,
+                "runtime_kind": self.runtime_kind,
             }),
         )
     }
@@ -90,12 +119,13 @@ mod tests {
     use serde_json::Value;
 
     fn artifact_value(
+        runtime_kind: RuntimeKind,
         permission_mode: AgentPermissionMode,
         env_vars: HashMap<String, String>,
         status: TurnStatus,
         items: &[Item],
     ) -> Value {
-        AgentEgressEvidence::from_spawn_env(permission_mode, &env_vars)
+        AgentEgressEvidence::from_spawn_env(runtime_kind, permission_mode, &env_vars)
             .artifact(status, items)
             .artifact
     }
@@ -115,6 +145,7 @@ mod tests {
 
         assert_eq!(
             artifact_value(
+                RuntimeKind::CodexJsonrpc,
                 AgentPermissionMode::Scoped,
                 env_vars,
                 TurnStatus::Completed,
@@ -125,6 +156,7 @@ mod tests {
                 "verification_result": "verified_at_dispatch",
                 "network_allowlist": ["api.openai.com", "github.com"],
                 "isolation_tier": "container",
+                "runtime_kind": "codex_jsonrpc",
             })
         );
     }
@@ -142,6 +174,7 @@ mod tests {
 
         assert_eq!(
             artifact_value(
+                RuntimeKind::CodexJsonrpc,
                 AgentPermissionMode::Scoped,
                 env_vars,
                 TurnStatus::Failed,
@@ -160,6 +193,7 @@ mod tests {
 
         assert_eq!(
             artifact_value(
+                RuntimeKind::CodexJsonrpc,
                 AgentPermissionMode::Scoped,
                 env_vars,
                 TurnStatus::Failed,
@@ -178,10 +212,36 @@ mod tests {
             (AgentPermissionMode::Scoped, "deny_all"),
             (AgentPermissionMode::Full, "unrestricted"),
         ] {
-            let artifact = artifact_value(permission_mode, HashMap::new(), TurnStatus::Failed, &[]);
+            let artifact = artifact_value(
+                RuntimeKind::CodexJsonrpc,
+                permission_mode,
+                HashMap::new(),
+                TurnStatus::Failed,
+                &[],
+            );
             assert_eq!(artifact["mode"], expected_mode);
             assert_eq!(artifact["verification_result"], "not_required");
             assert_eq!(artifact["isolation_tier"], "host");
         }
+    }
+
+    #[test]
+    fn in_process_anthropic_api_does_not_claim_spawn_egress_enforcement() {
+        let env_vars = HashMap::from([(
+            AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
+            "api.anthropic.com".to_string(),
+        )]);
+
+        let artifact = artifact_value(
+            RuntimeKind::AnthropicApi,
+            AgentPermissionMode::Scoped,
+            env_vars,
+            TurnStatus::Completed,
+            &[],
+        );
+
+        assert_eq!(artifact["mode"], "not_applicable");
+        assert_eq!(artifact["verification_result"], "not_applicable");
+        assert_eq!(artifact["runtime_kind"], "anthropic_api");
     }
 }
