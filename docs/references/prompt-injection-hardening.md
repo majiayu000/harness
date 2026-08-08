@@ -114,6 +114,12 @@ and bubblewrap helpers cannot safely express them; operators must use container
 isolation for allowlisted Linux workloads. Proxy setup and canary failures are
 typed spawn failures and never downgrade to open networking.
 
+This boundary wraps the complete spawned CLI process, including its model API
+traffic and tool children. An empty allowlist therefore also blocks provider
+connectivity. Operators must explicitly list the selected provider endpoints;
+Harness does not create an implicit control-plane exception that a shell child
+could reuse.
+
 ### G4 — Contract-only enforcement of orchestration-table integrity
 
 `agent_must_not_edit_workflow_tables` is a statement in the packet. The

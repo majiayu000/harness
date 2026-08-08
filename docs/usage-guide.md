@@ -441,7 +441,7 @@ tool permissions are required.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `default_tier` | `"host"` | Default isolation tier: `host` or `container`; `microvm` is reserved and rejected at startup |
-| `network_allowlist` | `[]` | Exact DNS hostnames allowed through Harness's first-party proxy; scoped mode with an empty list denies network access |
+| `network_allowlist` | `[]` | Exact DNS hostnames allowed through Harness's first-party proxy; scoped mode with an empty list denies all CLI networking, including model-provider connectivity |
 | `rules` | `[]` | Trust-class routing overrides such as `non_collaborator` to `container` |
 
 The bundled proxy image defaults to `harness-egress-proxy:latest`; production
@@ -449,6 +449,12 @@ deployments should set `HARNESS_AGENT_EGRESS_PROXY_IMAGE` to an immutable image
 digest. `HARNESS_AGENT_EGRESS_PROXY` is rejected. See the
 [container tier operator guide](container-tier-operator-guide.md) for build,
 canary, fail-closed, and Linux host behavior.
+
+The proxy boundary covers the complete spawned CLI process and its tool
+children. Harness does not silently exempt model-provider traffic because a
+shell child could use the same exemption. Add every required provider endpoint
+(for example, `api.openai.com` or `api.anthropic.com`) to the exact-host list.
+On Linux, any non-empty allowlist requires `default_tier = "container"`.
 
 ### `[agents.claude]`
 

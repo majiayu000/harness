@@ -777,6 +777,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "agents.capability_profile is not configured; the scoped standard default is active; set capability_profile = \"full\" only for an explicit unrestricted opt-up"
         );
     }
+    if config.agents.resolve_permission_mode()
+        == harness_core::config::agents::AgentPermissionMode::Scoped
+        && config.isolation.network_allowlist.is_empty()
+    {
+        tracing::warn!(network_policy = "deny", "scoped CLI agents have no network access, including model-provider connectivity; configure exact provider hosts in isolation.network_allowlist and use container isolation for allowlisted Linux workloads");
+    }
     log_runtime_log_status(&logging);
 
     // Register the central base WORKFLOW.md (sibling of the loaded config file,

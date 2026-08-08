@@ -53,12 +53,13 @@ export HARNESS_AGENT_EGRESS_PROXY_IMAGE=ghcr.io/OWNER/harness-egress-proxy@sha25
 
 ## Enable Container Routing
 
-Set an isolation rule for untrusted intake. Keep trusted work on `host` unless a
-project explicitly needs the stronger tier for all tasks.
+Set an isolation rule for untrusted intake. The example uses `container` as the
+default because its non-empty allowlist must also work on Linux; macOS operators
+may use `host` for trusted work.
 
 ```toml
 [isolation]
-default_tier = "host"
+default_tier = "container"
 network_allowlist = [
   "github.com",
   "api.github.com",
@@ -83,6 +84,10 @@ harness --config harness.toml serve
 proxy container per agent and puts the agent on a unique internal Docker
 network. The proxy alone is also attached to Docker's bridge network. The
 agent therefore cannot bypass the proxy by ignoring `HTTP_PROXY`.
+
+The list governs the whole CLI process, including model-provider requests and
+tool subprocesses. Include the selected provider's required endpoints; Harness
+does not add an implicit control-plane bypass that shell tools could reuse.
 
 - Scoped mode with an empty allowlist has no network access.
 - Any non-empty allowlist uses the first-party proxy, including when the tool
