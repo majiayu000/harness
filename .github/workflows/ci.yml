@@ -78,6 +78,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Test first-party egress proxy
+        run: python3 -I -m unittest discover -s docker/egress-proxy -p 'test_proxy.py' -v
       - name: Install test dependencies
         run: python3 -I -m pip install --disable-pip-version-check 'pytest==9.0.3'
       - name: Test repository contracts
