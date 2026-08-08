@@ -15,7 +15,7 @@ const PROXY_PORT: u16 = 8080;
 const PROXY_ALIAS: &str = "egress-proxy";
 const PROXY_HEALTH_ATTEMPTS: usize = 50;
 const PROXY_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
-const PROXY_CANARY_TIMEOUT: Duration = Duration::from_secs(2);
+const PROXY_CANARY_TIMEOUT: Duration = Duration::from_secs(20);
 static EGRESS_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn proxy_env_keys() -> [&'static str; 6] {
@@ -41,8 +41,12 @@ pub(super) fn apply_proxy_env(env: &mut BTreeMap<String, String>, proxy_url: &st
 pub(super) fn container_canary_command(
     program: OsString,
     child_args: Vec<OsString>,
+    allowed_host: &str,
 ) -> Vec<OsString> {
-    const SCRIPT: &str = r#"status="$(curl --silent --show-error --noproxy '' --proxy "$HTTP_PROXY" --output /dev/null --write-out '%{http_code}' --max-time 5 http://harness-egress-canary.invalid/)" || { echo 'first-party egress proxy canary was unreachable' >&2; exit 70; }
+    const SCRIPT: &str = r#"allowed_host="$1"
+shift
+curl --silent --show-error --noproxy '' --proxy "$HTTP_PROXY" --output /dev/null --max-time 10 "https://${allowed_host}/" || { echo "first-party egress proxy could not reach allowlisted host ${allowed_host}" >&2; exit 70; }
+status="$(curl --silent --show-error --noproxy '' --proxy "$HTTP_PROXY" --output /dev/null --write-out '%{http_code}' --max-time 5 http://harness-egress-canary.invalid/)" || { echo 'first-party egress proxy canary was unreachable' >&2; exit 70; }
 if [ "$status" != "403" ]; then echo "first-party egress proxy canary returned $status instead of 403" >&2; exit 70; fi
 exec "$@""#;
     let mut args = vec![
@@ -50,6 +54,7 @@ exec "$@""#;
         OsString::from("-c"),
         OsString::from(SCRIPT),
         OsString::from("harness-egress-canary"),
+        OsString::from(allowed_host),
         program,
     ];
     args.extend(child_args);
@@ -131,6 +136,9 @@ impl EgressProxyLease {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(DEFAULT_EGRESS_PROXY_IMAGE);
+        let verification_host = allowlist.first().ok_or_else(|| {
+            agent_error("first-party egress proxy requires a non-empty allowlist")
+        })?;
         let suffix = unique_suffix();
         let container_name = format!("harness-egress-proxy-{suffix}");
         let allowlist_value = allowlist.join(",");
@@ -149,7 +157,7 @@ impl EgressProxyLease {
                 let result = (|| {
                     wait_for_proxy_health(&container_name)?;
                     let port = published_proxy_port(&container_name)?;
-                    verify_proxy_canary(port)?;
+                    verify_proxy_canary(port, verification_host)?;
                     Ok(Self {
                         route: EgressProxyRoute::host(port),
                         container_name: container_name.clone(),
@@ -312,7 +320,30 @@ fn published_proxy_port(container_name: &str) -> Result<u16, HarnessError> {
         .ok_or_else(|| agent_error("Docker did not publish the first-party proxy loopback port"))
 }
 
-fn verify_proxy_canary(port: u16) -> Result<(), HarnessError> {
+fn verify_proxy_canary(port: u16, allowed_host: &str) -> Result<(), HarnessError> {
+    let allowed_request = format!(
+        "CONNECT {allowed_host}:443 HTTP/1.1\r\nHost: {allowed_host}:443\r\nConnection: close\r\n\r\n"
+    );
+    verify_proxy_response(
+        port,
+        allowed_request.as_bytes(),
+        b"HTTP/1.1 200 Connection Established\r\n",
+        "could not reach the configured allowlisted host",
+    )?;
+    verify_proxy_response(
+        port,
+        b"GET http://harness-egress-canary.invalid/ HTTP/1.1\r\nHost: harness-egress-canary.invalid\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 403 Forbidden\r\n",
+        "did not return the required 403 refusal",
+    )
+}
+
+fn verify_proxy_response(
+    port: u16,
+    request: &[u8],
+    expected_status: &[u8],
+    failure: &str,
+) -> Result<(), HarnessError> {
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     let mut stream = TcpStream::connect_timeout(&address.into(), PROXY_CANARY_TIMEOUT)
         .map_err(|error| agent_error(format!("egress proxy canary could not connect: {error}")))?;
@@ -320,25 +351,20 @@ fn verify_proxy_canary(port: u16) -> Result<(), HarnessError> {
         .set_read_timeout(Some(PROXY_CANARY_TIMEOUT))
         .map_err(|error| agent_error(format!("egress proxy canary setup failed: {error}")))?;
     stream
-        .write_all(
-            b"GET http://harness-egress-canary.invalid/ HTTP/1.1\r\nHost: harness-egress-canary.invalid\r\nConnection: close\r\n\r\n",
-        )
+        .write_all(request)
         .map_err(|error| agent_error(format!("egress proxy canary write failed: {error}")))?;
     let response = read_canary_response(&mut stream)?;
-    if response.starts_with(b"HTTP/1.1 403 Forbidden\r\n") {
+    if response.starts_with(expected_status) {
         Ok(())
     } else {
-        Err(agent_error(
-            "egress proxy canary did not return the required 403 refusal",
-        ))
+        Err(agent_error(format!("egress proxy canary {failure}")))
     }
 }
 
 fn read_canary_response(reader: &mut impl Read) -> Result<Vec<u8>, HarnessError> {
     let mut response = vec![0_u8; 128];
     let mut total_read = 0;
-    let expected = b"HTTP/1.1 403 Forbidden\r\n";
-    while total_read < expected.len() {
+    while total_read < response.len() && !response[..total_read].ends_with(b"\r\n") {
         let size = reader
             .read(&mut response[total_read..])
             .map_err(|error| agent_error(format!("egress proxy canary read failed: {error}")))?;

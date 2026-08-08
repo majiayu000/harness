@@ -240,9 +240,15 @@ impl AgentSpawnContract for ContainerSpawn {
         }
         args.push(OsString::from(image));
         if egress_route.is_some_and(EgressProxyRoute::requires_container_canary) {
+            let verification_host = allowlist.first().ok_or_else(|| {
+                HarnessError::AgentExecution(
+                    "first-party egress proxy requires a non-empty allowlist".to_string(),
+                )
+            })?;
             args.extend(container_canary_command(
                 container_program(input.program),
                 child_args,
+                verification_host,
             ));
         } else {
             args.push(container_program(input.program));
@@ -477,6 +483,10 @@ mod container_spawn_tests {
         assert!(args
             .iter()
             .any(|arg| arg.contains("canary returned $status")));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("could not reach allowlisted host")));
+        assert!(args.contains(&"github.com".to_string()));
         assert!(args.contains(&"claude".to_string()));
         assert!(!args.iter().any(|arg| arg.contains("EGRESS_ALLOWLIST")));
         Ok(())
