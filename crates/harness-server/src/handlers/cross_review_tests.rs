@@ -179,6 +179,39 @@ fn proj_dir() -> tempfile::TempDir {
         .expect("create temp dir")
 }
 
+#[test]
+fn configured_review_request_preserves_policy_and_explicit_tool_scope() {
+    let mut config = HarnessConfig::default();
+    config.agents.capability_profile = harness_core::config::agents::CapabilityProfile::Full;
+    config.isolation.default_tier = harness_core::config::isolation::IsolationTier::Container;
+    config.isolation.network_allowlist = vec!["api.anthropic.com".to_string()];
+
+    let request = configured_review_request(
+        &config,
+        "review".to_string(),
+        PathBuf::from("/tmp/project"),
+        &Some(Vec::new()),
+    );
+
+    assert_eq!(
+        request.permission_mode,
+        harness_core::config::agents::AgentPermissionMode::Full
+    );
+    assert_eq!(request.allowed_tools, Some(Vec::new()));
+    assert_eq!(
+        request
+            .env_vars
+            .get(harness_core::agent::AGENT_ISOLATION_TIER_ENV),
+        Some(&"container".to_string())
+    );
+    assert_eq!(
+        request
+            .env_vars
+            .get(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV),
+        Some(&"api.anthropic.com".to_string())
+    );
+}
+
 #[tokio::test]
 async fn two_agents_extract_consensus_and_contested() {
     let proj = proj_dir();
@@ -189,6 +222,7 @@ async fn two_agents_extract_consensus_and_contested() {
         "fn foo() {}".to_string(),
         3,
         None,
+        &HarnessConfig::default(),
     )
     .await
     .expect("run_cross_review should succeed");
@@ -213,6 +247,7 @@ async fn single_agent_graceful_degradation() {
         "fn foo() {}".to_string(),
         3,
         None,
+        &HarnessConfig::default(),
     )
     .await
     .expect("single-agent should succeed");
@@ -238,6 +273,7 @@ async fn approved_when_no_issues() {
         "fn foo() {}".to_string(),
         3,
         None,
+        &HarnessConfig::default(),
     )
     .await
     .expect("lgtm path should succeed");
@@ -283,6 +319,7 @@ async fn live_task_persists_raw_before_compressing_challenger_input() {
         2,
         Some(vec![]),
         Some(&context),
+        &HarnessConfig::default(),
     )
     .await
     .unwrap();
@@ -328,6 +365,7 @@ async fn persistence_failure_bypasses_compressor_and_injects_raw() {
         2,
         Some(vec![]),
         Some(&context),
+        &HarnessConfig::default(),
     )
     .await
     .unwrap();
@@ -375,6 +413,7 @@ async fn single_round_skips_unused_persistence_and_compression() {
         1,
         Some(vec![]),
         Some(&context),
+        &HarnessConfig::default(),
     )
     .await
     .unwrap();
@@ -398,6 +437,7 @@ async fn raw_wrapper_keeps_challenger_input_uncompressed() {
         "target".to_string(),
         2,
         Some(vec![]),
+        &HarnessConfig::default(),
     )
     .await
     .unwrap();
@@ -447,6 +487,7 @@ async fn tagless_challenger_reply_is_protocol_failure_not_approval() {
         "fn foo() {}".to_string(),
         3,
         None,
+        &HarnessConfig::default(),
     )
     .await
     .expect("protocol failure is a verdict, not an error");
@@ -471,6 +512,7 @@ async fn false_positive_only_reply_is_a_valid_approving_round() {
         "fn foo() {}".to_string(),
         3,
         None,
+        &HarnessConfig::default(),
     )
     .await
     .expect("false-positive-only round should succeed");
@@ -490,6 +532,7 @@ async fn single_round_with_challenger_is_not_a_protocol_failure() {
         "fn foo() {}".to_string(),
         1,
         None,
+        &HarnessConfig::default(),
     )
     .await
     .expect("single-round review should succeed");

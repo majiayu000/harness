@@ -3,7 +3,7 @@ use crate::observation_compression::{
 };
 use crate::task_runner::TaskId;
 use crate::{http::AppState, validate_root};
-use harness_core::{agent::AgentRequest, agent::CodeAgent};
+use harness_core::{agent::AgentRequest, agent::CodeAgent, config::HarnessConfig};
 use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -114,11 +114,20 @@ pub async fn cross_review(
     let challenger = distinct_challenger(&primary, state.core.server.agent_registry.get("codex"));
     let rounds = max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
 
-    let result =
-        match run_cross_review(primary, challenger, project_root, target, rounds, None).await {
-            Ok(r) => r,
-            Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
-        };
+    let result = match run_cross_review(
+        primary,
+        challenger,
+        project_root,
+        target,
+        rounds,
+        None,
+        &state.core.server.config,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return RpcResponse::error(id, INTERNAL_ERROR, e),
+    };
 
     match serde_json::to_value(&result) {
         Ok(v) => RpcResponse::success(id, v),
@@ -136,7 +145,7 @@ pub async fn cross_review(
 /// 4. Returns APPROVED when no consensus issues remain; NOT_CONVERGED after max rounds.
 ///
 /// `allowed_tools` controls agent execution permissions:
-/// - `None`        → Full profile (`--dangerously-skip-permissions`). Use for interactive calls.
+/// - `None`        → Use the operator-configured capability profile.
 /// - `Some(tools)` → Restricted to the listed tools. Pass `Some(vec![])` to deny all tools
 ///   (read-only text review where all content is in the prompt).
 pub async fn run_cross_review(
@@ -146,6 +155,7 @@ pub async fn run_cross_review(
     target: String,
     max_rounds: u32,
     allowed_tools: Option<Vec<String>>,
+    config: &HarnessConfig,
 ) -> Result<CrossReviewResult, String> {
     run_cross_review_with_context(
         primary,
@@ -155,6 +165,7 @@ pub async fn run_cross_review(
         max_rounds,
         allowed_tools,
         None,
+        config,
     )
     .await
 }
@@ -167,17 +178,15 @@ pub(crate) async fn run_cross_review_with_context(
     max_rounds: u32,
     allowed_tools: Option<Vec<String>>,
     compression: Option<&CrossReviewCompressionContext>,
+    config: &HarnessConfig,
 ) -> Result<CrossReviewResult, String> {
     let safe_target = harness_core::prompts::wrap_external_data(&target);
     let primary_prompt = harness_core::prompts::cross_review::primary_review_prompt(&safe_target);
 
+    let primary_request =
+        configured_review_request(config, primary_prompt, project_root.clone(), &allowed_tools);
     let primary_resp = primary
-        .execute(AgentRequest {
-            prompt: primary_prompt,
-            project_root: project_root.clone(),
-            allowed_tools: allowed_tools.clone(),
-            ..Default::default()
-        })
+        .execute(primary_request)
         .await
         .map_err(|e| e.to_string())?;
     let primary_review = primary_resp.output;
@@ -270,13 +279,14 @@ pub(crate) async fn run_cross_review_with_context(
         let challenge_prompt =
             harness_core::prompts::cross_review::challenger_prompt(&safe_primary, &outstanding);
 
+        let challenger_request = configured_review_request(
+            config,
+            challenge_prompt,
+            project_root.clone(),
+            &allowed_tools,
+        );
         let resp = challenger
-            .execute(AgentRequest {
-                prompt: challenge_prompt,
-                project_root: project_root.clone(),
-                allowed_tools: allowed_tools.clone(),
-                ..Default::default()
-            })
+            .execute(challenger_request)
             .await
             .map_err(|e| e.to_string())?;
         challenger_review = resp.output;
@@ -382,6 +392,24 @@ pub(crate) async fn run_cross_review_with_context(
         final_verdict: CrossReviewVerdict::NotConverged,
         protocol_failure: None,
     })
+}
+
+fn configured_review_request(
+    config: &HarnessConfig,
+    prompt: String,
+    project_root: PathBuf,
+    allowed_tools: &Option<Vec<String>>,
+) -> AgentRequest {
+    let mut request = AgentRequest {
+        prompt,
+        project_root,
+        ..Default::default()
+    };
+    request.apply_configured_policy(config);
+    if let Some(tools) = allowed_tools {
+        request.allowed_tools = Some(tools.clone());
+    }
+    request
 }
 
 /// Identity guard (GH-1767): a challenger resolving to the same agent

@@ -2,7 +2,7 @@ use crate::{http::AppState, validate_root};
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use harness_core::agent::{AgentRequest, CodeAgent, TaskComplexity};
-use harness_core::config::agents::CapabilityProfile;
+use harness_core::config::{agents::CapabilityProfile, HarnessConfig};
 use harness_core::types::{Event, EventFilters, SessionId};
 use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR};
 use harness_rules::engine::RuleEngine;
@@ -48,6 +48,7 @@ pub async fn run_preflight(
     skills: Arc<RwLock<SkillStore>>,
     rules: Arc<RwLock<RuleEngine>>,
     events: Arc<harness_observe::event_store::EventStore>,
+    config: &HarnessConfig,
     project_root: PathBuf,
     task_description: String,
 ) -> anyhow::Result<PreflightResult> {
@@ -97,12 +98,7 @@ pub async fn run_preflight(
     } else {
         prompt
     };
-    let req = AgentRequest {
-        prompt,
-        project_root,
-        allowed_tools: CapabilityProfile::ReadOnly.tools(),
-        ..Default::default()
-    };
+    let req = configured_preflight_request(config, prompt, project_root);
 
     let resp = agent.execute(req).await?;
     let parsed = parse_preflight_output(&resp.output)?;
@@ -117,6 +113,21 @@ pub async fn run_preflight(
         baseline_scan_session_id: baseline.session_id,
         recommended_complexity: parsed.recommended_complexity,
     })
+}
+
+fn configured_preflight_request(
+    config: &HarnessConfig,
+    prompt: String,
+    project_root: PathBuf,
+) -> AgentRequest {
+    let mut request = AgentRequest {
+        prompt,
+        project_root,
+        ..Default::default()
+    };
+    request.apply_configured_policy(config);
+    request.allowed_tools = CapabilityProfile::ReadOnly.tools();
+    request
 }
 
 fn parse_preflight_output(output: &str) -> anyhow::Result<ParsedPreflightOutput> {
@@ -224,6 +235,7 @@ pub async fn preflight(
         state.engines.skills.clone(),
         state.engines.rules.clone(),
         state.observability.events.clone(),
+        &state.core.server.config,
         project_root,
         task_description,
     )
@@ -286,6 +298,38 @@ AFFECTED_FILES:\n- src/lib.rs\n- src/handler.rs\n\
 RISK: medium\n\
 COMPLEXITY: complex"
             .to_string()
+    }
+
+    #[test]
+    fn preflight_request_applies_policy_before_read_only_tool_scope() {
+        let mut config = HarnessConfig::default();
+        config.agents.capability_profile = harness_core::config::agents::CapabilityProfile::Full;
+        config.isolation.default_tier = harness_core::config::isolation::IsolationTier::Container;
+        config.isolation.network_allowlist = vec!["api.openai.com".to_string()];
+
+        let request = configured_preflight_request(
+            &config,
+            "preflight".to_string(),
+            PathBuf::from("/tmp/project"),
+        );
+
+        assert_eq!(
+            request.permission_mode,
+            harness_core::config::agents::AgentPermissionMode::Full
+        );
+        assert_eq!(request.allowed_tools, CapabilityProfile::ReadOnly.tools());
+        assert_eq!(
+            request
+                .env_vars
+                .get(harness_core::agent::AGENT_ISOLATION_TIER_ENV),
+            Some(&"container".to_string())
+        );
+        assert_eq!(
+            request
+                .env_vars
+                .get(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV),
+            Some(&"api.openai.com".to_string())
+        );
     }
 
     #[test]
@@ -435,6 +479,7 @@ COMPLEXITY: complex"
             Arc::new(RwLock::new(SkillStore::new())),
             Arc::new(RwLock::new(RuleEngine::new())),
             events,
+            &HarnessConfig::default(),
             temp.path().to_path_buf(),
             "test task".to_string(),
         )
@@ -463,6 +508,7 @@ COMPLEXITY: complex"
             Arc::new(RwLock::new(SkillStore::new())),
             Arc::new(RwLock::new(RuleEngine::new())),
             Arc::new(harness_observe::event_store::EventStore::new(temp.path()).await?),
+            &HarnessConfig::default(),
             temp.path().to_path_buf(),
             "test task".to_string(),
         )
@@ -491,6 +537,7 @@ COMPLEXITY: complex"
             Arc::new(RwLock::new(SkillStore::new())),
             Arc::new(RwLock::new(RuleEngine::new())),
             Arc::new(harness_observe::event_store::EventStore::new(temp.path()).await?),
+            &HarnessConfig::default(),
             temp.path().to_path_buf(),
             "test task".to_string(),
         )

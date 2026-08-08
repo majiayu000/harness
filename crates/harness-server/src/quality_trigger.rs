@@ -2,7 +2,7 @@ use crate::handlers::cross_review::run_cross_review_with_context;
 use crate::observation_compression::{completion_observation_session, RawObservationSink};
 use chrono::{Duration as ChronoDuration, Utc};
 use harness_core::agent::CodeAgent;
-use harness_core::config::misc::AutoAdoptPolicy;
+use harness_core::config::{misc::AutoAdoptPolicy, HarnessConfig};
 use harness_core::types::TaskId;
 use harness_core::types::{Capability, EventFilters, Grade, Project};
 use harness_gc::gc_agent::GcAgent;
@@ -47,6 +47,7 @@ pub struct QualityTrigger {
     auto_adopt: AutoAdoptPolicy,
     auto_adopt_path_prefix: String,
     gc_run_timeout_secs: u64,
+    agent_config: HarnessConfig,
 }
 
 impl QualityTrigger {
@@ -62,6 +63,7 @@ impl QualityTrigger {
         auto_adopt: AutoAdoptPolicy,
         auto_adopt_path_prefix: String,
         gc_run_timeout_secs: u64,
+        agent_config: HarnessConfig,
     ) -> Self {
         Self {
             events,
@@ -75,6 +77,7 @@ impl QualityTrigger {
             auto_adopt,
             auto_adopt_path_prefix,
             gc_run_timeout_secs,
+            agent_config,
         }
     }
 
@@ -254,6 +257,7 @@ impl QualityTrigger {
                                     2,
                                     Some(vec![]),
                                     compression,
+                                    &self.agent_config,
                                 ),
                             )
                             .await
