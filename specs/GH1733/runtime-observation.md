@@ -686,19 +686,19 @@ ABI gate does the owner reject closed `RuntimeTransitiveExecutionClass`:
   `io_uring_setup`, `pidfd_getfd`, `recvmsg`, `recvmmsg`, `prctl`, every
   `personality` argument other than the side-effect-free exact
   `0xffff_ffff` query,
-  `creat`, or `open`/`openat`/`open_by_handle_at`/`openat2` whose flags request
-  `O_WRONLY`, `O_RDWR`, or `O_TRUNC`;
-- `KernelModuleLoading`: native `init_module` or `finit_module`, regardless of
-  current capabilities; and
+  `creat`, every `openat2`, or `open`/`openat`/`open_by_handle_at` whose flags
+  request `O_WRONLY`, `O_RDWR`, or `O_TRUNC`;
+- `KernelCodeLoading`: native `bpf`, `init_module`, or `finit_module`,
+  regardless of command or current capabilities; and
 - `ProcessSignalling`: `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`,
   `rt_tgsigqueueinfo`, or `pidfd_send_signal`, for every target, signal, PID,
   TID, pidfd, zero, negative, process-group, and broadcast form.
 
-The fixed-size `open_how` prefix used by `openat2` is copied from the stopped
-single-threaded target with one bounded `process_vm_readv`; an unreadable
-pointer, a size smaller than the flags field, nonzero unknown tail bytes, or
-unknown/conflicting flag bits is `ExecutionVerificationUnavailable`. It is
-never resumed as a read-only open. Descriptor isolation proves that the target
+Every `openat2` entry is denied without reading `open_how`. A cooperating
+same-UID process therefore cannot mutate attacker-owned argument memory between
+classification and kernel consumption. Denying native `bpf` in full prevents
+program loading and later attachment from bypassing the initial-image-only
+contract. Descriptor isolation proves that the target
 inherits no writable memory fd or Unix socket. Denying every later
 write-capable open blocks `/proc/self/mem`, `/proc/thread-self/mem`, numeric
 proc aliases, and mount aliases without parsing an attacker-controlled
