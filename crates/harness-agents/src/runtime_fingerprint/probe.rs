@@ -249,17 +249,39 @@ fn validate_ptrace_capability(
     {
         return Err(());
     }
-    let first_op = ptrace_syscall_info_op(pid).filter(|op| matches!(op, 1 | 2));
+    let first_stop = super::syscall_guard::read_syscall_stop(pid);
     // SAFETY: resume to the alternating tagged syscall stop.
-    if first_op.is_none()
+    if first_stop.is_none()
         || unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) } != 0
         || !waitid_pidfd_stop(pidfd, pid, deadline)
     {
         return Err(());
     }
-    let second_op = ptrace_syscall_info_op(pid).filter(|op| matches!(op, 1 | 2));
-    if second_op.is_none()
-        || first_op == second_op
+    let second_stop = super::syscall_guard::read_syscall_stop(pid);
+    let alternating = matches!(
+        (first_stop, second_stop),
+        (
+            Some(super::syscall_guard::SyscallStop::Entry { .. }),
+            Some(super::syscall_guard::SyscallStop::Exit)
+        ) | (
+            Some(super::syscall_guard::SyscallStop::Exit),
+            Some(super::syscall_guard::SyscallStop::Entry { .. })
+        )
+    );
+    let entry_allowed = [first_stop, second_stop]
+        .into_iter()
+        .all(|stop| match stop {
+            Some(super::syscall_guard::SyscallStop::Entry { number, arguments }) => {
+                matches!(
+                    super::syscall_guard::denied_class(number, arguments),
+                    Ok(None)
+                )
+            }
+            Some(super::syscall_guard::SyscallStop::Exit) => true,
+            None => false,
+        });
+    if !alternating
+        || !entry_allowed
         // SAFETY: detach resumes the exact traced child without injecting a signal.
         || unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) } != 0
     {
@@ -293,20 +315,6 @@ fn waitid_pidfd_stop(pidfd: libc::c_int, pid: libc::pid_t, deadline: Instant) ->
         }
         std::thread::yield_now();
     }
-}
-
-fn ptrace_syscall_info_op(pid: libc::pid_t) -> Option<u8> {
-    let mut info = [0_u8; 128];
-    // SAFETY: the registered child is in a ptrace syscall stop and info is a bounded output frame.
-    let size = unsafe {
-        libc::ptrace(
-            libc::PTRACE_GET_SYSCALL_INFO,
-            pid,
-            info.len(),
-            info.as_mut_ptr(),
-        )
-    };
-    (size > 0).then_some(info[0])
 }
 
 pub(super) fn registration_error(

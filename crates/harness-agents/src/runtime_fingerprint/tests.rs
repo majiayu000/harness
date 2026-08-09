@@ -704,3 +704,57 @@ fn linux_pre_spawn_checkpoint_detects_in_place_content_change() {
         checkpoint::PreSpawnCheckpoint::IdentityChanged
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_syscall_guard_freezes_every_denied_class_and_safe_queries() {
+    use harness_core::stack::fingerprint::RuntimeProbeFailureDetail as D;
+
+    let mut arguments = [0_u64; 6];
+    #[cfg(target_arch = "x86_64")]
+    let cases = [
+        (56, D::ProcessCreation),
+        (59, D::ImageExecution),
+        (134, D::ExecutableMapping),
+        (437, D::ExecutableImageMutation),
+        (321, D::KernelCodeLoading),
+        (62, D::ProcessSignalling),
+    ];
+    #[cfg(target_arch = "aarch64")]
+    let cases = [
+        (220, D::ProcessCreation),
+        (221, D::ImageExecution),
+        (437, D::ExecutableImageMutation),
+        (280, D::KernelCodeLoading),
+        (129, D::ProcessSignalling),
+    ];
+    for (number, expected) in cases {
+        assert_eq!(
+            syscall_guard::denied_class(number, arguments),
+            Ok(Some(expected))
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        arguments[2] = libc::PROT_EXEC as u64;
+        assert_eq!(
+            syscall_guard::denied_class(222, arguments),
+            Ok(Some(D::ExecutableMapping))
+        );
+    }
+    arguments = [0; 6];
+    arguments[0] = u64::from(u32::MAX);
+    let personality = if cfg!(target_arch = "x86_64") {
+        135
+    } else {
+        92
+    };
+    assert_eq!(
+        syscall_guard::denied_class(personality, arguments),
+        Ok(None)
+    );
+    assert_eq!(syscall_guard::denied_class(0, [0; 6]), Ok(None));
+
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(syscall_guard::denied_class(0x4000_0000, [0; 6]), Err(()));
+}
