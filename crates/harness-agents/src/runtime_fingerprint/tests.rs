@@ -661,3 +661,46 @@ async fn linux_target_authorization_rejects_multiple_hard_links() {
         "multiple_hard_links"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_pre_spawn_checkpoint_detects_in_place_content_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = tempfile::tempdir().unwrap();
+    let executable = write_static_fixture(directory.path(), "changing-runtime");
+    let deadline = std::time::Instant::now() + RUNTIME_FINGERPRINT_PROBE_DEADLINE;
+    let working_directory =
+        executable::observe_working_directory(directory.path(), deadline).unwrap();
+    let command =
+        executable::prepare_command(executable.as_os_str(), directory.path(), None).unwrap();
+    let retained =
+        match candidate::observe_candidate(&command.candidates[0], &working_directory, deadline)
+            .unwrap()
+        {
+            candidate::CandidateObservation::Retained(retained) => retained,
+            other => panic!("expected retained candidate, got {other:?}"),
+        };
+    let mut changed = static_elf_fixture(if cfg!(target_arch = "x86_64") {
+        62
+    } else {
+        183
+    });
+    changed.push(1);
+    std::fs::write(&executable, changed).unwrap();
+    let boundaries = ValidatedRepositoryBoundarySet::from_existing_roots(
+        repository.path(),
+        std::iter::empty::<&Path>(),
+    )
+    .unwrap();
+    assert_eq!(
+        checkpoint::pre_spawn(
+            &command.candidates[0],
+            &working_directory,
+            &retained,
+            &boundaries,
+            deadline,
+        )
+        .unwrap(),
+        checkpoint::PreSpawnCheckpoint::IdentityChanged
+    );
+}

@@ -189,7 +189,7 @@ fn child_observe_candidate(
         child_status_exit(status[1], super::probe::CHILD_SIGNAL_FAILED);
     }
     let retained_directory = (directory_fd != libc::AT_FDCWD).then_some(directory_fd);
-    let isolation = child_isolate(gate[0], status[1], protocol[1], retained_directory);
+    let isolation = child_isolate(gate[0], status[1], protocol[1], [retained_directory, None]);
     if isolation != super::probe::CHILD_READY {
         child_status_exit(status[1], isolation);
     }
@@ -297,6 +297,10 @@ fn child_hash(fd: libc::c_int) -> Result<[u8; 32], u8> {
             .checked_add(read as u64)
             .ok_or(STATUS_EXECUTABLE_TOO_LARGE)?;
     }
+}
+
+pub(super) fn child_checkpoint_hash(fd: libc::c_int) -> Option<[u8; 32]> {
+    child_hash(fd).ok()
 }
 
 fn child_static_elf_is_supported(fd: libc::c_int) -> bool {
@@ -425,15 +429,20 @@ pub(super) fn child_isolate(
     gate: libc::c_int,
     status: libc::c_int,
     protocol: libc::c_int,
-    directory: Option<libc::c_int>,
+    extras: [Option<libc::c_int>; 2],
 ) -> u8 {
-    let mut allowed = [gate as u32, status as u32, protocol as u32, u32::MAX];
-    let count = if let Some(directory) = directory {
-        allowed[3] = directory as u32;
-        4
-    } else {
-        3
-    };
+    let mut allowed = [
+        gate as u32,
+        status as u32,
+        protocol as u32,
+        u32::MAX,
+        u32::MAX,
+    ];
+    let mut count = 3;
+    for descriptor in extras.into_iter().flatten() {
+        allowed[count] = descriptor as u32;
+        count += 1;
+    }
     allowed[..count].sort_unstable();
     let mut start = 0_u32;
     for descriptor in allowed[..count].iter().copied() {
@@ -509,7 +518,7 @@ fn child_send(
     unsafe { libc::_exit(if sent == frame.len() as isize { 0 } else { 133 }) }
 }
 
-fn stat_link_count(metadata: &libc::stat) -> u64 {
+pub(super) fn stat_link_count(metadata: &libc::stat) -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
         u64::from(metadata.st_nlink)

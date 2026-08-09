@@ -2,6 +2,7 @@
 
 use super::authorization::TargetAuthorization;
 use super::candidate::{CandidateObservation, RetainedExecutable};
+use super::checkpoint::PreSpawnCheckpoint;
 use super::environment::SelectedEnvironment;
 use super::executable::{PreparedCommand, ResolvedCandidate, RetainedWorkingDirectory};
 use super::{
@@ -183,6 +184,82 @@ pub(super) fn resolve(
                             }
                             TargetAuthorization::Authorized
                             | TargetAuthorization::ResolvedTargetRepository => {
+                                return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+                            }
+                        };
+                        attempts.push(attempt(
+                            candidate,
+                            RuntimeResolutionAttemptOutcome::AuthorizationUnavailable,
+                        )?);
+                        return complete_with(
+                            configured,
+                            environment,
+                            command,
+                            working_directory,
+                            attempts,
+                            RuntimeProbeFailure::with_detail(
+                                RuntimeProbeFailureKind::TargetAuthorizationUnavailable,
+                                detail,
+                            )?,
+                        );
+                    }
+                }
+                match super::checkpoint::pre_spawn(
+                    candidate,
+                    working_directory,
+                    &executable,
+                    boundaries,
+                    deadline,
+                )? {
+                    PreSpawnCheckpoint::Consistent => {}
+                    PreSpawnCheckpoint::IdentityChanged => {
+                        attempts.push(attempt(
+                            candidate,
+                            RuntimeResolutionAttemptOutcome::InspectionFailed,
+                        )?);
+                        return complete_with(
+                            configured,
+                            environment,
+                            command,
+                            working_directory,
+                            attempts,
+                            RuntimeProbeFailure::new(RuntimeProbeFailureKind::IdentityChanged)?,
+                        );
+                    }
+                    PreSpawnCheckpoint::ResolvedTargetRepository => {
+                        attempts.push(attempt(
+                            candidate,
+                            RuntimeResolutionAttemptOutcome::InspectionTarget,
+                        )?);
+                        return complete_with(
+                            configured,
+                            environment,
+                            command,
+                            working_directory,
+                            attempts,
+                            RuntimeProbeFailure::with_detail(
+                                RuntimeProbeFailureKind::ProbeNotAuthorized,
+                                RuntimeProbeFailureDetail::ResolvedTargetRepository,
+                            )?,
+                        );
+                    }
+                    checkpoint => {
+                        let detail = match checkpoint {
+                            PreSpawnCheckpoint::BoundaryUnprovable => {
+                                RuntimeProbeFailureDetail::BoundaryUnprovable
+                            }
+                            PreSpawnCheckpoint::LinkCountUnprovable => {
+                                RuntimeProbeFailureDetail::LinkCountUnprovable
+                            }
+                            PreSpawnCheckpoint::UnlinkedTarget => {
+                                RuntimeProbeFailureDetail::UnlinkedTarget
+                            }
+                            PreSpawnCheckpoint::MultipleHardLinks => {
+                                RuntimeProbeFailureDetail::MultipleHardLinks
+                            }
+                            PreSpawnCheckpoint::Consistent
+                            | PreSpawnCheckpoint::IdentityChanged
+                            | PreSpawnCheckpoint::ResolvedTargetRepository => {
                                 return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
                             }
                         };

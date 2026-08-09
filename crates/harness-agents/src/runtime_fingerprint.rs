@@ -7,6 +7,8 @@ mod tests;
 mod authorization;
 #[cfg(target_os = "linux")]
 mod candidate;
+#[cfg(target_os = "linux")]
+mod checkpoint;
 mod environment;
 mod executable;
 #[cfg(target_os = "linux")]

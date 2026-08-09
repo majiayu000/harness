@@ -1,6 +1,7 @@
-//! Final-path repository authorization for a retained Linux executable.
+//! Pre-spawn retained-handle and candidate-path checkpoint.
 
 use super::candidate::RetainedExecutable;
+use super::executable::{CandidateReference, ResolvedCandidate, RetainedWorkingDirectory};
 use super::{
     RuntimeFingerprintProduceError, RuntimeObservationProtocolReason,
     ValidatedRepositoryBoundarySet,
@@ -9,18 +10,19 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::time::Instant;
 
-const AUTHORIZED: u8 = 1;
-const RESOLVED_TARGET_REPOSITORY: u8 = 2;
-const BOUNDARY_UNPROVABLE: u8 = 3;
-const LINK_COUNT_UNPROVABLE: u8 = 4;
-const UNLINKED_TARGET: u8 = 5;
-const MULTIPLE_HARD_LINKS: u8 = 6;
-const IDENTITY_CHANGED: u8 = 7;
+const CONSISTENT: u8 = 1;
+const IDENTITY_CHANGED: u8 = 2;
+const RESOLVED_TARGET_REPOSITORY: u8 = 3;
+const BOUNDARY_UNPROVABLE: u8 = 4;
+const LINK_COUNT_UNPROVABLE: u8 = 5;
+const UNLINKED_TARGET: u8 = 6;
+const MULTIPLE_HARD_LINKS: u8 = 7;
 const FINAL_PATH_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TargetAuthorization {
-    Authorized,
+pub(super) enum PreSpawnCheckpoint {
+    Consistent,
+    IdentityChanged,
     ResolvedTargetRepository,
     BoundaryUnprovable,
     LinkCountUnprovable,
@@ -28,17 +30,28 @@ pub(super) enum TargetAuthorization {
     MultipleHardLinks,
 }
 
-struct AuthorizationContext<'a> {
+struct CheckpointContext<'a> {
     executable: &'a RetainedExecutable,
+    working_directory_fd: Option<libc::c_int>,
+    candidate_path: &'a CString,
     proc_fd_path: &'a CString,
     boundaries: &'a [CString],
+    expected_digest: [u8; 32],
 }
 
-pub(super) fn authorize_target(
+pub(super) fn pre_spawn(
+    candidate: &ResolvedCandidate,
+    working_directory: &RetainedWorkingDirectory,
     executable: &RetainedExecutable,
     boundaries: &ValidatedRepositoryBoundarySet,
     deadline: Instant,
-) -> Result<TargetAuthorization, RuntimeFingerprintProduceError> {
+) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
+    let (working_directory_fd, path) = match &candidate.reference {
+        CandidateReference::Absolute(path) => (None, path),
+        CandidateReference::WorkingDirectoryRelative(path) => (Some(working_directory.fd()), path),
+    };
+    let candidate_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
     let proc_fd_path = CString::new(format!("/proc/self/fd/{}", executable.fd()))
         .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
     let boundary_strings = boundaries
@@ -47,20 +60,27 @@ pub(super) fn authorize_target(
         .map(|root| CString::new(root.as_os_str().as_bytes()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
-    let context = AuthorizationContext {
-        executable,
-        proc_fd_path: &proc_fd_path,
-        boundaries: &boundary_strings,
-    };
-    run_authorization_child(&context, deadline)
+    let expected_digest = decode_digest(executable.executable_sha256.as_str())
+        .ok_or(RuntimeFingerprintProduceError::InvalidLaunchContext)?;
+    run_child(
+        &CheckpointContext {
+            executable,
+            working_directory_fd,
+            candidate_path: &candidate_path,
+            proc_fd_path: &proc_fd_path,
+            boundaries: &boundary_strings,
+            expected_digest,
+        },
+        deadline,
+    )
 }
 
-fn run_authorization_child(
-    context: &AuthorizationContext<'_>,
+fn run_child(
+    context: &CheckpointContext<'_>,
     deadline: Instant,
-) -> Result<TargetAuthorization, RuntimeFingerprintProduceError> {
+) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
     let role = super::RuntimeOwnedChildRole::Observation(
-        super::RuntimeObservationStage::TargetAuthorization,
+        super::RuntimeObservationStage::PreSpawnCheckpoint,
     );
     let mut gate = [-1; 2];
     let mut status = [-1; 2];
@@ -99,7 +119,7 @@ fn run_authorization_child(
     }
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        child_authorize(gate, status, protocol, context);
+        child_checkpoint(gate, status, protocol, context);
     }
     let restored =
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut()) };
@@ -158,26 +178,26 @@ fn run_authorization_child(
         ));
     }
     super::probe::close_fd(gate[1]);
-    let authorization = receive_authorization(protocol[0], deadline);
+    let checkpoint = receive(protocol[0], deadline);
     super::probe::close_fd(protocol[0]);
     let exited = super::probe::waitid_pidfd(pidfd, false, deadline);
     if !matches!(exited, Ok((seen, libc::CLD_EXITED, 0)) if seen == pid) {
         let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
         super::probe::cleanup_registered_child(pidfd, cleanup_deadline, role)?;
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
-            stage: super::RuntimeObservationStage::TargetAuthorization,
+            stage: super::RuntimeObservationStage::PreSpawnCheckpoint,
             reason: RuntimeObservationProtocolReason::HelperExited,
         });
     }
     super::probe::close_fd(pidfd);
-    authorization
+    checkpoint
 }
 
-fn child_authorize(
+fn child_checkpoint(
     gate: [libc::c_int; 2],
     status: [libc::c_int; 2],
     protocol: [libc::c_int; 2],
-    context: &AuthorizationContext<'_>,
+    context: &CheckpointContext<'_>,
 ) -> ! {
     if !super::probe::child_reset_signal_dispositions() {
         child_status_exit(status[1], super::probe::CHILD_SIGNAL_FAILED);
@@ -186,7 +206,7 @@ fn child_authorize(
         gate[0],
         status[1],
         protocol[1],
-        [Some(context.executable.fd()), None],
+        [Some(context.executable.fd()), context.working_directory_fd],
     );
     if isolation != super::probe::CHILD_READY {
         child_status_exit(status[1], isolation);
@@ -195,31 +215,28 @@ fn child_authorize(
         child_status_exit(status[1], super::probe::CHILD_SIGNAL_FAILED);
     }
     if super::probe::write_byte(status[1], super::probe::CHILD_READY).is_err() {
-        unsafe { libc::_exit(141) };
+        unsafe { libc::_exit(151) };
     }
     let mut go = 0_u8;
     if unsafe { libc::read(gate[0], (&mut go as *mut u8).cast(), 1) } != 1
         || go != super::probe::CHILD_GO
     {
-        unsafe { libc::_exit(142) };
+        unsafe { libc::_exit(152) };
     }
-    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(context.executable.fd(), &mut metadata) } != 0 {
+    let mut retained_metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(context.executable.fd(), &mut retained_metadata) } != 0 {
         child_send(protocol[1], LINK_COUNT_UNPROVABLE);
     }
-    let link_count = stat_link_count(&metadata);
-    if link_count == 0 {
+    let retained_links = super::candidate::stat_link_count(&retained_metadata);
+    if retained_links == 0 {
         child_send(protocol[1], UNLINKED_TARGET);
     }
-    if link_count > 1 {
+    if retained_links > 1 {
         child_send(protocol[1], MULTIPLE_HARD_LINKS);
     }
-    if metadata.st_dev != context.executable.device
-        || metadata.st_ino != context.executable.inode
-        || link_count != context.executable.link_count
-        || metadata.st_size < 0
-        || metadata.st_size as u64 != context.executable.file_size_bytes
-        || metadata.st_mode != context.executable.unix_mode
+    if !metadata_matches(&retained_metadata, context.executable)
+        || super::candidate::child_checkpoint_hash(context.executable.fd())
+            != Some(context.expected_digest)
     {
         child_send(protocol[1], IDENTITY_CHANGED);
     }
@@ -247,34 +264,73 @@ fn child_authorize(
             child_send(protocol[1], RESOLVED_TARGET_REPOSITORY);
         }
     }
-    child_send(protocol[1], AUTHORIZED);
+    let directory_fd = context.working_directory_fd.unwrap_or(libc::AT_FDCWD);
+    let reopened = unsafe {
+        libc::openat(
+            directory_fd,
+            context.candidate_path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if reopened < 0 {
+        child_send(protocol[1], IDENTITY_CHANGED);
+    }
+    let mut path_metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(reopened, &mut path_metadata) } != 0
+        || path_metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+        || path_metadata.st_mode & 0o111 == 0
+        || !metadata_matches(&path_metadata, context.executable)
+    {
+        child_send(protocol[1], IDENTITY_CHANGED);
+    }
+    child_send(protocol[1], CONSISTENT);
 }
 
-fn stat_link_count(metadata: &libc::stat) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        u64::from(metadata.st_nlink)
+fn metadata_matches(metadata: &libc::stat, executable: &RetainedExecutable) -> bool {
+    metadata.st_dev == executable.device
+        && metadata.st_ino == executable.inode
+        && super::candidate::stat_link_count(metadata) == executable.link_count
+        && metadata.st_size >= 0
+        && metadata.st_size as u64 == executable.file_size_bytes
+        && metadata.st_mode == executable.unix_mode
+}
+
+fn decode_digest(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        metadata.st_nlink
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        digest[index] = hex_nibble(pair[0])?
+            .checked_mul(16)?
+            .checked_add(hex_nibble(pair[1])?)?;
+    }
+    Some(digest)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
     }
 }
 
 fn child_status_exit(fd: libc::c_int, status: u8) -> ! {
-    let _status_result = super::probe::write_byte(fd, status);
-    unsafe { libc::_exit(140) }
+    let _result = super::probe::write_byte(fd, status);
+    unsafe { libc::_exit(150) }
 }
 
 fn child_send(fd: libc::c_int, value: u8) -> ! {
     let result = super::probe::write_byte(fd, value);
-    unsafe { libc::_exit(if result.is_ok() { 0 } else { 143 }) }
+    unsafe { libc::_exit(if result.is_ok() { 0 } else { 153 }) }
 }
 
-fn receive_authorization(
+fn receive(
     fd: libc::c_int,
     deadline: Instant,
-) -> Result<TargetAuthorization, RuntimeFingerprintProduceError> {
+) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
     let remaining = deadline
         .saturating_duration_since(Instant::now())
         .as_millis();
@@ -286,7 +342,7 @@ fn receive_authorization(
     if unsafe { libc::poll(&mut pollfd, 1, remaining.min(i32::MAX as u128) as _) } <= 0 {
         return Err(
             RuntimeFingerprintProduceError::ObservationDeadlineExceeded {
-                stage: super::RuntimeObservationStage::TargetAuthorization,
+                stage: super::RuntimeObservationStage::PreSpawnCheckpoint,
             },
         );
     }
@@ -294,7 +350,7 @@ fn receive_authorization(
     let received = unsafe { libc::recv(fd, frame.as_mut_ptr().cast(), frame.len(), 0) };
     if received != 1 {
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
-            stage: super::RuntimeObservationStage::TargetAuthorization,
+            stage: super::RuntimeObservationStage::PreSpawnCheckpoint,
             reason: if received > 1 {
                 RuntimeObservationProtocolReason::SurplusFields
             } else {
@@ -303,15 +359,15 @@ fn receive_authorization(
         });
     }
     match frame[0] {
-        AUTHORIZED => Ok(TargetAuthorization::Authorized),
-        RESOLVED_TARGET_REPOSITORY => Ok(TargetAuthorization::ResolvedTargetRepository),
-        BOUNDARY_UNPROVABLE => Ok(TargetAuthorization::BoundaryUnprovable),
-        LINK_COUNT_UNPROVABLE => Ok(TargetAuthorization::LinkCountUnprovable),
-        UNLINKED_TARGET => Ok(TargetAuthorization::UnlinkedTarget),
-        MULTIPLE_HARD_LINKS => Ok(TargetAuthorization::MultipleHardLinks),
-        IDENTITY_CHANGED => Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable),
+        CONSISTENT => Ok(PreSpawnCheckpoint::Consistent),
+        IDENTITY_CHANGED => Ok(PreSpawnCheckpoint::IdentityChanged),
+        RESOLVED_TARGET_REPOSITORY => Ok(PreSpawnCheckpoint::ResolvedTargetRepository),
+        BOUNDARY_UNPROVABLE => Ok(PreSpawnCheckpoint::BoundaryUnprovable),
+        LINK_COUNT_UNPROVABLE => Ok(PreSpawnCheckpoint::LinkCountUnprovable),
+        UNLINKED_TARGET => Ok(PreSpawnCheckpoint::UnlinkedTarget),
+        MULTIPLE_HARD_LINKS => Ok(PreSpawnCheckpoint::MultipleHardLinks),
         _ => Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
-            stage: super::RuntimeObservationStage::TargetAuthorization,
+            stage: super::RuntimeObservationStage::PreSpawnCheckpoint,
             reason: RuntimeObservationProtocolReason::SurplusFields,
         }),
     }
