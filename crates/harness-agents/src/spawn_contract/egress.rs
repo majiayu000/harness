@@ -360,12 +360,97 @@ fn verify_proxy_canary(port: u16, allowed_host: &str) -> Result<(), HarnessError
         b"HTTP/1.1 200 Connection Established\r\n",
         "could not reach the configured allowlisted host",
     )?;
+    verify_proxy_rejects_mismatched_sni(port, allowed_host)?;
     verify_proxy_response(
         port,
         b"GET http://harness-egress-canary.invalid/ HTTP/1.1\r\nHost: harness-egress-canary.invalid\r\nConnection: close\r\n\r\n",
         b"HTTP/1.1 403 Forbidden\r\n",
         "did not return the required 403 refusal",
     )
+}
+
+fn verify_proxy_rejects_mismatched_sni(port: u16, allowed_host: &str) -> Result<(), HarnessError> {
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    let mut stream =
+        TcpStream::connect_timeout(&address.into(), PROXY_CANARY_TIMEOUT).map_err(|error| {
+            agent_error(format!(
+                "egress proxy SNI canary could not connect: {error}"
+            ))
+        })?;
+    stream
+        .set_read_timeout(Some(PROXY_CANARY_TIMEOUT))
+        .map_err(|error| agent_error(format!("egress proxy SNI canary setup failed: {error}")))?;
+    let connect = format!(
+        "CONNECT {allowed_host}:443 HTTP/1.1\r\nHost: {allowed_host}:443\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(connect.as_bytes())
+        .map_err(|error| agent_error(format!("egress proxy SNI canary write failed: {error}")))?;
+    let response = read_canary_response(&mut stream)?;
+    if !response.starts_with(b"HTTP/1.1 200 Connection Established\r\n") {
+        return Err(agent_error(
+            "egress proxy SNI canary could not open the allowlisted CONNECT target",
+        ));
+    }
+
+    let mismatched_host = if allowed_host.eq_ignore_ascii_case("denied.invalid") {
+        "blocked.invalid"
+    } else {
+        "denied.invalid"
+    };
+    stream
+        .write_all(&tls_client_hello(mismatched_host)?)
+        .map_err(|error| agent_error(format!("egress proxy SNI canary write failed: {error}")))?;
+    let response = read_canary_response(&mut stream)?;
+    if response.starts_with(b"HTTP/1.1 403 Forbidden\r\n") {
+        Ok(())
+    } else {
+        Err(agent_error(
+            "egress proxy canary did not reject mismatched TLS SNI",
+        ))
+    }
+}
+
+fn tls_client_hello(server_name: &str) -> Result<Vec<u8>, HarnessError> {
+    let name = server_name.as_bytes();
+    if !server_name.is_ascii() {
+        return Err(agent_error("egress proxy SNI canary hostname is not ASCII"));
+    }
+    let name_length = u16::try_from(name.len())
+        .map_err(|_| agent_error("egress proxy SNI canary hostname is too long"))?;
+    let name_list_length = name_length
+        .checked_add(3)
+        .ok_or_else(|| agent_error("egress proxy SNI canary hostname is too long"))?;
+    let sni_payload_length = name_list_length
+        .checked_add(2)
+        .ok_or_else(|| agent_error("egress proxy SNI canary hostname is too long"))?;
+    let extensions_length = sni_payload_length
+        .checked_add(4)
+        .ok_or_else(|| agent_error("egress proxy SNI canary hostname is too long"))?;
+    let body_length = extensions_length
+        .checked_add(43)
+        .ok_or_else(|| agent_error("egress proxy SNI canary ClientHello is too long"))?;
+    let record_length = body_length
+        .checked_add(4)
+        .ok_or_else(|| agent_error("egress proxy SNI canary ClientHello is too long"))?;
+
+    let mut hello = Vec::with_capacity(usize::from(record_length) + 5);
+    hello.extend_from_slice(&[22, 3, 1]);
+    hello.extend_from_slice(&record_length.to_be_bytes());
+    hello.extend_from_slice(&[1, 0]);
+    hello.extend_from_slice(&body_length.to_be_bytes());
+    hello.extend_from_slice(&[3, 3]);
+    hello.extend_from_slice(&[0; 32]);
+    hello.push(0);
+    hello.extend_from_slice(&[0, 2, 0x13, 0x01, 1, 0]);
+    hello.extend_from_slice(&extensions_length.to_be_bytes());
+    hello.extend_from_slice(&[0, 0]);
+    hello.extend_from_slice(&sni_payload_length.to_be_bytes());
+    hello.extend_from_slice(&name_list_length.to_be_bytes());
+    hello.push(0);
+    hello.extend_from_slice(&name_length.to_be_bytes());
+    hello.extend_from_slice(name);
+    Ok(hello)
 }
 
 fn verify_proxy_response(
@@ -392,9 +477,13 @@ fn verify_proxy_response(
 }
 
 fn read_canary_response(reader: &mut impl Read) -> Result<Vec<u8>, HarnessError> {
-    let mut response = vec![0_u8; 128];
+    let mut response = vec![0_u8; 1024];
     let mut total_read = 0;
-    while total_read < response.len() && !response[..total_read].ends_with(b"\r\n") {
+    while total_read < response.len()
+        && !response[..total_read]
+            .windows(4)
+            .any(|window| window == b"\r\n\r\n")
+    {
         let size = reader
             .read(&mut response[total_read..])
             .map_err(|error| agent_error(format!("egress proxy canary read failed: {error}")))?;
@@ -461,9 +550,10 @@ fn agent_error(message: impl Into<String>) -> HarnessError {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_proxy_env, read_canary_response};
+    use super::{apply_proxy_env, read_canary_response, verify_proxy_canary};
     use std::collections::BTreeMap;
-    use std::io::{self, Read};
+    use std::io::{self, Read, Write};
+    use std::net::{Ipv4Addr, TcpListener};
 
     struct ChunkedReader<'a> {
         bytes: &'a [u8],
@@ -492,6 +582,48 @@ mod tests {
         let response = read_canary_response(&mut reader)?;
 
         assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_canary_rejects_connect_proxy_without_sni_enforcement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> io::Result<()> {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0_u8; 1];
+                    stream.read_exact(&mut byte)?;
+                    request.push(byte[0]);
+                }
+                if attempt == 0 {
+                    stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+                } else if request.starts_with(b"GET ") {
+                    stream.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")?;
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+                    let mut client_hello = [0_u8; 512];
+                    if stream.read(&mut client_hello)? == 0 {
+                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                    }
+                    stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+                }
+            }
+            Ok(())
+        });
+
+        let result = verify_proxy_canary(port, "example.com");
+        server
+            .join()
+            .map_err(|_| io::Error::other("fake proxy thread panicked"))??;
+
+        assert!(
+            result.is_err(),
+            "canary accepted a proxy that ignored TLS SNI"
+        );
         Ok(())
     }
 
