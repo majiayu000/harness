@@ -196,7 +196,7 @@ fn child_verify(
         child_send(protocol[1], VERIFICATION_UNAVAILABLE);
     }
     if !metadata_matches(&retained, context.executable)
-        || super::candidate::stat_link_count(&retained) != 1
+        || super::candidate::stat_link_count(&retained) != context.executable.link_count
         || super::candidate::child_checkpoint_hash(context.executable.fd())
             != Some(context.expected_digest)
     {
@@ -217,7 +217,7 @@ fn child_verify(
         child_send(protocol[1], VERIFICATION_UNAVAILABLE);
     }
     if !metadata_matches(&image_metadata, context.executable)
-        || super::candidate::stat_link_count(&image_metadata) != 1
+        || super::candidate::stat_link_count(&image_metadata) != context.executable.link_count
     {
         child_send(protocol[1], IDENTITY_CHANGED);
     }

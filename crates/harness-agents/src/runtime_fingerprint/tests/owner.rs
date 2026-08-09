@@ -90,6 +90,13 @@ fn global_post_ready_resource_ceiling_is_frozen() {
 }
 
 #[test]
+fn ptrace_guard_options_require_exitkill_for_capability_and_target() {
+    assert_ne!(probe::PTRACE_GUARD_OPTIONS & libc::PTRACE_O_EXITKILL, 0);
+    assert_ne!(probe::PTRACE_GUARD_OPTIONS & libc::PTRACE_O_TRACEEXEC, 0);
+    assert_ne!(probe::PTRACE_GUARD_OPTIONS & libc::PTRACE_O_TRACESYSGOOD, 0);
+}
+
+#[test]
 fn raw_kernel_signal_mask_blocks_nptl_reserved_signals_and_restores_exactly() {
     let saved = probe::block_all_signals().unwrap();
     let mut blocked = 0_u64;

@@ -327,7 +327,7 @@ fn configured_command_and_working_directory_limits_are_exact() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn linux_capability_blocks_proc_self_mem_and_reaps_by_pidfd() {
+async fn linux_capability_proves_exec_stop_image_blocks_proc_mem_and_reaps_by_pidfd() {
     let working_directory = std::env::current_dir().unwrap();
     let envelope = fingerprint_configured_runtime_executable(
         &configured(IsolationTier::Host, sandbox(SandboxMode::DangerFullAccess)),

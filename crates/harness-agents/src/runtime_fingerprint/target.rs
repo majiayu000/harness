@@ -288,8 +288,14 @@ fn supervise_initial_stop(
         }
         _ => return verification_cleanup(child, pre_exec, stdout, stderr),
     }
-    let options = libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACESYSGOOD;
-    if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, child.pid(), 0, options) } != 0
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETOPTIONS,
+            child.pid(),
+            0,
+            super::probe::PTRACE_GUARD_OPTIONS,
+        )
+    } != 0
         || unsafe { libc::ptrace(libc::PTRACE_CONT, child.pid(), 0, 0) } != 0
     {
         return verification_cleanup(child, pre_exec, stdout, stderr);
@@ -414,7 +420,7 @@ pub(super) fn wait_event(
     }
 }
 
-fn is_exec_event(pid: libc::pid_t) -> bool {
+pub(super) fn is_exec_event(pid: libc::pid_t) -> bool {
     let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
     (unsafe { libc::ptrace(libc::PTRACE_GETSIGINFO, pid, 0, &mut info) }) == 0
         && info.si_signo == libc::SIGTRAP

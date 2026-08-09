@@ -120,6 +120,8 @@ pub(super) const CHILD_SIGNAL_FAILED: u8 = 2;
 pub(super) const CHILD_DESCRIPTOR_UNAVAILABLE: u8 = 3;
 pub(super) const CHILD_DESCRIPTOR_FAILED: u8 = 4;
 pub(super) const CHILD_GO: u8 = 5;
+pub(super) const PTRACE_GUARD_OPTIONS: libc::c_int =
+    libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACESYSGOOD | libc::PTRACE_O_EXITKILL;
 
 pub(super) fn registration_error(
     role: super::RuntimeOwnedChildRole,

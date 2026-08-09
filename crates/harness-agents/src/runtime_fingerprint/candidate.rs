@@ -48,6 +48,40 @@ impl RetainedExecutable {
         self.descriptor_lease = Some(lease);
         Ok(())
     }
+
+    pub(super) fn from_capability_image(
+        fd: libc::c_int,
+        descriptor_lease: super::registry::DescriptorLease,
+        image: &[u8],
+    ) -> Result<Self, RuntimeFingerprintProduceError> {
+        let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+        let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        let required_seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if fd < 0
+            || unsafe { libc::fstat(fd, &mut metadata) } != 0
+            || descriptor_flags & libc::FD_CLOEXEC == 0
+            || seals < 0
+            || seals & required_seals != required_seals
+            || metadata.st_size < 0
+            || metadata.st_size as usize != image.len()
+            || metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+            || metadata.st_mode & 0o111 == 0
+        {
+            return Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable);
+        }
+        Ok(Self {
+            fd,
+            descriptor_lease: Some(descriptor_lease),
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
+            link_count: stat_link_count(&metadata),
+            file_size_bytes: metadata.st_size as u64,
+            unix_mode: metadata.st_mode,
+            executable_sha256: Sha256Digest::from_bytes(image),
+        })
+    }
 }
 
 impl Drop for RetainedExecutable {

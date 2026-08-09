@@ -6,12 +6,17 @@ use std::time::Instant;
 
 const MAX_CAPABILITY_SYSCALL_STOPS: usize = 16;
 const PROC_SELF_MEM: &[u8; 15] = b"/proc/self/mem\0";
+const CAPABILITY_ARG0: &[u8; 19] = b"harness-capability\0";
+const LOAD_OFFSET: usize = 0x1000;
+const LOAD_ADDRESS: u64 = 0x0040_0000;
 
 pub(super) fn validate(
     deadline: Instant,
     registry: &super::registry::OwnerRegistry,
 ) -> Result<(), RuntimeFingerprintProduceError> {
-    let _descriptor_lease = registry.reserve_descriptors(4)?;
+    let mut descriptor_lease = registry.reserve_descriptors(5)?;
+    let trusted_image = trusted_capability_image();
+    let executable = create_capability_executable(&trusted_image, descriptor_lease.split_off(1)?)?;
     let role =
         super::RuntimeOwnedChildRole::Observation(super::RuntimeObservationStage::CapabilityCheck);
     let mut gate = [-1; 2];
@@ -44,7 +49,7 @@ pub(super) fn validate(
     // SAFETY: the child executes only the allocation-free routine below until _exit.
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        child_main(gate, status);
+        child_main(gate, status, executable.fd());
     }
     let restore_result = super::probe::restore_signal_mask(saved_signal_mask);
     super::probe::close_fd(gate[0]);
@@ -130,7 +135,7 @@ pub(super) fn validate(
             return Err(error);
         }
     };
-    if validate_ptrace(pid, child.pidfd(), gate[1], deadline).is_err() {
+    if validate_ptrace(pid, child.pidfd(), gate[1], &executable, deadline, registry).is_err() {
         super::probe::close_fd(gate[1]);
         child.cleanup(deadline)?;
         return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
@@ -141,15 +146,146 @@ pub(super) fn validate(
     validate_and_consume_exit(child, pid, deadline, role)
 }
 
+fn create_capability_executable(
+    image: &[u8],
+    descriptor_lease: super::registry::DescriptorLease,
+) -> Result<super::candidate::RetainedExecutable, RuntimeFingerprintProduceError> {
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            c"harness-capability".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        ) as libc::c_int
+    };
+    if fd < 0 || !write_capability_image(fd, image) {
+        super::probe::close_fd(fd);
+        return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
+            ContainmentUnavailableReason::PostExecGuardUnavailable,
+        ));
+    }
+    match super::candidate::RetainedExecutable::from_capability_image(fd, descriptor_lease, image) {
+        Ok(executable) => Ok(executable),
+        Err(error) => {
+            super::probe::close_fd(fd);
+            Err(error)
+        }
+    }
+}
+
+fn write_capability_image(fd: libc::c_int, image: &[u8]) -> bool {
+    let mut offset = 0_usize;
+    while offset < image.len() {
+        let written = unsafe {
+            libc::pwrite(
+                fd,
+                image.as_ptr().add(offset).cast(),
+                image.len() - offset,
+                offset as libc::off_t,
+            )
+        };
+        if written <= 0 {
+            return false;
+        }
+        offset += written as usize;
+    }
+    (unsafe { libc::fchmod(fd, 0o500) }) == 0
+        && (unsafe {
+            libc::fcntl(
+                fd,
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+            )
+        }) == 0
+}
+
+fn trusted_capability_image() -> Vec<u8> {
+    let code = trusted_exit_code();
+    let mut image = vec![0_u8; LOAD_OFFSET + code.len()];
+    image[..4].copy_from_slice(b"\x7fELF");
+    image[4] = 2;
+    image[5] = 1;
+    image[6] = 1;
+    image[16..18].copy_from_slice(&2_u16.to_le_bytes());
+    image[18..20].copy_from_slice(&native_machine().to_le_bytes());
+    image[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    image[24..32].copy_from_slice(&(LOAD_ADDRESS + LOAD_OFFSET as u64).to_le_bytes());
+    image[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    image[52..54].copy_from_slice(&64_u16.to_le_bytes());
+    image[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    image[56..58].copy_from_slice(&2_u16.to_le_bytes());
+    let image_size = image.len() as u64;
+    write_program_header(
+        &mut image[64..120],
+        1,
+        5,
+        0,
+        LOAD_ADDRESS,
+        image_size,
+        0x1000,
+    );
+    write_program_header(&mut image[120..176], 0x6474_e551, 6, 0, 0, 0, 16);
+    image[LOAD_OFFSET..].copy_from_slice(code);
+    image
+}
+
+fn write_program_header(
+    header: &mut [u8],
+    kind: u32,
+    flags: u32,
+    offset: u64,
+    address: u64,
+    size: u64,
+    alignment: u64,
+) {
+    header[0..4].copy_from_slice(&kind.to_le_bytes());
+    header[4..8].copy_from_slice(&flags.to_le_bytes());
+    header[8..16].copy_from_slice(&offset.to_le_bytes());
+    header[16..24].copy_from_slice(&address.to_le_bytes());
+    header[24..32].copy_from_slice(&address.to_le_bytes());
+    header[32..40].copy_from_slice(&size.to_le_bytes());
+    header[40..48].copy_from_slice(&size.to_le_bytes());
+    header[48..56].copy_from_slice(&alignment.to_le_bytes());
+}
+
+#[cfg(target_arch = "x86_64")]
+fn trusted_exit_code() -> &'static [u8] {
+    &[0xb8, 0x3c, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05]
+}
+
+#[cfg(target_arch = "aarch64")]
+fn trusted_exit_code() -> &'static [u8] {
+    &[
+        0x00, 0x00, 0x80, 0xd2, 0xa8, 0x0b, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4,
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn native_machine() -> u16 {
+    62
+}
+
+#[cfg(target_arch = "aarch64")]
+const fn native_machine() -> u16 {
+    183
+}
+
 fn validate_ptrace(
     pid: libc::pid_t,
     pidfd: libc::c_int,
     gate: libc::c_int,
+    executable: &super::candidate::RetainedExecutable,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<(), ()> {
-    let options = libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACESYSGOOD;
     // SAFETY: pid is the registered gated child and these requests do not deliver signals.
-    if unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, options) } != 0
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_SEIZE,
+            pid,
+            0,
+            super::probe::PTRACE_GUARD_OPTIONS,
+        )
+    } != 0
         || unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) } != 0
         || !wait_for_stop(pidfd, pid, deadline)
         || super::probe::write_byte(gate, super::probe::CHILD_GO).is_err()
@@ -174,10 +310,7 @@ fn validate_ptrace(
                 ) {
                     return Err(());
                 }
-                // SAFETY: the child is stopped at the suppressed syscall exit.
-                return (unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) } == 0)
-                    .then_some(())
-                    .ok_or(());
+                return validate_exec_stop(pid, pidfd, executable, deadline, registry);
             }
             super::syscall_guard::SyscallStop::Entry { number, arguments } => {
                 if !matches!(
@@ -192,6 +325,33 @@ fn validate_ptrace(
         previous = Some(stop);
     }
     Err(())
+}
+
+fn validate_exec_stop(
+    pid: libc::pid_t,
+    pidfd: libc::c_int,
+    executable: &super::candidate::RetainedExecutable,
+    deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
+) -> Result<(), ()> {
+    if unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, 0) } != 0 {
+        return Err(());
+    }
+    let event = super::target::wait_event(pidfd, pid, deadline, None).map_err(|_| ())?;
+    if !matches!(
+        event,
+        super::target::TargetEvent::Stopped(status)
+            if status == libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8)
+                && super::target::is_exec_event(pid)
+    ) || super::exec_stop::verify(pid, executable, deadline, registry).map_err(|_| ())?
+        != super::exec_stop::ExecStopCheckpoint::Consistent
+    {
+        return Err(());
+    }
+    // SAFETY: the child remains stopped at its verified exec event and may now run the fixed image.
+    (unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) } == 0)
+        .then_some(())
+        .ok_or(())
 }
 
 fn resume_to_syscall_stop(
@@ -401,11 +561,11 @@ fn bootstrap_pid_fallback(
     }
 }
 
-fn child_main(gate: [libc::c_int; 2], status: [libc::c_int; 2]) -> ! {
+fn child_main(gate: [libc::c_int; 2], status: [libc::c_int; 2], executable_fd: libc::c_int) -> ! {
     if !super::probe::child_reset_signal_dispositions() {
         child_status_exit(status[1], super::probe::CHILD_SIGNAL_FAILED);
     }
-    let descriptor_status = child_isolate_descriptors(gate[0], status[1]);
+    let descriptor_status = child_isolate_descriptors([gate[0], status[1], executable_fd]);
     if descriptor_status != super::probe::CHILD_READY {
         child_status_exit(status[1], descriptor_status);
     }
@@ -454,24 +614,32 @@ fn child_main(gate: [libc::c_int; 2], status: [libc::c_int; 2]) -> ! {
     if opened >= 0 {
         super::probe::close_fd(opened as libc::c_int);
     }
-    // SAFETY: success requires the owner-suppressed mutation syscall to return ENOSYS.
-    unsafe { libc::_exit(if denied { 0 } else { 114 }) }
+    if !denied {
+        unsafe { libc::_exit(114) };
+    }
+    let argv: [*const libc::c_char; 2] = [CAPABILITY_ARG0.as_ptr().cast(), std::ptr::null()];
+    let envp = [std::ptr::null::<libc::c_char>()];
+    unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            executable_fd,
+            c"".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        );
+        libc::_exit(115)
+    }
 }
 
-fn child_isolate_descriptors(first: libc::c_int, second: libc::c_int) -> u8 {
-    let low = first.min(second) as u32;
-    let high = first.max(second) as u32;
-    let ranges = [
-        (0_u32, low.saturating_sub(1), low != 0),
-        (low + 1, high.saturating_sub(1), high > low + 1),
-        (high + 1, u32::MAX, high != u32::MAX),
-    ];
-    for (start, end, required) in ranges {
-        if !required {
-            continue;
-        }
-        // SAFETY: close_range affects only the fork child and excludes both allowlisted fds.
-        if unsafe { libc::syscall(libc::SYS_close_range, start, end, 0) } != 0 {
+fn child_isolate_descriptors(mut allowed: [libc::c_int; 3]) -> u8 {
+    allowed.sort_unstable();
+    let mut start = 0_u32;
+    for descriptor in allowed {
+        let descriptor = descriptor as u32;
+        if start < descriptor
+            && unsafe { libc::syscall(libc::SYS_close_range, start, descriptor - 1, 0) } != 0
+        {
             let errno = super::probe::last_errno();
             return if matches!(
                 errno,
@@ -482,6 +650,17 @@ fn child_isolate_descriptors(first: libc::c_int, second: libc::c_int) -> u8 {
                 super::probe::CHILD_DESCRIPTOR_FAILED
             };
         }
+        start = descriptor.saturating_add(1);
+    }
+    if start != 0 && unsafe { libc::syscall(libc::SYS_close_range, start, u32::MAX, 0) } != 0 {
+        return if matches!(
+            super::probe::last_errno(),
+            libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EINVAL
+        ) {
+            super::probe::CHILD_DESCRIPTOR_UNAVAILABLE
+        } else {
+            super::probe::CHILD_DESCRIPTOR_FAILED
+        };
     }
     super::probe::CHILD_READY
 }
