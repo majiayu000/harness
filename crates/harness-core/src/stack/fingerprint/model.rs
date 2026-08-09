@@ -222,7 +222,7 @@ impl RuntimeProbeFailureKind {
         match self.rank() {
             0..=2 => RuntimeProbePhase::PathResolution,
             3..=9 => RuntimeProbePhase::Identity,
-            10..=26 => RuntimeProbePhase::VersionProbe,
+            10..=21 => RuntimeProbePhase::VersionProbe,
             _ => RuntimeProbePhase::LifecycleCleanup,
         }
     }
@@ -243,7 +243,7 @@ pub enum RuntimeProbeFailureDetail {
     ImageExecution,
     ExecutableMapping,
     ExecutableImageMutation,
-    KernelModuleLoading,
+    KernelCodeLoading,
     ProcessSignalling,
     ExitCode(i32),
     OutputLimitBytes(u64),
@@ -308,7 +308,7 @@ impl RuntimeProbeFailure {
                         | D::ImageExecution
                         | D::ExecutableMapping
                         | D::ExecutableImageMutation
-                        | D::KernelModuleLoading
+                        | D::KernelCodeLoading
                         | D::ProcessSignalling,
                     ),
                 ) => true,

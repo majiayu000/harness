@@ -28,6 +28,20 @@ fn runtime_payload_with_observation(
     executable: Option<RuntimeExecutableIdentity>,
     version: Option<RuntimeVersionFacts>,
 ) -> Result<RuntimeExecutableFingerprintPayload, AgentStackFingerprintError> {
+    runtime_payload_with_facts(
+        kind,
+        executable,
+        version,
+        vec![RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathNotFound).unwrap()],
+    )
+}
+
+fn runtime_payload_with_facts(
+    kind: LocalExecutableRuntimeKind,
+    executable: Option<RuntimeExecutableIdentity>,
+    version: Option<RuntimeVersionFacts>,
+    failures: Vec<RuntimeProbeFailure>,
+) -> Result<RuntimeExecutableFingerprintPayload, AgentStackFingerprintError> {
     let base = AgentStackSource::logical(
         AgentStackSourceScope::Runner,
         "configured_runtime",
@@ -57,7 +71,7 @@ fn runtime_payload_with_observation(
                 },
             ),
         ],
-        vec![RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathNotFound).unwrap()],
+        failures,
     )
 }
 
@@ -418,9 +432,43 @@ fn runtime_typed_constructors_reject_impossible_states() {
     .is_ok());
     assert!(RuntimeProbeFailure::with_detail(
         RuntimeProbeFailureKind::NonzeroExit,
-        RuntimeProbeFailureDetail::KernelModuleLoading,
+        RuntimeProbeFailureDetail::KernelCodeLoading,
     )
     .is_err());
+}
+
+#[test]
+fn closed_failure_vocabulary_and_canonical_ordering_are_enforced() {
+    let cleanup = vec![
+        RuntimeProbeFailure::new(RuntimeProbeFailureKind::TerminationFailed).unwrap(),
+        RuntimeProbeFailure::new(RuntimeProbeFailureKind::ReapFailed).unwrap(),
+        RuntimeProbeFailure::new(RuntimeProbeFailureKind::OutputDrainFailed).unwrap(),
+    ];
+    let payload = runtime_payload_with_facts(
+        LocalExecutableRuntimeKind::CodexExec,
+        None,
+        None,
+        cleanup.clone(),
+    )
+    .unwrap();
+    let json = AgentStackFingerprintEnvelope::agent_runtime(payload)
+        .unwrap()
+        .to_json_string()
+        .unwrap();
+    assert_eq!(json.matches("\"phase\":\"lifecycle_cleanup\"").count(), 3);
+
+    let mut reversed = cleanup;
+    reversed.reverse();
+    assert!(matches!(
+        runtime_payload_with_facts(LocalExecutableRuntimeKind::CodexExec, None, None, reversed,),
+        Err(AgentStackFingerprintError::InvalidPayloadState)
+    ));
+
+    assert!(RuntimeProbeFailure::with_detail(
+        RuntimeProbeFailureKind::TransitiveExecutionDenied,
+        RuntimeProbeFailureDetail::KernelCodeLoading,
+    )
+    .is_ok());
 }
 
 #[test]
