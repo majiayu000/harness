@@ -123,7 +123,12 @@ On macOS host isolation, scoped allowlisted agents are restricted by Seatbelt to
 the proxy's loopback port. On Linux host isolation, deny-all networking is
 supported, but proxy-only host networking is rejected because Landlock and
 bubblewrap cannot express that boundary safely. Use the container tier for
-Linux tasks that need allowlisted network access.
+Linux tasks that need allowlisted network access. The specific Linux
+combination `danger-full-access` plus scoped deny-all networking requires
+Bubblewrap even when `harness-landlock` is installed, because the Landlock
+helper has no network-only mode. Startup health reports the host tier
+unavailable when that requirement is unmet, and matching dispatches fail
+closed.
 
 Check health before enabling the rule broadly:
 

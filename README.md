@@ -59,7 +59,12 @@ execution is deliberate.
 On Linux, the default `workspace-write` sandbox also requires
 `harness-landlock` or [`bwrap`](https://github.com/containers/bubblewrap) on
 `PATH`; install your distribution's Bubblewrap package if you do not have the
-Landlock helper. Harness fails closed when neither helper is available.
+Landlock helper. A host-tier `danger-full-access` agent with scoped permissions
+and an empty network allowlist requires `bwrap` specifically: Landlock cannot
+provide network-only isolation while leaving filesystem access unrestricted.
+Harness reports that host tier as unavailable during startup health probing and
+refuses matching dispatches. Other Linux sandbox combinations continue to
+accept either helper.
 
 ```bash
 # With Codex CLI (Linux or macOS)

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(any(target_os = "linux", test))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use linux::linux_network_only_bwrap_args;
 #[cfg(any(target_os = "linux", test))]
 use linux::{linux_bwrap_args, linux_landlock_args};
@@ -145,6 +145,23 @@ fn wrap_linux_command(
     args: &[OsString],
     spec: &SandboxSpec,
 ) -> Result<WrappedCommand, SandboxError> {
+    wrap_linux_command_with_tools(
+        program,
+        args,
+        spec,
+        find_tool("harness-landlock"),
+        find_tool("bwrap"),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn wrap_linux_command_with_tools(
+    program: &Path,
+    args: &[OsString],
+    spec: &SandboxSpec,
+    landlock_runner: Option<PathBuf>,
+    bwrap: Option<PathBuf>,
+) -> Result<WrappedCommand, SandboxError> {
     if spec.network_policy.is_local_proxy() {
         return Err(spec.network_policy.unsupported("linux host sandbox"));
     }
@@ -152,7 +169,9 @@ fn wrap_linux_command(
         && spec.allowed_write_paths.is_none()
         && spec.network_policy == NetworkPolicy::Deny
     {
-        let bwrap = find_tool("bwrap").ok_or(SandboxError::MissingTool("bwrap"))?;
+        let bwrap = bwrap.ok_or(SandboxError::MissingTool(
+            "bwrap (required for danger-full-access with deny-all networking)",
+        ))?;
         return Ok(WrappedCommand {
             program: bwrap,
             args: linux_network_only_bwrap_args(program, args, spec),
@@ -160,7 +179,7 @@ fn wrap_linux_command(
         });
     }
 
-    if let Some(landlock_runner) = find_tool("harness-landlock") {
+    if let Some(landlock_runner) = landlock_runner {
         return Ok(WrappedCommand {
             program: landlock_runner,
             args: linux_landlock_args(program, args, spec)?,
@@ -168,12 +187,16 @@ fn wrap_linux_command(
         });
     }
 
-    let bwrap = find_tool("bwrap").ok_or(SandboxError::MissingTool("harness-landlock or bwrap"))?;
+    let bwrap = bwrap.ok_or(SandboxError::MissingTool("harness-landlock or bwrap"))?;
     Ok(WrappedCommand {
         program: bwrap,
         args: linux_bwrap_args(program, args, spec)?,
         engine: SandboxEngine::Bubblewrap,
     })
+}
+
+pub fn validate_host_sandbox_support(spec: &SandboxSpec) -> Result<SandboxEngine, SandboxError> {
+    wrap_command(Path::new("true"), &[], spec).map(|wrapped| wrapped.engine)
 }
 
 // Keep `test` enabled so non-macOS CI can validate policy-generation logic.

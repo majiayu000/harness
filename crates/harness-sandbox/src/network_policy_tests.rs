@@ -60,6 +60,38 @@ fn linux_proxy_only_policy_fails_closed() {
     ));
 }
 
+#[test]
+fn danger_deny_requires_bwrap_even_when_landlock_is_available() {
+    let spec = SandboxSpec::new(SandboxMode::DangerFullAccess, "/tmp/project")
+        .with_network_policy(NetworkPolicy::Deny);
+    let error = wrap_linux_command_with_tools(
+        Path::new("/usr/bin/codex"),
+        &[],
+        &spec,
+        Some(PathBuf::from("/usr/bin/harness-landlock")),
+        None,
+    )
+    .expect_err("Landlock cannot provide network-only isolation");
+
+    assert!(matches!(
+        error,
+        SandboxError::MissingTool(
+            "bwrap (required for danger-full-access with deny-all networking)"
+        )
+    ));
+
+    let wrapped = wrap_linux_command_with_tools(
+        Path::new("/usr/bin/codex"),
+        &[],
+        &spec,
+        Some(PathBuf::from("/usr/bin/harness-landlock")),
+        Some(PathBuf::from("/usr/bin/bwrap")),
+    )
+    .expect("Bubblewrap should provide the network-only boundary");
+    assert_eq!(wrapped.engine, SandboxEngine::Bubblewrap);
+    assert!(wrapped.args.contains(&OsString::from("--unshare-net")));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_network_only_bwrap_isolates_the_process_tree() {

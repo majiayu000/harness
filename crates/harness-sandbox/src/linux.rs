@@ -122,7 +122,7 @@ pub(super) fn linux_bwrap_args(
     Ok(wrapped_args)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn linux_network_only_bwrap_args(
     program: &Path,
     args: &[OsString],
