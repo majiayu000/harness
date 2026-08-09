@@ -706,8 +706,10 @@ attempt vocabularies are normative in `runtime-product.md`.
 - [ ] A changed-file and call-site audit proves there is no snapshot, CLI,
       server, workflow-runtime, `CodeAgent`, or `AgentAdapter` consumer and no
       persistence or existing launch-behavior change. The only manifest change
-      is a direct `harness-agents` dependency on the existing workspace `libc`;
-      no new package, version, or lockfile change is allowed.
+      is a direct `harness-agents` dependency on the existing workspace `libc`.
+      `Cargo.lock` may change only by adding that direct dependency edge to the
+      existing `harness-agents` package entry; no package, version, source, or
+      checksum change is allowed.
 
 ## Boundary Checklist
 

@@ -92,8 +92,9 @@ only expose the two facades. The one authorized server-file change is a
 mapping, call site, or consumer. `harness-agents` adds a direct dependency on
 the already pinned workspace `libc` solely for Linux no-shell descriptor
 isolation, exact pidfds, ptrace exec-stop, and
-`execveat(AT_EMPTY_PATH)` primitives. This adds no
-package/version and must not change `Cargo.lock`. `harness-core` explicitly
+`execveat(AT_EMPTY_PATH)` primitives. This adds no package/version; Cargo must
+record only that direct dependency edge in the existing `harness-agents`
+lockfile entry. `harness-core` explicitly
 enables the existing workspace `serde_json` dependency's `raw_value` feature
 so borrowed `RawValue` slices can preserve validated number lexemes. This also
 adds no package/version and must not change `Cargo.lock`; no handwritten JSON
@@ -636,12 +637,15 @@ Only these paths are authorized:
 13. `crates/harness-agents/src/runtime_fingerprint/tests.rs`
 14. `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs`
     (`#[cfg(test)]` exhaustive mapping contract only)
+15. `Cargo.lock` (only the existing `harness-agents` package's direct `libc`
+    dependency edge)
 
 Moving the two existing inline test modules into their listed test files is
 part of this scope. The agents manifest may add only `libc = { workspace =
 true }`; the core manifest may change only its existing `serde_json` dependency
 to `{ workspace = true, features = ["raw_value"] }`. There is no new
-crate/version or lockfile change. No other manifest,
+crate/version, source, or checksum. `Cargo.lock` may add only the direct `libc`
+edge named above. No other manifest,
 database, configuration, adapter, spawn contract, workflow model, CLI, HTTP,
 prompt, snapshot, or high-context file change is authorized. Any production
 server import or call site requires an ASC-005 consumer specification rather
@@ -668,9 +672,10 @@ cargo audit
 git diff --check
 ```
 
-The changed-file audit must equal the fourteen-path manifest. `Cargo.lock` must
-be unchanged and `cargo tree -p harness-agents -i libc` must show the pinned
-workspace dependency. `cargo tree -e features -p harness-core` must show the
+The changed-file audit must equal the fifteen-path manifest. `Cargo.lock` must
+differ only by the direct `libc` edge in the existing `harness-agents` package,
+and `cargo tree -p harness-agents -i libc` must show the pinned workspace
+dependency. `cargo tree -e features -p harness-core` must show the
 direct `serde_json/raw_value` feature. A call-site audit
 must show that production uses of the new APIs remain confined to their
 defining modules; test uses do not count as consumers. File-length checks must

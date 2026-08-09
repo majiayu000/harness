@@ -83,7 +83,7 @@ implementation PR or force-push.
       Verify: `cargo test -p harness-agents runtime_fingerprint`,
       `cargo test -p harness-agents`, and
       `cargo check -p harness-agents --all-targets`.
-- [ ] `SP1733-T3` — Owner: boundary contract worker. Dependencies: SP1733-T1 and SP1733-T2. Covers: B-002 and B-016. Done when: a `#[cfg(test)]`-only exhaustive workflow `RuntimeKind` mapping proves the three local kinds map one-to-one, `AnthropicApi`/`RemoteHost` are not local executables, and no non-host isolation can be interpreted as a host fingerprint subject; production call-site audit proves there is no snapshot, server, workflow-runtime, task-runner, `CodeAgent`, `AgentAdapter`, CLI, HTTP, persistence, or migration consumer; and the implementation diff matches the fourteen authorized paths exactly with no lockfile change. Verify: `cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib` plus the manifest and `rg` audits described below.
+- [ ] `SP1733-T3` — Owner: boundary contract worker. Dependencies: SP1733-T1 and SP1733-T2. Covers: B-002 and B-016. Done when: a `#[cfg(test)]`-only exhaustive workflow `RuntimeKind` mapping proves the three local kinds map one-to-one, `AnthropicApi`/`RemoteHost` are not local executables, and no non-host isolation can be interpreted as a host fingerprint subject; production call-site audit proves there is no snapshot, server, workflow-runtime, task-runner, `CodeAgent`, `AgentAdapter`, CLI, HTTP, persistence, or migration consumer; and the implementation diff matches the fifteen authorized paths exactly, including only the direct `libc` dependency edge in the existing `harness-agents` lockfile entry. Verify: `cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib` plus the manifest and `rg` audits described below.
 - [ ] `SP1733-T4` — Owner: verification and handoff owner.
       Dependencies: SP1733-T1 through SP1733-T3. Covers: B-001 through B-016.
       Done when formatting, focused/package/workspace tests, clippy,
@@ -123,14 +123,14 @@ files remain disjoint exactly as follows.
 | Task | Writable files |
 | --- | --- |
 | SP1733-T1 | `crates/harness-core/Cargo.toml`; `crates/harness-core/src/stack/mod.rs`; `crates/harness-core/src/stack/fingerprint.rs`; `crates/harness-core/src/stack/fingerprint/model.rs`; `crates/harness-core/src/stack/fingerprint/schema.rs`; `crates/harness-core/src/stack/fingerprint/tests.rs` |
-| SP1733-T2 | `crates/harness-agents/Cargo.toml`; `crates/harness-agents/src/lib.rs`; `crates/harness-agents/src/runtime_fingerprint.rs`; `crates/harness-agents/src/runtime_fingerprint/environment.rs`; `crates/harness-agents/src/runtime_fingerprint/executable.rs`; `crates/harness-agents/src/runtime_fingerprint/probe.rs`; `crates/harness-agents/src/runtime_fingerprint/tests.rs` |
+| SP1733-T2 | `Cargo.lock` (only the existing `harness-agents` direct `libc` edge); `crates/harness-agents/Cargo.toml`; `crates/harness-agents/src/lib.rs`; `crates/harness-agents/src/runtime_fingerprint.rs`; `crates/harness-agents/src/runtime_fingerprint/environment.rs`; `crates/harness-agents/src/runtime_fingerprint/executable.rs`; `crates/harness-agents/src/runtime_fingerprint/probe.rs`; `crates/harness-agents/src/runtime_fingerprint/tests.rs` |
 | SP1733-T3 | `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs` (`#[cfg(test)]` contract only) |
 | SP1733-T4 | Read-only verification, review-thread resolution, and original-branch handoff; no writable source files |
 
 No other implementation path is authorized. The agents manifest may add only
 the existing workspace `libc`; the core manifest may only enable
 `serde_json/raw_value` on its existing workspace dependency. Do not edit any
-other Cargo file, the lockfile,
+other Cargo file or lockfile entry,
 database or persistence code, configuration schemas, adapter launch paths,
 snapshots, prompts, CLI/HTTP surfaces, or high-context files. A newly
 discovered need outside this manifest returns the change to spec review instead
@@ -153,10 +153,11 @@ of silently expanding scope.
 - [ ] Run `cargo audit`.
 - [ ] Run `git diff --check`.
 - [ ] Confirm every changed Rust file is below 800 lines after rustfmt.
-- [ ] Confirm the implementation changed-file set equals the fourteen paths in
+- [ ] Confirm the implementation changed-file set equals the fifteen paths in
       the tech-spec `specrail-planned-changes` manifest.
-- [ ] Confirm `Cargo.lock` is unchanged and `cargo tree -p harness-agents -i
-      libc` resolves the existing pinned workspace dependency; confirm
+- [ ] Confirm `Cargo.lock` adds only the direct `libc` edge to the existing
+      `harness-agents` package and `cargo tree -p harness-agents -i libc`
+      resolves the existing pinned workspace dependency; confirm
       `cargo tree -e features -p harness-core` shows direct
       `serde_json/raw_value`.
 - [ ] Use `rg` to prove the new producer APIs have no production consumer
@@ -298,5 +299,5 @@ fixed vectors, never values generated by the helper under test.
 - Output precedence is capture completion, then signal/nonzero, then
   zero-exit-only UTF-8/blank/grammar selection.
 - Core schema dialect, raw-number preservation, MCP bounds, fingerprint digest,
-  authorized 14-path manifest, no-lockfile, and producer-only constraints are
-  unchanged.
+  authorized 15-path manifest, lockfile-edge-only, and producer-only constraints
+  are unchanged.
