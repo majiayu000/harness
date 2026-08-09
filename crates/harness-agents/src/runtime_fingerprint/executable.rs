@@ -231,34 +231,23 @@ pub(super) fn observe_working_directory(
             super::RuntimeChildRegistrationStage::GateCreate,
         ));
     }
-    let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    let mut saved = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    // SAFETY: initialized masks affect only the owner thread around fork.
-    let mask_result = unsafe {
-        libc::sigfillset(&mut blocked);
-        libc::sigdelset(&mut blocked, libc::SIGKILL);
-        libc::sigdelset(&mut blocked, libc::SIGSTOP);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &blocked, &mut saved)
-    };
-    if mask_result != 0 {
+    let saved_signal_mask = super::probe::block_all_signals().map_err(|()| {
         close_observation_fds(gate, status, protocol);
-        return Err(super::probe::registration_error(
+        super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::SignalIsolation,
-        ));
-    }
+        )
+    })?;
     // SAFETY: only the allocation-free child routine runs after fork.
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         child_open_working_directory(gate, status, protocol, path.as_ptr());
     }
-    // SAFETY: restore the exact owner-thread mask before any wait.
-    let restored =
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut()) };
+    let restored = super::probe::restore_signal_mask(saved_signal_mask);
     super::probe::close_fd(gate[0]);
     super::probe::close_fd(status[1]);
     super::probe::close_fd(protocol[1]);
-    if pid < 0 || restored != 0 {
+    if pid < 0 || restored.is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(status[0]);
         super::probe::close_fd(protocol[0]);

@@ -85,31 +85,25 @@ fn run_authorization_child(
             super::RuntimeChildRegistrationStage::GateCreate,
         ));
     }
-    let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    let mut saved = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    let mask_result = unsafe {
-        libc::sigfillset(&mut blocked);
-        libc::sigdelset(&mut blocked, libc::SIGKILL);
-        libc::sigdelset(&mut blocked, libc::SIGSTOP);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &blocked, &mut saved)
+    let saved_signal_mask = match super::probe::block_all_signals() {
+        Ok(saved) => saved,
+        Err(()) => {
+            close_all(gate, status, protocol);
+            return Err(super::probe::registration_error(
+                role,
+                super::RuntimeChildRegistrationStage::SignalIsolation,
+            ));
+        }
     };
-    if mask_result != 0 {
-        close_all(gate, status, protocol);
-        return Err(super::probe::registration_error(
-            role,
-            super::RuntimeChildRegistrationStage::SignalIsolation,
-        ));
-    }
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         child_authorize(gate, status, protocol, context);
     }
-    let restored =
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut()) };
+    let restored = super::probe::restore_signal_mask(saved_signal_mask);
     super::probe::close_fd(gate[0]);
     super::probe::close_fd(status[1]);
     super::probe::close_fd(protocol[1]);
-    if pid < 0 || restored != 0 {
+    if pid < 0 || restored.is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(status[0]);
         super::probe::close_fd(protocol[0]);

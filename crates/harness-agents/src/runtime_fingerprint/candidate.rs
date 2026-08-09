@@ -101,31 +101,22 @@ pub(super) fn observe_candidate(
         ));
     }
 
-    let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    let mut saved = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    let mask_result = unsafe {
-        libc::sigfillset(&mut blocked);
-        libc::sigdelset(&mut blocked, libc::SIGKILL);
-        libc::sigdelset(&mut blocked, libc::SIGSTOP);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &blocked, &mut saved)
-    };
-    if mask_result != 0 {
+    let saved_signal_mask = super::probe::block_all_signals().map_err(|()| {
         close_all(gate, status, protocol);
-        return Err(super::probe::registration_error(
+        super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::SignalIsolation,
-        ));
-    }
+        )
+    })?;
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         child_observe_candidate(gate, status, protocol, directory_fd, path.as_ptr());
     }
-    let restored =
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut()) };
+    let restored = super::probe::restore_signal_mask(saved_signal_mask);
     super::probe::close_fd(gate[0]);
     super::probe::close_fd(status[1]);
     super::probe::close_fd(protocol[1]);
-    if pid < 0 || restored != 0 {
+    if pid < 0 || restored.is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(status[0]);
         super::probe::close_fd(protocol[0]);

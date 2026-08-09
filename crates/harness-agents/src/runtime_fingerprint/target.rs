@@ -183,35 +183,26 @@ fn start(
         argv: &argv,
         envp: &envp,
     };
-    let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    let mut saved = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-    let mask_result = unsafe {
-        libc::sigfillset(&mut blocked);
-        libc::sigdelset(&mut blocked, libc::SIGKILL);
-        libc::sigdelset(&mut blocked, libc::SIGSTOP);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &blocked, &mut saved)
-    };
-    if mask_result != 0 {
+    let saved_signal_mask = super::probe::block_all_signals().map_err(|()| {
         close_child_descriptors(&context.descriptors);
         close_six(gate, status, pre_exec, stdin, stdout, stderr);
-        return Err(super::probe::registration_error(
+        super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::SignalIsolation,
-        ));
-    }
+        )
+    })?;
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         child_main(&context);
     }
-    let restored =
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut()) };
+    let restored = super::probe::restore_signal_mask(saved_signal_mask);
     close_child_descriptors(&context.descriptors);
     super::probe::close_fd(gate[0]);
     super::probe::close_fd(status[1]);
     super::probe::close_fd(pre_exec[1]);
     super::probe::close_fd(stdout[1]);
     super::probe::close_fd(stderr[1]);
-    if pid < 0 || restored != 0 {
+    if pid < 0 || restored.is_err() {
         close_parent_descriptors(gate[1], status[0], pre_exec[0], stdout[0], stderr[0]);
         if pid > 0 {
             super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;

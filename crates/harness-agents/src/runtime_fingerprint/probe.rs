@@ -159,6 +159,37 @@ pub(super) fn rollback_unregistered_child(
     registry.cleanup_pre_registration_child(pid, role, deadline)
 }
 
+pub(super) fn block_all_signals() -> Result<u64, ()> {
+    let blocked = u64::MAX;
+    let mut saved = 0_u64;
+    // SAFETY: Linux exposes a one-u64 kernel signal set on supported architectures. The raw
+    // syscall intentionally includes glibc/NPTL-reserved signals 32 and 33.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_SETMASK,
+            &blocked,
+            &mut saved,
+            std::mem::size_of::<u64>(),
+        )
+    };
+    (result == 0).then_some(saved).ok_or(())
+}
+
+pub(super) fn restore_signal_mask(saved: u64) -> Result<(), ()> {
+    // SAFETY: saved came from block_all_signals on this same owner thread.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_SETMASK,
+            &saved,
+            std::ptr::null_mut::<u64>(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    (result == 0).then_some(()).ok_or(())
+}
+
 pub(super) fn waitid_pidfd(
     pidfd: libc::c_int,
     nowait: bool,

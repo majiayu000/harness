@@ -90,6 +90,38 @@ fn global_post_ready_resource_ceiling_is_frozen() {
 }
 
 #[test]
+fn raw_kernel_signal_mask_blocks_nptl_reserved_signals_and_restores_exactly() {
+    let saved = probe::block_all_signals().unwrap();
+    let mut blocked = 0_u64;
+    let observed = unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_SETMASK,
+            std::ptr::null::<u64>(),
+            &mut blocked,
+            std::mem::size_of::<u64>(),
+        )
+    };
+    let restored = probe::restore_signal_mask(saved);
+    let mut after_restore = 0_u64;
+    let restore_observed = unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            libc::SIG_SETMASK,
+            std::ptr::null::<u64>(),
+            &mut after_restore,
+            std::mem::size_of::<u64>(),
+        )
+    };
+    assert_eq!(observed, 0);
+    assert!(restored.is_ok());
+    assert_eq!(restore_observed, 0);
+    assert_ne!(blocked & (1_u64 << 31), 0);
+    assert_ne!(blocked & (1_u64 << 32), 0);
+    assert_eq!(after_restore, saved);
+}
+
+#[test]
 fn failed_registry_commit_reaps_gated_child_before_any_workload() {
     let registry = registry::OwnerRegistry::new();
     let mut occupied = [-1; 2];
