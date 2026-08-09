@@ -172,6 +172,14 @@ pub(crate) struct PreparedAgentSpawn {
     pub(crate) clear_inherited_env: bool,
     pub(crate) sandbox_engine: SandboxEngine,
     pub(crate) egress_proxy_lease: Option<Arc<EgressProxyLease>>,
+    pub(crate) egress_verification: EgressVerification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EgressVerification {
+    NotRequired,
+    VerifiedBeforeSpawn,
+    AwaitContainerCanary,
 }
 
 pub(crate) trait AgentSpawnContract {
@@ -222,6 +230,11 @@ impl AgentSpawnContract for HostSpawn {
             clear_inherited_env: false,
             sandbox_engine: wrapped_command.engine,
             egress_proxy_lease: None,
+            egress_verification: if egress_route.is_some() {
+                EgressVerification::VerifiedBeforeSpawn
+            } else {
+                EgressVerification::NotRequired
+            },
         })
     }
 }
@@ -393,6 +406,11 @@ impl AgentSpawnContract for ContainerSpawn {
             clear_inherited_env: true,
             sandbox_engine: SandboxEngine::None,
             egress_proxy_lease: None,
+            egress_verification: if egress_route.is_some() {
+                EgressVerification::AwaitContainerCanary
+            } else {
+                EgressVerification::NotRequired
+            },
         })
     }
 }

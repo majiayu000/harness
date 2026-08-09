@@ -67,6 +67,7 @@ struct AdapterState {
     next_id: u64,
     session_id: Option<String>,
     spawn_policy_fingerprint: Option<crate::spawn_contract::AdapterSpawnPolicyFingerprint>,
+    egress_verified_at_dispatch: bool,
 }
 
 impl AdapterState {
@@ -78,6 +79,7 @@ impl AdapterState {
             next_id: 1,
             session_id: None,
             spawn_policy_fingerprint: None,
+            egress_verified_at_dispatch: false,
         }
     }
 
@@ -102,6 +104,7 @@ impl AdapterState {
         self.stdout_lines = None;
         self.session_id = None;
         self.spawn_policy_fingerprint = None;
+        self.egress_verified_at_dispatch = false;
     }
 }
 
@@ -203,6 +206,11 @@ impl OpenCodeAcpAdapter {
         if line.trim().is_empty() {
             return Ok(Some(ParsedAcpMessage::Ignore));
         }
+        if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+            return Ok(Some(ParsedAcpMessage::Event(
+                AgentEvent::EgressVerifiedAtDispatch,
+            )));
+        }
         parse_acp_message(&line).map(Some).ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "opencode acp emitted invalid JSON-RPC stdout: {}",
@@ -278,6 +286,8 @@ impl OpenCodeAcpAdapter {
         )
         .await?;
         let mut child = supervised.child;
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let mut egress_verified_at_dispatch = child.egress_verified_before_spawn();
 
         if let Some(stderr) = child.inner_mut().stderr.take() {
             tokio::spawn(async move {
@@ -336,6 +346,11 @@ impl OpenCodeAcpAdapter {
                     Some(ParsedAcpMessage::Event(AgentEvent::Error { message })) => {
                         return Err(harness_core::error::HarnessError::AgentExecution(message));
                     }
+                    Some(ParsedAcpMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
                     Some(_) => {}
                     None => {
                         return Err(harness_core::error::HarnessError::AgentExecution(
@@ -376,6 +391,11 @@ impl OpenCodeAcpAdapter {
                     Some(ParsedAcpMessage::Event(AgentEvent::Error { message })) => {
                         return Err(harness_core::error::HarnessError::AgentExecution(message));
                     }
+                    Some(ParsedAcpMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
                     Some(_) => {}
                     None => {
                         return Err(harness_core::error::HarnessError::AgentExecution(
@@ -383,6 +403,12 @@ impl OpenCodeAcpAdapter {
                         ));
                     }
                 }
+            }
+            if await_container_egress_canary && !egress_verified_at_dispatch {
+                return Err(harness_core::error::HarnessError::AgentExecution(
+                    "opencode acp started before the container egress canary reported success"
+                        .into(),
+                ));
             }
             Ok(())
         }
@@ -392,6 +418,7 @@ impl OpenCodeAcpAdapter {
             Ok(()) => {
                 state.stdout_lines = Some(lines);
                 state.spawn_policy_fingerprint = Some(requested_fingerprint);
+                state.egress_verified_at_dispatch = egress_verified_at_dispatch;
                 Ok(())
             }
             Err(error) => {
@@ -426,11 +453,7 @@ impl AgentAdapter for OpenCodeAcpAdapter {
         crate::spawn_supervisor::validate_capability_token(req.capability_token.as_ref())?;
         let mut state = self.state.lock().await;
         self.ensure_child(&req, &mut state).await?;
-        if state
-            .child
-            .as_ref()
-            .is_some_and(crate::ManagedChild::has_egress_proxy)
-        {
+        if state.egress_verified_at_dispatch {
             tx.send(AgentEvent::EgressVerifiedAtDispatch)
                 .await
                 .map_err(|error| {

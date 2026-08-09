@@ -238,7 +238,8 @@ async fn run_setup_command(
         ))
     })?;
     let mut child = crate::ManagedChild::new(child, "codex cloud setup")
-        .with_egress_proxy_lease(spawn.egress_proxy_lease.clone());
+        .with_egress_proxy_lease(spawn.egress_proxy_lease.clone())
+        .with_egress_verification(spawn.egress_verification);
     let secret_values: Vec<String> = cloud
         .setup_secret_env
         .iter()

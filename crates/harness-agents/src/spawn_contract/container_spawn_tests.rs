@@ -338,6 +338,9 @@ fn container_spawn_applies_first_party_proxy_route_and_canary() -> anyhow::Resul
     assert!(args
         .iter()
         .any(|arg| arg.contains("could not reach allowlisted host")));
+    assert!(args
+        .iter()
+        .any(|arg| arg.contains("HARNESS_EGRESS_CANARY_VERIFIED_V1")));
     assert!(args.contains(&"github.com".to_string()));
     assert!(args.contains(&"claude".to_string()));
     assert!(!args.iter().any(|arg| arg.contains("EGRESS_ALLOWLIST")));

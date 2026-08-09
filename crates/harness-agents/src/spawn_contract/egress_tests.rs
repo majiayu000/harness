@@ -235,5 +235,10 @@ if curl --silent --noproxy '*' --max-time 2 https://example.com/ >/dev/null 2>&1
         "prepared agent spawn failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        super::egress::CONTAINER_EGRESS_CANARY_VERIFIED,
+        "the container wrapper must report canary success before executing the agent"
+    );
     Ok(())
 }

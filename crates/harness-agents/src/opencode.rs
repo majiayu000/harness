@@ -413,7 +413,7 @@ impl CodeAgent for OpenCodeAgent {
         )
         .await?;
         let mut child = supervised.child;
-        if child.has_egress_proxy() {
+        if child.egress_verified_before_spawn() {
             send_stream_item(
                 &tx,
                 StreamItem::EgressVerifiedAtDispatch,
@@ -441,6 +441,8 @@ impl CodeAgent for OpenCodeAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let mut container_egress_verified = !await_container_egress_canary;
 
         let mut stream_result: harness_core::error::Result<()> = Ok(());
         loop {
@@ -464,6 +466,26 @@ impl CodeAgent for OpenCodeAgent {
                     break;
                 }
             };
+            if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+                if !container_egress_verified {
+                    if send_stream_item(
+                        &tx,
+                        StreamItem::EgressVerifiedAtDispatch,
+                        self.name(),
+                        "egress verification",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        stream_result = Err(harness_core::error::HarnessError::AgentExecution(
+                            "opencode stream send failed".into(),
+                        ));
+                        break;
+                    }
+                    container_egress_verified = true;
+                }
+                continue;
+            }
             let Some(event) = parse_opencode_run_line(&line) else {
                 continue;
             };
@@ -559,6 +581,12 @@ impl CodeAgent for OpenCodeAgent {
                     break;
                 }
             }
+        }
+
+        if stream_result.is_ok() && !container_egress_verified {
+            stream_result = Err(harness_core::error::HarnessError::AgentExecution(
+                "opencode exited before the container egress canary reported success".into(),
+            ));
         }
 
         let status = child

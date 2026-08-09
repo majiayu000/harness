@@ -147,6 +147,9 @@ fn apply_claude_stream_event(
 pub(crate) fn parse_claude_stream_output(stdout: &str) -> ParsedClaudeStreamOutput {
     let mut parsed = ParsedClaudeStreamOutput::default();
     for line in stdout.lines() {
+        if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+            continue;
+        }
         parsed.raw_stdout.push_str(line);
         parsed.raw_stdout.push('\n');
         let mut emitted_items = Vec::new();
@@ -200,6 +203,7 @@ pub(crate) async fn stream_claude_code_output(
     child: &mut tokio::process::Child,
     tx: &tokio::sync::mpsc::Sender<StreamItem>,
     idle_timeout: Option<Duration>,
+    await_container_egress_canary: bool,
 ) -> harness_core::error::Result<ParsedClaudeStreamOutput> {
     let stdout = child
         .stdout
@@ -207,8 +211,22 @@ pub(crate) async fn stream_claude_code_output(
         .ok_or_else(|| HarnessError::AgentExecution("claude stdout unavailable".into()))?;
     let mut lines = BufReader::new(stdout).lines();
     let mut parsed = ParsedClaudeStreamOutput::default();
+    let mut container_egress_verified = !await_container_egress_canary;
 
     while let Some(line) = read_next_claude_line(&mut lines, child, idle_timeout).await? {
+        if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+            if !container_egress_verified {
+                send_stream_item(
+                    tx,
+                    StreamItem::EgressVerifiedAtDispatch,
+                    "claude",
+                    "egress_verification",
+                )
+                .await?;
+                container_egress_verified = true;
+            }
+            continue;
+        }
         parsed.raw_stdout.push_str(&line);
         parsed.raw_stdout.push('\n');
         let mut emitted_items = Vec::new();
@@ -234,6 +252,12 @@ pub(crate) async fn stream_claude_code_output(
         } else {
             format!("claude exited with {status}: stdout_tail=[{stdout_tail}]")
         }));
+    }
+
+    if !container_egress_verified {
+        return Err(HarnessError::AgentExecution(
+            "claude exited before the container egress canary reported success".into(),
+        ));
     }
 
     if let Some(failure) = &parsed.failure {

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(super) const LEGACY_EGRESS_PROXY_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY";
+pub(crate) const CONTAINER_EGRESS_CANARY_VERIFIED: &str = "HARNESS_EGRESS_CANARY_VERIFIED_V1";
 const DEFAULT_EGRESS_PROXY_IMAGE: &str = "harness-egress-proxy:latest";
 const PROXY_PORT: u16 = 8080;
 const PROXY_ALIAS: &str = "egress-proxy";
@@ -48,6 +49,7 @@ shift
 curl --silent --show-error --noproxy '' --proxy "$HTTP_PROXY" --output /dev/null --max-time 10 "https://${allowed_host}/" || { echo "first-party egress proxy could not reach allowlisted host ${allowed_host}" >&2; exit 70; }
 status="$(curl --silent --show-error --noproxy '' --proxy "$HTTP_PROXY" --output /dev/null --write-out '%{http_code}' --max-time 5 http://harness-egress-canary.invalid/)" || { echo 'first-party egress proxy canary was unreachable' >&2; exit 70; }
 if [ "$status" != "403" ]; then echo "first-party egress proxy canary returned $status instead of 403" >&2; exit 70; fi
+printf '%s\n' 'HARNESS_EGRESS_CANARY_VERIFIED_V1'
 exec "$@""#;
     let mut args = vec![
         OsString::from("sh"),

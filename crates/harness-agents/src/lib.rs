@@ -141,6 +141,7 @@ pub(crate) struct ManagedChild {
     label: &'static str,
     cleanup_disarmed: bool,
     egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
+    egress_verification: crate::spawn_contract::EgressVerification,
 }
 
 impl ManagedChild {
@@ -152,6 +153,7 @@ impl ManagedChild {
             label,
             cleanup_disarmed: false,
             egress_proxy_lease: None,
+            egress_verification: crate::spawn_contract::EgressVerification::NotRequired,
         }
     }
 
@@ -176,8 +178,20 @@ impl ManagedChild {
             })?
     }
 
-    pub(crate) fn has_egress_proxy(&self) -> bool {
-        self.egress_proxy_lease.is_some()
+    pub(crate) fn with_egress_verification(
+        mut self,
+        verification: crate::spawn_contract::EgressVerification,
+    ) -> Self {
+        self.egress_verification = verification;
+        self
+    }
+
+    pub(crate) fn egress_verified_before_spawn(&self) -> bool {
+        self.egress_verification == crate::spawn_contract::EgressVerification::VerifiedBeforeSpawn
+    }
+
+    pub(crate) fn awaits_container_egress_canary(&self) -> bool {
+        self.egress_verification == crate::spawn_contract::EgressVerification::AwaitContainerCanary
     }
 
     fn child_mut(&mut self) -> &mut tokio::process::Child {
@@ -736,6 +750,9 @@ mod managed_child_tests {
 #[cfg(test)]
 #[path = "run_id_tests.rs"]
 mod run_id_tests;
+
+#[cfg(test)]
+mod egress_verification_tests;
 
 #[cfg(test)]
 mod spawn_failure_tests {

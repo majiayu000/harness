@@ -79,6 +79,7 @@ struct AdapterState {
     active_turn_id: Option<String>,
     child_workspace: Option<PathBuf>,
     spawn_policy_fingerprint: Option<crate::spawn_contract::AdapterSpawnPolicyFingerprint>,
+    egress_verified_at_dispatch: bool,
 }
 impl AdapterState {
     fn new() -> Self {
@@ -91,6 +92,7 @@ impl AdapterState {
             active_turn_id: None,
             child_workspace: None,
             spawn_policy_fingerprint: None,
+            egress_verified_at_dispatch: false,
         }
     }
     fn next_request_id(&mut self) -> u64 {
@@ -114,6 +116,7 @@ impl AdapterState {
         self.active_turn_id = None;
         self.child_workspace = None;
         self.spawn_policy_fingerprint = None;
+        self.egress_verified_at_dispatch = false;
     }
 }
 
@@ -255,6 +258,11 @@ impl CodexAdapter {
         if line.trim().is_empty() {
             return Ok(Some(ParsedCodexMessage::Ignore));
         }
+        if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+            return Ok(Some(ParsedCodexMessage::Event(
+                AgentEvent::EgressVerifiedAtDispatch,
+            )));
+        }
         parse_codex_message(&line).map(Some).ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "codex app-server emitted invalid JSON-RPC stdout: {}",
@@ -331,6 +339,8 @@ impl CodexAdapter {
         .await?;
         let child_workspace = supervised.prepared_spawn.child_workspace.clone();
         let mut child = supervised.child;
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let mut egress_verified_at_dispatch = child.egress_verified_before_spawn();
 
         if let Some(stderr) = child.inner_mut().stderr.take() {
             tokio::spawn(async move {
@@ -392,6 +402,11 @@ impl CodexAdapter {
                     Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
                         return Err(harness_core::error::HarnessError::AgentExecution(message));
                     }
+                    Some(ParsedCodexMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
                     Some(_) => {}
                     None => {
                         return Err(harness_core::error::HarnessError::AgentExecution(
@@ -436,6 +451,11 @@ impl CodexAdapter {
                     Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
                         return Err(harness_core::error::HarnessError::AgentExecution(message));
                     }
+                    Some(ParsedCodexMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
                     Some(_) => {}
                     None => {
                         return Err(harness_core::error::HarnessError::AgentExecution(
@@ -443,6 +463,12 @@ impl CodexAdapter {
                         ));
                     }
                 }
+            }
+            if await_container_egress_canary && !egress_verified_at_dispatch {
+                return Err(harness_core::error::HarnessError::AgentExecution(
+                    "codex app-server started before the container egress canary reported success"
+                        .into(),
+                ));
             }
             Ok(())
         }
@@ -452,6 +478,7 @@ impl CodexAdapter {
             Ok(()) => {
                 state.stdout_lines = Some(lines);
                 state.spawn_policy_fingerprint = Some(requested_fingerprint);
+                state.egress_verified_at_dispatch = egress_verified_at_dispatch;
                 Ok(())
             }
             Err(error) => {
@@ -493,11 +520,7 @@ impl AgentAdapter for CodexAdapter {
         .await?;
         let mut state = self.state.lock().await;
         self.ensure_child(&req, &mut state).await?;
-        if state
-            .child
-            .as_ref()
-            .is_some_and(crate::ManagedChild::has_egress_proxy)
-        {
+        if state.egress_verified_at_dispatch {
             tx.send(AgentEvent::EgressVerifiedAtDispatch)
                 .await
                 .map_err(|error| {

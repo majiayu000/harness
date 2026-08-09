@@ -210,6 +210,9 @@ pub(crate) fn parse_codex_exec_output(
     let mut seen_message_deltas = HashSet::new();
 
     for line in stdout.lines() {
+        if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+            continue;
+        }
         let event = parse_codex_exec_event_line(line).ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to parse codex json line: {line}"
@@ -226,6 +229,7 @@ pub(crate) async fn stream_codex_exec_output(
     child: &mut tokio::process::Child,
     tx: &tokio::sync::mpsc::Sender<StreamItem>,
     idle_timeout: Option<Duration>,
+    await_container_egress_canary: bool,
 ) -> harness_core::error::Result<ParsedCodexExecOutput> {
     let stdout = child.stdout.take().ok_or_else(|| {
         harness_core::error::HarnessError::AgentExecution("codex stdout unavailable".into())
@@ -233,6 +237,7 @@ pub(crate) async fn stream_codex_exec_output(
     let mut lines = BufReader::new(stdout).lines();
     let mut parsed = ParsedCodexExecOutput::default();
     let mut seen_message_deltas = HashSet::new();
+    let mut container_egress_verified = !await_container_egress_canary;
 
     loop {
         let maybe_line = if let Some(duration) = idle_timeout {
@@ -261,6 +266,19 @@ pub(crate) async fn stream_codex_exec_output(
         let Some(line) = maybe_line else {
             break;
         };
+        if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+            if !container_egress_verified {
+                send_stream_item(
+                    tx,
+                    StreamItem::EgressVerifiedAtDispatch,
+                    "codex",
+                    "egress_verification",
+                )
+                .await?;
+                container_egress_verified = true;
+            }
+            continue;
+        }
         let event = parse_codex_exec_event_line(&line).ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to parse codex json line: {line}"
@@ -288,6 +306,12 @@ pub(crate) async fn stream_codex_exec_output(
             };
             send_stream_item(tx, item, "codex", item_label).await?;
         }
+    }
+
+    if !container_egress_verified {
+        return Err(harness_core::error::HarnessError::AgentExecution(
+            "codex exited before the container egress canary reported success".into(),
+        ));
     }
 
     Ok(parsed)

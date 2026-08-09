@@ -391,7 +391,7 @@ impl CodeAgent for ClaudeCodeAgent {
         )
         .await?;
         let mut child = supervised.child;
-        if child.has_egress_proxy() {
+        if child.egress_verified_before_spawn() {
             send_stream_item(
                 &tx,
                 StreamItem::EgressVerifiedAtDispatch,
@@ -415,7 +415,14 @@ impl CodeAgent for ClaudeCodeAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        let stream_result = stream_claude_code_output(child.inner_mut(), &tx, idle_timeout).await;
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let stream_result = stream_claude_code_output(
+            child.inner_mut(),
+            &tx,
+            idle_timeout,
+            await_container_egress_canary,
+        )
+        .await;
         let stream_send_failed = matches!(
             &stream_result,
             Err(harness_core::error::HarnessError::AgentExecution(message))
