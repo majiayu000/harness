@@ -561,3 +561,103 @@ async fn linux_retained_static_candidate_requires_repository_boundaries() {
         "authorization_unavailable"
     );
 }
+
+#[cfg(target_os = "linux")]
+fn write_static_fixture(directory: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let machine = if cfg!(target_arch = "x86_64") {
+        62
+    } else {
+        183
+    };
+    let executable = directory.join(name);
+    std::fs::write(&executable, static_elf_fixture(machine)).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    executable
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_target_authorization_classifies_repository_and_external_handles() {
+    let repository = tempfile::tempdir().unwrap();
+    let repository_executable = write_static_fixture(repository.path(), "repository-runtime");
+    let boundaries = ValidatedRepositoryBoundarySet::from_existing_roots(
+        repository.path(),
+        [&repository.path()],
+    )
+    .unwrap();
+    let envelope = fingerprint_configured_runtime_executable(
+        &configured_path(&repository_executable),
+        &RuntimeFingerprintOptions::new(std::env::current_dir().unwrap())
+            .with_repository_boundaries(boundaries),
+    )
+    .await
+    .unwrap();
+    let observed: serde_json::Value =
+        serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap();
+    assert_eq!(
+        observed["payload"]["failures"][0]["kind"],
+        "probe_not_authorized"
+    );
+    assert_eq!(
+        observed["payload"]["failures"][0]["detail"]["detail"],
+        "resolved_target_repository"
+    );
+    assert_eq!(
+        observed["payload"]["resolution_attempts"][0]["outcome"],
+        "inspection_target"
+    );
+
+    let external = tempfile::tempdir().unwrap();
+    let external_executable = write_static_fixture(external.path(), "external-runtime");
+    let boundaries = ValidatedRepositoryBoundarySet::from_existing_roots(
+        repository.path(),
+        std::iter::empty::<&Path>(),
+    )
+    .unwrap();
+    let error = fingerprint_configured_runtime_executable(
+        &configured_path(&external_executable),
+        &RuntimeFingerprintOptions::new(std::env::current_dir().unwrap())
+            .with_repository_boundaries(boundaries),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeFingerprintProduceError::ContainmentUnavailable(
+            ContainmentUnavailableReason::PostExecGuardUnavailable
+        )
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_target_authorization_rejects_multiple_hard_links() {
+    let repository = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let executable = write_static_fixture(external.path(), "linked-runtime");
+    std::fs::hard_link(&executable, external.path().join("second-link")).unwrap();
+    let boundaries = ValidatedRepositoryBoundarySet::from_existing_roots(
+        repository.path(),
+        std::iter::empty::<&Path>(),
+    )
+    .unwrap();
+    let envelope = fingerprint_configured_runtime_executable(
+        &configured_path(&executable),
+        &RuntimeFingerprintOptions::new(std::env::current_dir().unwrap())
+            .with_repository_boundaries(boundaries),
+    )
+    .await
+    .unwrap();
+    let observed: serde_json::Value =
+        serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap();
+    assert_eq!(
+        observed["payload"]["failures"][0]["kind"],
+        "target_authorization_unavailable"
+    );
+    assert_eq!(
+        observed["payload"]["failures"][0]["detail"]["detail"],
+        "multiple_hard_links"
+    );
+}

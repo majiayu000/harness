@@ -408,7 +408,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     ])
 }
 
-fn child_install_empty_mask() -> bool {
+pub(super) fn child_install_empty_mask() -> bool {
     let empty: u64 = 0;
     unsafe {
         libc::syscall(
@@ -421,7 +421,7 @@ fn child_install_empty_mask() -> bool {
     }
 }
 
-fn child_isolate(
+pub(super) fn child_isolate(
     gate: libc::c_int,
     status: libc::c_int,
     protocol: libc::c_int,
@@ -480,7 +480,7 @@ fn child_send(
     if let Some((metadata, digest)) = metadata {
         frame[1..9].copy_from_slice(&metadata.st_dev.to_be_bytes());
         frame[9..17].copy_from_slice(&metadata.st_ino.to_be_bytes());
-        frame[17..25].copy_from_slice(&(metadata.st_nlink as u64).to_be_bytes());
+        frame[17..25].copy_from_slice(&stat_link_count(metadata).to_be_bytes());
         frame[25..33].copy_from_slice(&(metadata.st_size as u64).to_be_bytes());
         frame[33..37].copy_from_slice(&metadata.st_mode.to_be_bytes());
         frame[37..69].copy_from_slice(&digest);
@@ -507,6 +507,17 @@ fn child_send(
     }
     let sent = unsafe { libc::sendmsg(fd, &message, libc::MSG_NOSIGNAL) };
     unsafe { libc::_exit(if sent == frame.len() as isize { 0 } else { 133 }) }
+}
+
+fn stat_link_count(metadata: &libc::stat) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        u64::from(metadata.st_nlink)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        metadata.st_nlink
+    }
 }
 
 fn receive_candidate(

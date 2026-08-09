@@ -1,5 +1,6 @@
 //! Ordered candidate resolution and terminal evidence mapping.
 
+use super::authorization::TargetAuthorization;
 use super::candidate::{CandidateObservation, RetainedExecutable};
 use super::environment::SelectedEnvironment;
 use super::executable::{PreparedCommand, ResolvedCandidate, RetainedWorkingDirectory};
@@ -130,16 +131,7 @@ pub(super) fn resolve(
                         )?,
                     );
                 }
-                let authorization_failure = if options.repository_boundaries().is_none() {
-                    Some(RuntimeProbeFailureDetail::BoundaryUnprovable)
-                } else if executable.link_count == 0 {
-                    Some(RuntimeProbeFailureDetail::UnlinkedTarget)
-                } else if executable.link_count > 1 {
-                    Some(RuntimeProbeFailureDetail::MultipleHardLinks)
-                } else {
-                    None
-                };
-                if let Some(detail) = authorization_failure {
+                let Some(boundaries) = options.repository_boundaries() else {
                     attempts.push(attempt(
                         candidate,
                         RuntimeResolutionAttemptOutcome::AuthorizationUnavailable,
@@ -152,9 +144,64 @@ pub(super) fn resolve(
                         attempts,
                         RuntimeProbeFailure::with_detail(
                             RuntimeProbeFailureKind::TargetAuthorizationUnavailable,
-                            detail,
+                            RuntimeProbeFailureDetail::BoundaryUnprovable,
                         )?,
                     );
+                };
+                match super::authorization::authorize_target(&executable, boundaries, deadline)? {
+                    TargetAuthorization::Authorized => {}
+                    TargetAuthorization::ResolvedTargetRepository => {
+                        attempts.push(attempt(
+                            candidate,
+                            RuntimeResolutionAttemptOutcome::InspectionTarget,
+                        )?);
+                        return complete_with(
+                            configured,
+                            environment,
+                            command,
+                            working_directory,
+                            attempts,
+                            RuntimeProbeFailure::with_detail(
+                                RuntimeProbeFailureKind::ProbeNotAuthorized,
+                                RuntimeProbeFailureDetail::ResolvedTargetRepository,
+                            )?,
+                        );
+                    }
+                    authorization => {
+                        let detail = match authorization {
+                            TargetAuthorization::BoundaryUnprovable => {
+                                RuntimeProbeFailureDetail::BoundaryUnprovable
+                            }
+                            TargetAuthorization::LinkCountUnprovable => {
+                                RuntimeProbeFailureDetail::LinkCountUnprovable
+                            }
+                            TargetAuthorization::UnlinkedTarget => {
+                                RuntimeProbeFailureDetail::UnlinkedTarget
+                            }
+                            TargetAuthorization::MultipleHardLinks => {
+                                RuntimeProbeFailureDetail::MultipleHardLinks
+                            }
+                            TargetAuthorization::Authorized
+                            | TargetAuthorization::ResolvedTargetRepository => {
+                                return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+                            }
+                        };
+                        attempts.push(attempt(
+                            candidate,
+                            RuntimeResolutionAttemptOutcome::AuthorizationUnavailable,
+                        )?);
+                        return complete_with(
+                            configured,
+                            environment,
+                            command,
+                            working_directory,
+                            attempts,
+                            RuntimeProbeFailure::with_detail(
+                                RuntimeProbeFailureKind::TargetAuthorizationUnavailable,
+                                detail,
+                            )?,
+                        );
+                    }
                 }
                 return Ok(ResolutionDisposition::Selected {
                     candidate: candidate.clone(),
