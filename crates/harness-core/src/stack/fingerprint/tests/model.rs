@@ -402,7 +402,7 @@ fn failed_runtime_from_source(
         vec![],
         None,
         None,
-        failure(RuntimeProbeFailureKind::PathNotFound),
+        failure(RuntimeProbeFailureKind::PathUnusable),
     )
     .unwrap()
 }
