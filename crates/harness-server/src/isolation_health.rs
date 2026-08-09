@@ -7,7 +7,11 @@ use tokio::{process::Command, time::Duration};
 const DOCKER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) async fn probe_isolation_availability(config: &HarnessConfig) -> IsolationAvailability {
-    availability_from_statuses(probe_host_tier(config), probe_container_tier().await)
+    availability_for_config(
+        config,
+        probe_host_tier(config),
+        probe_container_tier().await,
+    )
 }
 
 #[cfg(test)]
@@ -32,6 +36,32 @@ fn availability_from_statuses(
             "isolation tier `microvm` is reserved but not implemented",
         ),
     ])
+}
+
+fn availability_for_config(
+    config: &HarnessConfig,
+    host_status: IsolationTierStatus,
+    container_status: IsolationTierStatus,
+) -> IsolationAvailability {
+    let host_status = if host_status.available
+        && matches!(
+            host_network_policy(config),
+            NetworkPolicy::LocalProxy { .. }
+        )
+        && !container_status.available
+    {
+        let reason = container_status
+            .reason
+            .as_deref()
+            .unwrap_or("Docker is unavailable");
+        IsolationTierStatus::unavailable(
+            IsolationTier::Host,
+            format!("host egress proxy requires Docker: {reason}"),
+        )
+    } else {
+        host_status
+    };
+    availability_from_statuses(host_status, container_status)
 }
 
 fn probe_host_tier(config: &HarnessConfig) -> IsolationTierStatus {
@@ -131,5 +161,24 @@ mod tests {
         let config = HarnessConfig::default();
 
         assert_eq!(host_network_policy(&config), NetworkPolicy::Deny);
+    }
+
+    #[test]
+    fn host_proxy_is_unavailable_when_docker_is_unavailable() {
+        let mut config = HarnessConfig::default();
+        config.isolation.network_allowlist = vec!["api.openai.com".to_string()];
+
+        let availability = availability_for_config(
+            &config,
+            IsolationTierStatus::available(IsolationTier::Host),
+            IsolationTierStatus::unavailable(IsolationTier::Container, "docker missing"),
+        );
+
+        let host = availability.status_for(IsolationTier::Host);
+        assert!(!host.available);
+        assert_eq!(
+            host.reason.as_deref(),
+            Some("host egress proxy requires Docker: docker missing")
+        );
     }
 }
