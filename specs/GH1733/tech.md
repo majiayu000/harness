@@ -76,7 +76,7 @@ before adding the remediation:
 - `stack/fingerprint/schema.rs` owns duplicate-aware JSON decoding and the
   schema-context canonicalization state machine.
 - `stack/fingerprint/tests.rs` owns shared core fixtures and wire/digest tests;
-  `stack/fingerprint/tests/model.rs` and `tests/schema.rs` split the mandatory
+  `stack/fingerprint/tests/model.rs` and `stack/fingerprint/tests/schema.rs` split the mandatory
   runtime-model and MCP schema matrices below the hard file-size ceiling.
 - `runtime_fingerprint.rs` owns configured-runtime inputs and the async
   orchestration that assembles one runtime payload.
