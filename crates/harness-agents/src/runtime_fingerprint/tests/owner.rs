@@ -203,3 +203,38 @@ fn expired_cleanup_retains_obligation_until_owner_drain_reaps() {
     );
     assert_eq!(probe::last_errno(), libc::ECHILD);
 }
+
+#[test]
+fn expired_unregistered_cleanup_retains_pid_until_owner_drain_reaps() {
+    let registry = registry::OwnerRegistry::new();
+    let role = RuntimeOwnedChildRole::InitialTarget;
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        loop {
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+    assert!(matches!(
+        probe::rollback_unregistered_child(&registry, pid, std::time::Instant::now(), role),
+        Err(
+            RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
+                operation: RuntimeChildCleanupOperation::Reap,
+                ..
+            }
+        )
+    ));
+    assert_eq!(registry.pre_registration_usage(), 1);
+    assert!(!registry.is_empty());
+    registry.drain_retained();
+    assert_eq!(registry.pre_registration_usage(), 0);
+    assert!(registry.is_empty());
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(probe::last_errno(), libc::ECHILD);
+}

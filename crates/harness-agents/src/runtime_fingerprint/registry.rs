@@ -15,9 +15,16 @@ struct ChildEntry {
     role: RuntimeOwnedChildRole,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreRegistrationEntry {
+    pid: libc::pid_t,
+    role: RuntimeOwnedChildRole,
+}
+
 #[derive(Debug)]
 struct RegistryInner {
     children: [Option<ChildEntry>; RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS],
+    pre_registration: [Option<PreRegistrationEntry>; RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS + 1],
     auxiliary_pidfds: usize,
     non_pidfds: usize,
 }
@@ -39,6 +46,7 @@ impl OwnerRegistry {
         Self {
             inner: Rc::new(RefCell::new(RegistryInner {
                 children: std::array::from_fn(|_| None),
+                pre_registration: std::array::from_fn(|_| None),
                 auxiliary_pidfds: 0,
                 non_pidfds: 0,
             })),
@@ -116,9 +124,104 @@ impl OwnerRegistry {
         })
     }
 
+    pub(super) fn retain_pre_registration_child(
+        &self,
+        pid: libc::pid_t,
+        role: RuntimeOwnedChildRole,
+    ) -> Result<(), RuntimeFingerprintProduceError> {
+        if pid <= 0 {
+            return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+        }
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .children
+            .iter()
+            .flatten()
+            .any(|entry| entry.pid == pid)
+        {
+            return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+        }
+        if let Some(entry) = inner
+            .pre_registration
+            .iter()
+            .flatten()
+            .find(|entry| entry.pid == pid)
+        {
+            return (entry.role == role)
+                .then_some(())
+                .ok_or(RuntimeFingerprintProduceError::InvalidLaunchContext);
+        }
+        let Some(slot) = inner.pre_registration.iter().position(Option::is_none) else {
+            return Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded);
+        };
+        inner.pre_registration[slot] = Some(PreRegistrationEntry { pid, role });
+        Ok(())
+    }
+
+    pub(super) fn cleanup_pre_registration_child(
+        &self,
+        pid: libc::pid_t,
+        role: RuntimeOwnedChildRole,
+        deadline: Instant,
+    ) -> Result<(), RuntimeFingerprintProduceError> {
+        let retained = self
+            .inner
+            .borrow()
+            .pre_registration
+            .iter()
+            .flatten()
+            .any(|entry| entry.pid == pid && entry.role == role);
+        if !retained {
+            return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+        }
+        if Instant::now() >= deadline {
+            return Err(pre_registration_cleanup_error(
+                role,
+                RuntimeChildCleanupOperation::Reap,
+            ));
+        }
+        // SAFETY: the registry proves this exact positive PID is an unreaped direct child.
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 && last_errno() != libc::ESRCH {
+            return Err(pre_registration_cleanup_error(
+                role,
+                RuntimeChildCleanupOperation::Termination,
+            ));
+        }
+        loop {
+            let mut status = 0;
+            // SAFETY: the same registry obligation remains live until this wait succeeds.
+            let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if result == pid {
+                self.remove_pre_registration_child(pid, role);
+                return Ok(());
+            }
+            if result < 0 {
+                let errno = last_errno();
+                if errno == libc::EINTR {
+                    continue;
+                }
+                if errno == libc::ECHILD {
+                    self.remove_pre_registration_child(pid, role);
+                }
+                return Err(pre_registration_cleanup_error(
+                    role,
+                    RuntimeChildCleanupOperation::Reap,
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(pre_registration_cleanup_error(
+                    role,
+                    RuntimeChildCleanupOperation::Reap,
+                ));
+            }
+            std::thread::yield_now();
+        }
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         let inner = self.inner.borrow();
         inner.children.iter().all(Option::is_none)
+            && inner.pre_registration.iter().all(Option::is_none)
             && inner.auxiliary_pidfds == 0
             && inner.non_pidfds == 0
     }
@@ -137,6 +240,16 @@ impl OwnerRegistry {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn pre_registration_usage(&self) -> usize {
+        self.inner
+            .borrow()
+            .pre_registration
+            .iter()
+            .flatten()
+            .count()
+    }
+
     pub(super) fn drain_retained(&self) {
         while !self.is_empty() {
             self.cleanup_before(Instant::now() + Duration::from_millis(250));
@@ -147,6 +260,23 @@ impl OwnerRegistry {
     }
 
     fn cleanup_before(&self, deadline: Instant) {
+        let pre_registration = {
+            let inner = self.inner.borrow();
+            inner
+                .pre_registration
+                .iter()
+                .flatten()
+                .map(|entry| (entry.pid, entry.role))
+                .collect::<Vec<_>>()
+        };
+        for (pid, role) in pre_registration {
+            if let Err(error) = self.cleanup_pre_registration_child(pid, role, deadline) {
+                tracing::debug!(
+                    ?error,
+                    "pre-registration child cleanup remains pending for owner drain"
+                );
+            }
+        }
         let entries = {
             let inner = self.inner.borrow();
             inner
@@ -169,6 +299,19 @@ impl OwnerRegistry {
                 self.remove_and_close(slot, pid, pidfd);
             }
         }
+    }
+
+    fn remove_pre_registration_child(&self, pid: libc::pid_t, role: RuntimeOwnedChildRole) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let Some(slot) = inner
+            .pre_registration
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.pid == pid && entry.role == role))
+        else {
+            return false;
+        };
+        inner.pre_registration[slot] = None;
+        true
     }
 
     fn remove_and_close(&self, slot: usize, pid: libc::pid_t, pidfd: libc::c_int) -> bool {
@@ -209,6 +352,13 @@ impl OwnerRegistry {
             }
         }
     }
+}
+
+fn pre_registration_cleanup_error(
+    role: RuntimeOwnedChildRole,
+    operation: RuntimeChildCleanupOperation,
+) -> RuntimeFingerprintProduceError {
+    RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete { role, operation }
 }
 
 #[derive(Debug)]

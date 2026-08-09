@@ -138,7 +138,7 @@ pub(super) fn register_child(
     match registry.register_child(pid, pidfd, role) {
         Ok(child) => Ok(child),
         Err(_) => {
-            let cleanup = rollback_unregistered_child(pid, deadline, role);
+            let cleanup = rollback_unregistered_child(registry, pid, deadline, role);
             close_fd(pidfd);
             cleanup?;
             Err(registration_error(
@@ -150,36 +150,13 @@ pub(super) fn register_child(
 }
 
 pub(super) fn rollback_unregistered_child(
+    registry: &super::registry::OwnerRegistry,
     pid: libc::pid_t,
     deadline: Instant,
     role: super::RuntimeOwnedChildRole,
 ) -> Result<(), RuntimeFingerprintProduceError> {
-    // SAFETY: this exact positive PID is an unreaped direct child and has not been registered.
-    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
-        return Err(
-            RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
-                role,
-                operation: super::RuntimeChildCleanupOperation::Termination,
-            },
-        );
-    }
-    loop {
-        let mut status = 0;
-        // SAFETY: the same exact positive direct-child PID remains unreaped in this loop.
-        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if result == pid {
-            return Ok(());
-        }
-        if result < 0 || Instant::now() >= deadline {
-            return Err(
-                RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
-                    role,
-                    operation: super::RuntimeChildCleanupOperation::Reap,
-                },
-            );
-        }
-        std::thread::yield_now();
-    }
+    registry.retain_pre_registration_child(pid, role)?;
+    registry.cleanup_pre_registration_child(pid, role, deadline)
 }
 
 pub(super) fn waitid_pidfd(

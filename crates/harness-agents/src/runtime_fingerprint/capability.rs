@@ -71,7 +71,7 @@ pub(super) fn validate(
     if restore_result != 0 {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(status[0]);
-        super::probe::rollback_unregistered_child(pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::SignalIsolation,
@@ -84,6 +84,7 @@ pub(super) fn validate(
             super::probe::close_fd(gate[1]);
             super::probe::close_fd(status[0]);
             super::probe::rollback_unregistered_child(
+                registry,
                 pid,
                 Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE,
                 role,
@@ -100,7 +101,7 @@ pub(super) fn validate(
         super::probe::CHILD_READY => {}
         super::probe::CHILD_SIGNAL_FAILED => {
             super::probe::close_fd(gate[1]);
-            super::probe::rollback_unregistered_child(pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
             return Err(super::probe::registration_error(
                 role,
                 super::RuntimeChildRegistrationStage::SignalIsolation,
@@ -108,14 +109,14 @@ pub(super) fn validate(
         }
         super::probe::CHILD_DESCRIPTOR_UNAVAILABLE => {
             super::probe::close_fd(gate[1]);
-            super::probe::rollback_unregistered_child(pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
             return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
                 ContainmentUnavailableReason::DescriptorIsolationUnavailable,
             ));
         }
         _ => {
             super::probe::close_fd(gate[1]);
-            super::probe::rollback_unregistered_child(pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
             return Err(super::probe::registration_error(
                 role,
                 super::RuntimeChildRegistrationStage::DescriptorIsolation,
@@ -127,7 +128,7 @@ pub(super) fn validate(
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
     if pidfd < 0 {
         super::probe::close_fd(gate[1]);
-        super::probe::rollback_unregistered_child(pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::PidfdOpen,

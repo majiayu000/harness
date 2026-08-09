@@ -130,7 +130,7 @@ pub(super) fn observe_candidate(
         super::probe::close_fd(status[0]);
         super::probe::close_fd(protocol[0]);
         if pid > 0 {
-            super::probe::rollback_unregistered_child(pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
         }
         return Err(super::probe::registration_error(
             role,
@@ -146,7 +146,7 @@ pub(super) fn observe_candidate(
     if ready != Ok(super::probe::CHILD_READY) {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::rollback_unregistered_child(pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
         return Err(super::probe::registration_error(
             role,
             match ready {
@@ -161,7 +161,7 @@ pub(super) fn observe_candidate(
     if pidfd < 0 {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::rollback_unregistered_child(pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::PidfdOpen,

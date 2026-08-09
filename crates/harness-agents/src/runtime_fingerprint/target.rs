@@ -214,7 +214,7 @@ fn start(
     if pid < 0 || restored != 0 {
         close_parent_descriptors(gate[1], status[0], pre_exec[0], stdout[0], stderr[0]);
         if pid > 0 {
-            super::probe::rollback_unregistered_child(pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
         }
         return Err(super::probe::registration_error(
             role,
@@ -229,7 +229,7 @@ fn start(
     super::probe::close_fd(status[0]);
     if ready != Ok(super::probe::CHILD_READY) {
         close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
-        super::probe::rollback_unregistered_child(pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
         return Err(super::probe::registration_error(
             role,
             match ready {
@@ -243,7 +243,7 @@ fn start(
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
     if pidfd < 0 {
         close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
-        super::probe::rollback_unregistered_child(pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::PidfdOpen,
