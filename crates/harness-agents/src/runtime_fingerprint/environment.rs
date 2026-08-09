@@ -19,6 +19,26 @@ use std::ffi::{OsStr, OsString};
 const PATH_DIGEST_DOMAIN: &[u8] = b"harness_runtime_environment_path_v0_1\0";
 const CLAUDE_CONFIG_DIR_DIGEST_DOMAIN: &[u8] =
     b"harness_runtime_environment_claude_config_dir_v0_1\0";
+const WORKING_DIRECTORY_DIGEST_DOMAIN: &[u8] = b"harness_runtime_working_directory_v0_1\0";
+
+pub fn windows_working_directory_digest(
+    units: &[u16],
+) -> Result<Sha256Digest, RuntimeFingerprintProduceError> {
+    if units.len() > RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS {
+        return Err(RuntimeFingerprintProduceError::LaunchInputLimitExceeded(
+            RuntimeLaunchInputLimitKind::WorkingDirectory,
+        ));
+    }
+    let mut framed =
+        Vec::with_capacity(WORKING_DIRECTORY_DIGEST_DOMAIN.len() + units.len() * 2 + 16);
+    framed.extend_from_slice(WORKING_DIRECTORY_DIGEST_DOMAIN);
+    framed.extend_from_slice(b"windows\0");
+    framed.extend_from_slice(&(units.len() as u64).to_be_bytes());
+    for unit in units {
+        framed.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(Sha256Digest::from_bytes(&framed))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeTermination {

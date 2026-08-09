@@ -322,6 +322,24 @@ async fn linux_capability_child_is_gated_registered_and_reaped_by_pidfd() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bare_without_sanitized_path_records_path_unusable_after_containment() {
+    let envelope = fingerprint_configured_runtime_executable(
+        &configured(IsolationTier::Host, sandbox(SandboxMode::DangerFullAccess)),
+        &RuntimeFingerprintOptions::new(std::env::current_dir().unwrap()),
+    )
+    .await
+    .unwrap();
+    let json = envelope.to_json_string().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["payload"]["failures"][0]["kind"], "path_unusable");
+    assert_eq!(parsed["payload"]["resolution_attempts"], json!([]));
+    assert!(parsed["payload"]["working_directory_identity_digest"]
+        .as_str()
+        .is_some_and(|value| value.len() == 64));
+}
+
 #[test]
 fn runtime_whole_output_grammars_and_stream_selection_are_exact() {
     let codex = classify_completed_runtime_output(

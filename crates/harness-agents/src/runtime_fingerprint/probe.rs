@@ -7,97 +7,23 @@ use super::{
     RuntimeFingerprintProduceError,
 };
 use harness_core::stack::fingerprint::AgentStackFingerprintEnvelope;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use harness_core::stack::fingerprint::{RuntimeProbeFailure, RuntimeProbeFailureKind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-static ACTIVE_OWNERS: AtomicUsize = AtomicUsize::new(0);
-
-struct OwnerPermit;
-
-impl OwnerPermit {
-    fn try_acquire() -> Result<Self, RuntimeFingerprintProduceError> {
-        ACTIVE_OWNERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < super::RUNTIME_FINGERPRINT_OWNER_CAPACITY).then_some(active + 1)
-            })
-            .map_err(|_| RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded)?;
-        Ok(Self)
-    }
-}
-
-impl Drop for OwnerPermit {
-    fn drop(&mut self) {
-        ACTIVE_OWNERS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-pub(super) async fn produce(
+pub(super) fn owner_run(
     executable: &ConfiguredRuntimeExecutable,
     options: &RuntimeFingerprintOptions,
     environment: SelectedEnvironment,
     command: PreparedCommand,
+    stop_requested: &AtomicBool,
 ) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
     if environment.facts.is_empty()
-        && environment.child_path.is_none()
-        && command.candidates.is_empty()
-        && !command.path_unusable
+        || executable.executable().as_os_str().is_empty()
+        || (command.candidates.is_empty() && !command.path_unusable)
     {
         return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
     }
-    let permit = OwnerPermit::try_acquire()?;
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let owner_stop = Arc::clone(&stop_requested);
-    let executable = executable.clone();
-    let options = options.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("runtime-fingerprint-owner".to_owned())
-        .spawn(move || {
-            let _permit = permit;
-            if ready_tx.send(()).is_err() || owner_stop.load(Ordering::Acquire) {
-                return;
-            }
-            let result = owner_run(&executable, &options, environment, command, &owner_stop);
-            if result_tx.send(result).is_err() {
-                tracing::error!("runtime fingerprint caller dropped before owner completion");
-            }
-        })
-        .map_err(|_| {
-            RuntimeFingerprintProduceError::ContainmentUnavailable(
-                ContainmentUnavailableReason::OwnerStartFailed,
-            )
-        })?;
-
-    match tokio::time::timeout(super::RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE, ready_rx).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
-                ContainmentUnavailableReason::OwnerStartFailed,
-            ));
-        }
-        Err(_) => {
-            stop_requested.store(true, Ordering::Release);
-            return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
-                ContainmentUnavailableReason::OwnerReadyTimeout,
-            ));
-        }
-    }
-    result_rx.await.map_err(|_| {
-        RuntimeFingerprintProduceError::ContainmentUnavailable(
-            ContainmentUnavailableReason::OwnerStopJoinTimeout,
-        )
-    })?
-}
-
-fn owner_run(
-    _executable: &ConfiguredRuntimeExecutable,
-    _options: &RuntimeFingerprintOptions,
-    _environment: SelectedEnvironment,
-    _command: PreparedCommand,
-    stop_requested: &AtomicBool,
-) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
     if stop_requested.load(Ordering::Acquire) {
         return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
             ContainmentUnavailableReason::OwnerStopJoinTimeout,
@@ -107,9 +33,26 @@ fn owner_run(
     let deadline = Instant::now() + super::RUNTIME_FINGERPRINT_PROBE_DEADLINE;
     capability_child(deadline)?;
     let working_directory =
-        super::executable::observe_working_directory(_options.working_dir(), deadline)?;
+        super::executable::observe_working_directory(options.working_dir(), deadline)?;
     if working_directory.fd() < 0 || working_directory.identity_digest.as_str().is_empty() {
         return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+    }
+    if command.path_unusable {
+        let failure = RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathUnusable)?;
+        return super::finish_runtime_envelope(
+            executable,
+            super::RuntimeEnvelopeEvidence {
+                command_form: command.command_form,
+                configured_command_digest: command.configured_command_digest,
+                working_directory_digest: command.working_directory_digest,
+                working_directory_identity_digest: working_directory.identity_digest.clone(),
+                resolution_attempts: Vec::new(),
+                executable: None,
+                version: None,
+                environment: environment.facts,
+                failures: vec![failure],
+            },
+        );
     }
     Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
         ContainmentUnavailableReason::PostExecGuardUnavailable,
@@ -271,15 +214,26 @@ fn validate_ptrace_capability(
     {
         return Err(());
     }
-    if write_byte(gate, CHILD_GO).is_err()
-        // SAFETY: PTRACE_SYSCALL resumes only the registered traced child.
+    if write_byte(gate, CHILD_GO).is_err() {
+        return Err(());
+    }
+    // SAFETY: PTRACE_SYSCALL resumes only the registered traced child.
+    if unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) } != 0
+        || !waitid_pidfd_stop(pidfd, pid, deadline)
+    {
+        return Err(());
+    }
+    let first_op = ptrace_syscall_info_op(pid).filter(|op| matches!(op, 1 | 2));
+    // SAFETY: resume to the alternating tagged syscall stop.
+    if first_op.is_none()
         || unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) } != 0
         || !waitid_pidfd_stop(pidfd, pid, deadline)
-        || ptrace_syscall_info_op(pid) != Some(2)
-        // SAFETY: resume from the read exit stop to the next tagged syscall entry.
-        || unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) } != 0
-        || !waitid_pidfd_stop(pidfd, pid, deadline)
-        || ptrace_syscall_info_op(pid) != Some(1)
+    {
+        return Err(());
+    }
+    let second_op = ptrace_syscall_info_op(pid).filter(|op| matches!(op, 1 | 2));
+    if second_op.is_none()
+        || first_op == second_op
         // SAFETY: detach resumes the exact traced child without injecting a signal.
         || unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) } != 0
     {

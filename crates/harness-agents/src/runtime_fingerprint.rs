@@ -13,19 +13,30 @@ use harness_core::config::isolation::IsolationTier;
 use harness_core::stack::fingerprint::{
     AgentStackFingerprintEnvelope, ConfiguredRuntimeSource, LocalExecutableRuntimeKind,
 };
+#[cfg(target_os = "linux")]
+use harness_core::stack::fingerprint::{
+    RuntimeCommandForm, RuntimeEnvironmentFact, RuntimeExecutableFingerprintPayload,
+    RuntimeExecutableIdentity, RuntimeProbeFailure, RuntimeResolutionAttempt,
+    RuntimeRoleSourceBinding, RuntimeVersionFacts,
+};
+#[cfg(target_os = "linux")]
+use harness_core::stack::Sha256Digest;
 use harness_sandbox::SandboxSpec;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+
 pub use environment::{
-    classify_completed_runtime_output, RuntimeOutputClassification, RuntimeTermination,
+    classify_completed_runtime_output, windows_working_directory_digest,
+    RuntimeOutputClassification, RuntimeTermination,
 };
-pub use executable::{
-    runtime_working_directory_identity_digest, windows_working_directory_digest,
-    ValidatedRepositoryBoundarySet,
-};
+pub use executable::runtime_working_directory_identity_digest;
 
 pub const RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES: u64 = 67_108_864;
 pub const RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES: usize = 65_536;
@@ -45,6 +56,64 @@ pub const RUNTIME_FINGERPRINT_CLEANUP_DEADLINE: Duration = Duration::from_secs(5
 pub const RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE: Duration = Duration::from_secs(1);
 pub const RUNTIME_FINGERPRINT_OWNER_STOP_JOIN_DEADLINE: Duration = Duration::from_secs(1);
 pub const RUNTIME_FINGERPRINT_ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(150);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedRepositoryBoundarySet {
+    roots: Vec<PathBuf>,
+}
+
+impl ValidatedRepositoryBoundarySet {
+    pub fn from_existing_roots(
+        declared_repository_root: impl AsRef<Path>,
+        linked_worktree_roots: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) -> Result<Self, RuntimeFingerprintProduceError> {
+        let declared = std::fs::canonicalize(declared_repository_root)
+            .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
+        let mut roots = vec![declared];
+        for root in linked_worktree_roots {
+            let canonical = std::fs::canonicalize(root)
+                .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
+            if !roots.contains(&canonical) {
+                roots.push(canonical);
+            }
+        }
+        roots.sort();
+        Ok(Self { roots })
+    }
+
+    pub fn contains(&self, target: &Path) -> bool {
+        self.roots.iter().any(|root| target.starts_with(root))
+    }
+
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+}
+
+#[cfg(target_os = "linux")]
+static ACTIVE_RUNTIME_FINGERPRINT_OWNERS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "linux")]
+struct RuntimeFingerprintOwnerPermit;
+
+#[cfg(target_os = "linux")]
+impl RuntimeFingerprintOwnerPermit {
+    fn try_acquire() -> Result<Self, RuntimeFingerprintProduceError> {
+        ACTIVE_RUNTIME_FINGERPRINT_OWNERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < RUNTIME_FINGERPRINT_OWNER_CAPACITY).then_some(active + 1)
+            })
+            .map_err(|_| RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded)?;
+        Ok(Self)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RuntimeFingerprintOwnerPermit {
+    fn drop(&mut self) {
+        ACTIVE_RUNTIME_FINGERPRINT_OWNERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainmentUnavailableReason {
@@ -176,6 +245,43 @@ pub enum RuntimeFingerprintProduceError {
     },
     #[error("runtime execution verification is unavailable")]
     ExecutionVerificationUnavailable,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct RuntimeEnvelopeEvidence {
+    pub(super) command_form: RuntimeCommandForm,
+    pub(super) configured_command_digest: Sha256Digest,
+    pub(super) working_directory_digest: Sha256Digest,
+    pub(super) working_directory_identity_digest: Sha256Digest,
+    pub(super) resolution_attempts: Vec<RuntimeResolutionAttempt>,
+    pub(super) executable: Option<RuntimeExecutableIdentity>,
+    pub(super) version: Option<RuntimeVersionFacts>,
+    pub(super) environment: Vec<RuntimeEnvironmentFact>,
+    pub(super) failures: Vec<RuntimeProbeFailure>,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn finish_runtime_envelope(
+    configured: &ConfiguredRuntimeExecutable,
+    evidence: RuntimeEnvelopeEvidence,
+) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
+    let role_binding = RuntimeRoleSourceBinding::derive(
+        configured.configured_source(),
+        configured.runtime_kind(),
+    )?;
+    let payload = RuntimeExecutableFingerprintPayload::new(
+        role_binding,
+        evidence.command_form,
+        evidence.configured_command_digest,
+        evidence.working_directory_digest,
+        evidence.working_directory_identity_digest,
+        evidence.resolution_attempts,
+        evidence.executable,
+        evidence.version,
+        evidence.environment,
+        evidence.failures,
+    )?;
+    Ok(AgentStackFingerprintEnvelope::agent_runtime(payload)?)
 }
 
 #[derive(Debug, Clone)]
@@ -376,7 +482,55 @@ async fn produce_on_supported_platform(
     selected_environment: environment::SelectedEnvironment,
     prepared_command: executable::PreparedCommand,
 ) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
-    probe::produce(executable, options, selected_environment, prepared_command).await
+    let permit = RuntimeFingerprintOwnerPermit::try_acquire()?;
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let owner_stop = Arc::clone(&stop_requested);
+    let executable = executable.clone();
+    let options = options.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("runtime-fingerprint-owner".to_owned())
+        .spawn(move || {
+            let _permit = permit;
+            if ready_tx.send(()).is_err() || owner_stop.load(Ordering::Acquire) {
+                return;
+            }
+            let result = probe::owner_run(
+                &executable,
+                &options,
+                selected_environment,
+                prepared_command,
+                &owner_stop,
+            );
+            if result_tx.send(result).is_err() {
+                tracing::error!("runtime fingerprint caller dropped before owner completion");
+            }
+        })
+        .map_err(|_| {
+            RuntimeFingerprintProduceError::ContainmentUnavailable(
+                ContainmentUnavailableReason::OwnerStartFailed,
+            )
+        })?;
+    match tokio::time::timeout(RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE, ready_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
+                ContainmentUnavailableReason::OwnerStartFailed,
+            ));
+        }
+        Err(_) => {
+            stop_requested.store(true, Ordering::Release);
+            return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
+                ContainmentUnavailableReason::OwnerReadyTimeout,
+            ));
+        }
+    }
+    result_rx.await.map_err(|_| {
+        RuntimeFingerprintProduceError::ContainmentUnavailable(
+            ContainmentUnavailableReason::OwnerStopJoinTimeout,
+        )
+    })?
 }
 
 #[cfg(not(target_os = "linux"))]

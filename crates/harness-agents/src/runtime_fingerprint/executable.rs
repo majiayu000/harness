@@ -18,39 +18,6 @@ const WORKING_DIRECTORY_IDENTITY_DOMAIN: &[u8] =
 const CANDIDATE_DIGEST_DOMAIN: &[u8] = b"harness_runtime_resolution_candidate_v0_1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedRepositoryBoundarySet {
-    roots: Vec<PathBuf>,
-}
-
-impl ValidatedRepositoryBoundarySet {
-    pub fn from_existing_roots(
-        declared_repository_root: impl AsRef<Path>,
-        linked_worktree_roots: impl IntoIterator<Item = impl AsRef<Path>>,
-    ) -> Result<Self, RuntimeFingerprintProduceError> {
-        let declared = std::fs::canonicalize(declared_repository_root)
-            .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
-        let mut roots = vec![declared];
-        for root in linked_worktree_roots {
-            let canonical = std::fs::canonicalize(root)
-                .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
-            if !roots.contains(&canonical) {
-                roots.push(canonical);
-            }
-        }
-        roots.sort();
-        Ok(Self { roots })
-    }
-
-    pub fn contains(&self, target: &Path) -> bool {
-        self.roots.iter().any(|root| target.starts_with(root))
-    }
-
-    pub fn roots(&self) -> &[PathBuf] {
-        &self.roots
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CandidateReference {
     Absolute(PathBuf),
     WorkingDirectoryRelative(PathBuf),
@@ -622,28 +589,6 @@ fn digest_unix_bytes(domain: &[u8], value: &[u8]) -> Sha256Digest {
     framed.extend_from_slice(&(value.len() as u64).to_be_bytes());
     framed.extend_from_slice(value);
     Sha256Digest::from_bytes(&framed)
-}
-
-pub(super) fn digest_windows_units(domain: &[u8], units: &[u16]) -> Sha256Digest {
-    let mut framed = Vec::with_capacity(domain.len() + units.len() * 2 + 16);
-    framed.extend_from_slice(domain);
-    framed.extend_from_slice(b"windows\0");
-    framed.extend_from_slice(&(units.len() as u64).to_be_bytes());
-    for unit in units {
-        framed.extend_from_slice(&unit.to_le_bytes());
-    }
-    Sha256Digest::from_bytes(&framed)
-}
-
-pub fn windows_working_directory_digest(
-    units: &[u16],
-) -> Result<Sha256Digest, RuntimeFingerprintProduceError> {
-    if units.len() > RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS {
-        return Err(RuntimeFingerprintProduceError::LaunchInputLimitExceeded(
-            super::RuntimeLaunchInputLimitKind::WorkingDirectory,
-        ));
-    }
-    Ok(digest_windows_units(WORKING_DIRECTORY_DIGEST_DOMAIN, units))
 }
 
 #[cfg(unix)]
