@@ -691,7 +691,8 @@ stopped-image identity/hash validation under kernel write denial,
 offset-zero bounded `pread` hashing that ignores shared open-description offsets,
 W+X/executable-stack rejection, post-exec syscall-stop denial of process
 creation, image execution, executable mappings, and existing executable-image
-mutation plus native `init_module`/`finit_module` kernel-module loading,
+mutation including every `openat2`, plus native `bpf`/`init_module`/`finit_module`
+kernel-code loading,
 post-capability registered-pidfd-only signalling and reap ordering, legal
 signal-delivery reinjection and illegal-state rejection,
 argument/environment pointers, NUL validation, error
