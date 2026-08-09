@@ -57,6 +57,17 @@ pub(super) fn denied_class(
     Ok(classify_native(number, arguments))
 }
 
+pub(super) const fn is_exit_syscall(number: u64) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        matches!(number, 60 | 231)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        matches!(number, 93 | 94)
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 fn classify_native(number: u64, arguments: [u64; 6]) -> Option<RuntimeProbeFailureDetail> {
     use RuntimeProbeFailureDetail as D;

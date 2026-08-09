@@ -90,8 +90,8 @@ pub(super) fn owner_run(
                     return Err(error);
                 }
             };
-            stopped.terminate_without_resume(cleanup_deadline)?;
             if checkpoint == super::exec_stop::ExecStopCheckpoint::IdentityChanged {
+                stopped.terminate_without_resume(cleanup_deadline)?;
                 attempts.push(RuntimeResolutionAttempt::new(
                     candidate.candidate_digest.clone(),
                     RuntimeResolutionAttemptOutcome::ExecVerificationFailed,
@@ -116,6 +116,37 @@ pub(super) fn owner_run(
                         )?],
                     },
                 );
+            }
+            attempts.push(RuntimeResolutionAttempt::new(
+                candidate.candidate_digest.clone(),
+                RuntimeResolutionAttemptOutcome::ExecStarted,
+                RuntimeExecSequence::Single,
+                Some(RuntimeExecutionContext::LinuxFdCloexecExecveatEmptyPathFd10),
+            )?);
+            match super::supervision::run(stopped, options.max_output_bytes(), deadline)? {
+                super::supervision::SupervisionOutcome::Failed(failure) => {
+                    return super::finish_runtime_envelope(
+                        executable,
+                        super::RuntimeEnvelopeEvidence {
+                            command_form: command.command_form,
+                            configured_command_digest: command.configured_command_digest,
+                            working_directory_digest: command.working_directory_digest,
+                            working_directory_identity_digest: working_directory
+                                .identity_digest
+                                .clone(),
+                            resolution_attempts: attempts,
+                            executable: None,
+                            version: None,
+                            environment: environment.facts,
+                            failures: vec![failure],
+                        },
+                    );
+                }
+                super::supervision::SupervisionOutcome::Captured {
+                    stdout,
+                    stderr,
+                    termination,
+                } => drop((stdout, stderr, termination)),
             }
         }
         super::target::TargetStart::SetupFailed(detail) => {

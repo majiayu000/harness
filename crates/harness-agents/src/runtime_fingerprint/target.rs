@@ -22,10 +22,10 @@ pub(super) enum TargetStart {
 }
 
 pub(super) struct StoppedTarget {
-    pid: libc::pid_t,
-    pidfd: libc::c_int,
-    stdout: libc::c_int,
-    stderr: libc::c_int,
+    pub(super) pid: libc::pid_t,
+    pub(super) pidfd: libc::c_int,
+    pub(super) stdout: libc::c_int,
+    pub(super) stderr: libc::c_int,
 }
 
 impl StoppedTarget {
@@ -244,10 +244,10 @@ fn supervise_initial_stop(
     };
     match initial {
         TargetEvent::Stopped(libc::SIGSTOP) => {}
-        TargetEvent::Exited => {
+        TargetEvent::Exited(_) => {
             return finish_early_exit(pidfd, pre_exec, stdout, stderr);
         }
-        TargetEvent::Signalled => {
+        TargetEvent::Signalled(_) => {
             return verification_after_reap(pidfd, pre_exec, stdout, stderr);
         }
         _ => return verification_cleanup(pidfd, pre_exec, stdout, stderr),
@@ -272,8 +272,8 @@ fn supervise_initial_stop(
                 stderr,
             }))
         }
-        TargetEvent::Exited => finish_early_exit(pidfd, pre_exec, stdout, stderr),
-        TargetEvent::Signalled => verification_after_reap(pidfd, pre_exec, stdout, stderr),
+        TargetEvent::Exited(_) => finish_early_exit(pidfd, pre_exec, stdout, stderr),
+        TargetEvent::Signalled(_) => verification_after_reap(pidfd, pre_exec, stdout, stderr),
         _ => verification_cleanup(pidfd, pre_exec, stdout, stderr),
     }
 }
@@ -324,13 +324,13 @@ fn verification_after_reap(
     Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
 }
 
-enum TargetEvent {
+pub(super) enum TargetEvent {
     Stopped(libc::c_int),
-    Exited,
-    Signalled,
+    Exited(libc::c_int),
+    Signalled(libc::c_int),
 }
 
-fn wait_event(
+pub(super) fn wait_event(
     pidfd: libc::c_int,
     pid: libc::pid_t,
     deadline: Instant,
@@ -357,8 +357,10 @@ fn wait_event(
                 libc::CLD_TRAPPED | libc::CLD_STOPPED => {
                     Ok(TargetEvent::Stopped(unsafe { info.si_status() }))
                 }
-                libc::CLD_EXITED => Ok(TargetEvent::Exited),
-                libc::CLD_KILLED | libc::CLD_DUMPED => Ok(TargetEvent::Signalled),
+                libc::CLD_EXITED => Ok(TargetEvent::Exited(unsafe { info.si_status() })),
+                libc::CLD_KILLED | libc::CLD_DUMPED => {
+                    Ok(TargetEvent::Signalled(unsafe { info.si_status() }))
+                }
                 _ => Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable),
             };
         }

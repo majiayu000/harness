@@ -18,6 +18,8 @@ mod probe;
 #[cfg(target_os = "linux")]
 mod resolution;
 #[cfg(target_os = "linux")]
+mod supervision;
+#[cfg(target_os = "linux")]
 mod syscall_guard;
 #[cfg(target_os = "linux")]
 mod target;
