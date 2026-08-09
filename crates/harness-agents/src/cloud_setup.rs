@@ -190,7 +190,7 @@ async fn run_setup_command(
     cloud: &CodexCloudConfig,
     context: &CloudSetupContext<'_>,
     setup_command: &str,
-    secret_state: Option<&container_state::SecretContainerState>,
+    secret_state: Option<&container_state::SecretSetupState>,
 ) -> harness_core::error::Result<crate::BoundedOutput> {
     crate::spawn_supervisor::validate_capability_token(context.capability_token)?;
     let setup_sandbox_mode = setup_sandbox_mode(context.sandbox_mode);
@@ -274,7 +274,7 @@ pub(crate) async fn run_setup_phase(
         return Ok(());
     }
 
-    let secret_state = container_state::SecretContainerState::create(cloud, &context)?;
+    let secret_state = container_state::SecretSetupState::create(cloud, &context)?;
     let discards_container_state = secret_state.is_some();
     let setup_result = async {
         for setup_command in &cloud.setup_commands {
