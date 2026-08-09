@@ -27,13 +27,16 @@ pub(super) enum ResolutionDisposition {
     },
 }
 
-struct ResolutionContext<'a> {
-    configured: &'a ConfiguredRuntimeExecutable,
-    options: &'a RuntimeFingerprintOptions,
-    environment: &'a SelectedEnvironment,
-    command: &'a PreparedCommand,
-    working_directory: &'a RetainedWorkingDirectory,
-    deadline: Instant,
+#[derive(Clone, Copy)]
+pub(super) struct ResolutionContext<'a> {
+    pub(super) configured: &'a ConfiguredRuntimeExecutable,
+    pub(super) options: &'a RuntimeFingerprintOptions,
+    pub(super) environment: &'a SelectedEnvironment,
+    pub(super) command: &'a PreparedCommand,
+    pub(super) working_directory: &'a RetainedWorkingDirectory,
+    pub(super) deadline: Instant,
+    pub(super) registry: &'a super::registry::OwnerRegistry,
+    pub(super) stop_requested: &'a std::sync::atomic::AtomicBool,
 }
 
 pub(super) struct ResolutionCursor {
@@ -42,50 +45,17 @@ pub(super) struct ResolutionCursor {
 }
 
 pub(super) fn resolve(
-    configured: &ConfiguredRuntimeExecutable,
-    options: &RuntimeFingerprintOptions,
-    environment: &SelectedEnvironment,
-    command: &PreparedCommand,
-    working_directory: &RetainedWorkingDirectory,
-    deadline: Instant,
+    context: ResolutionContext<'_>,
 ) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
-    resolve_from(
-        ResolutionContext {
-            configured,
-            options,
-            environment,
-            command,
-            working_directory,
-            deadline,
-        },
-        0,
-        Vec::with_capacity(command.candidates.len()),
-        false,
-    )
+    let candidate_capacity = context.command.candidates.len();
+    resolve_from(context, 0, Vec::with_capacity(candidate_capacity), false)
 }
 
 pub(super) fn resume_after_eacces(
-    configured: &ConfiguredRuntimeExecutable,
-    options: &RuntimeFingerprintOptions,
-    environment: &SelectedEnvironment,
-    command: &PreparedCommand,
-    working_directory: &RetainedWorkingDirectory,
-    deadline: Instant,
+    context: ResolutionContext<'_>,
     cursor: ResolutionCursor,
 ) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
-    resolve_from(
-        ResolutionContext {
-            configured,
-            options,
-            environment,
-            command,
-            working_directory,
-            deadline,
-        },
-        cursor.next_candidate_index,
-        cursor.attempts,
-        true,
-    )
+    resolve_from(context, cursor.next_candidate_index, cursor.attempts, true)
 }
 
 fn resolve_from(
@@ -101,9 +71,13 @@ fn resolve_from(
         command,
         working_directory,
         deadline,
+        registry,
+        stop_requested,
     } = context;
     for (candidate_index, candidate) in command.candidates.iter().enumerate().skip(start_index) {
-        match super::candidate::observe_candidate(candidate, working_directory, deadline)? {
+        super::probe::ensure_owner_running(stop_requested)?;
+        match super::candidate::observe_candidate(candidate, working_directory, deadline, registry)?
+        {
             CandidateObservation::Absent => {
                 attempts.push(attempt(candidate, RuntimeResolutionAttemptOutcome::Absent)?);
                 if command.command_form != RuntimeCommandForm::UnixBare {
@@ -216,7 +190,12 @@ fn resolve_from(
                         )?,
                     );
                 };
-                match super::authorization::authorize_target(&executable, boundaries, deadline)? {
+                match super::authorization::authorize_target(
+                    &executable,
+                    boundaries,
+                    deadline,
+                    registry,
+                )? {
                     TargetAuthorization::Authorized => {}
                     TargetAuthorization::ResolvedTargetRepository => {
                         attempts.push(attempt(
@@ -277,6 +256,7 @@ fn resolve_from(
                     &executable,
                     boundaries,
                     deadline,
+                    registry,
                 )? {
                     PreSpawnCheckpoint::Consistent => {}
                     PreSpawnCheckpoint::IdentityChanged => {

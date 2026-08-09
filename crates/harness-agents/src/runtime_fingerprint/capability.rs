@@ -7,7 +7,11 @@ use std::time::Instant;
 const MAX_CAPABILITY_SYSCALL_STOPS: usize = 16;
 const PROC_SELF_MEM: &[u8; 15] = b"/proc/self/mem\0";
 
-pub(super) fn validate(deadline: Instant) -> Result<(), RuntimeFingerprintProduceError> {
+pub(super) fn validate(
+    deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
+) -> Result<(), RuntimeFingerprintProduceError> {
+    let _descriptor_lease = registry.reserve_descriptors(4)?;
     let role =
         super::RuntimeOwnedChildRole::Observation(super::RuntimeObservationStage::CapabilityCheck);
     let mut gate = [-1; 2];
@@ -129,15 +133,22 @@ pub(super) fn validate(deadline: Instant) -> Result<(), RuntimeFingerprintProduc
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
-    if validate_ptrace(pid, pidfd, gate[1], deadline).is_err() {
+    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+        Ok(child) => child,
+        Err(error) => {
+            super::probe::close_fd(gate[1]);
+            return Err(error);
+        }
+    };
+    if validate_ptrace(pid, child.pidfd(), gate[1], deadline).is_err() {
         super::probe::close_fd(gate[1]);
-        super::probe::cleanup_registered_child(pidfd, deadline, role)?;
+        child.cleanup(deadline)?;
         return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
             ContainmentUnavailableReason::PostExecGuardUnavailable,
         ));
     }
     super::probe::close_fd(gate[1]);
-    validate_and_consume_exit(pidfd, pid, deadline, role)
+    validate_and_consume_exit(child, pid, deadline, role)
 }
 
 fn validate_ptrace(
@@ -243,7 +254,42 @@ fn suppress_syscall(pid: libc::pid_t) -> Result<(), ()> {
 
 #[cfg(target_arch = "aarch64")]
 fn suppress_syscall(pid: libc::pid_t) -> Result<(), ()> {
+    const NT_PRSTATUS: usize = 1;
     const NT_ARM_SYSTEM_CALL: usize = 0x404;
+    let mut registers = unsafe { std::mem::zeroed::<libc::user_regs_struct>() };
+    let mut get_register_vector = libc::iovec {
+        iov_base: (&mut registers as *mut libc::user_regs_struct).cast(),
+        iov_len: std::mem::size_of::<libc::user_regs_struct>(),
+    };
+    // SAFETY: NT_PRSTATUS reads the complete stopped task register set.
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGSET,
+            pid,
+            NT_PRSTATUS as *mut libc::c_void,
+            &mut get_register_vector,
+        )
+    } != 0
+    {
+        return Err(());
+    }
+    registers.regs[0] = (-(libc::ENOSYS as i64)) as u64;
+    let mut set_register_vector = libc::iovec {
+        iov_base: (&mut registers as *mut libc::user_regs_struct).cast(),
+        iov_len: std::mem::size_of::<libc::user_regs_struct>(),
+    };
+    // SAFETY: arm64 requires both NO_SYSCALL and an explicit x0 result when skipping a syscall.
+    if unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETREGSET,
+            pid,
+            NT_PRSTATUS as *mut libc::c_void,
+            &mut set_register_vector,
+        )
+    } != 0
+    {
+        return Err(());
+    }
     let mut syscall_number: libc::c_int = -1;
     let mut vector = libc::iovec {
         iov_base: (&mut syscall_number as *mut libc::c_int).cast(),
@@ -290,36 +336,37 @@ fn wait_for_stop(pidfd: libc::c_int, pid: libc::pid_t, deadline: Instant) -> boo
 }
 
 fn validate_and_consume_exit(
-    pidfd: libc::c_int,
+    child: super::registry::RegisteredChild,
     pid: libc::pid_t,
     deadline: Instant,
     role: super::RuntimeOwnedChildRole,
 ) -> Result<(), RuntimeFingerprintProduceError> {
-    let observed = super::probe::waitid_pidfd(pidfd, true, deadline);
+    let observed = super::probe::waitid_pidfd(child.pidfd(), true, deadline);
     if !matches!(observed, Ok((seen, libc::CLD_EXITED, 0)) if seen == pid) {
-        let cleanup = bootstrap_pid_fallback(pidfd, pid, deadline, role);
-        super::probe::close_fd(pidfd);
-        return cleanup.and(Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
+        bootstrap_pid_fallback(child.pidfd(), pid, deadline, role)?;
+        child.reaped()?;
+        return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
             ContainmentUnavailableReason::PidfdUnavailable,
-        )));
+        ));
     }
-    match super::probe::waitid_pidfd(pidfd, false, deadline) {
+    let consumed = super::probe::waitid_pidfd(child.pidfd(), false, deadline);
+    match consumed {
         Ok((seen, libc::CLD_EXITED, 0)) if seen == pid => {
-            super::probe::close_fd(pidfd);
+            child.reaped()?;
             Ok(())
         }
         Ok(_) => {
-            super::probe::close_fd(pidfd);
+            child.reaped()?;
             Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
                 ContainmentUnavailableReason::PidfdUnavailable,
             ))
         }
         Err(()) => {
-            let cleanup = bootstrap_pid_fallback(pidfd, pid, deadline, role);
-            super::probe::close_fd(pidfd);
-            cleanup.and(Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
+            bootstrap_pid_fallback(child.pidfd(), pid, deadline, role)?;
+            child.reaped()?;
+            Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
                 ContainmentUnavailableReason::PidfdUnavailable,
-            )))
+            ))
         }
     }
 }

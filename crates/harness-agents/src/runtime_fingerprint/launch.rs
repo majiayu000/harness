@@ -31,12 +31,14 @@ pub(super) fn launch_initial(
     mut attempts: Vec<RuntimeResolutionAttempt>,
     deadline: Instant,
 ) -> Result<InitialLaunch, RuntimeFingerprintProduceError> {
+    super::probe::ensure_owner_running(context.stop_requested)?;
     let target = super::target::start_initial(
         context.configured,
         context.environment,
         context.working_directory,
         context.executable,
         deadline,
+        context.registry,
     )?;
     match target {
         super::target::TargetStart::ExecStopped(stopped) => Ok(InitialLaunch::Complete(Box::new(
@@ -100,11 +102,13 @@ fn retry_after_etxtbsy(
     attempts: Vec<RuntimeResolutionAttempt>,
     deadline: Instant,
 ) -> Result<InitialLaunch, RuntimeFingerprintProduceError> {
+    super::probe::ensure_owner_running(context.stop_requested)?;
     let retry_at = Instant::now() + super::RUNTIME_FINGERPRINT_ETXTBSY_RETRY_DELAY;
     if retry_at >= deadline {
         return Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable);
     }
     std::thread::sleep(super::RUNTIME_FINGERPRINT_ETXTBSY_RETRY_DELAY);
+    super::probe::ensure_owner_running(context.stop_requested)?;
     if Instant::now() >= deadline {
         return Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable);
     }
@@ -112,7 +116,12 @@ fn retry_after_etxtbsy(
         .options
         .repository_boundaries()
         .ok_or(RuntimeFingerprintProduceError::InvalidLaunchContext)?;
-    match super::authorization::authorize_target(context.executable, boundaries, deadline)? {
+    match super::authorization::authorize_target(
+        context.executable,
+        boundaries,
+        deadline,
+        context.registry,
+    )? {
         TargetAuthorization::Authorized => {}
         TargetAuthorization::ResolvedTargetRepository => {
             return retry_failure(
@@ -143,6 +152,7 @@ fn retry_after_etxtbsy(
         context.executable,
         boundaries,
         deadline,
+        context.registry,
     )? {
         PreSpawnCheckpoint::Consistent => {}
         PreSpawnCheckpoint::IdentityChanged => {
@@ -183,6 +193,7 @@ fn retry_after_etxtbsy(
         context.working_directory,
         context.executable,
         deadline,
+        context.registry,
     )?;
     let sequence = RuntimeExecSequence::EtxtbsyThenCheckpointAfter150Ms;
     match target {

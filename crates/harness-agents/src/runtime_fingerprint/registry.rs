@@ -1,0 +1,362 @@
+//! Owner-local child and descriptor resource ledger.
+
+use super::{
+    RuntimeChildCleanupOperation, RuntimeFingerprintProduceError, RuntimeOwnedChildRole,
+    RUNTIME_FINGERPRINT_OWNER_NON_PIDFD_SLOTS, RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS,
+};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+struct ChildEntry {
+    pid: libc::pid_t,
+    pidfd: libc::c_int,
+    role: RuntimeOwnedChildRole,
+}
+
+#[derive(Debug)]
+struct RegistryInner {
+    children: [Option<ChildEntry>; RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS],
+    auxiliary_pidfds: usize,
+    non_pidfds: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct OwnerRegistry {
+    inner: Rc<RefCell<RegistryInner>>,
+    observer: Option<std::sync::mpsc::Sender<super::owner::OwnerLifecycleEvent>>,
+}
+
+impl OwnerRegistry {
+    pub(super) fn new() -> Self {
+        Self::with_observer(None)
+    }
+
+    pub(super) fn with_observer(
+        observer: Option<std::sync::mpsc::Sender<super::owner::OwnerLifecycleEvent>>,
+    ) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(RegistryInner {
+                children: std::array::from_fn(|_| None),
+                auxiliary_pidfds: 0,
+                non_pidfds: 0,
+            })),
+            observer,
+        }
+    }
+
+    pub(super) fn reserve_descriptors(
+        &self,
+        count: usize,
+    ) -> Result<DescriptorLease, RuntimeFingerprintProduceError> {
+        let mut inner = self.inner.borrow_mut();
+        let next = inner
+            .non_pidfds
+            .checked_add(count)
+            .ok_or(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded)?;
+        if next > RUNTIME_FINGERPRINT_OWNER_NON_PIDFD_SLOTS {
+            return Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded);
+        }
+        inner.non_pidfds = next;
+        Ok(DescriptorLease {
+            registry: self.clone(),
+            count,
+        })
+    }
+
+    pub(super) fn register_child(
+        &self,
+        pid: libc::pid_t,
+        pidfd: libc::c_int,
+        role: RuntimeOwnedChildRole,
+    ) -> Result<RegisteredChild, RuntimeFingerprintProduceError> {
+        if pid <= 0 || pidfd < 0 {
+            return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+        }
+        let slot = {
+            let mut inner = self.inner.borrow_mut();
+            let child_count = inner
+                .children
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count();
+            if child_count + inner.auxiliary_pidfds >= RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS {
+                return Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded);
+            }
+            let Some(slot) = inner.children.iter().position(Option::is_none) else {
+                return Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded);
+            };
+            inner.children[slot] = Some(ChildEntry { pid, pidfd, role });
+            slot
+        };
+        self.notify(super::owner::OwnerLifecycleEvent::ChildRegistered { pid, role });
+        Ok(RegisteredChild {
+            registry: self.clone(),
+            slot,
+            pid,
+            pidfd,
+            role,
+        })
+    }
+
+    pub(super) fn reserve_pidfd(&self) -> Result<PidfdLease, RuntimeFingerprintProduceError> {
+        let mut inner = self.inner.borrow_mut();
+        let child_count = inner
+            .children
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
+        if child_count + inner.auxiliary_pidfds >= RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS {
+            return Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded);
+        }
+        inner.auxiliary_pidfds += 1;
+        Ok(PidfdLease {
+            registry: self.clone(),
+        })
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.children.iter().all(Option::is_none)
+            && inner.auxiliary_pidfds == 0
+            && inner.non_pidfds == 0
+    }
+
+    #[cfg(test)]
+    pub(super) fn usage(&self) -> (usize, usize) {
+        let inner = self.inner.borrow();
+        (
+            inner
+                .children
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count()
+                + inner.auxiliary_pidfds,
+            inner.non_pidfds,
+        )
+    }
+
+    pub(super) fn drain_retained(&self) {
+        while !self.is_empty() {
+            self.cleanup_before(Instant::now() + Duration::from_millis(250));
+            if !self.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    fn cleanup_before(&self, deadline: Instant) {
+        let entries = {
+            let inner = self.inner.borrow();
+            inner
+                .children
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, entry)| {
+                    entry
+                        .as_ref()
+                        .map(|entry| (slot, entry.pid, entry.pidfd, entry.role))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (slot, pid, pidfd, _) in entries {
+            let signal = pidfd_send_kill(pidfd);
+            if signal.is_err() && last_errno() != libc::ESRCH {
+                continue;
+            }
+            if matches!(waitid_pidfd(pidfd, deadline), Ok(seen) if seen == pid) {
+                self.remove_and_close(slot, pid, pidfd);
+            }
+        }
+    }
+
+    fn remove_and_close(&self, slot: usize, pid: libc::pid_t, pidfd: libc::c_int) -> bool {
+        let removed_role = {
+            let mut inner = self.inner.borrow_mut();
+            match inner.children.get(slot).and_then(Option::as_ref) {
+                Some(entry) if entry.pid == pid && entry.pidfd == pidfd => {
+                    let role = entry.role;
+                    inner.children[slot] = None;
+                    Some(role)
+                }
+                _ => None,
+            }
+        };
+        if let Some(role) = removed_role {
+            close_fd(pidfd);
+            self.notify(super::owner::OwnerLifecycleEvent::ChildReaped { pid, role });
+        }
+        removed_role.is_some()
+    }
+
+    fn release_descriptors(&self, count: usize) {
+        let mut inner = self.inner.borrow_mut();
+        debug_assert!(inner.non_pidfds >= count);
+        inner.non_pidfds = inner.non_pidfds.saturating_sub(count);
+    }
+
+    fn release_pidfd(&self) {
+        let mut inner = self.inner.borrow_mut();
+        debug_assert!(inner.auxiliary_pidfds > 0);
+        inner.auxiliary_pidfds = inner.auxiliary_pidfds.saturating_sub(1);
+    }
+
+    fn notify(&self, event: super::owner::OwnerLifecycleEvent) {
+        if let Some(observer) = &self.observer {
+            if observer.send(event).is_err() {
+                tracing::debug!("runtime fingerprint owner observer dropped");
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PidfdLease {
+    registry: OwnerRegistry,
+}
+
+impl Drop for PidfdLease {
+    fn drop(&mut self) {
+        self.registry.release_pidfd();
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct DescriptorLease {
+    registry: OwnerRegistry,
+    count: usize,
+}
+
+impl DescriptorLease {
+    pub(super) fn split_off(
+        &mut self,
+        count: usize,
+    ) -> Result<Self, RuntimeFingerprintProduceError> {
+        if count > self.count {
+            return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+        }
+        self.count -= count;
+        Ok(Self {
+            registry: self.registry.clone(),
+            count,
+        })
+    }
+}
+
+impl Drop for DescriptorLease {
+    fn drop(&mut self) {
+        self.registry.release_descriptors(self.count);
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct RegisteredChild {
+    registry: OwnerRegistry,
+    slot: usize,
+    pid: libc::pid_t,
+    pidfd: libc::c_int,
+    role: RuntimeOwnedChildRole,
+}
+
+impl RegisteredChild {
+    pub(super) const fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    pub(super) const fn pidfd(&self) -> libc::c_int {
+        self.pidfd
+    }
+
+    pub(super) fn reaped(self) -> Result<(), RuntimeFingerprintProduceError> {
+        if !self
+            .registry
+            .remove_and_close(self.slot, self.pid, self.pidfd)
+        {
+            return Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable);
+        }
+        Ok(())
+    }
+
+    pub(super) fn cleanup(self, deadline: Instant) -> Result<(), RuntimeFingerprintProduceError> {
+        if Instant::now() >= deadline {
+            return Err(
+                RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
+                    role: self.role,
+                    operation: RuntimeChildCleanupOperation::Reap,
+                },
+            );
+        }
+        let signal = pidfd_send_kill(self.pidfd);
+        if signal.is_err() && last_errno() != libc::ESRCH {
+            return Err(
+                RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
+                    role: self.role,
+                    operation: RuntimeChildCleanupOperation::Termination,
+                },
+            );
+        }
+        match waitid_pidfd(self.pidfd, deadline) {
+            Ok(seen) if seen == self.pid => self.reaped(),
+            _ => Err(
+                RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
+                    role: self.role,
+                    operation: RuntimeChildCleanupOperation::Reap,
+                },
+            ),
+        }
+    }
+}
+
+fn pidfd_send_kill(pidfd: libc::c_int) -> Result<(), ()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    (result == 0).then_some(()).ok_or(())
+}
+
+fn waitid_pidfd(pidfd: libc::c_int, deadline: Instant) -> Result<libc::pid_t, ()> {
+    loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG,
+            )
+        };
+        if result != 0 {
+            if last_errno() == libc::EINTR {
+                continue;
+            }
+            return Err(());
+        }
+        let seen = unsafe { info.si_pid() };
+        if seen != 0 {
+            return Ok(seen);
+        }
+        if Instant::now() >= deadline {
+            return Err(());
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn close_fd(fd: libc::c_int) {
+    if fd >= 0 {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+fn last_errno() -> libc::c_int {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}

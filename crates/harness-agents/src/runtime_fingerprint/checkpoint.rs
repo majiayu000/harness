@@ -45,6 +45,7 @@ pub(super) fn pre_spawn(
     executable: &RetainedExecutable,
     boundaries: &ValidatedRepositoryBoundarySet,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
     checkpoint(
         candidate,
@@ -53,6 +54,7 @@ pub(super) fn pre_spawn(
         boundaries,
         deadline,
         RuntimeObservationStage::PreSpawnCheckpoint,
+        registry,
     )
 }
 
@@ -62,6 +64,7 @@ pub(super) fn post_reap(
     executable: &RetainedExecutable,
     boundaries: &ValidatedRepositoryBoundarySet,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
     checkpoint(
         candidate,
@@ -70,6 +73,7 @@ pub(super) fn post_reap(
         boundaries,
         deadline,
         RuntimeObservationStage::PostReapCheckpoint,
+        registry,
     )
 }
 
@@ -80,6 +84,7 @@ fn checkpoint(
     boundaries: &ValidatedRepositoryBoundarySet,
     deadline: Instant,
     stage: RuntimeObservationStage,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
     let (working_directory_fd, path) = match &candidate.reference {
         CandidateReference::Absolute(path) => (None, path),
@@ -108,6 +113,7 @@ fn checkpoint(
         },
         deadline,
         stage,
+        registry,
     )
 }
 
@@ -115,7 +121,9 @@ fn run_child(
     context: &CheckpointContext<'_>,
     deadline: Instant,
     stage: RuntimeObservationStage,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
+    let _descriptor_lease = registry.reserve_descriptors(6)?;
     let role = super::RuntimeOwnedChildRole::Observation(stage);
     let mut gate = [-1; 2];
     let mut status = [-1; 2];
@@ -203,10 +211,18 @@ fn run_child(
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
+    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+        Ok(child) => child,
+        Err(error) => {
+            super::probe::close_fd(gate[1]);
+            super::probe::close_fd(protocol[0]);
+            return Err(error);
+        }
+    };
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::cleanup_registered_child(pidfd, deadline, role)?;
+        child.cleanup(deadline)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::GateRelease,
@@ -215,16 +231,16 @@ fn run_child(
     super::probe::close_fd(gate[1]);
     let checkpoint = receive(protocol[0], deadline, stage);
     super::probe::close_fd(protocol[0]);
-    let exited = super::probe::waitid_pidfd(pidfd, false, deadline);
+    let exited = super::probe::waitid_pidfd(child.pidfd(), false, deadline);
     if !matches!(exited, Ok((seen, libc::CLD_EXITED, 0)) if seen == pid) {
         let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
-        super::probe::cleanup_registered_child(pidfd, cleanup_deadline, role)?;
+        child.cleanup(cleanup_deadline)?;
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage,
             reason: RuntimeObservationProtocolReason::HelperExited,
         });
     }
-    super::probe::close_fd(pidfd);
+    child.reaped()?;
     checkpoint
 }
 

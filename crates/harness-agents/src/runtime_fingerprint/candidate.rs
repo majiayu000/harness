@@ -24,6 +24,7 @@ const STATUS_UNSUPPORTED_FORMAT: u8 = 9;
 #[derive(Debug)]
 pub(super) struct RetainedExecutable {
     fd: libc::c_int,
+    descriptor_lease: Option<super::registry::DescriptorLease>,
     pub(super) device: u64,
     pub(super) inode: u64,
     pub(super) link_count: u64,
@@ -35,6 +36,17 @@ pub(super) struct RetainedExecutable {
 impl RetainedExecutable {
     pub(super) const fn fd(&self) -> libc::c_int {
         self.fd
+    }
+
+    fn attach_descriptor_lease(
+        &mut self,
+        lease: super::registry::DescriptorLease,
+    ) -> Result<(), RuntimeFingerprintProduceError> {
+        if self.descriptor_lease.is_some() {
+            return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+        }
+        self.descriptor_lease = Some(lease);
+        Ok(())
     }
 }
 
@@ -58,7 +70,9 @@ pub(super) fn observe_candidate(
     candidate: &ResolvedCandidate,
     working_directory: &RetainedWorkingDirectory,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<CandidateObservation, RuntimeFingerprintProduceError> {
+    let mut descriptor_lease = registry.reserve_descriptors(7)?;
     let (directory_fd, path) = match &candidate.reference {
         CandidateReference::Absolute(path) => (libc::AT_FDCWD, path),
         CandidateReference::WorkingDirectoryRelative(path) => (working_directory.fd(), path),
@@ -153,10 +167,18 @@ pub(super) fn observe_candidate(
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
+    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+        Ok(child) => child,
+        Err(error) => {
+            super::probe::close_fd(gate[1]);
+            super::probe::close_fd(protocol[0]);
+            return Err(error);
+        }
+    };
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::cleanup_registered_child(pidfd, deadline, role)?;
+        child.cleanup(deadline)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::GateRelease,
@@ -165,17 +187,23 @@ pub(super) fn observe_candidate(
     super::probe::close_fd(gate[1]);
     let observed = receive_candidate(protocol[0], deadline);
     super::probe::close_fd(protocol[0]);
-    let exited = super::probe::waitid_pidfd(pidfd, false, deadline);
+    let exited = super::probe::waitid_pidfd(child.pidfd(), false, deadline);
     if !matches!(exited, Ok((seen, libc::CLD_EXITED, 0)) if seen == pid) {
         let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
-        super::probe::cleanup_registered_child(pidfd, cleanup_deadline, role)?;
+        child.cleanup(cleanup_deadline)?;
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage: super::RuntimeObservationStage::Candidate,
             reason: RuntimeObservationProtocolReason::HelperExited,
         });
     }
-    super::probe::close_fd(pidfd);
-    observed
+    child.reaped()?;
+    match observed {
+        Ok(CandidateObservation::Retained(mut executable)) => {
+            executable.attach_descriptor_lease(descriptor_lease.split_off(1)?)?;
+            Ok(CandidateObservation::Retained(executable))
+        }
+        other => other,
+    }
 }
 
 fn child_observe_candidate(
@@ -628,6 +656,7 @@ fn receive_candidate(
     })?;
     Ok(CandidateObservation::Retained(RetainedExecutable {
         fd: retained,
+        descriptor_lease: None,
         device: frame_u64(&frame, 1),
         inode: frame_u64(&frame, 9),
         link_count: frame_u64(&frame, 17),

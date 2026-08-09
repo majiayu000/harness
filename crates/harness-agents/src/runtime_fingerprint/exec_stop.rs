@@ -25,6 +25,7 @@ pub(super) fn verify(
     target_pid: libc::pid_t,
     executable: &RetainedExecutable,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<ExecStopCheckpoint, RuntimeFingerprintProduceError> {
     let image_path = CString::new(format!("/proc/{target_pid}/exe"))
         .map_err(|_| RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)?;
@@ -37,13 +38,16 @@ pub(super) fn verify(
             expected_digest,
         },
         deadline,
+        registry,
     )
 }
 
 fn run_child(
     context: &ExecStopContext<'_>,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<ExecStopCheckpoint, RuntimeFingerprintProduceError> {
+    let _descriptor_lease = registry.reserve_descriptors(6)?;
     let role = super::RuntimeOwnedChildRole::Observation(
         super::RuntimeObservationStage::ExecStopCheckpoint,
     );
@@ -133,10 +137,18 @@ fn run_child(
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
+    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+        Ok(child) => child,
+        Err(error) => {
+            super::probe::close_fd(gate[1]);
+            super::probe::close_fd(protocol[0]);
+            return Err(error);
+        }
+    };
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::cleanup_registered_child(pidfd, deadline, role)?;
+        child.cleanup(deadline)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::GateRelease,
@@ -145,16 +157,16 @@ fn run_child(
     super::probe::close_fd(gate[1]);
     let observed = receive(protocol[0], deadline);
     super::probe::close_fd(protocol[0]);
-    let exited = super::probe::waitid_pidfd(pidfd, false, deadline);
+    let exited = super::probe::waitid_pidfd(child.pidfd(), false, deadline);
     if !matches!(exited, Ok((seen, libc::CLD_EXITED, 0)) if seen == pid) {
         let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
-        super::probe::cleanup_registered_child(pidfd, cleanup_deadline, role)?;
+        child.cleanup(cleanup_deadline)?;
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage: super::RuntimeObservationStage::ExecStopCheckpoint,
             reason: RuntimeObservationProtocolReason::HelperExited,
         });
     }
-    super::probe::close_fd(pidfd);
+    child.reaped()?;
     observed
 }
 

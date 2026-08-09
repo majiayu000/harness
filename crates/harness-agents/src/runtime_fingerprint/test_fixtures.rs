@@ -17,17 +17,24 @@ struct ProgramHeader {
 }
 
 pub(super) fn write_version_fixture(directory: &Path, name: &str) -> PathBuf {
+    write_fixture(directory, name, version_code())
+}
+
+pub(super) fn write_loop_fixture(directory: &Path, name: &str) -> PathBuf {
+    write_fixture(directory, name, loop_code())
+}
+
+fn write_fixture(directory: &Path, name: &str, code: Vec<u8>) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let executable = directory.join(name);
-    std::fs::write(&executable, version_elf()).expect("write static version fixture");
+    std::fs::write(&executable, elf_with_code(code)).expect("write static fixture");
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
         .expect("make static version fixture executable");
     executable
 }
 
-fn version_elf() -> Vec<u8> {
-    let code = version_code();
+fn elf_with_code(code: Vec<u8>) -> Vec<u8> {
     let mut image = vec![0_u8; LOAD_OFFSET + code.len()];
     image[..4].copy_from_slice(b"\x7fELF");
     image[4] = 2;
@@ -69,6 +76,16 @@ fn version_elf() -> Vec<u8> {
     );
     image[LOAD_OFFSET..].copy_from_slice(&code);
     image
+}
+
+#[cfg(target_arch = "x86_64")]
+fn loop_code() -> Vec<u8> {
+    vec![0xeb, 0xfe]
+}
+
+#[cfg(target_arch = "aarch64")]
+fn loop_code() -> Vec<u8> {
+    0x1400_0000_u32.to_le_bytes().to_vec()
 }
 
 fn write_program_header(header: &mut [u8], value: ProgramHeader) {

@@ -25,6 +25,8 @@ pub(super) struct InitialCompletion<'a> {
     pub(super) working_directory: &'a RetainedWorkingDirectory,
     pub(super) candidate: &'a ResolvedCandidate,
     pub(super) executable: &'a RetainedExecutable,
+    pub(super) registry: &'a super::registry::OwnerRegistry,
+    pub(super) stop_requested: &'a std::sync::atomic::AtomicBool,
 }
 
 pub(super) fn complete_initial(
@@ -65,7 +67,12 @@ fn complete(
     sequence: RuntimeExecSequence,
 ) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
     let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
-    let exec_stop = match super::exec_stop::verify(stopped.pid(), context.executable, deadline) {
+    let exec_stop = match super::exec_stop::verify(
+        stopped.pid(),
+        context.executable,
+        deadline,
+        context.registry,
+    ) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
             stopped.terminate_without_resume(cleanup_deadline)?;
@@ -95,7 +102,12 @@ fn complete(
         RuntimeResolutionAttemptOutcome::ExecStarted,
         sequence,
     )?);
-    let outcome = super::supervision::run(stopped, context.options.max_output_bytes(), deadline)?;
+    let outcome = super::supervision::run(
+        stopped,
+        context.options.max_output_bytes(),
+        deadline,
+        context.stop_requested,
+    )?;
     let (stdout, stderr, termination) = match outcome {
         SupervisionOutcome::Captured {
             stdout,
@@ -117,6 +129,7 @@ fn complete(
         context.executable,
         boundaries,
         deadline,
+        context.registry,
     )? {
         PreSpawnCheckpoint::Consistent => {}
         PreSpawnCheckpoint::BoundaryUnprovable | PreSpawnCheckpoint::LinkCountUnprovable => {

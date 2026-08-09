@@ -20,7 +20,11 @@ mod executable;
 #[cfg(target_os = "linux")]
 mod launch;
 #[cfg(target_os = "linux")]
+mod owner;
+#[cfg(target_os = "linux")]
 mod probe;
+#[cfg(target_os = "linux")]
+mod registry;
 #[cfg(target_os = "linux")]
 mod resolution;
 #[cfg(target_os = "linux")]
@@ -50,11 +54,6 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
-
-#[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
-use std::sync::Arc;
 
 pub use environment::{
     classify_completed_runtime_output, windows_working_directory_digest,
@@ -114,61 +113,6 @@ impl ValidatedRepositoryBoundarySet {
 
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
-    }
-}
-
-#[cfg(target_os = "linux")]
-static ACTIVE_RUNTIME_FINGERPRINT_OWNERS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(target_os = "linux")]
-struct RuntimeFingerprintOwnerPermit;
-
-#[cfg(target_os = "linux")]
-impl RuntimeFingerprintOwnerPermit {
-    fn try_acquire() -> Result<Self, RuntimeFingerprintProduceError> {
-        try_reserve_owner(&ACTIVE_RUNTIME_FINGERPRINT_OWNERS)?;
-        Ok(Self)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn try_reserve_owner(counter: &AtomicUsize) -> Result<(), RuntimeFingerprintProduceError> {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < RUNTIME_FINGERPRINT_OWNER_CAPACITY).then_some(active + 1)
-        })
-        .map(|_| ())
-        .map_err(|_| {
-            RuntimeFingerprintProduceError::ContainmentUnavailable(
-                ContainmentUnavailableReason::OwnerCapacityExhausted,
-            )
-        })
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod owner_capacity_tests {
-    use super::*;
-
-    #[test]
-    fn ninth_owner_fails_with_the_global_capacity_reason() {
-        let counter = AtomicUsize::new(0);
-        for expected in 1..=RUNTIME_FINGERPRINT_OWNER_CAPACITY {
-            assert!(try_reserve_owner(&counter).is_ok());
-            assert_eq!(counter.load(Ordering::Acquire), expected);
-        }
-        assert!(matches!(
-            try_reserve_owner(&counter),
-            Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
-                ContainmentUnavailableReason::OwnerCapacityExhausted
-            ))
-        ));
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for RuntimeFingerprintOwnerPermit {
-    fn drop(&mut self) {
-        ACTIVE_RUNTIME_FINGERPRINT_OWNERS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -539,55 +483,7 @@ async fn produce_on_supported_platform(
     selected_environment: environment::SelectedEnvironment,
     prepared_command: executable::PreparedCommand,
 ) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
-    let permit = RuntimeFingerprintOwnerPermit::try_acquire()?;
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let owner_stop = Arc::clone(&stop_requested);
-    let executable = executable.clone();
-    let options = options.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("runtime-fingerprint-owner".to_owned())
-        .spawn(move || {
-            let _permit = permit;
-            if ready_tx.send(()).is_err() || owner_stop.load(Ordering::Acquire) {
-                return;
-            }
-            let result = probe::owner_run(
-                &executable,
-                &options,
-                selected_environment,
-                prepared_command,
-                &owner_stop,
-            );
-            if result_tx.send(result).is_err() {
-                tracing::error!("runtime fingerprint caller dropped before owner completion");
-            }
-        })
-        .map_err(|_| {
-            RuntimeFingerprintProduceError::ContainmentUnavailable(
-                ContainmentUnavailableReason::OwnerStartFailed,
-            )
-        })?;
-    match tokio::time::timeout(RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE, ready_rx).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
-                ContainmentUnavailableReason::OwnerStartFailed,
-            ));
-        }
-        Err(_) => {
-            stop_requested.store(true, Ordering::Release);
-            return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
-                ContainmentUnavailableReason::OwnerReadyTimeout,
-            ));
-        }
-    }
-    result_rx.await.map_err(|_| {
-        RuntimeFingerprintProduceError::ContainmentUnavailable(
-            ContainmentUnavailableReason::OwnerStopJoinTimeout,
-        )
-    })?
+    owner::run(executable, options, selected_environment, prepared_command).await
 }
 
 #[cfg(not(target_os = "linux"))]

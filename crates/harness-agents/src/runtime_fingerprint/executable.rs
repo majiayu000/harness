@@ -166,6 +166,7 @@ impl PreparedCommand {
 #[derive(Debug)]
 pub(super) struct RetainedWorkingDirectory {
     fd: libc::c_int,
+    descriptor_lease: Option<super::registry::DescriptorLease>,
     pub(super) identity_digest: Sha256Digest,
 }
 
@@ -173,6 +174,17 @@ pub(super) struct RetainedWorkingDirectory {
 impl RetainedWorkingDirectory {
     pub(super) const fn fd(&self) -> libc::c_int {
         self.fd
+    }
+
+    fn attach_descriptor_lease(
+        &mut self,
+        lease: super::registry::DescriptorLease,
+    ) -> Result<(), RuntimeFingerprintProduceError> {
+        if self.descriptor_lease.is_some() {
+            return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+        }
+        self.descriptor_lease = Some(lease);
+        Ok(())
     }
 }
 
@@ -187,9 +199,11 @@ impl Drop for RetainedWorkingDirectory {
 pub(super) fn observe_working_directory(
     path: &Path,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<RetainedWorkingDirectory, RuntimeFingerprintProduceError> {
     use std::os::unix::ffi::OsStrExt;
 
+    let mut descriptor_lease = registry.reserve_descriptors(7)?;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
     let role =
@@ -287,10 +301,18 @@ pub(super) fn observe_working_directory(
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
+    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+        Ok(child) => child,
+        Err(error) => {
+            super::probe::close_fd(gate[1]);
+            super::probe::close_fd(protocol[0]);
+            return Err(error);
+        }
+    };
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::cleanup_registered_child(pidfd, deadline, role)?;
+        child.cleanup(deadline)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::GateRelease,
@@ -299,15 +321,18 @@ pub(super) fn observe_working_directory(
     super::probe::close_fd(gate[1]);
     let observed = receive_working_directory(protocol[0], deadline);
     super::probe::close_fd(protocol[0]);
-    let exited = super::probe::waitid_pidfd(pidfd, false, deadline);
-    super::probe::close_fd(pidfd);
+    let exited = super::probe::waitid_pidfd(child.pidfd(), false, deadline);
     if !matches!(exited, Ok((seen, libc::CLD_EXITED, 0)) if seen == pid) {
+        child.cleanup(Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE)?;
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage: super::RuntimeObservationStage::WorkingDirectory,
             reason: super::RuntimeObservationProtocolReason::HelperExited,
         });
     }
-    observed
+    child.reaped()?;
+    let mut observed = observed?;
+    observed.attach_descriptor_lease(descriptor_lease.split_off(1)?)?;
+    Ok(observed)
 }
 
 #[cfg(target_os = "linux")]
@@ -531,6 +556,7 @@ fn receive_working_directory(
     let ino = u64::from_be_bytes(ino_bytes);
     Ok(RetainedWorkingDirectory {
         fd: retained,
+        descriptor_lease: None,
         identity_digest: runtime_working_directory_identity_digest(dev, ino),
     })
 }

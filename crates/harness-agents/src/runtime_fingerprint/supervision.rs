@@ -3,7 +3,7 @@
 use super::environment::RuntimeTermination;
 use super::syscall_guard::{self, SyscallStop};
 use super::target::{StoppedTarget, TargetEvent};
-use super::{RuntimeFingerprintProduceError, RuntimeOwnedChildRole};
+use super::RuntimeFingerprintProduceError;
 use harness_core::stack::fingerprint::{
     RuntimeProbeFailure, RuntimeProbeFailureDetail, RuntimeProbeFailureKind,
 };
@@ -79,16 +79,23 @@ struct OutputCapture {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     limit: usize,
+    _descriptor_lease: super::registry::DescriptorLease,
 }
 
 impl OutputCapture {
-    fn new(stdout_fd: libc::c_int, stderr_fd: libc::c_int, limit: usize) -> Self {
+    fn new(
+        stdout_fd: libc::c_int,
+        stderr_fd: libc::c_int,
+        limit: usize,
+        descriptor_lease: super::registry::DescriptorLease,
+    ) -> Self {
         Self {
             stdout_fd,
             stderr_fd,
             stdout: Vec::new(),
             stderr: Vec::new(),
             limit,
+            _descriptor_lease: descriptor_lease,
         }
     }
 
@@ -150,58 +157,56 @@ pub(super) fn run(
     target: StoppedTarget,
     max_output_bytes: usize,
     deadline: Instant,
+    stop_requested: &std::sync::atomic::AtomicBool,
 ) -> Result<SupervisionOutcome, RuntimeFingerprintProduceError> {
     let StoppedTarget {
-        pid,
-        pidfd,
+        child,
         stdout,
         stderr,
-        role,
+        descriptor_lease,
     } = target;
-    let mut capture = OutputCapture::new(stdout, stderr, max_output_bytes);
+    let pid = child.pid();
+    let pidfd = child.pidfd();
+    let mut capture = OutputCapture::new(stdout, stderr, max_output_bytes, descriptor_lease);
     let mut state = TraceState::InitialExecExit;
     if !resume_syscall(pid, 0) {
-        return verification_failure(pidfd, capture, role);
+        return verification_failure(child, capture);
     }
 
     loop {
+        if super::probe::ensure_owner_running(stop_requested).is_err() {
+            return verification_failure(child, capture);
+        }
         if let Err(failure) = capture.drain_available() {
-            return semantic_cleanup(
-                pidfd,
-                capture,
-                capture_failure(failure, max_output_bytes)?,
-                role,
-            );
+            return semantic_cleanup(child, capture, capture_failure(failure, max_output_bytes)?);
         }
         if Instant::now() >= deadline {
             return semantic_cleanup(
-                pidfd,
+                child,
                 capture,
                 RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout)?,
-                role,
             );
         }
-        let event = match super::target::wait_event(pidfd, pid, deadline) {
+        let event = match super::target::wait_event(pidfd, pid, deadline, Some(stop_requested)) {
             Ok(event) => event,
             Err(_) if Instant::now() >= deadline => {
                 return semantic_cleanup(
-                    pidfd,
+                    child,
                     capture,
                     RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout)?,
-                    role,
                 );
             }
-            Err(_) => return verification_failure(pidfd, capture, role),
+            Err(_) => return verification_failure(child, capture),
         };
         match event {
             TargetEvent::Stopped(signal) if signal == libc::SIGTRAP | 0x80 => {
                 let Some(stop) = syscall_guard::read_syscall_stop(pid) else {
-                    return verification_failure(pidfd, capture, role);
+                    return verification_failure(child, capture);
                 };
                 match state.accept_syscall(stop) {
                     Ok(StopDecision::Resume) => {
                         if !resume_syscall(pid, 0) {
-                            return verification_failure(pidfd, capture, role);
+                            return verification_failure(child, capture);
                         }
                     }
                     Ok(StopDecision::Denied(detail)) => {
@@ -209,25 +214,25 @@ pub(super) fn run(
                             RuntimeProbeFailureKind::TransitiveExecutionDenied,
                             detail,
                         )?;
-                        return semantic_cleanup(pidfd, capture, failure, role);
+                        return semantic_cleanup(child, capture, failure);
                     }
-                    Err(()) => return verification_failure(pidfd, capture, role),
+                    Err(()) => return verification_failure(child, capture),
                 }
             }
             TargetEvent::Stopped(signal) => {
                 if !state.permits_signal_delivery() || !valid_signal_delivery_stop(pid, signal) {
-                    return verification_failure(pidfd, capture, role);
+                    return verification_failure(child, capture);
                 }
                 if !resume_syscall(pid, signal) {
-                    return verification_failure(pidfd, capture, role);
+                    return verification_failure(child, capture);
                 }
             }
             TargetEvent::Exited(code) => {
                 if !state.permits_exit() {
-                    close_reaped(pidfd, &mut capture);
+                    close_reaped(child, &mut capture)?;
                     return Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable);
                 }
-                super::probe::close_fd(pidfd);
+                child.reaped()?;
                 let (stdout, stderr) = match capture.complete(deadline) {
                     Ok(output) => output,
                     Err(failure) => {
@@ -245,10 +250,10 @@ pub(super) fn run(
             }
             TargetEvent::Signalled(signal) => {
                 if !state.permits_signal_termination(signal) {
-                    close_reaped(pidfd, &mut capture);
+                    close_reaped(child, &mut capture)?;
                     return Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable);
                 }
-                super::probe::close_fd(pidfd);
+                child.reaped()?;
                 let (stdout, stderr) = match capture.complete(deadline) {
                     Ok(output) => output,
                     Err(failure) => {
@@ -341,37 +346,31 @@ fn capture_failure(
 }
 
 fn semantic_cleanup(
-    pidfd: libc::c_int,
+    child: super::registry::RegisteredChild,
     mut capture: OutputCapture,
     failure: RuntimeProbeFailure,
-    role: RuntimeOwnedChildRole,
 ) -> Result<SupervisionOutcome, RuntimeFingerprintProduceError> {
     capture.close();
-    super::probe::cleanup_registered_child(
-        pidfd,
-        Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE,
-        role,
-    )?;
+    child.cleanup(Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE)?;
     Ok(SupervisionOutcome::Failed(failure))
 }
 
 fn verification_failure(
-    pidfd: libc::c_int,
+    child: super::registry::RegisteredChild,
     mut capture: OutputCapture,
-    role: RuntimeOwnedChildRole,
 ) -> Result<SupervisionOutcome, RuntimeFingerprintProduceError> {
     capture.close();
-    super::probe::cleanup_registered_child(
-        pidfd,
-        Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE,
-        role,
-    )?;
+    child.cleanup(Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE)?;
     Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
 }
 
-fn close_reaped(pidfd: libc::c_int, capture: &mut OutputCapture) {
-    super::probe::close_fd(pidfd);
+fn close_reaped(
+    child: super::registry::RegisteredChild,
+    capture: &mut OutputCapture,
+) -> Result<(), RuntimeFingerprintProduceError> {
+    child.reaped()?;
     capture.close();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -394,13 +393,24 @@ mod tests {
 
     #[test]
     fn output_capture_enforces_one_exact_combined_bound() {
-        let capture = OutputCapture::new(pipe_with(b"abc"), pipe_with(b"de"), 5);
+        let registry = super::super::registry::OwnerRegistry::new();
+        let capture = OutputCapture::new(
+            pipe_with(b"abc"),
+            pipe_with(b"de"),
+            5,
+            registry.reserve_descriptors(2).unwrap(),
+        );
         assert_eq!(
             capture.complete(Instant::now() + std::time::Duration::from_secs(1)),
             Ok((b"abc".to_vec(), b"de".to_vec()))
         );
 
-        let capture = OutputCapture::new(pipe_with(b"abc"), pipe_with(b"de"), 4);
+        let capture = OutputCapture::new(
+            pipe_with(b"abc"),
+            pipe_with(b"de"),
+            4,
+            registry.reserve_descriptors(2).unwrap(),
+        );
         assert_eq!(
             capture.complete(Instant::now() + std::time::Duration::from_secs(1)),
             Err(CaptureFailure::Limit)

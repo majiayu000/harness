@@ -22,25 +22,31 @@ pub(super) enum TargetStart {
 }
 
 pub(super) struct StoppedTarget {
-    pub(super) pid: libc::pid_t,
-    pub(super) pidfd: libc::c_int,
+    pub(super) child: super::registry::RegisteredChild,
     pub(super) stdout: libc::c_int,
     pub(super) stderr: libc::c_int,
-    pub(super) role: RuntimeOwnedChildRole,
+    pub(super) descriptor_lease: super::registry::DescriptorLease,
 }
 
 impl StoppedTarget {
     pub(super) const fn pid(&self) -> libc::pid_t {
-        self.pid
+        self.child.pid()
     }
 
     pub(super) fn terminate_without_resume(
         self,
         deadline: Instant,
     ) -> Result<(), RuntimeFingerprintProduceError> {
-        super::probe::close_fd(self.stdout);
-        super::probe::close_fd(self.stderr);
-        super::probe::cleanup_registered_child(self.pidfd, deadline, self.role)
+        let Self {
+            child,
+            stdout,
+            stderr,
+            descriptor_lease,
+        } = self;
+        super::probe::close_fd(stdout);
+        super::probe::close_fd(stderr);
+        drop(descriptor_lease);
+        child.cleanup(deadline)
     }
 }
 
@@ -67,6 +73,7 @@ pub(super) fn start_initial(
     working_directory: &RetainedWorkingDirectory,
     executable: &RetainedExecutable,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
     start(
         configured,
@@ -75,6 +82,7 @@ pub(super) fn start_initial(
         executable,
         deadline,
         RuntimeOwnedChildRole::InitialTarget,
+        registry,
     )
 }
 
@@ -84,6 +92,7 @@ pub(super) fn start_retry(
     working_directory: &RetainedWorkingDirectory,
     executable: &RetainedExecutable,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
     start(
         configured,
@@ -92,6 +101,7 @@ pub(super) fn start_retry(
         executable,
         deadline,
         RuntimeOwnedChildRole::RetryTarget,
+        registry,
     )
 }
 
@@ -102,7 +112,9 @@ fn start(
     executable: &RetainedExecutable,
     deadline: Instant,
     role: RuntimeOwnedChildRole,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
+    let mut descriptor_lease = registry.reserve_descriptors(20)?;
     let argv_storage = vec![
         cstring(configured.executable().as_os_str())?,
         CString::new(configured.runtime_kind().version_args()[0])
@@ -237,9 +249,16 @@ fn start(
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
+    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+        Ok(child) => child,
+        Err(error) => {
+            close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
+            return Err(error);
+        }
+    };
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
-        super::probe::cleanup_registered_child(pidfd, deadline, role)?;
+        child.cleanup(deadline)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::GateRelease,
@@ -247,77 +266,75 @@ fn start(
     }
     super::probe::close_fd(gate[1]);
     supervise_initial_stop(
-        pid,
-        pidfd,
+        child,
         pre_exec[0],
         stdout[0],
         stderr[0],
         deadline,
-        role,
+        &mut descriptor_lease,
     )
 }
 
 fn supervise_initial_stop(
-    pid: libc::pid_t,
-    pidfd: libc::c_int,
+    child: super::registry::RegisteredChild,
     pre_exec: libc::c_int,
     stdout: libc::c_int,
     stderr: libc::c_int,
     deadline: Instant,
-    role: RuntimeOwnedChildRole,
+    descriptor_lease: &mut super::registry::DescriptorLease,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
-    let initial = match wait_event(pidfd, pid, deadline) {
+    let initial = match wait_event(child.pidfd(), child.pid(), deadline, None) {
         Ok(event) => event,
-        Err(_) => return verification_cleanup(pidfd, pre_exec, stdout, stderr, role),
+        Err(_) => return verification_cleanup(child, pre_exec, stdout, stderr),
     };
     match initial {
         TargetEvent::Stopped(libc::SIGSTOP) => {}
         TargetEvent::Exited(_) => {
-            return finish_early_exit(pidfd, pre_exec, stdout, stderr);
+            return finish_early_exit(child, pre_exec, stdout, stderr);
         }
         TargetEvent::Signalled(_) => {
-            return verification_after_reap(pidfd, pre_exec, stdout, stderr);
+            return verification_after_reap(child, pre_exec, stdout, stderr);
         }
-        _ => return verification_cleanup(pidfd, pre_exec, stdout, stderr, role),
+        _ => return verification_cleanup(child, pre_exec, stdout, stderr),
     }
     let options = libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACESYSGOOD;
-    if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, options) } != 0
-        || unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, 0) } != 0
+    if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, child.pid(), 0, options) } != 0
+        || unsafe { libc::ptrace(libc::PTRACE_CONT, child.pid(), 0, 0) } != 0
     {
-        return verification_cleanup(pidfd, pre_exec, stdout, stderr, role);
+        return verification_cleanup(child, pre_exec, stdout, stderr);
     }
-    let after_exec = match wait_event(pidfd, pid, deadline) {
+    let after_exec = match wait_event(child.pidfd(), child.pid(), deadline, None) {
         Ok(event) => event,
-        Err(_) => return verification_cleanup(pidfd, pre_exec, stdout, stderr, role),
+        Err(_) => return verification_cleanup(child, pre_exec, stdout, stderr),
     };
     match after_exec {
         TargetEvent::Stopped(status)
-            if status == libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8) && is_exec_event(pid) =>
+            if status == libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8)
+                && is_exec_event(child.pid()) =>
         {
             super::probe::close_fd(pre_exec);
             Ok(TargetStart::ExecStopped(StoppedTarget {
-                pid,
-                pidfd,
+                child,
                 stdout,
                 stderr,
-                role,
+                descriptor_lease: descriptor_lease.split_off(2)?,
             }))
         }
-        TargetEvent::Exited(_) => finish_early_exit(pidfd, pre_exec, stdout, stderr),
-        TargetEvent::Signalled(_) => verification_after_reap(pidfd, pre_exec, stdout, stderr),
-        _ => verification_cleanup(pidfd, pre_exec, stdout, stderr, role),
+        TargetEvent::Exited(_) => finish_early_exit(child, pre_exec, stdout, stderr),
+        TargetEvent::Signalled(_) => verification_after_reap(child, pre_exec, stdout, stderr),
+        _ => verification_cleanup(child, pre_exec, stdout, stderr),
     }
 }
 
 fn finish_early_exit(
-    pidfd: libc::c_int,
+    child: super::registry::RegisteredChild,
     pre_exec: libc::c_int,
     stdout: libc::c_int,
     stderr: libc::c_int,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
     let frame = read_pre_exec_frame(pre_exec);
     close_parent_descriptors(-1, -1, pre_exec, stdout, stderr);
-    super::probe::close_fd(pidfd);
+    child.reaped()?;
     match frame {
         Some([CHILD_SETUP_FAILED, SETUP_WORKING_DIRECTORY, _, _, _]) => Ok(
             TargetStart::SetupFailed(RuntimeProbeFailureDetail::WorkingDirectoryEnter),
@@ -333,26 +350,25 @@ fn finish_early_exit(
 }
 
 fn verification_cleanup(
-    pidfd: libc::c_int,
+    child: super::registry::RegisteredChild,
     pre_exec: libc::c_int,
     stdout: libc::c_int,
     stderr: libc::c_int,
-    role: RuntimeOwnedChildRole,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
     close_parent_descriptors(-1, -1, pre_exec, stdout, stderr);
     let deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
-    super::probe::cleanup_registered_child(pidfd, deadline, role)?;
+    child.cleanup(deadline)?;
     Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
 }
 
 fn verification_after_reap(
-    pidfd: libc::c_int,
+    child: super::registry::RegisteredChild,
     pre_exec: libc::c_int,
     stdout: libc::c_int,
     stderr: libc::c_int,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
     close_parent_descriptors(-1, -1, pre_exec, stdout, stderr);
-    super::probe::close_fd(pidfd);
+    child.reaped()?;
     Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
 }
 
@@ -366,8 +382,12 @@ pub(super) fn wait_event(
     pidfd: libc::c_int,
     pid: libc::pid_t,
     deadline: Instant,
+    stop_requested: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<TargetEvent, RuntimeFingerprintProduceError> {
     loop {
+        if stop_requested.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable);
+        }
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
         if unsafe {
             libc::waitid(

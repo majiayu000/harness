@@ -17,6 +17,7 @@ pub(super) fn owner_run(
     environment: SelectedEnvironment,
     command: PreparedCommand,
     stop_requested: &AtomicBool,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
     if environment.facts.is_empty()
         || executable.executable().as_os_str().is_empty()
@@ -24,16 +25,14 @@ pub(super) fn owner_run(
     {
         return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
     }
-    if stop_requested.load(Ordering::Acquire) {
-        return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
-            ContainmentUnavailableReason::OwnerStopJoinTimeout,
-        ));
-    }
-    pidfd_self_preflight()?;
+    ensure_owner_running(stop_requested)?;
+    pidfd_self_preflight(registry)?;
     let deadline = Instant::now() + super::RUNTIME_FINGERPRINT_PROBE_DEADLINE;
-    super::capability::validate(deadline)?;
+    super::capability::validate(deadline, registry)?;
+    ensure_owner_running(stop_requested)?;
     let working_directory =
-        super::executable::observe_working_directory(options.working_dir(), deadline)?;
+        super::executable::observe_working_directory(options.working_dir(), deadline, registry)?;
+    ensure_owner_running(stop_requested)?;
     if working_directory.fd() < 0 || working_directory.identity_digest.as_str().is_empty() {
         return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
     }
@@ -54,14 +53,17 @@ pub(super) fn owner_run(
             },
         );
     }
-    let mut disposition = super::resolution::resolve(
-        executable,
+    let resolution_context = super::resolution::ResolutionContext {
+        configured: executable,
         options,
-        &environment,
-        &command,
-        &working_directory,
+        environment: &environment,
+        command: &command,
+        working_directory: &working_directory,
         deadline,
-    )?;
+        registry,
+        stop_requested,
+    };
+    let mut disposition = super::resolution::resolve(resolution_context)?;
     loop {
         let (candidate_index, candidate, retained, attempts) = match disposition {
             super::resolution::ResolutionDisposition::Complete(envelope) => return Ok(*envelope),
@@ -81,6 +83,8 @@ pub(super) fn owner_run(
                 working_directory: &working_directory,
                 candidate: &candidate,
                 executable: &retained,
+                registry,
+                stop_requested,
             },
             attempts,
             deadline,
@@ -88,12 +92,7 @@ pub(super) fn owner_run(
             super::launch::InitialLaunch::Complete(envelope) => return Ok(*envelope),
             super::launch::InitialLaunch::ContinueAfterEacces(attempts) => {
                 disposition = super::resolution::resume_after_eacces(
-                    executable,
-                    options,
-                    &environment,
-                    &command,
-                    &working_directory,
-                    deadline,
+                    resolution_context,
                     super::resolution::ResolutionCursor {
                         next_candidate_index: candidate_index + 1,
                         attempts,
@@ -101,6 +100,18 @@ pub(super) fn owner_run(
                 )?;
             }
         }
+    }
+}
+
+pub(super) fn ensure_owner_running(
+    stop_requested: &AtomicBool,
+) -> Result<(), RuntimeFingerprintProduceError> {
+    if stop_requested.load(Ordering::Acquire) {
+        Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
+            ContainmentUnavailableReason::OwnerStopJoinTimeout,
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -115,6 +126,27 @@ pub(super) fn registration_error(
     stage: super::RuntimeChildRegistrationStage,
 ) -> RuntimeFingerprintProduceError {
     RuntimeFingerprintProduceError::ChildRegistrationUnavailable { role, stage }
+}
+
+pub(super) fn register_child(
+    registry: &super::registry::OwnerRegistry,
+    pid: libc::pid_t,
+    pidfd: libc::c_int,
+    deadline: Instant,
+    role: super::RuntimeOwnedChildRole,
+) -> Result<super::registry::RegisteredChild, RuntimeFingerprintProduceError> {
+    match registry.register_child(pid, pidfd, role) {
+        Ok(child) => Ok(child),
+        Err(_) => {
+            let cleanup = rollback_unregistered_child(pid, deadline, role);
+            close_fd(pidfd);
+            cleanup?;
+            Err(registration_error(
+                role,
+                super::RuntimeChildRegistrationStage::RegistryCommit,
+            ))
+        }
+    }
 }
 
 pub(super) fn rollback_unregistered_child(
@@ -148,40 +180,6 @@ pub(super) fn rollback_unregistered_child(
         }
         std::thread::yield_now();
     }
-}
-
-pub(super) fn cleanup_registered_child(
-    pidfd: libc::c_int,
-    deadline: Instant,
-    role: super::RuntimeOwnedChildRole,
-) -> Result<(), RuntimeFingerprintProduceError> {
-    // SAFETY: pidfd is the registered identity; no numeric PID is used after registration.
-    let signal_result = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd,
-            libc::SIGKILL,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if signal_result != 0 {
-        close_fd(pidfd);
-        return Err(
-            RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
-                role,
-                operation: super::RuntimeChildCleanupOperation::Termination,
-            },
-        );
-    }
-    let result = waitid_pidfd(pidfd, false, deadline);
-    close_fd(pidfd);
-    result.map(|_| ()).map_err(|_| {
-        RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
-            role,
-            operation: super::RuntimeChildCleanupOperation::Reap,
-        }
-    })
 }
 
 pub(super) fn waitid_pidfd(
@@ -314,7 +312,10 @@ pub(super) fn last_errno() -> libc::c_int {
     unsafe { *libc::__errno_location() }
 }
 
-fn pidfd_self_preflight() -> Result<(), RuntimeFingerprintProduceError> {
+fn pidfd_self_preflight(
+    registry: &super::registry::OwnerRegistry,
+) -> Result<(), RuntimeFingerprintProduceError> {
+    let _pidfd_lease = registry.reserve_pidfd()?;
     // SAFETY: both syscalls use the current process identity and an owned descriptor.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) as libc::c_int };
     if pidfd < 0 {

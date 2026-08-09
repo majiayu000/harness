@@ -38,7 +38,9 @@ pub(super) fn authorize_target(
     executable: &RetainedExecutable,
     boundaries: &ValidatedRepositoryBoundarySet,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<TargetAuthorization, RuntimeFingerprintProduceError> {
+    let _descriptor_lease = registry.reserve_descriptors(6)?;
     let proc_fd_path = CString::new(format!("/proc/self/fd/{}", executable.fd()))
         .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
     let boundary_strings = boundaries
@@ -52,12 +54,13 @@ pub(super) fn authorize_target(
         proc_fd_path: &proc_fd_path,
         boundaries: &boundary_strings,
     };
-    run_authorization_child(&context, deadline)
+    run_authorization_child(&context, deadline, registry)
 }
 
 fn run_authorization_child(
     context: &AuthorizationContext<'_>,
     deadline: Instant,
+    registry: &super::registry::OwnerRegistry,
 ) -> Result<TargetAuthorization, RuntimeFingerprintProduceError> {
     let role = super::RuntimeOwnedChildRole::Observation(
         super::RuntimeObservationStage::TargetAuthorization,
@@ -148,10 +151,18 @@ fn run_authorization_child(
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
+    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+        Ok(child) => child,
+        Err(error) => {
+            super::probe::close_fd(gate[1]);
+            super::probe::close_fd(protocol[0]);
+            return Err(error);
+        }
+    };
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::cleanup_registered_child(pidfd, deadline, role)?;
+        child.cleanup(deadline)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::GateRelease,
@@ -160,16 +171,16 @@ fn run_authorization_child(
     super::probe::close_fd(gate[1]);
     let authorization = receive_authorization(protocol[0], deadline);
     super::probe::close_fd(protocol[0]);
-    let exited = super::probe::waitid_pidfd(pidfd, false, deadline);
+    let exited = super::probe::waitid_pidfd(child.pidfd(), false, deadline);
     if !matches!(exited, Ok((seen, libc::CLD_EXITED, 0)) if seen == pid) {
         let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
-        super::probe::cleanup_registered_child(pidfd, cleanup_deadline, role)?;
+        child.cleanup(cleanup_deadline)?;
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage: super::RuntimeObservationStage::TargetAuthorization,
             reason: RuntimeObservationProtocolReason::HelperExited,
         });
     }
-    super::probe::close_fd(pidfd);
+    child.reaped()?;
     authorization
 }
 
