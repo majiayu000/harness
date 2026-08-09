@@ -7,6 +7,7 @@ mod cloud_setup;
 pub mod codex;
 pub mod codex_adapter;
 pub mod compress_model;
+pub mod docker_reconciliation;
 pub mod opencode;
 pub mod opencode_adapter;
 mod output_capture;

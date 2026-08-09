@@ -96,9 +96,7 @@ async fn probe_container_tier() -> IsolationTierStatus {
         .arg("{{.ServerVersion}}")
         .output();
     match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, probe).await {
-        Ok(Ok(output)) if output.status.success() => {
-            IsolationTierStatus::available(IsolationTier::Container)
-        }
+        Ok(Ok(output)) if output.status.success() => reconcile_stale_docker_resources().await,
         Ok(Ok(output)) => IsolationTierStatus::unavailable(
             IsolationTier::Container,
             docker_probe_failure_reason(&output),
@@ -110,6 +108,24 @@ async fn probe_container_tier() -> IsolationTierStatus {
         Err(_) => {
             IsolationTierStatus::unavailable(IsolationTier::Container, "docker CLI probe timed out")
         }
+    }
+}
+
+async fn reconcile_stale_docker_resources() -> IsolationTierStatus {
+    match tokio::task::spawn_blocking(
+        harness_agents::docker_reconciliation::reconcile_stale_resources,
+    )
+    .await
+    {
+        Ok(Ok(())) => IsolationTierStatus::available(IsolationTier::Container),
+        Ok(Err(error)) => IsolationTierStatus::unavailable(
+            IsolationTier::Container,
+            format!("stale Docker resource reconciliation failed: {error}"),
+        ),
+        Err(error) => IsolationTierStatus::unavailable(
+            IsolationTier::Container,
+            format!("stale Docker resource reconciliation task failed: {error}"),
+        ),
     }
 }
 

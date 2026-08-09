@@ -16,10 +16,12 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
+pub(crate) mod docker_ownership;
 pub(crate) mod egress;
 mod output_schema;
 mod review_git;
 mod spawn_env;
+use docker_ownership::{append_os_labels, unique_resource_name, ManagedDockerResource};
 use egress::{
     apply_proxy_env, container_canary_command, proxy_env_keys, EgressProxyLease, EgressProxyRoute,
     LEGACY_EGRESS_PROXY_ENV,
@@ -282,6 +284,9 @@ impl AgentSpawnContract for ContainerSpawn {
             );
         let (child_args, output_schema_mount) = output_schema::rewrite_for_container(input.args)?;
         let mut args = vec![OsString::from("run"), OsString::from("--rm")];
+        args.push(OsString::from("--name"));
+        args.push(OsString::from(unique_resource_name("harness-agent-")));
+        append_os_labels(&mut args, ManagedDockerResource::AgentContainer);
         if input.forward_stdin {
             args.push(OsString::from("--interactive"));
         }

@@ -127,6 +127,15 @@ fn container_spawn_mounts_only_task_workspace() -> anyhow::Result<()> {
     assert_eq!(spawn.program, PathBuf::from("docker"));
     assert!(spawn.clear_inherited_env);
     assert_eq!(spawn.current_dir, std::fs::canonicalize(root.path())?);
+    assert!(args.iter().any(|arg| arg.starts_with("harness-agent-")));
+    assert!(args.contains(&"com.harness.managed=process-owned-v1".to_string()));
+    assert!(args.contains(&"com.harness.resource=agent-container".to_string()));
+    assert!(args
+        .iter()
+        .any(|arg| arg.starts_with("com.harness.owner.pid=")));
+    assert!(args
+        .iter()
+        .any(|arg| arg.starts_with("com.harness.owner.token=")));
     assert!(args.contains(&"--mount".to_string()));
     assert!(args.contains(&format!(
         "type=bind,src={},dst={CONTAINER_WORKSPACE}",

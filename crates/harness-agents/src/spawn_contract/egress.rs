@@ -6,8 +6,9 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use super::docker_ownership::{append_string_labels, unique_resource_name, ManagedDockerResource};
 
 pub(super) const LEGACY_EGRESS_PROXY_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY";
 pub(crate) const CONTAINER_EGRESS_CANARY_VERIFIED: &str = "HARNESS_EGRESS_CANARY_VERIFIED_V1";
@@ -17,7 +18,6 @@ const PROXY_ALIAS: &str = "egress-proxy";
 const PROXY_HEALTH_ATTEMPTS: usize = 50;
 const PROXY_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 const PROXY_CANARY_TIMEOUT: Duration = Duration::from_secs(20);
-static EGRESS_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn proxy_env_keys() -> [&'static str; 6] {
     [
@@ -141,7 +141,7 @@ impl EgressProxyLease {
         let verification_host = allowlist.first().ok_or_else(|| {
             agent_error("first-party egress proxy requires a non-empty allowlist")
         })?;
-        let suffix = unique_suffix();
+        let suffix = unique_resource_name("");
         let container_name = format!("harness-egress-proxy-{suffix}");
         let allowlist_value = allowlist.join(",");
         let allow_rfc2544 = docker_runtime_name()?.eq_ignore_ascii_case("orbstack");
@@ -173,7 +173,14 @@ impl EgressProxyLease {
             }
             IsolationTier::Container => {
                 let network_name = format!("harness-egress-{suffix}");
-                run_docker(&["network", "create", "--internal", &network_name])?;
+                let mut network_args = vec![
+                    "network".to_string(),
+                    "create".to_string(),
+                    "--internal".to_string(),
+                ];
+                append_string_labels(&mut network_args, ManagedDockerResource::EgressNetwork);
+                network_args.push(network_name.clone());
+                run_docker_owned(&network_args)?;
                 let result = (|| {
                     start_proxy_container(
                         &container_name,
@@ -272,6 +279,7 @@ fn start_proxy_container(
         "--name".to_string(),
         name.to_string(),
     ];
+    append_string_labels(&mut args, ManagedDockerResource::EgressProxy);
     if let Some(network) = network {
         args.extend([
             "--network".to_string(),
@@ -445,15 +453,6 @@ fn cleanup_docker_resource(args: &[&str], kind: &str, name: &str) {
             tracing::error!(resource_kind = kind, resource_name = name, %error, "failed to invoke Docker for egress cleanup")
         }
     }
-}
-
-fn unique_suffix() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let sequence = EGRESS_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{millis}-{sequence}", std::process::id())
 }
 
 fn agent_error(message: impl Into<String>) -> HarnessError {
