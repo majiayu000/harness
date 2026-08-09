@@ -68,8 +68,7 @@ impl TraceState {
     }
 
     const fn permits_signal_termination(self, signal: libc::c_int) -> bool {
-        matches!(self, Self::Entry)
-            || signal == libc::SIGKILL && matches!(self, Self::Exit | Self::Termination)
+        matches!(self, Self::Entry) || signal == libc::SIGKILL && matches!(self, Self::Exit)
     }
 }
 
@@ -453,6 +452,10 @@ mod tests {
 
     #[test]
     fn trace_state_denies_before_advancing_and_closes_exit_transition() {
+        assert!(!TraceState::InitialExecExit.permits_signal_termination(libc::SIGKILL));
+        assert!(TraceState::Entry.permits_signal_termination(libc::SIGTERM));
+        assert!(TraceState::Exit.permits_signal_termination(libc::SIGKILL));
+        assert!(!TraceState::Exit.permits_signal_termination(libc::SIGTERM));
         let mut state = TraceState::Entry;
         let denied_number = if cfg!(target_arch = "x86_64") {
             56
@@ -481,5 +484,6 @@ mod tests {
         assert_eq!(state, TraceState::Termination);
         assert!(state.permits_exit());
         assert!(!state.permits_signal_delivery());
+        assert!(!state.permits_signal_termination(libc::SIGKILL));
     }
 }
