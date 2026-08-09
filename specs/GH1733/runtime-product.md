@@ -375,7 +375,10 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    cancellation, or cleanup-incomplete cannot release it early.
 
    Each fork occurs with every blockable signal blocked after saving the owner
-   thread's exact mask. The parent restores that mask immediately; restore
+   thread's exact kernel mask through raw `rt_sigprocmask` with the Linux
+   kernel sigset size. The implementation must not use glibc
+   `sigfillset`/`pthread_sigmask`, which omit NPTL-reserved signals 32 and 33.
+   The parent restores that mask immediately through the same raw syscall; restore
    failure closes the gate, rolls back the child, and returns
    `containment_unavailable/signal_isolation_unavailable`. The child resets all
    catchable dispositions while blocked, then installs the exact empty mask
@@ -426,7 +429,11 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    register the exact pidfd plus reap obligation before releasing `GO` or
    exposing a cancellable lease. Registration failure closes the gate and may
    use only the exact still-unreaped direct-child positive PID for bounded
-   rollback. After registration, all signalling uses the registered pidfd
+   rollback. Before attempting that rollback, the owner records a distinct
+   pre-registration PID obligation in its registry. If termination or reap
+   misses the cleanup deadline, that obligation and the owner permit remain
+   retained until exact direct-child reap; registry emptiness includes these
+   obligations. After registration, all signalling uses the registered pidfd
    identity. Wait/reap is pidfd-only after capability success, except for the
    failed initial capability bootstrap's exact positive-PID reap while its
    pidfd remains held. No negative PID, PGID, post-reap PID, or `/proc`
@@ -447,9 +454,13 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
 
    Supported Linux requires `close_range` descriptor isolation,
    `pidfd_open`, `pidfd_send_signal`, parent-child ptrace with
-   `PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD`, exact
+   `PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL`, exact
    `PTRACE_GET_SYSCALL_INFO`, and strong stopped-image identity before cwd
-   observation. Other platforms fail no-envelope before cwd access. The
+   observation. The capability transaction must execute a fixed trusted native
+   image through the same retained-handle exec-stop path and prove one exact
+   `PTRACE_EVENT_EXEC` plus strong `/proc/<pid>/exe` identity and offset-zero
+   hash matching before any user cwd is opened. Other platforms fail
+   no-envelope before cwd access. The
    capability helper is owner-traced with `PTRACE_SEIZE`; it never calls
    `PTRACE_TRACEME`. Exact `ENOSYS`, `EPERM`, or `EINVAL` from an
    eligible target's frozen fd-10 `execveat(AT_EMPTY_PATH)` is candidate-local
@@ -474,7 +485,8 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    untagged, out-of-order, or unreadable stops return no-envelope
    `execution_verification_unavailable`. Direct `SIGKILL` death from
    `AwaitEntry` or `AwaitExit` yields `terminated_by_signal`; from
-   `AwaitInitialExecExit` it is `execution_verification_unavailable`.
+   `AwaitInitialExecExit` or the internal `AwaitTermination` state after an
+   `exit`/`exit_group` entry it is `execution_verification_unavailable`.
 
    The only setup stages after the capability gate are
    `working_directory_enter` and `trace_setup`. Failure on the initial or
@@ -671,8 +683,9 @@ reap, `exec_failed` without `spawn_failed`, `exec_started` with a spawn failure,
 `bare_eacces_exhausted` unless the final non-skipped attempt is `exec_eacces`
 and no final executable identity exists. `candidate_limit_exceeded` requires
 `unix_bare` and exactly 64 nonterminal attempts. For `unix_bare`,
-`path_not_found` permits only skipped `absent`, `not_regular`, and
-`not_executable` outcomes and no identity failure. For `unix_absolute` or
+`path_not_found` requires one through 64 attempts, permits only skipped
+`absent`, `not_regular`, and `not_executable` outcomes, and permits no identity
+failure. An empty attempt list is rejected. For `unix_absolute` or
 `unix_qualified`, it permits exactly one `absent`; a sole `not_regular` or
 `not_executable` is terminal and requires its matching identity failure.
 The no-target-helper invariant of a `none` attempt is local to that attempt;

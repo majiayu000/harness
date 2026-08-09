@@ -105,9 +105,15 @@ pidfd, and only then creates the capability child. Any self-preflight syscall
 failure returns no-envelope `ContainmentUnavailable(PidfdUnavailable)` before
 cwd observation; it cannot be reported as a capability-child registration
 failure. This proves open and signalling only. Under the already-started
-active deadline, the capability child then proves strong stopped-process/image
-observation, tagged ptrace guarding, the kill-isolated observation protocol,
-and exact pidfd wait/reap before containment becomes available. macOS, other Unix,
+active deadline, the capability child then proves raw descriptor isolation,
+tagged ptrace guarding with
+`PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL`, safe
+architecture-specific syscall suppression, and exact pidfd wait/reap. The same
+preflight executes a fixed trusted native capability image through retained-fd
+`execveat(AT_EMPTY_PATH)`, observes exactly one `PTRACE_EVENT_EXEC` before its
+first instruction, and validates strong `/proc/<pid>/exe` identity plus an
+offset-zero retained-handle hash through the kill-isolated observation
+protocol before containment becomes available. macOS, other Unix,
 and Windows return typed no-envelope producer error
 `ContainmentUnavailable(UnsupportedPlatform)` before cwd observation. On
 supported Linux, an observation subprocess opens the directory once with
@@ -488,9 +494,14 @@ precomputes a collision-free remap schedule; an already-fd-10 retained handle
 keeps its original `O_CLOEXEC`, otherwise the child uses `dup3(..., 10,
 O_CLOEXEC)` before closing the source descriptor.
 
-Before each fork, the owner saves the calling thread's signal mask and blocks every
-blockable signal; failure returns no-envelope `ContainmentUnavailable(SignalIsolationUnavailable)` before fork. The child inherits the all-blocked mask.
-The parent restores its exact saved mask immediately after fork inside the same critical section and before waiting for child status. Restore failure closes the
+Before each fork, the owner uses raw Linux `rt_sigprocmask` with the kernel
+sigset size to save the calling thread's exact mask and block every blockable
+signal, including glibc/NPTL-reserved signals 32 and 33; `sigfillset`,
+`sigprocmask`, and `pthread_sigmask` wrappers are forbidden here. Failure
+returns no-envelope `ContainmentUnavailable(SignalIsolationUnavailable)`
+before fork. The child inherits the kernel-verified all-blocked mask.
+The parent restores its exact saved mask with raw `rt_sigprocmask` immediately
+after fork inside the same critical section and before waiting for child status. Restore failure closes the
 gate, runs bounded exact-positive-PID rollback, and returns that same containment
 error after reap; incomplete rollback uses the existing cleanup-incomplete result and retains the permit.
 The owner thread then exits and is never reused with the unrestored mask.
@@ -527,14 +538,19 @@ registered pidfd, except for the failed capability-bootstrap reap defined
 below. A completed rollback returns no-envelope
 `ChildRegistrationUnavailable { role, stage }`; a rollback that misses the
 applicable cleanup deadline returns
-`ChildRegistrationCleanupIncomplete { role, operation }`, retains the direct-
-child or pidfd reap obligation and global owner permit, and exposes no lease or
-descriptor. Its closed cleanup operations are `GateClose`, `Termination`, and
+`ChildRegistrationCleanupIncomplete { role, operation }`. Before any bounded
+positive-PID rollback begins, the owner registry records that still-gated
+direct child as a pre-registration PID obligation. A missed rollback deadline
+retains that exact obligation and the global owner permit until direct-child
+reap, and exposes no lease or descriptor. Its closed cleanup operations are
+`GateClose`, `Termination`, and
 `Reap`. Logical slot exhaustion is instead
 `OwnerResourceCapacityExceeded`; after slots are reserved, `pipe2`/`socketpair`
 or `pidfd_open` resource failure is the concrete child-registration stage.
-`SCM_RIGHTS` descriptor counts cannot exceed reserved transfer slots, and a
-surplus is protocol-invalid descriptor mismatch. A concrete registration
+Every `SCM_RIGHTS` receiver validates exact `cmsg_len`, one expected control
+message, and exactly the reserved descriptor count. A surplus fd within one
+message is protocol-invalid descriptor mismatch, and every descriptor received
+on a non-success path is closed before returning. A concrete registration
 failure observed before deadline has precedence over a later deadline; a
 deadline error is used only when no concrete syscall failure was observed.
 Cancellation returns no visible result and drives the same owner rollback. The
@@ -643,7 +659,8 @@ After final target authorization, the owner creates the target and remains the
 sole parent-side ptrace controller and wait/reap owner. The target helper's
 audited pre-exec closure is the one exception: it first
 `PTRACE_TRACEME`s and stops itself before exec. The parent verifies that stop,
-sets `PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD`, and resumes only into
+sets `PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL`, and
+resumes only into
 retained-handle
 `execveat(10, "", ..., AT_EMPTY_PATH)`. Exact
 `EACCES`/`ETXTBSY`/`ENOEXEC` retain their
@@ -723,7 +740,9 @@ injecting the same signal. A caught or ignored signal keeps `AwaitEntry`; a
 terminating signal yields only `terminated_by_signal` after complete capture.
 A direct `SIGKILL` terminal event in `AwaitEntry` or `AwaitExit` yields the same
 semantic result; in `AwaitInitialExecExit` it is
-`ExecutionVerificationUnavailable`. A delivery
+`ExecutionVerificationUnavailable`. A direct terminal signal in the internal
+`AwaitTermination` state after an allowed `exit`/`exit_group` entry is also
+`ExecutionVerificationUnavailable`, never semantic termination evidence. A delivery
 stop in `AwaitInitialExecExit` or `AwaitExit`, malformed siginfo, a group,
 seccomp, event, untagged, wrong-op, wrong-architecture, or duplicate stop
 returns `ExecutionVerificationUnavailable` and starts cleanup. The active

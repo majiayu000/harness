@@ -97,11 +97,14 @@ facts in snapshots or through a CLI.
    Runtime producer input also carries the existing closed execution isolation
    value and the adapter's effective `SandboxSpec`. v0.1 accepts only `host`
    plus the exact passthrough sandbox state
-   `DangerFullAccess` with `allowed_write_paths = None`; its payload records the
-   closed fact `sandbox_policy = danger_full_access_unrestricted`.
+   `DangerFullAccess` with `allowed_write_paths = None` and
+   `network_policy = InheritSandboxMode`, the exact state for which
+   `wrap_command` returns `SandboxEngine::None`; its payload records the closed
+   fact `sandbox_policy = danger_full_access_unrestricted`.
    `container` and `microvm` retain their typed unsupported-isolation errors.
-   `ReadOnly`, `ReadOnlyWithNetwork`, `WorkspaceWrite`, or any narrowed
-   allowed-write-path state fails separately with
+   `ReadOnly`, `ReadOnlyWithNetwork`, `WorkspaceWrite`, any narrowed
+   allowed-write-path state, `NetworkPolicy::Deny`, or any local-proxy policy
+   fails separately with
    `sandbox_parity_unavailable`. Both gates precede PATH resolution,
    working-directory or executable access, and process creation. v0.1 never
    runs an unrestricted version child for an adapter launch that would be
@@ -391,6 +394,9 @@ attempt vocabularies are normative in `runtime-product.md`.
       `interpreter_authorization_unavailable`, does not execute a later PATH
       candidate, and records the documented security divergence even when the
       adapter would continue searching.
+      A Unix bare `path_not_found` envelope always carries at least one reached
+      skipped attempt; an empty attempt list is impossible and strict parsing
+      rejects it.
 - [ ] Unix bare-name PATH-unset fixtures return `path_unusable` without
       observing a default search path, while absolute and qualified commands
       remain representable; Windows conformance compares the frozen resolver
@@ -437,6 +443,11 @@ attempt vocabularies are normative in `runtime-product.md`.
       audit proves the owner is the sole target/helper fork, parent-side ptrace
       controller, wait/reap, and observation-helper-spawn authority; the
       target pre-exec closure's audited `PTRACE_TRACEME` is the sole exception.
+      Both capability `PTRACE_SEIZE` and target `PTRACE_SETOPTIONS` install
+      `PTRACE_O_EXITKILL` together with the existing exec/tagged-stop options
+      before any traced child can resume. Capability fixtures prove an actual
+      retained-handle exec stop and stopped-image strong identity/hash
+      observation, not only basic ptrace syscall stops.
       After verified initial exec, syscall-entry fixtures prove `fork`, `vfork`,
       `clone`, `clone3`, `execve`, `execveat`, executable `mmap`/`mprotect`,
       executable `shmat`, x86_64 `uselib`, `ptrace`, `process_vm_writev`, `userfaultfd`,
@@ -479,6 +490,10 @@ attempt vocabularies are normative in `runtime-product.md`.
       the same retained directory identity. A search/execute-only directory
       that denies ordinary read access remains usable through the retained
       `O_PATH` handle.
+      Every fixed-frame `SCM_RIGHTS` receiver requires one exact control
+      message containing exactly the reserved descriptor count, rejects
+      surplus descriptors within one message, and closes every received fd on
+      every malformed or error path before returning.
 - [ ] Linux executable-format fixtures prove static `ET_EXEC` and static-PIE
       `ET_DYN` success for the exact native machine tuple. Direct and
       `#!/usr/bin/env` shebangs, `PT_INTERP`, same-class/endianness
@@ -518,6 +533,10 @@ attempt vocabularies are normative in `runtime-product.md`.
       claim. Cancellation at every capability, observation, initial-target,
       and retry-target create/register boundary proves the owner atomically
       registers the exact pidfd and reap obligation before `GO` or any lease.
+      If `pidfd_open`, registry commit, or bounded direct-PID rollback fails
+      before registration, the still-gated exact positive PID becomes an
+      owner-registry pre-registration obligation. The owner retains its permit
+      and drains that exact unreaped direct child before exit.
 - [ ] Authorization-race fixtures replace and rewrite the source after the
       final checkpoint and prove the exec-stop hash/identity gate kills a
       changed native image before its first instruction, while an introduced
@@ -577,7 +596,9 @@ attempt vocabularies are normative in `runtime-product.md`.
       signalling or semantic exit evidence; capture failure still has priority.
       Direct `SIGKILL` death is accepted from `AwaitEntry` or `AwaitExit` as
       `terminated_by_signal`, but from `AwaitInitialExecExit` it is
-      `ExecutionVerificationUnavailable`; each state has a fixture.
+      `ExecutionVerificationUnavailable`; `AwaitTermination` after an
+      `exit`/`exit_group` entry is also illegal semantic signal evidence and
+      fails verification. Each state has a fixture.
 - [ ] On x86_64, both dangerous and otherwise harmless syscall numbers carrying
       `__X32_SYSCALL_BIT` fail no-envelope execution verification before native
       classification and are never normalized by clearing the bit. Native
@@ -623,6 +644,10 @@ attempt vocabularies are normative in `runtime-product.md`.
       the gated direct child is rolled back by its still-unreaped positive PID.
       Logical-slot exhaustion and post-reservation `EMFILE` retain their
       distinct capacity and registration-stage errors.
+      Pre-fork mask fixtures use the raw Linux `rt_sigprocmask` syscall with
+      the kernel sigset size, not glibc `sigfillset`/`pthread_sigmask`, and
+      prove signals 32 and 33 plus every other blockable signal are blocked
+      across each fork transaction before child disposition reset.
 
 - [ ] Failure fixtures cover every B-008 phase/kind, deterministic ordering,
       sanitized bounded facts, rejection of unknown values, and a fixed vector

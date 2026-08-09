@@ -12,7 +12,7 @@ See `specs/GH1733/product.md` and the split runtime contracts in
 `tasks.md`.
 
 <!-- specrail-planned-changes
-{"issue":1733,"complete":true,"paths":["Cargo.lock","crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/authorization.rs","crates/harness-agents/src/runtime_fingerprint/candidate.rs","crates/harness-agents/src/runtime_fingerprint/capability.rs","crates/harness-agents/src/runtime_fingerprint/checkpoint.rs","crates/harness-agents/src/runtime_fingerprint/completion.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/exec_stop.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/launch.rs","crates/harness-agents/src/runtime_fingerprint/owner.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/registry.rs","crates/harness-agents/src/runtime_fingerprint/resolution.rs","crates/harness-agents/src/runtime_fingerprint/supervision.rs","crates/harness-agents/src/runtime_fingerprint/syscall_guard.rs","crates/harness-agents/src/runtime_fingerprint/target.rs","crates/harness-agents/src/runtime_fingerprint/test_fixtures.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-agents/src/runtime_fingerprint/tests/lifecycle.rs","crates/harness-agents/src/runtime_fingerprint/tests/owner.rs","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/model/validation.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint/tests/model.rs","crates/harness-core/src/stack/fingerprint/tests/schema.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs","specs/GH1733/tasks.md","specs/GH1733/tech.md"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
+{"issue":1733,"complete":true,"paths":["Cargo.lock","crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/authorization.rs","crates/harness-agents/src/runtime_fingerprint/candidate.rs","crates/harness-agents/src/runtime_fingerprint/capability.rs","crates/harness-agents/src/runtime_fingerprint/checkpoint.rs","crates/harness-agents/src/runtime_fingerprint/completion.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/exec_stop.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/launch.rs","crates/harness-agents/src/runtime_fingerprint/owner.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/registry.rs","crates/harness-agents/src/runtime_fingerprint/resolution.rs","crates/harness-agents/src/runtime_fingerprint/supervision.rs","crates/harness-agents/src/runtime_fingerprint/syscall_guard.rs","crates/harness-agents/src/runtime_fingerprint/target.rs","crates/harness-agents/src/runtime_fingerprint/test_fixtures.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-agents/src/runtime_fingerprint/tests/lifecycle.rs","crates/harness-agents/src/runtime_fingerprint/tests/owner.rs","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/model/validation.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint/tests/model.rs","crates/harness-core/src/stack/fingerprint/tests/schema.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs","specs/GH1733/product.md","specs/GH1733/runtime-observation.md","specs/GH1733/runtime-product.md","specs/GH1733/runtime-supervision.md","specs/GH1733/tasks.md","specs/GH1733/tech.md"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
 -->
 
 ## Current System and Root Cause
@@ -227,9 +227,11 @@ The public configured-runtime constructor takes this enum, a validated
 `harness_sandbox::SandboxSpec`, and exactly one `PathBuf`. Validation first
 exhaustively accepts only `Host`; `Container` and `Microvm` return a typed
 producer-input error. It then accepts only `SandboxMode::DangerFullAccess`
-with `allowed_write_paths = None`, the exact state for which `wrap_command`
-returns `SandboxEngine::None`. Every other mode or narrowed path set returns
-typed `SandboxParityUnavailable`. Both gates run before PATH resolution,
+with `allowed_write_paths = None` and
+`network_policy = NetworkPolicy::InheritSandboxMode`, the exact state for
+which `wrap_command` returns `SandboxEngine::None`. Every other mode, narrowed
+path set, denied network policy, or local-proxy policy returns typed
+`SandboxParityUnavailable`. Both gates run before PATH resolution,
 working-directory/executable access, or process creation.
 Their configured CLI path names a command inside another execution boundary,
 not the host executable that would actually be launched, so host
@@ -714,6 +716,14 @@ checker, verification must not claim to run a removed script; structural
 review of the manifest and B-001 through B-016 coverage is the current spec
 check.
 
+The owner lifecycle additionally records failed pre-registration direct-child
+PID obligations before bounded rollback, uses raw kernel `rt_sigprocmask`
+around every fork, requires exact `SCM_RIGHTS` descriptor counts and error-path
+closure, and gates containment on `PTRACE_O_EXITKILL` plus an actual
+exec-stop/strong-image capability probe. Strict runtime parsing rejects an
+empty Unix-bare `path_not_found` attempt list, and trace supervision rejects
+terminal signals from its internal termination state.
+
 The GH-1733 owner has required a follow-up PR from current `main` because PR
 #1859 is merged. Every valid historical finding must be addressed on that
 follow-up, and fresh current-head CI, independent review, available advisory
@@ -753,7 +763,8 @@ fall back to the unsafe pre-spec PATH/environment behavior.
 - Running an unrestricted probe for a restricted or path-narrowed adapter
   launch is rejected. Reusing the current sandbox wrapper would replace the
   retained-handle target with a wrapper/path launch, so v0.1 accepts only the
-  exact passthrough sandbox state and otherwise fails before host observation.
+  exact passthrough sandbox state, including inherited network policy, and
+  otherwise fails before host observation.
 - Executing repository-owned code merely to obtain `--version` is rejected:
   repository sources and any resolved repository/worktree target produce
   identity-only evidence with `probe_not_authorized` until a separately

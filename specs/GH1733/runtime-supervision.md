@@ -54,8 +54,12 @@ reserved slot on `pidfd_open(getpid(), 0)` and
 `ContainmentUnavailable(PidfdUnavailable)`. It next runs one bounded
 capability helper behind the standard start gate. The helper proves descriptor
 isolation, owner-side `PTRACE_SEIZE/PTRACE_INTERRUPT`,
-`PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD`, tagged syscall stops,
-`PTRACE_GET_SYSCALL_INFO`, and strong stopped-image observation. It also
+`PTRACE_O_TRACEEXEC | PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL`, tagged
+syscall stops, `PTRACE_GET_SYSCALL_INFO`, and safe architecture-specific
+syscall suppression. It then exercises an actual fixed trusted native
+retained-handle exec, exact `PTRACE_EVENT_EXEC`, and strong stopped-image
+identity plus offset-zero hash observation through the production observation
+protocol. It also
 attempts a write-capable open of `/proc/self/mem`; the owner must classify and
 deny that entry before execution. The helper never calls `PTRACE_TRACEME`.
 Containment is not available until this successful
@@ -79,7 +83,10 @@ uses the same creation transaction:
 
 Before step 5 completes, registration failure closes the gate and may signal
 only the exact still-unreaped positive PID of that direct child for bounded
-rollback. After registration, every signal decision is tied to the registered
+rollback. Before rollback, the owner registry records a pre-registration PID
+obligation. A missed termination/reap deadline retains that obligation and the
+permit until exact direct-child reap; registry emptiness includes it. After
+registration, every signal decision is tied to the registered
 pidfd identity. The initial capability child additionally proves pidfd wait and
 reap before that mechanism is trusted. A `WNOWAIT` error/mismatch, or a
 consuming-call error while the child remains unreaped, permits the sole
@@ -196,7 +203,7 @@ The fail-closed result matrix is:
 | Earliest outcome | Allowed later facts |
 | --- | --- |
 | owner/capacity/preflight failure | typed no-envelope error before cwd or target observation |
-| child registration failure | no workload ran; gated direct-child rollback reaped it or the owner retained its exact obligation |
+| child registration failure | no workload ran; gated direct-child rollback reaped it or the owner retained its exact pre-registration PID obligation |
 | observation or execution verification failure | typed no-envelope error; registered child is killed/reaped without fabricated facts |
 | target setup failure | `working_directory_enter` or `trace_setup`; registered target reaped; no handle exec or fallback |
 | post-resume exit/output/guard failure | selected identity may remain; version absent; exact-pidfd cleanup runs |
@@ -218,6 +225,9 @@ incomplete/read-failed stream starts cleanup and no exit or parsing failure is
 substituted for it. After both streams are captured completely, termination
 status has second precedence: signal termination yields only
 `terminated_by_signal`, otherwise a nonzero exit yields only `nonzero_exit`.
+Direct `SIGKILL` is semantic only from `AwaitEntry` or `AwaitExit`; a terminal
+signal from `AwaitInitialExecExit`, internal `AwaitTermination`, or any other
+illegal trace state is no-envelope `ExecutionVerificationUnavailable`.
 Only a zero exit reaches UTF-8 validation, blank classification, grammar
 parsing, and stream selection. Successful version evidence computes and
 retains both exact SHA-256 stream digests.
