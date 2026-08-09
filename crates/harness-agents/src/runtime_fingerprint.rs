@@ -126,12 +126,42 @@ struct RuntimeFingerprintOwnerPermit;
 #[cfg(target_os = "linux")]
 impl RuntimeFingerprintOwnerPermit {
     fn try_acquire() -> Result<Self, RuntimeFingerprintProduceError> {
-        ACTIVE_RUNTIME_FINGERPRINT_OWNERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < RUNTIME_FINGERPRINT_OWNER_CAPACITY).then_some(active + 1)
-            })
-            .map_err(|_| RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded)?;
+        try_reserve_owner(&ACTIVE_RUNTIME_FINGERPRINT_OWNERS)?;
         Ok(Self)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_reserve_owner(counter: &AtomicUsize) -> Result<(), RuntimeFingerprintProduceError> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < RUNTIME_FINGERPRINT_OWNER_CAPACITY).then_some(active + 1)
+        })
+        .map(|_| ())
+        .map_err(|_| {
+            RuntimeFingerprintProduceError::ContainmentUnavailable(
+                ContainmentUnavailableReason::OwnerCapacityExhausted,
+            )
+        })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod owner_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn ninth_owner_fails_with_the_global_capacity_reason() {
+        let counter = AtomicUsize::new(0);
+        for expected in 1..=RUNTIME_FINGERPRINT_OWNER_CAPACITY {
+            assert!(try_reserve_owner(&counter).is_ok());
+            assert_eq!(counter.load(Ordering::Acquire), expected);
+        }
+        assert!(matches!(
+            try_reserve_owner(&counter),
+            Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
+                ContainmentUnavailableReason::OwnerCapacityExhausted
+            ))
+        ));
     }
 }
 
