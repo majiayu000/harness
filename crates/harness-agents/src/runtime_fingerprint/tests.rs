@@ -623,12 +623,13 @@ async fn linux_target_authorization_classifies_repository_and_external_handles()
     )
     .await
     .unwrap_err();
-    assert!(matches!(
-        error,
-        RuntimeFingerprintProduceError::ContainmentUnavailable(
-            ContainmentUnavailableReason::PostExecGuardUnavailable
-        )
-    ));
+    assert!(
+        matches!(
+            error,
+            RuntimeFingerprintProduceError::ExecutionVerificationUnavailable
+        ),
+        "unexpected post-exec verification result: {error:?}"
+    );
 }
 
 #[cfg(target_os = "linux")]

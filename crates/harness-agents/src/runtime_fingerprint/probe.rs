@@ -54,7 +54,7 @@ pub(super) fn owner_run(
             },
         );
     }
-    match super::resolution::resolve(
+    let selected = match super::resolution::resolve(
         executable,
         options,
         &environment,
@@ -67,22 +67,30 @@ pub(super) fn owner_run(
             candidate,
             executable: retained,
             attempts,
-        } => {
-            let _selected_identity = (
-                retained.fd(),
-                retained.device,
-                retained.inode,
-                retained.file_size_bytes,
-                retained.unix_mode,
-                retained.executable_sha256.as_str(),
-                candidate.candidate_digest.as_str(),
-                attempts.len(),
-            );
+        } => (candidate, retained, attempts),
+    };
+    let (candidate, retained, attempts) = selected;
+    let target = super::target::start_initial(
+        executable,
+        &environment,
+        &working_directory,
+        &retained,
+        deadline,
+    )?;
+    match target {
+        super::target::TargetStart::ExecStopped(stopped) => {
+            let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
+            stopped.terminate_without_resume(cleanup_deadline)?;
+        }
+        super::target::TargetStart::SetupFailed(detail) => {
+            let _setup_failure = detail;
+        }
+        super::target::TargetStart::ExecFailed(errno) => {
+            let _exec_failure = errno;
         }
     }
-    Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
-        ContainmentUnavailableReason::PostExecGuardUnavailable,
-    ))
+    drop((candidate, attempts));
+    Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
 }
 
 pub(super) const CHILD_READY: u8 = 1;

@@ -17,6 +17,8 @@ mod probe;
 mod resolution;
 #[cfg(target_os = "linux")]
 mod syscall_guard;
+#[cfg(target_os = "linux")]
+mod target;
 
 use harness_core::config::agents::{AgentsConfig, SandboxMode};
 use harness_core::config::isolation::IsolationTier;
