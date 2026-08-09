@@ -3,6 +3,11 @@
 #[cfg(test)]
 mod tests;
 
+mod environment;
+mod executable;
+#[cfg(target_os = "linux")]
+mod probe;
+
 use harness_core::config::agents::{AgentsConfig, SandboxMode};
 use harness_core::config::isolation::IsolationTier;
 use harness_core::stack::fingerprint::{
@@ -11,12 +16,35 @@ use harness_core::stack::fingerprint::{
 use harness_sandbox::SandboxSpec;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
+
+pub use environment::{
+    classify_completed_runtime_output, RuntimeOutputClassification, RuntimeTermination,
+};
+pub use executable::{
+    runtime_working_directory_identity_digest, windows_working_directory_digest,
+    ValidatedRepositoryBoundarySet,
+};
 
 pub const RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES: u64 = 67_108_864;
 pub const RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES: usize = 65_536;
-pub const RUNTIME_FINGERPRINT_ACTIVE_DEADLINE_SECS: u64 = 5;
-pub const RUNTIME_FINGERPRINT_CLEANUP_DEADLINE_SECS: u64 = 5;
+pub const RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS: usize = 65_536;
+pub const RUNTIME_FINGERPRINT_MAX_OBSERVATION_ENV_ENTRIES: usize = 1_024;
+pub const RUNTIME_FINGERPRINT_MAX_ENVIRONMENT_KEY_UNITS: usize = 1_024;
+pub const RUNTIME_FINGERPRINT_MAX_SETUP_SECRET_NAMES: usize = 1_024;
+pub const RUNTIME_FINGERPRINT_MAX_SETUP_SECRET_NAME_UNITS: usize = 1_024;
+pub const RUNTIME_FINGERPRINT_MAX_RESOLUTION_CANDIDATES: usize = 64;
+pub const RUNTIME_FINGERPRINT_OWNER_CAPACITY: usize = 8;
+pub const RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS: usize = 2;
+pub const RUNTIME_FINGERPRINT_OWNER_NON_PIDFD_SLOTS: usize = 28;
+pub const RUNTIME_FINGERPRINT_POST_READY_CHILD_REFERENCES: usize = 12;
+pub const RUNTIME_FINGERPRINT_TARGET_EXEC_FD: i32 = 10;
+pub const RUNTIME_FINGERPRINT_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+pub const RUNTIME_FINGERPRINT_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
+pub const RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE: Duration = Duration::from_secs(1);
+pub const RUNTIME_FINGERPRINT_OWNER_STOP_JOIN_DEADLINE: Duration = Duration::from_secs(1);
+pub const RUNTIME_FINGERPRINT_ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainmentUnavailableReason {
@@ -32,7 +60,7 @@ pub enum ContainmentUnavailableReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaunchInputLimitKind {
+pub enum RuntimeLaunchInputLimitKind {
     ConfiguredCommand,
     WorkingDirectory,
     WindowsCurrentExecutableDirectory,
@@ -47,8 +75,61 @@ pub enum LaunchInputLimitKind {
     ClaudeConfigDirectory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeOwnedChildRole {
+    Observation(RuntimeObservationStage),
+    InitialTarget,
+    RetryTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeObservationStage {
+    CapabilityCheck,
+    WorkingDirectory,
+    Candidate,
+    TargetAuthorization,
+    SourceHash,
+    PreSpawnCheckpoint,
+    ExecStopCheckpoint,
+    PostReapCheckpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeChildRegistrationStage {
+    GateCreate,
+    Fork,
+    SignalIsolation,
+    DescriptorIsolation,
+    PidfdOpen,
+    RegistryCommit,
+    GateRelease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeChildCleanupOperation {
+    GateClose,
+    Termination,
+    Reap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeObservationCleanupOperation {
+    Termination,
+    Reap,
+    ProtocolClose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeObservationProtocolReason {
+    TruncatedFrame,
+    OversizedFrame,
+    SurplusFields,
+    DescriptorCountMismatch,
+    HelperExited,
+}
+
 #[derive(Debug, Error)]
-pub enum RuntimeFingerprintError {
+pub enum RuntimeFingerprintProduceError {
     #[error(transparent)]
     Stack(#[from] harness_core::stack::fingerprint::AgentStackFingerprintError),
     #[error("runtime isolation {0:?} cannot produce a host fingerprint")]
@@ -58,9 +139,43 @@ pub enum RuntimeFingerprintError {
     #[error("runtime fingerprint containment is unavailable: {0:?}")]
     ContainmentUnavailable(ContainmentUnavailableReason),
     #[error("runtime fingerprint launch input exceeds the {0:?} limit")]
-    LaunchInputLimitExceeded(LaunchInputLimitKind),
+    LaunchInputLimitExceeded(RuntimeLaunchInputLimitKind),
     #[error("runtime fingerprint output limit must be in 1..=65536")]
     InvalidOutputLimit,
+    #[error("runtime fingerprint environment contains an invalid key")]
+    InvalidEnvironmentKey,
+    #[error("runtime fingerprint environment contains a canonical key collision")]
+    EnvironmentKeyCollision,
+    #[error("runtime fingerprint launch context is invalid")]
+    InvalidLaunchContext,
+    #[error("runtime fingerprint working directory is unavailable")]
+    WorkingDirectoryUnavailable,
+    #[error("runtime fingerprint owner resource capacity is exhausted")]
+    OwnerResourceCapacityExceeded,
+    #[error("runtime child registration failed for {role:?} at {stage:?}")]
+    ChildRegistrationUnavailable {
+        role: RuntimeOwnedChildRole,
+        stage: RuntimeChildRegistrationStage,
+    },
+    #[error("runtime child registration cleanup is incomplete for {role:?}: {operation:?}")]
+    ChildRegistrationCleanupIncomplete {
+        role: RuntimeOwnedChildRole,
+        operation: RuntimeChildCleanupOperation,
+    },
+    #[error("runtime observation deadline exceeded at {stage:?}")]
+    ObservationDeadlineExceeded { stage: RuntimeObservationStage },
+    #[error("runtime observation cleanup is incomplete at {stage:?}: {operation:?}")]
+    ObservationCleanupIncomplete {
+        stage: RuntimeObservationStage,
+        operation: RuntimeObservationCleanupOperation,
+    },
+    #[error("runtime observation protocol is invalid at {stage:?}: {reason:?}")]
+    ObservationProtocolInvalid {
+        stage: RuntimeObservationStage,
+        reason: RuntimeObservationProtocolReason,
+    },
+    #[error("runtime execution verification is unavailable")]
+    ExecutionVerificationUnavailable,
 }
 
 #[derive(Debug, Clone)]
@@ -108,16 +223,16 @@ impl ConfiguredRuntimeExecutable {
         &self.setup_secret_env
     }
 
-    fn validate_execution_boundary(&self) -> Result<(), RuntimeFingerprintError> {
+    fn validate_execution_boundary(&self) -> Result<(), RuntimeFingerprintProduceError> {
         if self.isolation != IsolationTier::Host {
-            return Err(RuntimeFingerprintError::UnsupportedIsolation(
+            return Err(RuntimeFingerprintProduceError::UnsupportedIsolation(
                 self.isolation,
             ));
         }
         if self.sandbox.mode != SandboxMode::DangerFullAccess
             || self.sandbox.allowed_write_paths.is_some()
         {
-            return Err(RuntimeFingerprintError::SandboxParityUnavailable);
+            return Err(RuntimeFingerprintProduceError::SandboxParityUnavailable);
         }
         Ok(())
     }
@@ -127,6 +242,7 @@ impl ConfiguredRuntimeExecutable {
 pub struct RuntimeFingerprintOptions {
     working_dir: PathBuf,
     environment: Vec<(OsString, OsString)>,
+    repository_boundaries: Option<ValidatedRepositoryBoundarySet>,
     max_output_bytes: usize,
 }
 
@@ -135,6 +251,7 @@ impl RuntimeFingerprintOptions {
         Self {
             working_dir: working_dir.into(),
             environment: Vec::new(),
+            repository_boundaries: None,
             max_output_bytes: RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES,
         }
     }
@@ -152,6 +269,14 @@ impl RuntimeFingerprintOptions {
         self
     }
 
+    pub fn with_repository_boundaries(
+        mut self,
+        repository_boundaries: ValidatedRepositoryBoundarySet,
+    ) -> Self {
+        self.repository_boundaries = Some(repository_boundaries);
+        self
+    }
+
     pub fn working_dir(&self) -> &Path {
         &self.working_dir
     }
@@ -162,6 +287,10 @@ impl RuntimeFingerprintOptions {
 
     pub const fn max_output_bytes(&self) -> usize {
         self.max_output_bytes
+    }
+
+    pub fn repository_boundaries(&self) -> Option<&ValidatedRepositoryBoundarySet> {
+        self.repository_boundaries.as_ref()
     }
 }
 
@@ -210,30 +339,106 @@ pub fn configured_runtime_executables_from_agents_config(
 pub async fn fingerprint_configured_runtime_executable(
     executable: &ConfiguredRuntimeExecutable,
     options: &RuntimeFingerprintOptions,
-) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintError> {
+) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
     executable.validate_execution_boundary()?;
-    produce_on_supported_platform(executable, options).await
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn produce_on_supported_platform(
-    _executable: &ConfiguredRuntimeExecutable,
-    _options: &RuntimeFingerprintOptions,
-) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintError> {
-    Err(RuntimeFingerprintError::ContainmentUnavailable(
-        ContainmentUnavailableReason::UnsupportedPlatform,
-    ))
+    ensure_supported_platform()?;
+    if !(1..=RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES).contains(&options.max_output_bytes) {
+        return Err(RuntimeFingerprintProduceError::InvalidOutputLimit);
+    }
+    validate_launch_value_limit(
+        executable.executable.as_os_str(),
+        RuntimeLaunchInputLimitKind::ConfiguredCommand,
+    )?;
+    validate_launch_value_limit(
+        options.working_dir.as_os_str(),
+        RuntimeLaunchInputLimitKind::WorkingDirectory,
+    )?;
+    let selected_environment = environment::validate_and_select(
+        executable.runtime_kind,
+        &options.environment,
+        &executable.setup_secret_env,
+    )?;
+    let prepared_command = executable::prepare_command(
+        executable.executable.as_os_str(),
+        &options.working_dir,
+        selected_environment.child_path.as_deref(),
+    )?;
+    if !prepared_command.validate_shape() {
+        return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+    }
+    produce_on_supported_platform(executable, options, selected_environment, prepared_command).await
 }
 
 #[cfg(target_os = "linux")]
 async fn produce_on_supported_platform(
-    _executable: &ConfiguredRuntimeExecutable,
+    executable: &ConfiguredRuntimeExecutable,
     options: &RuntimeFingerprintOptions,
-) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintError> {
-    if !(1..=RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES).contains(&options.max_output_bytes) {
-        return Err(RuntimeFingerprintError::InvalidOutputLimit);
+    selected_environment: environment::SelectedEnvironment,
+    prepared_command: executable::PreparedCommand,
+) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
+    probe::produce(executable, options, selected_environment, prepared_command).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn produce_on_supported_platform(
+    executable: &ConfiguredRuntimeExecutable,
+    options: &RuntimeFingerprintOptions,
+    selected_environment: environment::SelectedEnvironment,
+    prepared_command: executable::PreparedCommand,
+) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
+    let environment::SelectedEnvironment { facts, child_path } = selected_environment;
+    let executable::PreparedCommand {
+        command_form,
+        configured_command_digest,
+        working_directory_digest,
+        candidates,
+        candidate_limit_exceeded,
+        path_unusable,
+    } = prepared_command;
+    for candidate in candidates {
+        match candidate.reference {
+            executable::CandidateReference::Absolute(path)
+            | executable::CandidateReference::WorkingDirectoryRelative(path) => drop(path),
+        }
+        drop(candidate.candidate_digest);
     }
-    Err(RuntimeFingerprintError::ContainmentUnavailable(
-        ContainmentUnavailableReason::PostExecGuardUnavailable,
+    drop((
+        executable,
+        options,
+        facts,
+        child_path,
+        command_form,
+        configured_command_digest,
+        working_directory_digest,
+        candidate_limit_exceeded,
+        path_unusable,
+    ));
+    unreachable!("the platform gate returns before producer dispatch")
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_supported_platform() -> Result<(), RuntimeFingerprintProduceError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_supported_platform() -> Result<(), RuntimeFingerprintProduceError> {
+    Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
+        ContainmentUnavailableReason::UnsupportedPlatform,
     ))
+}
+
+fn validate_launch_value_limit(
+    value: &std::ffi::OsStr,
+    kind: RuntimeLaunchInputLimitKind,
+) -> Result<(), RuntimeFingerprintProduceError> {
+    if executable::native_os_units_len(value, RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS)
+        > RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS
+    {
+        Err(RuntimeFingerprintProduceError::LaunchInputLimitExceeded(
+            kind,
+        ))
+    } else {
+        Ok(())
+    }
 }
