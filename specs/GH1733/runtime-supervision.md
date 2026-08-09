@@ -130,8 +130,8 @@ before native-table decoding. Denied classes are:
   `pkey_mprotect`, or `shmat` requesting executable access, plus x86_64
   `uselib`;
 - `executable_image_mutation`: the closed writable-image and descriptor
-  acquisition operations in the product contract;
-- `kernel_module_loading`: native `init_module` and `finit_module`; and
+  acquisition operations in the product contract, including every `openat2`;
+- `kernel_code_loading`: native `bpf`, `init_module`, and `finit_module`; and
 - `process_signalling`: every closed signal syscall and target form.
 
 The frozen x86_64 syscall table includes `uselib`; aarch64 does not invent an

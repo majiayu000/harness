@@ -440,7 +440,7 @@ attempt vocabularies are normative in `runtime-product.md`.
       After verified initial exec, syscall-entry fixtures prove `fork`, `vfork`,
       `clone`, `clone3`, `execve`, `execveat`, executable `mmap`/`mprotect`,
       executable `shmat`, x86_64 `uselib`, `ptrace`, `process_vm_writev`, `userfaultfd`,
-      `io_uring_setup`, `pidfd_getfd`, `recvmsg`/`recvmmsg`, `prctl`,
+      `io_uring_setup`, `pidfd_getfd`, `recvmsg`/`recvmmsg`, `prctl`, `openat2`,
       non-query `personality`, and write-capable/truncating open-family requests are
       stopped before kernel execution, yield the exact closed
       transitive-denial class, execute no second-image/child/mapping/mutation
@@ -451,11 +451,12 @@ attempt vocabularies are normative in `runtime-product.md`.
       `READ_IMPLIES_EXEC` attempts are denied. The exact
       `personality(0xffff_ffff)` query is resumed, returns through the ordinary
       entry/exit trace transition, and does not produce denial evidence; every
-      other argument is denied. Exact and extended `openat2`
-      payloads are decoded, while short, unreadable, unknown-tail, and
-      unknown/conflicting-flag payloads return no-envelope execution
-      verification failure. Missing/untagged/unreadable syscall stops return no
-      envelope and cleanup the target.
+      other argument is denied. Every `openat2` entry is denied without reading
+      attacker-owned `open_how` memory, so an external same-UID writer cannot
+      change approved flags after validation. Native `bpf`, `init_module`, and
+      `finit_module` entries are denied as kernel-code loading regardless of
+      command or current capabilities. Missing/untagged/unreadable syscall stops
+      return no envelope and cleanup the target.
       A static aux-vector fixture proves each direct-exec attempt records
       `linux_fd_cloexec_execveat_empty_path_fd_10`, observes exact
       `AT_EXECFN = "/dev/fd/10"`, cannot reopen fd 10 after exec, and does not
