@@ -13,7 +13,6 @@ fn runtime_attempt_sequence_and_outcome_matrix_is_closed() {
         None,
     )
     .is_err());
-
     let terminal_then_skip = runtime_payload_with_facts(
         LocalExecutableRuntimeKind::CodexExec,
         RuntimeCommandForm::UnixBare,
@@ -75,7 +74,6 @@ fn absolute_and_qualified_forms_require_exactly_one_non_fallback_attempt() {
             failure(RuntimeProbeFailureKind::PathNotFound),
         )
         .is_ok());
-
         for attempts in [
             vec![],
             vec![
@@ -268,7 +266,6 @@ fn normalized_runtime_version_is_strict_semver() {
 fn runtime_environment_requires_the_exact_kind_policy_key_set() {
     let base = runtime_payload(LocalExecutableRuntimeKind::CodexExec);
     assert_eq!(base.runtime_kind(), LocalExecutableRuntimeKind::CodexExec);
-
     let claude_environment = vec![
         RuntimeEnvironmentFact::new(
             RuntimeEnvironmentKey::AnthropicApiKey,
@@ -301,7 +298,6 @@ fn runtime_environment_requires_the_exact_kind_policy_key_set() {
         failure(RuntimeProbeFailureKind::PathNotFound),
     )
     .is_ok());
-
     assert!(runtime_payload_with_facts(
         LocalExecutableRuntimeKind::CodexExec,
         RuntimeCommandForm::UnixBare,
