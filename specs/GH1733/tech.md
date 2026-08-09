@@ -12,7 +12,7 @@ See `specs/GH1733/product.md` and the split runtime contracts in
 `tasks.md`.
 
 <!-- specrail-planned-changes
-{"issue":1733,"complete":true,"paths":["crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
+{"issue":1733,"complete":true,"paths":["Cargo.lock","crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/model/validation.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint/tests/model.rs","crates/harness-core/src/stack/fingerprint/tests/schema.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
 -->
 
 ## Current System and Root Cause
@@ -70,9 +70,14 @@ before adding the remediation:
 - `stack/fingerprint/model.rs` owns the closed subjects, payloads, runtime
   kinds, canonical runtime-role source binding, environment facts, version
   facts, failure vocabulary, and typed errors.
+- `stack/fingerprint/model/validation.rs` owns the closed runtime
+  attempt/outcome/failure state-machine validation used by constructors and
+  strict parsing.
 - `stack/fingerprint/schema.rs` owns duplicate-aware JSON decoding and the
   schema-context canonicalization state machine.
-- `stack/fingerprint/tests.rs` owns core wire, MCP, schema, and digest tests.
+- `stack/fingerprint/tests.rs` owns shared core fixtures and wire/digest tests;
+  `stack/fingerprint/tests/model.rs` and `tests/schema.rs` split the mandatory
+  runtime-model and MCP schema matrices below the hard file-size ceiling.
 - `runtime_fingerprint.rs` owns configured-runtime inputs and the async
   orchestration that assembles one runtime payload.
 - `runtime_fingerprint/environment.rs` owns the closed runtime-kind policy,
@@ -639,6 +644,9 @@ Only these paths are authorized:
     (`#[cfg(test)]` exhaustive mapping contract only)
 15. `Cargo.lock` (only the existing `harness-agents` package's direct `libc`
     dependency edge)
+16. `crates/harness-core/src/stack/fingerprint/model/validation.rs`
+17. `crates/harness-core/src/stack/fingerprint/tests/model.rs`
+18. `crates/harness-core/src/stack/fingerprint/tests/schema.rs`
 
 Moving the two existing inline test modules into their listed test files is
 part of this scope. The agents manifest may add only `libc = { workspace =
@@ -672,7 +680,7 @@ cargo audit
 git diff --check
 ```
 
-The changed-file audit must equal the fifteen-path manifest. `Cargo.lock` must
+The changed-file audit must equal the eighteen-path manifest. `Cargo.lock` must
 differ only by the direct `libc` edge in the existing `harness-agents` package,
 and `cargo tree -p harness-agents -i libc` must show the pinned workspace
 dependency. `cargo tree -e features -p harness-core` must show the
