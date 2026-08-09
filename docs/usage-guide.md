@@ -483,6 +483,10 @@ For container-isolated Codex runs with setup commands, Harness creates a project
 state directory under `.harness/cloud-setup-state/`. Every setup command and the final
 Codex process share its writable `HOME` and temporary directory mounts, so installed
 tools and caches remain available across the otherwise ephemeral containers.
+When `setup_secret_env` is non-empty, container setup instead uses temporary
+HOME and temporary-directory mounts so credential files cannot reach the agent.
+Those setup runs are not cached because their isolated state is removed after
+each setup phase; persist intended non-secret outputs in the workspace.
 
 ### `[agents.review]`
 

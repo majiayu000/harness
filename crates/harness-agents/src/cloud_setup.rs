@@ -275,6 +275,7 @@ pub(crate) async fn run_setup_phase(
     }
 
     let secret_state = container_state::SecretContainerState::create(cloud, &context)?;
+    let discards_container_state = secret_state.is_some();
     let setup_result = async {
         for setup_command in &cloud.setup_commands {
             if setup_command.trim().is_empty() {
@@ -304,7 +305,9 @@ pub(crate) async fn run_setup_phase(
         setup_result?;
     }
 
-    write_setup_cache_stamp(cloud, context.project_root)?;
+    if !discards_container_state {
+        write_setup_cache_stamp(cloud, context.project_root)?;
+    }
     Ok(())
 }
 
@@ -648,6 +651,47 @@ mod tests {
 
         let result = run_test_setup(&cloud, dir.path()).await;
         assert!(result.is_err(), "chaining command must be rejected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the reference agent Docker image"]
+    async fn secret_backed_container_setup_does_not_cache_discarded_state() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let count = dir.path().join("setup-count");
+        let cloud = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["printf x >> setup-count".to_string()],
+            setup_secret_env: vec!["HARNESS_TEST_SETUP_TOKEN".to_string()],
+        };
+        let env_vars = HashMap::from([
+            (
+                AGENT_ISOLATION_TIER_ENV.to_string(),
+                "container".to_string(),
+            ),
+            (
+                AGENT_CONTAINER_IMAGE_ENV.to_string(),
+                "harness-agent:gh1771".to_string(),
+            ),
+        ]);
+        let run = || {
+            run_setup_phase(
+                &cloud,
+                CloudSetupContext {
+                    project_root: dir.path(),
+                    sandbox_mode: SandboxMode::DangerFullAccess,
+                    permission_mode: AgentPermissionMode::Full,
+                    env_vars: &env_vars,
+                    capability_token: None,
+                },
+            )
+        };
+
+        run().await?;
+        run().await?;
+
+        assert_eq!(fs::read_to_string(count)?, "xx");
         Ok(())
     }
 
