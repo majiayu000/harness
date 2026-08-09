@@ -115,20 +115,21 @@ impl AgentRequest {
         self.env_vars.extend(configured_agent_spawn_env(config));
     }
 
-    /// Returns `true` for an unrestricted request without an allowlist.
+    /// Returns `true` when the CLI should run without tool restrictions.
     ///
     /// When `true`, the CLI adapter should use `--dangerously-skip-permissions`.
     /// When `false`, the adapter should use `--allowedTools <list>` instead —
     /// these flags are mutually exclusive in Claude CLI 2.1.70+.
     pub fn uses_dangerously_skip_permissions(&self) -> bool {
-        self.effective_permission_mode() == AgentPermissionMode::Full
+        self.allowed_tools.is_none()
     }
 
-    /// Resolves compatibility at the public request boundary. Default and
-    /// runtime requests carry an explicit tool list; legacy direct callers
-    /// that set `allowed_tools` to `None` retain unrestricted behavior.
+    /// Resolves the permission mode used for egress. Explicit Full mode is
+    /// independent from tool restrictions so correction turns can deny every
+    /// tool without losing provider access. Legacy direct callers that set
+    /// `allowed_tools` to `None` also retain unrestricted egress.
     pub fn effective_permission_mode(&self) -> AgentPermissionMode {
-        if self.allowed_tools.is_none() {
+        if self.permission_mode == AgentPermissionMode::Full || self.allowed_tools.is_none() {
             AgentPermissionMode::Full
         } else {
             AgentPermissionMode::Scoped

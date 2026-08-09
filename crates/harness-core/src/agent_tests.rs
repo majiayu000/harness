@@ -195,7 +195,7 @@ fn default_agent_request_is_scoped_to_standard_tools() {
 }
 
 #[test]
-fn explicit_full_agent_request_is_unrestricted_only_without_an_allowlist() {
+fn explicit_full_agent_request_keeps_egress_when_tools_are_restricted() {
     let full = AgentRequest {
         permission_mode: crate::config::agents::AgentPermissionMode::Full,
         allowed_tools: None,
@@ -210,7 +210,7 @@ fn explicit_full_agent_request_is_unrestricted_only_without_an_allowlist() {
     assert!(!restricted.uses_dangerously_skip_permissions());
     assert_eq!(
         restricted.effective_permission_mode(),
-        crate::config::agents::AgentPermissionMode::Scoped
+        crate::config::agents::AgentPermissionMode::Full
     );
     assert_eq!(restricted.scoped_allowed_tools(), vec!["Read"]);
 }
@@ -227,6 +227,22 @@ fn legacy_missing_tool_allowlist_keeps_unrestricted_behavior() {
         request.effective_permission_mode(),
         crate::config::agents::AgentPermissionMode::Full
     );
+    assert_eq!(
+        crate::agent::AgentEgressMode::resolve(request.effective_permission_mode(), &[]),
+        crate::agent::AgentEgressMode::Unrestricted
+    );
+}
+
+#[test]
+fn full_egress_is_preserved_when_tools_are_explicitly_empty() {
+    let request = AgentRequest {
+        permission_mode: crate::config::agents::AgentPermissionMode::Full,
+        allowed_tools: Some(Vec::new()),
+        ..AgentRequest::default()
+    };
+
+    assert!(!request.uses_dangerously_skip_permissions());
+    assert!(request.scoped_allowed_tools().is_empty());
     assert_eq!(
         crate::agent::AgentEgressMode::resolve(request.effective_permission_mode(), &[]),
         crate::agent::AgentEgressMode::Unrestricted
