@@ -108,6 +108,7 @@ pub(crate) struct ContainerBindMount {
     pub(crate) source: PathBuf,
     pub(crate) destination: PathBuf,
     scope: ContainerBindMountScope,
+    read_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +123,16 @@ impl ContainerBindMount {
             source,
             destination,
             scope: ContainerBindMountScope::Workspace,
+            read_only: false,
+        }
+    }
+
+    pub(crate) fn workspace_read_only(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            source,
+            destination,
+            scope: ContainerBindMountScope::Workspace,
+            read_only: true,
         }
     }
 
@@ -130,6 +141,7 @@ impl ContainerBindMount {
             source,
             destination,
             scope: ContainerBindMountScope::HarnessTemp,
+            read_only: false,
         }
     }
 }
@@ -282,12 +294,16 @@ impl AgentSpawnContract for ContainerSpawn {
                     mount.destination.display()
                 )));
             }
-            args.push(OsString::from("--mount"));
-            args.push(OsString::from(format!(
+            let mut bind_mount = format!(
                 "type=bind,src={},dst={}",
                 source.display(),
                 mount.destination.display()
-            )));
+            );
+            if mount.read_only {
+                bind_mount.push_str(",readonly");
+            }
+            args.push(OsString::from("--mount"));
+            args.push(OsString::from(bind_mount));
         }
         if let Some(layout) = &review_layout {
             for mount in &layout.git_mounts {

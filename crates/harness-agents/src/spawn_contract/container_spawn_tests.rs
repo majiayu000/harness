@@ -186,6 +186,43 @@ fn container_spawn_adds_workspace_scoped_state_mounts() -> anyhow::Result<()> {
 }
 
 #[test]
+fn container_spawn_marks_read_only_workspace_bind_mounts() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let state_mask = root.path().join(".harness/cloud-setup-mask/test");
+    std::fs::create_dir_all(&state_mask)?;
+    let env_vars = HashMap::from([(
+        AGENT_ISOLATION_TIER_ENV.to_string(),
+        "container".to_string(),
+    )]);
+    let sandbox_spec = SandboxSpec::new(SandboxMode::ReadOnly, root.path());
+    let mounts = [ContainerBindMount::workspace_read_only(
+        state_mask.clone(),
+        PathBuf::from("/workspace/.harness/cloud-setup-state"),
+    )];
+
+    let spawn = ContainerSpawn.prepare(
+        AgentSpawnInput {
+            program: Path::new("codex"),
+            args: &[],
+            project_root: root.path(),
+            sandbox_spec: &sandbox_spec,
+            env_vars: &env_vars,
+            secret_env_keys: &[],
+            container_bind_mounts: &mounts,
+            permission_mode: AgentPermissionMode::Scoped,
+            forward_stdin: false,
+        },
+        None,
+    )?;
+
+    assert!(string_args(&spawn).contains(&format!(
+        "type=bind,src={},dst=/workspace/.harness/cloud-setup-state,readonly",
+        std::fs::canonicalize(state_mask)?.display()
+    )));
+    Ok(())
+}
+
+#[test]
 fn container_spawn_rejects_state_mount_outside_workspace() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let outside = tempfile::tempdir()?;

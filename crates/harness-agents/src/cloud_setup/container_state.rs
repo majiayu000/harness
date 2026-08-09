@@ -104,7 +104,7 @@ pub(crate) fn apply_container_state(
         .join(".harness/cloud-setup-mask")
         .join(setup_cache_key(cloud, project_root));
     create_workspace_state_dir(project_root, &mask, 0o755)?;
-    let mut mounts = vec![ContainerBindMount::workspace(
+    let mut mounts = vec![ContainerBindMount::workspace_read_only(
         mask,
         PathBuf::from(CONTAINER_STATE_MASK),
     )];
