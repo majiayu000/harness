@@ -40,6 +40,23 @@ fn runtime_attempt_sequence_and_outcome_matrix_is_closed() {
 }
 
 #[test]
+fn pre_spawn_identity_change_is_a_terminal_inspection_failure() {
+    let payload = runtime_payload_with_facts(
+        LocalExecutableRuntimeKind::CodexExec,
+        RuntimeCommandForm::UnixAbsolute,
+        vec![runtime_attempt(
+            b"changed-before-spawn",
+            RuntimeResolutionAttemptOutcome::InspectionFailed,
+            RuntimeExecSequence::None,
+        )],
+        None,
+        None,
+        failure(RuntimeProbeFailureKind::IdentityChanged),
+    );
+    assert!(payload.is_ok());
+}
+
+#[test]
 fn absolute_and_qualified_forms_require_exactly_one_non_fallback_attempt() {
     for form in [
         RuntimeCommandForm::UnixAbsolute,

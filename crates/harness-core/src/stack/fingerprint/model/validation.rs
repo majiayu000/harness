@@ -270,7 +270,9 @@ fn primary_failure_matches(
         K::NotRegularFile => final_outcome_is(O::NotRegular) && no_final_identity,
         K::NotExecutable => final_outcome_is(O::NotExecutable) && no_final_identity,
         K::IdentityChanged => {
-            final_outcome_is(O::ExecVerificationFailed) || final_outcome_is(O::ExecStarted)
+            final_outcome_is(O::InspectionFailed)
+                || final_outcome_is(O::ExecVerificationFailed)
+                || final_outcome_is(O::ExecStarted)
         }
         K::ProbeNotAuthorized => match failure.detail {
             Some(D::ConfigurationSourceRepository) => final_outcome_is(O::InspectionTarget),
