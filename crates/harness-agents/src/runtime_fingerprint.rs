@@ -49,7 +49,7 @@ use harness_core::stack::fingerprint::{
 };
 #[cfg(target_os = "linux")]
 use harness_core::stack::Sha256Digest;
-use harness_sandbox::SandboxSpec;
+use harness_sandbox::{NetworkPolicy, SandboxSpec};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -338,6 +338,7 @@ impl ConfiguredRuntimeExecutable {
         }
         if self.sandbox.mode != SandboxMode::DangerFullAccess
             || self.sandbox.allowed_write_paths.is_some()
+            || self.sandbox.network_policy != NetworkPolicy::InheritSandboxMode
         {
             return Err(RuntimeFingerprintProduceError::SandboxParityUnavailable);
         }

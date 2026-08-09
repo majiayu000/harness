@@ -102,6 +102,26 @@ async fn narrowed_allowed_write_paths_fail_before_host_observation() {
     ));
 }
 
+#[tokio::test]
+async fn non_inherited_network_policies_fail_before_host_observation() {
+    for policy in [
+        NetworkPolicy::Deny,
+        NetworkPolicy::LocalProxy { port: 18_080 },
+    ] {
+        let restricted = sandbox(SandboxMode::DangerFullAccess).with_network_policy(policy);
+        let error = fingerprint_configured_runtime_executable(
+            &configured(IsolationTier::Host, restricted),
+            &RuntimeFingerprintOptions::new("/missing"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeFingerprintProduceError::SandboxParityUnavailable
+        ));
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn unsupported_platform_fails_before_output_or_cwd_validation() {
