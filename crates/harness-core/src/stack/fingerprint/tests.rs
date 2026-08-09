@@ -1,6 +1,9 @@
 use super::*;
 use crate::stack::{AgentStackSource, AgentStackSourceScope, Sha256Digest};
 
+mod model;
+mod schema;
+
 #[test]
 fn fingerprint_digest_framing_vectors_are_independent() {
     let payload = br#"{"a":1,"z":"\n"}"#;
@@ -28,16 +31,35 @@ fn runtime_payload_with_observation(
     executable: Option<RuntimeExecutableIdentity>,
     version: Option<RuntimeVersionFacts>,
 ) -> Result<RuntimeExecutableFingerprintPayload, AgentStackFingerprintError> {
+    let (attempts, failures) = if version.is_some() {
+        (
+            vec![runtime_attempt(
+                b"selected",
+                RuntimeResolutionAttemptOutcome::ExecStarted,
+                RuntimeExecSequence::Single,
+            )],
+            vec![],
+        )
+    } else {
+        (
+            vec![],
+            vec![RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathNotFound).unwrap()],
+        )
+    };
     runtime_payload_with_facts(
         kind,
+        RuntimeCommandForm::UnixBare,
+        attempts,
         executable,
         version,
-        vec![RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathNotFound).unwrap()],
+        failures,
     )
 }
 
 fn runtime_payload_with_facts(
     kind: LocalExecutableRuntimeKind,
+    command_form: RuntimeCommandForm,
+    resolution_attempts: Vec<RuntimeResolutionAttempt>,
     executable: Option<RuntimeExecutableIdentity>,
     version: Option<RuntimeVersionFacts>,
     failures: Vec<RuntimeProbeFailure>,
@@ -49,17 +71,30 @@ fn runtime_payload_with_facts(
     )
     .unwrap();
     let source = ConfiguredRuntimeSource::from_exact_source_bytes(base, b"runtime source").unwrap();
-    let binding = RuntimeRoleSourceBinding::derive(&source, kind).unwrap();
-    RuntimeExecutableFingerprintPayload::new(
-        binding,
-        RuntimeCommandForm::UnixBare,
-        Sha256Digest::from_bytes(b"command"),
-        Sha256Digest::from_bytes(b"cwd"),
-        Sha256Digest::from_bytes(b"cwd identity"),
-        vec![],
+    runtime_payload_from_configured_source(
+        source,
+        kind,
+        command_form,
+        resolution_attempts,
         executable,
         version,
-        vec![
+        failures,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_payload_from_configured_source(
+    source: ConfiguredRuntimeSource,
+    kind: LocalExecutableRuntimeKind,
+    command_form: RuntimeCommandForm,
+    resolution_attempts: Vec<RuntimeResolutionAttempt>,
+    executable: Option<RuntimeExecutableIdentity>,
+    version: Option<RuntimeVersionFacts>,
+    failures: Vec<RuntimeProbeFailure>,
+) -> Result<RuntimeExecutableFingerprintPayload, AgentStackFingerprintError> {
+    let binding = RuntimeRoleSourceBinding::derive(&source, kind).unwrap();
+    let environment = match kind {
+        LocalExecutableRuntimeKind::CodexExec | LocalExecutableRuntimeKind::CodexJsonrpc => vec![
             RuntimeEnvironmentFact::new(
                 RuntimeEnvironmentKey::OpenaiApiKey,
                 RuntimeEnvironmentValue::Unset,
@@ -71,8 +106,50 @@ fn runtime_payload_with_facts(
                 },
             ),
         ],
+        LocalExecutableRuntimeKind::ClaudeCode => vec![
+            RuntimeEnvironmentFact::new(
+                RuntimeEnvironmentKey::AnthropicApiKey,
+                RuntimeEnvironmentValue::Unset,
+            ),
+            RuntimeEnvironmentFact::new(
+                RuntimeEnvironmentKey::ClaudeConfigDir,
+                RuntimeEnvironmentValue::Unset,
+            ),
+            RuntimeEnvironmentFact::new(
+                RuntimeEnvironmentKey::Path,
+                RuntimeEnvironmentValue::SetDigest {
+                    value_sha256: Sha256Digest::from_bytes(b"path"),
+                },
+            ),
+        ],
+    };
+    RuntimeExecutableFingerprintPayload::new(
+        binding,
+        command_form,
+        Sha256Digest::from_bytes(b"command"),
+        Sha256Digest::from_bytes(b"cwd"),
+        Sha256Digest::from_bytes(b"cwd identity"),
+        resolution_attempts,
+        executable,
+        version,
+        environment,
         failures,
     )
+}
+
+fn runtime_attempt(
+    candidate: &[u8],
+    outcome: RuntimeResolutionAttemptOutcome,
+    sequence: RuntimeExecSequence,
+) -> RuntimeResolutionAttempt {
+    RuntimeResolutionAttempt::new(
+        Sha256Digest::from_bytes(candidate),
+        outcome,
+        sequence,
+        (sequence != RuntimeExecSequence::None)
+            .then_some(RuntimeExecutionContext::LinuxFdCloexecExecveatEmptyPathFd10),
+    )
+    .unwrap()
 }
 
 fn runtime_identity(
@@ -155,7 +232,7 @@ fn envelope_round_trips_both_closed_subjects() {
 }
 
 #[test]
-fn envelope_rejects_version_subject_capability_and_digest_mismatch() {
+fn envelope_rejects_version_subject_payload_capability_and_fingerprint_digest_mismatch() {
     let envelope = AgentStackFingerprintEnvelope::agent_runtime(runtime_payload(
         LocalExecutableRuntimeKind::CodexExec,
     ))
@@ -200,7 +277,7 @@ fn envelope_rejects_version_subject_capability_and_digest_mismatch() {
 }
 
 #[test]
-fn runtime_role_sources_are_pairwise_distinct_and_preserve_integrity() {
+fn runtime_role_sources_are_pairwise_distinct_for_one_base() {
     let base =
         AgentStackSource::logical(AgentStackSourceScope::System, "runtime", "shared").unwrap();
     let configured = ConfiguredRuntimeSource::from_exact_source_bytes(base, b"same bytes").unwrap();
@@ -237,6 +314,116 @@ fn configured_sources_enforce_exact_limits_before_derivation() {
             McpContractError::LimitExceeded(McpContractLimitKind::ConfiguredServerStableKeyBytes)
         ))
     ));
+}
+
+#[test]
+fn runtime_fingerprint_limits_accept_exact_and_reject_limit_plus_one() {
+    let base = AgentStackSource::logical(
+        AgentStackSourceScope::Runner,
+        "configured_runtime",
+        "exact-source",
+    )
+    .unwrap();
+    assert!(ConfiguredRuntimeSource::from_exact_source_bytes(
+        base.clone(),
+        &vec![b'x'; RUNTIME_FINGERPRINT_MAX_EXACT_SOURCE_BYTES],
+    )
+    .is_ok());
+    assert!(matches!(
+        ConfiguredRuntimeSource::from_exact_source_bytes(
+            base,
+            &vec![b'x'; RUNTIME_FINGERPRINT_MAX_EXACT_SOURCE_BYTES + 1],
+        ),
+        Err(AgentStackFingerprintError::LimitExceeded(
+            RuntimeFingerprintLimitKind::ExactSourceBytes
+        ))
+    ));
+
+    let prefix = "configured_runtime/";
+    let exact_locator = format!(
+        "{prefix}{}",
+        "a".repeat(RUNTIME_FINGERPRINT_MAX_BASE_SOURCE_LOCATOR_BYTES - prefix.len())
+    );
+    let exact_base = AgentStackSource::new(AgentStackSourceScope::Runner, &exact_locator).unwrap();
+    assert!(ConfiguredRuntimeSource::without_canonical_bytes(exact_base).is_ok());
+    let over_locator = format!("{exact_locator}a");
+    let over_base = AgentStackSource::new(AgentStackSourceScope::Runner, &over_locator).unwrap();
+    assert!(matches!(
+        ConfiguredRuntimeSource::without_canonical_bytes(over_base),
+        Err(AgentStackFingerprintError::LimitExceeded(
+            RuntimeFingerprintLimitKind::BaseSourceLocatorBytes
+        ))
+    ));
+
+    let envelope = AgentStackFingerprintEnvelope::agent_runtime(runtime_payload(
+        LocalExecutableRuntimeKind::CodexExec,
+    ))
+    .unwrap();
+    let json = envelope.to_json_string().unwrap();
+    let exact_envelope = format!(
+        "{json}{}",
+        " ".repeat(RUNTIME_FINGERPRINT_MAX_ENVELOPE_BYTES - json.len())
+    );
+    assert_eq!(exact_envelope.len(), RUNTIME_FINGERPRINT_MAX_ENVELOPE_BYTES);
+    assert!(AgentStackFingerprintEnvelope::from_json_str(&exact_envelope).is_ok());
+    assert!(matches!(
+        AgentStackFingerprintEnvelope::from_json_str(&format!("{exact_envelope} ")),
+        Err(AgentStackFingerprintError::LimitExceeded(
+            RuntimeFingerprintLimitKind::EnvelopeBytes
+        ))
+    ));
+}
+
+#[test]
+fn derived_source_parser_rejects_limit_plus_one_before_suffix_decoding() {
+    let base = AgentStackSource::logical(
+        AgentStackSourceScope::Runner,
+        "base",
+        &"a".repeat(RUNTIME_FINGERPRINT_MAX_BASE_SOURCE_LOCATOR_BYTES - 5),
+    )
+    .unwrap();
+    let payload = McpToolFingerprintPayload::new(
+        ConfiguredMcpServerBinding::new(base, &"s".repeat(1_024)).unwrap(),
+        &"t".repeat(1_024),
+        None,
+        None,
+        McpInputSchema::from_json_str("{}").unwrap(),
+        None,
+    )
+    .unwrap();
+    let envelope = AgentStackFingerprintEnvelope::mcp_tool(payload).unwrap();
+    let old_source = envelope.component().source();
+    assert_eq!(
+        old_source.locator().as_str().len(),
+        RUNTIME_FINGERPRINT_MAX_DERIVED_SOURCE_LOCATOR_BYTES
+    );
+    let over_source = AgentStackSource::new(
+        old_source.scope(),
+        &format!("{}0", old_source.locator().as_str()),
+    )
+    .unwrap();
+    let old_id = envelope.component().component_id();
+    let over_id =
+        AgentStackComponentId::from_source(AgentStackComponentKind::McpTool, &over_source);
+    let invalid = envelope
+        .to_json_string()
+        .unwrap()
+        .replacen(old_id.as_str(), over_id.as_str(), 1)
+        .replacen(
+            &format!("\"locator\":\"{}\"", old_source.locator().as_str()),
+            &format!("\"locator\":\"{}\"", over_source.locator().as_str()),
+            1,
+        );
+    let result = AgentStackFingerprintEnvelope::from_json_str(&invalid);
+    assert!(
+        matches!(
+            result,
+            Err(AgentStackFingerprintError::LimitExceeded(
+                RuntimeFingerprintLimitKind::DerivedSourceLocatorBytes
+            ))
+        ),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -363,7 +550,7 @@ fn schema_is_duplicate_aware_dialect_aware_and_context_aware() {
 }
 
 #[test]
-fn raw_number_tokens_are_preserved_in_canonical_payloads() {
+fn canonical_payload_preserves_raw_json_number_tokens() {
     let digest = |number: &str| {
         let schema = format!(r#"{{"default":{number}}}"#);
         AgentStackFingerprintEnvelope::mcp_tool(mcp_payload(None, None, &schema, None))
@@ -440,13 +627,20 @@ fn runtime_typed_constructors_reject_impossible_states() {
 #[test]
 fn closed_failure_vocabulary_and_canonical_ordering_are_enforced() {
     let cleanup = vec![
+        RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout).unwrap(),
         RuntimeProbeFailure::new(RuntimeProbeFailureKind::TerminationFailed).unwrap(),
         RuntimeProbeFailure::new(RuntimeProbeFailureKind::ReapFailed).unwrap(),
         RuntimeProbeFailure::new(RuntimeProbeFailureKind::OutputDrainFailed).unwrap(),
     ];
     let payload = runtime_payload_with_facts(
         LocalExecutableRuntimeKind::CodexExec,
-        None,
+        RuntimeCommandForm::UnixBare,
+        vec![runtime_attempt(
+            b"selected",
+            RuntimeResolutionAttemptOutcome::ExecStarted,
+            RuntimeExecSequence::Single,
+        )],
+        Some(runtime_identity(true, true)),
         None,
         cleanup.clone(),
     )
@@ -460,7 +654,18 @@ fn closed_failure_vocabulary_and_canonical_ordering_are_enforced() {
     let mut reversed = cleanup;
     reversed.reverse();
     assert!(matches!(
-        runtime_payload_with_facts(LocalExecutableRuntimeKind::CodexExec, None, None, reversed,),
+        runtime_payload_with_facts(
+            LocalExecutableRuntimeKind::CodexExec,
+            RuntimeCommandForm::UnixBare,
+            vec![runtime_attempt(
+                b"selected",
+                RuntimeResolutionAttemptOutcome::ExecStarted,
+                RuntimeExecSequence::Single,
+            )],
+            Some(runtime_identity(true, true)),
+            None,
+            reversed,
+        ),
         Err(AgentStackFingerprintError::InvalidPayloadState)
     ));
 

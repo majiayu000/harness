@@ -11,6 +11,8 @@ use crate::stack::{AgentStackComponent, AgentStackSource, Sha256Digest};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 
+mod validation;
+
 const MCP_IDENTITY_MAX_BYTES: usize = 1_024;
 const MCP_DESCRIPTION_MAX_BYTES: usize = 65_536;
 
@@ -71,7 +73,11 @@ pub enum RuntimeExecutionContext {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeExecutableIdentity {
     file_size_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "validation::deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     unix_mode: Option<u32>,
     #[serde(deserialize_with = "deserialize_digest")]
     executable_sha256: Sha256Digest,
@@ -122,7 +128,7 @@ impl RuntimeVersionFacts {
         stderr_sha256: Sha256Digest,
         selected_stream: RuntimeVersionStream,
     ) -> Result<Self, AgentStackFingerprintError> {
-        if normalized_version.is_empty() || !normalized_version.is_ascii() {
+        if !validation::normalized_version_is_valid(&normalized_version) {
             return Err(AgentStackFingerprintError::InvalidPayloadState);
         }
         Ok(Self {
@@ -157,7 +163,7 @@ pub enum RuntimeEnvironmentValue {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeEnvironmentFact {
     key: RuntimeEnvironmentKey,
     #[serde(flatten)]
@@ -222,14 +228,19 @@ impl RuntimeProbeFailureKind {
         match self.rank() {
             0..=2 => RuntimeProbePhase::PathResolution,
             3..=9 => RuntimeProbePhase::Identity,
-            10..=21 => RuntimeProbePhase::VersionProbe,
+            10..=26 => RuntimeProbePhase::VersionProbe,
             _ => RuntimeProbePhase::LifecycleCleanup,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "detail", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "detail",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum RuntimeProbeFailureDetail {
     ConfigurationSourceRepository,
     ResolvedTargetRepository,
@@ -254,7 +265,11 @@ pub enum RuntimeProbeFailureDetail {
 pub struct RuntimeProbeFailure {
     phase: RuntimeProbePhase,
     kind: RuntimeProbeFailureKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "validation::deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     detail: Option<RuntimeProbeFailureDetail>,
 }
 
@@ -348,15 +363,6 @@ pub enum RuntimeResolutionAttemptOutcome {
     ExecStarted,
 }
 
-impl RuntimeResolutionAttemptOutcome {
-    fn terminal(self) -> bool {
-        !matches!(
-            self,
-            Self::Absent | Self::NotRegular | Self::NotExecutable | Self::ExecEacces
-        )
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeResolutionAttempt {
@@ -364,7 +370,11 @@ pub struct RuntimeResolutionAttempt {
     candidate_digest: Sha256Digest,
     outcome: RuntimeResolutionAttemptOutcome,
     exec_sequence: RuntimeExecSequence,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "validation::deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     exec_context: Option<RuntimeExecutionContext>,
 }
 
@@ -375,7 +385,7 @@ impl RuntimeResolutionAttempt {
         exec_sequence: RuntimeExecSequence,
         exec_context: Option<RuntimeExecutionContext>,
     ) -> Result<Self, AgentStackFingerprintError> {
-        if (exec_sequence == RuntimeExecSequence::None) != exec_context.is_none() {
+        if !validation::attempt_is_valid(exec_sequence, exec_context, outcome) {
             return Err(AgentStackFingerprintError::InvalidPayloadState);
         }
         Ok(Self {
@@ -423,7 +433,9 @@ pub(crate) struct RuntimePayloadWire {
     #[serde(deserialize_with = "deserialize_digest")]
     working_directory_identity_digest: Sha256Digest,
     resolution_attempts: Vec<RuntimeResolutionAttempt>,
+    #[serde(default, deserialize_with = "validation::deserialize_present_option")]
     executable: Option<RuntimeExecutableIdentity>,
+    #[serde(default, deserialize_with = "validation::deserialize_present_option")]
     version: Option<RuntimeVersionFacts>,
     environment: Vec<RuntimeEnvironmentFact>,
     failures: Vec<RuntimeProbeFailure>,
@@ -492,28 +504,7 @@ impl RuntimeExecutableFingerprintPayload {
     }
 
     pub(crate) fn validate(&self) -> Result<(), AgentStackFingerprintError> {
-        let attempts_valid = self.resolution_attempts.len() <= 64
-            && self
-                .resolution_attempts
-                .iter()
-                .enumerate()
-                .all(|(index, attempt)| {
-                    !attempt.outcome.terminal() || index + 1 == self.resolution_attempts.len()
-                });
-        let failures_valid = self.failures.iter().all(RuntimeProbeFailure::valid)
-            && self.failures.windows(2).all(|pair| {
-                (pair[0].phase, pair[0].kind.rank()) < (pair[1].phase, pair[1].kind.rank())
-            });
-        let version_has_stable_identity = self.version.is_none()
-            || self.executable.as_ref().is_some_and(|identity| {
-                identity.checkpoint_consistent_path && identity.exec_stop_consistent_handle
-            });
-        if self.runtime_kind != self.role_binding.runtime_kind()
-            || !attempts_valid
-            || !failures_valid
-            || !valid_environment(self.runtime_kind, &self.environment)
-            || !version_has_stable_identity
-        {
+        if !validation::payload_is_valid(self) {
             return Err(AgentStackFingerprintError::InvalidPayloadState);
         }
         Ok(())
@@ -530,7 +521,22 @@ impl RuntimeExecutableFingerprintPayload {
 }
 
 fn valid_environment(kind: LocalExecutableRuntimeKind, facts: &[RuntimeEnvironmentFact]) -> bool {
-    facts.windows(2).all(|pair| pair[0].key < pair[1].key)
+    let expected_keys: &[RuntimeEnvironmentKey] = match kind {
+        LocalExecutableRuntimeKind::CodexExec | LocalExecutableRuntimeKind::CodexJsonrpc => &[
+            RuntimeEnvironmentKey::OpenaiApiKey,
+            RuntimeEnvironmentKey::Path,
+        ],
+        LocalExecutableRuntimeKind::ClaudeCode => &[
+            RuntimeEnvironmentKey::AnthropicApiKey,
+            RuntimeEnvironmentKey::ClaudeConfigDir,
+            RuntimeEnvironmentKey::Path,
+        ],
+    };
+    facts.len() == expected_keys.len()
+        && facts
+            .iter()
+            .map(|fact| fact.key)
+            .eq(expected_keys.iter().copied())
         && facts.iter().all(|fact| {
             let key_allowed = match kind {
                 LocalExecutableRuntimeKind::CodexExec
@@ -575,12 +581,22 @@ pub(crate) struct McpPayloadWire<'a> {
     schema_version: String,
     server_component_id: String,
     tool_name: String,
+    #[serde(default, deserialize_with = "validation::deserialize_present_option")]
     description: Option<String>,
-    #[serde(default, borrow)]
+    #[serde(
+        default,
+        borrow,
+        deserialize_with = "validation::deserialize_present_option"
+    )]
     annotations: Option<&'a RawValue>,
     #[serde(rename = "inputSchema", borrow)]
     input_schema: &'a RawValue,
-    #[serde(default, rename = "outputSchema", borrow)]
+    #[serde(
+        default,
+        rename = "outputSchema",
+        borrow,
+        deserialize_with = "validation::deserialize_present_option"
+    )]
     output_schema: Option<&'a RawValue>,
 }
 

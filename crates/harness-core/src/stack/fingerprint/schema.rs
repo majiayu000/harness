@@ -173,7 +173,7 @@ fn parse_raw(value: &[u8], limits: Limits) -> Result<CanonicalNode, McpContractE
         serde_json::from_slice(value).map_err(|_| McpContractError::InvalidJson)?;
     let mut budget = Budget::default();
     let node = parse_validated_raw(raw, 1, limits, &mut budget)?;
-    if node.canonical_bytes().len() > limits.canonical {
+    if node.canonical_len() > limits.canonical {
         return Err(McpContractError::LimitExceeded(limits.kinds.canonical));
     }
     Ok(node)
@@ -259,7 +259,7 @@ impl<'de> Visitor<'de> for NodeVisitor<'_> {
             }
             values.push(
                 parse_validated_raw(raw, self.depth + 1, self.limits, self.budget)
-                    .map_err(serde::de::Error::custom)?,
+                    .map_err(|error| serde::de::Error::custom(visitor_error_marker(&error)))?,
             );
         }
         Ok(CanonicalNode::Array(values))
@@ -278,12 +278,12 @@ impl<'de> Visitor<'de> for NodeVisitor<'_> {
                 )));
             }
             if !keys.insert(key.clone()) {
-                return Err(serde::de::Error::custom(format!("DUPLICATE:{key}")));
+                return Err(serde::de::Error::custom(duplicate_marker(&key)));
             }
             charge_string(key.len(), self.limits, self.budget).map_err(serde::de::Error::custom)?;
             let raw = map.next_value::<&RawValue>()?;
             let value = parse_validated_raw(raw, self.depth + 1, self.limits, self.budget)
-                .map_err(serde::de::Error::custom)?;
+                .map_err(|error| serde::de::Error::custom(visitor_error_marker(&error)))?;
             entries.push((key, value));
         }
         Ok(CanonicalNode::Object(entries))
@@ -310,11 +310,27 @@ fn limit_marker(kind: McpContractLimitKind) -> String {
     format!("LIMIT:{kind:?}")
 }
 
+fn duplicate_marker(key: &str) -> String {
+    format!("DUPLICATE:{}:{key}", key.len())
+}
+
+fn visitor_error_marker(error: &McpContractError) -> String {
+    match error {
+        McpContractError::DuplicateObjectKey(key) => duplicate_marker(key),
+        McpContractError::LimitExceeded(kind) => limit_marker(*kind),
+        _ => "INVALID_JSON".to_owned(),
+    }
+}
+
 fn decode_visitor_error(message: &str) -> McpContractError {
     if let Some(value) = message.split("DUPLICATE:").nth(1) {
-        return McpContractError::DuplicateObjectKey(
-            value.split(" at line").next().unwrap_or(value).to_owned(),
-        );
+        if let Some((length, value)) = value.split_once(':') {
+            if let Ok(length) = length.parse::<usize>() {
+                if value.len() >= length && value.is_char_boundary(length) {
+                    return McpContractError::DuplicateObjectKey(value[..length].to_owned());
+                }
+            }
+        }
     }
     for kind in [
         McpContractLimitKind::AnnotationsDepth,
@@ -334,6 +350,26 @@ fn decode_visitor_error(message: &str) -> McpContractError {
 }
 
 impl CanonicalNode {
+    fn canonical_len(&self) -> usize {
+        match self {
+            Self::Null | Self::Bool(true) => 4,
+            Self::Bool(false) => 5,
+            Self::Number(value) => value.len(),
+            Self::String(value) => canonical_string_len(value),
+            Self::Array(values) => {
+                2 + values.len().saturating_sub(1)
+                    + values.iter().map(Self::canonical_len).sum::<usize>()
+            }
+            Self::Object(entries) => {
+                2 + entries.len().saturating_sub(1)
+                    + entries
+                        .iter()
+                        .map(|(key, value)| canonical_string_len(key) + 1 + value.canonical_len())
+                        .sum::<usize>()
+            }
+        }
+    }
+
     fn canonical_bytes(&self) -> Vec<u8> {
         let mut output = Vec::new();
         self.write_canonical(&mut output);
@@ -374,7 +410,16 @@ impl CanonicalNode {
         }
     }
 }
-
+fn canonical_string_len(value: &str) -> usize {
+    2 + value
+        .chars()
+        .map(|character| match character {
+            '"' | '\\' | '\u{08}' | '\t' | '\n' | '\u{0c}' | '\r' => 2,
+            control if control <= '\u{1f}' => 6,
+            scalar => scalar.len_utf8(),
+        })
+        .sum::<usize>()
+}
 fn write_string(value: &str, output: &mut Vec<u8>) {
     output.push(b'"');
     for character in value.chars() {
@@ -679,11 +724,6 @@ impl McpToolSchema {
         let parsed = parse_raw(value, SCHEMA_LIMITS)?;
         let dialect = select_dialect(&parsed)?;
         let canonical = canonicalize_schema(parsed, dialect, true)?;
-        if canonical.canonical_bytes().len() > SCHEMA_CANONICAL_MAX {
-            return Err(McpContractError::LimitExceeded(
-                McpContractLimitKind::SchemaCanonicalBytes,
-            ));
-        }
         Ok(Self { dialect, canonical })
     }
 }
@@ -732,11 +772,6 @@ impl McpToolAnnotations {
         let parsed = parse_raw(value, ANNOTATION_LIMITS)?;
         object_entries(&parsed)?;
         let canonical = canonicalize_instance(parsed)?;
-        if canonical.canonical_bytes().len() > ANNOTATIONS_CANONICAL_MAX {
-            return Err(McpContractError::LimitExceeded(
-                McpContractLimitKind::AnnotationsCanonicalBytes,
-            ));
-        }
         Ok(Self(canonical))
     }
 
