@@ -29,9 +29,40 @@ pub(super) struct InitialCompletion<'a> {
 
 pub(super) fn complete_initial(
     context: InitialCompletion<'_>,
+    attempts: Vec<RuntimeResolutionAttempt>,
+    stopped: StoppedTarget,
+    deadline: Instant,
+) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
+    complete(
+        context,
+        attempts,
+        stopped,
+        deadline,
+        RuntimeExecSequence::Single,
+    )
+}
+
+pub(super) fn complete_retry(
+    context: InitialCompletion<'_>,
+    attempts: Vec<RuntimeResolutionAttempt>,
+    stopped: StoppedTarget,
+    deadline: Instant,
+) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
+    complete(
+        context,
+        attempts,
+        stopped,
+        deadline,
+        RuntimeExecSequence::EtxtbsyThenCheckpointAfter150Ms,
+    )
+}
+
+fn complete(
+    context: InitialCompletion<'_>,
     mut attempts: Vec<RuntimeResolutionAttempt>,
     stopped: StoppedTarget,
     deadline: Instant,
+    sequence: RuntimeExecSequence,
 ) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
     let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
     let exec_stop = match super::exec_stop::verify(stopped.pid(), context.executable, deadline) {
@@ -46,6 +77,7 @@ pub(super) fn complete_initial(
         attempts.push(attempt(
             context.candidate,
             RuntimeResolutionAttemptOutcome::ExecVerificationFailed,
+            sequence,
         )?);
         return finish(
             &context,
@@ -61,6 +93,7 @@ pub(super) fn complete_initial(
     attempts.push(attempt(
         context.candidate,
         RuntimeResolutionAttemptOutcome::ExecStarted,
+        sequence,
     )?);
     let outcome = super::supervision::run(stopped, context.options.max_output_bytes(), deadline)?;
     let (stdout, stderr, termination) = match outcome {
@@ -139,19 +172,21 @@ pub(super) fn complete_initial(
     }
 }
 
-fn attempt(
+pub(super) fn attempt(
     candidate: &ResolvedCandidate,
     outcome: RuntimeResolutionAttemptOutcome,
+    sequence: RuntimeExecSequence,
 ) -> Result<RuntimeResolutionAttempt, RuntimeFingerprintProduceError> {
     Ok(RuntimeResolutionAttempt::new(
         candidate.candidate_digest.clone(),
         outcome,
-        RuntimeExecSequence::Single,
-        Some(RuntimeExecutionContext::LinuxFdCloexecExecveatEmptyPathFd10),
+        sequence,
+        (sequence != RuntimeExecSequence::None)
+            .then_some(RuntimeExecutionContext::LinuxFdCloexecExecveatEmptyPathFd10),
     )?)
 }
 
-fn finish(
+pub(super) fn finish(
     context: &InitialCompletion<'_>,
     attempts: Vec<RuntimeResolutionAttempt>,
     executable: Option<RuntimeExecutableIdentity>,

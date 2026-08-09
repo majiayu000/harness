@@ -16,6 +16,8 @@ mod environment;
 mod exec_stop;
 mod executable;
 #[cfg(target_os = "linux")]
+mod launch;
+#[cfg(target_os = "linux")]
 mod probe;
 #[cfg(target_os = "linux")]
 mod resolution;

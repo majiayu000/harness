@@ -26,6 +26,7 @@ pub(super) struct StoppedTarget {
     pub(super) pidfd: libc::c_int,
     pub(super) stdout: libc::c_int,
     pub(super) stderr: libc::c_int,
+    pub(super) role: RuntimeOwnedChildRole,
 }
 
 impl StoppedTarget {
@@ -39,11 +40,7 @@ impl StoppedTarget {
     ) -> Result<(), RuntimeFingerprintProduceError> {
         super::probe::close_fd(self.stdout);
         super::probe::close_fd(self.stderr);
-        super::probe::cleanup_registered_child(
-            self.pidfd,
-            deadline,
-            RuntimeOwnedChildRole::InitialTarget,
-        )
+        super::probe::cleanup_registered_child(self.pidfd, deadline, self.role)
     }
 }
 
@@ -71,6 +68,41 @@ pub(super) fn start_initial(
     executable: &RetainedExecutable,
     deadline: Instant,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
+    start(
+        configured,
+        environment,
+        working_directory,
+        executable,
+        deadline,
+        RuntimeOwnedChildRole::InitialTarget,
+    )
+}
+
+pub(super) fn start_retry(
+    configured: &ConfiguredRuntimeExecutable,
+    environment: &SelectedEnvironment,
+    working_directory: &RetainedWorkingDirectory,
+    executable: &RetainedExecutable,
+    deadline: Instant,
+) -> Result<TargetStart, RuntimeFingerprintProduceError> {
+    start(
+        configured,
+        environment,
+        working_directory,
+        executable,
+        deadline,
+        RuntimeOwnedChildRole::RetryTarget,
+    )
+}
+
+fn start(
+    configured: &ConfiguredRuntimeExecutable,
+    environment: &SelectedEnvironment,
+    working_directory: &RetainedWorkingDirectory,
+    executable: &RetainedExecutable,
+    deadline: Instant,
+    role: RuntimeOwnedChildRole,
+) -> Result<TargetStart, RuntimeFingerprintProduceError> {
     let argv_storage = vec![
         cstring(configured.executable().as_os_str())?,
         CString::new(configured.runtime_kind().version_args()[0])
@@ -87,17 +119,20 @@ pub(super) fn start_initial(
     let envp = pointer_vector(&environment_storage);
 
     let [mut gate, mut status, mut pre_exec, mut stdin, mut stdout, mut stderr] =
-        create_target_pipes()?;
-    let child_descriptors = match duplicate_child_descriptors([
-        gate[0],
-        status[1],
-        pre_exec[1],
-        stdin[0],
-        stdout[1],
-        stderr[1],
-        executable.fd(),
-        working_directory.fd(),
-    ]) {
+        create_target_pipes(role)?;
+    let child_descriptors = match duplicate_child_descriptors(
+        [
+            gate[0],
+            status[1],
+            pre_exec[1],
+            stdin[0],
+            stdout[1],
+            stderr[1],
+            executable.fd(),
+            working_directory.fd(),
+        ],
+        role,
+    ) {
         Ok(descriptors) => descriptors,
         Err(error) => {
             close_six(gate, status, pre_exec, stdin, stdout, stderr);
@@ -148,7 +183,7 @@ pub(super) fn start_initial(
         close_child_descriptors(&context.descriptors);
         close_six(gate, status, pre_exec, stdin, stdout, stderr);
         return Err(super::probe::registration_error(
-            RuntimeOwnedChildRole::InitialTarget,
+            role,
             super::RuntimeChildRegistrationStage::SignalIsolation,
         ));
     }
@@ -167,14 +202,10 @@ pub(super) fn start_initial(
     if pid < 0 || restored != 0 {
         close_parent_descriptors(gate[1], status[0], pre_exec[0], stdout[0], stderr[0]);
         if pid > 0 {
-            super::probe::rollback_unregistered_child(
-                pid,
-                deadline,
-                RuntimeOwnedChildRole::InitialTarget,
-            )?;
+            super::probe::rollback_unregistered_child(pid, deadline, role)?;
         }
         return Err(super::probe::registration_error(
-            RuntimeOwnedChildRole::InitialTarget,
+            role,
             if pid < 0 {
                 super::RuntimeChildRegistrationStage::Fork
             } else {
@@ -186,13 +217,9 @@ pub(super) fn start_initial(
     super::probe::close_fd(status[0]);
     if ready != Ok(super::probe::CHILD_READY) {
         close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
-        super::probe::rollback_unregistered_child(
-            pid,
-            deadline,
-            RuntimeOwnedChildRole::InitialTarget,
-        )?;
+        super::probe::rollback_unregistered_child(pid, deadline, role)?;
         return Err(super::probe::registration_error(
-            RuntimeOwnedChildRole::InitialTarget,
+            role,
             match ready {
                 Ok(super::probe::CHILD_SIGNAL_FAILED) => {
                     super::RuntimeChildRegistrationStage::SignalIsolation
@@ -204,30 +231,30 @@ pub(super) fn start_initial(
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
     if pidfd < 0 {
         close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
-        super::probe::rollback_unregistered_child(
-            pid,
-            deadline,
-            RuntimeOwnedChildRole::InitialTarget,
-        )?;
+        super::probe::rollback_unregistered_child(pid, deadline, role)?;
         return Err(super::probe::registration_error(
-            RuntimeOwnedChildRole::InitialTarget,
+            role,
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
-        super::probe::cleanup_registered_child(
-            pidfd,
-            deadline,
-            RuntimeOwnedChildRole::InitialTarget,
-        )?;
+        super::probe::cleanup_registered_child(pidfd, deadline, role)?;
         return Err(super::probe::registration_error(
-            RuntimeOwnedChildRole::InitialTarget,
+            role,
             super::RuntimeChildRegistrationStage::GateRelease,
         ));
     }
     super::probe::close_fd(gate[1]);
-    supervise_initial_stop(pid, pidfd, pre_exec[0], stdout[0], stderr[0], deadline)
+    supervise_initial_stop(
+        pid,
+        pidfd,
+        pre_exec[0],
+        stdout[0],
+        stderr[0],
+        deadline,
+        role,
+    )
 }
 
 fn supervise_initial_stop(
@@ -237,10 +264,11 @@ fn supervise_initial_stop(
     stdout: libc::c_int,
     stderr: libc::c_int,
     deadline: Instant,
+    role: RuntimeOwnedChildRole,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
     let initial = match wait_event(pidfd, pid, deadline) {
         Ok(event) => event,
-        Err(_) => return verification_cleanup(pidfd, pre_exec, stdout, stderr),
+        Err(_) => return verification_cleanup(pidfd, pre_exec, stdout, stderr, role),
     };
     match initial {
         TargetEvent::Stopped(libc::SIGSTOP) => {}
@@ -250,17 +278,17 @@ fn supervise_initial_stop(
         TargetEvent::Signalled(_) => {
             return verification_after_reap(pidfd, pre_exec, stdout, stderr);
         }
-        _ => return verification_cleanup(pidfd, pre_exec, stdout, stderr),
+        _ => return verification_cleanup(pidfd, pre_exec, stdout, stderr, role),
     }
     let options = libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACESYSGOOD;
     if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, options) } != 0
         || unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, 0) } != 0
     {
-        return verification_cleanup(pidfd, pre_exec, stdout, stderr);
+        return verification_cleanup(pidfd, pre_exec, stdout, stderr, role);
     }
     let after_exec = match wait_event(pidfd, pid, deadline) {
         Ok(event) => event,
-        Err(_) => return verification_cleanup(pidfd, pre_exec, stdout, stderr),
+        Err(_) => return verification_cleanup(pidfd, pre_exec, stdout, stderr, role),
     };
     match after_exec {
         TargetEvent::Stopped(status)
@@ -272,11 +300,12 @@ fn supervise_initial_stop(
                 pidfd,
                 stdout,
                 stderr,
+                role,
             }))
         }
         TargetEvent::Exited(_) => finish_early_exit(pidfd, pre_exec, stdout, stderr),
         TargetEvent::Signalled(_) => verification_after_reap(pidfd, pre_exec, stdout, stderr),
-        _ => verification_cleanup(pidfd, pre_exec, stdout, stderr),
+        _ => verification_cleanup(pidfd, pre_exec, stdout, stderr, role),
     }
 }
 
@@ -308,10 +337,11 @@ fn verification_cleanup(
     pre_exec: libc::c_int,
     stdout: libc::c_int,
     stderr: libc::c_int,
+    role: RuntimeOwnedChildRole,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
     close_parent_descriptors(-1, -1, pre_exec, stdout, stderr);
     let deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
-    super::probe::cleanup_registered_child(pidfd, deadline, RuntimeOwnedChildRole::InitialTarget)?;
+    super::probe::cleanup_registered_child(pidfd, deadline, role)?;
     Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
 }
 
@@ -523,6 +553,7 @@ fn child_write_frame(fd: libc::c_int, kind: u8, value: libc::c_int) -> ! {
 
 fn duplicate_child_descriptors(
     sources: [libc::c_int; 8],
+    role: RuntimeOwnedChildRole,
 ) -> Result<TargetChildDescriptors, RuntimeFingerprintProduceError> {
     let mut duplicated = [-1; 8];
     for (index, source) in sources.into_iter().enumerate() {
@@ -533,7 +564,7 @@ fn duplicate_child_descriptors(
                 super::probe::close_fd(descriptor);
             }
             return Err(super::probe::registration_error(
-                RuntimeOwnedChildRole::InitialTarget,
+                role,
                 super::RuntimeChildRegistrationStage::DescriptorIsolation,
             ));
         }
@@ -550,7 +581,9 @@ fn duplicate_child_descriptors(
     })
 }
 
-fn create_target_pipes() -> Result<[[libc::c_int; 2]; 6], RuntimeFingerprintProduceError> {
+fn create_target_pipes(
+    role: RuntimeOwnedChildRole,
+) -> Result<[[libc::c_int; 2]; 6], RuntimeFingerprintProduceError> {
     let mut pipes = [[-1; 2]; 6];
     for index in 0..pipes.len() {
         if unsafe { libc::pipe2(pipes[index].as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -558,7 +591,7 @@ fn create_target_pipes() -> Result<[[libc::c_int; 2]; 6], RuntimeFingerprintProd
                 super::probe::close_pipe_pair(pipe);
             }
             return Err(super::probe::registration_error(
-                RuntimeOwnedChildRole::InitialTarget,
+                role,
                 super::RuntimeChildRegistrationStage::GateCreate,
             ));
         }

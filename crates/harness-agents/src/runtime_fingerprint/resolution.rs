@@ -20,10 +20,25 @@ use std::time::Instant;
 pub(super) enum ResolutionDisposition {
     Complete(Box<AgentStackFingerprintEnvelope>),
     Selected {
+        candidate_index: usize,
         candidate: ResolvedCandidate,
         executable: RetainedExecutable,
         attempts: Vec<RuntimeResolutionAttempt>,
     },
+}
+
+struct ResolutionContext<'a> {
+    configured: &'a ConfiguredRuntimeExecutable,
+    options: &'a RuntimeFingerprintOptions,
+    environment: &'a SelectedEnvironment,
+    command: &'a PreparedCommand,
+    working_directory: &'a RetainedWorkingDirectory,
+    deadline: Instant,
+}
+
+pub(super) struct ResolutionCursor {
+    pub(super) next_candidate_index: usize,
+    pub(super) attempts: Vec<RuntimeResolutionAttempt>,
 }
 
 pub(super) fn resolve(
@@ -34,8 +49,60 @@ pub(super) fn resolve(
     working_directory: &RetainedWorkingDirectory,
     deadline: Instant,
 ) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
-    let mut attempts = Vec::with_capacity(command.candidates.len());
-    for candidate in &command.candidates {
+    resolve_from(
+        ResolutionContext {
+            configured,
+            options,
+            environment,
+            command,
+            working_directory,
+            deadline,
+        },
+        0,
+        Vec::with_capacity(command.candidates.len()),
+        false,
+    )
+}
+
+pub(super) fn resume_after_eacces(
+    configured: &ConfiguredRuntimeExecutable,
+    options: &RuntimeFingerprintOptions,
+    environment: &SelectedEnvironment,
+    command: &PreparedCommand,
+    working_directory: &RetainedWorkingDirectory,
+    deadline: Instant,
+    cursor: ResolutionCursor,
+) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
+    resolve_from(
+        ResolutionContext {
+            configured,
+            options,
+            environment,
+            command,
+            working_directory,
+            deadline,
+        },
+        cursor.next_candidate_index,
+        cursor.attempts,
+        true,
+    )
+}
+
+fn resolve_from(
+    context: ResolutionContext<'_>,
+    start_index: usize,
+    mut attempts: Vec<RuntimeResolutionAttempt>,
+    saw_exec_eacces: bool,
+) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
+    let ResolutionContext {
+        configured,
+        options,
+        environment,
+        command,
+        working_directory,
+        deadline,
+    } = context;
+    for (candidate_index, candidate) in command.candidates.iter().enumerate().skip(start_index) {
         match super::candidate::observe_candidate(candidate, working_directory, deadline)? {
             CandidateObservation::Absent => {
                 attempts.push(attempt(candidate, RuntimeResolutionAttemptOutcome::Absent)?);
@@ -281,6 +348,7 @@ pub(super) fn resolve(
                     }
                 }
                 return Ok(ResolutionDisposition::Selected {
+                    candidate_index,
                     candidate: candidate.clone(),
                     executable,
                     attempts,
@@ -290,6 +358,8 @@ pub(super) fn resolve(
     }
     let failure = if command.candidate_limit_exceeded {
         RuntimeProbeFailureKind::CandidateLimitExceeded
+    } else if saw_exec_eacces {
+        RuntimeProbeFailureKind::BareEaccesExhausted
     } else {
         RuntimeProbeFailureKind::PathNotFound
     };

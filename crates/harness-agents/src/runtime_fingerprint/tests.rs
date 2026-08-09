@@ -636,6 +636,43 @@ async fn linux_target_authorization_classifies_repository_and_external_handles()
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn linux_etxtbsy_retries_once_after_the_fixed_delay() {
+    let repository = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let executable = write_static_fixture(external.path(), "busy-runtime");
+    let _writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&executable)
+        .unwrap();
+    let boundaries = ValidatedRepositoryBoundarySet::from_existing_roots(
+        repository.path(),
+        std::iter::empty::<&Path>(),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let envelope = fingerprint_configured_runtime_executable(
+        &configured_path(&executable),
+        &RuntimeFingerprintOptions::new(std::env::current_dir().unwrap())
+            .with_repository_boundaries(boundaries),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() >= RUNTIME_FINGERPRINT_ETXTBSY_RETRY_DELAY);
+    let observed: serde_json::Value =
+        serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap();
+    assert_eq!(observed["payload"]["failures"][0]["kind"], "spawn_failed");
+    assert_eq!(
+        observed["payload"]["resolution_attempts"][0]["exec_sequence"],
+        "etxtbsy_then_checkpoint_after_150_ms"
+    );
+    assert_eq!(
+        observed["payload"]["resolution_attempts"][0]["outcome"],
+        "exec_failed"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn linux_target_authorization_rejects_multiple_hard_links() {
     let repository = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();

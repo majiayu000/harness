@@ -156,22 +156,29 @@ pub(super) fn run(
         pidfd,
         stdout,
         stderr,
+        role,
     } = target;
     let mut capture = OutputCapture::new(stdout, stderr, max_output_bytes);
     let mut state = TraceState::InitialExecExit;
     if !resume_syscall(pid, 0) {
-        return verification_failure(pidfd, capture);
+        return verification_failure(pidfd, capture, role);
     }
 
     loop {
         if let Err(failure) = capture.drain_available() {
-            return semantic_cleanup(pidfd, capture, capture_failure(failure, max_output_bytes)?);
+            return semantic_cleanup(
+                pidfd,
+                capture,
+                capture_failure(failure, max_output_bytes)?,
+                role,
+            );
         }
         if Instant::now() >= deadline {
             return semantic_cleanup(
                 pidfd,
                 capture,
                 RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout)?,
+                role,
             );
         }
         let event = match super::target::wait_event(pidfd, pid, deadline) {
@@ -181,19 +188,20 @@ pub(super) fn run(
                     pidfd,
                     capture,
                     RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout)?,
+                    role,
                 );
             }
-            Err(_) => return verification_failure(pidfd, capture),
+            Err(_) => return verification_failure(pidfd, capture, role),
         };
         match event {
             TargetEvent::Stopped(signal) if signal == libc::SIGTRAP | 0x80 => {
                 let Some(stop) = syscall_guard::read_syscall_stop(pid) else {
-                    return verification_failure(pidfd, capture);
+                    return verification_failure(pidfd, capture, role);
                 };
                 match state.accept_syscall(stop) {
                     Ok(StopDecision::Resume) => {
                         if !resume_syscall(pid, 0) {
-                            return verification_failure(pidfd, capture);
+                            return verification_failure(pidfd, capture, role);
                         }
                     }
                     Ok(StopDecision::Denied(detail)) => {
@@ -201,17 +209,17 @@ pub(super) fn run(
                             RuntimeProbeFailureKind::TransitiveExecutionDenied,
                             detail,
                         )?;
-                        return semantic_cleanup(pidfd, capture, failure);
+                        return semantic_cleanup(pidfd, capture, failure, role);
                     }
-                    Err(()) => return verification_failure(pidfd, capture),
+                    Err(()) => return verification_failure(pidfd, capture, role),
                 }
             }
             TargetEvent::Stopped(signal) => {
                 if !state.permits_signal_delivery() || !valid_signal_delivery_stop(pid, signal) {
-                    return verification_failure(pidfd, capture);
+                    return verification_failure(pidfd, capture, role);
                 }
                 if !resume_syscall(pid, signal) {
-                    return verification_failure(pidfd, capture);
+                    return verification_failure(pidfd, capture, role);
                 }
             }
             TargetEvent::Exited(code) => {
@@ -336,12 +344,13 @@ fn semantic_cleanup(
     pidfd: libc::c_int,
     mut capture: OutputCapture,
     failure: RuntimeProbeFailure,
+    role: RuntimeOwnedChildRole,
 ) -> Result<SupervisionOutcome, RuntimeFingerprintProduceError> {
     capture.close();
     super::probe::cleanup_registered_child(
         pidfd,
         Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE,
-        RuntimeOwnedChildRole::InitialTarget,
+        role,
     )?;
     Ok(SupervisionOutcome::Failed(failure))
 }
@@ -349,12 +358,13 @@ fn semantic_cleanup(
 fn verification_failure(
     pidfd: libc::c_int,
     mut capture: OutputCapture,
+    role: RuntimeOwnedChildRole,
 ) -> Result<SupervisionOutcome, RuntimeFingerprintProduceError> {
     capture.close();
     super::probe::cleanup_registered_child(
         pidfd,
         Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE,
-        RuntimeOwnedChildRole::InitialTarget,
+        role,
     )?;
     Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
 }

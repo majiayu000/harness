@@ -60,6 +60,7 @@ pub enum RuntimeCommandForm {
 pub enum RuntimeExecSequence {
     None,
     Single,
+    #[serde(rename = "etxtbsy_then_checkpoint_after_150_ms")]
     EtxtbsyThenCheckpointAfter150Ms,
 }
 

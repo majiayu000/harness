@@ -54,55 +54,54 @@ pub(super) fn owner_run(
             },
         );
     }
-    let selected = match super::resolution::resolve(
+    let mut disposition = super::resolution::resolve(
         executable,
         options,
         &environment,
         &command,
         &working_directory,
         deadline,
-    )? {
-        super::resolution::ResolutionDisposition::Complete(envelope) => return Ok(*envelope),
-        super::resolution::ResolutionDisposition::Selected {
-            candidate,
-            executable: retained,
-            attempts,
-        } => (candidate, retained, attempts),
-    };
-    let (candidate, retained, attempts) = selected;
-    let target = super::target::start_initial(
-        executable,
-        &environment,
-        &working_directory,
-        &retained,
-        deadline,
     )?;
-    match target {
-        super::target::TargetStart::ExecStopped(stopped) => {
-            return super::completion::complete_initial(
-                super::completion::InitialCompletion {
-                    configured: executable,
-                    options,
-                    environment: &environment,
-                    command: &command,
-                    working_directory: &working_directory,
-                    candidate: &candidate,
-                    executable: &retained,
-                },
+    loop {
+        let (candidate_index, candidate, retained, attempts) = match disposition {
+            super::resolution::ResolutionDisposition::Complete(envelope) => return Ok(*envelope),
+            super::resolution::ResolutionDisposition::Selected {
+                candidate_index,
+                candidate,
+                executable: retained,
                 attempts,
-                stopped,
-                deadline,
-            );
-        }
-        super::target::TargetStart::SetupFailed(detail) => {
-            let _setup_failure = detail;
-        }
-        super::target::TargetStart::ExecFailed(errno) => {
-            let _exec_failure = errno;
+            } => (candidate_index, candidate, retained, attempts),
+        };
+        match super::launch::launch_initial(
+            super::completion::InitialCompletion {
+                configured: executable,
+                options,
+                environment: &environment,
+                command: &command,
+                working_directory: &working_directory,
+                candidate: &candidate,
+                executable: &retained,
+            },
+            attempts,
+            deadline,
+        )? {
+            super::launch::InitialLaunch::Complete(envelope) => return Ok(*envelope),
+            super::launch::InitialLaunch::ContinueAfterEacces(attempts) => {
+                disposition = super::resolution::resume_after_eacces(
+                    executable,
+                    options,
+                    &environment,
+                    &command,
+                    &working_directory,
+                    deadline,
+                    super::resolution::ResolutionCursor {
+                        next_candidate_index: candidate_index + 1,
+                        attempts,
+                    },
+                )?;
+            }
         }
     }
-    drop((candidate, attempts));
-    Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
 }
 
 pub(super) const CHILD_READY: u8 = 1;
