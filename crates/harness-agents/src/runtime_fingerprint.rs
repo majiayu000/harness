@@ -8,6 +8,8 @@ mod authorization;
 #[cfg(target_os = "linux")]
 mod candidate;
 #[cfg(target_os = "linux")]
+mod capability;
+#[cfg(target_os = "linux")]
 mod checkpoint;
 #[cfg(target_os = "linux")]
 mod completion;
