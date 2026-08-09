@@ -304,21 +304,19 @@ fn configured_command_and_working_directory_limits_are_exact() {
 #[tokio::test]
 async fn linux_capability_child_is_gated_registered_and_reaped_by_pidfd() {
     let working_directory = std::env::current_dir().unwrap();
-    let error = fingerprint_configured_runtime_executable(
+    let envelope = fingerprint_configured_runtime_executable(
         &configured(IsolationTier::Host, sandbox(SandboxMode::DangerFullAccess)),
         &RuntimeFingerprintOptions::new(working_directory)
             .with_environment([(OsString::from("PATH"), OsString::from("/bin"))]),
     )
     .await
-    .unwrap_err();
-    assert!(
-        matches!(
-            &error,
-            RuntimeFingerprintProduceError::ContainmentUnavailable(
-                ContainmentUnavailableReason::PostExecGuardUnavailable
-            )
-        ),
-        "unexpected capability result: {error:?}"
+    .unwrap();
+    let observed: serde_json::Value =
+        serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap();
+    assert_eq!(observed["payload"]["failures"][0]["kind"], "path_not_found");
+    assert_eq!(
+        observed["payload"]["resolution_attempts"][0]["outcome"],
+        "absent"
     );
 }
 
@@ -466,4 +464,100 @@ fn static_elf_classifier_freezes_architecture_and_program_header_policy() {
             LinuxStaticElfClassification::Unsupported
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+fn configured_path(path: &Path) -> ConfiguredRuntimeExecutable {
+    ConfiguredRuntimeExecutable::new(
+        LocalExecutableRuntimeKind::CodexExec,
+        source("candidate"),
+        IsolationTier::Host,
+        sandbox(SandboxMode::DangerFullAccess),
+        path,
+        Vec::new(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+async fn fingerprint_failure_for(path: &Path) -> serde_json::Value {
+    let envelope = fingerprint_configured_runtime_executable(
+        &configured_path(path),
+        &RuntimeFingerprintOptions::new(std::env::current_dir().unwrap()),
+    )
+    .await
+    .unwrap();
+    serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_candidate_observation_records_closed_skip_and_identity_failures() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let missing = fingerprint_failure_for(Path::new("/definitely/missing/harness-runtime")).await;
+    assert_eq!(missing["payload"]["failures"][0]["kind"], "path_not_found");
+    assert_eq!(
+        missing["payload"]["resolution_attempts"][0]["outcome"],
+        "absent"
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let non_executable = directory.path().join("non-executable");
+    std::fs::write(&non_executable, b"not executable").unwrap();
+    std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let observed = fingerprint_failure_for(&non_executable).await;
+    assert_eq!(observed["payload"]["failures"][0]["kind"], "not_executable");
+    assert_eq!(
+        observed["payload"]["resolution_attempts"][0]["outcome"],
+        "not_executable"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_candidate_observation_rejects_interpreters_before_authorization() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let script = directory.path().join("script");
+    std::fs::write(&script, b"#!/bin/sh\necho forbidden\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let observed = fingerprint_failure_for(&script).await;
+    assert_eq!(
+        observed["payload"]["failures"][0]["kind"],
+        "interpreter_authorization_unavailable"
+    );
+    assert_eq!(
+        observed["payload"]["resolution_attempts"][0]["outcome"],
+        "interpreter_authorization_unavailable"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_retained_static_candidate_requires_repository_boundaries() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let machine = if cfg!(target_arch = "x86_64") {
+        62
+    } else {
+        183
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("static-elf");
+    std::fs::write(&executable, static_elf_fixture(machine)).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let observed = fingerprint_failure_for(&executable).await;
+    assert_eq!(
+        observed["payload"]["failures"][0]["kind"],
+        "target_authorization_unavailable"
+    );
+    assert_eq!(
+        observed["payload"]["failures"][0]["detail"]["detail"],
+        "boundary_unprovable"
+    );
+    assert_eq!(
+        observed["payload"]["resolution_attempts"][0]["outcome"],
+        "authorization_unavailable"
+    );
 }

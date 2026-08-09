@@ -1,0 +1,218 @@
+//! Ordered candidate resolution and terminal evidence mapping.
+
+use super::candidate::{CandidateObservation, RetainedExecutable};
+use super::environment::SelectedEnvironment;
+use super::executable::{PreparedCommand, ResolvedCandidate, RetainedWorkingDirectory};
+use super::{
+    ConfiguredRuntimeExecutable, RuntimeEnvelopeEvidence, RuntimeFingerprintOptions,
+    RuntimeFingerprintProduceError,
+};
+use harness_core::stack::fingerprint::{
+    AgentStackFingerprintEnvelope, RuntimeCommandForm, RuntimeExecSequence, RuntimeProbeFailure,
+    RuntimeProbeFailureDetail, RuntimeProbeFailureKind, RuntimeResolutionAttempt,
+    RuntimeResolutionAttemptOutcome,
+};
+use harness_core::stack::AgentStackSourceScope;
+use std::time::Instant;
+
+pub(super) enum ResolutionDisposition {
+    Complete(Box<AgentStackFingerprintEnvelope>),
+    Selected {
+        candidate: ResolvedCandidate,
+        executable: RetainedExecutable,
+        attempts: Vec<RuntimeResolutionAttempt>,
+    },
+}
+
+pub(super) fn resolve(
+    configured: &ConfiguredRuntimeExecutable,
+    options: &RuntimeFingerprintOptions,
+    environment: &SelectedEnvironment,
+    command: &PreparedCommand,
+    working_directory: &RetainedWorkingDirectory,
+    deadline: Instant,
+) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
+    let mut attempts = Vec::with_capacity(command.candidates.len());
+    for candidate in &command.candidates {
+        match super::candidate::observe_candidate(candidate, working_directory, deadline)? {
+            CandidateObservation::Absent => {
+                attempts.push(attempt(candidate, RuntimeResolutionAttemptOutcome::Absent)?);
+                if command.command_form != RuntimeCommandForm::UnixBare {
+                    return complete_with(
+                        configured,
+                        environment,
+                        command,
+                        working_directory,
+                        attempts,
+                        RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathNotFound)?,
+                    );
+                }
+            }
+            CandidateObservation::NotRegular => {
+                attempts.push(attempt(
+                    candidate,
+                    RuntimeResolutionAttemptOutcome::NotRegular,
+                )?);
+                if command.command_form != RuntimeCommandForm::UnixBare {
+                    return complete_with(
+                        configured,
+                        environment,
+                        command,
+                        working_directory,
+                        attempts,
+                        RuntimeProbeFailure::new(RuntimeProbeFailureKind::NotRegularFile)?,
+                    );
+                }
+            }
+            CandidateObservation::NotExecutable => {
+                attempts.push(attempt(
+                    candidate,
+                    RuntimeResolutionAttemptOutcome::NotExecutable,
+                )?);
+                if command.command_form != RuntimeCommandForm::UnixBare {
+                    return complete_with(
+                        configured,
+                        environment,
+                        command,
+                        working_directory,
+                        attempts,
+                        RuntimeProbeFailure::new(RuntimeProbeFailureKind::NotExecutable)?,
+                    );
+                }
+            }
+            CandidateObservation::InspectionFailed(kind) => {
+                attempts.push(attempt(
+                    candidate,
+                    RuntimeResolutionAttemptOutcome::InspectionFailed,
+                )?);
+                return complete_with(
+                    configured,
+                    environment,
+                    command,
+                    working_directory,
+                    attempts,
+                    RuntimeProbeFailure::new(kind)?,
+                );
+            }
+            CandidateObservation::UnsupportedFormat => {
+                attempts.push(attempt(
+                    candidate,
+                    RuntimeResolutionAttemptOutcome::InterpreterAuthorizationUnavailable,
+                )?);
+                return complete_with(
+                    configured,
+                    environment,
+                    command,
+                    working_directory,
+                    attempts,
+                    RuntimeProbeFailure::new(
+                        RuntimeProbeFailureKind::InterpreterAuthorizationUnavailable,
+                    )?,
+                );
+            }
+            CandidateObservation::Retained(executable) => {
+                if configured.configured_source().source().scope()
+                    == AgentStackSourceScope::Repository
+                {
+                    attempts.push(attempt(
+                        candidate,
+                        RuntimeResolutionAttemptOutcome::InspectionTarget,
+                    )?);
+                    return complete_with(
+                        configured,
+                        environment,
+                        command,
+                        working_directory,
+                        attempts,
+                        RuntimeProbeFailure::with_detail(
+                            RuntimeProbeFailureKind::ProbeNotAuthorized,
+                            RuntimeProbeFailureDetail::ConfigurationSourceRepository,
+                        )?,
+                    );
+                }
+                let authorization_failure = if options.repository_boundaries().is_none() {
+                    Some(RuntimeProbeFailureDetail::BoundaryUnprovable)
+                } else if executable.link_count == 0 {
+                    Some(RuntimeProbeFailureDetail::UnlinkedTarget)
+                } else if executable.link_count > 1 {
+                    Some(RuntimeProbeFailureDetail::MultipleHardLinks)
+                } else {
+                    None
+                };
+                if let Some(detail) = authorization_failure {
+                    attempts.push(attempt(
+                        candidate,
+                        RuntimeResolutionAttemptOutcome::AuthorizationUnavailable,
+                    )?);
+                    return complete_with(
+                        configured,
+                        environment,
+                        command,
+                        working_directory,
+                        attempts,
+                        RuntimeProbeFailure::with_detail(
+                            RuntimeProbeFailureKind::TargetAuthorizationUnavailable,
+                            detail,
+                        )?,
+                    );
+                }
+                return Ok(ResolutionDisposition::Selected {
+                    candidate: candidate.clone(),
+                    executable,
+                    attempts,
+                });
+            }
+        }
+    }
+    let failure = if command.candidate_limit_exceeded {
+        RuntimeProbeFailureKind::CandidateLimitExceeded
+    } else {
+        RuntimeProbeFailureKind::PathNotFound
+    };
+    complete_with(
+        configured,
+        environment,
+        command,
+        working_directory,
+        attempts,
+        RuntimeProbeFailure::new(failure)?,
+    )
+}
+
+fn attempt(
+    candidate: &ResolvedCandidate,
+    outcome: RuntimeResolutionAttemptOutcome,
+) -> Result<RuntimeResolutionAttempt, RuntimeFingerprintProduceError> {
+    Ok(RuntimeResolutionAttempt::new(
+        candidate.candidate_digest.clone(),
+        outcome,
+        RuntimeExecSequence::None,
+        None,
+    )?)
+}
+
+fn complete_with(
+    configured: &ConfiguredRuntimeExecutable,
+    environment: &SelectedEnvironment,
+    command: &PreparedCommand,
+    working_directory: &RetainedWorkingDirectory,
+    attempts: Vec<RuntimeResolutionAttempt>,
+    failure: RuntimeProbeFailure,
+) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
+    Ok(ResolutionDisposition::Complete(Box::new(
+        super::finish_runtime_envelope(
+            configured,
+            RuntimeEnvelopeEvidence {
+                command_form: command.command_form,
+                configured_command_digest: command.configured_command_digest.clone(),
+                working_directory_digest: command.working_directory_digest.clone(),
+                working_directory_identity_digest: working_directory.identity_digest.clone(),
+                resolution_attempts: attempts,
+                executable: None,
+                version: None,
+                environment: environment.facts.clone(),
+                failures: vec![failure],
+            },
+        )?,
+    )))
+}

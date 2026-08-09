@@ -3,10 +3,14 @@
 #[cfg(test)]
 mod tests;
 
+#[cfg(target_os = "linux")]
+mod candidate;
 mod environment;
 mod executable;
 #[cfg(target_os = "linux")]
 mod probe;
+#[cfg(target_os = "linux")]
+mod resolution;
 
 use harness_core::config::agents::{AgentsConfig, SandboxMode};
 use harness_core::config::isolation::IsolationTier;

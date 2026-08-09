@@ -54,6 +54,32 @@ pub(super) fn owner_run(
             },
         );
     }
+    match super::resolution::resolve(
+        executable,
+        options,
+        &environment,
+        &command,
+        &working_directory,
+        deadline,
+    )? {
+        super::resolution::ResolutionDisposition::Complete(envelope) => return Ok(*envelope),
+        super::resolution::ResolutionDisposition::Selected {
+            candidate,
+            executable: retained,
+            attempts,
+        } => {
+            let _selected_identity = (
+                retained.fd(),
+                retained.device,
+                retained.inode,
+                retained.file_size_bytes,
+                retained.unix_mode,
+                retained.executable_sha256.as_str(),
+                candidate.candidate_digest.as_str(),
+                attempts.len(),
+            );
+        }
+    }
     Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
         ContainmentUnavailableReason::PostExecGuardUnavailable,
     ))
