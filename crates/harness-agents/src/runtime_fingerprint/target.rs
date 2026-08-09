@@ -22,12 +22,17 @@ pub(super) enum TargetStart {
 }
 
 pub(super) struct StoppedTarget {
+    pid: libc::pid_t,
     pidfd: libc::c_int,
     stdout: libc::c_int,
     stderr: libc::c_int,
 }
 
 impl StoppedTarget {
+    pub(super) const fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
     pub(super) fn terminate_without_resume(
         self,
         deadline: Instant,
@@ -261,6 +266,7 @@ fn supervise_initial_stop(
         TargetEvent::Stopped(libc::SIGTRAP) if is_exec_event(pid) => {
             super::probe::close_fd(pre_exec);
             Ok(TargetStart::ExecStopped(StoppedTarget {
+                pid,
                 pidfd,
                 stdout,
                 stderr,

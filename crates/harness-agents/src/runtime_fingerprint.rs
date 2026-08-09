@@ -10,6 +10,8 @@ mod candidate;
 #[cfg(target_os = "linux")]
 mod checkpoint;
 mod environment;
+#[cfg(target_os = "linux")]
+mod exec_stop;
 mod executable;
 #[cfg(target_os = "linux")]
 mod probe;
