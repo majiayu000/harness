@@ -29,6 +29,10 @@ use spawn_env::{
     network_allowlist, review_git_safe_workspace, ContainerEnv,
 };
 
+pub(crate) fn agent_container_image(env_vars: &HashMap<String, String>) -> String {
+    container_image(env_vars)
+}
+
 /// Env keys Claude Code uses to detect that it is running nested inside
 /// another Claude Code session; leaking any of them into a spawned agent
 /// causes SIGTRAP. Only these markers are stripped — legitimate `CLAUDE_*`

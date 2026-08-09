@@ -6,6 +6,7 @@ use harness_core::error::HarnessError;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const CONTAINER_CLOUD_HOME: &str = "/harness-cloud-home";
 const CONTAINER_CLOUD_TMP: &str = "/tmp";
@@ -131,6 +132,7 @@ pub(crate) fn apply_container_state(
 
 pub(super) struct SecretContainerState {
     directory: tempfile::TempDir,
+    cleanup_image: String,
 }
 
 impl SecretContainerState {
@@ -152,7 +154,10 @@ impl SecretContainerState {
             fs::create_dir(&path).map_err(|error| state_error("create secret", &path, error))?;
             set_container_writable(&path, mode)?;
         }
-        Ok(Some(Self { directory }))
+        Ok(Some(Self {
+            directory,
+            cleanup_image: crate::spawn_contract::agent_container_image(context.env_vars),
+        }))
     }
 
     pub(super) fn apply(&self, env_vars: &mut HashMap<String, String>) -> Vec<ContainerBindMount> {
@@ -173,11 +178,20 @@ impl SecretContainerState {
         self,
         setup_result: harness_core::error::Result<()>,
     ) -> harness_core::error::Result<()> {
-        let cleanup_result = self.directory.close().map_err(|error| {
-            HarnessError::AgentExecution(format!(
-                "failed to remove secret cloud setup state: {error}"
-            ))
-        });
+        let root = self.directory.path().to_path_buf();
+        let cleanup_result = match self.directory.close() {
+            Ok(()) => Ok(()),
+            Err(host_error) => cleanup_container_owned_state(&self.cleanup_image, &root)
+                .and_then(|()| {
+                    fs::remove_dir_all(&root)
+                        .map_err(|error| state_error("remove secret", &root, error))
+                })
+                .map_err(|fallback_error| {
+                    HarnessError::AgentExecution(format!(
+                        "failed to remove secret cloud setup state: {host_error}; container cleanup also failed: {fallback_error}"
+                    ))
+                }),
+        };
         match (setup_result, cleanup_result) {
             (Err(setup), Err(cleanup)) => Err(HarnessError::AgentExecution(format!(
                 "{setup}; additionally, {cleanup}"
@@ -185,6 +199,74 @@ impl SecretContainerState {
             (Err(error), _) | (_, Err(error)) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
         }
+    }
+}
+
+fn cleanup_container_owned_state(image: &str, root: &Path) -> harness_core::error::Result<()> {
+    let home = root.join("home");
+    let temporary = root.join("tmp");
+    ensure_cleanup_mount(&home, 0o777)?;
+    ensure_cleanup_mount(&temporary, 0o1777)?;
+    let home_mount = format!("type=bind,src={},dst=/harness-secret-home", home.display());
+    let temporary_mount = format!(
+        "type=bind,src={},dst=/harness-secret-tmp",
+        temporary.display()
+    );
+    const CLEANUP_SCRIPT: &str = r#"for root in /harness-secret-home /harness-secret-tmp; do
+  find "$root" -mindepth 1 -type d -exec chmod u+rwx '{}' +
+  find "$root" -mindepth 1 -depth -delete
+done"#;
+    let status = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--mount",
+            &home_mount,
+            "--mount",
+            &temporary_mount,
+            "--entrypoint",
+            "sh",
+            image,
+            "-c",
+            CLEANUP_SCRIPT,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            HarnessError::AgentExecution(format!(
+                "failed to start secret state cleanup container: {error}"
+            ))
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(HarnessError::AgentExecution(format!(
+            "secret state cleanup container exited with {status}"
+        )))
+    }
+}
+
+fn ensure_cleanup_mount(path: &Path, unix_mode: u32) -> harness_core::error::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(HarnessError::AgentExecution(format!(
+            "secret state cleanup path `{}` is not a directory",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|error| state_error("recreate secret", path, error))?;
+            set_container_writable(path, unix_mode)
+        }
+        Err(error) => Err(state_error("inspect secret", path, error)),
     }
 }
 
@@ -276,6 +358,54 @@ mod tests {
         assert!(!root.starts_with(project.path()));
         assert_eq!(setup_env["HOME"], CONTAINER_CLOUD_HOME);
         state.finish(Ok(()))?;
+        assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires the reference agent Docker image for fallback cleanup"]
+    fn secret_state_cleanup_handles_container_owned_directories() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir()?;
+        let cloud = CodexCloudConfig {
+            setup_secret_env: vec!["NPM_TOKEN".to_string()],
+            ..cloud(vec!["npm ci".to_string()])
+        };
+        let env = HashMap::from([
+            (
+                AGENT_ISOLATION_TIER_ENV.to_string(),
+                "container".to_string(),
+            ),
+            (
+                harness_core::agent::AGENT_CONTAINER_IMAGE_ENV.to_string(),
+                "harness-agent:gh1771".to_string(),
+            ),
+        ]);
+        let context = CloudSetupContext {
+            project_root: project.path(),
+            sandbox_mode: SandboxMode::ReadOnly,
+            permission_mode: AgentPermissionMode::Scoped,
+            env_vars: &env,
+            capability_token: None,
+        };
+        let state = SecretContainerState::create(&cloud, &context)?
+            .ok_or_else(|| anyhow::anyhow!("missing secret state"))?;
+        let root = state.directory.path().to_path_buf();
+        let nested = root.join("home/container-owned");
+        fs::create_dir(&nested)?;
+        fs::write(nested.join("credential"), b"secret")?;
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o555))?;
+        fs::remove_dir(root.join("tmp"))?;
+
+        let result = state.finish(Ok(()));
+        if root.exists() {
+            fs::set_permissions(&nested, fs::Permissions::from_mode(0o755))?;
+            fs::remove_dir_all(&root)?;
+        }
+
+        result?;
         assert!(!root.exists());
         Ok(())
     }
