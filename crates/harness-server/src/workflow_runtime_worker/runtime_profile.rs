@@ -304,11 +304,45 @@ fn runtime_profile_approval_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::stack::fingerprint::LocalExecutableRuntimeKind;
 
     fn profile_with_timeout(name: &str, kind: RuntimeKind) -> RuntimeProfile {
         let mut profile = RuntimeProfile::new(name, kind);
         profile.timeout_secs = Some(3600);
         profile
+    }
+
+    #[test]
+    fn runtime_fingerprint_runtime_kind_contract_is_exhaustive() {
+        fn local_fingerprint_kind(kind: RuntimeKind) -> Option<LocalExecutableRuntimeKind> {
+            match kind {
+                RuntimeKind::CodexExec => Some(LocalExecutableRuntimeKind::CodexExec),
+                RuntimeKind::CodexJsonrpc => Some(LocalExecutableRuntimeKind::CodexJsonrpc),
+                RuntimeKind::ClaudeCode => Some(LocalExecutableRuntimeKind::ClaudeCode),
+                RuntimeKind::AnthropicApi | RuntimeKind::RemoteHost | RuntimeKind::OpenCode => None,
+            }
+        }
+
+        assert_eq!(LocalExecutableRuntimeKind::ALL.len(), 3);
+        assert_eq!(
+            [
+                RuntimeKind::CodexExec,
+                RuntimeKind::CodexJsonrpc,
+                RuntimeKind::ClaudeCode,
+                RuntimeKind::AnthropicApi,
+                RuntimeKind::RemoteHost,
+                RuntimeKind::OpenCode,
+            ]
+            .map(local_fingerprint_kind),
+            [
+                Some(LocalExecutableRuntimeKind::CodexExec),
+                Some(LocalExecutableRuntimeKind::CodexJsonrpc),
+                Some(LocalExecutableRuntimeKind::ClaudeCode),
+                None,
+                None,
+                None,
+            ]
+        );
     }
 
     #[test]
