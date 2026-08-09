@@ -97,6 +97,39 @@ fn ptrace_guard_options_require_exitkill_for_capability_and_target() {
 }
 
 #[test]
+fn surplus_rights_in_one_control_message_are_all_closed() {
+    #[repr(align(16))]
+    struct Control([u8; 64]);
+
+    let mut descriptors = [-1; 4];
+    assert_eq!(unsafe { libc::pipe2(descriptors.as_mut_ptr(), 0) }, 0);
+    assert_eq!(unsafe { libc::pipe2(descriptors[2..].as_mut_ptr(), 0) }, 0);
+    let mut control = Control([0; 64]);
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_control = control.0.as_mut_ptr().cast();
+    message.msg_controllen =
+        unsafe { libc::CMSG_SPACE((2 * std::mem::size_of::<libc::c_int>()) as _) } as usize;
+    let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    unsafe {
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN((2 * std::mem::size_of::<libc::c_int>()) as _) as usize;
+        std::ptr::write_unaligned(libc::CMSG_DATA(header).cast(), descriptors[0]);
+        std::ptr::write_unaligned(
+            libc::CMSG_DATA(header).cast::<libc::c_int>().add(1),
+            descriptors[2],
+        );
+    }
+    assert!(probe::take_exactly_one_received_right(&message).is_err());
+    assert_eq!(unsafe { libc::fcntl(descriptors[0], libc::F_GETFD) }, -1);
+    assert_eq!(probe::last_errno(), libc::EBADF);
+    assert_eq!(unsafe { libc::fcntl(descriptors[2], libc::F_GETFD) }, -1);
+    assert_eq!(probe::last_errno(), libc::EBADF);
+    probe::close_fd(descriptors[1]);
+    probe::close_fd(descriptors[3]);
+}
+
+#[test]
 fn raw_kernel_signal_mask_blocks_nptl_reserved_signals_and_restores_exactly() {
     let saved = probe::block_all_signals().unwrap();
     let mut blocked = 0_u64;

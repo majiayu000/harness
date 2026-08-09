@@ -616,7 +616,7 @@ fn receive_candidate(
     if received != frame.len() as isize
         || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
     {
-        close_received_rights(&message);
+        super::probe::close_received_rights(&message);
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage: super::RuntimeObservationStage::Candidate,
             reason: RuntimeObservationProtocolReason::TruncatedFrame,
@@ -625,7 +625,7 @@ fn receive_candidate(
     let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
     if frame[0] != STATUS_RETAINED {
         if !header.is_null() || frame[1..].iter().any(|byte| *byte != 0) {
-            close_received_rights(&message);
+            super::probe::close_received_rights(&message);
             return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
                 stage: super::RuntimeObservationStage::Candidate,
                 reason: RuntimeObservationProtocolReason::SurplusFields,
@@ -633,27 +633,12 @@ fn receive_candidate(
         }
         return decode_failure(frame[0]);
     }
-    if header.is_null()
-        || unsafe { (*header).cmsg_level } != libc::SOL_SOCKET
-        || unsafe { (*header).cmsg_type } != libc::SCM_RIGHTS
-        || unsafe { (*header).cmsg_len }
-            != unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) } as usize
-        || !unsafe { libc::CMSG_NXTHDR(&message, header) }.is_null()
-    {
-        close_received_rights(&message);
-        return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
+    let retained = super::probe::take_exactly_one_received_right(&message).map_err(|()| {
+        RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage: super::RuntimeObservationStage::Candidate,
             reason: RuntimeObservationProtocolReason::DescriptorCountMismatch,
-        });
-    }
-    let retained =
-        unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>()) };
-    if retained < 0 {
-        return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
-            stage: super::RuntimeObservationStage::Candidate,
-            reason: RuntimeObservationProtocolReason::DescriptorCountMismatch,
-        });
-    }
+        }
+    })?;
     let flags = unsafe { libc::fcntl(retained, libc::F_GETFL) };
     let descriptor_flags = unsafe { libc::fcntl(retained, libc::F_GETFD) };
     if flags < 0
@@ -689,31 +674,6 @@ fn receive_candidate(
         unix_mode: u32::from_be_bytes([frame[33], frame[34], frame[35], frame[36]]),
         executable_sha256,
     }))
-}
-
-fn close_received_rights(message: &libc::msghdr) {
-    let mut header = unsafe { libc::CMSG_FIRSTHDR(message) };
-    while !header.is_null() {
-        let is_rights = unsafe {
-            (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS
-        };
-        let header_bytes = unsafe { libc::CMSG_LEN(0) } as usize;
-        let data_bytes = unsafe { (*header).cmsg_len }.saturating_sub(header_bytes);
-        if is_rights {
-            let count = data_bytes / std::mem::size_of::<libc::c_int>();
-            let mut index = 0;
-            while index < count {
-                let descriptor = unsafe {
-                    std::ptr::read_unaligned(
-                        libc::CMSG_DATA(header).cast::<libc::c_int>().add(index),
-                    )
-                };
-                super::probe::close_fd(descriptor);
-                index += 1;
-            }
-        }
-        header = unsafe { libc::CMSG_NXTHDR(message, header) };
-    }
 }
 
 fn decode_failure(status: u8) -> Result<CandidateObservation, RuntimeFingerprintProduceError> {

@@ -310,6 +310,66 @@ pub(super) fn close_pipe_pair(pair: [libc::c_int; 2]) {
     close_fd(pair[1]);
 }
 
+pub(super) fn take_exactly_one_received_right(message: &libc::msghdr) -> Result<libc::c_int, ()> {
+    let header = unsafe { libc::CMSG_FIRSTHDR(message) };
+    let exact_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) } as usize;
+    let valid = !header.is_null()
+        && unsafe { (*header).cmsg_level } == libc::SOL_SOCKET
+        && unsafe { (*header).cmsg_type } == libc::SCM_RIGHTS
+        && unsafe { (*header).cmsg_len } == exact_len
+        && unsafe { libc::CMSG_NXTHDR(message, header) }.is_null();
+    if !valid {
+        close_received_rights(message);
+        return Err(());
+    }
+    let descriptor =
+        unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>()) };
+    if descriptor < 0 {
+        close_received_rights(message);
+        return Err(());
+    }
+    Ok(descriptor)
+}
+
+pub(super) fn close_received_rights(message: &libc::msghdr) {
+    let control_start = message.msg_control as usize;
+    let Some(control_end) = control_start.checked_add(message.msg_controllen) else {
+        return;
+    };
+    let header_bytes = unsafe { libc::CMSG_LEN(0) } as usize;
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(message) };
+    while !header.is_null() {
+        let header_start = header as usize;
+        let Some(header_end) = header_start.checked_add(header_bytes) else {
+            break;
+        };
+        if header_start < control_start || header_end > control_end {
+            break;
+        }
+        let claimed_len = unsafe { (*header).cmsg_len };
+        let available_len = control_end - header_start;
+        let bounded_len = claimed_len.min(available_len);
+        let is_rights = unsafe {
+            (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS
+        };
+        if is_rights && bounded_len >= header_bytes {
+            let count = (bounded_len - header_bytes) / std::mem::size_of::<libc::c_int>();
+            for index in 0..count {
+                let descriptor = unsafe {
+                    std::ptr::read_unaligned(
+                        libc::CMSG_DATA(header).cast::<libc::c_int>().add(index),
+                    )
+                };
+                close_fd(descriptor);
+            }
+        }
+        if claimed_len < header_bytes || claimed_len > available_len {
+            break;
+        }
+        header = unsafe { libc::CMSG_NXTHDR(message, header) };
+    }
+}
+
 pub(super) fn close_fd(fd: libc::c_int) {
     if fd >= 0 {
         // SAFETY: callers transfer each owned descriptor to this close site at most once.

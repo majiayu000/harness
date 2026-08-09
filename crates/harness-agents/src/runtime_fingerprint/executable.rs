@@ -508,6 +508,7 @@ fn receive_working_directory(
     if received != frame.len() as isize
         || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
     {
+        super::probe::close_received_rights(&message);
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage: super::RuntimeObservationStage::WorkingDirectory,
             reason: super::RuntimeObservationProtocolReason::TruncatedFrame,
@@ -517,20 +518,22 @@ fn receive_working_directory(
     if frame[0] == 2 && header.is_null() {
         return Err(RuntimeFingerprintProduceError::WorkingDirectoryUnavailable);
     }
-    if frame[0] != 1
-        || header.is_null()
-        || unsafe { (*header).cmsg_level } != libc::SOL_SOCKET
-        || unsafe { (*header).cmsg_type } != libc::SCM_RIGHTS
-        || !unsafe { libc::CMSG_NXTHDR(&message, header) }.is_null()
-    {
+    if frame[0] != 1 {
+        super::probe::close_received_rights(&message);
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage: super::RuntimeObservationStage::WorkingDirectory,
             reason: super::RuntimeObservationProtocolReason::DescriptorCountMismatch,
         });
     }
-    let retained =
-        unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>()) };
-    if retained < 0 || unsafe { libc::fcntl(retained, libc::F_GETFL) } & libc::O_PATH == 0 {
+    let retained = super::probe::take_exactly_one_received_right(&message).map_err(|()| {
+        RuntimeFingerprintProduceError::ObservationProtocolInvalid {
+            stage: super::RuntimeObservationStage::WorkingDirectory,
+            reason: super::RuntimeObservationProtocolReason::DescriptorCountMismatch,
+        }
+    })?;
+    let flags = unsafe { libc::fcntl(retained, libc::F_GETFL) };
+    let descriptor_flags = unsafe { libc::fcntl(retained, libc::F_GETFD) };
+    if flags < 0 || flags & libc::O_PATH == 0 || descriptor_flags & libc::FD_CLOEXEC == 0 {
         super::probe::close_fd(retained);
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
             stage: super::RuntimeObservationStage::WorkingDirectory,
