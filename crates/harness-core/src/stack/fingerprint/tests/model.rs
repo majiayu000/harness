@@ -295,7 +295,7 @@ fn runtime_environment_requires_the_exact_kind_policy_key_set() {
         None,
         None,
         claude_environment,
-        failure(RuntimeProbeFailureKind::PathNotFound),
+        failure(RuntimeProbeFailureKind::PathUnusable),
     )
     .is_ok());
     assert!(runtime_payload_with_facts(
@@ -304,7 +304,7 @@ fn runtime_environment_requires_the_exact_kind_policy_key_set() {
         vec![],
         None,
         None,
-        failure(RuntimeProbeFailureKind::PathNotFound),
+        failure(RuntimeProbeFailureKind::PathUnusable),
     )
     .is_ok());
 }

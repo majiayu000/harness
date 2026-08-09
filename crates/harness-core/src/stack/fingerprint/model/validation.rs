@@ -241,12 +241,15 @@ fn primary_failure_matches(
         K::PathNotFound => {
             no_final_identity
                 && match form {
-                    RuntimeCommandForm::UnixBare => attempts.iter().all(|attempt| {
-                        matches!(
-                            attempt.outcome,
-                            O::Absent | O::NotRegular | O::NotExecutable
-                        )
-                    }),
+                    RuntimeCommandForm::UnixBare => {
+                        !attempts.is_empty()
+                            && attempts.iter().all(|attempt| {
+                                matches!(
+                                    attempt.outcome,
+                                    O::Absent | O::NotRegular | O::NotExecutable
+                                )
+                            })
+                    }
                     RuntimeCommandForm::UnixAbsolute | RuntimeCommandForm::UnixQualified => {
                         attempts.len() == 1 && final_outcome_is(O::Absent)
                     }

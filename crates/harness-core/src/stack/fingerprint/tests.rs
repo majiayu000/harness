@@ -42,7 +42,11 @@ fn runtime_payload_with_observation(
         )
     } else {
         (
-            vec![],
+            vec![runtime_attempt(
+                b"missing",
+                RuntimeResolutionAttemptOutcome::Absent,
+                RuntimeExecSequence::None,
+            )],
             vec![RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathNotFound).unwrap()],
         )
     };
@@ -54,6 +58,19 @@ fn runtime_payload_with_observation(
         version,
         failures,
     )
+}
+
+#[test]
+fn unix_bare_path_not_found_requires_a_reached_attempt() {
+    assert!(runtime_payload_with_facts(
+        LocalExecutableRuntimeKind::CodexExec,
+        RuntimeCommandForm::UnixBare,
+        vec![],
+        None,
+        None,
+        vec![RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathNotFound).unwrap()],
+    )
+    .is_err());
 }
 
 fn runtime_payload_with_facts(
