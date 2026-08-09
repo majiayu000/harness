@@ -16,11 +16,14 @@ use harness_core::{
     types::Capability, types::ReasoningBudget,
 };
 use harness_sandbox::SandboxSpec;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+
+pub(crate) const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
 pub struct ClaudeCodeAgent {
     pub cli_path: PathBuf,
@@ -33,6 +36,7 @@ pub struct ClaudeCodeAgent {
     /// subprocess is declared a zombie and terminated. `None` = no timeout.
     pub stream_timeout_secs: Option<u64>,
     pub provider_gate: ProviderBackpressureGate,
+    anthropic_api_key: Option<String>,
 }
 
 impl ClaudeCodeAgent {
@@ -44,6 +48,7 @@ impl ClaudeCodeAgent {
             reasoning_budget: None,
             stream_timeout_secs: Some(3600),
             provider_gate: ProviderBackpressureGate::disabled(),
+            anthropic_api_key: None,
         }
     }
 
@@ -72,6 +77,62 @@ impl ClaudeCodeAgent {
     pub fn with_provider_backpressure_gate(mut self, gate: ProviderBackpressureGate) -> Self {
         self.provider_gate = gate;
         self
+    }
+
+    pub fn with_anthropic_api_key(mut self, api_key: String) -> Self {
+        if !api_key.trim().is_empty() {
+            self.anthropic_api_key = Some(api_key);
+        }
+        self
+    }
+
+    fn container_runtime_secret_env_keys(
+        &self,
+        env_vars: &mut HashMap<String, String>,
+    ) -> Vec<String> {
+        let is_container = env_vars
+            .get(harness_core::agent::AGENT_ISOLATION_TIER_ENV)
+            .is_some_and(|tier| tier.trim() == "container");
+        let Some(api_key) = self.anthropic_api_key.as_ref().filter(|_| is_container) else {
+            return Vec::new();
+        };
+        env_vars.insert(ANTHROPIC_API_KEY_ENV.to_string(), api_key.clone());
+        vec![ANTHROPIC_API_KEY_ENV.to_string()]
+    }
+
+    async fn prepare_spawn(
+        &self,
+        req: &AgentRequest,
+        base_args: &[OsString],
+    ) -> harness_core::error::Result<(
+        crate::spawn_contract::PreparedAgentSpawn,
+        harness_core::run_id::RunIdentity,
+    )> {
+        let sandbox_mode = self.effective_sandbox_mode(req);
+        let sandbox_spec = if let Some(ref token) = req.capability_token {
+            SandboxSpec::new(sandbox_mode, &req.project_root)
+                .with_allowed_write_paths(token.allowed_write_paths.clone())
+        } else {
+            SandboxSpec::new(sandbox_mode, &req.project_root)
+        };
+        let mut spawn_env_vars = req.env_vars.clone();
+        let secret_env_keys = self.container_runtime_secret_env_keys(&mut spawn_env_vars);
+        let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
+        run_identity.write_env_vars(&mut spawn_env_vars);
+        let prepared_spawn =
+            crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+                program: &self.cli_path,
+                args: base_args,
+                project_root: &req.project_root,
+                sandbox_spec: &sandbox_spec,
+                env_vars: &spawn_env_vars,
+                secret_env_keys: &secret_env_keys,
+                container_bind_mounts: &[],
+                permission_mode: req.permission_mode,
+                forward_stdin: false,
+            })
+            .await?;
+        Ok((prepared_spawn, run_identity))
     }
 
     fn resolve_model<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
@@ -188,30 +249,7 @@ impl CodeAgent for ClaudeCodeAgent {
             )
             .await?;
 
-        // Narrow sandbox write paths to token scope when present.
-        let sandbox_mode = self.effective_sandbox_mode(&req);
-        let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
-                .with_allowed_write_paths(token.allowed_write_paths.clone())
-        } else {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
-        };
-        let mut spawn_env_vars = req.env_vars.clone();
-        let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
-        run_identity.write_env_vars(&mut spawn_env_vars);
-        let prepared_spawn =
-            crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
-                program: &self.cli_path,
-                args: &base_args,
-                project_root: &req.project_root,
-                sandbox_spec: &sandbox_spec,
-                env_vars: &spawn_env_vars,
-                secret_env_keys: &[],
-                container_bind_mounts: &[],
-                permission_mode: req.permission_mode,
-                forward_stdin: false,
-            })
-            .await?;
+        let (prepared_spawn, run_identity) = self.prepare_spawn(&req, &base_args).await?;
 
         tracing::debug!(
             cli = %prepared_spawn.program.display(),
@@ -306,29 +344,7 @@ impl CodeAgent for ClaudeCodeAgent {
             waited_ms = provider_permit.waited_ms(),
             "claude execute_stream admitted by provider gate"
         );
-        let sandbox_mode = self.effective_sandbox_mode(&req);
-        let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
-                .with_allowed_write_paths(token.allowed_write_paths.clone())
-        } else {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
-        };
-        let mut spawn_env_vars = req.env_vars.clone();
-        let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
-        run_identity.write_env_vars(&mut spawn_env_vars);
-        let prepared_spawn =
-            crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
-                program: &self.cli_path,
-                args: &base_args,
-                project_root: &req.project_root,
-                sandbox_spec: &sandbox_spec,
-                env_vars: &spawn_env_vars,
-                secret_env_keys: &[],
-                container_bind_mounts: &[],
-                permission_mode: req.permission_mode,
-                forward_stdin: false,
-            })
-            .await?;
+        let (prepared_spawn, run_identity) = self.prepare_spawn(&req, &base_args).await?;
 
         // Dump full args (truncate each to 120 chars) so we can diagnose
         // exactly what is being passed to the Claude CLI process.
@@ -495,6 +511,47 @@ mod prompt_layer_tests;
 #[cfg(test)]
 #[path = "claude_permission_tests.rs"]
 mod permission_tests;
+
+#[cfg(test)]
+mod runtime_secret_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn container_spawn_forwards_configured_anthropic_key_by_name() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let api_key = "operator-anthropic-key";
+        let agent = ClaudeCodeAgent::new(
+            PathBuf::from("claude"),
+            "test-model".to_string(),
+            SandboxMode::WorkspaceWrite,
+        )
+        .with_anthropic_api_key(api_key.to_string());
+        let request = AgentRequest {
+            project_root: project.path().to_path_buf(),
+            env_vars: HashMap::from([(
+                harness_core::agent::AGENT_ISOLATION_TIER_ENV.to_string(),
+                "container".to_string(),
+            )]),
+            ..AgentRequest::default()
+        };
+
+        let base_args = agent.base_args(&request);
+        let (spawn, _) = agent.prepare_spawn(&request, &base_args).await?;
+        let args = spawn
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(args.contains(&ANTHROPIC_API_KEY_ENV.to_string()));
+        assert!(!args.iter().any(|arg| arg.contains(api_key)));
+        assert_eq!(
+            spawn.process_env.get(ANTHROPIC_API_KEY_ENV),
+            Some(&api_key.to_string())
+        );
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod compatibility_tests {

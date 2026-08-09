@@ -11,7 +11,7 @@
 //! Anything that varies per entry point is a parameter here. Everything else
 //! is applied identically by construction.
 
-use crate::claude::ClaudeCodeAgent;
+use crate::claude::{ClaudeCodeAgent, ANTHROPIC_API_KEY_ENV};
 use crate::codex::CodexAgent;
 use crate::codex_adapter::CodexAdapter;
 use crate::opencode::OpenCodeAgent;
@@ -25,10 +25,6 @@ use harness_core::{
     types::Capability,
 };
 use std::sync::Arc;
-
-/// Environment variable that supplies the Anthropic API key. The
-/// `anthropic-api` backend is registered only when it is set.
-const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
 /// An agent whose configuration is sealed at the canonical builder boundary.
 ///
@@ -100,6 +96,11 @@ fn claude_agent_from_config_with_gate(
     .with_stream_timeout(config.stream_timeout_secs);
     if let Some(budget) = config.claude.reasoning_budget.clone() {
         agent = agent.with_reasoning_budget(budget);
+    }
+    if let Some(api_key) =
+        harness_core::config::process_env::non_blank_config_value(ANTHROPIC_API_KEY_ENV)
+    {
+        agent = agent.with_anthropic_api_key(api_key);
     }
     ConfiguredAgent::new(agent)
 }

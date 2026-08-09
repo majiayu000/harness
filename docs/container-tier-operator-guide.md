@@ -2,8 +2,10 @@
 
 Harness can route untrusted GitHub issue intake to the `container` isolation
 tier. The container tier runs the agent CLI through Docker with only the task
-workspace mounted, no inherited operator secrets, and the scoped GitHub token
-mapped to `GITHUB_TOKEN` and `GH_TOKEN` inside the container.
+workspace mounted and no ambient inherited operator secrets. Harness maps the
+scoped GitHub token to `GITHUB_TOKEN` and `GH_TOKEN` inside the container. For
+Claude, it also forwards the explicitly configured `ANTHROPIC_API_KEY` provider
+credential by environment variable name, never as a value in Docker arguments.
 
 ## Build The Images
 
@@ -77,8 +79,14 @@ Start the server with both pinned images in the environment:
 ```bash
 export HARNESS_AGENT_CONTAINER_IMAGE=ghcr.io/OWNER/harness-agent@sha256:...
 export HARNESS_AGENT_EGRESS_PROXY_IMAGE=ghcr.io/OWNER/harness-egress-proxy@sha256:...
+export ANTHROPIC_API_KEY=sk-ant-...
 harness --config harness.toml serve
 ```
+
+The `ANTHROPIC_API_KEY` line is required when the selected container agent is
+Claude and it does not have another authentication mechanism provisioned in
+the image. Harness authorizes only that provider key for Claude container
+spawns; unrelated operator credentials remain filtered.
 
 `network_allowlist` is an exact-host allowlist. Harness starts one bundled
 proxy container per agent and puts the agent on a unique internal Docker

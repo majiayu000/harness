@@ -442,6 +442,12 @@ exporter = "otlp-http"
 # endpoint = "http://127.0.0.1:4318"
 ```
 
+With `default_agent = "auto"`, Claude is the first registered CLI agent. Start
+Harness with `ANTHROPIC_API_KEY` set when using the container tier. Harness
+forwards that provider credential to the Claude container by environment
+variable name; the value is kept out of Docker arguments. Other ambient
+operator secrets remain filtered.
+
 HTTP API authentication now fails closed by default. Starting `harness serve`
 without `server.api_token` or `HARNESS_API_TOKEN` exits with an actionable
 configuration error. For intentional tokenless local development, set
