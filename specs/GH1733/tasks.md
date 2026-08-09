@@ -15,15 +15,15 @@ GH-1733
 
 ## Readiness Gate
 
-This plan is not implementation approval. GH-1733 is currently
-`ready_to_spec`. Do not modify PR #1859 production code until maintainers
-approve all six files in this packet and record `ready_to_implement`. Once
-approved, amend the original PR branch only; do not create a replacement
-implementation PR or force-push.
+PR #1859 is merged and cannot accept amendments. The GH-1733 owner reopened
+the issue after a current-main completion audit and required remediation in a
+follow-up PR from current `main`. This revision records approval for that
+follow-up to implement the six-file packet without force-pushing or rewriting
+the merged PR.
 
 ## Implementation Tasks
 
-- [ ] `SP1733-T1` — Owner: core fingerprint model worker. Dependencies: approved product and tech specs plus `ready_to_implement`. Covers: B-001, B-003, B-008, B-011 through B-015. Done when: the strict outer envelope carries a canonical `fingerprint_digest` separate from ASC-001 exact-source-byte component integrity; its exact domain, three `u64` frames, string escaping, raw-number preservation, two framing vectors, and one full valid vector per subject are frozen independently; closed runtime/MCP payloads, probe and lifecycle-cleanup failures, injective runtime-role and configured-server-scoped MCP tool-source derivation, exact bounded MCP text, optional presence-sensitive raw-object `annotations`, required `inputSchema`, optional presence-sensitive `outputSchema`, and raw-JSON-only duplicate-aware object-root schema parsing are implemented in the split core modules. The core manifest explicitly enables existing `serde_json/raw_value`; a borrowed `RawValue` recursive visitor preserves exact validated number lexemes without a handwritten lexer, new package, or lockfile change. The schema parser defaults absent `$schema` to Draft 2020-12, accepts only the two exact Draft 2020-12 and Draft-07 identifiers, rejects unknown/non-string/nested dialect declarations, and applies `contentSchema`, modern dependency/prefix keywords, legacy `dependencies`, tuple `items`, and `additionalItems` only under the selected dialect; Draft-07 `contentSchema` remains ordered instance data. Core owns typed `RuntimeRoleSourceBinding::derive` and strict `parse`; exact source bytes and raw envelopes are each bounded at 2,097,152 before copy/hash or JSON allocation, base source locators at 4,096 UTF-8 bytes, and complete derived locators at 8,259; the four closed limit reasons and precedence are frozen, and configured MCP server identity uses the exact bounded stable key with the frozen HT/LF/CR/SP blank predicate. Every non-object schema root and every invalid subject/payload/source, dialect, capability, ordering, integrity, fingerprint-digest, or fixed resource-limit combination fails typed; callers cannot supply generic serializable/schema maps; constructors and parsers require an empty capability list; exact and limit-plus-one vectors cover source/locator/envelope sizes, stable-key blank bytes, number spellings, root depth, value nodes, decoded strings, direct entries, raw bytes, and canonical bytes; every core file is below 800 lines. Verify: `cargo test -p harness-core fingerprint`, `cargo test -p harness-core stack`, `cargo test -p harness-core`, `cargo check -p harness-core --all-targets`, and `cargo tree -e features -p harness-core`.
+- [ ] `SP1733-T1` — Owner: core fingerprint model worker. Dependencies: the approved follow-up revision of the product and tech specs. Covers: B-001, B-003, B-008, B-011 through B-015. Done when: the strict outer envelope carries a canonical `fingerprint_digest` separate from ASC-001 exact-source-byte component integrity; its exact domain, three `u64` frames, string escaping, raw-number preservation, two framing vectors, and one full valid vector per subject are frozen independently; closed runtime/MCP payloads, probe and lifecycle-cleanup failures, injective runtime-role and configured-server-scoped MCP tool-source derivation, exact bounded MCP text, optional presence-sensitive raw-object `annotations`, required `inputSchema`, optional presence-sensitive `outputSchema`, and raw-JSON-only duplicate-aware object-root schema parsing are implemented in the split core modules. The core manifest explicitly enables existing `serde_json/raw_value`; a borrowed `RawValue` recursive visitor preserves exact validated number lexemes without a handwritten lexer, new package, or lockfile change. The schema parser defaults absent `$schema` to Draft 2020-12, accepts only the two exact Draft 2020-12 and Draft-07 identifiers, rejects unknown/non-string/nested dialect declarations, and applies `contentSchema`, modern dependency/prefix keywords, legacy `dependencies`, tuple `items`, and `additionalItems` only under the selected dialect; Draft-07 `contentSchema` remains ordered instance data. Core owns typed `RuntimeRoleSourceBinding::derive` and strict `parse`; exact source bytes and raw envelopes are each bounded at 2,097,152 before copy/hash or JSON allocation, base source locators at 4,096 UTF-8 bytes, and complete derived locators at 8,259; the four closed limit reasons and precedence are frozen, and configured MCP server identity uses the exact bounded stable key with the frozen HT/LF/CR/SP blank predicate. Every non-object schema root and every invalid subject/payload/source, dialect, capability, ordering, integrity, fingerprint-digest, or fixed resource-limit combination fails typed; callers cannot supply generic serializable/schema maps; constructors and parsers require an empty capability list; exact and limit-plus-one vectors cover source/locator/envelope sizes, stable-key blank bytes, number spellings, root depth, value nodes, decoded strings, direct entries, raw bytes, and canonical bytes; every core file is below 800 lines. Verify: `cargo test -p harness-core fingerprint`, `cargo test -p harness-core stack`, `cargo test -p harness-core`, `cargo check -p harness-core --all-targets`, and `cargo tree -e features -p harness-core`.
       The schema transition table additionally treats `not`, `if`, `then`,
       `else`, `contains`, `propertyNames`, and `additionalProperties` as
       object/boolean schema positions in both dialects, and Draft-07
@@ -83,7 +83,7 @@ implementation PR or force-push.
       Verify: `cargo test -p harness-agents runtime_fingerprint`,
       `cargo test -p harness-agents`, and
       `cargo check -p harness-agents --all-targets`.
-- [ ] `SP1733-T3` — Owner: boundary contract worker. Dependencies: SP1733-T1 and SP1733-T2. Covers: B-002 and B-016. Done when: a `#[cfg(test)]`-only exhaustive workflow `RuntimeKind` mapping proves the three local kinds map one-to-one, `AnthropicApi`/`RemoteHost` are not local executables, and no non-host isolation can be interpreted as a host fingerprint subject; production call-site audit proves there is no snapshot, server, workflow-runtime, task-runner, `CodeAgent`, `AgentAdapter`, CLI, HTTP, persistence, or migration consumer; and the implementation diff matches the eighteen authorized paths exactly, including only the direct `libc` dependency edge in the existing `harness-agents` lockfile entry. Verify: `cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib` plus the manifest and `rg` audits described below.
+- [ ] `SP1733-T3` — Owner: boundary contract worker. Dependencies: SP1733-T1 and SP1733-T2. Covers: B-002 and B-016. Done when: a `#[cfg(test)]`-only exhaustive workflow `RuntimeKind` mapping proves the three local kinds map one-to-one while `AnthropicApi`, `RemoteHost`, and `OpenCode` map to `None`; `OpenCode` is not a v0.1 local fingerprint subject; no non-host isolation can be interpreted as a host fingerprint subject; production call-site audit proves there is no snapshot, server, workflow-runtime, task-runner, `CodeAgent`, `AgentAdapter`, CLI, HTTP, persistence, or migration consumer; and every implementation path is contained in the approved follow-up allowlist, including only the direct `libc` dependency edge in the existing `harness-agents` lockfile entry. Verify: `cargo test -p harness-server runtime_fingerprint_runtime_kind_contract_is_exhaustive --lib` plus the allowlist and `rg` audits described below.
 - [ ] `SP1733-T4` — Owner: verification and handoff owner.
       Dependencies: SP1733-T1 through SP1733-T3. Covers: B-001 through B-016.
       Done when formatting, focused/package/workspace tests, clippy,
@@ -110,7 +110,7 @@ implementation PR or force-push.
       exec-stop/hash verification, repository non-execution, platform gates,
       exact digest vectors, `ETXTBSY`, schema dialect behavior, source
       binding, annotation bounds, and unchanged producer-only scope.
-      The original PR may close GH-1733 only after all gates pass. Verify every
+      The follow-up PR may close GH-1733 only after all gates pass. Verify every
       command and audit in Required Verification on one current implementation
       head, then collect fresh PR-gate evidence.
 
@@ -123,11 +123,14 @@ files remain disjoint exactly as follows.
 | Task | Writable files |
 | --- | --- |
 | SP1733-T1 | `crates/harness-core/Cargo.toml`; `crates/harness-core/src/stack/mod.rs`; `crates/harness-core/src/stack/fingerprint.rs`; `crates/harness-core/src/stack/fingerprint/model.rs`; `crates/harness-core/src/stack/fingerprint/model/validation.rs`; `crates/harness-core/src/stack/fingerprint/schema.rs`; `crates/harness-core/src/stack/fingerprint/tests.rs`; `crates/harness-core/src/stack/fingerprint/tests/model.rs`; `crates/harness-core/src/stack/fingerprint/tests/schema.rs` |
-| SP1733-T2 | `Cargo.lock` (only the existing `harness-agents` direct `libc` edge); `crates/harness-agents/Cargo.toml`; `crates/harness-agents/src/lib.rs`; `crates/harness-agents/src/runtime_fingerprint.rs`; `crates/harness-agents/src/runtime_fingerprint/environment.rs`; `crates/harness-agents/src/runtime_fingerprint/executable.rs`; `crates/harness-agents/src/runtime_fingerprint/probe.rs`; `crates/harness-agents/src/runtime_fingerprint/tests.rs` |
+| SP1733-T2 | `Cargo.lock` (only the existing `harness-agents` direct `libc` edge); `crates/harness-agents/Cargo.toml`; `crates/harness-agents/src/lib.rs`; `crates/harness-agents/src/runtime_fingerprint.rs`; every approved module under `crates/harness-agents/src/runtime_fingerprint/`, including `owner.rs`, `registry.rs`, `tests/owner.rs`, and `tests/lifecycle.rs` |
 | SP1733-T3 | `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs` (`#[cfg(test)]` contract only) |
-| SP1733-T4 | Read-only verification, review-thread resolution, and original-branch handoff; no writable source files |
+| SP1733-T4 | Read-only verification, review-thread resolution, and follow-up-branch handoff; no writable source files |
 
-No other implementation path is authorized. The agents manifest may add only
+The writable-file rows are an allowlist: a follow-up diff may use any subset,
+but every changed implementation path must be listed. The two approved
+`specs/GH1733/{tech,tasks}.md` changes record this follow-up amendment. No other
+implementation path is authorized. The agents manifest may add only
 the existing workspace `libc`; the core manifest may only enable
 `serde_json/raw_value` on its existing workspace dependency. Do not edit any
 other Cargo file or lockfile entry,
@@ -153,8 +156,9 @@ of silently expanding scope.
 - [ ] Run `cargo audit`.
 - [ ] Run `git diff --check`.
 - [ ] Confirm every changed Rust file is below 800 lines after rustfmt.
-- [ ] Confirm the implementation changed-file set equals the eighteen paths in
-      the tech-spec `specrail-planned-changes` manifest.
+- [ ] Confirm every changed path is contained in the tech-spec
+      `specrail-planned-changes` follow-up allowlist; exact equality is not
+      required for paths whose approved implementation is already on `main`.
 - [ ] Confirm `Cargo.lock` adds only the direct `libc` edge to the existing
       `harness-agents` package and `cargo tree -p harness-agents -i libc`
       resolves the existing pinned workspace dependency; confirm
@@ -259,9 +263,8 @@ fixed vectors, never values generated by the helper under test.
 
 ## Handoff Notes
 
-- PR #1859 remains the sole implementation PR and must be repaired on its
-  original branch only after maintainers approve this packet and record
-  `ready_to_implement`.
+- PR #1859 is merged. GH-1733 remediation proceeds in one follow-up PR from
+  current `main`, as required by the issue owner's completion audit.
 - The six-file packet is normative as a unit:
   `product.md`, `runtime-product.md`, `runtime-observation.md`,
   `runtime-supervision.md`, `tech.md`, and `tasks.md`.
@@ -299,5 +302,5 @@ fixed vectors, never values generated by the helper under test.
 - Output precedence is capture completion, then signal/nonzero, then
   zero-exit-only UTF-8/blank/grammar selection.
 - Core schema dialect, raw-number preservation, MCP bounds, fingerprint digest,
-  authorized 18-path manifest, lockfile-edge-only, and producer-only constraints
-  are unchanged.
+  follow-up allowlist, lockfile-edge-only, and producer-only constraints remain
+  mandatory. `OpenCode` remains outside the v0.1 local fingerprint subjects.

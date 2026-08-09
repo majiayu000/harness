@@ -12,7 +12,7 @@ See `specs/GH1733/product.md` and the split runtime contracts in
 `tasks.md`.
 
 <!-- specrail-planned-changes
-{"issue":1733,"complete":true,"paths":["Cargo.lock","crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/model/validation.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint/tests/model.rs","crates/harness-core/src/stack/fingerprint/tests/schema.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
+{"issue":1733,"complete":true,"paths":["Cargo.lock","crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/authorization.rs","crates/harness-agents/src/runtime_fingerprint/candidate.rs","crates/harness-agents/src/runtime_fingerprint/capability.rs","crates/harness-agents/src/runtime_fingerprint/checkpoint.rs","crates/harness-agents/src/runtime_fingerprint/completion.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/exec_stop.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/launch.rs","crates/harness-agents/src/runtime_fingerprint/owner.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/registry.rs","crates/harness-agents/src/runtime_fingerprint/resolution.rs","crates/harness-agents/src/runtime_fingerprint/supervision.rs","crates/harness-agents/src/runtime_fingerprint/syscall_guard.rs","crates/harness-agents/src/runtime_fingerprint/target.rs","crates/harness-agents/src/runtime_fingerprint/test_fixtures.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-agents/src/runtime_fingerprint/tests/lifecycle.rs","crates/harness-agents/src/runtime_fingerprint/tests/owner.rs","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/model/validation.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint/tests/model.rs","crates/harness-core/src/stack/fingerprint/tests/schema.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs","specs/GH1733/tasks.md","specs/GH1733/tech.md"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
 -->
 
 ## Current System and Root Cause
@@ -22,9 +22,10 @@ component vocabulary, validated source locators and component IDs, exact
 SHA-256 values, observation/trust/freshness fields, and strict JSON parsing.
 GH-1733 must consume that contract; it must not redefine or weaken it.
 
-PR #1859 at head `c09002963031abdaf296922c1209df47bf0e97f4`
-currently changes four files and provides an unapproved first implementation.
-It has seven unresolved, non-outdated review findings:
+PR #1859 merged on 2026-08-06. A current-main completion audit recorded by
+the GH-1733 owner found that the merged implementation did not satisfy this
+subsequently approved contract. The historical implementation had seven
+representative unresolved review findings:
 
 1. `codex.cloud.setup_secret_env` is treated as runtime environment input, so
    a setup-only secret such as `NPM_ACCESS` can be hashed and passed to the
@@ -56,8 +57,8 @@ producer-only boundary required by B-016.
 The root cause is not one isolated bug. The implementation lacks four explicit
 boundaries: a strict typed wire model, a source-preserving producer input, a
 single supervised executable-observation lifecycle, and a context-aware schema
-canonicalizer. This specification replaces those boundaries before #1859 may
-be amended. It does not approve that implementation or advance issue readiness.
+canonicalizer. This specification replaces those boundaries in a follow-up
+implementation from current `main`; merged PR #1859 cannot be amended.
 
 ## Module and Ownership Design
 
@@ -78,8 +79,13 @@ before adding the remediation:
 - `stack/fingerprint/tests.rs` owns shared core fixtures and wire/digest tests;
   `stack/fingerprint/tests/model.rs` and `stack/fingerprint/tests/schema.rs` split the mandatory
   runtime-model and MCP schema matrices below the hard file-size ceiling.
-- `runtime_fingerprint.rs` owns configured-runtime inputs and the async
-  orchestration that assembles one runtime payload.
+- `runtime_fingerprint.rs` owns configured-runtime inputs and the public async
+  facade that assembles one runtime payload.
+- `runtime_fingerprint/owner.rs` owns admission, owner-thread startup, caller
+  cancellation, stop/join, and permit lifetime.
+- `runtime_fingerprint/registry.rs` owns the exact per-owner pidfd/non-pidfd
+  ledger, registered reap obligations, cleanup retention, and empty-registry
+  success barrier.
 - `runtime_fingerprint/environment.rs` owns the closed runtime-kind policy,
   platform key normalization, setup-secret exclusion, probe environment
   construction, and environment evidence.
@@ -87,8 +93,10 @@ before adding the remediation:
   handle-based inspection, bounded hashing, and path-identity checks.
 - `runtime_fingerprint/probe.rs` owns process supervision, combined output
   draining, exit classification, and version parsing.
-- `runtime_fingerprint/tests.rs` owns PATH, identity, environment, lifecycle,
-  and failure regressions.
+- `runtime_fingerprint/tests.rs` owns shared PATH, identity, environment, and
+  failure regressions; `runtime_fingerprint/tests/owner.rs` and
+  `runtime_fingerprint/tests/lifecycle.rs` split the mandatory owner-ledger,
+  cancellation, cleanup-retention, and success-barrier matrices.
 
 Every production file and test file must remain below 800 lines after rustfmt;
 the typical target is 200-400 lines. `stack/mod.rs` and `harness-agents/lib.rs`
@@ -278,9 +286,10 @@ malformed, noncanonical, or wrong-role suffixes fail typed.
 
 The `#[cfg(test)]` addition in
 `workflow_runtime_worker/runtime_profile.rs` imports the producer enum only in
-the test module and exhaustively matches all five workflow `RuntimeKind`
-variants: the three local variants map one-to-one; `AnthropicApi` and
-`RemoteHost` map to `None`. Adding a workflow variant therefore breaks this
+the test module and exhaustively matches all six workflow `RuntimeKind`
+variants: the three local variants map one-to-one; `AnthropicApi`,
+`RemoteHost`, and `OpenCode` map to `None`. `OpenCode` is not a v0.1 local
+fingerprint subject. Adding another workflow variant therefore breaks this
 test until its local-executable status is decided. This preserves dependency
 direction, adds no runtime consumer, and covers B-002 and B-016.
 
@@ -625,39 +634,27 @@ owns user-facing collection commands. This is B-016.
 
 ## Authorized Implementation Surface
 
-Only these paths are authorized:
+The `specrail-planned-changes` paths above are the approved follow-up allowlist.
+The changed-file set relative to the follow-up's current-main merge base must
+be a subset of that allowlist; equality is neither required nor expected,
+because PR #1859 already placed part of the approved implementation on `main`.
+The two listed spec files record this approved amendment and are not production
+implementation paths.
 
-1. `crates/harness-core/Cargo.toml` (enable `serde_json/raw_value` only)
-2. `crates/harness-core/src/stack/mod.rs`
-3. `crates/harness-core/src/stack/fingerprint.rs`
-4. `crates/harness-core/src/stack/fingerprint/model.rs`
-5. `crates/harness-core/src/stack/fingerprint/schema.rs`
-6. `crates/harness-core/src/stack/fingerprint/tests.rs`
-7. `crates/harness-agents/Cargo.toml` (direct existing workspace `libc` only)
-8. `crates/harness-agents/src/lib.rs`
-9. `crates/harness-agents/src/runtime_fingerprint.rs`
-10. `crates/harness-agents/src/runtime_fingerprint/environment.rs`
-11. `crates/harness-agents/src/runtime_fingerprint/executable.rs`
-12. `crates/harness-agents/src/runtime_fingerprint/probe.rs`
-13. `crates/harness-agents/src/runtime_fingerprint/tests.rs`
-14. `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs`
-    (`#[cfg(test)]` exhaustive mapping contract only)
-15. `Cargo.lock` (only the existing `harness-agents` package's direct `libc`
-    dependency edge)
-16. `crates/harness-core/src/stack/fingerprint/model/validation.rs`
-17. `crates/harness-core/src/stack/fingerprint/tests/model.rs`
-18. `crates/harness-core/src/stack/fingerprint/tests/schema.rs`
+The expanded agents surface authorizes the already split observation modules
+plus `owner.rs`, `registry.rs`, `tests/owner.rs`, and `tests/lifecycle.rs` for
+the exact owner-ledger and cancellation work required by SP1733-T2. It does not
+authorize a new public API or production consumer. The server path remains
+limited to the `#[cfg(test)]` exhaustive mapping contract.
 
-Moving the two existing inline test modules into their listed test files is
-part of this scope. The agents manifest may add only `libc = { workspace =
-true }`; the core manifest may change only its existing `serde_json` dependency
-to `{ workspace = true, features = ["raw_value"] }`. There is no new
-crate/version, source, or checksum. `Cargo.lock` may add only the direct `libc`
-edge named above. No other manifest,
-database, configuration, adapter, spawn contract, workflow model, CLI, HTTP,
-prompt, snapshot, or high-context file change is authorized. Any production
-server import or call site requires an ASC-005 consumer specification rather
-than an amendment here.
+The agents manifest may add only `libc = { workspace = true }`; the core
+manifest may change only its existing `serde_json` dependency to
+`{ workspace = true, features = ["raw_value"] }`. There is no new crate,
+version, source, or checksum. `Cargo.lock` may add only the direct `libc` edge
+named above. No other manifest, database, configuration, adapter, spawn
+contract, workflow model, CLI, HTTP, prompt, snapshot, or high-context file
+change is authorized. Any production server import or call site requires an
+ASC-005 consumer specification rather than an amendment here.
 
 ## Verification and Handoff Gates
 
@@ -680,11 +677,12 @@ cargo audit
 git diff --check
 ```
 
-The changed-file audit must equal the eighteen-path manifest. `Cargo.lock` must
-differ only by the direct `libc` edge in the existing `harness-agents` package,
-and `cargo tree -p harness-agents -i libc` must show the pinned workspace
-dependency. `cargo tree -e features -p harness-core` must show the
-direct `serde_json/raw_value` feature. A call-site audit
+The changed-file audit must prove every changed path is in the approved
+follow-up allowlist. `Cargo.lock` must differ only by the direct `libc` edge in
+the existing `harness-agents` package, and
+`cargo tree -p harness-agents -i libc` must show the pinned workspace
+dependency. `cargo tree -e features -p harness-core` must show the direct
+`serde_json/raw_value` feature. A call-site audit
 must show that production uses of the new APIs remain confined to their
 defining modules; test uses do not count as consumers. File-length checks must
 show every Rust file below 800 lines. The sandbox parity gate and Linux
@@ -716,13 +714,12 @@ checker, verification must not claim to run a removed script; structural
 review of the manifest and B-001 through B-016 coverage is the current spec
 check.
 
-PR #1859 may be amended on its original branch only after this spec packet is
-approved and maintainers record `ready_to_implement`. Then every valid review
-finding must be addressed and resolved, the branch must be updated to current
-`main`, and fresh current-head CI, independent review, Gemini review, and
-repository ruleset approval must pass before merge. This spec does not itself
-approve implementation, resolve a thread, close GH-1733, or authorize bypass of
-those gates.
+The GH-1733 owner has required a follow-up PR from current `main` because PR
+#1859 is merged. Every valid historical finding must be addressed on that
+follow-up, and fresh current-head CI, independent review, available advisory
+bot review, and repository ruleset approval must pass before merge. This spec
+does not itself resolve a thread, close GH-1733, or authorize bypass of those
+gates.
 
 ## Rollout and Rollback
 
