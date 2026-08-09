@@ -263,7 +263,9 @@ fn supervise_initial_stop(
         Err(_) => return verification_cleanup(pidfd, pre_exec, stdout, stderr),
     };
     match after_exec {
-        TargetEvent::Stopped(libc::SIGTRAP) if is_exec_event(pid) => {
+        TargetEvent::Stopped(status)
+            if status == libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8) && is_exec_event(pid) =>
+        {
             super::probe::close_fd(pre_exec);
             Ok(TargetStart::ExecStopped(StoppedTarget {
                 pid,

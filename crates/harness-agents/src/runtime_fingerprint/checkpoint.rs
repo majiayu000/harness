@@ -3,7 +3,7 @@
 use super::candidate::RetainedExecutable;
 use super::executable::{CandidateReference, ResolvedCandidate, RetainedWorkingDirectory};
 use super::{
-    RuntimeFingerprintProduceError, RuntimeObservationProtocolReason,
+    RuntimeFingerprintProduceError, RuntimeObservationProtocolReason, RuntimeObservationStage,
     ValidatedRepositoryBoundarySet,
 };
 use std::ffi::CString;
@@ -46,6 +46,41 @@ pub(super) fn pre_spawn(
     boundaries: &ValidatedRepositoryBoundarySet,
     deadline: Instant,
 ) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
+    checkpoint(
+        candidate,
+        working_directory,
+        executable,
+        boundaries,
+        deadline,
+        RuntimeObservationStage::PreSpawnCheckpoint,
+    )
+}
+
+pub(super) fn post_reap(
+    candidate: &ResolvedCandidate,
+    working_directory: &RetainedWorkingDirectory,
+    executable: &RetainedExecutable,
+    boundaries: &ValidatedRepositoryBoundarySet,
+    deadline: Instant,
+) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
+    checkpoint(
+        candidate,
+        working_directory,
+        executable,
+        boundaries,
+        deadline,
+        RuntimeObservationStage::PostReapCheckpoint,
+    )
+}
+
+fn checkpoint(
+    candidate: &ResolvedCandidate,
+    working_directory: &RetainedWorkingDirectory,
+    executable: &RetainedExecutable,
+    boundaries: &ValidatedRepositoryBoundarySet,
+    deadline: Instant,
+    stage: RuntimeObservationStage,
+) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
     let (working_directory_fd, path) = match &candidate.reference {
         CandidateReference::Absolute(path) => (None, path),
         CandidateReference::WorkingDirectoryRelative(path) => (Some(working_directory.fd()), path),
@@ -72,16 +107,16 @@ pub(super) fn pre_spawn(
             expected_digest,
         },
         deadline,
+        stage,
     )
 }
 
 fn run_child(
     context: &CheckpointContext<'_>,
     deadline: Instant,
+    stage: RuntimeObservationStage,
 ) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
-    let role = super::RuntimeOwnedChildRole::Observation(
-        super::RuntimeObservationStage::PreSpawnCheckpoint,
-    );
+    let role = super::RuntimeOwnedChildRole::Observation(stage);
     let mut gate = [-1; 2];
     let mut status = [-1; 2];
     let mut protocol = [-1; 2];
@@ -178,14 +213,14 @@ fn run_child(
         ));
     }
     super::probe::close_fd(gate[1]);
-    let checkpoint = receive(protocol[0], deadline);
+    let checkpoint = receive(protocol[0], deadline, stage);
     super::probe::close_fd(protocol[0]);
     let exited = super::probe::waitid_pidfd(pidfd, false, deadline);
     if !matches!(exited, Ok((seen, libc::CLD_EXITED, 0)) if seen == pid) {
         let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
         super::probe::cleanup_registered_child(pidfd, cleanup_deadline, role)?;
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
-            stage: super::RuntimeObservationStage::PreSpawnCheckpoint,
+            stage,
             reason: RuntimeObservationProtocolReason::HelperExited,
         });
     }
@@ -330,6 +365,7 @@ fn child_send(fd: libc::c_int, value: u8) -> ! {
 fn receive(
     fd: libc::c_int,
     deadline: Instant,
+    stage: RuntimeObservationStage,
 ) -> Result<PreSpawnCheckpoint, RuntimeFingerprintProduceError> {
     let remaining = deadline
         .saturating_duration_since(Instant::now())
@@ -340,17 +376,13 @@ fn receive(
         revents: 0,
     };
     if unsafe { libc::poll(&mut pollfd, 1, remaining.min(i32::MAX as u128) as _) } <= 0 {
-        return Err(
-            RuntimeFingerprintProduceError::ObservationDeadlineExceeded {
-                stage: super::RuntimeObservationStage::PreSpawnCheckpoint,
-            },
-        );
+        return Err(RuntimeFingerprintProduceError::ObservationDeadlineExceeded { stage });
     }
     let mut frame = [0_u8; 2];
     let received = unsafe { libc::recv(fd, frame.as_mut_ptr().cast(), frame.len(), 0) };
     if received != 1 {
         return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
-            stage: super::RuntimeObservationStage::PreSpawnCheckpoint,
+            stage,
             reason: if received > 1 {
                 RuntimeObservationProtocolReason::SurplusFields
             } else {
@@ -367,7 +399,7 @@ fn receive(
         UNLINKED_TARGET => Ok(PreSpawnCheckpoint::UnlinkedTarget),
         MULTIPLE_HARD_LINKS => Ok(PreSpawnCheckpoint::MultipleHardLinks),
         _ => Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
-            stage: super::RuntimeObservationStage::PreSpawnCheckpoint,
+            stage,
             reason: RuntimeObservationProtocolReason::SurplusFields,
         }),
     }

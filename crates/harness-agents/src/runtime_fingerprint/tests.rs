@@ -564,17 +564,7 @@ async fn linux_retained_static_candidate_requires_repository_boundaries() {
 
 #[cfg(target_os = "linux")]
 fn write_static_fixture(directory: &Path, name: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let machine = if cfg!(target_arch = "x86_64") {
-        62
-    } else {
-        183
-    };
-    let executable = directory.join(name);
-    std::fs::write(&executable, static_elf_fixture(machine)).unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    executable
+    super::test_fixtures::write_version_fixture(directory, name)
 }
 
 #[cfg(target_os = "linux")]
@@ -616,19 +606,31 @@ async fn linux_target_authorization_classifies_repository_and_external_handles()
         std::iter::empty::<&Path>(),
     )
     .unwrap();
-    let error = fingerprint_configured_runtime_executable(
+    let envelope = fingerprint_configured_runtime_executable(
         &configured_path(&external_executable),
         &RuntimeFingerprintOptions::new(std::env::current_dir().unwrap())
             .with_repository_boundaries(boundaries),
     )
     .await
-    .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            RuntimeFingerprintProduceError::ExecutionVerificationUnavailable
-        ),
-        "unexpected post-exec verification result: {error:?}"
+    .unwrap();
+    let observed: serde_json::Value =
+        serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap();
+    assert_eq!(
+        observed["payload"]["resolution_attempts"][0]["outcome"],
+        "exec_started"
+    );
+    assert_eq!(observed["payload"]["failures"], serde_json::json!([]));
+    assert_eq!(
+        observed["payload"]["version"]["normalized_version"],
+        "1.2.3"
+    );
+    assert_eq!(
+        observed["payload"]["executable"]["checkpoint_consistent_path"],
+        true
+    );
+    assert_eq!(
+        observed["payload"]["executable"]["exec_stop_consistent_handle"],
+        true
     );
 }
 

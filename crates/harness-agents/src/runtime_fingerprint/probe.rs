@@ -7,10 +7,7 @@ use super::{
     RuntimeFingerprintProduceError,
 };
 use harness_core::stack::fingerprint::AgentStackFingerprintEnvelope;
-use harness_core::stack::fingerprint::{
-    RuntimeExecSequence, RuntimeExecutionContext, RuntimeProbeFailure, RuntimeProbeFailureKind,
-    RuntimeResolutionAttempt, RuntimeResolutionAttemptOutcome,
-};
+use harness_core::stack::fingerprint::{RuntimeProbeFailure, RuntimeProbeFailureKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -72,7 +69,7 @@ pub(super) fn owner_run(
             attempts,
         } => (candidate, retained, attempts),
     };
-    let (candidate, retained, mut attempts) = selected;
+    let (candidate, retained, attempts) = selected;
     let target = super::target::start_initial(
         executable,
         &environment,
@@ -82,72 +79,20 @@ pub(super) fn owner_run(
     )?;
     match target {
         super::target::TargetStart::ExecStopped(stopped) => {
-            let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
-            let checkpoint = match super::exec_stop::verify(stopped.pid(), &retained, deadline) {
-                Ok(checkpoint) => checkpoint,
-                Err(error) => {
-                    stopped.terminate_without_resume(cleanup_deadline)?;
-                    return Err(error);
-                }
-            };
-            if checkpoint == super::exec_stop::ExecStopCheckpoint::IdentityChanged {
-                stopped.terminate_without_resume(cleanup_deadline)?;
-                attempts.push(RuntimeResolutionAttempt::new(
-                    candidate.candidate_digest.clone(),
-                    RuntimeResolutionAttemptOutcome::ExecVerificationFailed,
-                    RuntimeExecSequence::Single,
-                    Some(RuntimeExecutionContext::LinuxFdCloexecExecveatEmptyPathFd10),
-                )?);
-                return super::finish_runtime_envelope(
-                    executable,
-                    super::RuntimeEnvelopeEvidence {
-                        command_form: command.command_form,
-                        configured_command_digest: command.configured_command_digest,
-                        working_directory_digest: command.working_directory_digest,
-                        working_directory_identity_digest: working_directory
-                            .identity_digest
-                            .clone(),
-                        resolution_attempts: attempts,
-                        executable: None,
-                        version: None,
-                        environment: environment.facts,
-                        failures: vec![RuntimeProbeFailure::new(
-                            RuntimeProbeFailureKind::IdentityChanged,
-                        )?],
-                    },
-                );
-            }
-            attempts.push(RuntimeResolutionAttempt::new(
-                candidate.candidate_digest.clone(),
-                RuntimeResolutionAttemptOutcome::ExecStarted,
-                RuntimeExecSequence::Single,
-                Some(RuntimeExecutionContext::LinuxFdCloexecExecveatEmptyPathFd10),
-            )?);
-            match super::supervision::run(stopped, options.max_output_bytes(), deadline)? {
-                super::supervision::SupervisionOutcome::Failed(failure) => {
-                    return super::finish_runtime_envelope(
-                        executable,
-                        super::RuntimeEnvelopeEvidence {
-                            command_form: command.command_form,
-                            configured_command_digest: command.configured_command_digest,
-                            working_directory_digest: command.working_directory_digest,
-                            working_directory_identity_digest: working_directory
-                                .identity_digest
-                                .clone(),
-                            resolution_attempts: attempts,
-                            executable: None,
-                            version: None,
-                            environment: environment.facts,
-                            failures: vec![failure],
-                        },
-                    );
-                }
-                super::supervision::SupervisionOutcome::Captured {
-                    stdout,
-                    stderr,
-                    termination,
-                } => drop((stdout, stderr, termination)),
-            }
+            return super::completion::complete_initial(
+                super::completion::InitialCompletion {
+                    configured: executable,
+                    options,
+                    environment: &environment,
+                    command: &command,
+                    working_directory: &working_directory,
+                    candidate: &candidate,
+                    executable: &retained,
+                },
+                attempts,
+                stopped,
+                deadline,
+            );
         }
         super::target::TargetStart::SetupFailed(detail) => {
             let _setup_failure = detail;

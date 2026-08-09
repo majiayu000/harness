@@ -9,6 +9,8 @@ mod authorization;
 mod candidate;
 #[cfg(target_os = "linux")]
 mod checkpoint;
+#[cfg(target_os = "linux")]
+mod completion;
 mod environment;
 #[cfg(target_os = "linux")]
 mod exec_stop;
@@ -23,6 +25,8 @@ mod supervision;
 mod syscall_guard;
 #[cfg(target_os = "linux")]
 mod target;
+#[cfg(all(test, target_os = "linux"))]
+mod test_fixtures;
 
 use harness_core::config::agents::{AgentsConfig, SandboxMode};
 use harness_core::config::isolation::IsolationTier;
