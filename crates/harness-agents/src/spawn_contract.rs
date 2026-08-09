@@ -150,6 +150,15 @@ impl ContainerBindMount {
             read_only: false,
         }
     }
+
+    pub(crate) fn harness_temp_read_only(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            source,
+            destination,
+            scope: ContainerBindMountScope::HarnessTemp,
+            read_only: true,
+        }
+    }
 }
 
 pub(crate) struct AgentSpawnInput<'a> {

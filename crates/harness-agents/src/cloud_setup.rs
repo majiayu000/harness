@@ -695,6 +695,46 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "requires the reference agent Docker image"]
+    async fn secret_backed_container_setup_masks_persistent_state() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let persistent_state = dir.path().join(".harness/cloud-setup-state");
+        fs::create_dir_all(&persistent_state)?;
+        fs::write(persistent_state.join("existing"), b"secret")?;
+        let cloud = CodexCloudConfig {
+            enabled: true,
+            cache_ttl_hours: 12,
+            setup_commands: vec!["test ! -e .harness/cloud-setup-state/existing".to_string()],
+            setup_secret_env: vec!["HARNESS_TEST_SETUP_TOKEN".to_string()],
+        };
+        let env_vars = HashMap::from([
+            (
+                AGENT_ISOLATION_TIER_ENV.to_string(),
+                "container".to_string(),
+            ),
+            (
+                AGENT_CONTAINER_IMAGE_ENV.to_string(),
+                "harness-agent:gh1771".to_string(),
+            ),
+        ]);
+
+        run_setup_phase(
+            &cloud,
+            CloudSetupContext {
+                project_root: dir.path(),
+                sandbox_mode: SandboxMode::DangerFullAccess,
+                permission_mode: AgentPermissionMode::Full,
+                env_vars: &env_vars,
+                capability_token: None,
+            },
+        )
+        .await?;
+
+        assert_eq!(fs::read(persistent_state.join("existing"))?, b"secret");
+        Ok(())
+    }
+
     async fn run_test_setup(cloud: &CodexCloudConfig, project_root: &Path) -> anyhow::Result<()> {
         let env_vars = HashMap::new();
         run_setup_phase(

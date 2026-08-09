@@ -160,6 +160,11 @@ impl SecretSetupState {
             fs::create_dir(&path).map_err(|error| state_error("create secret", &path, error))?;
             set_container_writable(&path, mode)?;
         }
+        if container_tier {
+            let mask = directory.path().join("state-mask");
+            fs::create_dir(&mask).map_err(|error| state_error("create secret", &mask, error))?;
+            set_container_writable(&mask, 0o755)?;
+        }
         Ok(Some(Self {
             directory,
             cleanup_image: container_tier
@@ -171,6 +176,10 @@ impl SecretSetupState {
         if self.cleanup_image.is_some() {
             set_container_state_env(env_vars);
             vec![
+                ContainerBindMount::harness_temp_read_only(
+                    self.directory.path().join("state-mask"),
+                    PathBuf::from(CONTAINER_STATE_MASK),
+                ),
                 ContainerBindMount::harness_temp(
                     self.directory.path().join("home"),
                     PathBuf::from(CONTAINER_CLOUD_HOME),
@@ -373,7 +382,16 @@ mod tests {
         };
         let mut setup_env = HashMap::new();
         let mounts = state.apply(&mut setup_env);
-        let Some(root) = mounts[0].source.parent().map(Path::to_path_buf) else {
+        assert_eq!(mounts.len(), 3);
+        assert_eq!(
+            mounts[0],
+            ContainerBindMount::harness_temp_read_only(
+                mounts[0].source.clone(),
+                PathBuf::from(CONTAINER_STATE_MASK),
+            )
+        );
+        assert!(!mounts[0].source.starts_with(project.path()));
+        let Some(root) = mounts[1].source.parent().map(Path::to_path_buf) else {
             anyhow::bail!("secret state mount must have a parent");
         };
 

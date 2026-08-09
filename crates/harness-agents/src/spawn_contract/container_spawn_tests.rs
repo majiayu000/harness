@@ -275,16 +275,21 @@ fn container_spawn_accepts_harness_owned_temporary_mount() -> anyhow::Result<()>
         .prefix("harness-cloud-setup-")
         .tempdir()?;
     let home = temporary.path().join("home");
+    let state_mask = temporary.path().join("state-mask");
     std::fs::create_dir(&home)?;
+    std::fs::create_dir(&state_mask)?;
     let env_vars = HashMap::from([(
         AGENT_ISOLATION_TIER_ENV.to_string(),
         "container".to_string(),
     )]);
     let sandbox_spec = SandboxSpec::new(SandboxMode::ReadOnly, root.path());
-    let mounts = [ContainerBindMount::harness_temp(
-        home.clone(),
-        PathBuf::from("/harness-cloud-home"),
-    )];
+    let mounts = [
+        ContainerBindMount::harness_temp(home.clone(), PathBuf::from("/harness-cloud-home")),
+        ContainerBindMount::harness_temp_read_only(
+            state_mask.clone(),
+            PathBuf::from("/workspace/.harness/cloud-setup-state"),
+        ),
+    ];
 
     let spawn = ContainerSpawn.prepare(
         AgentSpawnInput {
@@ -304,6 +309,10 @@ fn container_spawn_accepts_harness_owned_temporary_mount() -> anyhow::Result<()>
     assert!(string_args(&spawn).contains(&format!(
         "type=bind,src={},dst=/harness-cloud-home",
         std::fs::canonicalize(home)?.display()
+    )));
+    assert!(string_args(&spawn).contains(&format!(
+        "type=bind,src={},dst=/workspace/.harness/cloud-setup-state,readonly",
+        std::fs::canonicalize(state_mask)?.display()
     )));
     Ok(())
 }
