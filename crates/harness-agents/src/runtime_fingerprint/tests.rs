@@ -422,3 +422,48 @@ fn runtime_output_exit_precedence_and_blank_predicate_are_closed() {
         "unparseable_version"
     );
 }
+
+fn static_elf_fixture(machine: u16) -> Vec<u8> {
+    let mut image = vec![0_u8; 120];
+    image[..4].copy_from_slice(b"\x7fELF");
+    image[4] = 2;
+    image[5] = 1;
+    image[6] = 1;
+    image[16..18].copy_from_slice(&2_u16.to_le_bytes());
+    image[18..20].copy_from_slice(&machine.to_le_bytes());
+    image[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    image[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    image[52..54].copy_from_slice(&64_u16.to_le_bytes());
+    image[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    image[56..58].copy_from_slice(&1_u16.to_le_bytes());
+    image[64..68].copy_from_slice(&0x6474_e551_u32.to_le_bytes());
+    image[68..72].copy_from_slice(&6_u32.to_le_bytes());
+    image
+}
+
+#[test]
+fn static_elf_classifier_freezes_architecture_and_program_header_policy() {
+    let eligible = static_elf_fixture(62);
+    assert_eq!(
+        classify_static_linux_elf(&eligible, LinuxElfArchitecture::X86_64),
+        LinuxStaticElfClassification::Eligible
+    );
+    assert_eq!(
+        classify_static_linux_elf(&eligible, LinuxElfArchitecture::Aarch64),
+        LinuxStaticElfClassification::Unsupported
+    );
+
+    let mut interpreter = eligible.clone();
+    interpreter[64..68].copy_from_slice(&3_u32.to_le_bytes());
+    let mut executable_stack = eligible.clone();
+    executable_stack[68..72].copy_from_slice(&7_u32.to_le_bytes());
+    let mut writable_executable = eligible.clone();
+    writable_executable[64..68].copy_from_slice(&1_u32.to_le_bytes());
+    writable_executable[68..72].copy_from_slice(&3_u32.to_le_bytes());
+    for unsupported in [interpreter, executable_stack, writable_executable] {
+        assert_eq!(
+            classify_static_linux_elf(&unsupported, LinuxElfArchitecture::X86_64),
+            LinuxStaticElfClassification::Unsupported
+        );
+    }
+}

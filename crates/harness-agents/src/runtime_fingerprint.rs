@@ -36,7 +36,10 @@ pub use environment::{
     classify_completed_runtime_output, windows_working_directory_digest,
     RuntimeOutputClassification, RuntimeTermination,
 };
-pub use executable::runtime_working_directory_identity_digest;
+pub use executable::{
+    classify_static_linux_elf, runtime_working_directory_identity_digest, LinuxElfArchitecture,
+    LinuxStaticElfClassification,
+};
 
 pub const RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES: u64 = 67_108_864;
 pub const RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES: usize = 65_536;

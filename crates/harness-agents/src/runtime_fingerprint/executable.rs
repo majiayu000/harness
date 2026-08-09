@@ -17,6 +17,103 @@ const WORKING_DIRECTORY_IDENTITY_DOMAIN: &[u8] =
     b"harness_runtime_working_directory_identity_v0_1\0";
 const CANDIDATE_DIGEST_DOMAIN: &[u8] = b"harness_runtime_resolution_candidate_v0_1\0";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxElfArchitecture {
+    X86_64,
+    Aarch64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxStaticElfClassification {
+    Eligible,
+    Unsupported,
+    ExecutableTooLarge,
+}
+
+pub fn classify_static_linux_elf(
+    image: &[u8],
+    architecture: LinuxElfArchitecture,
+) -> LinuxStaticElfClassification {
+    if image.len() as u64 > super::RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES {
+        return LinuxStaticElfClassification::ExecutableTooLarge;
+    }
+    if image.len() < 64
+        || &image[..4] != b"\x7fELF"
+        || image[4] != 2
+        || image[5] != 1
+        || image[6] != 1
+        || le_u32(image, 20) != Some(1)
+        || le_u16(image, 52) != Some(64)
+        || le_u16(image, 54) != Some(56)
+    {
+        return LinuxStaticElfClassification::Unsupported;
+    }
+    let expected_machine = match architecture {
+        LinuxElfArchitecture::X86_64 => 62,
+        LinuxElfArchitecture::Aarch64 => 183,
+    };
+    if !matches!(le_u16(image, 16), Some(2 | 3)) || le_u16(image, 18) != Some(expected_machine) {
+        return LinuxStaticElfClassification::Unsupported;
+    }
+    let Some(program_offset) = le_u64(image, 32).and_then(|value| usize::try_from(value).ok())
+    else {
+        return LinuxStaticElfClassification::Unsupported;
+    };
+    let Some(program_count) = le_u16(image, 56).map(usize::from) else {
+        return LinuxStaticElfClassification::Unsupported;
+    };
+    let Some(program_bytes) = program_count.checked_mul(56) else {
+        return LinuxStaticElfClassification::Unsupported;
+    };
+    if program_count == 0
+        || program_count == 0xffff
+        || program_offset
+            .checked_add(program_bytes)
+            .is_none_or(|end| end > image.len())
+    {
+        return LinuxStaticElfClassification::Unsupported;
+    }
+    let mut stack_headers = 0;
+    for index in 0..program_count {
+        let offset = program_offset + index * 56;
+        let program_type = le_u32(image, offset);
+        let flags = le_u32(image, offset + 4);
+        if program_type == Some(3)
+            || (program_type == Some(1) && flags.is_some_and(|value| value & 3 == 3))
+        {
+            return LinuxStaticElfClassification::Unsupported;
+        }
+        if program_type == Some(0x6474_e551) {
+            stack_headers += 1;
+            if flags.is_some_and(|value| value & 1 != 0) {
+                return LinuxStaticElfClassification::Unsupported;
+            }
+        }
+    }
+    if stack_headers == 1 {
+        LinuxStaticElfClassification::Eligible
+    } else {
+        LinuxStaticElfClassification::Unsupported
+    }
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let value = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn le_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let value = bytes.get(offset..offset.checked_add(8)?)?;
+    Some(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CandidateReference {
     Absolute(PathBuf),
