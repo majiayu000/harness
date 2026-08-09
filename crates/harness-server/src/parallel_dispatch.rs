@@ -4,6 +4,7 @@ use harness_core::{
     agent::AgentResponse,
     agent::CodeAgent,
     capability::CapabilityToken,
+    config::HarnessConfig,
     types::{ContextItem, TaskId},
 };
 use std::path::{Path, PathBuf};
@@ -273,6 +274,7 @@ pub async fn run_parallel_subtasks(
     base_branch: &str,
     context: Vec<ContextItem>,
     turn_timeout: Duration,
+    config: &HarnessConfig,
 ) -> ParallelRunResult {
     let is_sequential = subtasks.iter().any(|s| !s.depends_on_indices.is_empty());
 
@@ -287,6 +289,7 @@ pub async fn run_parallel_subtasks(
             base_branch,
             context,
             turn_timeout,
+            config,
         )
         .await;
     }
@@ -301,6 +304,7 @@ pub async fn run_parallel_subtasks(
         base_branch,
         context,
         turn_timeout,
+        config,
     )
     .await
 }
@@ -326,6 +330,7 @@ async fn run_sequential_subtasks(
     base_branch: &str,
     context: Vec<ContextItem>,
     turn_timeout: Duration,
+    config: &HarnessConfig,
 ) -> ParallelRunResult {
     let total = subtasks.len();
     let mut results = Vec::with_capacity(total);
@@ -364,13 +369,14 @@ async fn run_sequential_subtasks(
     );
 
     for (i, spec) in subtasks.into_iter().enumerate() {
-        let req = AgentRequest {
+        let mut req = AgentRequest {
             prompt: spec.prompt,
             project_root: workspace.clone(),
             context: context.clone(),
             capability_token: Some(seq_token.clone()),
             ..Default::default()
         };
+        req.apply_configured_policy(config);
         // Spawn into a task so a panic in agent.execute surfaces as JoinError
         // instead of unwinding through this function and skipping cleanup.
         //
@@ -459,6 +465,7 @@ async fn run_concurrent_subtasks(
     base_branch: &str,
     context: Vec<ContextItem>,
     turn_timeout: Duration,
+    config: &HarnessConfig,
 ) -> ParallelRunResult {
     let count = subtasks.len();
     let mut handles: Vec<tokio::task::JoinHandle<(usize, Result<AgentResponse, String>)>> =
@@ -480,6 +487,7 @@ async fn run_concurrent_subtasks(
         let remote = remote.to_string();
         let base_branch = base_branch.to_string();
         let sem = Arc::clone(&sem);
+        let config = config.clone();
         let handle = tokio::spawn(async move {
             // Acquire semaphore first (unbounded wait), then apply timeout only to
             // the actual agent execution. Workspace acquisition is part of the
@@ -507,13 +515,14 @@ async fn run_concurrent_subtasks(
                 token_write_paths(workspace.clone()),
                 turn_timeout.saturating_add(Duration::from_secs(60)),
             );
-            let req = AgentRequest {
+            let mut req = AgentRequest {
                 prompt: spec.prompt,
                 project_root: workspace,
                 context,
                 capability_token: Some(token),
                 ..Default::default()
             };
+            req.apply_configured_policy(&config);
             let agent_clone = agent.clone();
             let mut agent_handle = tokio::spawn(async move { agent_clone.execute(req).await });
             let _agent_abort_guard = AbortOnDrop(agent_handle.abort_handle());

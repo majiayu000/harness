@@ -32,19 +32,23 @@ const GIT_LOCAL_ENV_VARS: &[&str] = &[
 
 struct SequencedAgent {
     outputs: Mutex<VecDeque<String>>,
-    prompts: Mutex<Vec<String>>,
+    requests: Mutex<Vec<AgentRequest>>,
 }
 
 impl SequencedAgent {
     fn new(outputs: impl IntoIterator<Item = &'static str>) -> Self {
         Self {
             outputs: Mutex::new(outputs.into_iter().map(str::to_string).collect()),
-            prompts: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
         }
     }
 
     fn prompt_count(&self) -> usize {
-        self.prompts.lock().unwrap().len()
+        self.requests.lock().unwrap().len()
+    }
+
+    fn requests(&self) -> Vec<AgentRequest> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -59,7 +63,7 @@ impl CodeAgent for SequencedAgent {
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
-        self.prompts.lock().unwrap().push(req.prompt);
+        self.requests.lock().unwrap().push(req);
         let output = self
             .outputs
             .lock()
@@ -136,6 +140,10 @@ async fn sequential_whitespace_output_aborts_remaining_steps() -> anyhow::Result
         ..Default::default()
     })?);
     let agent = Arc::new(SequencedAgent::new([" \n\t", "should not run"]));
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.agents.capability_profile = harness_core::config::agents::CapabilityProfile::Full;
+    config.isolation.default_tier = harness_core::config::isolation::IsolationTier::Container;
+    config.isolation.network_allowlist = vec!["api.openai.com".to_string()];
     let subtasks = vec![
         SubtaskSpec {
             prompt: "step 1".to_string(),
@@ -157,11 +165,29 @@ async fn sequential_whitespace_output_aborts_remaining_steps() -> anyhow::Result
         &base_branch,
         Vec::new(),
         Duration::from_secs(5),
+        &config,
     )
     .await;
 
     assert!(result.is_sequential);
     assert_eq!(agent.prompt_count(), 1, "second step must not execute");
+    let requests = agent.requests();
+    assert_eq!(
+        requests[0].permission_mode,
+        harness_core::config::agents::AgentPermissionMode::Full
+    );
+    assert_eq!(
+        requests[0]
+            .env_vars
+            .get(harness_core::agent::AGENT_ISOLATION_TIER_ENV),
+        Some(&"container".to_string())
+    );
+    assert_eq!(
+        requests[0]
+            .env_vars
+            .get(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV),
+        Some(&"api.openai.com".to_string())
+    );
     assert_eq!(result.results.len(), 1);
     assert_eq!(result.results[0].index, 0);
     assert!(result.results[0].response.is_none());
@@ -208,6 +234,7 @@ async fn concurrent_subtasks_release_pool_slots_before_creating_all_workspaces(
             &base_branch,
             Vec::new(),
             Duration::from_secs(5),
+            &harness_core::config::HarnessConfig::default(),
         ),
     )
     .await

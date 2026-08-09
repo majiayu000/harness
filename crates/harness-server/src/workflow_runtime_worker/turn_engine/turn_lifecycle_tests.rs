@@ -13,13 +13,43 @@ use harness_core::config::HarnessConfig;
 use harness_core::error::HarnessError;
 use harness_core::types::{AgentId, Capability, Item, TokenUsage, TurnId, TurnStatus};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use tokio::sync::mpsc;
 
 struct CountingAgent {
     calls: Arc<AtomicUsize>,
+}
+
+struct VerifiedThenFailedAgent;
+
+#[async_trait::async_trait]
+impl CodeAgent for VerifiedThenFailedAgent {
+    fn name(&self) -> &str {
+        "verified-then-failed"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![Capability::Read]
+    }
+
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        unreachable!("the lifecycle test exercises streaming only")
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: AgentRequest,
+        tx: mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        tx.send(StreamItem::EgressVerifiedAtDispatch)
+            .await
+            .map_err(|error| HarnessError::AgentExecution(format!("stream closed: {error}")))?;
+        Err(HarnessError::AgentExecution(
+            "unrelated failure after spawn".to_string(),
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -255,6 +285,45 @@ async fn lifecycle_force_code_agent_bypasses_turn_adapter() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn lifecycle_preserves_egress_verification_after_unrelated_failure() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut config = HarnessConfig::default();
+    config.server.project_root = root.path().to_path_buf();
+    config.agents.default_agent = "codex".to_string();
+    let mut registry = AgentRegistry::new("codex");
+    registry.register("codex", Arc::new(VerifiedThenFailedAgent));
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let turn_id = start_test_turn(&server, root.path())?;
+    let verified_at_dispatch = Arc::new(AtomicBool::new(false));
+
+    run_test_turn(
+        server.clone(),
+        root.path(),
+        turn_id.clone(),
+        TurnLifecycleOptions {
+            egress_verified_at_dispatch: Some(Arc::clone(&verified_at_dispatch)),
+            ..TurnLifecycleOptions::default()
+        },
+    )
+    .await?;
+
+    assert!(verified_at_dispatch.load(Ordering::Acquire));
+    let thread_id = server
+        .thread_manager
+        .find_thread_for_turn(&turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should belong to a thread"))?;
+    let turn = server
+        .thread_manager
+        .get_turn(&thread_id, &turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(turn.items.iter().any(
+        |item| matches!(item, Item::Error { message, .. } if message.contains("unrelated failure"))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let agent_calls = Arc::new(AtomicUsize::new(0));
@@ -356,6 +425,23 @@ fn bridge_preserves_warning_and_token_usage_events() {
             }
         })
     );
+}
+
+#[test]
+fn bridge_preserves_egress_verification_event() {
+    let mut output_buf = String::new();
+    let mut emitted_agent_completion = false;
+
+    assert_eq!(
+        bridge_agent_event(
+            AgentEvent::EgressVerifiedAtDispatch,
+            &mut output_buf,
+            &mut emitted_agent_completion,
+        ),
+        Some(StreamItem::EgressVerifiedAtDispatch)
+    );
+    assert!(output_buf.is_empty());
+    assert!(!emitted_agent_completion);
 }
 
 #[test]

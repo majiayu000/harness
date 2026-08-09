@@ -6,6 +6,15 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "linux", test))]
+mod linux;
+#[cfg(any(target_os = "linux", test))]
+use linux::linux_network_only_bwrap_args;
+#[cfg(any(target_os = "linux", test))]
+use linux::{linux_bwrap_args, linux_landlock_args};
+mod network_policy;
+pub use network_policy::NetworkPolicy;
+
 // Intentional scope: keep VCS/agent metadata immutable inside workspace-write mode.
 // `.env` is user-managed project content and is not forced read-only here.
 const PROTECTED_RELATIVE_PATHS: [&str; 2] = [".git", ".harness"];
@@ -25,6 +34,8 @@ pub struct SandboxSpec {
     /// When set, sandbox write policy uses these specific paths instead of the
     /// blanket `project_root` allow. Populated from a `CapabilityToken`.
     pub allowed_write_paths: Option<Vec<PathBuf>>,
+    /// Network boundary applied in addition to the filesystem sandbox mode.
+    pub network_policy: NetworkPolicy,
 }
 
 impl SandboxSpec {
@@ -34,12 +45,18 @@ impl SandboxSpec {
             mode,
             project_root,
             allowed_write_paths: None,
+            network_policy: NetworkPolicy::InheritSandboxMode,
         }
     }
 
     /// Narrow write access to the given paths instead of the full `project_root`.
     pub fn with_allowed_write_paths(mut self, paths: Vec<PathBuf>) -> Self {
         self.allowed_write_paths = Some(paths);
+        self
+    }
+
+    pub fn with_network_policy(mut self, policy: NetworkPolicy) -> Self {
+        self.network_policy = policy;
         self
     }
 }
@@ -59,7 +76,10 @@ pub fn wrap_command(
     // DangerFullAccess bypasses sandboxing only when no token paths narrow the write
     // scope.  If allowed_write_paths is set (from a CapabilityToken), we upgrade to
     // WorkspaceWrite so the token's isolation is actually enforced.
-    if spec.mode == SandboxMode::DangerFullAccess && spec.allowed_write_paths.is_none() {
+    if spec.mode == SandboxMode::DangerFullAccess
+        && spec.allowed_write_paths.is_none()
+        && spec.network_policy == NetworkPolicy::InheritSandboxMode
+    {
         return Ok(WrappedCommand {
             program: program.to_path_buf(),
             args: args.to_vec(),
@@ -68,15 +88,16 @@ pub fn wrap_command(
     }
 
     let owned;
-    let spec: &SandboxSpec = if spec.mode == SandboxMode::DangerFullAccess {
-        owned = SandboxSpec {
-            mode: SandboxMode::WorkspaceWrite,
-            ..spec.clone()
+    let spec: &SandboxSpec =
+        if spec.mode == SandboxMode::DangerFullAccess && spec.allowed_write_paths.is_some() {
+            owned = SandboxSpec {
+                mode: SandboxMode::WorkspaceWrite,
+                ..spec.clone()
+            };
+            &owned
+        } else {
+            spec
         };
-        &owned
-    } else {
-        spec
-    };
 
     #[cfg(target_os = "macos")]
     {
@@ -124,7 +145,41 @@ fn wrap_linux_command(
     args: &[OsString],
     spec: &SandboxSpec,
 ) -> Result<WrappedCommand, SandboxError> {
-    if let Some(landlock_runner) = find_tool("harness-landlock") {
+    wrap_linux_command_with_tools(
+        program,
+        args,
+        spec,
+        find_tool("harness-landlock"),
+        find_tool("bwrap"),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn wrap_linux_command_with_tools(
+    program: &Path,
+    args: &[OsString],
+    spec: &SandboxSpec,
+    landlock_runner: Option<PathBuf>,
+    bwrap: Option<PathBuf>,
+) -> Result<WrappedCommand, SandboxError> {
+    if spec.network_policy.is_local_proxy() {
+        return Err(spec.network_policy.unsupported("linux host sandbox"));
+    }
+    if spec.mode == SandboxMode::DangerFullAccess
+        && spec.allowed_write_paths.is_none()
+        && spec.network_policy == NetworkPolicy::Deny
+    {
+        let bwrap = bwrap.ok_or(SandboxError::MissingTool(
+            "bwrap (required for danger-full-access with deny-all networking)",
+        ))?;
+        return Ok(WrappedCommand {
+            program: bwrap,
+            args: linux_network_only_bwrap_args(program, args, spec),
+            engine: SandboxEngine::Bubblewrap,
+        });
+    }
+
+    if let Some(landlock_runner) = landlock_runner {
         return Ok(WrappedCommand {
             program: landlock_runner,
             args: linux_landlock_args(program, args, spec)?,
@@ -132,7 +187,7 @@ fn wrap_linux_command(
         });
     }
 
-    let bwrap = find_tool("bwrap").ok_or(SandboxError::MissingTool("harness-landlock or bwrap"))?;
+    let bwrap = bwrap.ok_or(SandboxError::MissingTool("harness-landlock or bwrap"))?;
     Ok(WrappedCommand {
         program: bwrap,
         args: linux_bwrap_args(program, args, spec)?,
@@ -140,10 +195,23 @@ fn wrap_linux_command(
     })
 }
 
+pub fn validate_host_sandbox_support(spec: &SandboxSpec) -> Result<SandboxEngine, SandboxError> {
+    wrap_command(Path::new("true"), &[], spec).map(|wrapped| wrapped.engine)
+}
+
 // Keep `test` enabled so non-macOS CI can validate policy-generation logic.
 #[cfg(any(target_os = "macos", test))]
 fn seatbelt_policy(spec: &SandboxSpec) -> Result<String, SandboxError> {
     let workspace_path = seatbelt_escape_path(&spec.project_root)?;
+
+    if spec.mode == SandboxMode::DangerFullAccess {
+        if spec.network_policy == NetworkPolicy::InheritSandboxMode {
+            return Err(invalid_helper_mode("seatbelt_policy", spec.mode));
+        }
+        let mut lines = vec!["(version 1)".to_string(), "(allow default)".to_string()];
+        lines.extend(spec.network_policy.seatbelt_rules(spec.mode));
+        return Ok(lines.join("\n"));
+    }
 
     let mut lines = vec![
         "(version 1)".to_string(),
@@ -151,9 +219,9 @@ fn seatbelt_policy(spec: &SandboxSpec) -> Result<String, SandboxError> {
         "(allow process-exec)".to_string(),
         "(allow process-fork)".to_string(),
         "(allow signal (target self))".to_string(),
-        "(allow network-outbound)".to_string(),
         "(allow file-read*)".to_string(),
     ];
+    lines.extend(spec.network_policy.seatbelt_rules(spec.mode));
 
     // Blanket /tmp write access is omitted when token paths are present.
     // Token paths already define the write boundary; granting /tmp globally
@@ -194,120 +262,6 @@ fn seatbelt_policy(spec: &SandboxSpec) -> Result<String, SandboxError> {
     }
 
     Ok(lines.join("\n"))
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn linux_landlock_args(
-    program: &Path,
-    args: &[OsString],
-    spec: &SandboxSpec,
-) -> Result<Vec<OsString>, SandboxError> {
-    let network_mode = match spec.mode {
-        SandboxMode::ReadOnly => "deny",
-        SandboxMode::ReadOnlyWithNetwork => "allow",
-        SandboxMode::WorkspaceWrite => "allow",
-        SandboxMode::DangerFullAccess => {
-            return Err(invalid_helper_mode("linux_landlock_args", spec.mode));
-        }
-    };
-
-    let mut wrapped_args = vec![
-        OsString::from("--mode"),
-        OsString::from(match spec.mode {
-            SandboxMode::ReadOnlyWithNetwork => SandboxMode::ReadOnly.to_string(),
-            mode => mode.to_string(),
-        }),
-        OsString::from("--network"),
-        OsString::from(network_mode),
-    ];
-
-    // Pass every write path as a separate --workspace flag so multi-path tokens are
-    // fully honoured.  Previously only the first entry was forwarded, silently
-    // dropping any remaining paths in the Vec<PathBuf>.
-    let write_paths: &[PathBuf] = spec
-        .allowed_write_paths
-        .as_deref()
-        .unwrap_or(std::slice::from_ref(&spec.project_root));
-    for path in write_paths {
-        wrapped_args.push(OsString::from("--workspace"));
-        wrapped_args.push(path.as_os_str().to_os_string());
-    }
-
-    for protected_path in protected_paths(&spec.project_root) {
-        wrapped_args.push(OsString::from("--readonly-path"));
-        wrapped_args.push(protected_path.into_os_string());
-    }
-
-    wrapped_args.push(OsString::from("--"));
-    wrapped_args.push(program.as_os_str().to_os_string());
-    wrapped_args.extend(args.iter().cloned());
-    Ok(wrapped_args)
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn linux_bwrap_args(
-    program: &Path,
-    args: &[OsString],
-    spec: &SandboxSpec,
-) -> Result<Vec<OsString>, SandboxError> {
-    let mut wrapped_args = vec![
-        OsString::from("--die-with-parent"),
-        OsString::from("--new-session"),
-        OsString::from("--ro-bind"),
-        OsString::from("/"),
-        OsString::from("/"),
-        OsString::from("--proc"),
-        OsString::from("/proc"),
-        OsString::from("--dev"),
-        OsString::from("/dev"),
-        OsString::from("--tmpfs"),
-        OsString::from("/tmp"),
-    ];
-
-    match spec.mode {
-        SandboxMode::ReadOnly => {
-            wrapped_args.push(OsString::from("--unshare-net"));
-        }
-        SandboxMode::ReadOnlyWithNetwork => {}
-        SandboxMode::WorkspaceWrite => {
-            if let Some(ref paths) = spec.allowed_write_paths {
-                for path in paths {
-                    // Skip /tmp: the --tmpfs mount above already provides a private writable
-                    // tmpfs inside the container.  Binding host /tmp would override that
-                    // private mount and expose the shared host /tmp, breaking per-task
-                    // isolation.  Also skip paths that don't exist on this host (e.g.
-                    // /private/tmp on Linux).
-                    if path == Path::new("/tmp") || !path.exists() {
-                        continue;
-                    }
-                    wrapped_args.push(OsString::from("--bind"));
-                    wrapped_args.push(path.as_os_str().to_os_string());
-                    wrapped_args.push(path.as_os_str().to_os_string());
-                }
-            } else {
-                wrapped_args.push(OsString::from("--bind"));
-                wrapped_args.push(spec.project_root.as_os_str().to_os_string());
-                wrapped_args.push(spec.project_root.as_os_str().to_os_string());
-            }
-            for protected_path in protected_paths(&spec.project_root) {
-                if protected_path.exists() {
-                    wrapped_args.push(OsString::from("--ro-bind"));
-                    wrapped_args.push(protected_path.as_os_str().to_os_string());
-                    wrapped_args.push(protected_path.as_os_str().to_os_string());
-                }
-            }
-        }
-        SandboxMode::DangerFullAccess => {
-            return Err(invalid_helper_mode("linux_bwrap_args", spec.mode));
-        }
-    }
-
-    wrapped_args.push(OsString::from("--chdir"));
-    wrapped_args.push(spec.project_root.as_os_str().to_os_string());
-    wrapped_args.push(OsString::from("--"));
-    wrapped_args.push(program.as_os_str().to_os_string());
-    wrapped_args.extend(args.iter().cloned());
-    Ok(wrapped_args)
 }
 
 fn protected_paths(project_root: &Path) -> Vec<PathBuf> {
@@ -467,6 +421,7 @@ mod tests {
         let spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, "/tmp/project");
         let command_args = vec![OsString::from("--flag"), OsString::from("value")];
         let args = linux_bwrap_args(Path::new("/usr/bin/claude"), &command_args, &spec).unwrap();
+        assert!(args.contains(&OsString::from("--unshare-pid")));
         assert!(!args.contains(&OsString::from("--unshare-net")));
         let project_occurrences = args
             .iter()
@@ -687,6 +642,7 @@ mod tests {
             mode: SandboxMode::DangerFullAccess,
             project_root: PathBuf::from("/tmp/project"),
             allowed_write_paths: Some(vec![PathBuf::from("/tmp/worktree-0")]),
+            network_policy: NetworkPolicy::InheritSandboxMode,
         };
         // Verify the effective spec (WorkspaceWrite mode) produces the correct policy.
         let effective = SandboxSpec {
@@ -715,6 +671,7 @@ mod tests {
                 PathBuf::from("/tmp"),
                 PathBuf::from("/var/tmp"),
             ]),
+            network_policy: NetworkPolicy::InheritSandboxMode,
         };
         let args = linux_landlock_args(Path::new("/usr/bin/codex"), &[], &spec).unwrap();
         let workspace_values: Vec<OsString> = args
@@ -745,6 +702,7 @@ mod tests {
                 PathBuf::from("/private/tmp"),
                 PathBuf::from("/var/tmp"),
             ]),
+            network_policy: NetworkPolicy::InheritSandboxMode,
         };
         let policy = seatbelt_policy(&spec).expect("should build policy");
         assert!(
@@ -764,3 +722,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "network_policy_tests.rs"]
+mod network_policy_tests;

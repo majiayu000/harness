@@ -1472,6 +1472,7 @@ dependencies = [
  "harness-observe",
  "harness-protocol",
  "harness-rules",
+ "harness-sandbox",
  "harness-skills",
  "harness-workflow",
  "hmac",

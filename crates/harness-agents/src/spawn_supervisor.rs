@@ -99,9 +99,12 @@ pub(crate) async fn spawn_agent(
         );
     }
 
+    let managed_child = ManagedChild::new(child, process_label)
+        .with_egress_proxy_lease(prepared_spawn.egress_proxy_lease.clone())
+        .with_egress_verification(prepared_spawn.egress_verification);
     Ok(SupervisedAgentProcess {
         prepared_spawn,
-        child: ManagedChild::new(child, process_label),
+        child: managed_child,
     })
 }
 

@@ -117,15 +117,24 @@ fn parse_step_finish_tokens(value: &Value) -> TokenUsage {
 
 /// Build the permission env value for an explicit allowlist.
 ///
-/// `None` = full profile (opencode `--auto`). An explicitly empty list means
-/// deny-all, mirroring `AgentRequest::allowed_tools` semantics.
+/// An explicitly empty list means deny-all, mirroring
+/// `AgentRequest::allowed_tools` semantics. Full mode bypasses this helper.
 fn permission_env_value(tools: &[String]) -> String {
     if tools.is_empty() {
         return r#"{"*":"deny"}"#.to_string();
     }
     let mut map = serde_json::Map::new();
+    map.insert("*".to_string(), Value::String("deny".to_string()));
     for tool in tools {
-        map.insert(tool.clone(), Value::String("allow".to_string()));
+        let permission = match tool.as_str() {
+            "Read" => "read",
+            "Write" | "Edit" => "edit",
+            "Bash" => "bash",
+            "Grep" => "grep",
+            "Glob" => "glob",
+            custom => custom,
+        };
+        map.insert(permission.to_string(), Value::String("allow".to_string()));
     }
     serde_json::Value::Object(map).to_string()
 }
@@ -170,7 +179,7 @@ impl OpenCodeAgent {
             args.push(OsString::from("--model"));
             args.push(OsString::from(model));
         }
-        if req.allowed_tools.is_none() {
+        if req.uses_dangerously_skip_permissions() {
             args.push(OsString::from("--auto"));
         }
         args.push(OsString::from(req.prompt.clone()));
@@ -179,10 +188,11 @@ impl OpenCodeAgent {
 
     fn spawn_env_vars(&self, req: &AgentRequest) -> Vec<(String, String)> {
         let mut vars = Vec::new();
-        if let Some(tools) = req.allowed_tools.as_ref() {
+        if !req.uses_dangerously_skip_permissions() {
+            let tools = req.scoped_allowed_tools();
             vars.push((
                 OPENCODE_PERMISSION_ENV.to_string(),
-                permission_env_value(tools),
+                permission_env_value(&tools),
             ));
         }
         vars
@@ -245,8 +255,12 @@ impl CodeAgent for OpenCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                secret_env_keys: &[],
+                container_bind_mounts: &[],
+                permission_mode: req.effective_permission_mode(),
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         let spawn_error_req = req.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(
@@ -365,8 +379,12 @@ impl CodeAgent for OpenCodeAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                secret_env_keys: &[],
+                container_bind_mounts: &[],
+                permission_mode: req.effective_permission_mode(),
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         let spawn_error_req = req.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(
@@ -395,6 +413,15 @@ impl CodeAgent for OpenCodeAgent {
         )
         .await?;
         let mut child = supervised.child;
+        if child.egress_verified_before_spawn() {
+            send_stream_item(
+                &tx,
+                StreamItem::EgressVerifiedAtDispatch,
+                self.name(),
+                "egress verification",
+            )
+            .await?;
+        }
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;
@@ -414,6 +441,8 @@ impl CodeAgent for OpenCodeAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let mut container_egress_verified = !await_container_egress_canary;
 
         let mut stream_result: harness_core::error::Result<()> = Ok(());
         loop {
@@ -437,6 +466,26 @@ impl CodeAgent for OpenCodeAgent {
                     break;
                 }
             };
+            if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+                if !container_egress_verified {
+                    if send_stream_item(
+                        &tx,
+                        StreamItem::EgressVerifiedAtDispatch,
+                        self.name(),
+                        "egress verification",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        stream_result = Err(harness_core::error::HarnessError::AgentExecution(
+                            "opencode stream send failed".into(),
+                        ));
+                        break;
+                    }
+                    container_egress_verified = true;
+                }
+                continue;
+            }
             let Some(event) = parse_opencode_run_line(&line) else {
                 continue;
             };
@@ -534,6 +583,12 @@ impl CodeAgent for OpenCodeAgent {
             }
         }
 
+        if stream_result.is_ok() && !container_egress_verified {
+            stream_result = Err(harness_core::error::HarnessError::AgentExecution(
+                "opencode exited before the container egress canary reported success".into(),
+            ));
+        }
+
         let status = child
             .wait_and_cleanup_descendants()
             .await
@@ -624,11 +679,22 @@ mod tests {
     }
 
     #[test]
-    fn permission_env_mapping() {
+    fn permission_env_mapping() -> Result<(), serde_json::Error> {
         assert_eq!(
-            permission_env_value(&["bash".to_string(), "edit".to_string()]),
-            r#"{"bash":"allow","edit":"allow"}"#
+            serde_json::from_str::<Value>(&permission_env_value(&[
+                "Read".to_string(),
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Bash".to_string(),
+            ]))?,
+            serde_json::json!({
+                "*": "deny",
+                "read": "allow",
+                "edit": "allow",
+                "bash": "allow",
+            })
         );
         assert_eq!(permission_env_value(&[]), r#"{"*":"deny"}"#);
+        Ok(())
     }
 }

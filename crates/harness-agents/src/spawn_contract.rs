@@ -1,18 +1,39 @@
-use harness_core::agent::{AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
+use harness_core::agent::{AgentEgressMode, TurnRequest, AGENT_EGRESS_PROXY_IMAGE_ENV};
+#[cfg(test)]
+use harness_core::agent::{
+    AGENT_CONTAINER_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV,
+};
+use harness_core::config::agents::AgentPermissionMode;
+use harness_core::config::agents::SandboxMode;
 use harness_core::config::isolation::IsolationTier;
 use harness_core::error::HarnessError;
 use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
-use harness_sandbox::{wrap_command, SandboxEngine, SandboxSpec};
+use harness_sandbox::{wrap_command, NetworkPolicy, SandboxEngine, SandboxSpec};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::scoped_token::{
-    CONTAINER_GH_TOKEN_ENV, CONTAINER_GITHUB_TOKEN_ENV, SCOPED_GITHUB_TOKEN_ENV,
-};
+use sha2::{Digest, Sha256};
 
+pub(crate) mod docker_ownership;
+pub(crate) mod egress;
 mod output_schema;
 mod review_git;
+mod spawn_env;
+use docker_ownership::{append_os_labels, unique_resource_name, ManagedDockerResource};
+use egress::{
+    apply_proxy_env, container_canary_command, proxy_env_keys, EgressProxyLease, EgressProxyRoute,
+    LEGACY_EGRESS_PROXY_ENV,
+};
+use spawn_env::{
+    container_env_vars, container_image, docker_process_env, host_process_env, isolation_tier,
+    network_allowlist, review_git_safe_workspace, ContainerEnv,
+};
+
+pub(crate) fn agent_container_image(env_vars: &HashMap<String, String>) -> String {
+    container_image(env_vars)
+}
 
 /// Env keys Claude Code uses to detect that it is running nested inside
 /// another Claude Code session; leaking any of them into a spawned agent
@@ -30,11 +51,115 @@ pub(crate) const NESTED_SESSION_ENV_KEYS: [&str; 5] = [
 ];
 
 const DEFAULT_AGENT_CONTAINER_IMAGE: &str = "harness-agent:latest";
-const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
-const AGENT_EGRESS_PROXY_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY";
-const CONTAINER_EGRESS_ALLOWLIST_ENV: &str = "HARNESS_AGENT_EGRESS_ALLOWLIST";
 const CONTAINER_WORKSPACE: &str = "/workspace";
 pub(crate) const REVIEW_GIT_SAFE_WORKSPACE_ENV: &str = "HARNESS_AGENT_REVIEW_GIT_SAFE_WORKSPACE";
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AdapterSpawnPolicyFingerprint([u8; 32]);
+
+pub(crate) fn adapter_spawn_policy_fingerprint(
+    req: &TurnRequest,
+    default_sandbox_mode: SandboxMode,
+) -> AdapterSpawnPolicyFingerprint {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"adapter-spawn-policy/v1");
+    hash_field(&mut hasher, req.project_root.as_os_str().as_encoded_bytes());
+    hash_field(
+        &mut hasher,
+        &[match req.permission_mode {
+            AgentPermissionMode::Scoped => 0,
+            AgentPermissionMode::Full => 1,
+        }],
+    );
+    hash_field(
+        &mut hasher,
+        &[match req.sandbox_mode.unwrap_or(default_sandbox_mode) {
+            SandboxMode::ReadOnly => 0,
+            SandboxMode::ReadOnlyWithNetwork => 1,
+            SandboxMode::WorkspaceWrite => 2,
+            SandboxMode::DangerFullAccess => 3,
+        }],
+    );
+
+    let mut env_vars: Vec<_> = req
+        .env_vars
+        .iter()
+        .filter(|(key, _)| key.as_str() != AGENT_RUN_ID_ENV && key.as_str() != AGENT_RUN_PARENT_ENV)
+        .collect();
+    env_vars.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (key, value) in env_vars {
+        hash_field(&mut hasher, key.as_bytes());
+        hash_field(&mut hasher, value.as_bytes());
+    }
+
+    if let Some(token) = &req.capability_token {
+        hash_field(&mut hasher, b"capability");
+        for path in &token.allowed_write_paths {
+            hash_field(&mut hasher, path.as_os_str().as_encoded_bytes());
+        }
+    } else {
+        hash_field(&mut hasher, b"no-capability");
+    }
+
+    AdapterSpawnPolicyFingerprint(hasher.finalize().into())
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerBindMount {
+    pub(crate) source: PathBuf,
+    pub(crate) destination: PathBuf,
+    scope: ContainerBindMountScope,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerBindMountScope {
+    Workspace,
+    HarnessTemp,
+}
+
+impl ContainerBindMount {
+    pub(crate) fn workspace(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            source,
+            destination,
+            scope: ContainerBindMountScope::Workspace,
+            read_only: false,
+        }
+    }
+
+    pub(crate) fn workspace_read_only(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            source,
+            destination,
+            scope: ContainerBindMountScope::Workspace,
+            read_only: true,
+        }
+    }
+
+    pub(crate) fn harness_temp(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            source,
+            destination,
+            scope: ContainerBindMountScope::HarnessTemp,
+            read_only: false,
+        }
+    }
+
+    pub(crate) fn harness_temp_read_only(source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            source,
+            destination,
+            scope: ContainerBindMountScope::HarnessTemp,
+            read_only: true,
+        }
+    }
+}
 
 pub(crate) struct AgentSpawnInput<'a> {
     pub(crate) program: &'a Path,
@@ -42,6 +167,9 @@ pub(crate) struct AgentSpawnInput<'a> {
     pub(crate) project_root: &'a Path,
     pub(crate) sandbox_spec: &'a SandboxSpec,
     pub(crate) env_vars: &'a HashMap<String, String>,
+    pub(crate) secret_env_keys: &'a [String],
+    pub(crate) container_bind_mounts: &'a [ContainerBindMount],
+    pub(crate) permission_mode: AgentPermissionMode,
     /// The caller pipes the prompt through the child's stdin. The container
     /// tier must keep stdin open (`docker run -i`) or the prompt is silently
     /// dropped; the host tier inherits stdin either way.
@@ -58,28 +186,70 @@ pub(crate) struct PreparedAgentSpawn {
     pub(crate) process_env: BTreeMap<String, String>,
     pub(crate) clear_inherited_env: bool,
     pub(crate) sandbox_engine: SandboxEngine,
+    pub(crate) egress_proxy_lease: Option<Arc<EgressProxyLease>>,
+    pub(crate) egress_verification: EgressVerification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EgressVerification {
+    NotRequired,
+    VerifiedBeforeSpawn,
+    AwaitContainerCanary,
 }
 
 pub(crate) trait AgentSpawnContract {
-    fn prepare(&self, input: AgentSpawnInput<'_>) -> Result<PreparedAgentSpawn, HarnessError>;
+    fn prepare(
+        &self,
+        input: AgentSpawnInput<'_>,
+        egress_route: Option<&EgressProxyRoute>,
+    ) -> Result<PreparedAgentSpawn, HarnessError>;
 }
 
 pub(crate) struct HostSpawn;
 
 impl AgentSpawnContract for HostSpawn {
-    fn prepare(&self, input: AgentSpawnInput<'_>) -> Result<PreparedAgentSpawn, HarnessError> {
+    fn prepare(
+        &self,
+        input: AgentSpawnInput<'_>,
+        egress_route: Option<&EgressProxyRoute>,
+    ) -> Result<PreparedAgentSpawn, HarnessError> {
+        let allowlist = network_allowlist(input.env_vars);
+        let egress_policy = AgentEgressMode::resolve(input.permission_mode, &allowlist);
+        let network_policy = match egress_policy {
+            AgentEgressMode::Unrestricted => NetworkPolicy::InheritSandboxMode,
+            AgentEgressMode::DenyAll => NetworkPolicy::Deny,
+            AgentEgressMode::FirstPartyProxy => NetworkPolicy::LocalProxy {
+                port: egress_route
+                    .and_then(EgressProxyRoute::local_proxy_port)
+                    .ok_or_else(|| missing_proxy_route(IsolationTier::Host))?,
+            },
+        };
+        let sandbox_spec = input
+            .sandbox_spec
+            .clone()
+            .with_network_policy(network_policy);
         let wrapped_command =
-            wrap_command(input.program, input.args, input.sandbox_spec).map_err(|error| {
+            wrap_command(input.program, input.args, &sandbox_spec).map_err(|error| {
                 HarnessError::AgentExecution(format!("sandbox setup failed for agent: {error}"))
             })?;
+        let mut process_env = host_process_env(input.env_vars);
+        if let Some(route) = egress_route {
+            apply_proxy_env(&mut process_env, route.proxy_url());
+        }
         Ok(PreparedAgentSpawn {
             program: wrapped_command.program,
             args: wrapped_command.args,
             current_dir: input.project_root.to_path_buf(),
             child_workspace: input.project_root.to_path_buf(),
-            process_env: host_process_env(input.env_vars),
+            process_env,
             clear_inherited_env: false,
             sandbox_engine: wrapped_command.engine,
+            egress_proxy_lease: None,
+            egress_verification: if egress_route.is_some() {
+                EgressVerification::VerifiedBeforeSpawn
+            } else {
+                EgressVerification::NotRequired
+            },
         })
     }
 }
@@ -87,7 +257,11 @@ impl AgentSpawnContract for HostSpawn {
 pub(crate) struct ContainerSpawn;
 
 impl AgentSpawnContract for ContainerSpawn {
-    fn prepare(&self, input: AgentSpawnInput<'_>) -> Result<PreparedAgentSpawn, HarnessError> {
+    fn prepare(
+        &self,
+        input: AgentSpawnInput<'_>,
+        egress_route: Option<&EgressProxyRoute>,
+    ) -> Result<PreparedAgentSpawn, HarnessError> {
         let project_root = canonical_workspace(input.project_root)?;
         let tier = isolation_tier(input.env_vars)?;
         if tier != IsolationTier::Container {
@@ -98,6 +272,7 @@ impl AgentSpawnContract for ContainerSpawn {
         }
 
         let allowlist = network_allowlist(input.env_vars);
+        let egress_policy = AgentEgressMode::resolve(input.permission_mode, &allowlist);
         let image = container_image(input.env_vars);
         let review_layout = review_git_safe_workspace(input.env_vars)
             .then(|| review_git::plan(&project_root))
@@ -118,6 +293,9 @@ impl AgentSpawnContract for ContainerSpawn {
             );
         let (child_args, output_schema_mount) = output_schema::rewrite_for_container(input.args)?;
         let mut args = vec![OsString::from("run"), OsString::from("--rm")];
+        args.push(OsString::from("--name"));
+        args.push(OsString::from(unique_resource_name("harness-agent-")));
+        append_os_labels(&mut args, ManagedDockerResource::AgentContainer);
         if input.forward_stdin {
             args.push(OsString::from("--interactive"));
         }
@@ -132,6 +310,32 @@ impl AgentSpawnContract for ContainerSpawn {
             workspace_mount.push_str(",readonly");
         }
         args.push(OsString::from(workspace_mount));
+        for mount in input.container_bind_mounts {
+            let source = match mount.scope {
+                ContainerBindMountScope::Workspace => {
+                    canonical_container_bind_source(&project_root, &mount.source)?
+                }
+                ContainerBindMountScope::HarnessTemp => {
+                    canonical_harness_temp_bind_source(&mount.source)?
+                }
+            };
+            if !mount.destination.is_absolute() || mount.destination == Path::new("/") {
+                return Err(HarnessError::AgentExecution(format!(
+                    "container bind destination must be a specific absolute path: {}",
+                    mount.destination.display()
+                )));
+            }
+            let mut bind_mount = format!(
+                "type=bind,src={},dst={}",
+                source.display(),
+                mount.destination.display()
+            );
+            if mount.read_only {
+                bind_mount.push_str(",readonly");
+            }
+            args.push(OsString::from("--mount"));
+            args.push(OsString::from(bind_mount));
+        }
         if let Some(layout) = &review_layout {
             for mount in &layout.git_mounts {
                 args.push(OsString::from("--mount"));
@@ -147,11 +351,15 @@ impl AgentSpawnContract for ContainerSpawn {
             args.push(output_schema::mount_arg(mount));
         }
         args.push(OsString::from("--network"));
-        args.push(OsString::from(container_network_mode(
-            input.env_vars,
-            &allowlist,
-        )));
-        let ContainerEnv { plain, secret } = container_env_vars(input.env_vars);
+        args.push(OsString::from(match egress_policy {
+            AgentEgressMode::Unrestricted => "bridge",
+            AgentEgressMode::DenyAll => "none",
+            AgentEgressMode::FirstPartyProxy => egress_route
+                .and_then(EgressProxyRoute::container_network)
+                .ok_or_else(|| missing_proxy_route(IsolationTier::Container))?,
+        }));
+        let ContainerEnv { plain, secret } =
+            container_env_vars(input.env_vars, input.secret_env_keys);
         for (key, value) in plain {
             args.push(OsString::from("--env"));
             args.push(OsString::from(format!("{key}={value}")));
@@ -164,20 +372,15 @@ impl AgentSpawnContract for ContainerSpawn {
             args.push(OsString::from("--env"));
             args.push(OsString::from(key));
         }
-        if !allowlist.is_empty() {
-            args.push(OsString::from("--env"));
-            args.push(OsString::from(format!(
-                "{CONTAINER_EGRESS_ALLOWLIST_ENV}={}",
-                allowlist.join(",")
-            )));
-        }
-        if let Some(proxy) = egress_proxy(input.env_vars) {
-            for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+        if let Some(route) = egress_route {
+            for key in proxy_env_keys() {
                 args.push(OsString::from("--env"));
-                args.push(OsString::from(format!("{key}={proxy}")));
+                args.push(OsString::from(format!("{key}={}", route.proxy_url())));
             }
-            args.push(OsString::from("--env"));
-            args.push(OsString::from("NO_PROXY=localhost,127.0.0.1"));
+            for key in ["NO_PROXY", "no_proxy"] {
+                args.push(OsString::from("--env"));
+                args.push(OsString::from(format!("{key}=localhost,127.0.0.1")));
+            }
         }
         if review_git_safe_workspace(input.env_vars) {
             for (key, value) in [
@@ -196,8 +399,21 @@ impl AgentSpawnContract for ContainerSpawn {
             }
         }
         args.push(OsString::from(image));
-        args.push(container_program(input.program));
-        args.extend(child_args);
+        if egress_route.is_some_and(EgressProxyRoute::requires_container_canary) {
+            let verification_host = allowlist.first().ok_or_else(|| {
+                HarnessError::AgentExecution(
+                    "first-party egress proxy requires a non-empty allowlist".to_string(),
+                )
+            })?;
+            args.extend(container_canary_command(
+                container_program(input.program),
+                child_args,
+                verification_host,
+            ));
+        } else {
+            args.push(container_program(input.program));
+            args.extend(child_args);
+        }
 
         Ok(PreparedAgentSpawn {
             program: PathBuf::from("docker"),
@@ -207,20 +423,57 @@ impl AgentSpawnContract for ContainerSpawn {
             process_env: docker_process_env(secret),
             clear_inherited_env: true,
             sandbox_engine: SandboxEngine::None,
+            egress_proxy_lease: None,
+            egress_verification: if egress_route.is_some() {
+                EgressVerification::AwaitContainerCanary
+            } else {
+                EgressVerification::NotRequired
+            },
         })
     }
 }
 
-pub(crate) fn prepare_agent_spawn(
+pub(crate) async fn prepare_agent_spawn(
     input: AgentSpawnInput<'_>,
 ) -> Result<PreparedAgentSpawn, HarnessError> {
-    match isolation_tier(input.env_vars)? {
-        IsolationTier::Host => HostSpawn.prepare(input),
-        IsolationTier::Container => ContainerSpawn.prepare(input),
-        IsolationTier::Microvm => Err(HarnessError::AgentExecution(
-            "isolation tier `microvm` is reserved but not implemented".to_string(),
-        )),
+    if input
+        .env_vars
+        .get(LEGACY_EGRESS_PROXY_ENV)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(HarnessError::AgentExecution(format!(
+            "{LEGACY_EGRESS_PROXY_ENV} is no longer accepted because external proxy URLs cannot prove allowlist enforcement; configure {AGENT_EGRESS_PROXY_IMAGE_ENV} instead"
+        )));
     }
+    let tier = isolation_tier(input.env_vars)?;
+    if tier == IsolationTier::Microvm {
+        return Err(HarnessError::AgentExecution(
+            "isolation tier `microvm` is reserved but not implemented".to_string(),
+        ));
+    }
+    let allowlist = network_allowlist(input.env_vars);
+    let egress_policy = AgentEgressMode::resolve(input.permission_mode, &allowlist);
+    let lease = if egress_policy == AgentEgressMode::FirstPartyProxy {
+        let env_vars = input.env_vars.clone();
+        let lease = tokio::task::spawn_blocking(move || {
+            EgressProxyLease::start(tier, &allowlist, &env_vars)
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::AgentExecution(format!("egress proxy setup task failed: {error}"))
+        })??;
+        Some(Arc::new(lease))
+    } else {
+        None
+    };
+    let route = lease.as_deref().map(EgressProxyLease::route);
+    let mut spawn = match tier {
+        IsolationTier::Host => HostSpawn.prepare(input, route),
+        IsolationTier::Container => ContainerSpawn.prepare(input, route),
+        IsolationTier::Microvm => unreachable!("microvm returned before egress setup"),
+    }?;
+    spawn.egress_proxy_lease = lease;
+    Ok(spawn)
 }
 
 pub(crate) fn apply_process_env(cmd: &mut tokio::process::Command, spawn: &PreparedAgentSpawn) {
@@ -242,149 +495,11 @@ pub(crate) fn strip_nested_session_env(cmd: &mut tokio::process::Command) {
     }
 }
 
-fn is_nested_session_env(key: &str) -> bool {
-    NESTED_SESSION_ENV_KEYS.contains(&key)
-}
-
-fn isolation_tier(env_vars: &HashMap<String, String>) -> Result<IsolationTier, HarnessError> {
-    match env_vars.get(AGENT_ISOLATION_TIER_ENV).map(String::as_str) {
-        None | Some("") | Some("host") => Ok(IsolationTier::Host),
-        Some("container") => Ok(IsolationTier::Container),
-        Some("microvm") => Ok(IsolationTier::Microvm),
-        Some(other) => Err(HarnessError::AgentExecution(format!(
-            "unknown isolation tier `{other}`"
-        ))),
-    }
-}
-
-fn network_allowlist(env_vars: &HashMap<String, String>) -> Vec<String> {
-    env_vars
-        .get(AGENT_NETWORK_ALLOWLIST_ENV)
-        .map(String::as_str)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn host_process_env(env_vars: &HashMap<String, String>) -> BTreeMap<String, String> {
-    env_vars
-        .iter()
-        .filter(|(key, _)| !is_spawn_control_env(key))
-        .filter(|(key, _)| !is_nested_session_env(key))
-        .filter(|(key, _)| key.as_str() != SCOPED_GITHUB_TOKEN_ENV)
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-/// Container environment split by transport.
-///
-/// `plain` values are safe to render into Docker argv. `secret` values must
-/// never appear there: they reach the container through the Docker client's
-/// process environment, which is readable only by the same user, instead of
-/// through the world-readable process command line.
-struct ContainerEnv {
-    plain: BTreeMap<String, String>,
-    secret: BTreeMap<String, String>,
-}
-
-fn container_env_vars(env_vars: &HashMap<String, String>) -> ContainerEnv {
-    let plain = env_vars
-        .iter()
-        .filter(|(key, _)| !is_spawn_control_env(key))
-        .filter(|(key, _)| !is_nested_session_env(key))
-        .filter(|(key, _)| key.as_str() != SCOPED_GITHUB_TOKEN_ENV)
-        .filter(|(key, _)| !is_operator_secret_env(key))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut secret = BTreeMap::new();
-    if let Some(scoped_token) = env_vars
-        .get(SCOPED_GITHUB_TOKEN_ENV)
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        secret.insert(
-            CONTAINER_GITHUB_TOKEN_ENV.to_string(),
-            scoped_token.to_string(),
-        );
-        secret.insert(CONTAINER_GH_TOKEN_ENV.to_string(), scoped_token.to_string());
-    }
-    ContainerEnv { plain, secret }
-}
-
-fn docker_process_env(secret: BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut env = std::env::var("PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|path| BTreeMap::from([("PATH".to_string(), path)]))
-        .unwrap_or_default();
-    env.extend(secret);
-    env
-}
-
-fn is_spawn_control_env(key: &str) -> bool {
-    matches!(
-        key,
-        AGENT_ISOLATION_TIER_ENV
-            | AGENT_NETWORK_ALLOWLIST_ENV
-            | AGENT_CONTAINER_IMAGE_ENV
-            | AGENT_EGRESS_PROXY_ENV
-            | SCOPED_GITHUB_TOKEN_ENV
-            | REVIEW_GIT_SAFE_WORKSPACE_ENV
-    )
-}
-
-fn review_git_safe_workspace(env_vars: &HashMap<String, String>) -> bool {
-    env_vars
-        .get(REVIEW_GIT_SAFE_WORKSPACE_ENV)
-        .is_some_and(|value| value == "1")
-}
-
-fn is_operator_secret_env(key: &str) -> bool {
-    if key == AGENT_RUN_ID_ENV || key == AGENT_RUN_PARENT_ENV || key.starts_with("HARNESS_SCOPED_")
-    {
-        return false;
-    }
-    let key = key.to_ascii_uppercase();
-    key == "GITHUB_TOKEN"
-        || key == "GH_TOKEN"
-        || key.ends_with("_TOKEN")
-        || key.contains("API_KEY")
-        || key.contains("SECRET")
-        || key.contains("PASSWORD")
-}
-
-fn container_image(env_vars: &HashMap<String, String>) -> String {
-    env_vars
-        .get(AGENT_CONTAINER_IMAGE_ENV)
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_AGENT_CONTAINER_IMAGE)
-        .to_string()
-}
-
-fn egress_proxy(env_vars: &HashMap<String, String>) -> Option<String> {
-    env_vars
-        .get(AGENT_EGRESS_PROXY_ENV)
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn container_network_mode(
-    env_vars: &HashMap<String, String>,
-    allowlist: &[String],
-) -> &'static str {
-    if allowlist.is_empty() || egress_proxy(env_vars).is_none() {
-        "none"
-    } else {
-        "bridge"
-    }
+fn missing_proxy_route(tier: IsolationTier) -> HarnessError {
+    HarnessError::AgentExecution(format!(
+        "first-party egress proxy route is missing for `{}` isolation; refusing unrestricted fallback",
+        tier.as_str()
+    ))
 }
 
 fn canonical_workspace(project_root: &Path) -> Result<PathBuf, HarnessError> {
@@ -394,6 +509,54 @@ fn canonical_workspace(project_root: &Path) -> Result<PathBuf, HarnessError> {
             project_root.display()
         ))
     })
+}
+
+fn canonical_container_bind_source(
+    project_root: &Path,
+    source: &Path,
+) -> Result<PathBuf, HarnessError> {
+    let source = std::fs::canonicalize(source).map_err(|error| {
+        HarnessError::AgentExecution(format!(
+            "failed to resolve container bind source {}: {error}",
+            source.display()
+        ))
+    })?;
+    if !source.starts_with(project_root) {
+        return Err(HarnessError::AgentExecution(format!(
+            "container bind source must remain inside the task workspace: {}",
+            source.display()
+        )));
+    }
+    Ok(source)
+}
+
+fn canonical_harness_temp_bind_source(source: &Path) -> Result<PathBuf, HarnessError> {
+    let temp_root = std::fs::canonicalize(std::env::temp_dir()).map_err(|error| {
+        HarnessError::AgentExecution(format!("failed to resolve temporary directory: {error}"))
+    })?;
+    let source = std::fs::canonicalize(source).map_err(|error| {
+        HarnessError::AgentExecution(format!(
+            "failed to resolve container bind source {}: {error}",
+            source.display()
+        ))
+    })?;
+    let trusted = source
+        .strip_prefix(&temp_root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .starts_with("harness-cloud-setup-")
+        });
+    if !trusted {
+        return Err(HarnessError::AgentExecution(format!(
+            "container temporary bind source is not Harness-owned: {}",
+            source.display()
+        )));
+    }
+    Ok(source)
 }
 
 fn container_program(program: &Path) -> OsString {
@@ -408,376 +571,9 @@ fn container_program(program: &Path) -> OsString {
 }
 
 #[cfg(test)]
-mod container_spawn_tests {
-    use super::*;
-    use harness_core::config::agents::SandboxMode;
+#[path = "spawn_contract/container_spawn_tests.rs"]
+mod container_spawn_tests;
 
-    fn input<'a>(
-        program: &'a Path,
-        args: &'a [OsString],
-        project_root: &'a Path,
-        sandbox_spec: &'a SandboxSpec,
-        env_vars: &'a HashMap<String, String>,
-    ) -> AgentSpawnInput<'a> {
-        AgentSpawnInput {
-            program,
-            args,
-            project_root,
-            sandbox_spec,
-            env_vars,
-            forward_stdin: false,
-        }
-    }
-
-    fn string_args(spawn: &PreparedAgentSpawn) -> Vec<String> {
-        spawn
-            .args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect()
-    }
-
-    #[test]
-    fn container_spawn_mounts_only_task_workspace() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            AGENT_ISOLATION_TIER_ENV.to_string(),
-            "container".to_string(),
-        );
-        env_vars.insert(
-            AGENT_CONTAINER_IMAGE_ENV.to_string(),
-            "example/agent:sha256-test".to_string(),
-        );
-        let schema_dir = tempfile::tempdir()?;
-        let schema_path = schema_dir.path().join("activity-result-schema.json");
-        std::fs::write(&schema_path, "{}")?;
-        let args = vec![
-            OsString::from("exec"),
-            OsString::from("--output-schema"),
-            schema_path.as_os_str().to_os_string(),
-            OsString::from("prompt"),
-        ];
-        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
-
-        let spawn = ContainerSpawn.prepare(input(
-            Path::new("/opt/harness/bin/codex"),
-            &args,
-            root.path(),
-            &sandbox_spec,
-            &env_vars,
-        ))?;
-
-        let args = string_args(&spawn);
-        assert_eq!(spawn.program, PathBuf::from("docker"));
-        assert!(spawn.clear_inherited_env);
-        assert_eq!(spawn.current_dir, std::fs::canonicalize(root.path())?);
-        assert!(args.contains(&"--mount".to_string()));
-        assert!(args.contains(&format!(
-            "type=bind,src={},dst={CONTAINER_WORKSPACE}",
-            std::fs::canonicalize(root.path())?.display()
-        )));
-        assert!(!args
-            .iter()
-            .any(|arg| arg.contains("/Users/") && arg.contains("home")));
-        assert!(args.contains(&"--network".to_string()));
-        assert!(args.contains(&"none".to_string()));
-        assert!(args.contains(&"example/agent:sha256-test".to_string()));
-        assert!(args.contains(&"codex".to_string()));
-        assert!(args.contains(&format!(
-            "type=bind,src={},dst=/harness-output-schema,readonly",
-            std::fs::canonicalize(schema_dir.path())?.display()
-        )));
-        assert!(args.contains(&"/harness-output-schema/activity-result-schema.json".to_string()));
-        assert!(!args.contains(&schema_path.display().to_string()));
-        Ok(())
-    }
-
-    #[test]
-    fn container_spawn_applies_allowlist_proxy_contract() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            AGENT_ISOLATION_TIER_ENV.to_string(),
-            "container".to_string(),
-        );
-        env_vars.insert(
-            AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
-            "github.com, api.anthropic.com".to_string(),
-        );
-        env_vars.insert(
-            AGENT_EGRESS_PROXY_ENV.to_string(),
-            "http://egress-proxy.local:8080".to_string(),
-        );
-        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
-
-        let spawn = ContainerSpawn.prepare(input(
-            Path::new("claude"),
-            &[],
-            root.path(),
-            &sandbox_spec,
-            &env_vars,
-        ))?;
-
-        let args = string_args(&spawn);
-        assert!(args.contains(&"bridge".to_string()));
-        assert!(args.contains(&format!(
-            "{CONTAINER_EGRESS_ALLOWLIST_ENV}=github.com,api.anthropic.com"
-        )));
-        assert!(args.contains(&"HTTPS_PROXY=http://egress-proxy.local:8080".to_string()));
-        assert!(args.contains(&"ALL_PROXY=http://egress-proxy.local:8080".to_string()));
-        Ok(())
-    }
-
-    #[test]
-    fn container_spawn_keeps_network_closed_without_proxy_for_allowlist() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            AGENT_ISOLATION_TIER_ENV.to_string(),
-            "container".to_string(),
-        );
-        env_vars.insert(
-            AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
-            "github.com".to_string(),
-        );
-        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
-
-        let spawn = ContainerSpawn.prepare(input(
-            Path::new("codex"),
-            &[],
-            root.path(),
-            &sandbox_spec,
-            &env_vars,
-        ))?;
-
-        let args = string_args(&spawn);
-        assert!(args.contains(&"none".to_string()));
-        assert!(args.contains(&format!("{CONTAINER_EGRESS_ALLOWLIST_ENV}=github.com")));
-        assert!(!args.iter().any(|arg| arg.starts_with("HTTPS_PROXY=")));
-        Ok(())
-    }
-
-    #[test]
-    fn container_spawn_filters_operator_env_secrets() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            AGENT_ISOLATION_TIER_ENV.to_string(),
-            "container".to_string(),
-        );
-        env_vars.insert(
-            AGENT_RUN_ID_ENV.to_string(),
-            "ar-01j00000000000000000000000".to_string(),
-        );
-        env_vars.insert("GITHUB_TOKEN".to_string(), "operator-token".to_string());
-        env_vars.insert("ANTHROPIC_API_KEY".to_string(), "operator-key".to_string());
-        env_vars.insert(
-            "HARNESS_SCOPED_GITHUB_TOKEN".to_string(),
-            "scoped-token".to_string(),
-        );
-        env_vars.insert(
-            "CARGO_TARGET_DIR".to_string(),
-            "/workspace/target".to_string(),
-        );
-        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
-
-        let spawn = ContainerSpawn.prepare(input(
-            Path::new("codex"),
-            &[],
-            root.path(),
-            &sandbox_spec,
-            &env_vars,
-        ))?;
-
-        let args = string_args(&spawn);
-        assert!(args.contains(&format!("{AGENT_RUN_ID_ENV}=ar-01j00000000000000000000000")));
-        // The scoped token reaches the container by name only: `--env KEY`
-        // with no `=value`, so no token value is ever rendered into argv.
-        assert!(args.contains(&"GITHUB_TOKEN".to_string()));
-        assert!(args.contains(&"GH_TOKEN".to_string()));
-        assert!(!args.iter().any(|arg| arg.contains("scoped-token")));
-        assert!(!args
-            .iter()
-            .any(|arg| arg.starts_with("HARNESS_SCOPED_GITHUB_TOKEN")));
-        assert!(args.contains(&"CARGO_TARGET_DIR=/workspace/target".to_string()));
-        assert!(!args.iter().any(|arg| arg.contains("operator-token")));
-        assert!(!args.iter().any(|arg| arg.contains("operator-key")));
-        // The Docker client process carries the scoped value, and only it.
-        assert_eq!(
-            spawn.process_env.get("GITHUB_TOKEN"),
-            Some(&"scoped-token".to_string())
-        );
-        assert_eq!(
-            spawn.process_env.get("GH_TOKEN"),
-            Some(&"scoped-token".to_string())
-        );
-        assert!(!spawn
-            .process_env
-            .contains_key("HARNESS_SCOPED_GITHUB_TOKEN"));
-        assert!(!spawn.process_env.values().any(|v| v == "operator-token"));
-        assert!(spawn.clear_inherited_env);
-        Ok(())
-    }
-
-    #[test]
-    fn container_spawn_keeps_token_values_out_of_every_rendered_string() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            AGENT_ISOLATION_TIER_ENV.to_string(),
-            "container".to_string(),
-        );
-        env_vars.insert(
-            "HARNESS_SCOPED_GITHUB_TOKEN".to_string(),
-            "ghs_supersecretvalue".to_string(),
-        );
-        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
-
-        let spawn = ContainerSpawn.prepare(input(
-            Path::new("codex"),
-            &[],
-            root.path(),
-            &sandbox_spec,
-            &env_vars,
-        ))?;
-
-        // Everything an operator or another local user can observe about the
-        // launch: the program, the argv, and the Debug rendering used by
-        // tracing and error formatting.
-        let rendered = format!(
-            "{} {:?} {:?}",
-            spawn.program.display(),
-            spawn.args,
-            spawn.args
-        );
-        assert!(
-            !rendered.contains("ghs_supersecretvalue"),
-            "token value leaked into the rendered docker command: {rendered}"
-        );
-        // …while the container still receives it.
-        assert_eq!(
-            spawn.process_env.get("GITHUB_TOKEN"),
-            Some(&"ghs_supersecretvalue".to_string())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn container_spawn_omits_token_env_flags_without_a_scoped_token() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            AGENT_ISOLATION_TIER_ENV.to_string(),
-            "container".to_string(),
-        );
-        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
-
-        let spawn = ContainerSpawn.prepare(input(
-            Path::new("codex"),
-            &[],
-            root.path(),
-            &sandbox_spec,
-            &env_vars,
-        ))?;
-
-        // A bare `--env GITHUB_TOKEN` with nothing in the client environment
-        // would be a no-op, but emitting it anyway would imply a credential
-        // that does not exist. Nothing is emitted.
-        let args = string_args(&spawn);
-        assert!(!args.iter().any(|arg| arg == "GITHUB_TOKEN"));
-        assert!(!args.iter().any(|arg| arg == "GH_TOKEN"));
-        assert!(!spawn.process_env.contains_key("GITHUB_TOKEN"));
-        assert!(!spawn.process_env.contains_key("GH_TOKEN"));
-        Ok(())
-    }
-
-    #[test]
-    fn host_spawn_filters_injected_nested_session_markers() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut env_vars = HashMap::new();
-        for key in NESTED_SESSION_ENV_KEYS {
-            env_vars.insert(key.to_string(), "1".to_string());
-        }
-        env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), "/cfg".to_string());
-        let sandbox_spec = SandboxSpec::new(SandboxMode::DangerFullAccess, root.path());
-
-        let spawn = prepare_agent_spawn(input(
-            Path::new("claude"),
-            &[],
-            root.path(),
-            &sandbox_spec,
-            &env_vars,
-        ))?;
-
-        for key in NESTED_SESSION_ENV_KEYS {
-            assert!(
-                !spawn.process_env.contains_key(key),
-                "{key} must be stripped from the host process env"
-            );
-        }
-        // Legitimate CLAUDE_* configuration must pass through.
-        assert_eq!(
-            spawn.process_env.get("CLAUDE_CONFIG_DIR"),
-            Some(&"/cfg".to_string())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn container_spawn_filters_injected_nested_session_markers() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut env_vars = HashMap::new();
-        env_vars.insert(
-            AGENT_ISOLATION_TIER_ENV.to_string(),
-            "container".to_string(),
-        );
-        env_vars.insert("CLAUDECODE".to_string(), "1".to_string());
-        env_vars.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), "cli".to_string());
-        env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), "/cfg".to_string());
-        let sandbox_spec = SandboxSpec::new(SandboxMode::WorkspaceWrite, root.path());
-
-        let spawn = ContainerSpawn.prepare(input(
-            Path::new("claude"),
-            &[],
-            root.path(),
-            &sandbox_spec,
-            &env_vars,
-        ))?;
-
-        let args = string_args(&spawn);
-        assert!(!args.iter().any(|arg| arg.starts_with("CLAUDECODE=")));
-        assert!(!args
-            .iter()
-            .any(|arg| arg.starts_with("CLAUDE_CODE_ENTRYPOINT=")));
-        assert!(args.contains(&"CLAUDE_CONFIG_DIR=/cfg".to_string()));
-        Ok(())
-    }
-
-    #[test]
-    fn host_spawn_filters_spawn_control_env() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut env_vars = HashMap::new();
-        env_vars.insert(AGENT_ISOLATION_TIER_ENV.to_string(), "host".to_string());
-        env_vars.insert("CARGO_TARGET_DIR".to_string(), "/tmp/target".to_string());
-        let args = vec![OsString::from("exec")];
-        let sandbox_spec = SandboxSpec::new(SandboxMode::DangerFullAccess, root.path());
-
-        let spawn = prepare_agent_spawn(input(
-            Path::new("codex"),
-            &args,
-            root.path(),
-            &sandbox_spec,
-            &env_vars,
-        ))?;
-
-        assert!(!spawn.clear_inherited_env);
-        assert_eq!(
-            spawn.process_env.get("CARGO_TARGET_DIR"),
-            Some(&"/tmp/target".to_string())
-        );
-        assert!(!spawn.process_env.contains_key(AGENT_ISOLATION_TIER_ENV));
-        assert_eq!(spawn.program, PathBuf::from("codex"));
-        Ok(())
-    }
-}
+#[cfg(test)]
+#[path = "spawn_contract/egress_tests.rs"]
+mod egress_tests;

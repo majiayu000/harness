@@ -1,14 +1,14 @@
 use crate::http::AppState;
-use harness_core::agent::{
-    AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV, AGENT_OUTPUT_SCHEMA_PATH_ENV,
-};
+use harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV;
 use harness_core::config::workflow::WorkflowConfig;
 use harness_core::types::AgentId;
 use harness_workflow::runtime::{ActivityArtifact, ActivityResult, RuntimeJob, WorkflowInstance};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use super::activity_result::{
     activity_result_from_turn_with_workflow, structured_output_correction,
@@ -40,6 +40,15 @@ use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
 #[path = "executor/runtime_timeout.rs"]
 mod runtime_timeout;
 use runtime_timeout::runtime_profile_with_timeout_fallback;
+#[path = "executor/egress_evidence.rs"]
+mod egress_evidence;
+use egress_evidence::AgentEgressEvidence;
+#[path = "executor/permission_profile.rs"]
+mod permission_profile;
+use permission_profile::RuntimePermissionProfile;
+#[path = "executor/spawn_env.rs"]
+mod spawn_env;
+use spawn_env::{correction_spawn_env_vars, isolation_spawn_env_vars};
 #[path = "executor/structured_output.rs"]
 mod structured_output;
 use structured_output::{
@@ -167,6 +176,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 build_runtime_job_prompt(&prompt_packet, prompt_task_request.prompt_text());
             let mut correction_retry = None;
             let mut transcript_turn = None;
+            let mut attempt_enforcement_artifacts = Vec::new();
             for attempt in 0..=1 {
                 record_runtime_prompt_input(
                     self.state,
@@ -201,9 +211,24 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                             turn_id.clone(),
                         )
                     });
-                let mut env_vars = isolation_spawn_env_vars(&job);
                 let correction_only = attempt > 0 && correction_retry.is_some();
-                if correction_only { env_vars.retain(|key, _| key == AGENT_ISOLATION_TIER_ENV); }
+                let mut env_vars = if correction_only {
+                    correction_spawn_env_vars(&job)
+                } else {
+                    isolation_spawn_env_vars(&job)
+                };
+                let permission_profile = RuntimePermissionProfile::resolve(
+                    resolved_settings.permission_mode,
+                    resolved_settings.allowed_tools.clone(),
+                    resolved_settings.tool_allowlist_enforcement,
+                    correction_only,
+                );
+                let egress_evidence = AgentEgressEvidence::from_spawn_env(
+                    job.runtime_kind,
+                    permission_profile.permission_mode,
+                    &env_vars,
+                );
+                let egress_verified_at_dispatch = Arc::new(AtomicBool::new(false));
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
                         AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
@@ -239,7 +264,8 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         stall_timeout_secs: Some(resolved_settings.stall_timeout_secs),
                         lease_lost: Some(self.lease_lost.subscribe()),
                         env_vars,
-                        allowed_tools: correction_only.then(Vec::new),
+                        permission_mode: permission_profile.permission_mode,
+                        allowed_tools: permission_profile.allowed_tools.clone(),
                         force_code_agent: force_code_agent || correction_only,
                         runtime_usage: runtime_usage_context(
                             self.state,
@@ -249,6 +275,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                             agent_name,
                             &source_project_root,
                         ),
+                        egress_verified_at_dispatch: Some(Arc::clone(
+                            &egress_verified_at_dispatch,
+                        )),
                     },
                 )
                 .await;
@@ -259,6 +288,16 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     .thread_manager
                     .get_turn(&thread_id, &turn_id)
                     .ok_or_else(|| anyhow::anyhow!("runtime turn disappeared before completion"))?;
+                let attempt_number = attempt + 1;
+                attempt_enforcement_artifacts.push(permission_profile.artifact(
+                    resolved_settings.capability_profile,
+                    attempt_number,
+                ));
+                attempt_enforcement_artifacts.push(egress_evidence.artifact(
+                    &turn.items,
+                    egress_verified_at_dispatch.load(Ordering::Acquire),
+                    attempt_number,
+                ));
                 let mut result = activity_result_from_turn_with_workflow(
                     &job,
                     &turn.status,
@@ -321,6 +360,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         transcript_turn.as_ref().unwrap_or(&turn),
                     )?
                     .with_artifact(repo_memory_config_artifact(memory_enabled));
+                let result = attempt_enforcement_artifacts
+                    .into_iter()
+                    .fold(result, |result, artifact| result.with_artifact(artifact));
                 let result = if let Some(degradation) = repo_memory.degradation.clone() {
                     result.with_artifact(degradation)
                 } else {
@@ -456,36 +498,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
 pub(super) fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
     is_builtin_lifecycle_activity(job) || is_server_owned_pr_feedback_inspection(job)
 }
-fn isolation_spawn_env_vars(job: &RuntimeJob) -> HashMap<String, String> {
-    let mut env_vars = HashMap::new();
-    let Some(isolation) = job.input.get("isolation").and_then(Value::as_object) else {
-        return env_vars;
-    };
-    if let Some(tier) = isolation
-        .get("tier")
-        .and_then(Value::as_str)
-        .filter(|tier| !tier.trim().is_empty())
-    {
-        env_vars.insert(AGENT_ISOLATION_TIER_ENV.to_string(), tier.to_string());
-    }
-    let allowlist = isolation
-        .get("network_allowlist")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    if !allowlist.is_empty() {
-        env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
-    }
-    env_vars
-}
 fn runtime_worker_disabled_result_for_config(
     activity: &str,
     project_root: &Path,
@@ -554,21 +566,6 @@ mod tests {
             "codex-default",
             json!({ "activity": activity }),
         )
-    }
-    #[test]
-    fn isolation_spawn_env_vars_extracts_tier_and_allowlist() {
-        let mut job = runtime_job("implement_issue");
-        job.input = json!({
-            "activity": "implement_issue",
-            "isolation": {
-                "tier": "container",
-                "trust_class": "non_collaborator",
-                "network_allowlist": ["github.com", " api.com ", ""],
-            }
-        });
-        let env_vars = isolation_spawn_env_vars(&job);
-        assert_eq!(env_vars[AGENT_ISOLATION_TIER_ENV], "container");
-        assert_eq!(env_vars[AGENT_NETWORK_ALLOWLIST_ENV], "github.com,api.com");
     }
     fn workflow(definition_id: &str) -> WorkflowInstance {
         WorkflowInstance::new(

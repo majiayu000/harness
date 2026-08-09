@@ -35,7 +35,7 @@ current implementation is weakest.
 | Orchestration-table write prohibition | `prompt_packet.rs:76` (`agent_must_not_edit_workflow_tables: true`) | Contract statement in the packet; enforced socially, not mechanically. |
 | Filesystem sandbox with `.git`/`.harness` write-deny | `crates/harness-sandbox/src/lib.rs:11` (`PROTECTED_RELATIVE_PATHS`); Seatbelt policy generation emits the protected-path `(deny file-write* ...)` rules at `lib.rs:184-188`; Landlock/bwrap equivalents | Prevents an injected agent from rewriting git history or harness-local state directly. |
 | Read-only sandbox modes for review/inspect profiles | `workflow_runtime_worker/runtime_profile.rs:27-38` maps a runtime profile's `sandbox: "read-only-with-network"` to `SandboxMode::ReadOnlyWithNetwork`. The mode flows agent-agnostically: `workflow_runtime_worker/executor.rs:99-101` resolves it (falling back to the `agents.sandbox_mode` config default) and passes it through `TurnLifecycleOptions` (`executor.rs:197`; forwarded at `turn_engine/turn_lifecycle.rs:227` and `:243`). Claude spawns enforce it at the OS level — `claude_adapter.rs:104-109` and `claude.rs:85`, `:184-189`, `:313-318` build `SandboxSpec`s enforced by harness-sandbox Seatbelt/Landlock; the codex paths translate it to CLI sandbox config (`codex.rs:667-676`, `codex_adapter.rs:566-580`). | Filesystem sandboxing is real for Claude spawns. The residual gap is the *tool-permission flag surface*: `--dangerously-skip-permissions` is orthogonal to the sandbox mode and stays permissive even under a write-restricted sandbox. |
-| Scoped tool profile (exists, non-default) | `crates/harness-agents/src/claude.rs:115-131` | `allowed_tools = Some(...)` produces `--allowedTools`; the mechanism is built and mutually exclusive with the skip-permissions flag. |
+| Scoped tool profile (default) | `crates/harness-core/src/config/agents/permissions.rs`; `crates/harness-agents/src/claude.rs`; `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs` | `standard` is the default capability profile. Claude enforces `Read,Write,Edit,Bash`; `full` is an explicit opt-up. Runtime provenance and the final `agent_permission_profile` artifact record both the resolved request and whether Harness enforces the allowlist for that backend. |
 | Context provenance recording (spec) | `specs/GH1732/` (merged spec, prompt packet v2) | Records which sources were selected into a packet, with per-entry trust level. Observational: it proves what went in; it does not change how untrusted entries are framed. |
 
 ## Gaps
@@ -71,43 +71,54 @@ but it is an implicit trust decision that is nowhere declared or gated by the
 tier system (`tier_resolution.rs` classifies submitter trust, not repo-file
 trust).
 
-### G2 — Default agent profile is maximally permissive
+### G2 — Default agent profile is scoped (resolved)
 
-Both spawn paths pass `--dangerously-skip-permissions` whenever
-`allowed_tools` is unset — the "Full profile" is the default:
+The default `CapabilityProfile` is now `standard`, and the workflow runtime
+resolves the effective `permission_mode` and `allowed_tools` once before it
+constructs either agent request surface. Claude receives `--allowedTools`
+with `Read,Write,Edit,Bash`; `--dangerously-skip-permissions` is emitted only
+when configuration explicitly selects `capability_profile = "full"` and no
+allowlist is present. An explicit allowlist always wins over Full, and an
+empty list remains deny-all.
 
-- `crates/harness-agents/src/claude.rs:115-131` (batch CodeAgent)
-- `crates/harness-agents/src/claude_adapter.rs:87-93` (streaming adapter;
-  `claude_adapter.rs:316-320` additionally documents that approvals are
-  auto-granted and mid-turn input is impossible)
+The resolved settings participate in prompt-provenance hashing, and every
+runtime result carries an `agent_permission_profile` artifact. Its
+`tool_allowlist_enforcement` field distinguishes Claude CLI enforcement from
+backends where Harness records the requested profile but does not enforce that
+tool list. Structured-output correction turns request scoped deny-all; the
+same enforcement field prevents that request from being misreported as a hard
+tool boundary on unsupported backends. This closes Claude's implicit
+`allowed_tools = None` to unrestricted-access coupling without overstating the
+guarantee for other runtimes. Per-activity profiles remain a possible future
+refinement.
 
-Consequence: any successful injection executes with every tool the CLI
-offers. The scoped mechanism exists and is tested; it is simply not the
-default, and nothing in the workflow runtime chooses a profile per activity
-(a read-only activity like triage runs with the same full profile as
-implementation).
+### G3 — First-party fail-closed egress floor (resolved)
 
-### G3 — Egress control is delegated to infrastructure that is not shipped
+Harness now ships `docker/egress-proxy`, an exact-DNS-host allowlist proxy with
+public-address validation to prevent allowlisted DNS names from reaching local
+or private endpoints. A non-empty `network_allowlist` starts a per-agent proxy
+lease; proxy health must pass before spawn, and container agents must receive a
+`403` for a deliberately non-allowlisted canary before the agent command runs.
 
-`crates/harness-agents/src/spawn_contract.rs:16-17` defines
-`HARNESS_AGENT_EGRESS_PROXY` / `HARNESS_AGENT_EGRESS_ALLOWLIST`. For the
-container tier, `container_network_mode` (`spawn_contract.rs:249-258`)
-returns `"none"` unless an allowlist **and** a proxy URL are both configured;
-with both, the container gets `--network bridge` plus proxy env vars
-(`spawn_contract.rs:100-107`) and the allowlist is exported as an env var
-(`spawn_contract.rs:96`) for the *external* proxy to enforce. Harness itself
-never filters a single packet, and no proxy is bundled in `docker/` or
-`docker-compose.yml`.
+Container agents use a unique internal Docker network whose only egress path is
+the dual-homed proxy sidecar, so ignoring proxy environment variables does not
+open a bypass. Scoped agents with an empty allowlist use `--network none`.
+Explicit Full mode with an empty allowlist is the only unrestricted container
+route. External `HARNESS_AGENT_EGRESS_PROXY` URLs are rejected rather than
+treated as a verified boundary.
 
-Practical outcomes:
+On macOS host isolation, Seatbelt denies general outbound traffic and permits
+only the first-party proxy's loopback port. Linux supports deny-all host
+networking, but rejects proxy-only host policies because the current Landlock
+and bubblewrap helpers cannot safely express them; operators must use container
+isolation for allowlisted Linux workloads. Proxy setup and canary failures are
+typed spawn failures and never downgrade to open networking.
 
-- Container tier without proxy config: `--network none` — safe but breaks
-  any activity needing GitHub, so operators are pushed toward the host tier.
-- Container tier with proxy: enforcement quality is whatever the operator
-  deployed; harness cannot verify it.
-- Host tier (the default and the worktree workhorse): no network control at
-  all. An injected agent can exfiltrate the GitHub token or repo contents to
-  any host.
+This boundary wraps the complete spawned CLI process, including its model API
+traffic and tool children. An empty allowlist therefore also blocks provider
+connectivity. Operators must explicitly list the selected provider endpoints;
+Harness does not create an implicit control-plane exception that a shell child
+could reuse.
 
 ### G4 — Contract-only enforcement of orchestration-table integrity
 

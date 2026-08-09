@@ -607,7 +607,10 @@ async fn setup_secret_is_available_in_setup_but_removed_for_agent_phase() -> any
         fs::set_permissions(&cli_script, perms)?;
     }
 
-    let setup = format!("printenv '{secret_name}' > \"{}\"", setup_capture.display());
+    let setup = format!(
+        "printf '%s\\n%s\\n' \"${secret_name}\" \"$HOME\" > \"{}\"",
+        setup_capture.display()
+    );
 
     let cloud = CodexCloudConfig {
         enabled: true,
@@ -625,8 +628,11 @@ async fn setup_secret_is_available_in_setup_but_removed_for_agent_phase() -> any
 
     agent.execute(request).await?;
 
-    let setup_secret = fs::read_to_string(setup_capture)?;
-    assert_eq!(setup_secret.trim_end_matches('\n'), secret_value);
+    let setup_output = fs::read_to_string(setup_capture)?;
+    let mut setup_lines = setup_output.lines();
+    assert_eq!(setup_lines.next(), Some(secret_value.as_str()));
+    let setup_home = setup_lines.next().map(PathBuf::from).unwrap_or_default();
+    assert!(!setup_home.exists(), "secret setup HOME must be removed");
 
     let agent_env = fs::read_to_string(agent_capture)?;
     assert!(

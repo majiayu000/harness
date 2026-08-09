@@ -227,7 +227,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             server.config.workflow.circuit_breaker.clone(),
         ),
     );
-    let isolation_availability = crate::isolation_health::probe_isolation_availability().await;
+    let isolation_availability =
+        crate::isolation_health::probe_isolation_availability(&server.config).await;
     let isolation_required_unavailable = !isolation_availability
         .unavailable_required_tiers(&server.config.isolation)
         .is_empty();

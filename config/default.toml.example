@@ -72,6 +72,14 @@ default_agent = "codex"
 # Optional: preferred routing order for complex/critical tasks.
 complexity_preferred_agents = ["codex"]
 sandbox_mode = "danger-full-access"
+# Claude enforces Standard by default. Use "full" only as an explicit unrestricted opt-up.
+capability_profile = "standard"
+
+[isolation]
+# Scoped agents require explicit provider and task-service hosts. Container
+# isolation keeps this allowlist usable on Linux as well as macOS.
+default_tier = "container"
+network_allowlist = ["github.com", "api.github.com", "api.openai.com", "api.anthropic.com"]
 
 [agents.claude]
 cli_path = "claude"

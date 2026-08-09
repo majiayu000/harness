@@ -128,6 +128,19 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         "configured-codex-model"
     );
     assert_eq!(
+        prompt_event.event["prompt_packet"]["resolved_runtime_settings"]["capability_profile"],
+        "standard"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["resolved_runtime_settings"]["permission_mode"],
+        "scoped"
+    );
+    assert_eq!(
+        prompt_event.event["prompt_packet"]["resolved_runtime_settings"]
+            ["tool_allowlist_enforcement"],
+        "not_enforced_by_harness"
+    );
+    assert_eq!(
         prompt_event.event["prompt_packet"]["required_structured_output"]["validation_commands"],
         "Validation commands run and their results."
     );
@@ -196,6 +209,22 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         prompt_artifact.artifact["schema"],
         "harness.runtime.prompt_packet.v3"
     );
+    let permission_artifact = output
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "agent_permission_profile")
+        .expect("runtime output should record the effective permission profile");
+    assert_eq!(
+        permission_artifact.artifact,
+        serde_json::json!({
+            "attempt": 1,
+            "configured_capability_profile": "standard",
+            "permission_mode": "scoped",
+            "allowed_tools": ["Read", "Write", "Edit", "Bash"],
+            "tool_allowlist_enforcement": "not_enforced_by_harness",
+            "correction_only": false,
+        })
+    );
     let prompts = agent.prompts.lock().await;
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].contains("You are executing a Harness workflow runtime job."));
@@ -222,6 +251,19 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         agent.approval_policies.lock().await.as_slice(),
         &[Some("on-request".to_string())]
     );
+    assert_eq!(
+        agent.permission_modes.lock().await.as_slice(),
+        &[harness_core::config::agents::AgentPermissionMode::Scoped]
+    );
+    assert_eq!(
+        agent.allowed_tools.lock().await.as_slice(),
+        &[Some(vec![
+            "Read".to_string(),
+            "Write".to_string(),
+            "Edit".to_string(),
+            "Bash".to_string(),
+        ])]
+    );
     Ok(())
 }
 
@@ -245,10 +287,12 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
     ]);
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", agent.clone());
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.agents.capability_profile = harness_core::config::agents::CapabilityProfile::Full;
     let state = make_test_state_with_workflow_runtime_config_and_registry(
         dir.path(),
         &project_root,
-        harness_core::config::HarnessConfig::default(),
+        config,
         registry,
     )
     .await?;
@@ -292,8 +336,7 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
                 "dedupe_key": command.dedupe_key,
                 "command": command.command,
                 "isolation": {
-                    "tier": "container",
-                    "network_allowlist": ["github.com"]
+                    "tier": "container"
                 },
                 "runtime_profile": runtime_profile,
             }),
@@ -324,7 +367,10 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         env_vars[1][harness_core::agent::AGENT_ISOLATION_TIER_ENV],
         "container"
     );
-    assert!(!env_vars[1].contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV));
+    assert!(env_vars
+        .iter()
+        .all(|attempt_env| !attempt_env
+            .contains_key(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV)));
     assert!(matches!(
         agent.sandbox_modes.lock().await[1],
         Some(SandboxMode::ReadOnly)
@@ -334,6 +380,51 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
         Some("never")
     ));
     assert_eq!(agent.allowed_tools.lock().await[1], Some(Vec::new()));
+    assert_eq!(
+        agent.permission_modes.lock().await.as_slice(),
+        &[
+            harness_core::config::agents::AgentPermissionMode::Full,
+            harness_core::config::agents::AgentPermissionMode::Full,
+        ]
+    );
+    let permission_artifacts = output
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "agent_permission_profile")
+        .collect::<Vec<_>>();
+    assert_eq!(permission_artifacts.len(), 2);
+    assert_eq!(permission_artifacts[0].artifact["attempt"], 1);
+    assert_eq!(permission_artifacts[0].artifact["permission_mode"], "full");
+    assert_eq!(
+        permission_artifacts[0].artifact["allowed_tools"],
+        serde_json::Value::Null
+    );
+    assert_eq!(permission_artifacts[0].artifact["correction_only"], false);
+    assert_eq!(permission_artifacts[1].artifact["attempt"], 2);
+    assert_eq!(permission_artifacts[1].artifact["permission_mode"], "full");
+    assert_eq!(
+        permission_artifacts[1].artifact["allowed_tools"],
+        serde_json::json!([])
+    );
+    assert_eq!(permission_artifacts[1].artifact["correction_only"], true);
+    let egress_artifacts = output
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "agent_egress_enforcement")
+        .collect::<Vec<_>>();
+    assert_eq!(egress_artifacts.len(), 2);
+    for (index, egress_artifact) in egress_artifacts.iter().enumerate() {
+        assert_eq!(egress_artifact.artifact["attempt"], index + 1);
+        assert_eq!(egress_artifact.artifact["mode"], "unrestricted");
+        assert_eq!(
+            egress_artifact.artifact["verification_result"],
+            "not_required"
+        );
+        assert_eq!(
+            egress_artifact.artifact["network_allowlist"],
+            serde_json::json!([])
+        );
+    }
     let artifact_ref = harness_workflow::runtime::runtime_transcript_artifact_ref(&runtime_job.id);
     let RuntimeTranscriptRead::Verified(record) =
         store.read_runtime_transcript(&artifact_ref).await?

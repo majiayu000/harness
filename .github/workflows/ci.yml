@@ -78,6 +78,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Test first-party egress proxy
+        run: python3 -I -m unittest discover -s docker/egress-proxy -p 'test_proxy.py' -v
       - name: Install test dependencies
         run: python3 -I -m pip install --disable-pip-version-check 'pytest==9.0.3'
       - name: Test repository contracts
@@ -176,6 +178,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Configure Linux sandbox dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - uses: actions/download-artifact@v4
         with:
           name: web-dist

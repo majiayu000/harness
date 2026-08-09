@@ -59,7 +59,12 @@ execution is deliberate.
 On Linux, the default `workspace-write` sandbox also requires
 `harness-landlock` or [`bwrap`](https://github.com/containers/bubblewrap) on
 `PATH`; install your distribution's Bubblewrap package if you do not have the
-Landlock helper. Harness fails closed when neither helper is available.
+Landlock helper. A host-tier `danger-full-access` agent with scoped permissions
+and an empty network allowlist requires `bwrap` specifically: Landlock cannot
+provide network-only isolation while leaving filesystem access unrestricted.
+Harness reports that host tier as unavailable during startup health probing and
+refuses matching dispatches. Other Linux sandbox combinations continue to
+accept either helper.
 
 ```bash
 # With Codex CLI (Linux or macOS)
@@ -399,6 +404,14 @@ project_root = "."
 default_agent = "auto"
 # complexity_preferred_agents = ["codex", "claude"]
 sandbox_mode = "danger-full-access"
+# Claude enforces Standard tools. Set "full" only for an explicit unrestricted opt-up.
+capability_profile = "standard"
+
+[isolation]
+default_tier = "container"
+# Exact hosts only. Scoped mode with an empty list denies agent networking.
+# Linux allowlisted tasks require the container tier; macOS also supports host.
+network_allowlist = ["github.com", "api.github.com", "api.openai.com", "api.anthropic.com"]
 
 [agents.claude]
 cli_path = "claude"
@@ -433,6 +446,12 @@ environment = "production"
 exporter = "otlp-http"
 # endpoint = "http://127.0.0.1:4318"
 ```
+
+With `default_agent = "auto"`, Claude is the first registered CLI agent. Start
+Harness with `ANTHROPIC_API_KEY` set when using the container tier. Harness
+forwards that provider credential to the Claude container by environment
+variable name; the value is kept out of Docker arguments. Other ambient
+operator secrets remain filtered.
 
 HTTP API authentication now fails closed by default. Starting `harness serve`
 without `server.api_token` or `HARNESS_API_TOKEN` exits with an actionable

@@ -429,6 +429,32 @@ available at all times, including while a recheck is pending.
 | `complexity_preferred_agents` | `[]` | Optional ordered list for complex/critical routing (for example `["codex","claude"]`) |
 | `sandbox_mode` | `"danger-full-access"` | Sandbox policy: `read-only`, `read-only-with-network`, `workspace-write`, `danger-full-access` |
 | `approval_policy` | `"auto-edit"` | Approval policy for agent actions |
+| `capability_profile` | `"standard"` | Agent tool profile: `read-only`, `standard`, or explicit unrestricted opt-up `full`; Claude enforces the allowlist at its CLI boundary, while other backends retain their backend-specific sandbox/permission model |
+| `allowed_tools` | — | Optional explicit tool allowlist; overrides `capability_profile` and keeps the request scoped, including an empty deny-all list |
+
+When `capability_profile` is omitted, Harness emits a migration warning and
+uses the scoped `standard` profile. Set `full` explicitly only when unrestricted
+tool permissions are required.
+
+### `[isolation]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `default_tier` | `"host"` | Default isolation tier: `host` or `container`; `microvm` is reserved and rejected at startup |
+| `network_allowlist` | `[]` | Exact DNS hostnames allowed through Harness's first-party proxy; scoped mode with an empty list denies all CLI networking, including model-provider connectivity |
+| `rules` | `[]` | Trust-class routing overrides such as `non_collaborator` to `container` |
+
+The bundled proxy image defaults to `harness-egress-proxy:latest`; production
+deployments should set `HARNESS_AGENT_EGRESS_PROXY_IMAGE` to an immutable image
+digest. `HARNESS_AGENT_EGRESS_PROXY` is rejected. See the
+[container tier operator guide](container-tier-operator-guide.md) for build,
+canary, fail-closed, and Linux host behavior.
+
+The proxy boundary covers the complete spawned CLI process and its tool
+children. Harness does not silently exempt model-provider traffic because a
+shell child could use the same exemption. Add every required provider endpoint
+(for example, `api.openai.com` or `api.anthropic.com`) to the exact-host list.
+On Linux, any non-empty allowlist requires `default_tier = "container"`.
 
 ### `[agents.claude]`
 
@@ -452,6 +478,15 @@ available at all times, including while a recheck is pending.
 | `cache_ttl_hours` | `12` | Setup phase cache TTL |
 | `setup_commands` | `[]` | Commands run during cloud setup phase |
 | `setup_secret_env` | `[]` | Env vars available during setup but removed for agent execution |
+
+For container-isolated Codex runs with setup commands, Harness creates a project-local
+state directory under `.harness/cloud-setup-state/`. Every setup command and the final
+Codex process share its writable `HOME` and temporary directory mounts, so installed
+tools and caches remain available across the otherwise ephemeral containers.
+When `setup_secret_env` is non-empty, container setup instead uses temporary
+HOME and temporary-directory mounts so credential files cannot reach the agent.
+Those setup runs are not cached because their isolated state is removed after
+each setup phase; persist intended non-secret outputs in the workspace.
 
 ### `[agents.review]`
 

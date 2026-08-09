@@ -132,11 +132,39 @@ fn request_id_string_round_trip() {
     );
 }
 
+#[tokio::test]
+async fn stdout_reader_recognizes_container_canary_marker() -> anyhow::Result<()> {
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "printf '%s\\n' '{}'",
+            crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED,
+        ))
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing stdout"))?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let message = OpenCodeAcpAdapter::read_next_message(&mut lines).await?;
+
+    assert_eq!(
+        message,
+        Some(ParsedAcpMessage::Event(
+            AgentEvent::EgressVerifiedAtDispatch
+        ))
+    );
+    Ok(())
+}
+
 fn test_turn_request() -> TurnRequest {
     TurnRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp"),
+        permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
         execution_phase: None,

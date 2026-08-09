@@ -7,6 +7,7 @@ fn test_turn_request(project_root: PathBuf) -> TurnRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root,
+        permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
         execution_phase: None,
@@ -272,6 +273,7 @@ fn start_params_include_runtime_profile_overrides() {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
+        permission_mode: Default::default(),
         model: Some("gpt-runtime".to_string()),
         reasoning_effort: Some("medium".to_string()),
         execution_phase: None,
@@ -338,6 +340,7 @@ fn configured_adapter_applies_defaults_identity_and_secret_filtering() {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
+        permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
         execution_phase: None,
@@ -387,6 +390,7 @@ async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: dir.path().to_path_buf(),
+        permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
         execution_phase: None,
@@ -409,22 +413,19 @@ async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()
     Ok(())
 }
 
-#[test]
-fn app_server_spawn_honors_container_isolation() -> anyhow::Result<()> {
+#[tokio::test]
+async fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let mut env_vars = HashMap::new();
     env_vars.insert(
         harness_core::agent::AGENT_ISOLATION_TIER_ENV.to_string(),
         "container".to_string(),
     );
-    env_vars.insert(
-        harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
-        "github.com".to_string(),
-    );
     let request = TurnRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: root.path().to_path_buf(),
+        permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
         execution_phase: None,
@@ -437,7 +438,8 @@ fn app_server_spawn_honors_container_isolation() -> anyhow::Result<()> {
         capability_token: None,
     };
 
-    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request)?;
+    let cloud = harness_core::config::agents::CodexCloudConfig::default();
+    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &cloud, &request).await?;
     let args = spawn
         .args
         .iter()
@@ -454,12 +456,13 @@ fn app_server_spawn_honors_container_isolation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn app_server_spawn_keeps_host_workspace_path() -> anyhow::Result<()> {
+#[tokio::test]
+async fn app_server_spawn_keeps_host_workspace_path() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let request = test_turn_request(root.path().to_path_buf());
 
-    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &request)?;
+    let cloud = harness_core::config::agents::CodexCloudConfig::default();
+    let spawn = prepare_app_server_spawn(std::path::Path::new("codex"), &cloud, &request).await?;
 
     assert_eq!(spawn.child_workspace, root.path());
     assert_eq!(
@@ -671,6 +674,7 @@ async fn start_turn_missing_workspace_reports_workspace_missing() -> anyhow::Res
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: missing.clone(),
+        permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
         execution_phase: None,
@@ -738,6 +742,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
+        permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
         execution_phase: None,
@@ -749,6 +754,9 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         env_vars: HashMap::new(),
         capability_token: None,
     };
+    adapter.state.lock().await.spawn_policy_fingerprint = Some(
+        crate::spawn_contract::adapter_spawn_policy_fingerprint(&req, adapter.sandbox_mode),
+    );
     let (tx, mut rx) = mpsc::channel(4);
 
     let error = adapter

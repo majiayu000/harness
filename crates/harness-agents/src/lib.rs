@@ -7,8 +7,10 @@ mod cloud_setup;
 pub mod codex;
 pub mod codex_adapter;
 pub mod compress_model;
+pub mod docker_reconciliation;
 pub mod opencode;
 pub mod opencode_adapter;
+mod output_capture;
 pub mod provider_backpressure;
 pub mod registry;
 pub mod runtime_fingerprint;
@@ -21,6 +23,7 @@ use harness_core::run_id::RunIdentity;
 #[cfg(test)]
 use harness_core::run_id::{AGENT_RUN_ID_ENV, AGENT_RUN_PARENT_ENV};
 use harness_core::run_registry::{append_binding_nonblocking, BindingRecord};
+use output_capture::OutputCapture;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -138,6 +141,8 @@ pub(crate) struct ManagedChild {
     process_group_id: Option<u32>,
     label: &'static str,
     cleanup_disarmed: bool,
+    egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
+    egress_verification: crate::spawn_contract::EgressVerification,
 }
 
 impl ManagedChild {
@@ -148,7 +153,46 @@ impl ManagedChild {
             process_group_id,
             label,
             cleanup_disarmed: false,
+            egress_proxy_lease: None,
+            egress_verification: crate::spawn_contract::EgressVerification::NotRequired,
         }
+    }
+
+    pub(crate) fn with_egress_proxy_lease(
+        mut self,
+        lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
+    ) -> Self {
+        self.egress_proxy_lease = lease;
+        self
+    }
+
+    pub(crate) async fn validate_egress_proxy(&self) -> harness_core::error::Result<()> {
+        let Some(lease) = self.egress_proxy_lease.clone() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || lease.validate_health())
+            .await
+            .map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "egress proxy health check task failed: {error}"
+                ))
+            })?
+    }
+
+    pub(crate) fn with_egress_verification(
+        mut self,
+        verification: crate::spawn_contract::EgressVerification,
+    ) -> Self {
+        self.egress_verification = verification;
+        self
+    }
+
+    pub(crate) fn egress_verified_before_spawn(&self) -> bool {
+        self.egress_verification == crate::spawn_contract::EgressVerification::VerifiedBeforeSpawn
+    }
+
+    pub(crate) fn awaits_container_egress_canary(&self) -> bool {
+        self.egress_verification == crate::spawn_contract::EgressVerification::AwaitContainerCanary
     }
 
     fn child_mut(&mut self) -> &mut tokio::process::Child {
@@ -199,10 +243,19 @@ impl ManagedChild {
         &mut self,
         limits: &OutputLimits,
     ) -> std::io::Result<BoundedOutput> {
+        self.wait_with_redacted_output(limits, &[]).await
+    }
+
+    /// Wait while redacting configured values before bounded tail capture.
+    pub(crate) async fn wait_with_redacted_output(
+        &mut self,
+        limits: &OutputLimits,
+        secret_values: &[String],
+    ) -> std::io::Result<BoundedOutput> {
         let mut stdout_pipe = self.child_mut().stdout.take();
         let mut stderr_pipe = self.child_mut().stderr.take();
-        let mut stdout_buf = TailBuffer::new(limits.max_captured_bytes);
-        let mut stderr_buf = TailBuffer::new(limits.max_captured_bytes);
+        let mut stdout_buf = OutputCapture::new(limits.max_captured_bytes, secret_values);
+        let mut stderr_buf = OutputCapture::new(limits.max_captured_bytes, secret_values);
         let mut stdout_chunk = vec![0u8; OUTPUT_READ_CHUNK_BYTES];
         let mut stderr_chunk = vec![0u8; OUTPUT_READ_CHUNK_BYTES];
 
@@ -254,6 +307,9 @@ impl ManagedChild {
             }
         }
 
+        stdout_buf.finish();
+        stderr_buf.finish();
+
         let status = match exit_status {
             Some(status) => status,
             None => {
@@ -271,20 +327,20 @@ impl ManagedChild {
             }
         };
 
-        if stdout_buf.truncated || stderr_buf.truncated {
+        if stdout_buf.truncated() || stderr_buf.truncated() {
             tracing::warn!(
                 agent_process = self.label,
                 max_captured_bytes = limits.max_captured_bytes,
-                stdout_truncated = stdout_buf.truncated,
-                stderr_truncated = stderr_buf.truncated,
+                stdout_truncated = stdout_buf.truncated(),
+                stderr_truncated = stderr_buf.truncated(),
                 "agent output exceeded the capture limit; kept only the tail"
             );
         }
 
         Ok(BoundedOutput {
             status,
-            stdout: stdout_buf.data,
-            stderr: stderr_buf.data,
+            stdout: stdout_buf.into_data(),
+            stderr: stderr_buf.into_data(),
         })
     }
 
@@ -370,39 +426,6 @@ pub(crate) struct BoundedOutput {
     pub(crate) stderr: Vec<u8>,
 }
 
-/// Fixed-capacity byte buffer that keeps the most recent bytes pushed into it.
-struct TailBuffer {
-    data: Vec<u8>,
-    cap: usize,
-    truncated: bool,
-}
-
-impl TailBuffer {
-    fn new(cap: usize) -> Self {
-        Self {
-            data: Vec::new(),
-            cap,
-            truncated: false,
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) {
-        if chunk.len() >= self.cap {
-            self.truncated = self.truncated || !self.data.is_empty() || chunk.len() > self.cap;
-            self.data.clear();
-            self.data
-                .extend_from_slice(&chunk[chunk.len() - self.cap..]);
-            return;
-        }
-        let overflow = (self.data.len() + chunk.len()).saturating_sub(self.cap);
-        if overflow > 0 {
-            self.data.drain(..overflow);
-            self.truncated = true;
-        }
-        self.data.extend_from_slice(chunk);
-    }
-}
-
 enum PipeRead {
     Stdout(std::io::Result<usize>),
     Stderr(std::io::Result<usize>),
@@ -430,6 +453,7 @@ impl Drop for ManagedChild {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        let egress_proxy_lease = self.egress_proxy_lease.take();
         let child_reaped = match child.try_wait() {
             Ok(Some(_)) => true,
             Ok(None) => false,
@@ -470,9 +494,20 @@ impl Drop for ManagedChild {
         let process_group_id = self.process_group_id;
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(reap_killed_child(child, label, process_group_id));
+                handle.spawn(reap_killed_child(
+                    child,
+                    label,
+                    process_group_id,
+                    egress_proxy_lease,
+                ));
             }
-            Err(_) => drain_killed_child_blocking(child, child_reaped, label, process_group_id),
+            Err(_) => drain_killed_child_blocking(
+                child,
+                child_reaped,
+                label,
+                process_group_id,
+                egress_proxy_lease,
+            ),
         }
     }
 }
@@ -484,6 +519,7 @@ async fn reap_killed_child(
     mut child: tokio::process::Child,
     label: &'static str,
     process_group_id: Option<u32>,
+    _egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
 ) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     match tokio::time::timeout_at(deadline, child.wait()).await {
@@ -530,6 +566,7 @@ fn drain_killed_child_blocking(
     mut child_reaped: bool,
     label: &'static str,
     process_group_id: Option<u32>,
+    _egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
 ) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
@@ -598,22 +635,6 @@ mod managed_child_tests {
         )
     }
 
-    #[test]
-    fn tail_buffer_keeps_only_most_recent_bytes() {
-        let mut buf = TailBuffer::new(4);
-        buf.push(b"ab");
-        assert_eq!(buf.data, b"ab");
-        assert!(!buf.truncated);
-        buf.push(b"cdef");
-        assert_eq!(buf.data, b"cdef");
-        assert!(buf.truncated);
-
-        let mut big = TailBuffer::new(4);
-        big.push(b"0123456789");
-        assert_eq!(big.data, b"6789");
-        assert!(big.truncated);
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_with_output_times_out_on_silent_child() {
         let mut child = spawn_shell("sleep 30");
@@ -653,6 +674,22 @@ mod managed_child_tests {
             output.stdout.ends_with(b"END-MARKER"),
             "the trailing bytes must survive truncation"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_with_redacted_output_masks_before_tail_capture() -> anyhow::Result<()> {
+        let secret = "TOP-SECRET-TOKEN".to_string();
+        let mut child = spawn_shell("printf 'prefix-TOP-SECRET-TOKEN-tail'");
+        let limits = OutputLimits {
+            idle_timeout: Some(std::time::Duration::from_secs(10)),
+            max_captured_bytes: 12,
+        };
+
+        let output = child.wait_with_redacted_output(&limits, &[secret]).await?;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"fix-***-tail");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -714,6 +751,9 @@ mod managed_child_tests {
 #[cfg(test)]
 #[path = "run_id_tests.rs"]
 mod run_id_tests;
+
+#[cfg(test)]
+mod egress_verification_tests;
 
 #[cfg(test)]
 mod spawn_failure_tests {

@@ -1,5 +1,6 @@
 use crate::capability::CapabilityToken;
-use crate::config::agents::SandboxMode;
+use crate::config::agents::{AgentPermissionMode, CapabilityProfile, SandboxMode};
+use crate::config::HarnessConfig;
 use crate::types::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,28 @@ use std::path::PathBuf;
 pub const AGENT_ISOLATION_TIER_ENV: &str = "HARNESS_AGENT_ISOLATION_TIER";
 pub const AGENT_NETWORK_ALLOWLIST_ENV: &str = "HARNESS_AGENT_NETWORK_ALLOWLIST";
 pub const AGENT_OUTPUT_SCHEMA_PATH_ENV: &str = "HARNESS_AGENT_OUTPUT_SCHEMA_PATH";
+pub const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
+pub const AGENT_EGRESS_PROXY_IMAGE_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY_IMAGE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEgressMode {
+    DenyAll,
+    FirstPartyProxy,
+    Unrestricted,
+}
+
+impl AgentEgressMode {
+    pub fn resolve(permission_mode: AgentPermissionMode, allowlist: &[String]) -> Self {
+        if !allowlist.is_empty() {
+            Self::FirstPartyProxy
+        } else if permission_mode == AgentPermissionMode::Full {
+            Self::Unrestricted
+        } else {
+            Self::DenyAll
+        }
+    }
+}
 
 /// Core trait for all code agents (Claude Code, Codex, Anthropic API, etc.)
 #[async_trait]
@@ -40,9 +63,13 @@ pub struct AgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_layers: Option<AgentPromptLayers>,
     pub project_root: PathBuf,
+    /// Requested permission mode. Legacy direct requests with no allowlist are
+    /// also treated as unrestricted; see `effective_permission_mode`.
+    #[serde(default)]
+    pub permission_mode: AgentPermissionMode,
     /// Tool restriction for the agent invocation.
     ///
-    /// - `None`  → Full profile: no restriction, CLI uses `--dangerously-skip-permissions`.
+    /// - `None` → no restriction, preserving the legacy direct-request API.
     /// - `Some(tools)` → Restricted: CLI uses `--allowedTools <list>`.
     ///   An explicitly empty `Some(vec![])` means deny-all at the CLI boundary.
     ///
@@ -79,16 +106,42 @@ pub struct AgentRequest {
 }
 
 impl AgentRequest {
-    /// Returns `true` when no tool restriction is set (Full profile).
+    /// Apply operator-configured permissions and isolation to a direct agent
+    /// request. Workflow-runtime requests resolve these fields per job and do
+    /// not use this helper.
+    pub fn apply_configured_policy(&mut self, config: &HarnessConfig) {
+        self.permission_mode = config.agents.resolve_permission_mode();
+        self.allowed_tools = config.agents.resolve_allowed_tools();
+        self.env_vars.extend(configured_agent_spawn_env(config));
+    }
+
+    /// Returns `true` when the CLI should run without tool restrictions.
     ///
     /// When `true`, the CLI adapter should use `--dangerously-skip-permissions`.
     /// When `false`, the adapter should use `--allowedTools <list>` instead —
     /// these flags are mutually exclusive in Claude CLI 2.1.70+.
-    ///
-    /// `None` means "no restriction configured" (Full profile).
-    /// `Some(_)` means an explicit allowlist was provided, even if empty (deny-all).
     pub fn uses_dangerously_skip_permissions(&self) -> bool {
         self.allowed_tools.is_none()
+    }
+
+    /// Resolves the permission mode used for egress. Explicit Full mode is
+    /// independent from tool restrictions so correction turns can deny every
+    /// tool without losing provider access. Legacy direct callers that set
+    /// `allowed_tools` to `None` also retain unrestricted egress.
+    pub fn effective_permission_mode(&self) -> AgentPermissionMode {
+        if self.permission_mode == AgentPermissionMode::Full || self.allowed_tools.is_none() {
+            AgentPermissionMode::Full
+        } else {
+            AgentPermissionMode::Scoped
+        }
+    }
+
+    /// Resolve the tool list enforced by scoped backends. A missing list no
+    /// longer means unrestricted access; it resolves to the Standard profile.
+    pub fn scoped_allowed_tools(&self) -> Vec<String> {
+        self.allowed_tools
+            .clone()
+            .unwrap_or_else(default_scoped_tools)
     }
 
     pub fn from_prompt_layers(prompt_layers: AgentPromptLayers, project_root: PathBuf) -> Self {
@@ -118,13 +171,52 @@ impl AgentRequest {
     }
 }
 
+pub fn configured_agent_spawn_env(config: &HarnessConfig) -> HashMap<String, String> {
+    let mut env_vars = HashMap::from([(
+        AGENT_ISOLATION_TIER_ENV.to_string(),
+        config.isolation.default_tier.as_str().to_string(),
+    )]);
+    let allowlist = config
+        .isolation
+        .network_allowlist
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !allowlist.is_empty() {
+        env_vars.insert(AGENT_NETWORK_ALLOWLIST_ENV.to_string(), allowlist);
+    }
+    inherit_agent_spawn_control_env(&mut env_vars);
+    env_vars
+}
+
+pub fn inherit_agent_spawn_control_env(env_vars: &mut HashMap<String, String>) {
+    inherit_agent_spawn_control_env_with(env_vars, |key| {
+        crate::config::process_env::non_blank_config_value(key)
+    });
+}
+
+pub(crate) fn inherit_agent_spawn_control_env_with(
+    env_vars: &mut HashMap<String, String>,
+    mut read_process_env: impl FnMut(&str) -> Option<String>,
+) {
+    for key in [AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV] {
+        if let Some(value) = read_process_env(key).filter(|value| !value.trim().is_empty()) {
+            env_vars.insert(key.to_string(), value);
+        }
+    }
+}
+
 impl Default for AgentRequest {
     fn default() -> Self {
         Self {
             prompt: String::new(),
             prompt_layers: None,
             project_root: PathBuf::from("."),
-            allowed_tools: None,
+            permission_mode: AgentPermissionMode::default(),
+            allowed_tools: CapabilityProfile::default().tools(),
             model: None,
             reasoning_effort: None,
             sandbox_mode: None,
@@ -230,6 +322,7 @@ pub struct AgentResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamItem {
+    EgressVerifiedAtDispatch,
     ItemStarted { item: Item },
     MessageDelta { text: String },
     ToolOutputDelta { item_id: String, text: String },
@@ -265,6 +358,7 @@ pub enum TaskComplexity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    EgressVerifiedAtDispatch,
     TurnStarted,
     ItemStarted {
         item_type: String,
@@ -319,14 +413,14 @@ pub struct TurnRequest {
     pub prompt: String,
     pub prompt_layers: Option<AgentPromptLayers>,
     pub project_root: PathBuf,
+    pub permission_mode: AgentPermissionMode,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub execution_phase: Option<ExecutionPhase>,
     pub sandbox_mode: Option<SandboxMode>,
     pub approval_policy: Option<String>,
-    /// `None` = full profile (no tool restriction). `Some(list)` = restricted
-    /// profile — an empty list means deny-all and must NOT be promoted to full
-    /// permissions (mirrors `AgentRequest::allowed_tools`).
+    /// `None` uses the Standard tool list in scoped mode. `Some(list)` is an
+    /// explicit restriction; an empty list means deny-all.
     pub allowed_tools: Option<Vec<String>>,
     pub context: Vec<ContextItem>,
     pub timeout_secs: Option<u64>,
@@ -350,12 +444,21 @@ impl TurnRequest {
             .and_then(AgentPromptLayers::static_system_prompt_for_cache)
     }
 
-    /// True when no tool restriction applies (full profile). Mirrors
-    /// `AgentRequest::uses_dangerously_skip_permissions`: a `Some` list — even
-    /// an empty one — is a restricted profile.
+    /// True only when the request explicitly opts into Full and carries no
+    /// allowlist.
     pub fn uses_dangerously_skip_permissions(&self) -> bool {
-        self.allowed_tools.is_none()
+        self.permission_mode == AgentPermissionMode::Full && self.allowed_tools.is_none()
     }
+
+    pub fn scoped_allowed_tools(&self) -> Vec<String> {
+        self.allowed_tools
+            .clone()
+            .unwrap_or_else(default_scoped_tools)
+    }
+}
+
+fn default_scoped_tools() -> Vec<String> {
+    CapabilityProfile::standard_tools()
 }
 
 /// Streaming agent adapter — coexists with legacy CodeAgent trait.

@@ -162,6 +162,7 @@ fn turn_request_uses_same_claude_layer_split() {
         prompt: "static\ncontext\ndynamic\n".to_string(),
         prompt_layers: Some(AgentPromptLayers::new("static\n", "context\n", "dynamic\n")),
         project_root: PathBuf::from("/tmp/project"),
+        permission_mode: crate::config::agents::AgentPermissionMode::Scoped,
         model: None,
         reasoning_effort: None,
         execution_phase: None,
@@ -176,4 +177,157 @@ fn turn_request_uses_same_claude_layer_split() {
 
     assert_eq!(request.claude_system_prompt(), Some("static\n"));
     assert_eq!(request.claude_main_prompt(), "context\ndynamic\n");
+}
+
+#[test]
+fn default_agent_request_is_scoped_to_standard_tools() {
+    let request = AgentRequest::default();
+
+    assert!(!request.uses_dangerously_skip_permissions());
+    assert_eq!(
+        request.effective_permission_mode(),
+        crate::config::agents::AgentPermissionMode::Scoped
+    );
+    assert_eq!(
+        request.scoped_allowed_tools(),
+        vec!["Read", "Write", "Edit", "Bash"]
+    );
+}
+
+#[test]
+fn explicit_full_agent_request_keeps_egress_when_tools_are_restricted() {
+    let full = AgentRequest {
+        permission_mode: crate::config::agents::AgentPermissionMode::Full,
+        allowed_tools: None,
+        ..AgentRequest::default()
+    };
+    assert!(full.uses_dangerously_skip_permissions());
+
+    let restricted = AgentRequest {
+        allowed_tools: Some(vec!["Read".to_string()]),
+        ..full
+    };
+    assert!(!restricted.uses_dangerously_skip_permissions());
+    assert_eq!(
+        restricted.effective_permission_mode(),
+        crate::config::agents::AgentPermissionMode::Full
+    );
+    assert_eq!(restricted.scoped_allowed_tools(), vec!["Read"]);
+}
+
+#[test]
+fn legacy_missing_tool_allowlist_keeps_unrestricted_behavior() {
+    let request = AgentRequest {
+        allowed_tools: None,
+        ..AgentRequest::default()
+    };
+
+    assert!(request.uses_dangerously_skip_permissions());
+    assert_eq!(
+        request.effective_permission_mode(),
+        crate::config::agents::AgentPermissionMode::Full
+    );
+    assert_eq!(
+        crate::agent::AgentEgressMode::resolve(request.effective_permission_mode(), &[]),
+        crate::agent::AgentEgressMode::Unrestricted
+    );
+}
+
+#[test]
+fn full_egress_is_preserved_when_tools_are_explicitly_empty() {
+    let request = AgentRequest {
+        permission_mode: crate::config::agents::AgentPermissionMode::Full,
+        allowed_tools: Some(Vec::new()),
+        ..AgentRequest::default()
+    };
+
+    assert!(!request.uses_dangerously_skip_permissions());
+    assert!(request.scoped_allowed_tools().is_empty());
+    assert_eq!(
+        crate::agent::AgentEgressMode::resolve(request.effective_permission_mode(), &[]),
+        crate::agent::AgentEgressMode::Unrestricted
+    );
+}
+
+#[test]
+fn egress_mode_is_fail_closed_and_allowlist_driven() {
+    use crate::agent::AgentEgressMode;
+    use crate::config::agents::AgentPermissionMode;
+
+    assert_eq!(
+        AgentEgressMode::resolve(AgentPermissionMode::Scoped, &[]),
+        AgentEgressMode::DenyAll
+    );
+    assert_eq!(
+        AgentEgressMode::resolve(AgentPermissionMode::Full, &[]),
+        AgentEgressMode::Unrestricted
+    );
+    let allowlist = vec!["api.openai.com".to_string()];
+    for permission_mode in [AgentPermissionMode::Scoped, AgentPermissionMode::Full] {
+        assert_eq!(
+            AgentEgressMode::resolve(permission_mode, &allowlist),
+            AgentEgressMode::FirstPartyProxy
+        );
+    }
+}
+
+#[test]
+fn configured_policy_overrides_direct_request_permissions_and_isolation() {
+    let mut config = crate::config::HarnessConfig::default();
+    config.agents.capability_profile = crate::config::agents::CapabilityProfile::Full;
+    config.isolation.default_tier = crate::config::isolation::IsolationTier::Container;
+    config.isolation.network_allowlist = vec![
+        " github.com ".to_string(),
+        String::new(),
+        "api.openai.com".to_string(),
+    ];
+    let mut request = AgentRequest::default();
+
+    request.apply_configured_policy(&config);
+
+    assert_eq!(
+        request.permission_mode,
+        crate::config::agents::AgentPermissionMode::Full
+    );
+    assert_eq!(request.allowed_tools, None);
+    assert_eq!(
+        request.env_vars.get(crate::agent::AGENT_ISOLATION_TIER_ENV),
+        Some(&"container".to_string())
+    );
+    assert_eq!(
+        request
+            .env_vars
+            .get(crate::agent::AGENT_NETWORK_ALLOWLIST_ENV),
+        Some(&"github.com,api.openai.com".to_string())
+    );
+}
+
+#[test]
+fn spawn_control_env_inherits_only_declared_non_blank_image_settings() {
+    let process_env = HashMap::from([
+        (
+            crate::agent::AGENT_CONTAINER_IMAGE_ENV.to_string(),
+            "example/agent@sha256:test".to_string(),
+        ),
+        (
+            crate::agent::AGENT_EGRESS_PROXY_IMAGE_ENV.to_string(),
+            "example/proxy@sha256:test".to_string(),
+        ),
+        ("OPERATOR_SECRET".to_string(), "secret".to_string()),
+    ]);
+    let mut env_vars = HashMap::new();
+
+    crate::agent::inherit_agent_spawn_control_env_with(&mut env_vars, |key| {
+        process_env.get(key).cloned()
+    });
+
+    assert_eq!(env_vars.len(), 2);
+    assert_eq!(
+        env_vars.get(crate::agent::AGENT_CONTAINER_IMAGE_ENV),
+        Some(&"example/agent@sha256:test".to_string())
+    );
+    assert_eq!(
+        env_vars.get(crate::agent::AGENT_EGRESS_PROXY_IMAGE_ENV),
+        Some(&"example/proxy@sha256:test".to_string())
+    );
 }

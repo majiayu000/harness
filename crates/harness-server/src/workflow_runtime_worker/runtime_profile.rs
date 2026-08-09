@@ -1,5 +1,7 @@
 use anyhow::Context;
-use harness_core::config::agents::{AgentsConfig, SandboxMode};
+use harness_core::config::agents::{
+    AgentPermissionMode, AgentsConfig, CapabilityProfile, SandboxMode,
+};
 use harness_core::config::concurrency::ConcurrencyConfig;
 use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::types::ExecutionPhase;
@@ -55,6 +57,26 @@ pub(super) enum ResolvedApprovalPolicy {
     NotApplicable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ToolAllowlistEnforcement {
+    ClaudeCli,
+    NotEnforcedByHarness,
+}
+
+impl ToolAllowlistEnforcement {
+    fn for_runtime_kind(runtime_kind: RuntimeKind) -> Self {
+        match runtime_kind {
+            RuntimeKind::ClaudeCode => Self::ClaudeCli,
+            RuntimeKind::CodexExec
+            | RuntimeKind::CodexJsonrpc
+            | RuntimeKind::AnthropicApi
+            | RuntimeKind::RemoteHost
+            | RuntimeKind::OpenCode => Self::NotEnforcedByHarness,
+        }
+    }
+}
+
 impl ResolvedApprovalPolicy {
     pub(super) fn explicit_value(&self) -> Option<&str> {
         match self {
@@ -78,6 +100,10 @@ pub(super) struct ResolvedRuntimeSettings {
     pub(super) reasoning_effort: Option<String>,
     pub(super) sandbox_mode: SandboxMode,
     pub(super) approval_policy: ResolvedApprovalPolicy,
+    pub(super) capability_profile: CapabilityProfile,
+    pub(super) permission_mode: AgentPermissionMode,
+    pub(super) allowed_tools: Option<Vec<String>>,
+    pub(super) tool_allowlist_enforcement: ToolAllowlistEnforcement,
     pub(super) max_turns: Option<u32>,
     pub(super) timeout_secs: u64,
     pub(super) stall_timeout_secs: u64,
@@ -119,6 +145,10 @@ pub(super) fn resolve_runtime_settings(
         reasoning_effort: resolve_reasoning_effort(profile, runtime_kind, execution_phase, agents),
         sandbox_mode,
         approval_policy,
+        capability_profile: agents.capability_profile,
+        permission_mode: agents.resolve_permission_mode(),
+        allowed_tools: resolve_activity_allowed_tools(agents, execution_phase),
+        tool_allowlist_enforcement: ToolAllowlistEnforcement::for_runtime_kind(runtime_kind),
         max_turns: profile.max_turns,
         timeout_secs,
         stall_timeout_secs: normalize_stall_timeout_secs(
@@ -127,6 +157,31 @@ pub(super) fn resolve_runtime_settings(
         )
         .effective_secs,
     })
+}
+
+fn resolve_activity_allowed_tools(
+    agents: &AgentsConfig,
+    execution_phase: Option<ExecutionPhase>,
+) -> Option<Vec<String>> {
+    if agents.allowed_tools.is_some()
+        || agents.resolve_permission_mode() == AgentPermissionMode::Full
+        || agents.capability_profile == CapabilityProfile::ReadOnly
+    {
+        return agents.resolve_allowed_tools();
+    }
+
+    match execution_phase {
+        Some(ExecutionPhase::Execution | ExecutionPhase::Rebase) => {
+            CapabilityProfile::Standard.tools()
+        }
+        Some(
+            ExecutionPhase::Planning
+            | ExecutionPhase::Validation
+            | ExecutionPhase::SimpleReview
+            | ExecutionPhase::Triage,
+        )
+        | None => CapabilityProfile::ReadOnly.tools(),
+    }
 }
 
 fn resolve_model(
@@ -296,6 +351,13 @@ mod tests {
             resolved.reasoning_effort.as_deref(),
             Some("configured-effort")
         );
+        assert_eq!(resolved.capability_profile, CapabilityProfile::Standard);
+        assert_eq!(resolved.permission_mode, AgentPermissionMode::Scoped);
+        assert_eq!(
+            resolved.tool_allowlist_enforcement,
+            ToolAllowlistEnforcement::NotEnforcedByHarness
+        );
+        assert_eq!(resolved.allowed_tools, CapabilityProfile::ReadOnly.tools());
 
         let mut profile = profile;
         profile.model = Some("profile-model".to_string());
@@ -310,6 +372,103 @@ mod tests {
         .expect("explicit overrides should resolve");
         assert_eq!(resolved.model, "profile-model");
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("profile-effort"));
+    }
+
+    #[test]
+    fn scoped_defaults_derive_tools_from_the_activity_phase() {
+        let agents = AgentsConfig::default();
+        let profile = profile_with_timeout("claude-default", RuntimeKind::ClaudeCode);
+        let concurrency = ConcurrencyConfig::default();
+
+        for phase in [
+            None,
+            Some(ExecutionPhase::Planning),
+            Some(ExecutionPhase::Validation),
+            Some(ExecutionPhase::SimpleReview),
+            Some(ExecutionPhase::Triage),
+        ] {
+            let resolved = resolve_runtime_settings(
+                &profile,
+                RuntimeKind::ClaudeCode,
+                phase,
+                &agents,
+                &concurrency,
+            )
+            .expect("read-class activity settings should resolve");
+            assert_eq!(resolved.allowed_tools, CapabilityProfile::ReadOnly.tools());
+        }
+
+        for phase in [ExecutionPhase::Execution, ExecutionPhase::Rebase] {
+            let resolved = resolve_runtime_settings(
+                &profile,
+                RuntimeKind::ClaudeCode,
+                Some(phase),
+                &agents,
+                &concurrency,
+            )
+            .expect("implementation-class activity settings should resolve");
+            assert_eq!(resolved.allowed_tools, CapabilityProfile::Standard.tools());
+        }
+    }
+
+    #[test]
+    fn explicit_tool_and_full_profiles_override_activity_defaults() {
+        let profile = profile_with_timeout("claude-default", RuntimeKind::ClaudeCode);
+        let concurrency = ConcurrencyConfig::default();
+        let explicit_tools = AgentsConfig {
+            allowed_tools: Some(vec!["Read".to_string(), "Bash".to_string()]),
+            ..AgentsConfig::default()
+        };
+        let resolved = resolve_runtime_settings(
+            &profile,
+            RuntimeKind::ClaudeCode,
+            Some(ExecutionPhase::Planning),
+            &explicit_tools,
+            &concurrency,
+        )
+        .expect("explicit tools should resolve");
+        assert_eq!(resolved.allowed_tools, explicit_tools.allowed_tools);
+
+        let full = AgentsConfig {
+            capability_profile: CapabilityProfile::Full,
+            ..AgentsConfig::default()
+        };
+        let resolved = resolve_runtime_settings(
+            &profile,
+            RuntimeKind::ClaudeCode,
+            Some(ExecutionPhase::Planning),
+            &full,
+            &concurrency,
+        )
+        .expect("explicit Full profile should resolve");
+        assert_eq!(resolved.permission_mode, AgentPermissionMode::Full);
+        assert!(resolved.allowed_tools.is_none());
+    }
+
+    #[test]
+    fn resolved_settings_require_explicit_full_capability_profile() {
+        let agents = AgentsConfig {
+            capability_profile: CapabilityProfile::Full,
+            ..AgentsConfig::default()
+        };
+        let profile = profile_with_timeout("claude-default", RuntimeKind::ClaudeCode);
+
+        let resolved = resolve_runtime_settings(
+            &profile,
+            RuntimeKind::ClaudeCode,
+            None,
+            &agents,
+            &ConcurrencyConfig::default(),
+        )
+        .expect("explicit Full profile should resolve");
+
+        assert_eq!(resolved.capability_profile, CapabilityProfile::Full);
+        assert_eq!(resolved.permission_mode, AgentPermissionMode::Full);
+        assert!(resolved.allowed_tools.is_none());
+        assert_eq!(
+            resolved.tool_allowlist_enforcement,
+            ToolAllowlistEnforcement::ClaudeCli
+        );
     }
 
     #[test]

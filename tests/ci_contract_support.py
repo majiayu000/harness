@@ -219,6 +219,10 @@ HERMETIC_PYTEST_ARGUMENTS = (
     "-p", "no:cacheprovider", "tests",
 )
 REPOSITORY_PYTEST_COMMAND = f"python3 {' '.join(HERMETIC_PYTEST_ARGUMENTS)}"
+EGRESS_PROXY_TEST_COMMAND = (
+    "python3 -I -m unittest discover -s docker/egress-proxy "
+    "-p 'test_proxy.py' -v"
+)
 REPOSITORY_PYTEST_ENV = {
     "PYTHONPATH": '""',
     "PYTEST_ADDOPTS": '""',
@@ -559,6 +563,10 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
             {"uses": "actions/checkout@v4", "with": {"fetch-depth": "0"}},
             {"uses": "actions/setup-python@v5", "with": {"python-version": '"3.x"'}},
             {
+                "name": "Test first-party egress proxy",
+                "run": EGRESS_PROXY_TEST_COMMAND,
+            },
+            {
                 "name": "Install test dependencies",
                 "run": "python3 -I -m pip install --disable-pip-version-check 'pytest==9.0.3'",
             },
@@ -670,6 +678,18 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
             {"uses": "actions/checkout@v4"},
             {"uses": "dtolnay/rust-toolchain@stable"},
             {"uses": "Swatinem/rust-cache@v2"},
+            {
+                "name": "Configure Linux sandbox dependency",
+                "run": block(
+                    """\
+                    sudo apt-get update
+                    sudo apt-get install --yes --no-install-recommends bubblewrap
+                    if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+                      sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+                    fi
+                    """
+                ),
+            },
             {
                 "uses": "actions/download-artifact@v4",
                 "with": {"name": "web-dist", "path": "web/dist"},

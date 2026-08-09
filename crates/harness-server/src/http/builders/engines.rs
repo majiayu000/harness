@@ -205,12 +205,17 @@ pub(crate) async fn build_engines(
     // store (get_scan_watermark / set_scan_watermark).  A second file-based
     // cursor in GcAgent would create two independent cursors that can diverge
     // and silently drop events.
-    let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
-        server.config.gc.clone(),
-        signal_detector,
-        draft_store,
-        project_root.to_path_buf(),
-    ));
+    let gc_agent = Arc::new(
+        harness_gc::gc_agent::GcAgent::new(
+            server.config.gc.clone(),
+            signal_detector,
+            draft_store,
+            project_root.to_path_buf(),
+        )
+        .with_agent_env_vars(harness_core::agent::configured_agent_spawn_env(
+            &server.config,
+        )),
+    );
 
     // ── Skill store ───────────────────────────────────────────────────────────
     let mut skill_store = harness_skills::store::SkillStore::new()

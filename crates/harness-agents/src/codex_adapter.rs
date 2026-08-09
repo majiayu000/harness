@@ -28,8 +28,9 @@ use self::protocol::{
 };
 #[cfg(test)]
 use self::protocol::{sandbox_mode_value, sandbox_policy_value};
-fn prepare_app_server_spawn(
+async fn prepare_app_server_spawn(
     cli_path: &std::path::Path,
+    cloud: &CodexCloudConfig,
     req: &TurnRequest,
 ) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
     let args = [
@@ -44,15 +45,22 @@ fn prepare_app_server_spawn(
     } else {
         SandboxSpec::new(sandbox_mode, &req.project_root)
     };
+    let mut spawn_env_vars = req.env_vars.clone();
+    let container_bind_mounts =
+        crate::cloud_setup::apply_container_state(cloud, &req.project_root, &mut spawn_env_vars)?;
     crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
         program: cli_path,
         args: &args,
         project_root: &req.project_root,
         sandbox_spec: &sandbox_spec,
-        env_vars: &req.env_vars,
+        env_vars: &spawn_env_vars,
+        secret_env_keys: &[],
+        container_bind_mounts: &container_bind_mounts,
+        permission_mode: req.permission_mode,
         // The app-server protocol is driven over the child's stdin.
         forward_stdin: true,
     })
+    .await
 }
 pub struct CodexAdapter {
     cli_path: PathBuf,
@@ -70,6 +78,8 @@ struct AdapterState {
     thread_id: Option<String>,
     active_turn_id: Option<String>,
     child_workspace: Option<PathBuf>,
+    spawn_policy_fingerprint: Option<crate::spawn_contract::AdapterSpawnPolicyFingerprint>,
+    egress_verified_at_dispatch: bool,
 }
 impl AdapterState {
     fn new() -> Self {
@@ -81,6 +91,8 @@ impl AdapterState {
             thread_id: None,
             active_turn_id: None,
             child_workspace: None,
+            spawn_policy_fingerprint: None,
+            egress_verified_at_dispatch: false,
         }
     }
     fn next_request_id(&mut self) -> u64 {
@@ -103,6 +115,8 @@ impl AdapterState {
         self.thread_id = None;
         self.active_turn_id = None;
         self.child_workspace = None;
+        self.spawn_policy_fingerprint = None;
+        self.egress_verified_at_dispatch = false;
     }
 }
 
@@ -244,6 +258,11 @@ impl CodexAdapter {
         if line.trim().is_empty() {
             return Ok(Some(ParsedCodexMessage::Ignore));
         }
+        if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+            return Ok(Some(ParsedCodexMessage::Event(
+                AgentEvent::EgressVerifiedAtDispatch,
+            )));
+        }
         parse_codex_message(&line).map(Some).ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "codex app-server emitted invalid JSON-RPC stdout: {}",
@@ -274,18 +293,27 @@ impl CodexAdapter {
         req: &TurnRequest,
         state: &mut AdapterState,
     ) -> harness_core::error::Result<()> {
-        if state.child_ready() {
-            return Ok(());
+        let requested_fingerprint =
+            crate::spawn_contract::adapter_spawn_policy_fingerprint(req, self.sandbox_mode);
+        if state.child_ready()
+            && state.spawn_policy_fingerprint.as_ref() == Some(&requested_fingerprint)
+        {
+            if let Some(child) = state.child.as_ref() {
+                match child.validate_egress_proxy().await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => tracing::warn!(
+                        "codex app-server egress proxy is unavailable; restarting before starting a new turn: {error}"
+                    ),
+                }
+            }
         }
         if state.child.is_some() {
-            tracing::warn!(
-                "codex app-server state is incomplete; restarting before starting a new turn"
-            );
+            tracing::warn!("codex app-server spawn policy changed or state is incomplete; restarting before starting a new turn");
             state.reset_child().await;
         }
 
         let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let prepared_spawn = prepare_app_server_spawn(&self.cli_path, req)?;
+        let prepared_spawn = prepare_app_server_spawn(&self.cli_path, &self.cloud, req).await?;
         let spawn_project_root = req.project_root.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(
             crate::spawn_supervisor::AgentSpawnPlan {
@@ -311,6 +339,8 @@ impl CodexAdapter {
         .await?;
         let child_workspace = supervised.prepared_spawn.child_workspace.clone();
         let mut child = supervised.child;
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let mut egress_verified_at_dispatch = child.egress_verified_before_spawn();
 
         if let Some(stderr) = child.inner_mut().stderr.take() {
             tokio::spawn(async move {
@@ -372,6 +402,11 @@ impl CodexAdapter {
                     Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
                         return Err(harness_core::error::HarnessError::AgentExecution(message));
                     }
+                    Some(ParsedCodexMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
                     Some(_) => {}
                     None => {
                         return Err(harness_core::error::HarnessError::AgentExecution(
@@ -416,6 +451,11 @@ impl CodexAdapter {
                     Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
                         return Err(harness_core::error::HarnessError::AgentExecution(message));
                     }
+                    Some(ParsedCodexMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
                     Some(_) => {}
                     None => {
                         return Err(harness_core::error::HarnessError::AgentExecution(
@@ -424,6 +464,12 @@ impl CodexAdapter {
                     }
                 }
             }
+            if await_container_egress_canary && !egress_verified_at_dispatch {
+                return Err(harness_core::error::HarnessError::AgentExecution(
+                    "codex app-server started before the container egress canary reported success"
+                        .into(),
+                ));
+            }
             Ok(())
         }
         .await;
@@ -431,6 +477,8 @@ impl CodexAdapter {
         match protocol_result {
             Ok(()) => {
                 state.stdout_lines = Some(lines);
+                state.spawn_policy_fingerprint = Some(requested_fingerprint);
+                state.egress_verified_at_dispatch = egress_verified_at_dispatch;
                 Ok(())
             }
             Err(error) => {
@@ -459,9 +507,28 @@ impl AgentAdapter for CodexAdapter {
     ) -> harness_core::error::Result<()> {
         let req = self.effective_turn_request(req);
         crate::spawn_supervisor::validate_capability_token(req.capability_token.as_ref())?;
-        crate::cloud_setup::run_setup_phase(&self.cloud, &req.project_root).await?;
+        crate::cloud_setup::run_setup_phase(
+            &self.cloud,
+            crate::cloud_setup::CloudSetupContext {
+                project_root: &req.project_root,
+                sandbox_mode: req.sandbox_mode.unwrap_or(self.sandbox_mode),
+                permission_mode: req.permission_mode,
+                env_vars: &req.env_vars,
+                capability_token: req.capability_token.as_ref(),
+            },
+        )
+        .await?;
         let mut state = self.state.lock().await;
         self.ensure_child(&req, &mut state).await?;
+        if state.egress_verified_at_dispatch {
+            tx.send(AgentEvent::EgressVerifiedAtDispatch)
+                .await
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "codex app-server event receiver closed after egress verification: {error}"
+                    ))
+                })?;
+        }
 
         let thread_id = state.thread_id.clone().ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(
@@ -631,6 +698,69 @@ impl AgentAdapter for CodexAdapter {
 #[cfg(test)]
 #[path = "codex_adapter_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod spawn_policy_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn ready_child_restarts_when_spawn_policy_changes() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let adapter = CodexAdapter::new(project.path().join("missing-codex"));
+        let request = TurnRequest {
+            prompt: "ping".to_string(),
+            prompt_layers: None,
+            project_root: project.path().to_path_buf(),
+            permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
+            model: None,
+            reasoning_effort: None,
+            execution_phase: None,
+            sandbox_mode: Some(SandboxMode::DangerFullAccess),
+            approval_policy: None,
+            allowed_tools: None,
+            context: Vec::new(),
+            timeout_secs: None,
+            env_vars: HashMap::new(),
+            capability_token: None,
+        };
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("60")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        crate::set_process_group(&mut command);
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing stdout"))?;
+        let mut state = AdapterState::new();
+        state.stdin = Some(stdin);
+        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.child = Some(crate::ManagedChild::new(child, "codex policy test"));
+        state.spawn_policy_fingerprint = Some(
+            crate::spawn_contract::adapter_spawn_policy_fingerprint(&request, adapter.sandbox_mode),
+        );
+
+        adapter.ensure_child(&request, &mut state).await?;
+        let mut scoped = request;
+        scoped.permission_mode = harness_core::config::agents::AgentPermissionMode::Scoped;
+        adapter
+            .ensure_child(&scoped, &mut state)
+            .await
+            .expect_err("changed policy must attempt a fresh spawn");
+
+        assert!(state.child.is_none());
+        assert!(state.spawn_policy_fingerprint.is_none());
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 #[path = "codex_adapter_receiver_tests.rs"]

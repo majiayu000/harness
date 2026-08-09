@@ -10,6 +10,7 @@ fn review_request(base_ref: Option<&str>) -> CodexReviewRequest {
         reasoning_effort: Some("xhigh".to_string()),
         sandbox_mode: SandboxMode::ReadOnlyWithNetwork,
         approval_policy: Some("never".to_string()),
+        permission_mode: Default::default(),
         env_vars: Default::default(),
     }
 }
@@ -86,6 +87,7 @@ fn container_review_request(
         reasoning_effort: Some("high".to_string()),
         sandbox_mode: SandboxMode::ReadOnlyWithNetwork,
         approval_policy: Some("never".to_string()),
+        permission_mode: Default::default(),
         env_vars: env,
     }
 }
@@ -105,17 +107,19 @@ fn mark_standard_git_repository(root: &std::path::Path) -> anyhow::Result<()> {
 
 /// GH-1785: `execute_review` used to call `wrap_command` directly, so review
 /// runs got neither container isolation nor operator-secret env filtering.
-#[test]
-fn review_spawn_uses_container_isolation() -> anyhow::Result<()> {
+#[tokio::test]
+async fn review_spawn_uses_container_isolation() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     mark_standard_git_repository(dir.path())?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
-    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
-        dir.path(),
-        Some("origin/main"),
-        vec![],
-    ))?;
+    let (spawn, _) = agent
+        .prepare_review_spawn(&container_review_request(
+            dir.path(),
+            Some("origin/main"),
+            vec![],
+        ))
+        .await?;
 
     let args = spawn_args(&spawn);
     assert_eq!(spawn.program, PathBuf::from("docker"));
@@ -137,57 +141,77 @@ fn review_spawn_uses_container_isolation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn container_review_uses_configured_image_and_proxy() -> anyhow::Result<()> {
+#[tokio::test]
+async fn container_review_reuses_cloud_setup_home_and_tmp() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     mark_standard_git_repository(dir.path())?;
-    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+    let cloud = CodexCloudConfig {
+        enabled: true,
+        cache_ttl_hours: 12,
+        setup_commands: vec!["cargo fetch".to_string()],
+        setup_secret_env: Vec::new(),
+    };
+    let agent = CodexAgent::with_cloud(PathBuf::from("codex"), cloud, SandboxMode::WorkspaceWrite);
 
-    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
-        dir.path(),
-        Some("origin/main"),
-        vec![
-            (
-                "HARNESS_AGENT_CONTAINER_IMAGE",
-                "example/reviewer:sha256-test",
-            ),
-            (
-                "HARNESS_AGENT_EGRESS_PROXY",
-                "http://review-proxy.local:8080",
-            ),
-            (
-                "HARNESS_AGENT_NETWORK_ALLOWLIST",
-                "api.openai.com,github.com",
-            ),
-            ("OPERATOR_API_KEY", "operator-secret"),
-        ],
-    ))?;
+    let (spawn, _) = agent
+        .prepare_review_spawn(&container_review_request(
+            dir.path(),
+            Some("origin/main"),
+            vec![],
+        ))
+        .await?;
 
     let args = spawn_args(&spawn);
-    assert!(args.contains(&"example/reviewer:sha256-test".to_string()));
+    assert!(args.contains(&"HOME=/harness-cloud-home".to_string()));
+    assert!(args.contains(&"TMPDIR=/tmp".to_string()));
     assert!(args
-        .windows(2)
-        .any(|window| window == ["--network", "bridge"]));
-    assert!(args.contains(&"HTTPS_PROXY=http://review-proxy.local:8080".to_string()));
-    assert!(!args.iter().any(|arg| arg.contains("operator-secret")));
+        .iter()
+        .any(|arg| { arg.starts_with("type=bind,") && arg.ends_with(",dst=/harness-cloud-home") }));
+    assert!(args
+        .iter()
+        .any(|arg| arg.starts_with("type=bind,") && arg.ends_with(",dst=/tmp")));
     Ok(())
 }
 
-#[test]
-fn review_spawn_filters_operator_secrets() -> anyhow::Result<()> {
+#[tokio::test]
+async fn container_review_rejects_legacy_external_proxy() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     mark_standard_git_repository(dir.path())?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
-    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
-        dir.path(),
-        Some("origin/main"),
-        vec![
-            ("GITHUB_TOKEN", "operator-token"),
-            ("ANTHROPIC_API_KEY", "operator-key"),
-            ("HARNESS_SCOPED_GITHUB_TOKEN", "scoped-token"),
-        ],
-    ))?;
+    let error = agent
+        .prepare_review_spawn(&container_review_request(
+            dir.path(),
+            Some("origin/main"),
+            vec![(
+                "HARNESS_AGENT_EGRESS_PROXY",
+                "http://review-proxy.local:8080",
+            )],
+        ))
+        .await
+        .expect_err("external proxy URLs must not be treated as enforced boundaries");
+
+    assert!(error.to_string().contains("is no longer accepted"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_spawn_filters_operator_secrets() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    mark_standard_git_repository(dir.path())?;
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+
+    let (spawn, _) = agent
+        .prepare_review_spawn(&container_review_request(
+            dir.path(),
+            Some("origin/main"),
+            vec![
+                ("GITHUB_TOKEN", "operator-token"),
+                ("ANTHROPIC_API_KEY", "operator-key"),
+                ("HARNESS_SCOPED_GITHUB_TOKEN", "scoped-token"),
+            ],
+        ))
+        .await?;
 
     let args = spawn_args(&spawn);
     assert!(!args.iter().any(|arg| arg.contains("operator-token")));
@@ -209,38 +233,43 @@ fn review_spawn_filters_operator_secrets() -> anyhow::Result<()> {
 }
 
 /// A piped prompt is lost unless the container keeps stdin open.
-#[test]
-fn review_spawn_keeps_container_stdin_open_for_piped_prompt() -> anyhow::Result<()> {
+#[tokio::test]
+async fn review_spawn_keeps_container_stdin_open_for_piped_prompt() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     mark_standard_git_repository(dir.path())?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
-    let (piped, _) =
-        agent.prepare_review_spawn(&container_review_request(dir.path(), None, vec![]))?;
-    let (not_piped, _) = agent.prepare_review_spawn(&container_review_request(
-        dir.path(),
-        Some("origin/main"),
-        vec![],
-    ))?;
+    let (piped, _) = agent
+        .prepare_review_spawn(&container_review_request(dir.path(), None, vec![]))
+        .await?;
+    let (not_piped, _) = agent
+        .prepare_review_spawn(&container_review_request(
+            dir.path(),
+            Some("origin/main"),
+            vec![],
+        ))
+        .await?;
 
     assert!(spawn_args(&piped).contains(&"--interactive".to_string()));
     assert!(!spawn_args(&not_piped).contains(&"--interactive".to_string()));
     Ok(())
 }
 
-#[test]
-fn container_review_maps_repository_subdirectory() -> anyhow::Result<()> {
+#[tokio::test]
+async fn container_review_maps_repository_subdirectory() -> anyhow::Result<()> {
     let repo = tempfile::tempdir()?;
     mark_standard_git_repository(repo.path())?;
     let project = repo.path().join("crates/example");
     fs::create_dir_all(&project)?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
-    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
-        &project,
-        Some("origin/main"),
-        vec![],
-    ))?;
+    let (spawn, _) = agent
+        .prepare_review_spawn(&container_review_request(
+            &project,
+            Some("origin/main"),
+            vec![],
+        ))
+        .await?;
 
     let args = spawn_args(&spawn);
     assert_eq!(
@@ -257,8 +286,8 @@ fn container_review_maps_repository_subdirectory() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn container_review_mounts_linked_worktree_git_metadata_read_only() -> anyhow::Result<()> {
+#[tokio::test]
+async fn container_review_mounts_linked_worktree_git_metadata_read_only() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let common_git = root.path().join("common.git");
     let worktree_git = common_git.join("worktrees/feature");
@@ -272,11 +301,13 @@ fn container_review_mounts_linked_worktree_git_metadata_read_only() -> anyhow::R
     fs::write(worktree_git.join("commondir"), "../..\n")?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
-    let (spawn, _) = agent.prepare_review_spawn(&container_review_request(
-        &worktree,
-        Some("origin/main"),
-        vec![],
-    ))?;
+    let (spawn, _) = agent
+        .prepare_review_spawn(&container_review_request(
+            &worktree,
+            Some("origin/main"),
+            vec![],
+        ))
+        .await?;
 
     let args = spawn_args(&spawn);
     assert!(args.contains(&format!(
@@ -293,8 +324,8 @@ fn container_review_mounts_linked_worktree_git_metadata_read_only() -> anyhow::R
     Ok(())
 }
 
-#[test]
-fn container_review_fails_closed_without_git_topology() -> anyhow::Result<()> {
+#[tokio::test]
+async fn container_review_fails_closed_without_git_topology() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
 
@@ -304,6 +335,7 @@ fn container_review_fails_closed_without_git_topology() -> anyhow::Result<()> {
             Some("origin/main"),
             vec![],
         ))
+        .await
         .expect_err("container review must reject a workspace without Git metadata");
 
     assert!(matches!(
@@ -351,6 +383,7 @@ printf '%s\n' '```'
             reasoning_effort: Some("high".to_string()),
             sandbox_mode: SandboxMode::DangerFullAccess,
             approval_policy: Some("never".to_string()),
+            permission_mode: Default::default(),
             env_vars: Default::default(),
         })
         .await?;

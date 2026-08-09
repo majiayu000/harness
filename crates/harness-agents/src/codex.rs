@@ -7,19 +7,21 @@ use async_trait::async_trait;
 use harness_core::agent::{
     AgentRequest, AgentResponse, CodeAgent, StreamItem, AGENT_OUTPUT_SCHEMA_PATH_ENV,
 };
-use harness_core::config::agents::SandboxMode;
+use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig};
 use harness_core::types::Capability;
 use harness_sandbox::SandboxSpec;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 
 #[path = "codex_exec_parser.rs"]
-mod codex_exec_parser;
+pub(crate) mod codex_exec_parser;
 pub(crate) use self::codex_exec_parser::{
     parse_codex_error_item_message, parse_codex_item, parse_codex_token_usage,
 };
@@ -60,6 +62,7 @@ pub struct CodexReviewRequest {
     pub reasoning_effort: Option<String>,
     pub sandbox_mode: SandboxMode,
     pub approval_policy: Option<String>,
+    pub permission_mode: AgentPermissionMode,
     pub env_vars: HashMap<String, String>,
 }
 
@@ -96,8 +99,35 @@ impl CodexAgent {
         self
     }
 
-    async fn run_setup_phase(&self, project_root: &Path) -> harness_core::error::Result<()> {
-        cloud_setup::run_setup_phase(&self.cloud, project_root).await
+    async fn run_setup_phase(&self, req: &AgentRequest) -> harness_core::error::Result<()> {
+        cloud_setup::run_setup_phase(
+            &self.cloud,
+            cloud_setup::CloudSetupContext {
+                project_root: &req.project_root,
+                sandbox_mode: self.effective_sandbox_mode(req),
+                permission_mode: req.effective_permission_mode(),
+                env_vars: &req.env_vars,
+                capability_token: req.capability_token.as_ref(),
+            },
+        )
+        .await
+    }
+
+    async fn run_review_setup_phase(
+        &self,
+        req: &CodexReviewRequest,
+    ) -> harness_core::error::Result<()> {
+        cloud_setup::run_setup_phase(
+            &self.cloud,
+            cloud_setup::CloudSetupContext {
+                project_root: &req.project_root,
+                sandbox_mode: req.sandbox_mode,
+                permission_mode: req.permission_mode,
+                env_vars: &req.env_vars,
+                capability_token: None,
+            },
+        )
+        .await
     }
 
     fn effective_reasoning_effort<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
@@ -202,7 +232,7 @@ impl CodexAgent {
     /// Calling `wrap_command` directly (as this path used to) skipped container
     /// isolation and the operator-secret env filtering that
     /// `prepare_agent_spawn` applies.
-    fn prepare_review_spawn(
+    async fn prepare_review_spawn(
         &self,
         req: &CodexReviewRequest,
     ) -> harness_core::error::Result<(
@@ -224,6 +254,11 @@ impl CodexAgent {
                 spawn_env_vars.remove(key);
             }
         }
+        let container_bind_mounts = cloud_setup::apply_container_state(
+            &self.cloud,
+            &req.project_root,
+            &mut spawn_env_vars,
+        )?;
 
         let prepared_spawn =
             crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
@@ -232,8 +267,12 @@ impl CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                secret_env_keys: &[],
+                container_bind_mounts: &container_bind_mounts,
+                permission_mode: req.permission_mode,
                 forward_stdin: review_uses_stdin_prompt(req),
-            })?;
+            })
+            .await?;
         Ok((prepared_spawn, run_identity))
     }
 
@@ -241,10 +280,10 @@ impl CodexAgent {
         &self,
         req: CodexReviewRequest,
     ) -> harness_core::error::Result<AgentResponse> {
-        self.run_setup_phase(&req.project_root).await?;
+        self.run_review_setup_phase(&req).await?;
 
         let use_stdin_prompt = review_uses_stdin_prompt(&req);
-        let (prepared_spawn, run_identity) = self.prepare_review_spawn(&req)?;
+        let (prepared_spawn, run_identity) = self.prepare_review_spawn(&req).await?;
 
         tracing::debug!(
             agent = "codex",
@@ -431,7 +470,7 @@ impl CodeAgent for CodexAgent {
             }
         }
 
-        self.run_setup_phase(&req.project_root).await?;
+        self.run_setup_phase(&req).await?;
 
         let base_args = self.base_args(&req);
         let sandbox_mode = self.effective_sandbox_mode(&req);
@@ -450,6 +489,11 @@ impl CodeAgent for CodexAgent {
                 spawn_env_vars.remove(key);
             }
         }
+        let container_bind_mounts = cloud_setup::apply_container_state(
+            &self.cloud,
+            &req.project_root,
+            &mut spawn_env_vars,
+        )?;
         let prepared_spawn =
             crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
                 program: &self.cli_path,
@@ -457,8 +501,12 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                secret_env_keys: &[],
+                container_bind_mounts: &container_bind_mounts,
+                permission_mode: req.effective_permission_mode(),
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         log_codex_spawn_attempt(
             &prepared_spawn.program,
@@ -542,7 +590,7 @@ impl CodeAgent for CodexAgent {
             }
         }
 
-        self.run_setup_phase(&req.project_root).await?;
+        self.run_setup_phase(&req).await?;
 
         let base_args = self.base_args(&req);
         let sandbox_mode = self.effective_sandbox_mode(&req);
@@ -561,6 +609,11 @@ impl CodeAgent for CodexAgent {
                 spawn_env_vars.remove(key);
             }
         }
+        let container_bind_mounts = cloud_setup::apply_container_state(
+            &self.cloud,
+            &req.project_root,
+            &mut spawn_env_vars,
+        )?;
         let prepared_spawn =
             crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
                 program: &self.cli_path,
@@ -568,8 +621,12 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
+                secret_env_keys: &[],
+                container_bind_mounts: &container_bind_mounts,
+                permission_mode: req.effective_permission_mode(),
                 forward_stdin: false,
-            })?;
+            })
+            .await?;
 
         log_codex_spawn_attempt(
             &prepared_spawn.program,
@@ -601,6 +658,15 @@ impl CodeAgent for CodexAgent {
         )
         .await?;
         let mut child = supervised.child;
+        if child.egress_verified_before_spawn() {
+            send_stream_item(
+                &tx,
+                StreamItem::EgressVerifiedAtDispatch,
+                self.name(),
+                "egress verification",
+            )
+            .await?;
+        }
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;
@@ -616,7 +682,14 @@ impl CodeAgent for CodexAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        let stream_result = stream_codex_exec_output(child.inner_mut(), &tx, idle_timeout).await;
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let stream_result = stream_codex_exec_output(
+            child.inner_mut(),
+            &tx,
+            idle_timeout,
+            await_container_egress_canary,
+        )
+        .await;
         let stream_send_failed = matches!(
             &stream_result,
             Err(harness_core::error::HarnessError::AgentExecution(message))

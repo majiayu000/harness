@@ -26,11 +26,15 @@ trait PromptExecutor: Send + Sync {
 
 struct RegistryExecutor {
     agent_registry: Arc<AgentRegistry>,
+    config: HarnessConfig,
 }
 
 impl RegistryExecutor {
-    fn new(agent_registry: Arc<AgentRegistry>) -> Self {
-        Self { agent_registry }
+    fn new(agent_registry: Arc<AgentRegistry>, config: HarnessConfig) -> Self {
+        Self {
+            agent_registry,
+            config,
+        }
     }
 }
 
@@ -47,13 +51,13 @@ impl PromptExecutor for RegistryExecutor {
             format!("unknown agent `{agent}` (available: [{available}])")
         })?;
 
-        let response = code_agent
-            .execute(AgentRequest {
-                prompt,
-                project_root,
-                ..Default::default()
-            })
-            .await?;
+        let mut request = AgentRequest {
+            prompt,
+            project_root,
+            ..Default::default()
+        };
+        request.apply_configured_policy(&self.config);
+        let response = code_agent.execute(request).await?;
         Ok(response.output)
     }
 }
@@ -451,7 +455,7 @@ pub async fn run(config: HarnessConfig) -> anyhow::Result<()> {
         .resolved_default_agent_name()
         .unwrap_or(config.agents.default_agent.as_str())
         .to_string();
-    let executor = Arc::new(RegistryExecutor::new(Arc::new(agent_registry)));
+    let executor = Arc::new(RegistryExecutor::new(Arc::new(agent_registry), config));
     let server = McpServer::new(default_agent_name, executor);
     server.serve_stdio().await
 }

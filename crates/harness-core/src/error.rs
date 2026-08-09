@@ -90,6 +90,11 @@ pub enum SandboxError {
         helper: &'static str,
         mode: SandboxMode,
     },
+    #[error("network policy `{policy}` is unsupported by sandbox helper `{helper}`")]
+    UnsupportedNetworkPolicy {
+        helper: &'static str,
+        policy: &'static str,
+    },
 }
 
 #[derive(Debug, Error)]

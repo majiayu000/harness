@@ -16,7 +16,7 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
     ),
     allowed(
         "crates/harness-agents/src/cloud_setup.rs",
-        3,
+        1,
         "agent cloud setup secret passthrough",
     ),
     allowed(
@@ -33,16 +33,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "crates/harness-agents/src/run_id_tests.rs",
         2,
         "serialized run-id env fixture",
-    ),
-    allowed(
-        "crates/harness-agents/src/spawn_contract.rs",
-        1,
-        "PATH passthrough for child process env",
-    ),
-    allowed(
-        "crates/harness-cli/src/cmd/pr.rs",
-        1,
-        "agent review child env propagation",
     ),
     allowed(
         "crates/harness-cli/src/commands/exec.rs",
