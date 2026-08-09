@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn public_output_limit_boundaries_are_exact() {
+    for accepted in [1, RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES] {
+        assert!(super::super::validate_output_limit(accepted).is_ok());
+    }
+    for rejected in [0, RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES + 1] {
+        assert!(matches!(
+            super::super::validate_output_limit(rejected),
+            Err(RuntimeFingerprintProduceError::InvalidOutputLimit)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn terminal_first_path_candidate_never_derives_the_second_candidate() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    write_static_fixture(first.path(), "lazy-runtime");
+    write_static_fixture(second.path(), "lazy-runtime");
+    let configured = ConfiguredRuntimeExecutable::new(
+        LocalExecutableRuntimeKind::CodexExec,
+        source("lazy_resolution"),
+        IsolationTier::Host,
+        sandbox(SandboxMode::DangerFullAccess),
+        "lazy-runtime",
+        Vec::new(),
+    );
+    let child_path = std::env::join_paths([first.path(), second.path()]).unwrap();
+    let options = RuntimeFingerprintOptions::new(first.path())
+        .with_environment([(OsString::from("PATH"), child_path)]);
+    let selected = environment::validate_and_select(
+        configured.runtime_kind(),
+        options.environment(),
+        configured.setup_secret_env(),
+    )
+    .unwrap();
+    let prepared = command::prepare_command(
+        configured.executable().as_os_str(),
+        options.working_dir(),
+        selected.child_path.as_deref(),
+    )
+    .unwrap();
+    let derivation_count = prepared.derivation_count();
+    let envelope = super::super::owner::run(&configured, &options, selected, prepared)
+        .await
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap();
+    assert_eq!(
+        json["payload"]["resolution_attempts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        derivation_count.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
 fn linux_pre_spawn_checkpoint_detects_in_place_content_change() {
     let registry = registry::OwnerRegistry::new();
     let directory = tempfile::tempdir().unwrap();
@@ -9,10 +70,9 @@ fn linux_pre_spawn_checkpoint_detects_in_place_content_change() {
     let deadline = std::time::Instant::now() + RUNTIME_FINGERPRINT_PROBE_DEADLINE;
     let working_directory =
         executable::observe_working_directory(directory.path(), deadline, &registry).unwrap();
-    let command =
-        executable::prepare_command(executable.as_os_str(), directory.path(), None).unwrap();
+    let command = command::prepare_command(executable.as_os_str(), directory.path(), None).unwrap();
     let retained = match candidate::observe_candidate(
-        &command.candidates[0],
+        &command.candidate(0).unwrap().unwrap(),
         &working_directory,
         deadline,
         &registry,
@@ -36,7 +96,7 @@ fn linux_pre_spawn_checkpoint_detects_in_place_content_change() {
     .unwrap();
     assert_eq!(
         checkpoint::pre_spawn(
-            &command.candidates[0],
+            &command.candidate(0).unwrap().unwrap(),
             &working_directory,
             &retained,
             &boundaries,
@@ -69,7 +129,7 @@ fn dropping_hosting_tokio_runtime_still_reaps_registered_target() {
         configured.setup_secret_env(),
     )
     .unwrap();
-    let prepared = executable::prepare_command(
+    let prepared = command::prepare_command(
         configured.executable().as_os_str(),
         options.working_dir(),
         selected.child_path.as_deref(),
@@ -202,7 +262,7 @@ fn unrelated_same_session_setpgid_churn_never_enters_owner_registry() {
         configured.setup_secret_env(),
     )
     .unwrap();
-    let prepared = executable::prepare_command(
+    let prepared = command::prepare_command(
         configured.executable().as_os_str(),
         options.working_dir(),
         selected.child_path.as_deref(),

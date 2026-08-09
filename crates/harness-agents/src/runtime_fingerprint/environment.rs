@@ -1,22 +1,83 @@
 //! Closed runtime environment policy.
 
-use super::executable::{digest_native_os_string, native_os_units_len};
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use super::command::digest_native_os_string;
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use super::executable::native_os_units_len;
 use super::{
     RuntimeFingerprintProduceError, RuntimeLaunchInputLimitKind,
-    RUNTIME_FINGERPRINT_MAX_ENVIRONMENT_KEY_UNITS, RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS,
-    RUNTIME_FINGERPRINT_MAX_OBSERVATION_ENV_ENTRIES, RUNTIME_FINGERPRINT_MAX_SETUP_SECRET_NAMES,
-    RUNTIME_FINGERPRINT_MAX_SETUP_SECRET_NAME_UNITS,
+    RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS,
+};
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use super::{
+    RUNTIME_FINGERPRINT_MAX_ENVIRONMENT_KEY_UNITS, RUNTIME_FINGERPRINT_MAX_OBSERVATION_ENV_ENTRIES,
+    RUNTIME_FINGERPRINT_MAX_SETUP_SECRET_NAMES, RUNTIME_FINGERPRINT_MAX_SETUP_SECRET_NAME_UNITS,
 };
 use harness_core::stack::fingerprint::{
-    LocalExecutableRuntimeKind, RuntimeEnvironmentFact, RuntimeEnvironmentKey,
-    RuntimeEnvironmentValue, RuntimeProbeFailure, RuntimeProbeFailureDetail,
+    LocalExecutableRuntimeKind, RuntimeProbeFailure, RuntimeProbeFailureDetail,
     RuntimeProbeFailureKind, RuntimeVersionFacts, RuntimeVersionStream,
 };
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+use harness_core::stack::fingerprint::{
+    RuntimeEnvironmentFact, RuntimeEnvironmentKey, RuntimeEnvironmentValue,
+};
 use harness_core::stack::Sha256Digest;
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 use std::ffi::{OsStr, OsString};
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 const PATH_DIGEST_DOMAIN: &[u8] = b"harness_runtime_environment_path_v0_1\0";
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 const CLAUDE_CONFIG_DIR_DIGEST_DOMAIN: &[u8] =
     b"harness_runtime_environment_claude_config_dir_v0_1\0";
 const WORKING_DIRECTORY_DIGEST_DOMAIN: &[u8] = b"harness_runtime_working_directory_v0_1\0";
@@ -199,11 +260,25 @@ fn valid_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 pub(super) struct SelectedEnvironment {
     pub(super) facts: Vec<RuntimeEnvironmentFact>,
     pub(super) child_path: Option<OsString>,
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 pub(super) fn validate_and_select(
     kind: LocalExecutableRuntimeKind,
     entries: &[(OsString, OsString)],
@@ -278,6 +353,13 @@ pub(super) fn validate_and_select(
     })
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn validate_collection_limits(
     entries: &[(OsString, OsString)],
     setup_secret_names: &[OsString],
@@ -313,6 +395,13 @@ fn validate_collection_limits(
     Ok(())
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn ensure_value_limit(
     value: &OsStr,
     kind: RuntimeLaunchInputLimitKind,
@@ -328,6 +417,13 @@ fn ensure_value_limit(
     }
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn selected_value<'a>(
     key: &str,
     entries: &'a BTreeMap<String, &'a OsString>,
@@ -338,6 +434,13 @@ fn selected_value<'a>(
         .flatten()
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn secret_fact(
     evidence_key: RuntimeEnvironmentKey,
     key: &str,
@@ -352,6 +455,13 @@ fn secret_fact(
     RuntimeEnvironmentFact::new(evidence_key, value)
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn digest_fact(
     key: RuntimeEnvironmentKey,
     value: Option<&OsString>,
@@ -365,7 +475,16 @@ fn digest_fact(
     RuntimeEnvironmentFact::new(key, value)
 }
 
-#[cfg(unix)]
+#[cfg(all(
+    unix,
+    any(
+        test,
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
 fn canonical_environment_key(key: &OsStr) -> Result<String, RuntimeFingerprintProduceError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -378,7 +497,7 @@ fn canonical_environment_key(key: &OsStr) -> Result<String, RuntimeFingerprintPr
         .map_err(|_| RuntimeFingerprintProduceError::InvalidEnvironmentKey)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn canonical_environment_key(key: &OsStr) -> Result<String, RuntimeFingerprintProduceError> {
     use std::os::windows::ffi::OsStrExt;
 

@@ -1,9 +1,20 @@
 use super::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod lifecycle;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod owner;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod review_regressions;
 use harness_core::stack::fingerprint::RuntimeCommandForm;
 use harness_core::stack::{AgentStackSource, AgentStackSourceScope};
 use serde_json::json;
@@ -122,7 +133,10 @@ async fn non_inherited_network_policies_fail_before_host_observation() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 #[tokio::test]
 async fn unsupported_platform_fails_before_output_or_cwd_validation() {
     let error = fingerprint_configured_runtime_executable(
@@ -178,12 +192,14 @@ fn sandbox_passthrough_state_is_only_supported_policy() {
 #[cfg(unix)]
 #[test]
 fn unix_command_and_working_directory_digest_vectors_are_fixed() {
-    let prepared = executable::prepare_command(
+    let prepared = command::prepare_command(
         std::ffi::OsStr::new("codex"),
         Path::new("/x"),
         Some(std::ffi::OsStr::new("/bin")),
     )
     .unwrap();
+    assert!(prepared.validate_shape());
+    assert!(!prepared.path_unusable());
     assert_eq!(
         prepared.working_directory_digest.as_str(),
         "bdc1de448a5df96390bcc54bf757c96abf628c534baef27bdeba60c5350ebaf6"
@@ -214,40 +230,41 @@ fn working_directory_identity_digest_vector_is_fixed() {
 #[cfg(unix)]
 #[test]
 fn unix_command_forms_and_path_order_are_frozen() {
-    use executable::CandidateReference;
+    use command::CandidateReference;
 
     let absolute =
-        executable::prepare_command(std::ffi::OsStr::new("/opt/codex"), Path::new("/repo"), None)
+        command::prepare_command(std::ffi::OsStr::new("/opt/codex"), Path::new("/repo"), None)
             .unwrap();
     assert_eq!(absolute.command_form, RuntimeCommandForm::UnixAbsolute);
     assert!(matches!(
-        absolute.candidates[0].reference,
+        absolute.candidate(0).unwrap().unwrap().reference,
         CandidateReference::Absolute(_)
     ));
 
     let qualified =
-        executable::prepare_command(std::ffi::OsStr::new("bin/codex"), Path::new("/repo"), None)
+        command::prepare_command(std::ffi::OsStr::new("bin/codex"), Path::new("/repo"), None)
             .unwrap();
     assert_eq!(qualified.command_form, RuntimeCommandForm::UnixQualified);
     assert!(matches!(
-        qualified.candidates[0].reference,
+        qualified.candidate(0).unwrap().unwrap().reference,
         CandidateReference::WorkingDirectoryRelative(_)
     ));
 
-    let bare = executable::prepare_command(
+    let bare = command::prepare_command(
         std::ffi::OsStr::new("codex"),
         Path::new("/repo"),
         Some(std::ffi::OsStr::new(":rel:/abs")),
     )
     .unwrap();
     assert_eq!(bare.command_form, RuntimeCommandForm::UnixBare);
-    assert_eq!(bare.candidates.len(), 3);
+    assert!(bare.has_candidate(2));
+    assert!(!bare.has_candidate(3));
     assert!(matches!(
-        bare.candidates[0].reference,
+        bare.candidate(0).unwrap().unwrap().reference,
         CandidateReference::WorkingDirectoryRelative(_)
     ));
     assert!(matches!(
-        bare.candidates[2].reference,
+        bare.candidate(2).unwrap().unwrap().reference,
         CandidateReference::Absolute(_)
     ));
 }
@@ -258,14 +275,14 @@ fn unix_bare_path_candidate_65_is_not_observed() {
     let path = std::iter::repeat_n("entry", 65)
         .collect::<Vec<_>>()
         .join(":");
-    let prepared = executable::prepare_command(
+    let prepared = command::prepare_command(
         std::ffi::OsStr::new("codex"),
         Path::new("/repo"),
         Some(std::ffi::OsStr::new(&path)),
     )
     .unwrap();
-    assert_eq!(prepared.candidates.len(), 64);
-    assert!(prepared.candidate_limit_exceeded);
+    assert!(prepared.has_candidate(63));
+    assert!(prepared.has_candidate(64));
 }
 
 #[test]
@@ -325,7 +342,10 @@ fn configured_command_and_working_directory_limits_are_exact() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[tokio::test]
 async fn linux_capability_proves_exec_stop_image_blocks_proc_mem_and_reaps_by_pidfd() {
     let working_directory = std::env::current_dir().unwrap();
@@ -345,7 +365,10 @@ async fn linux_capability_proves_exec_stop_image_blocks_proc_mem_and_reaps_by_pi
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[tokio::test]
 async fn bare_without_sanitized_path_records_path_unusable_after_containment() {
     let envelope = fingerprint_configured_runtime_executable(
@@ -491,7 +514,10 @@ fn static_elf_classifier_freezes_architecture_and_program_header_policy() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn configured_path(path: &Path) -> ConfiguredRuntimeExecutable {
     ConfiguredRuntimeExecutable::new(
         LocalExecutableRuntimeKind::CodexExec,
@@ -503,7 +529,10 @@ fn configured_path(path: &Path) -> ConfiguredRuntimeExecutable {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 async fn fingerprint_failure_for(path: &Path) -> serde_json::Value {
     let envelope = fingerprint_configured_runtime_executable(
         &configured_path(path),
@@ -514,7 +543,10 @@ async fn fingerprint_failure_for(path: &Path) -> serde_json::Value {
     serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[tokio::test]
 async fn linux_candidate_observation_records_closed_skip_and_identity_failures() {
     use std::os::unix::fs::PermissionsExt;
@@ -538,7 +570,10 @@ async fn linux_candidate_observation_records_closed_skip_and_identity_failures()
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[tokio::test]
 async fn linux_candidate_observation_rejects_interpreters_before_authorization() {
     use std::os::unix::fs::PermissionsExt;
@@ -558,7 +593,10 @@ async fn linux_candidate_observation_rejects_interpreters_before_authorization()
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[tokio::test]
 async fn linux_retained_static_candidate_requires_repository_boundaries() {
     use std::os::unix::fs::PermissionsExt;
@@ -587,79 +625,18 @@ async fn linux_retained_static_candidate_requires_repository_boundaries() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn write_static_fixture(directory: &Path, name: &str) -> PathBuf {
     super::test_fixtures::write_version_fixture(directory, name)
 }
 
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn linux_target_authorization_classifies_repository_and_external_handles() {
-    let repository = tempfile::tempdir().unwrap();
-    let repository_executable = write_static_fixture(repository.path(), "repository-runtime");
-    let boundaries = ValidatedRepositoryBoundarySet::from_existing_roots(
-        repository.path(),
-        [&repository.path()],
-    )
-    .unwrap();
-    let envelope = fingerprint_configured_runtime_executable(
-        &configured_path(&repository_executable),
-        &RuntimeFingerprintOptions::new(std::env::current_dir().unwrap())
-            .with_repository_boundaries(boundaries),
-    )
-    .await
-    .unwrap();
-    let observed: serde_json::Value =
-        serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap();
-    assert_eq!(
-        observed["payload"]["failures"][0]["kind"],
-        "probe_not_authorized"
-    );
-    assert_eq!(
-        observed["payload"]["failures"][0]["detail"]["detail"],
-        "resolved_target_repository"
-    );
-    assert_eq!(
-        observed["payload"]["resolution_attempts"][0]["outcome"],
-        "inspection_target"
-    );
-
-    let external = tempfile::tempdir().unwrap();
-    let external_executable = write_static_fixture(external.path(), "external-runtime");
-    let boundaries = ValidatedRepositoryBoundarySet::from_existing_roots(
-        repository.path(),
-        std::iter::empty::<&Path>(),
-    )
-    .unwrap();
-    let envelope = fingerprint_configured_runtime_executable(
-        &configured_path(&external_executable),
-        &RuntimeFingerprintOptions::new(std::env::current_dir().unwrap())
-            .with_repository_boundaries(boundaries),
-    )
-    .await
-    .unwrap();
-    let observed: serde_json::Value =
-        serde_json::from_str(&envelope.to_json_string().unwrap()).unwrap();
-    assert_eq!(
-        observed["payload"]["resolution_attempts"][0]["outcome"],
-        "exec_started"
-    );
-    assert_eq!(observed["payload"]["failures"], serde_json::json!([]));
-    assert_eq!(
-        observed["payload"]["version"]["normalized_version"],
-        "1.2.3"
-    );
-    assert_eq!(
-        observed["payload"]["executable"]["checkpoint_consistent_path"],
-        true
-    );
-    assert_eq!(
-        observed["payload"]["executable"]["exec_stop_consistent_handle"],
-        true
-    );
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[tokio::test]
 async fn linux_etxtbsy_retries_once_after_the_fixed_delay() {
     let repository = tempfile::tempdir().unwrap();
@@ -696,7 +673,10 @@ async fn linux_etxtbsy_retries_once_after_the_fixed_delay() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[tokio::test]
 async fn linux_target_authorization_rejects_multiple_hard_links() {
     let repository = tempfile::tempdir().unwrap();
@@ -727,7 +707,10 @@ async fn linux_target_authorization_rejects_multiple_hard_links() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[test]
 fn linux_syscall_guard_freezes_every_denied_class_and_safe_queries() {
     use harness_core::stack::fingerprint::RuntimeProbeFailureDetail as D;

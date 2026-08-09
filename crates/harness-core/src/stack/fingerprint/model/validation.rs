@@ -22,6 +22,7 @@ enum EnvironmentStateWire {
 struct EnvironmentFactWire {
     key: RuntimeEnvironmentKey,
     state: EnvironmentStateWire,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
     value_sha256: Option<String>,
 }
 
@@ -62,7 +63,12 @@ pub(super) fn payload_is_valid(payload: &RuntimeExecutableFingerprintPayload) ->
 }
 
 fn attempts_are_valid(form: RuntimeCommandForm, attempts: &[RuntimeResolutionAttempt]) -> bool {
-    if attempts.len() > 64
+    if matches!(
+        form,
+        RuntimeCommandForm::WindowsBare
+            | RuntimeCommandForm::WindowsAbsolute
+            | RuntimeCommandForm::WindowsQualified
+    ) || attempts.len() > 64
         || (matches!(
             form,
             RuntimeCommandForm::UnixAbsolute | RuntimeCommandForm::UnixQualified
@@ -210,14 +216,65 @@ fn observation_state_is_valid(payload: &RuntimeExecutableFingerprintPayload) -> 
                 })
         }
         None => {
+            let retained_cleanup = payload.failures.iter().any(|failure| {
+                matches!(
+                    failure.kind,
+                    RuntimeProbeFailureKind::TerminationFailed
+                        | RuntimeProbeFailureKind::ReapFailed
+                )
+            });
             primary.len() == 1
+                && lifecycle_state_is_valid(payload, primary[0])
                 && primary_failure_matches(
                     payload.command_form,
                     &payload.resolution_attempts,
                     payload.executable.as_ref(),
                     primary[0],
+                    retained_cleanup,
                 )
         }
+    }
+}
+
+fn lifecycle_state_is_valid(
+    payload: &RuntimeExecutableFingerprintPayload,
+    primary: &RuntimeProbeFailure,
+) -> bool {
+    let has_termination_or_reap = payload.failures.iter().any(|failure| {
+        matches!(
+            failure.kind,
+            RuntimeProbeFailureKind::TerminationFailed | RuntimeProbeFailureKind::ReapFailed
+        )
+    });
+    let has_output_drain = payload
+        .failures
+        .iter()
+        .any(|failure| failure.kind == RuntimeProbeFailureKind::OutputDrainFailed);
+    if !has_termination_or_reap && !has_output_drain {
+        return true;
+    }
+
+    let cleanup_trigger = matches!(
+        primary.kind,
+        RuntimeProbeFailureKind::TransitiveExecutionDenied
+            | RuntimeProbeFailureKind::Timeout
+            | RuntimeProbeFailureKind::OutputLimitExceeded
+            | RuntimeProbeFailureKind::OutputReadFailed
+    );
+    let post_reap_identity_failure = matches!(
+        primary.kind,
+        RuntimeProbeFailureKind::MetadataUnavailable | RuntimeProbeFailureKind::IdentityChanged
+    );
+    let executed_identity = payload.executable.as_ref().is_some_and(|identity| {
+        identity.checkpoint_consistent_path && identity.exec_stop_consistent_handle
+    });
+
+    if has_termination_or_reap {
+        cleanup_trigger && payload.executable.is_none()
+    } else {
+        has_output_drain
+            && ((cleanup_trigger && executed_identity)
+                || (post_reap_identity_failure && payload.executable.is_none()))
     }
 }
 
@@ -226,6 +283,7 @@ fn primary_failure_matches(
     attempts: &[RuntimeResolutionAttempt],
     executable: Option<&RuntimeExecutableIdentity>,
     failure: &RuntimeProbeFailure,
+    retained_cleanup: bool,
 ) -> bool {
     use RuntimeProbeFailureDetail as D;
     use RuntimeProbeFailureKind as K;
@@ -236,6 +294,12 @@ fn primary_failure_matches(
     let final_sequence_is =
         |expected| last.is_some_and(|attempt| attempt.exec_sequence == expected);
     let no_final_identity = executable.is_none();
+    let inspection_identity = executable.is_some_and(|identity| {
+        !identity.checkpoint_consistent_path && !identity.exec_stop_consistent_handle
+    });
+    let executed_identity = executable.is_some_and(|identity| {
+        identity.checkpoint_consistent_path && identity.exec_stop_consistent_handle
+    });
 
     match failure.kind {
         K::PathNotFound => {
@@ -253,6 +317,9 @@ fn primary_failure_matches(
                     RuntimeCommandForm::UnixAbsolute | RuntimeCommandForm::UnixQualified => {
                         attempts.len() == 1 && final_outcome_is(O::Absent)
                     }
+                    RuntimeCommandForm::WindowsBare
+                    | RuntimeCommandForm::WindowsAbsolute
+                    | RuntimeCommandForm::WindowsQualified => false,
                 }
         }
         K::PathUnusable => attempts.is_empty() && no_final_identity,
@@ -268,35 +335,57 @@ fn primary_failure_matches(
             final_outcome_is(O::InspectionFailed) && no_final_identity
         }
         K::MetadataUnavailable => {
-            final_outcome_is(O::InspectionFailed) || final_outcome_is(O::ExecStarted)
+            no_final_identity
+                && (final_outcome_is(O::InspectionFailed) || final_outcome_is(O::ExecStarted))
         }
-        K::NotRegularFile => final_outcome_is(O::NotRegular) && no_final_identity,
-        K::NotExecutable => final_outcome_is(O::NotExecutable) && no_final_identity,
+        K::NotRegularFile => {
+            matches!(
+                form,
+                RuntimeCommandForm::UnixAbsolute | RuntimeCommandForm::UnixQualified
+            ) && final_outcome_is(O::NotRegular)
+                && no_final_identity
+        }
+        K::NotExecutable => {
+            matches!(
+                form,
+                RuntimeCommandForm::UnixAbsolute | RuntimeCommandForm::UnixQualified
+            ) && final_outcome_is(O::NotExecutable)
+                && no_final_identity
+        }
         K::IdentityChanged => {
-            final_outcome_is(O::InspectionFailed)
-                || final_outcome_is(O::ExecVerificationFailed)
-                || final_outcome_is(O::ExecStarted)
+            no_final_identity
+                && (final_outcome_is(O::InspectionFailed)
+                    || final_outcome_is(O::ExecVerificationFailed)
+                    || final_outcome_is(O::ExecStarted))
         }
         K::ProbeNotAuthorized => match failure.detail {
-            Some(D::ConfigurationSourceRepository) => final_outcome_is(O::InspectionTarget),
+            Some(D::ConfigurationSourceRepository) => {
+                final_outcome_is(O::InspectionTarget) && inspection_identity
+            }
             Some(D::ResolvedTargetRepository) => {
-                final_outcome_is(O::InspectionTarget)
-                    || (final_outcome_is(O::RetryNotAuthorized)
+                (final_outcome_is(O::InspectionTarget) && inspection_identity)
+                    || (no_final_identity
+                        && final_outcome_is(O::RetryNotAuthorized)
                         && final_sequence_is(RuntimeExecSequence::EtxtbsyThenCheckpointAfter150Ms))
             }
             _ => false,
         },
         K::TargetAuthorizationUnavailable => {
-            final_outcome_is(O::AuthorizationUnavailable)
-                || (final_outcome_is(O::RetryAuthorizationUnavailable)
-                    && final_sequence_is(RuntimeExecSequence::EtxtbsyThenCheckpointAfter150Ms))
+            no_final_identity
+                && (final_outcome_is(O::AuthorizationUnavailable)
+                    || (final_outcome_is(O::RetryAuthorizationUnavailable)
+                        && final_sequence_is(RuntimeExecSequence::EtxtbsyThenCheckpointAfter150Ms)))
         }
         K::InterpreterAuthorizationUnavailable => {
-            final_outcome_is(O::InterpreterAuthorizationUnavailable)
+            no_final_identity && final_outcome_is(O::InterpreterAuthorizationUnavailable)
         }
-        K::HandleExecutionUnavailable => final_outcome_is(O::HandleExecutionUnavailable),
-        K::SupervisionSetupFailed => final_outcome_is(O::SupervisionSetupFailed),
-        K::SpawnFailed => final_outcome_is(O::ExecFailed),
+        K::HandleExecutionUnavailable => {
+            no_final_identity && final_outcome_is(O::HandleExecutionUnavailable)
+        }
+        K::SupervisionSetupFailed => {
+            no_final_identity && final_outcome_is(O::SupervisionSetupFailed)
+        }
+        K::SpawnFailed => no_final_identity && final_outcome_is(O::ExecFailed),
         K::TransitiveExecutionDenied
         | K::Timeout
         | K::OutputLimitExceeded
@@ -306,7 +395,10 @@ fn primary_failure_matches(
         | K::InvalidUtf8
         | K::EmptyOutput
         | K::UnparseableVersion
-        | K::AmbiguousVersion => final_outcome_is(O::ExecStarted),
+        | K::AmbiguousVersion => {
+            final_outcome_is(O::ExecStarted)
+                && (executed_identity || retained_cleanup && no_final_identity)
+        }
         K::BareEaccesExhausted => {
             form == RuntimeCommandForm::UnixBare
                 && no_final_identity

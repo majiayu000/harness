@@ -1,6 +1,7 @@
 //! Handle-based Linux executable candidate observation.
 
-use super::executable::{CandidateReference, ResolvedCandidate, RetainedWorkingDirectory};
+use super::command::{CandidateReference, ResolvedCandidate};
+use super::executable::RetainedWorkingDirectory;
 use super::{RuntimeFingerprintProduceError, RuntimeObservationProtocolReason};
 use harness_core::stack::fingerprint::RuntimeProbeFailureKind;
 use harness_core::stack::Sha256Digest;
@@ -106,6 +107,8 @@ pub(super) fn observe_candidate(
     deadline: Instant,
     registry: &super::registry::OwnerRegistry,
 ) -> Result<CandidateObservation, RuntimeFingerprintProduceError> {
+    let role = super::RuntimeOwnedChildRole::Observation(super::RuntimeObservationStage::Candidate);
+    let pidfd_lease = registry.reserve_child_pidfd(role)?;
     let mut descriptor_lease = registry.reserve_descriptors(7)?;
     let (directory_fd, path) = match &candidate.reference {
         CandidateReference::Absolute(path) => (libc::AT_FDCWD, path),
@@ -113,7 +116,6 @@ pub(super) fn observe_candidate(
     };
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
-    let role = super::RuntimeOwnedChildRole::Observation(super::RuntimeObservationStage::Candidate);
     let mut gate = [-1; 2];
     let mut status = [-1; 2];
     let mut protocol = [-1; 2];
@@ -137,10 +139,7 @@ pub(super) fn observe_candidate(
 
     let saved_signal_mask = super::probe::block_all_signals().map_err(|()| {
         close_all(gate, status, protocol);
-        super::probe::registration_error(
-            role,
-            super::RuntimeChildRegistrationStage::SignalIsolation,
-        )
+        super::probe::parent_signal_isolation_error()
     })?;
     let pid = unsafe { libc::fork() };
     if pid == 0 {
@@ -150,49 +149,54 @@ pub(super) fn observe_candidate(
     super::probe::close_fd(gate[0]);
     super::probe::close_fd(status[1]);
     super::probe::close_fd(protocol[1]);
-    if pid < 0 || restored.is_err() {
+    if restored.is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(status[0]);
         super::probe::close_fd(protocol[0]);
         if pid > 0 {
-            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, role)?;
         }
+        return Err(super::probe::parent_signal_isolation_error());
+    }
+    if pid < 0 {
+        super::probe::close_fd(gate[1]);
+        super::probe::close_fd(status[0]);
+        super::probe::close_fd(protocol[0]);
         return Err(super::probe::registration_error(
             role,
-            if pid < 0 {
-                super::RuntimeChildRegistrationStage::Fork
-            } else {
-                super::RuntimeChildRegistrationStage::SignalIsolation
-            },
+            super::RuntimeChildRegistrationStage::Fork,
         ));
     }
     let ready = super::probe::read_byte_before(status[0], deadline);
     super::probe::close_fd(status[0]);
     if ready != Ok(super::probe::CHILD_READY) {
+        let error = match ready {
+            Ok(super::probe::CHILD_SIGNAL_FAILED) => super::probe::registration_error(
+                role,
+                super::RuntimeChildRegistrationStage::SignalIsolation,
+            ),
+            Ok(_) => super::probe::registration_error(
+                role,
+                super::RuntimeChildRegistrationStage::DescriptorIsolation,
+            ),
+            Err(error) => super::probe::readiness_error(role, error),
+        };
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
-        return Err(super::probe::registration_error(
-            role,
-            match ready {
-                Ok(super::probe::CHILD_SIGNAL_FAILED) => {
-                    super::RuntimeChildRegistrationStage::SignalIsolation
-                }
-                _ => super::RuntimeChildRegistrationStage::DescriptorIsolation,
-            },
-        ));
+        super::probe::rollback_unregistered_child(registry, pid, role)?;
+        return Err(error);
     }
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+    let pidfd = super::probe::open_child_pidfd(pid);
     if pidfd < 0 {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, role)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
-    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+    let child = match super::probe::register_child(registry, pidfd_lease, pid, pidfd, role) {
         Ok(child) => child,
         Err(error) => {
             super::probe::close_fd(gate[1]);
@@ -203,7 +207,7 @@ pub(super) fn observe_candidate(
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        child.cleanup(deadline)?;
+        super::probe::cleanup_registered_child(child)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::GateRelease,
@@ -586,21 +590,8 @@ fn receive_candidate(
     fd: libc::c_int,
     deadline: Instant,
 ) -> Result<CandidateObservation, RuntimeFingerprintProduceError> {
-    let remaining = deadline
-        .saturating_duration_since(Instant::now())
-        .as_millis();
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN | libc::POLLHUP,
-        revents: 0,
-    };
-    if unsafe { libc::poll(&mut pollfd, 1, remaining.min(i32::MAX as u128) as _) } <= 0 {
-        return Err(
-            RuntimeFingerprintProduceError::ObservationDeadlineExceeded {
-                stage: super::RuntimeObservationStage::Candidate,
-            },
-        );
-    }
+    let stage = super::RuntimeObservationStage::Candidate;
+    super::probe::wait_readable(fd, deadline, stage)?;
     let mut frame = [0_u8; FRAME_BYTES];
     let mut control = DescriptorControl([0; 64]);
     let mut iov = libc::iovec {
@@ -612,15 +603,12 @@ fn receive_candidate(
     message.msg_iovlen = 1;
     message.msg_control = control.0.as_mut_ptr().cast();
     message.msg_controllen = control.0.len();
-    let received = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC) };
-    if received != frame.len() as isize
-        || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+    let received = super::probe::recvmsg_retry(fd, &mut message, libc::MSG_CMSG_CLOEXEC, stage)?;
+    if let Some(reason) =
+        super::probe::fixed_frame_protocol_reason(received, frame.len(), message.msg_flags)
     {
         super::probe::close_received_rights(&message);
-        return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
-            stage: super::RuntimeObservationStage::Candidate,
-            reason: RuntimeObservationProtocolReason::TruncatedFrame,
-        });
+        return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid { stage, reason });
     }
     let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
     if frame[0] != STATUS_RETAINED {

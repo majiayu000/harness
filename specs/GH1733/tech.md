@@ -12,7 +12,7 @@ See `specs/GH1733/product.md` and the split runtime contracts in
 `tasks.md`.
 
 <!-- specrail-planned-changes
-{"issue":1733,"complete":true,"paths":["Cargo.lock","crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/authorization.rs","crates/harness-agents/src/runtime_fingerprint/candidate.rs","crates/harness-agents/src/runtime_fingerprint/capability.rs","crates/harness-agents/src/runtime_fingerprint/checkpoint.rs","crates/harness-agents/src/runtime_fingerprint/completion.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/exec_stop.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/launch.rs","crates/harness-agents/src/runtime_fingerprint/owner.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/registry.rs","crates/harness-agents/src/runtime_fingerprint/resolution.rs","crates/harness-agents/src/runtime_fingerprint/supervision.rs","crates/harness-agents/src/runtime_fingerprint/syscall_guard.rs","crates/harness-agents/src/runtime_fingerprint/target.rs","crates/harness-agents/src/runtime_fingerprint/test_fixtures.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-agents/src/runtime_fingerprint/tests/lifecycle.rs","crates/harness-agents/src/runtime_fingerprint/tests/owner.rs","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/model/validation.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint/tests/model.rs","crates/harness-core/src/stack/fingerprint/tests/schema.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs","specs/GH1733/product.md","specs/GH1733/runtime-observation.md","specs/GH1733/runtime-product.md","specs/GH1733/runtime-supervision.md","specs/GH1733/tasks.md","specs/GH1733/tech.md"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
+{"issue":1733,"complete":true,"paths":["Cargo.lock","crates/harness-agents/Cargo.toml","crates/harness-agents/src/lib.rs","crates/harness-agents/src/runtime_fingerprint.rs","crates/harness-agents/src/runtime_fingerprint/windows_candidate.rs","crates/harness-agents/src/runtime_fingerprint/windows_resolution.rs","crates/harness-agents/src/runtime_fingerprint/windows_resolution_contract_tests.rs","crates/harness-agents/src/runtime_fingerprint/authorization.rs","crates/harness-agents/src/runtime_fingerprint/candidate.rs","crates/harness-agents/src/runtime_fingerprint/capability.rs","crates/harness-agents/src/runtime_fingerprint/checkpoint.rs","crates/harness-agents/src/runtime_fingerprint/command.rs","crates/harness-agents/src/runtime_fingerprint/completion.rs","crates/harness-agents/src/runtime_fingerprint/environment.rs","crates/harness-agents/src/runtime_fingerprint/exec_stop.rs","crates/harness-agents/src/runtime_fingerprint/executable.rs","crates/harness-agents/src/runtime_fingerprint/launch.rs","crates/harness-agents/src/runtime_fingerprint/owner.rs","crates/harness-agents/src/runtime_fingerprint/probe.rs","crates/harness-agents/src/runtime_fingerprint/registry.rs","crates/harness-agents/src/runtime_fingerprint/resolution.rs","crates/harness-agents/src/runtime_fingerprint/supervision.rs","crates/harness-agents/src/runtime_fingerprint/syscall_guard.rs","crates/harness-agents/src/runtime_fingerprint/target.rs","crates/harness-agents/src/runtime_fingerprint/test_fixtures.rs","crates/harness-agents/src/runtime_fingerprint/tests.rs","crates/harness-agents/src/runtime_fingerprint/tests/lifecycle.rs","crates/harness-agents/src/runtime_fingerprint/tests/owner.rs","crates/harness-agents/src/runtime_fingerprint/tests/review_regressions.rs","crates/harness-core/Cargo.toml","crates/harness-core/src/stack/fingerprint.rs","crates/harness-core/src/stack/fingerprint/model.rs","crates/harness-core/src/stack/fingerprint/model/validation.rs","crates/harness-core/src/stack/fingerprint/schema.rs","crates/harness-core/src/stack/fingerprint/tests.rs","crates/harness-core/src/stack/fingerprint/tests/model.rs","crates/harness-core/src/stack/fingerprint/tests/schema.rs","crates/harness-core/src/stack/fingerprint/tests/validation.rs","crates/harness-core/src/stack/mod.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs","specs/GH1733/product.md","specs/GH1733/runtime-observation.md","specs/GH1733/runtime-product.md","specs/GH1733/runtime-supervision.md","specs/GH1733/tasks.md","specs/GH1733/tech.md"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
 -->
 
 ## Current System and Root Cause
@@ -77,8 +77,9 @@ before adding the remediation:
 - `stack/fingerprint/schema.rs` owns duplicate-aware JSON decoding and the
   schema-context canonicalization state machine.
 - `stack/fingerprint/tests.rs` owns shared core fixtures and wire/digest tests;
-  `stack/fingerprint/tests/model.rs` and `stack/fingerprint/tests/schema.rs` split the mandatory
-  runtime-model and MCP schema matrices below the hard file-size ceiling.
+  `stack/fingerprint/tests/model.rs`, `stack/fingerprint/tests/schema.rs`, and
+  `stack/fingerprint/tests/validation.rs` split the mandatory runtime-model,
+  MCP schema, and state-machine matrices below the hard file-size ceiling.
 - `runtime_fingerprint.rs` owns configured-runtime inputs and the public async
   facade that assembles one runtime payload.
 - `runtime_fingerprint/owner.rs` owns admission, owner-thread startup, caller
@@ -89,14 +90,23 @@ before adding the remediation:
 - `runtime_fingerprint/environment.rs` owns the closed runtime-kind policy,
   platform key normalization, setup-secret exclusion, probe environment
   construction, and environment evidence.
-- `runtime_fingerprint/executable.rs` owns native command resolution,
-  handle-based inspection, bounded hashing, and path-identity checks.
+- `runtime_fingerprint/command.rs` owns native command forms and digests plus
+  post-admission lazy Unix PATH candidate derivation.
+- `runtime_fingerprint/executable.rs` owns retained working-directory and
+  executable-handle inspection, bounded hashing, and path-identity checks.
+- `runtime_fingerprint/windows_resolution.rs` owns the platform-independent,
+  helper-only Windows command forms, frozen search order, `.exe` policy,
+  explicit-base rules, and four-field resolution-context digests.
+- `runtime_fingerprint/windows_candidate.rs` owns bounded shared search
+  references and per-candidate lazy Windows path/digest materialization.
 - `runtime_fingerprint/probe.rs` owns process supervision, combined output
   draining, exit classification, and version parsing.
 - `runtime_fingerprint/tests.rs` owns shared PATH, identity, environment, and
-  failure regressions; `runtime_fingerprint/tests/owner.rs` and
-  `runtime_fingerprint/tests/lifecycle.rs` split the mandatory owner-ledger,
-  cancellation, cleanup-retention, and success-barrier matrices.
+  failure regressions; `runtime_fingerprint/tests/owner.rs`,
+  `runtime_fingerprint/tests/lifecycle.rs`, and
+  `runtime_fingerprint/tests/review_regressions.rs` split the mandatory
+  owner-ledger, cancellation, cleanup-retention, protocol, and success-barrier
+  matrices.
 
 Every production file and test file must remain below 800 lines after rustfmt;
 the typical target is 200-400 lines. `stack/mod.rs` and `harness-agents/lib.rs`

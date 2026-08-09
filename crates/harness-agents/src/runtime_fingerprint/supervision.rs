@@ -16,7 +16,10 @@ pub(super) enum SupervisionOutcome {
         stderr: Vec<u8>,
         termination: RuntimeTermination,
     },
-    Failed(RuntimeProbeFailure),
+    Failed {
+        failures: Vec<RuntimeProbeFailure>,
+        target_reaped: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,14 +116,13 @@ impl OutputCapture {
         )
     }
 
-    fn complete(mut self, deadline: Instant) -> Result<(Vec<u8>, Vec<u8>), CaptureFailure> {
+    fn complete(&mut self, deadline: Instant) -> Result<(Vec<u8>, Vec<u8>), CaptureFailure> {
         while self.stdout_fd >= 0 || self.stderr_fd >= 0 {
             self.drain_available()?;
             if self.stdout_fd < 0 && self.stderr_fd < 0 {
                 break;
             }
             if Instant::now() >= deadline {
-                self.close();
                 return Err(CaptureFailure::Timeout);
             }
             std::thread::yield_now();
@@ -129,6 +131,21 @@ impl OutputCapture {
             std::mem::take(&mut self.stdout),
             std::mem::take(&mut self.stderr),
         ))
+    }
+
+    fn drain_to_eof(&mut self, deadline: Instant) -> Result<(), CaptureFailure> {
+        while self.stdout_fd >= 0 || self.stderr_fd >= 0 {
+            drain_discard_stream(&mut self.stdout_fd)?;
+            drain_discard_stream(&mut self.stderr_fd)?;
+            if self.stdout_fd < 0 && self.stderr_fd < 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(CaptureFailure::Timeout);
+            }
+            std::thread::yield_now();
+        }
+        Ok(())
     }
 
     fn close(&mut self) {
@@ -235,10 +252,7 @@ pub(super) fn run(
                 let (stdout, stderr) = match capture.complete(deadline) {
                     Ok(output) => output,
                     Err(failure) => {
-                        return Ok(SupervisionOutcome::Failed(capture_failure(
-                            failure,
-                            max_output_bytes,
-                        )?));
+                        return finish_reaped_capture_failure(capture, failure, max_output_bytes);
                     }
                 };
                 return Ok(SupervisionOutcome::Captured {
@@ -256,10 +270,7 @@ pub(super) fn run(
                 let (stdout, stderr) = match capture.complete(deadline) {
                     Ok(output) => output,
                     Err(failure) => {
-                        return Ok(SupervisionOutcome::Failed(capture_failure(
-                            failure,
-                            max_output_bytes,
-                        )?));
+                        return finish_reaped_capture_failure(capture, failure, max_output_bytes);
                     }
                 };
                 return Ok(SupervisionOutcome::Captured {
@@ -328,6 +339,29 @@ fn drain_stream(
     }
 }
 
+fn drain_discard_stream(fd: &mut libc::c_int) -> Result<(), CaptureFailure> {
+    if *fd < 0 {
+        return Ok(());
+    }
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = unsafe { libc::read(*fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read > 0 {
+            continue;
+        }
+        if read == 0 {
+            super::probe::close_fd(*fd);
+            *fd = -1;
+            return Ok(());
+        }
+        match super::probe::last_errno() {
+            libc::EINTR => continue,
+            libc::EAGAIN => return Ok(()),
+            _ => return Err(CaptureFailure::Read),
+        }
+    }
+}
+
 fn capture_failure(
     failure: CaptureFailure,
     max_output_bytes: usize,
@@ -346,12 +380,74 @@ fn capture_failure(
 
 fn semantic_cleanup(
     child: super::registry::RegisteredChild,
-    mut capture: OutputCapture,
+    capture: OutputCapture,
     failure: RuntimeProbeFailure,
 ) -> Result<SupervisionOutcome, RuntimeFingerprintProduceError> {
-    capture.close();
-    child.cleanup(Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE)?;
-    Ok(SupervisionOutcome::Failed(failure))
+    let deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
+    finish_semantic_cleanup(capture, failure, child.cleanup(deadline), deadline)
+}
+
+fn finish_reaped_capture_failure(
+    mut capture: OutputCapture,
+    failure: CaptureFailure,
+    max_output_bytes: usize,
+) -> Result<SupervisionOutcome, RuntimeFingerprintProduceError> {
+    let mut failures = vec![capture_failure(failure, max_output_bytes)?];
+    let cleanup_deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
+    if capture.drain_to_eof(cleanup_deadline).is_err() {
+        failures.push(RuntimeProbeFailure::new(
+            RuntimeProbeFailureKind::OutputDrainFailed,
+        )?);
+    }
+    Ok(SupervisionOutcome::Failed {
+        failures,
+        target_reaped: true,
+    })
+}
+
+fn finish_semantic_cleanup(
+    mut capture: OutputCapture,
+    failure: RuntimeProbeFailure,
+    cleanup: Result<(), RuntimeFingerprintProduceError>,
+    deadline: Instant,
+) -> Result<SupervisionOutcome, RuntimeFingerprintProduceError> {
+    let mut failures = vec![failure];
+    let target_reaped = match cleanup {
+        Ok(()) => true,
+        Err(RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
+            operation,
+            ..
+        }) => {
+            let kind = match operation {
+                super::RuntimeChildCleanupOperation::Termination => {
+                    RuntimeProbeFailureKind::TerminationFailed
+                }
+                super::RuntimeChildCleanupOperation::Reap => RuntimeProbeFailureKind::ReapFailed,
+                super::RuntimeChildCleanupOperation::GateClose => {
+                    return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+                }
+            };
+            failures.push(RuntimeProbeFailure::new(kind)?);
+            false
+        }
+        Err(error) => return Err(error),
+    };
+    let output_drained = if target_reaped {
+        capture.drain_to_eof(deadline).is_ok()
+    } else {
+        let complete = capture.stdout_fd < 0 && capture.stderr_fd < 0;
+        capture.close();
+        complete
+    };
+    if !output_drained {
+        failures.push(RuntimeProbeFailure::new(
+            RuntimeProbeFailureKind::OutputDrainFailed,
+        )?);
+    }
+    Ok(SupervisionOutcome::Failed {
+        failures,
+        target_reaped,
+    })
 }
 
 fn verification_failure(
@@ -390,10 +486,20 @@ mod tests {
         pipe[0]
     }
 
+    fn file_with_length(length: usize) -> libc::c_int {
+        use std::io::{Seek, Write};
+        use std::os::fd::IntoRawFd;
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![b'x'; length]).unwrap();
+        file.rewind().unwrap();
+        file.into_raw_fd()
+    }
+
     #[test]
     fn output_capture_enforces_one_exact_combined_bound() {
         let registry = super::super::registry::OwnerRegistry::new();
-        let capture = OutputCapture::new(
+        let mut capture = OutputCapture::new(
             pipe_with(b"abc"),
             pipe_with(b"de"),
             5,
@@ -404,7 +510,7 @@ mod tests {
             Ok((b"abc".to_vec(), b"de".to_vec()))
         );
 
-        let capture = OutputCapture::new(
+        let mut capture = OutputCapture::new(
             pipe_with(b"abc"),
             pipe_with(b"de"),
             4,
@@ -414,6 +520,174 @@ mod tests {
             capture.complete(Instant::now() + std::time::Duration::from_secs(1)),
             Err(CaptureFailure::Limit)
         );
+    }
+
+    #[test]
+    fn output_capture_accepts_65536_and_rejects_byte_65537() {
+        let registry = super::super::registry::OwnerRegistry::new();
+        let mut exact = OutputCapture::new(
+            file_with_length(super::super::RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES),
+            -1,
+            super::super::RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES,
+            registry.reserve_descriptors(1).unwrap(),
+        );
+        assert_eq!(
+            exact
+                .complete(Instant::now() + std::time::Duration::from_secs(1))
+                .unwrap()
+                .0
+                .len(),
+            super::super::RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES
+        );
+        let mut over = OutputCapture::new(
+            file_with_length(super::super::RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES + 1),
+            -1,
+            super::super::RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES,
+            registry.reserve_descriptors(1).unwrap(),
+        );
+        assert_eq!(
+            over.complete(Instant::now() + std::time::Duration::from_secs(1)),
+            Err(CaptureFailure::Limit)
+        );
+    }
+
+    #[test]
+    fn semantic_cleanup_records_each_closed_lifecycle_failure() {
+        let primary = || RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout).unwrap();
+        for (operation, expected) in [
+            (
+                super::super::RuntimeChildCleanupOperation::Termination,
+                RuntimeProbeFailureKind::TerminationFailed,
+            ),
+            (
+                super::super::RuntimeChildCleanupOperation::Reap,
+                RuntimeProbeFailureKind::ReapFailed,
+            ),
+        ] {
+            let registry = super::super::registry::OwnerRegistry::new();
+            let capture = OutputCapture::new(-1, -1, 1, registry.reserve_descriptors(0).unwrap());
+            let outcome = finish_semantic_cleanup(
+                capture,
+                primary(),
+                Err(
+                    RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
+                        role: super::super::RuntimeOwnedChildRole::InitialTarget,
+                        operation,
+                    },
+                ),
+                Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            let SupervisionOutcome::Failed {
+                failures,
+                target_reaped,
+            } = outcome
+            else {
+                panic!("expected semantic cleanup failure");
+            };
+            assert!(!target_reaped);
+            assert_eq!(failures.len(), 2);
+            assert_eq!(failures[1].kind(), expected);
+        }
+
+        let registry = super::super::registry::OwnerRegistry::new();
+        let capture = OutputCapture::new(
+            pipe_with(b"too much"),
+            -1,
+            1,
+            registry.reserve_descriptors(1).unwrap(),
+        );
+        let outcome = finish_semantic_cleanup(
+            capture,
+            primary(),
+            Ok(()),
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let SupervisionOutcome::Failed {
+            failures,
+            target_reaped,
+        } = outcome
+        else {
+            panic!("expected semantic cleanup failure");
+        };
+        assert!(target_reaped);
+        assert_eq!(failures.len(), 1);
+    }
+
+    #[test]
+    fn reaped_capture_failure_uses_fresh_drain_for_finite_remaining_output() {
+        let registry = super::super::registry::OwnerRegistry::new();
+        let capture = OutputCapture::new(
+            pipe_with(b"too much"),
+            -1,
+            1,
+            registry.reserve_descriptors(1).unwrap(),
+        );
+        let outcome = finish_reaped_capture_failure(capture, CaptureFailure::Limit, 1).unwrap();
+        let SupervisionOutcome::Failed { failures, .. } = outcome else {
+            panic!("expected capture failure");
+        };
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].kind(),
+            RuntimeProbeFailureKind::OutputLimitExceeded
+        );
+
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let mut capture =
+            OutputCapture::new(pipe[0], -1, 1, registry.reserve_descriptors(1).unwrap());
+        assert_eq!(
+            capture.complete(Instant::now()),
+            Err(CaptureFailure::Timeout)
+        );
+        super::super::probe::close_fd(pipe[1]);
+        let outcome = finish_reaped_capture_failure(capture, CaptureFailure::Timeout, 1).unwrap();
+        let SupervisionOutcome::Failed { failures, .. } = outcome else {
+            panic!("expected capture failure");
+        };
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind(), RuntimeProbeFailureKind::Timeout);
+    }
+
+    #[test]
+    fn cleanup_drain_discards_finite_output_and_times_out_on_an_open_stream() {
+        let registry = super::super::registry::OwnerRegistry::new();
+        let mut finite = OutputCapture::new(
+            pipe_with(b"discarded after limit"),
+            -1,
+            1,
+            registry.reserve_descriptors(1).unwrap(),
+        );
+        assert!(finite
+            .drain_to_eof(Instant::now() + std::time::Duration::from_secs(1))
+            .is_ok());
+
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let open = OutputCapture::new(pipe[0], -1, 1, registry.reserve_descriptors(1).unwrap());
+        let outcome = finish_semantic_cleanup(
+            open,
+            RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout).unwrap(),
+            Ok(()),
+            Instant::now(),
+        )
+        .unwrap();
+        let SupervisionOutcome::Failed { failures, .. } = outcome else {
+            panic!("expected cleanup failure evidence");
+        };
+        assert_eq!(
+            failures[1].kind(),
+            RuntimeProbeFailureKind::OutputDrainFailed
+        );
+        super::super::probe::close_fd(pipe[1]);
     }
 
     #[test]

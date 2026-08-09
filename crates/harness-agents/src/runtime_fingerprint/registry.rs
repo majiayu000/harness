@@ -21,11 +21,37 @@ struct PreRegistrationEntry {
     role: RuntimeOwnedChildRole,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidfdSlot {
+    Subject,
+    Helper,
+}
+
+impl PidfdSlot {
+    const fn for_role(role: Option<RuntimeOwnedChildRole>) -> Self {
+        match role {
+            Some(
+                RuntimeOwnedChildRole::InitialTarget
+                | RuntimeOwnedChildRole::RetryTarget
+                | RuntimeOwnedChildRole::Observation(super::RuntimeObservationStage::CapabilityCheck),
+            ) => Self::Subject,
+            Some(RuntimeOwnedChildRole::Observation(_)) | None => Self::Helper,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Subject => 0,
+            Self::Helper => 1,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RegistryInner {
     children: [Option<ChildEntry>; RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS],
     pre_registration: [Option<PreRegistrationEntry>; RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS + 1],
-    auxiliary_pidfds: usize,
+    reserved_pidfds: [bool; RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS],
     non_pidfds: usize,
 }
 
@@ -47,7 +73,7 @@ impl OwnerRegistry {
             inner: Rc::new(RefCell::new(RegistryInner {
                 children: std::array::from_fn(|_| None),
                 pre_registration: std::array::from_fn(|_| None),
-                auxiliary_pidfds: 0,
+                reserved_pidfds: [false; RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS],
                 non_pidfds: 0,
             })),
             observer,
@@ -75,29 +101,33 @@ impl OwnerRegistry {
 
     pub(super) fn register_child(
         &self,
+        mut pidfd_lease: PidfdLease,
         pid: libc::pid_t,
         pidfd: libc::c_int,
         role: RuntimeOwnedChildRole,
     ) -> Result<RegisteredChild, RuntimeFingerprintProduceError> {
-        if pid <= 0 || pidfd < 0 {
+        if pid <= 0
+            || pidfd < 0
+            || !pidfd_lease.active
+            || pidfd_lease.role != Some(role)
+            || !Rc::ptr_eq(&self.inner, &pidfd_lease.registry.inner)
+        {
             return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
         }
         let slot = {
             let mut inner = self.inner.borrow_mut();
-            let child_count = inner
-                .children
-                .iter()
-                .filter(|entry| entry.is_some())
-                .count();
-            if child_count + inner.auxiliary_pidfds >= RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS {
-                return Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded);
-            }
             let Some(slot) = inner.children.iter().position(Option::is_none) else {
-                return Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded);
+                return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
             };
+            let reserved_slot = PidfdSlot::for_role(pidfd_lease.role).index();
+            if !inner.reserved_pidfds[reserved_slot] {
+                return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+            }
+            inner.reserved_pidfds[reserved_slot] = false;
             inner.children[slot] = Some(ChildEntry { pid, pidfd, role });
             slot
         };
+        pidfd_lease.active = false;
         self.notify(super::owner::OwnerLifecycleEvent::ChildRegistered { pid, role });
         Ok(RegisteredChild {
             registry: self.clone(),
@@ -109,18 +139,35 @@ impl OwnerRegistry {
     }
 
     pub(super) fn reserve_pidfd(&self) -> Result<PidfdLease, RuntimeFingerprintProduceError> {
+        self.reserve_pidfd_for_role(None)
+    }
+
+    pub(super) fn reserve_child_pidfd(
+        &self,
+        role: RuntimeOwnedChildRole,
+    ) -> Result<PidfdLease, RuntimeFingerprintProduceError> {
+        self.reserve_pidfd_for_role(Some(role))
+    }
+
+    fn reserve_pidfd_for_role(
+        &self,
+        role: Option<RuntimeOwnedChildRole>,
+    ) -> Result<PidfdLease, RuntimeFingerprintProduceError> {
         let mut inner = self.inner.borrow_mut();
-        let child_count = inner
+        let slot = PidfdSlot::for_role(role);
+        let occupied = inner
             .children
             .iter()
-            .filter(|entry| entry.is_some())
-            .count();
-        if child_count + inner.auxiliary_pidfds >= RUNTIME_FINGERPRINT_OWNER_PIDFD_SLOTS {
+            .flatten()
+            .any(|entry| PidfdSlot::for_role(Some(entry.role)) == slot);
+        if occupied || inner.reserved_pidfds[slot.index()] {
             return Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded);
         }
-        inner.auxiliary_pidfds += 1;
+        inner.reserved_pidfds[slot.index()] = true;
         Ok(PidfdLease {
             registry: self.clone(),
+            role,
+            active: true,
         })
     }
 
@@ -222,7 +269,7 @@ impl OwnerRegistry {
         let inner = self.inner.borrow();
         inner.children.iter().all(Option::is_none)
             && inner.pre_registration.iter().all(Option::is_none)
-            && inner.auxiliary_pidfds == 0
+            && inner.reserved_pidfds.iter().all(|reserved| !reserved)
             && inner.non_pidfds == 0
     }
 
@@ -235,7 +282,11 @@ impl OwnerRegistry {
                 .iter()
                 .filter(|entry| entry.is_some())
                 .count()
-                + inner.auxiliary_pidfds,
+                + inner
+                    .reserved_pidfds
+                    .iter()
+                    .filter(|reserved| **reserved)
+                    .count(),
             inner.non_pidfds,
         )
     }
@@ -339,10 +390,11 @@ impl OwnerRegistry {
         inner.non_pidfds = inner.non_pidfds.saturating_sub(count);
     }
 
-    fn release_pidfd(&self) {
+    fn release_pidfd(&self, role: Option<RuntimeOwnedChildRole>) {
         let mut inner = self.inner.borrow_mut();
-        debug_assert!(inner.auxiliary_pidfds > 0);
-        inner.auxiliary_pidfds = inner.auxiliary_pidfds.saturating_sub(1);
+        let slot = PidfdSlot::for_role(role).index();
+        debug_assert!(inner.reserved_pidfds[slot]);
+        inner.reserved_pidfds[slot] = false;
     }
 
     fn notify(&self, event: super::owner::OwnerLifecycleEvent) {
@@ -364,11 +416,15 @@ fn pre_registration_cleanup_error(
 #[derive(Debug)]
 pub(super) struct PidfdLease {
     registry: OwnerRegistry,
+    role: Option<RuntimeOwnedChildRole>,
+    active: bool,
 }
 
 impl Drop for PidfdLease {
     fn drop(&mut self) {
-        self.registry.release_pidfd();
+        if self.active {
+            self.registry.release_pidfd(self.role);
+        }
     }
 }
 

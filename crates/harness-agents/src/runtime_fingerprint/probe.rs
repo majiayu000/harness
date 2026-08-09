@@ -1,7 +1,7 @@
 //! Linux exact-child supervision for runtime version probes.
 
+use super::command::PreparedCommand;
 use super::environment::SelectedEnvironment;
-use super::executable::PreparedCommand;
 use super::{
     ConfiguredRuntimeExecutable, ContainmentUnavailableReason, RuntimeFingerprintOptions,
     RuntimeFingerprintProduceError,
@@ -21,7 +21,7 @@ pub(super) fn owner_run(
 ) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
     if environment.facts.is_empty()
         || executable.executable().as_os_str().is_empty()
-        || (command.candidates.is_empty() && !command.path_unusable)
+        || !command.validate_shape()
     {
         return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
     }
@@ -36,7 +36,7 @@ pub(super) fn owner_run(
     if working_directory.fd() < 0 || working_directory.identity_digest.as_str().is_empty() {
         return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
     }
-    if command.path_unusable {
+    if command.path_unusable() {
         let failure = RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathUnusable)?;
         return super::finish_runtime_envelope(
             executable,
@@ -130,17 +130,50 @@ pub(super) fn registration_error(
     RuntimeFingerprintProduceError::ChildRegistrationUnavailable { role, stage }
 }
 
+pub(super) fn parent_signal_isolation_error() -> RuntimeFingerprintProduceError {
+    RuntimeFingerprintProduceError::ContainmentUnavailable(
+        super::ContainmentUnavailableReason::SignalIsolationUnavailable,
+    )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static NEXT_CHILD_PIDFD_OPEN_ERRNO: std::cell::Cell<libc::c_int> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+pub(super) fn open_child_pidfd(pid: libc::pid_t) -> libc::c_int {
+    #[cfg(test)]
+    if let Some(errno) = NEXT_CHILD_PIDFD_OPEN_ERRNO.with(|slot| {
+        let errno = slot.get();
+        slot.set(0);
+        (errno != 0).then_some(errno)
+    }) {
+        unsafe {
+            *libc::__errno_location() = errno;
+        }
+        return -1;
+    }
+    unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int }
+}
+
+#[cfg(test)]
+pub(super) fn inject_next_child_pidfd_open_errno(errno: libc::c_int) {
+    NEXT_CHILD_PIDFD_OPEN_ERRNO.with(|slot| slot.set(errno));
+}
+
 pub(super) fn register_child(
     registry: &super::registry::OwnerRegistry,
+    pidfd_lease: super::registry::PidfdLease,
     pid: libc::pid_t,
     pidfd: libc::c_int,
-    deadline: Instant,
     role: super::RuntimeOwnedChildRole,
 ) -> Result<super::registry::RegisteredChild, RuntimeFingerprintProduceError> {
-    match registry.register_child(pid, pidfd, role) {
+    match registry.register_child(pidfd_lease, pid, pidfd, role) {
         Ok(child) => Ok(child),
         Err(_) => {
-            let cleanup = rollback_unregistered_child(registry, pid, deadline, role);
+            let cleanup = rollback_unregistered_child(registry, pid, role);
             close_fd(pidfd);
             cleanup?;
             Err(registration_error(
@@ -152,6 +185,25 @@ pub(super) fn register_child(
 }
 
 pub(super) fn rollback_unregistered_child(
+    registry: &super::registry::OwnerRegistry,
+    pid: libc::pid_t,
+    role: super::RuntimeOwnedChildRole,
+) -> Result<(), RuntimeFingerprintProduceError> {
+    rollback_unregistered_child_before(
+        registry,
+        pid,
+        Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE,
+        role,
+    )
+}
+
+pub(super) fn cleanup_registered_child(
+    child: super::registry::RegisteredChild,
+) -> Result<(), RuntimeFingerprintProduceError> {
+    child.cleanup(Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE)
+}
+
+pub(super) fn rollback_unregistered_child_before(
     registry: &super::registry::OwnerRegistry,
     pid: libc::pid_t,
     deadline: Instant,
@@ -255,14 +307,38 @@ pub(super) fn child_reset_signal_dispositions() -> bool {
     true
 }
 
-pub(super) fn read_byte_before(
-    fd: libc::c_int,
-    deadline: Instant,
-) -> Result<u8, super::RuntimeChildCleanupOperation> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StatusReadError {
+    Deadline,
+    Channel,
+}
+
+pub(super) fn readiness_error(
+    role: super::RuntimeOwnedChildRole,
+    error: StatusReadError,
+) -> RuntimeFingerprintProduceError {
+    match error {
+        StatusReadError::Deadline => match role {
+            super::RuntimeOwnedChildRole::Observation(stage) => {
+                RuntimeFingerprintProduceError::ObservationDeadlineExceeded { stage }
+            }
+            super::RuntimeOwnedChildRole::InitialTarget
+            | super::RuntimeOwnedChildRole::RetryTarget => {
+                RuntimeFingerprintProduceError::ExecutionVerificationUnavailable
+            }
+        },
+        StatusReadError::Channel => registration_error(
+            role,
+            super::RuntimeChildRegistrationStage::DescriptorIsolation,
+        ),
+    }
+}
+
+pub(super) fn read_byte_before(fd: libc::c_int, deadline: Instant) -> Result<u8, StatusReadError> {
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return Err(super::RuntimeChildCleanupOperation::GateClose);
+            return Err(StatusReadError::Deadline);
         }
         let remaining = deadline.saturating_duration_since(now).as_millis();
         let timeout = remaining.min(i32::MAX as u128) as libc::c_int;
@@ -274,20 +350,26 @@ pub(super) fn read_byte_before(
         // SAFETY: pollfd points to one initialized entry and timeout is bounded.
         let poll_result = unsafe { libc::poll(&mut pollfd, 1, timeout) };
         if poll_result == 0 {
-            return Err(super::RuntimeChildCleanupOperation::GateClose);
+            return Err(StatusReadError::Deadline);
         }
         if poll_result < 0 {
             if last_errno() == libc::EINTR {
                 continue;
             }
-            return Err(super::RuntimeChildCleanupOperation::GateClose);
+            return Err(StatusReadError::Channel);
         }
-        let mut value = 0_u8;
-        // SAFETY: value is writable and fd is the live status descriptor.
-        let read = unsafe { libc::read(fd, (&mut value as *mut u8).cast(), 1) };
-        return (read == 1)
-            .then_some(value)
-            .ok_or(super::RuntimeChildCleanupOperation::GateClose);
+        loop {
+            let mut value = 0_u8;
+            // SAFETY: value is writable and fd is the live status descriptor.
+            let read = unsafe { libc::read(fd, (&mut value as *mut u8).cast(), 1) };
+            if read == 1 {
+                return Ok(value);
+            }
+            if read < 0 && last_errno() == libc::EINTR {
+                continue;
+            }
+            return Err(StatusReadError::Channel);
+        }
     }
 }
 
@@ -302,6 +384,117 @@ pub(super) fn write_byte(fd: libc::c_int, value: u8) -> Result<(), ()> {
             continue;
         }
         return Err(());
+    }
+}
+
+pub(super) fn wait_readable(
+    fd: libc::c_int,
+    deadline: Instant,
+    stage: super::RuntimeObservationStage,
+) -> Result<(), RuntimeFingerprintProduceError> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(RuntimeFingerprintProduceError::ObservationDeadlineExceeded { stage });
+        }
+        let remaining = deadline.saturating_duration_since(now).as_millis();
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let result = unsafe {
+            libc::poll(
+                &mut pollfd,
+                1,
+                remaining.min(i32::MAX as u128) as libc::c_int,
+            )
+        };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 {
+            return Err(RuntimeFingerprintProduceError::ObservationDeadlineExceeded { stage });
+        }
+        if last_errno() != libc::EINTR {
+            return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
+                stage,
+                reason: super::RuntimeObservationProtocolReason::HelperExited,
+            });
+        }
+    }
+}
+
+pub(super) fn fixed_frame_protocol_reason(
+    received: isize,
+    expected: usize,
+    flags: libc::c_int,
+) -> Option<super::RuntimeObservationProtocolReason> {
+    if received < 0 {
+        Some(super::RuntimeObservationProtocolReason::HelperExited)
+    } else if flags & libc::MSG_CTRUNC != 0 {
+        Some(super::RuntimeObservationProtocolReason::DescriptorCountMismatch)
+    } else if flags & libc::MSG_TRUNC != 0 || received > expected as isize {
+        Some(super::RuntimeObservationProtocolReason::OversizedFrame)
+    } else if received != expected as isize {
+        Some(super::RuntimeObservationProtocolReason::TruncatedFrame)
+    } else {
+        None
+    }
+}
+
+pub(super) fn recvmsg_retry(
+    fd: libc::c_int,
+    message: &mut libc::msghdr,
+    flags: libc::c_int,
+    stage: super::RuntimeObservationStage,
+) -> Result<isize, RuntimeFingerprintProduceError> {
+    recvmsg_retry_with(message, stage, |message| unsafe {
+        libc::recvmsg(fd, message, flags)
+    })
+}
+
+pub(super) fn recvmsg_retry_with(
+    message: &mut libc::msghdr,
+    stage: super::RuntimeObservationStage,
+    mut receive: impl FnMut(&mut libc::msghdr) -> isize,
+) -> Result<isize, RuntimeFingerprintProduceError> {
+    let control_capacity = message.msg_controllen;
+    let name_capacity = message.msg_namelen;
+    loop {
+        message.msg_flags = 0;
+        message.msg_controllen = control_capacity;
+        message.msg_namelen = name_capacity;
+        let received = receive(message);
+        if received >= 0 {
+            return Ok(received);
+        }
+        if last_errno() != libc::EINTR {
+            return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
+                stage,
+                reason: super::RuntimeObservationProtocolReason::HelperExited,
+            });
+        }
+    }
+}
+
+pub(super) fn receive_exact_frame(
+    fd: libc::c_int,
+    frame: &mut [u8],
+    stage: super::RuntimeObservationStage,
+) -> Result<(), RuntimeFingerprintProduceError> {
+    let mut iov = libc::iovec {
+        iov_base: frame.as_mut_ptr().cast(),
+        iov_len: frame.len(),
+    };
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    let received = recvmsg_retry(fd, &mut message, 0, stage)?;
+    if let Some(reason) = fixed_frame_protocol_reason(received, frame.len(), message.msg_flags) {
+        Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid { stage, reason })
+    } else {
+        Ok(())
     }
 }
 

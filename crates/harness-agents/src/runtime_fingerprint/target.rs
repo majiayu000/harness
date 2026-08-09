@@ -114,6 +114,7 @@ fn start(
     role: RuntimeOwnedChildRole,
     registry: &super::registry::OwnerRegistry,
 ) -> Result<TargetStart, RuntimeFingerprintProduceError> {
+    let pidfd_lease = registry.reserve_child_pidfd(role)?;
     let mut descriptor_lease = registry.reserve_descriptors(20)?;
     let argv_storage = vec![
         cstring(configured.executable().as_os_str())?,
@@ -186,10 +187,7 @@ fn start(
     let saved_signal_mask = super::probe::block_all_signals().map_err(|()| {
         close_child_descriptors(&context.descriptors);
         close_six(gate, status, pre_exec, stdin, stdout, stderr);
-        super::probe::registration_error(
-            role,
-            super::RuntimeChildRegistrationStage::SignalIsolation,
-        )
+        super::probe::parent_signal_isolation_error()
     })?;
     let pid = unsafe { libc::fork() };
     if pid == 0 {
@@ -202,45 +200,48 @@ fn start(
     super::probe::close_fd(pre_exec[1]);
     super::probe::close_fd(stdout[1]);
     super::probe::close_fd(stderr[1]);
-    if pid < 0 || restored.is_err() {
+    if restored.is_err() {
         close_parent_descriptors(gate[1], status[0], pre_exec[0], stdout[0], stderr[0]);
         if pid > 0 {
-            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, role)?;
         }
+        return Err(super::probe::parent_signal_isolation_error());
+    }
+    if pid < 0 {
+        close_parent_descriptors(gate[1], status[0], pre_exec[0], stdout[0], stderr[0]);
         return Err(super::probe::registration_error(
             role,
-            if pid < 0 {
-                super::RuntimeChildRegistrationStage::Fork
-            } else {
-                super::RuntimeChildRegistrationStage::SignalIsolation
-            },
+            super::RuntimeChildRegistrationStage::Fork,
         ));
     }
     let ready = super::probe::read_byte_before(status[0], deadline);
     super::probe::close_fd(status[0]);
     if ready != Ok(super::probe::CHILD_READY) {
+        let error = match ready {
+            Ok(super::probe::CHILD_SIGNAL_FAILED) => super::probe::registration_error(
+                role,
+                super::RuntimeChildRegistrationStage::SignalIsolation,
+            ),
+            Ok(_) => super::probe::registration_error(
+                role,
+                super::RuntimeChildRegistrationStage::DescriptorIsolation,
+            ),
+            Err(error) => super::probe::readiness_error(role, error),
+        };
         close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
-        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
-        return Err(super::probe::registration_error(
-            role,
-            match ready {
-                Ok(super::probe::CHILD_SIGNAL_FAILED) => {
-                    super::RuntimeChildRegistrationStage::SignalIsolation
-                }
-                _ => super::RuntimeChildRegistrationStage::DescriptorIsolation,
-            },
-        ));
+        super::probe::rollback_unregistered_child(registry, pid, role)?;
+        return Err(error);
     }
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+    let pidfd = super::probe::open_child_pidfd(pid);
     if pidfd < 0 {
         close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
-        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, role)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
-    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+    let child = match super::probe::register_child(registry, pidfd_lease, pid, pidfd, role) {
         Ok(child) => child,
         Err(error) => {
             close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
@@ -249,7 +250,7 @@ fn start(
     };
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         close_parent_descriptors(gate[1], -1, pre_exec[0], stdout[0], stderr[0]);
-        child.cleanup(deadline)?;
+        super::probe::cleanup_registered_child(child)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::GateRelease,

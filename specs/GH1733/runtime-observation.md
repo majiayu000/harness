@@ -597,7 +597,9 @@ mismatch, or a payload above its fixed bound fails typed.
 Every observation reply is bounded by its closed stage budget.
 `CapabilityCheck`, `WorkingDirectory`, `Candidate`, `TargetAuthorization`,
 `SourceHash`, `PreSpawnCheckpoint`, `ExecStopCheckpoint`, and
-`PostReapCheckpoint` use the one active deadline. If the applicable
+`PostReapCheckpoint` use the one active deadline, except that post-resume
+semantic cleanup that already reaped the target runs its envelope-mandatory
+`PostReapCheckpoint` under a fresh cleanup deadline. If the applicable
 deadline expires, the owner closes IPC and signals/reaps the exact helper pidfd
 within the remaining cleanup path. The producer returns closed
 `RuntimeFingerprintProduceError::ObservationDeadlineExceeded { stage }` when

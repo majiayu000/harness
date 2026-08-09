@@ -1,13 +1,15 @@
 //! Independent runtime fingerprint owner lifecycle.
 
+use super::command::PreparedCommand;
 use super::environment::SelectedEnvironment;
-use super::executable::PreparedCommand;
 use super::{
     ConfiguredRuntimeExecutable, ContainmentUnavailableReason, RuntimeFingerprintOptions,
     RuntimeFingerprintProduceError, RUNTIME_FINGERPRINT_OWNER_CAPACITY,
     RUNTIME_FINGERPRINT_OWNER_READY_DEADLINE, RUNTIME_FINGERPRINT_OWNER_STOP_JOIN_DEADLINE,
 };
-use harness_core::stack::fingerprint::AgentStackFingerprintEnvelope;
+use harness_core::stack::fingerprint::{
+    AgentStackFingerprintEnvelope, AgentStackFingerprintPayload, RuntimeProbeFailureKind,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -175,10 +177,11 @@ async fn run_inner(
                 &owner_stop,
                 &registry,
             );
-            let result = if result.is_ok() && !registry.is_empty() {
-                Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
-            } else {
-                result
+            let result = match result {
+                Ok(envelope) if !registry.is_empty() && !records_retained_cleanup(&envelope) => {
+                    Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)
+                }
+                result => result,
             };
             if result_tx.send(result).is_err() {
                 tracing::error!("runtime fingerprint caller dropped before owner completion");
@@ -231,6 +234,18 @@ async fn run_inner(
     })?;
     cancellation.disarm();
     result
+}
+
+fn records_retained_cleanup(envelope: &AgentStackFingerprintEnvelope) -> bool {
+    let AgentStackFingerprintPayload::AgentRuntime(payload) = envelope.payload() else {
+        return false;
+    };
+    payload.failures().iter().any(|failure| {
+        matches!(
+            failure.kind(),
+            RuntimeProbeFailureKind::TerminationFailed | RuntimeProbeFailureKind::ReapFailed
+        )
+    })
 }
 
 pub(super) fn try_reserve_owner(

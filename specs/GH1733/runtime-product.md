@@ -450,7 +450,10 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    target without resume and returns
    `execution_verification_unavailable`; only expiry after verified resume
    records `version_probe/timeout`. Cleanup has a separate five-second
-   deadline.
+   deadline. After an envelope-capable post-resume semantic failure has reaped
+   the target, its mandatory post-reap identity helper uses that cleanup
+   deadline; otherwise an expired active deadline could neither prove the
+   executed identity nor emit the required semantic failure envelope.
 
    Supported Linux requires `close_range` descriptor isolation,
    `pidfd_open`, `pidfd_send_signal`, parent-child ptrace with

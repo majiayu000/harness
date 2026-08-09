@@ -3,6 +3,7 @@ use crate::stack::{AgentStackSource, AgentStackSourceScope, Sha256Digest};
 
 mod model;
 mod schema;
+mod validation;
 
 #[test]
 fn fingerprint_digest_framing_vectors_are_independent() {
@@ -657,7 +658,7 @@ fn closed_failure_vocabulary_and_canonical_ordering_are_enforced() {
             RuntimeResolutionAttemptOutcome::ExecStarted,
             RuntimeExecSequence::Single,
         )],
-        Some(runtime_identity(true, true)),
+        None,
         None,
         cleanup.clone(),
     )
@@ -679,7 +680,7 @@ fn closed_failure_vocabulary_and_canonical_ordering_are_enforced() {
                 RuntimeResolutionAttemptOutcome::ExecStarted,
                 RuntimeExecSequence::Single,
             )],
-            Some(runtime_identity(true, true)),
+            None,
             None,
             reversed,
         ),

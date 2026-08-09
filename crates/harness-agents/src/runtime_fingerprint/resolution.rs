@@ -3,16 +3,17 @@
 use super::authorization::TargetAuthorization;
 use super::candidate::{CandidateObservation, RetainedExecutable};
 use super::checkpoint::PreSpawnCheckpoint;
+use super::command::{PreparedCommand, ResolvedCandidate};
 use super::environment::SelectedEnvironment;
-use super::executable::{PreparedCommand, ResolvedCandidate, RetainedWorkingDirectory};
+use super::executable::RetainedWorkingDirectory;
 use super::{
     ConfiguredRuntimeExecutable, RuntimeEnvelopeEvidence, RuntimeFingerprintOptions,
-    RuntimeFingerprintProduceError,
+    RuntimeFingerprintProduceError, RUNTIME_FINGERPRINT_MAX_RESOLUTION_CANDIDATES,
 };
 use harness_core::stack::fingerprint::{
-    AgentStackFingerprintEnvelope, RuntimeCommandForm, RuntimeExecSequence, RuntimeProbeFailure,
-    RuntimeProbeFailureDetail, RuntimeProbeFailureKind, RuntimeResolutionAttempt,
-    RuntimeResolutionAttemptOutcome,
+    AgentStackFingerprintEnvelope, RuntimeCommandForm, RuntimeExecSequence,
+    RuntimeExecutableIdentity, RuntimeProbeFailure, RuntimeProbeFailureDetail,
+    RuntimeProbeFailureKind, RuntimeResolutionAttempt, RuntimeResolutionAttemptOutcome,
 };
 use harness_core::stack::AgentStackSourceScope;
 use std::time::Instant;
@@ -47,7 +48,7 @@ pub(super) struct ResolutionCursor {
 pub(super) fn resolve(
     context: ResolutionContext<'_>,
 ) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
-    let candidate_capacity = context.command.candidates.len();
+    let candidate_capacity = context.command.candidate_capacity();
     resolve_from(context, 0, Vec::with_capacity(candidate_capacity), false)
 }
 
@@ -74,7 +75,12 @@ fn resolve_from(
         registry,
         stop_requested,
     } = context;
-    for (candidate_index, candidate) in command.candidates.iter().enumerate().skip(start_index) {
+    let mut candidate_index = start_index;
+    while candidate_index < RUNTIME_FINGERPRINT_MAX_RESOLUTION_CANDIDATES {
+        let Some(candidate) = command.candidate(candidate_index)? else {
+            break;
+        };
+        let candidate = &candidate;
         super::probe::ensure_owner_running(stop_requested)?;
         match super::candidate::observe_candidate(candidate, working_directory, deadline, registry)?
         {
@@ -161,12 +167,13 @@ fn resolve_from(
                         candidate,
                         RuntimeResolutionAttemptOutcome::InspectionTarget,
                     )?);
-                    return complete_with(
+                    return complete_inspection_with(
                         configured,
                         environment,
                         command,
                         working_directory,
                         attempts,
+                        &executable,
                         RuntimeProbeFailure::with_detail(
                             RuntimeProbeFailureKind::ProbeNotAuthorized,
                             RuntimeProbeFailureDetail::ConfigurationSourceRepository,
@@ -202,12 +209,13 @@ fn resolve_from(
                             candidate,
                             RuntimeResolutionAttemptOutcome::InspectionTarget,
                         )?);
-                        return complete_with(
+                        return complete_inspection_with(
                             configured,
                             environment,
                             command,
                             working_directory,
                             attempts,
+                            &executable,
                             RuntimeProbeFailure::with_detail(
                                 RuntimeProbeFailureKind::ProbeNotAuthorized,
                                 RuntimeProbeFailureDetail::ResolvedTargetRepository,
@@ -278,12 +286,13 @@ fn resolve_from(
                             candidate,
                             RuntimeResolutionAttemptOutcome::InspectionTarget,
                         )?);
-                        return complete_with(
+                        return complete_inspection_with(
                             configured,
                             environment,
                             command,
                             working_directory,
                             attempts,
+                            &executable,
                             RuntimeProbeFailure::with_detail(
                                 RuntimeProbeFailureKind::ProbeNotAuthorized,
                                 RuntimeProbeFailureDetail::ResolvedTargetRepository,
@@ -335,8 +344,9 @@ fn resolve_from(
                 });
             }
         }
+        candidate_index += 1;
     }
-    let failure = if command.candidate_limit_exceeded {
+    let failure = if command.has_candidate(RUNTIME_FINGERPRINT_MAX_RESOLUTION_CANDIDATES) {
         RuntimeProbeFailureKind::CandidateLimitExceeded
     } else if saw_exec_eacces {
         RuntimeProbeFailureKind::BareEaccesExhausted
@@ -373,6 +383,53 @@ fn complete_with(
     attempts: Vec<RuntimeResolutionAttempt>,
     failure: RuntimeProbeFailure,
 ) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
+    complete_with_identity(
+        configured,
+        environment,
+        command,
+        working_directory,
+        attempts,
+        None,
+        failure,
+    )
+}
+
+fn complete_inspection_with(
+    configured: &ConfiguredRuntimeExecutable,
+    environment: &SelectedEnvironment,
+    command: &PreparedCommand,
+    working_directory: &RetainedWorkingDirectory,
+    attempts: Vec<RuntimeResolutionAttempt>,
+    retained: &RetainedExecutable,
+    failure: RuntimeProbeFailure,
+) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
+    complete_with_identity(
+        configured,
+        environment,
+        command,
+        working_directory,
+        attempts,
+        Some(RuntimeExecutableIdentity::new(
+            retained.file_size_bytes,
+            Some(retained.unix_mode),
+            retained.executable_sha256.clone(),
+            false,
+            false,
+        )),
+        failure,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_with_identity(
+    configured: &ConfiguredRuntimeExecutable,
+    environment: &SelectedEnvironment,
+    command: &PreparedCommand,
+    working_directory: &RetainedWorkingDirectory,
+    attempts: Vec<RuntimeResolutionAttempt>,
+    executable: Option<RuntimeExecutableIdentity>,
+    failure: RuntimeProbeFailure,
+) -> Result<ResolutionDisposition, RuntimeFingerprintProduceError> {
     Ok(ResolutionDisposition::Complete(Box::new(
         super::finish_runtime_envelope(
             configured,
@@ -382,7 +439,7 @@ fn complete_with(
                 working_directory_digest: command.working_directory_digest.clone(),
                 working_directory_identity_digest: working_directory.identity_digest.clone(),
                 resolution_attempts: attempts,
-                executable: None,
+                executable,
                 version: None,
                 environment: environment.facts.clone(),
                 failures: vec![failure],

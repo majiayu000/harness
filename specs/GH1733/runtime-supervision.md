@@ -110,7 +110,10 @@ unexpected exit, or incomplete cleanup returns the corresponding typed
 no-envelope producer error. Expiry before verified resume kills/reaps the
 registered stopped target without resume and returns
 `ExecutionVerificationUnavailable`; expiry after resume records
-`version_probe/timeout`.
+`version_probe/timeout`. Once envelope-capable post-resume semantic cleanup has
+reaped the target, the mandatory post-reap identity helper uses a fresh cleanup
+deadline so the failure envelope can retain only freshly verified executed
+identity.
 
 The target's allocation-free pre-exec closure is the sole production
 `PTRACE_TRACEME` call site. The only closed

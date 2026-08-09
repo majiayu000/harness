@@ -65,6 +65,7 @@ fn run_authorization_child(
     let role = super::RuntimeOwnedChildRole::Observation(
         super::RuntimeObservationStage::TargetAuthorization,
     );
+    let pidfd_lease = registry.reserve_child_pidfd(role)?;
     let mut gate = [-1; 2];
     let mut status = [-1; 2];
     let mut protocol = [-1; 2];
@@ -89,10 +90,7 @@ fn run_authorization_child(
         Ok(saved) => saved,
         Err(()) => {
             close_all(gate, status, protocol);
-            return Err(super::probe::registration_error(
-                role,
-                super::RuntimeChildRegistrationStage::SignalIsolation,
-            ));
+            return Err(super::probe::parent_signal_isolation_error());
         }
     };
     let pid = unsafe { libc::fork() };
@@ -103,49 +101,54 @@ fn run_authorization_child(
     super::probe::close_fd(gate[0]);
     super::probe::close_fd(status[1]);
     super::probe::close_fd(protocol[1]);
-    if pid < 0 || restored.is_err() {
+    if restored.is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(status[0]);
         super::probe::close_fd(protocol[0]);
         if pid > 0 {
-            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, role)?;
         }
+        return Err(super::probe::parent_signal_isolation_error());
+    }
+    if pid < 0 {
+        super::probe::close_fd(gate[1]);
+        super::probe::close_fd(status[0]);
+        super::probe::close_fd(protocol[0]);
         return Err(super::probe::registration_error(
             role,
-            if pid < 0 {
-                super::RuntimeChildRegistrationStage::Fork
-            } else {
-                super::RuntimeChildRegistrationStage::SignalIsolation
-            },
+            super::RuntimeChildRegistrationStage::Fork,
         ));
     }
     let ready = super::probe::read_byte_before(status[0], deadline);
     super::probe::close_fd(status[0]);
     if ready != Ok(super::probe::CHILD_READY) {
+        let error = match ready {
+            Ok(super::probe::CHILD_SIGNAL_FAILED) => super::probe::registration_error(
+                role,
+                super::RuntimeChildRegistrationStage::SignalIsolation,
+            ),
+            Ok(_) => super::probe::registration_error(
+                role,
+                super::RuntimeChildRegistrationStage::DescriptorIsolation,
+            ),
+            Err(error) => super::probe::readiness_error(role, error),
+        };
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
-        return Err(super::probe::registration_error(
-            role,
-            match ready {
-                Ok(super::probe::CHILD_SIGNAL_FAILED) => {
-                    super::RuntimeChildRegistrationStage::SignalIsolation
-                }
-                _ => super::RuntimeChildRegistrationStage::DescriptorIsolation,
-            },
-        ));
+        super::probe::rollback_unregistered_child(registry, pid, role)?;
+        return Err(error);
     }
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+    let pidfd = super::probe::open_child_pidfd(pid);
     if pidfd < 0 {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, role)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
-    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+    let child = match super::probe::register_child(registry, pidfd_lease, pid, pidfd, role) {
         Ok(child) => child,
         Err(error) => {
             super::probe::close_fd(gate[1]);
@@ -156,7 +159,7 @@ fn run_authorization_child(
     if super::probe::write_byte(gate[1], super::probe::CHILD_GO).is_err() {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(protocol[0]);
-        child.cleanup(deadline)?;
+        super::probe::cleanup_registered_child(child)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::GateRelease,
@@ -280,33 +283,10 @@ fn receive_authorization(
     fd: libc::c_int,
     deadline: Instant,
 ) -> Result<TargetAuthorization, RuntimeFingerprintProduceError> {
-    let remaining = deadline
-        .saturating_duration_since(Instant::now())
-        .as_millis();
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN | libc::POLLHUP,
-        revents: 0,
-    };
-    if unsafe { libc::poll(&mut pollfd, 1, remaining.min(i32::MAX as u128) as _) } <= 0 {
-        return Err(
-            RuntimeFingerprintProduceError::ObservationDeadlineExceeded {
-                stage: super::RuntimeObservationStage::TargetAuthorization,
-            },
-        );
-    }
-    let mut frame = [0_u8; 2];
-    let received = unsafe { libc::recv(fd, frame.as_mut_ptr().cast(), frame.len(), 0) };
-    if received != 1 {
-        return Err(RuntimeFingerprintProduceError::ObservationProtocolInvalid {
-            stage: super::RuntimeObservationStage::TargetAuthorization,
-            reason: if received > 1 {
-                RuntimeObservationProtocolReason::SurplusFields
-            } else {
-                RuntimeObservationProtocolReason::TruncatedFrame
-            },
-        });
-    }
+    let stage = super::RuntimeObservationStage::TargetAuthorization;
+    super::probe::wait_readable(fd, deadline, stage)?;
+    let mut frame = [0_u8; 1];
+    super::probe::receive_exact_frame(fd, &mut frame, stage)?;
     match frame[0] {
         AUTHORIZED => Ok(TargetAuthorization::Authorized),
         RESOLVED_TARGET_REPOSITORY => Ok(TargetAuthorization::ResolvedTargetRepository),

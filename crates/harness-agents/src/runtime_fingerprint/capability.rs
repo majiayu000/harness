@@ -14,11 +14,12 @@ pub(super) fn validate(
     deadline: Instant,
     registry: &super::registry::OwnerRegistry,
 ) -> Result<(), RuntimeFingerprintProduceError> {
+    let role =
+        super::RuntimeOwnedChildRole::Observation(super::RuntimeObservationStage::CapabilityCheck);
+    let pidfd_lease = registry.reserve_child_pidfd(role)?;
     let mut descriptor_lease = registry.reserve_descriptors(5)?;
     let trusted_image = trusted_capability_image();
     let executable = create_capability_executable(&trusted_image, descriptor_lease.split_off(1)?)?;
-    let role =
-        super::RuntimeOwnedChildRole::Observation(super::RuntimeObservationStage::CapabilityCheck);
     let mut gate = [-1; 2];
     let mut status = [-1; 2];
     // SAFETY: both arrays contain space for exactly two descriptors.
@@ -40,10 +41,7 @@ pub(super) fn validate(
     let saved_signal_mask = super::probe::block_all_signals().map_err(|()| {
         super::probe::close_pipe_pair(gate);
         super::probe::close_pipe_pair(status);
-        super::probe::registration_error(
-            role,
-            super::RuntimeChildRegistrationStage::SignalIsolation,
-        )
+        super::probe::parent_signal_isolation_error()
     })?;
 
     // SAFETY: the child executes only the allocation-free routine below until _exit.
@@ -54,6 +52,14 @@ pub(super) fn validate(
     let restore_result = super::probe::restore_signal_mask(saved_signal_mask);
     super::probe::close_fd(gate[0]);
     super::probe::close_fd(status[1]);
+    if restore_result.is_err() {
+        super::probe::close_fd(gate[1]);
+        super::probe::close_fd(status[0]);
+        if pid > 0 {
+            super::probe::rollback_unregistered_child(registry, pid, role)?;
+        }
+        return Err(super::probe::parent_signal_isolation_error());
+    }
     if pid < 0 {
         super::probe::close_fd(gate[1]);
         super::probe::close_fd(status[0]);
@@ -62,32 +68,14 @@ pub(super) fn validate(
             super::RuntimeChildRegistrationStage::Fork,
         ));
     }
-    if restore_result.is_err() {
-        super::probe::close_fd(gate[1]);
-        super::probe::close_fd(status[0]);
-        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
-        return Err(super::probe::registration_error(
-            role,
-            super::RuntimeChildRegistrationStage::SignalIsolation,
-        ));
-    }
 
     let child_status = match super::probe::read_byte_before(status[0], deadline) {
         Ok(status) => status,
-        Err(_) => {
+        Err(error) => {
             super::probe::close_fd(gate[1]);
             super::probe::close_fd(status[0]);
-            super::probe::rollback_unregistered_child(
-                registry,
-                pid,
-                Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE,
-                role,
-            )?;
-            return Err(
-                RuntimeFingerprintProduceError::ObservationDeadlineExceeded {
-                    stage: super::RuntimeObservationStage::CapabilityCheck,
-                },
-            );
+            super::probe::rollback_unregistered_child(registry, pid, role)?;
+            return Err(super::probe::readiness_error(role, error));
         }
     };
     super::probe::close_fd(status[0]);
@@ -95,7 +83,7 @@ pub(super) fn validate(
         super::probe::CHILD_READY => {}
         super::probe::CHILD_SIGNAL_FAILED => {
             super::probe::close_fd(gate[1]);
-            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, role)?;
             return Err(super::probe::registration_error(
                 role,
                 super::RuntimeChildRegistrationStage::SignalIsolation,
@@ -103,14 +91,14 @@ pub(super) fn validate(
         }
         super::probe::CHILD_DESCRIPTOR_UNAVAILABLE => {
             super::probe::close_fd(gate[1]);
-            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, role)?;
             return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
                 ContainmentUnavailableReason::DescriptorIsolationUnavailable,
             ));
         }
         _ => {
             super::probe::close_fd(gate[1]);
-            super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+            super::probe::rollback_unregistered_child(registry, pid, role)?;
             return Err(super::probe::registration_error(
                 role,
                 super::RuntimeChildRegistrationStage::DescriptorIsolation,
@@ -119,16 +107,16 @@ pub(super) fn validate(
     }
 
     // SAFETY: pid is the live, still-gated direct child and flags are frozen to zero.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+    let pidfd = super::probe::open_child_pidfd(pid);
     if pidfd < 0 {
         super::probe::close_fd(gate[1]);
-        super::probe::rollback_unregistered_child(registry, pid, deadline, role)?;
+        super::probe::rollback_unregistered_child(registry, pid, role)?;
         return Err(super::probe::registration_error(
             role,
             super::RuntimeChildRegistrationStage::PidfdOpen,
         ));
     }
-    let child = match super::probe::register_child(registry, pid, pidfd, deadline, role) {
+    let child = match super::probe::register_child(registry, pidfd_lease, pid, pidfd, role) {
         Ok(child) => child,
         Err(error) => {
             super::probe::close_fd(gate[1]);
@@ -137,7 +125,7 @@ pub(super) fn validate(
     };
     if validate_ptrace(pid, child.pidfd(), gate[1], &executable, deadline, registry).is_err() {
         super::probe::close_fd(gate[1]);
-        child.cleanup(deadline)?;
+        super::probe::cleanup_registered_child(child)?;
         return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
             ContainmentUnavailableReason::PostExecGuardUnavailable,
         ));
@@ -493,7 +481,7 @@ fn validate_and_consume_exit(
 ) -> Result<(), RuntimeFingerprintProduceError> {
     let observed = super::probe::waitid_pidfd(child.pidfd(), true, deadline);
     if !matches!(observed, Ok((seen, libc::CLD_EXITED, 0)) if seen == pid) {
-        bootstrap_pid_fallback(child.pidfd(), pid, deadline, role)?;
+        bootstrap_pid_fallback(child.pidfd(), pid, role)?;
         child.reaped()?;
         return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
             ContainmentUnavailableReason::PidfdUnavailable,
@@ -512,7 +500,7 @@ fn validate_and_consume_exit(
             ))
         }
         Err(()) => {
-            bootstrap_pid_fallback(child.pidfd(), pid, deadline, role)?;
+            bootstrap_pid_fallback(child.pidfd(), pid, role)?;
             child.reaped()?;
             Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
                 ContainmentUnavailableReason::PidfdUnavailable,
@@ -524,9 +512,9 @@ fn validate_and_consume_exit(
 fn bootstrap_pid_fallback(
     pidfd: libc::c_int,
     pid: libc::pid_t,
-    deadline: Instant,
     role: super::RuntimeOwnedChildRole,
 ) -> Result<(), RuntimeFingerprintProduceError> {
+    let deadline = Instant::now() + super::RUNTIME_FINGERPRINT_CLEANUP_DEADLINE;
     if pidfd < 0 {
         return Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
             ContainmentUnavailableReason::PidfdUnavailable,
@@ -548,6 +536,9 @@ fn bootstrap_pid_fallback(
         let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if result == pid {
             return Ok(());
+        }
+        if result < 0 && super::probe::last_errno() == libc::EINTR {
+            continue;
         }
         if result < 0 || Instant::now() >= deadline {
             return Err(

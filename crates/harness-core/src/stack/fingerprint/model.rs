@@ -53,6 +53,9 @@ pub enum RuntimeCommandForm {
     UnixBare,
     UnixAbsolute,
     UnixQualified,
+    WindowsBare,
+    WindowsAbsolute,
+    WindowsQualified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +287,9 @@ impl RuntimeProbeFailure {
     ) -> Result<Self, AgentStackFingerprintError> {
         Self::build(kind, Some(detail))
     }
+    pub const fn kind(&self) -> RuntimeProbeFailureKind {
+        self.kind
+    }
     fn build(
         kind: RuntimeProbeFailureKind,
         detail: Option<RuntimeProbeFailureDetail>,
@@ -328,8 +334,10 @@ impl RuntimeProbeFailure {
                         | D::ProcessSignalling,
                     ),
                 ) => true,
-                (K::NonzeroExit, Some(D::ExitCode(_))) => true,
-                (K::OutputLimitExceeded, Some(D::OutputLimitBytes(_))) => true,
+                (K::NonzeroExit, Some(D::ExitCode(code))) => (1..=255).contains(code),
+                (K::OutputLimitExceeded, Some(D::OutputLimitBytes(limit))) => {
+                    (1..=65_536).contains(limit)
+                }
                 (kind, None) => !matches!(
                     kind,
                     K::ProbeNotAuthorized
@@ -518,6 +526,9 @@ impl RuntimeExecutableFingerprintPayload {
     }
     pub const fn runtime_kind(&self) -> LocalExecutableRuntimeKind {
         self.runtime_kind
+    }
+    pub fn failures(&self) -> &[RuntimeProbeFailure] {
+        &self.failures
     }
 }
 

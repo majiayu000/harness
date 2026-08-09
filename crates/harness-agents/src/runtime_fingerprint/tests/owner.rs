@@ -1,5 +1,15 @@
 use super::*;
 
+fn register_child_for_test(
+    registry: &registry::OwnerRegistry,
+    pid: libc::pid_t,
+    pidfd: libc::c_int,
+    role: RuntimeOwnedChildRole,
+) -> registry::RegisteredChild {
+    let lease = registry.reserve_child_pidfd(role).unwrap();
+    registry.register_child(lease, pid, pidfd, role).unwrap()
+}
+
 #[test]
 fn ninth_owner_fails_with_the_global_capacity_reason() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -50,8 +60,22 @@ fn owner_descriptor_ledger_accepts_exact_capacity_and_releases_splits() {
 }
 
 #[test]
-fn owner_pidfd_ledger_accepts_two_and_rejects_third() {
+fn owner_pidfd_ledger_reserves_one_target_and_one_helper_slot() {
     let registry = registry::OwnerRegistry::new();
+    let target_role = RuntimeOwnedChildRole::InitialTarget;
+    let helper_role = RuntimeOwnedChildRole::Observation(RuntimeObservationStage::Candidate);
+    let target_lease = registry.reserve_child_pidfd(target_role).unwrap();
+    let helper_lease = registry.reserve_child_pidfd(helper_role).unwrap();
+    assert!(matches!(
+        registry.reserve_child_pidfd(RuntimeOwnedChildRole::RetryTarget),
+        Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded)
+    ));
+    assert!(matches!(
+        registry.reserve_child_pidfd(RuntimeOwnedChildRole::Observation(
+            RuntimeObservationStage::SourceHash
+        )),
+        Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded)
+    ));
     let mut descriptors = [-1; 4];
     assert_eq!(
         unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
@@ -61,17 +85,61 @@ fn owner_pidfd_ledger_accepts_two_and_rejects_third() {
         unsafe { libc::pipe2(descriptors[2..].as_mut_ptr(), libc::O_CLOEXEC) },
         0
     );
-    let role = RuntimeOwnedChildRole::InitialTarget;
-    let first = registry.register_child(101, descriptors[0], role).unwrap();
-    let second = registry.register_child(102, descriptors[1], role).unwrap();
-    assert!(matches!(
-        registry.register_child(103, descriptors[2], role),
-        Err(RuntimeFingerprintProduceError::OwnerResourceCapacityExceeded)
-    ));
+    let target = registry
+        .register_child(target_lease, 101, descriptors[0], target_role)
+        .unwrap();
+    let helper = registry
+        .register_child(helper_lease, 102, descriptors[1], helper_role)
+        .unwrap();
     probe::close_fd(descriptors[2]);
     probe::close_fd(descriptors[3]);
-    first.reaped().unwrap();
-    second.reaped().unwrap();
+    target.reaped().unwrap();
+    helper.reaped().unwrap();
+    assert_eq!(registry.usage(), (0, 0));
+}
+
+#[test]
+fn post_reservation_emfile_keeps_the_pidfd_open_stage_distinct() {
+    let registry = registry::OwnerRegistry::new();
+    let role = RuntimeOwnedChildRole::InitialTarget;
+    let lease = registry.reserve_child_pidfd(role).unwrap();
+    assert_eq!(registry.usage(), (1, 0));
+    probe::inject_next_child_pidfd_open_errno(libc::EMFILE);
+    assert_eq!(probe::open_child_pidfd(unsafe { libc::getpid() }), -1);
+    assert_eq!(probe::last_errno(), libc::EMFILE);
+    assert!(matches!(
+        probe::registration_error(role, RuntimeChildRegistrationStage::PidfdOpen),
+        RuntimeFingerprintProduceError::ChildRegistrationUnavailable {
+            stage: RuntimeChildRegistrationStage::PidfdOpen,
+            ..
+        }
+    ));
+    drop(lease);
+    assert_eq!(registry.usage(), (0, 0));
+}
+
+#[test]
+fn child_pidfd_reservation_is_bound_to_its_declared_role() {
+    let registry = registry::OwnerRegistry::new();
+    let lease = registry
+        .reserve_child_pidfd(RuntimeOwnedChildRole::InitialTarget)
+        .unwrap();
+    let mut descriptors = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    assert!(matches!(
+        registry.register_child(
+            lease,
+            101,
+            descriptors[0],
+            RuntimeOwnedChildRole::RetryTarget,
+        ),
+        Err(RuntimeFingerprintProduceError::InvalidLaunchContext)
+    ));
+    probe::close_fd(descriptors[0]);
+    probe::close_fd(descriptors[1]);
     assert_eq!(registry.usage(), (0, 0));
 }
 
@@ -164,17 +232,9 @@ fn raw_kernel_signal_mask_blocks_nptl_reserved_signals_and_restores_exactly() {
 #[test]
 fn failed_registry_commit_reaps_gated_child_before_any_workload() {
     let registry = registry::OwnerRegistry::new();
-    let mut occupied = [-1; 2];
-    assert_eq!(
-        unsafe { libc::pipe2(occupied.as_mut_ptr(), libc::O_CLOEXEC) },
-        0
-    );
-    let first = registry
-        .register_child(101, occupied[0], RuntimeOwnedChildRole::InitialTarget)
-        .unwrap();
-    let second = registry
-        .register_child(102, occupied[1], RuntimeOwnedChildRole::RetryTarget)
-        .unwrap();
+    let foreign_registry = registry::OwnerRegistry::new();
+    let role = RuntimeOwnedChildRole::InitialTarget;
+    let mismatched_lease = foreign_registry.reserve_child_pidfd(role).unwrap();
 
     let mut gate = [-1; 2];
     let mut workload = [-1; 2];
@@ -205,13 +265,7 @@ fn failed_registry_commit_reaps_gated_child_before_any_workload() {
     probe::close_fd(workload[1]);
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
     assert!(pidfd >= 0);
-    let result = probe::register_child(
-        &registry,
-        pid,
-        pidfd,
-        std::time::Instant::now() + RUNTIME_FINGERPRINT_CLEANUP_DEADLINE,
-        RuntimeOwnedChildRole::InitialTarget,
-    );
+    let result = probe::register_child(&registry, mismatched_lease, pid, pidfd, role);
     assert!(matches!(
         result,
         Err(
@@ -234,9 +288,8 @@ fn failed_registry_commit_reaps_gated_child_before_any_workload() {
         -1
     );
     assert_eq!(probe::last_errno(), libc::ECHILD);
-    first.reaped().unwrap();
-    second.reaped().unwrap();
     assert_eq!(registry.usage(), (0, 0));
+    assert_eq!(foreign_registry.usage(), (0, 0));
 }
 
 #[test]
@@ -253,9 +306,8 @@ fn expired_cleanup_retains_obligation_until_owner_drain_reaps() {
     }
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
     assert!(pidfd >= 0);
-    let child = registry
-        .register_child(pid, pidfd, RuntimeOwnedChildRole::InitialTarget)
-        .unwrap();
+    let child =
+        register_child_for_test(&registry, pid, pidfd, RuntimeOwnedChildRole::InitialTarget);
     assert!(matches!(
         child.cleanup(std::time::Instant::now()),
         Err(
@@ -268,6 +320,32 @@ fn expired_cleanup_retains_obligation_until_owner_drain_reaps() {
     assert_eq!(registry.usage(), (1, 0));
     registry.drain_retained();
     assert_eq!(registry.usage(), (0, 0));
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(probe::last_errno(), libc::ECHILD);
+}
+
+#[test]
+fn registered_failure_cleanup_uses_a_fresh_cleanup_window() {
+    let registry = registry::OwnerRegistry::new();
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        loop {
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+    assert!(pidfd >= 0);
+    let child =
+        register_child_for_test(&registry, pid, pidfd, RuntimeOwnedChildRole::InitialTarget);
+    probe::cleanup_registered_child(child).unwrap();
+    assert!(registry.is_empty());
     let mut status = 0;
     assert_eq!(
         unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
@@ -290,7 +368,7 @@ fn expired_unregistered_cleanup_retains_pid_until_owner_drain_reaps() {
         }
     }
     assert!(matches!(
-        probe::rollback_unregistered_child(&registry, pid, std::time::Instant::now(), role),
+        probe::rollback_unregistered_child_before(&registry, pid, std::time::Instant::now(), role,),
         Err(
             RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
                 operation: RuntimeChildCleanupOperation::Reap,

@@ -3,51 +3,106 @@
 #[cfg(test)]
 mod tests;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod authorization;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod candidate;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod capability;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod checkpoint;
-#[cfg(target_os = "linux")]
+mod command;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod completion;
 mod environment;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod exec_stop;
 mod executable;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod launch;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod owner;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod probe;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod registry;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod resolution;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod supervision;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod syscall_guard;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod target;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod test_fixtures;
+mod windows_candidate;
+mod windows_resolution;
 
 use harness_core::config::agents::{AgentsConfig, SandboxMode};
 use harness_core::config::isolation::IsolationTier;
 use harness_core::stack::fingerprint::{
     AgentStackFingerprintEnvelope, ConfiguredRuntimeSource, LocalExecutableRuntimeKind,
 };
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use harness_core::stack::fingerprint::{
     RuntimeCommandForm, RuntimeEnvironmentFact, RuntimeExecutableFingerprintPayload,
     RuntimeExecutableIdentity, RuntimeProbeFailure, RuntimeResolutionAttempt,
     RuntimeRoleSourceBinding, RuntimeVersionFacts,
 };
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use harness_core::stack::Sha256Digest;
 use harness_sandbox::{NetworkPolicy, SandboxSpec};
 use std::ffi::OsString;
@@ -62,6 +117,11 @@ pub use environment::{
 pub use executable::{
     classify_static_linux_elf, runtime_working_directory_identity_digest, LinuxElfArchitecture,
     LinuxStaticElfClassification,
+};
+pub use windows_candidate::WindowsResolvedCandidate;
+pub use windows_resolution::{
+    resolve_windows_command, WindowsResolution, WindowsResolutionContextEvidence,
+    WindowsResolutionInput,
 };
 
 pub const RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES: u64 = 67_108_864;
@@ -248,7 +308,10 @@ pub enum RuntimeFingerprintProduceError {
     ExecutionVerificationUnavailable,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(super) struct RuntimeEnvelopeEvidence {
     pub(super) command_form: RuntimeCommandForm,
     pub(super) configured_command_digest: Sha256Digest,
@@ -261,7 +324,10 @@ pub(super) struct RuntimeEnvelopeEvidence {
     pub(super) failures: Vec<RuntimeProbeFailure>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(super) fn finish_runtime_envelope(
     configured: &ConfiguredRuntimeExecutable,
     evidence: RuntimeEnvelopeEvidence,
@@ -444,15 +510,16 @@ pub fn configured_runtime_executables_from_agents_config(
     ]
 }
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub async fn fingerprint_configured_runtime_executable(
     executable: &ConfiguredRuntimeExecutable,
     options: &RuntimeFingerprintOptions,
 ) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
     executable.validate_execution_boundary()?;
-    ensure_supported_platform()?;
-    if !(1..=RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES).contains(&options.max_output_bytes) {
-        return Err(RuntimeFingerprintProduceError::InvalidOutputLimit);
-    }
+    validate_output_limit(options.max_output_bytes)?;
     validate_launch_value_limit(
         executable.executable.as_os_str(),
         RuntimeLaunchInputLimitKind::ConfiguredCommand,
@@ -466,7 +533,7 @@ pub async fn fingerprint_configured_runtime_executable(
         &options.environment,
         &executable.setup_secret_env,
     )?;
-    let prepared_command = executable::prepare_command(
+    let prepared_command = command::prepare_command(
         executable.executable.as_os_str(),
         &options.working_dir,
         selected_environment.child_path.as_deref(),
@@ -474,68 +541,68 @@ pub async fn fingerprint_configured_runtime_executable(
     if !prepared_command.validate_shape() {
         return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
     }
-    produce_on_supported_platform(executable, options, selected_environment, prepared_command).await
-}
-
-#[cfg(target_os = "linux")]
-async fn produce_on_supported_platform(
-    executable: &ConfiguredRuntimeExecutable,
-    options: &RuntimeFingerprintOptions,
-    selected_environment: environment::SelectedEnvironment,
-    prepared_command: executable::PreparedCommand,
-) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
     owner::run(executable, options, selected_environment, prepared_command).await
 }
 
-#[cfg(not(target_os = "linux"))]
-async fn produce_on_supported_platform(
-    executable: &ConfiguredRuntimeExecutable,
-    options: &RuntimeFingerprintOptions,
-    selected_environment: environment::SelectedEnvironment,
-    prepared_command: executable::PreparedCommand,
-) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
-    let environment::SelectedEnvironment { facts, child_path } = selected_environment;
-    let executable::PreparedCommand {
-        command_form,
-        configured_command_digest,
-        working_directory_digest,
-        candidates,
-        candidate_limit_exceeded,
-        path_unusable,
-    } = prepared_command;
-    for candidate in candidates {
-        match candidate.reference {
-            executable::CandidateReference::Absolute(path)
-            | executable::CandidateReference::WorkingDirectoryRelative(path) => drop(path),
-        }
-        drop(candidate.candidate_digest);
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn validate_output_limit(max_output_bytes: usize) -> Result<(), RuntimeFingerprintProduceError> {
+    if (1..=RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES).contains(&max_output_bytes) {
+        Ok(())
+    } else {
+        Err(RuntimeFingerprintProduceError::InvalidOutputLimit)
     }
-    drop((
-        executable,
-        options,
-        facts,
-        child_path,
-        command_form,
-        configured_command_digest,
-        working_directory_digest,
-        candidate_limit_exceeded,
-        path_unusable,
-    ));
-    unreachable!("the platform gate returns before producer dispatch")
 }
 
-#[cfg(target_os = "linux")]
-fn ensure_supported_platform() -> Result<(), RuntimeFingerprintProduceError> {
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn ensure_supported_platform() -> Result<(), RuntimeFingerprintProduceError> {
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+pub async fn fingerprint_configured_runtime_executable(
+    executable: &ConfiguredRuntimeExecutable,
+    _options: &RuntimeFingerprintOptions,
+) -> Result<AgentStackFingerprintEnvelope, RuntimeFingerprintProduceError> {
+    executable.validate_execution_boundary()?;
     Err(RuntimeFingerprintProduceError::ContainmentUnavailable(
         ContainmentUnavailableReason::UnsupportedPlatform,
     ))
 }
 
+#[cfg(all(
+    unix,
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
+))]
+const _: fn(
+    &std::ffi::OsStr,
+    &Path,
+    Option<&std::ffi::OsStr>,
+) -> Result<command::PreparedCommand, RuntimeFingerprintProduceError> = command::prepare_command;
+#[cfg(all(
+    unix,
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
+))]
+const _: fn(&command::PreparedCommand) -> bool = command::PreparedCommand::validate_shape;
+#[cfg(all(
+    unix,
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
+))]
+const _: fn(&std::ffi::OsStr, usize) -> usize = executable::native_os_units_len;
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn validate_launch_value_limit(
     value: &std::ffi::OsStr,
     kind: RuntimeLaunchInputLimitKind,
