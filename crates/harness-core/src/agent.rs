@@ -63,14 +63,13 @@ pub struct AgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_layers: Option<AgentPromptLayers>,
     pub project_root: PathBuf,
-    /// Explicit permission mode. `Full` is the only value that may select an
-    /// unrestricted backend invocation, and only when no allowlist is present.
+    /// Requested permission mode. Legacy direct requests with no allowlist are
+    /// also treated as unrestricted; see `effective_permission_mode`.
     #[serde(default)]
     pub permission_mode: AgentPermissionMode,
     /// Tool restriction for the agent invocation.
     ///
-    /// - `None` in scoped mode → the Standard profile tool list.
-    /// - `None` in full mode → no restriction.
+    /// - `None` → no restriction, preserving the legacy direct-request API.
     /// - `Some(tools)` → Restricted: CLI uses `--allowedTools <list>`.
     ///   An explicitly empty `Some(vec![])` means deny-all at the CLI boundary.
     ///
@@ -116,14 +115,24 @@ impl AgentRequest {
         self.env_vars.extend(configured_agent_spawn_env(config));
     }
 
-    /// Returns `true` only for an explicit Full request without an allowlist.
+    /// Returns `true` for an unrestricted request without an allowlist.
     ///
     /// When `true`, the CLI adapter should use `--dangerously-skip-permissions`.
     /// When `false`, the adapter should use `--allowedTools <list>` instead —
     /// these flags are mutually exclusive in Claude CLI 2.1.70+.
-    ///
     pub fn uses_dangerously_skip_permissions(&self) -> bool {
-        self.permission_mode == AgentPermissionMode::Full && self.allowed_tools.is_none()
+        self.effective_permission_mode() == AgentPermissionMode::Full
+    }
+
+    /// Resolves compatibility at the public request boundary. Default and
+    /// runtime requests carry an explicit tool list; legacy direct callers
+    /// that set `allowed_tools` to `None` retain unrestricted behavior.
+    pub fn effective_permission_mode(&self) -> AgentPermissionMode {
+        if self.allowed_tools.is_none() {
+            AgentPermissionMode::Full
+        } else {
+            AgentPermissionMode::Scoped
+        }
     }
 
     /// Resolve the tool list enforced by scoped backends. A missing list no
@@ -435,7 +444,7 @@ impl TurnRequest {
     }
 
     /// True only when the request explicitly opts into Full and carries no
-    /// allowlist. Mirrors `AgentRequest::uses_dangerously_skip_permissions`.
+    /// allowlist.
     pub fn uses_dangerously_skip_permissions(&self) -> bool {
         self.permission_mode == AgentPermissionMode::Full && self.allowed_tools.is_none()
     }

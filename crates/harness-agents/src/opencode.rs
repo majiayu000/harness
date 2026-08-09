@@ -257,7 +257,7 @@ impl CodeAgent for OpenCodeAgent {
                 env_vars: &spawn_env_vars,
                 secret_env_keys: &[],
                 container_bind_mounts: &[],
-                permission_mode: req.permission_mode,
+                permission_mode: req.effective_permission_mode(),
                 forward_stdin: false,
             })
             .await?;
@@ -381,7 +381,7 @@ impl CodeAgent for OpenCodeAgent {
                 env_vars: &spawn_env_vars,
                 secret_env_keys: &[],
                 container_bind_mounts: &[],
-                permission_mode: req.permission_mode,
+                permission_mode: req.effective_permission_mode(),
                 forward_stdin: false,
             })
             .await?;

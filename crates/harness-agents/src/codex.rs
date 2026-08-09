@@ -105,7 +105,7 @@ impl CodexAgent {
             cloud_setup::CloudSetupContext {
                 project_root: &req.project_root,
                 sandbox_mode: self.effective_sandbox_mode(req),
-                permission_mode: req.permission_mode,
+                permission_mode: req.effective_permission_mode(),
                 env_vars: &req.env_vars,
                 capability_token: req.capability_token.as_ref(),
             },
@@ -503,7 +503,7 @@ impl CodeAgent for CodexAgent {
                 env_vars: &spawn_env_vars,
                 secret_env_keys: &[],
                 container_bind_mounts: &container_bind_mounts,
-                permission_mode: req.permission_mode,
+                permission_mode: req.effective_permission_mode(),
                 forward_stdin: false,
             })
             .await?;
@@ -623,7 +623,7 @@ impl CodeAgent for CodexAgent {
                 env_vars: &spawn_env_vars,
                 secret_env_keys: &[],
                 container_bind_mounts: &container_bind_mounts,
-                permission_mode: req.permission_mode,
+                permission_mode: req.effective_permission_mode(),
                 forward_stdin: false,
             })
             .await?;

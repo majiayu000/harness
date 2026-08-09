@@ -185,6 +185,10 @@ fn default_agent_request_is_scoped_to_standard_tools() {
 
     assert!(!request.uses_dangerously_skip_permissions());
     assert_eq!(
+        request.effective_permission_mode(),
+        crate::config::agents::AgentPermissionMode::Scoped
+    );
+    assert_eq!(
         request.scoped_allowed_tools(),
         vec!["Read", "Write", "Edit", "Bash"]
     );
@@ -204,7 +208,29 @@ fn explicit_full_agent_request_is_unrestricted_only_without_an_allowlist() {
         ..full
     };
     assert!(!restricted.uses_dangerously_skip_permissions());
+    assert_eq!(
+        restricted.effective_permission_mode(),
+        crate::config::agents::AgentPermissionMode::Scoped
+    );
     assert_eq!(restricted.scoped_allowed_tools(), vec!["Read"]);
+}
+
+#[test]
+fn legacy_missing_tool_allowlist_keeps_unrestricted_behavior() {
+    let request = AgentRequest {
+        allowed_tools: None,
+        ..AgentRequest::default()
+    };
+
+    assert!(request.uses_dangerously_skip_permissions());
+    assert_eq!(
+        request.effective_permission_mode(),
+        crate::config::agents::AgentPermissionMode::Full
+    );
+    assert_eq!(
+        crate::agent::AgentEgressMode::resolve(request.effective_permission_mode(), &[]),
+        crate::agent::AgentEgressMode::Unrestricted
+    );
 }
 
 #[test]
