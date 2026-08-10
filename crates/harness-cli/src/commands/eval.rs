@@ -295,7 +295,7 @@ mod tests {
     use clap::Parser;
     use harness_workflow::runtime::eval::model::{Confidence, UsageSnapshot};
     use harness_workflow::runtime::{
-        EvalEvidenceStatus, EvalQualityGateEvidence, EvalSubmissionEvidence,
+        EvalEvidenceStatus, EvalIsolationEvidence, EvalQualityGateEvidence, EvalSubmissionEvidence,
     };
 
     fn sample_eval_manifest() -> EvalBenchmarkManifest {
@@ -599,6 +599,18 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                 status: "succeeded".to_string(),
                 validation_passed: true,
                 validation_commands: vec!["cargo test".to_string()],
+            }),
+            isolation: Some(EvalIsolationEvidence {
+                required_tier: Some("container".to_string()),
+                selected_tier: Some("container".to_string()),
+                runtime_kind: Some("remote_host".to_string()),
+                runtime_profile: Some("eval-isolated-runtime-host".to_string()),
+                sandbox: Some("workspace-write".to_string()),
+                backend: Some("container_runtime_host".to_string()),
+                image: Some("harness-eval-runner:local".to_string()),
+                lifecycle: Some("ephemeral".to_string()),
+                cleanup_required: true,
+                cleanup_status: Some("cleaned".to_string()),
             }),
             missing_evidence,
         }

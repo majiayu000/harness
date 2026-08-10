@@ -27,6 +27,8 @@ pub struct EvalCaseEvidence {
     pub usage: Vec<UsageSnapshot>,
     pub submission: Option<EvalSubmissionEvidence>,
     pub quality_gate: Option<EvalQualityGateEvidence>,
+    #[serde(default)]
+    pub isolation: Option<EvalIsolationEvidence>,
     pub missing_evidence: Vec<String>,
 }
 
@@ -46,6 +48,20 @@ pub struct EvalQualityGateEvidence {
     pub status: String,
     pub validation_passed: bool,
     pub validation_commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalIsolationEvidence {
+    pub required_tier: Option<String>,
+    pub selected_tier: Option<String>,
+    pub runtime_kind: Option<String>,
+    pub runtime_profile: Option<String>,
+    pub sandbox: Option<String>,
+    pub backend: Option<String>,
+    pub image: Option<String>,
+    pub lifecycle: Option<String>,
+    pub cleanup_required: bool,
+    pub cleanup_status: Option<String>,
 }
 
 pub async fn collect_eval_case_evidence(
@@ -115,6 +131,11 @@ pub fn collect_eval_case_evidence_from_records(
     {
         missing_evidence.push("quality_gate_pass".to_string());
     }
+    let isolation = isolation_evidence(workflow, commands, runtime_jobs);
+    match isolation.as_ref() {
+        Some(isolation) => missing_evidence.extend(validate_isolation_evidence(isolation)),
+        None => missing_evidence.push("isolation_policy".to_string()),
+    }
 
     let runtime = workflow.map(|workflow| runtime_snapshot(workflow, runtime_jobs));
     if runtime.as_ref().is_none_or(|snapshot| {
@@ -146,6 +167,7 @@ pub fn collect_eval_case_evidence_from_records(
         usage,
         submission,
         quality_gate,
+        isolation,
         missing_evidence,
     }
 }
@@ -232,6 +254,116 @@ fn quality_gate_evidence(
         validation_passed,
         validation_commands,
     })
+}
+
+fn isolation_evidence(
+    workflow: Option<&WorkflowInstance>,
+    commands: &[WorkflowCommandRecord],
+    runtime_jobs: &[RuntimeJob],
+) -> Option<EvalIsolationEvidence> {
+    let required = required_eval_isolation(workflow, commands)?;
+    let implementation_job = implementation_runtime_job(commands, runtime_jobs);
+    Some(EvalIsolationEvidence {
+        required_tier: string_field(required, "tier"),
+        selected_tier: implementation_job
+            .and_then(|job| job.input.pointer("/isolation/tier"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        runtime_kind: implementation_job.map(|job| job.runtime_kind.as_str().to_string()),
+        runtime_profile: implementation_job.map(|job| job.runtime_profile.clone()),
+        sandbox: implementation_job
+            .and_then(|job| job.input.pointer("/runtime_profile/sandbox"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| string_field(required, "sandbox")),
+        backend: string_field(required, "backend"),
+        image: string_field(required, "image"),
+        lifecycle: string_field(required, "lifecycle"),
+        cleanup_required: required
+            .get("cleanup_required")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        cleanup_status: workflow
+            .and_then(|workflow| workflow.data.pointer("/eval/cleanup/status"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn required_eval_isolation<'a>(
+    workflow: Option<&'a WorkflowInstance>,
+    commands: &'a [WorkflowCommandRecord],
+) -> Option<&'a Value> {
+    commands
+        .iter()
+        .find_map(|command| command.command.command.pointer("/eval/isolation"))
+        .or_else(|| workflow.and_then(|workflow| workflow.data.pointer("/eval/isolation")))
+}
+
+fn implementation_runtime_job<'a>(
+    commands: &[WorkflowCommandRecord],
+    runtime_jobs: &'a [RuntimeJob],
+) -> Option<&'a RuntimeJob> {
+    let implementation_command_id = commands
+        .iter()
+        .find(|command| command.command.runtime_activity_key() == "implement_issue")
+        .map(|command| command.id.as_str());
+    implementation_command_id
+        .and_then(|command_id| runtime_jobs.iter().find(|job| job.command_id == command_id))
+        .or_else(|| {
+            runtime_jobs.iter().find(|job| {
+                job.input
+                    .get("activity")
+                    .and_then(Value::as_str)
+                    .is_some_and(|activity| activity == "implement_issue")
+                    || activity_result_from_job(job)
+                        .as_ref()
+                        .is_some_and(|result| result.activity == "implement_issue")
+            })
+        })
+}
+
+fn validate_isolation_evidence(isolation: &EvalIsolationEvidence) -> Vec<String> {
+    let mut missing = Vec::new();
+    if isolation.required_tier.as_deref() != Some("container") {
+        missing.push("isolation_required_tier".to_string());
+    }
+    if isolation.selected_tier.as_deref() != isolation.required_tier.as_deref() {
+        missing.push("isolation_selected_tier".to_string());
+    }
+    if isolation.runtime_kind.as_deref() != Some("remote_host") {
+        missing.push("runtime_host".to_string());
+    }
+    if isolation
+        .runtime_profile
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        missing.push("runtime_profile".to_string());
+    }
+    if isolation.sandbox.as_deref() != Some("workspace-write") {
+        missing.push("isolation_sandbox".to_string());
+    }
+    if isolation.backend.as_deref().is_none_or(str::is_empty) {
+        missing.push("isolation_backend".to_string());
+    }
+    if isolation.image.as_deref().is_none_or(str::is_empty) {
+        missing.push("isolation_image".to_string());
+    }
+    if isolation.lifecycle.as_deref() != Some("ephemeral") {
+        missing.push("isolation_lifecycle".to_string());
+    }
+    if isolation.cleanup_required && isolation.cleanup_status.is_none() {
+        missing.push("isolation_cleanup".to_string());
+    }
+    missing
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn runtime_snapshot(workflow: &WorkflowInstance, runtime_jobs: &[RuntimeJob]) -> RuntimeSnapshot {
@@ -460,6 +592,9 @@ mod tests {
             .missing_evidence
             .contains(&"quality_gate".to_string()));
         assert!(evidence.missing_evidence.contains(&"usage".to_string()));
+        assert!(evidence
+            .missing_evidence
+            .contains(&"isolation_policy".to_string()));
         assert_eq!(
             evidence.submission.as_ref().unwrap().runtime_job_ids,
             vec!["job-1".to_string()]
@@ -479,12 +614,24 @@ mod tests {
             "repo": "owner/repo",
             "issue_number": 42,
             "task_id": "eval-task-1",
-            "eval": {"eval_run_id": "run-1", "case_id": "owner/repo#42"}
+            "eval": {
+                "eval_run_id": "run-1",
+                "case_id": "owner/repo#42",
+                "cleanup": {"status": "cleaned"},
+                "isolation": eval_isolation_json()
+            }
         }));
         let implementation = command_record(
             "cmd-impl",
             "workflow-1",
-            WorkflowCommand::enqueue_activity("implement_issue", "impl-1"),
+            WorkflowCommand::new(
+                crate::runtime::WorkflowCommandType::EnqueueActivity,
+                "impl-1",
+                json!({
+                    "activity": "implement_issue",
+                    "eval": {"isolation": eval_isolation_json()}
+                }),
+            ),
             WorkflowCommandStatus::Completed,
         );
         let quality = command_record(
@@ -495,9 +642,21 @@ mod tests {
         );
         let mut implementation_job = RuntimeJob::pending(
             "cmd-impl",
-            RuntimeKind::CodexExec,
-            "codex",
-            json!({"activity": "implement_issue"}),
+            RuntimeKind::RemoteHost,
+            "eval-isolated-runtime-host",
+            json!({
+                "activity": "implement_issue",
+                "isolation": {
+                    "tier": "container",
+                    "trust_class": "non_collaborator",
+                    "reason": "eval command required container isolation tier from policy"
+                },
+                "runtime_profile": {
+                    "name": "eval-isolated-runtime-host",
+                    "kind": "remote_host",
+                    "sandbox": "workspace-write"
+                }
+            }),
         );
         implementation_job.id = "job-impl".to_string();
         implementation_job
@@ -557,6 +716,17 @@ mod tests {
 
         assert_eq!(evidence.status, EvalEvidenceStatus::Passed);
         assert!(evidence.missing_evidence.is_empty());
+        let isolation = evidence.isolation.as_ref().expect("isolation evidence");
+        assert_eq!(isolation.required_tier.as_deref(), Some("container"));
+        assert_eq!(isolation.selected_tier.as_deref(), Some("container"));
+        assert_eq!(isolation.runtime_kind.as_deref(), Some("remote_host"));
+        assert_eq!(isolation.backend.as_deref(), Some("container_runtime_host"));
+        assert_eq!(
+            isolation.image.as_deref(),
+            Some("harness-eval-runner:local")
+        );
+        assert_eq!(isolation.lifecycle.as_deref(), Some("ephemeral"));
+        assert_eq!(isolation.cleanup_status.as_deref(), Some("cleaned"));
         assert_eq!(
             evidence.quality_gate.as_ref().unwrap().validation_commands,
             vec!["cargo test -p harness-workflow eval_evidence".to_string()]
@@ -566,6 +736,79 @@ mod tests {
             evidence.runtime.as_ref().unwrap().terminal_state,
             Some("done".to_string())
         );
+    }
+
+    #[test]
+    fn eval_isolation_fails_without_cleanup_evidence() {
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "done",
+            WorkflowSubject::new("issue", "issue:42"),
+        )
+        .with_id("workflow-1")
+        .with_server_data(json!({
+            "repo": "owner/repo",
+            "issue_number": 42,
+            "task_id": "eval-task-1",
+            "eval": {
+                "eval_run_id": "run-1",
+                "case_id": "owner/repo#42",
+                "isolation": eval_isolation_json()
+            }
+        }));
+        let implementation = command_record(
+            "cmd-impl",
+            "workflow-1",
+            WorkflowCommand::new(
+                crate::runtime::WorkflowCommandType::EnqueueActivity,
+                "impl-1",
+                json!({
+                    "activity": "implement_issue",
+                    "eval": {"isolation": eval_isolation_json()}
+                }),
+            ),
+            WorkflowCommandStatus::Completed,
+        );
+        let mut implementation_job = RuntimeJob::pending(
+            "cmd-impl",
+            RuntimeKind::RemoteHost,
+            "eval-isolated-runtime-host",
+            json!({
+                "activity": "implement_issue",
+                "isolation": {"tier": "container"},
+                "runtime_profile": {
+                    "name": "eval-isolated-runtime-host",
+                    "kind": "remote_host",
+                    "sandbox": "workspace-write"
+                }
+            }),
+        );
+        implementation_job.id = "job-impl".to_string();
+        implementation_job
+            .complete(
+                &ActivityResult::succeeded("implement_issue", "opened PR").with_artifact(
+                    crate::runtime::ActivityArtifact::new(
+                        "pull_request",
+                        json!({"pr_number": 5, "pr_url": "https://github.com/owner/repo/pull/5"}),
+                    ),
+                ),
+            )
+            .expect("complete implementation job");
+
+        let evidence = collect_eval_case_evidence_from_records(
+            "run-1",
+            "owner/repo#42",
+            Some(&workflow),
+            &[implementation],
+            &[implementation_job],
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(evidence.status, EvalEvidenceStatus::Failed);
+        assert!(evidence
+            .missing_evidence
+            .contains(&"isolation_cleanup".to_string()));
     }
 
     #[test]
@@ -608,5 +851,18 @@ mod tests {
             attempt_generation: 1,
             superseded_by_command_id: None,
         }
+    }
+
+    fn eval_isolation_json() -> serde_json::Value {
+        json!({
+            "tier": "container",
+            "runtime_kind": "remote_host",
+            "runtime_profile": "eval-isolated-runtime-host",
+            "sandbox": "workspace-write",
+            "backend": "container_runtime_host",
+            "image": "harness-eval-runner:local",
+            "lifecycle": "ephemeral",
+            "cleanup_required": true
+        })
     }
 }

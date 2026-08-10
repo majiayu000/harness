@@ -1,4 +1,4 @@
-use super::manifest::EvalBenchmarkCase;
+use super::manifest::{EvalBenchmarkCase, EvalIsolationProfile};
 use super::run::*;
 use crate::runtime::{DataProvenance, WorkflowCommandStatus, WorkflowRuntimeStore};
 use harness_core::db::resolve_database_url;
@@ -13,6 +13,7 @@ fn benchmark_case(case_id: &str) -> EvalBenchmarkCase {
         base_commit: "abcdef1".to_string(),
         verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
         timeout_secs: 120,
+        isolation: EvalIsolationProfile::default(),
     }
 }
 
