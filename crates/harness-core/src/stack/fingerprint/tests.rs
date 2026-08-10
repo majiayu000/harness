@@ -647,7 +647,6 @@ fn closed_failure_vocabulary_and_canonical_ordering_are_enforced() {
     let cleanup = vec![
         RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout).unwrap(),
         RuntimeProbeFailure::new(RuntimeProbeFailureKind::TerminationFailed).unwrap(),
-        RuntimeProbeFailure::new(RuntimeProbeFailureKind::ReapFailed).unwrap(),
         RuntimeProbeFailure::new(RuntimeProbeFailureKind::OutputDrainFailed).unwrap(),
     ];
     let payload = runtime_payload_with_facts(
@@ -667,7 +666,25 @@ fn closed_failure_vocabulary_and_canonical_ordering_are_enforced() {
         .unwrap()
         .to_json_string()
         .unwrap();
-    assert_eq!(json.matches("\"phase\":\"lifecycle_cleanup\"").count(), 3);
+    assert_eq!(json.matches("\"phase\":\"lifecycle_cleanup\"").count(), 2);
+
+    assert!(runtime_payload_with_facts(
+        LocalExecutableRuntimeKind::CodexExec,
+        RuntimeCommandForm::UnixBare,
+        vec![runtime_attempt(
+            b"selected",
+            RuntimeResolutionAttemptOutcome::ExecStarted,
+            RuntimeExecSequence::Single,
+        )],
+        None,
+        None,
+        vec![
+            RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout).unwrap(),
+            RuntimeProbeFailure::new(RuntimeProbeFailureKind::ReapFailed).unwrap(),
+            RuntimeProbeFailure::new(RuntimeProbeFailureKind::OutputDrainFailed).unwrap(),
+        ],
+    )
+    .is_ok());
 
     let mut reversed = cleanup;
     reversed.reverse();

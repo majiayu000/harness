@@ -210,6 +210,14 @@ fn retry_after_etxtbsy(
             )?,
         ),
         super::target::TargetStart::ExecFailed(errno) => {
+            if let Some(fallback) = retry_eacces_fallback(
+                &attempts,
+                context.candidate,
+                errno,
+                context.command.command_form,
+            )? {
+                return Ok(fallback);
+            }
             let (outcome, failure) = terminal_exec_failure(errno)?;
             let mut attempts = attempts;
             attempts.push(super::completion::attempt(
@@ -298,6 +306,24 @@ fn classify_initial_exec_failure(
     }
 }
 
+fn retry_eacces_fallback(
+    attempts: &[RuntimeResolutionAttempt],
+    candidate: &super::command::ResolvedCandidate,
+    errno: libc::c_int,
+    form: RuntimeCommandForm,
+) -> Result<Option<InitialLaunch>, RuntimeFingerprintProduceError> {
+    if errno != libc::EACCES || form != RuntimeCommandForm::UnixBare {
+        return Ok(None);
+    }
+    let mut fallback_attempts = attempts.to_vec();
+    fallback_attempts.push(super::completion::attempt(
+        candidate,
+        RuntimeResolutionAttemptOutcome::ExecEacces,
+        RuntimeExecSequence::EtxtbsyThenCheckpointAfter150Ms,
+    )?);
+    Ok(Some(InitialLaunch::ContinueAfterEacces(fallback_attempts)))
+}
+
 fn terminal_exec_failure_kind(
     errno: libc::c_int,
 ) -> (RuntimeResolutionAttemptOutcome, RuntimeProbeFailureKind) {
@@ -322,6 +348,9 @@ fn terminal_exec_failure_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::stack::fingerprint::RuntimeExecutionContext;
+    use harness_core::stack::Sha256Digest;
+    use std::path::PathBuf;
 
     #[test]
     fn initial_and_retry_exec_errno_policies_are_closed() {
@@ -361,5 +390,48 @@ mod tests {
                 RuntimeProbeFailureKind::HandleExecutionUnavailable,
             )
         );
+    }
+
+    #[test]
+    fn retry_eacces_fallback_preserves_the_retry_sequence() {
+        let candidate = super::super::command::ResolvedCandidate {
+            reference: super::super::command::CandidateReference::Absolute(PathBuf::from(
+                "/runtime",
+            )),
+            candidate_digest: Sha256Digest::from_bytes(b"retry-eacces"),
+        };
+        let fallback =
+            retry_eacces_fallback(&[], &candidate, libc::EACCES, RuntimeCommandForm::UnixBare)
+                .unwrap()
+                .expect("bare-name retry EACCES must continue PATH resolution");
+        let InitialLaunch::ContinueAfterEacces(attempts) = fallback else {
+            panic!("retry EACCES must not complete the runtime envelope");
+        };
+        assert_eq!(
+            attempts,
+            vec![RuntimeResolutionAttempt::new(
+                candidate.candidate_digest.clone(),
+                RuntimeResolutionAttemptOutcome::ExecEacces,
+                RuntimeExecSequence::EtxtbsyThenCheckpointAfter150Ms,
+                Some(RuntimeExecutionContext::LinuxFdCloexecExecveatEmptyPathFd10),
+            )
+            .unwrap()]
+        );
+        assert!(retry_eacces_fallback(
+            &[],
+            &candidate,
+            libc::EACCES,
+            RuntimeCommandForm::UnixQualified,
+        )
+        .unwrap()
+        .is_none());
+        assert!(retry_eacces_fallback(
+            &[],
+            &candidate,
+            libc::ETXTBSY,
+            RuntimeCommandForm::UnixBare,
+        )
+        .unwrap()
+        .is_none());
     }
 }

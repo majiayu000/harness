@@ -153,12 +153,10 @@ impl ValidatedRepositoryBoundarySet {
         declared_repository_root: impl AsRef<Path>,
         linked_worktree_roots: impl IntoIterator<Item = impl AsRef<Path>>,
     ) -> Result<Self, RuntimeFingerprintProduceError> {
-        let declared = std::fs::canonicalize(declared_repository_root)
-            .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
+        let declared = canonical_repository_directory(declared_repository_root.as_ref())?;
         let mut roots = vec![declared];
         for root in linked_worktree_roots {
-            let canonical = std::fs::canonicalize(root)
-                .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
+            let canonical = canonical_repository_directory(root.as_ref())?;
             if !roots.contains(&canonical) {
                 roots.push(canonical);
             }
@@ -174,6 +172,15 @@ impl ValidatedRepositoryBoundarySet {
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
     }
+}
+
+fn canonical_repository_directory(root: &Path) -> Result<PathBuf, RuntimeFingerprintProduceError> {
+    let canonical = std::fs::canonicalize(root)
+        .map_err(|_| RuntimeFingerprintProduceError::InvalidLaunchContext)?;
+    if !std::fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+    }
+    Ok(canonical)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -152,6 +152,26 @@ fn readiness_failures_preserve_deadline_and_channel_semantics() {
 }
 
 #[test]
+fn repository_boundaries_require_directories_for_every_root() {
+    let repository = tempfile::tempdir().unwrap();
+    let file = repository.path().join("not-a-directory");
+    std::fs::write(&file, b"boundary").unwrap();
+    assert!(ValidatedRepositoryBoundarySet::from_existing_roots(
+        &file,
+        std::iter::empty::<&std::path::Path>(),
+    )
+    .is_err());
+    assert!(
+        ValidatedRepositoryBoundarySet::from_existing_roots(repository.path(), [&file],).is_err()
+    );
+    assert!(ValidatedRepositoryBoundarySet::from_existing_roots(
+        repository.path(),
+        [repository.path()],
+    )
+    .is_ok());
+}
+
+#[test]
 fn poll_wait_wakes_for_delayed_pipe_data_and_preserves_timeout() {
     let mut pipe = [-1; 2];
     assert_eq!(

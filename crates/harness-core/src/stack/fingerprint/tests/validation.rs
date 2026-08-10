@@ -317,6 +317,24 @@ fn lifecycle_cleanup_is_restricted_to_reachable_post_resume_states() {
         AgentStackFingerprintEnvelope::from_json_str(&serde_json::to_string(&path_json).unwrap()),
         Err(AgentStackFingerprintError::InvalidPayloadState)
     ));
+
+    assert!(runtime_payload_with_facts(
+        LocalExecutableRuntimeKind::CodexExec,
+        RuntimeCommandForm::UnixBare,
+        vec![runtime_attempt(
+            b"mutually-exclusive-cleanup",
+            RuntimeResolutionAttemptOutcome::ExecStarted,
+            RuntimeExecSequence::Single,
+        )],
+        None,
+        None,
+        vec![
+            RuntimeProbeFailure::new(RuntimeProbeFailureKind::Timeout).unwrap(),
+            RuntimeProbeFailure::new(RuntimeProbeFailureKind::TerminationFailed).unwrap(),
+            RuntimeProbeFailure::new(RuntimeProbeFailureKind::ReapFailed).unwrap(),
+        ],
+    )
+    .is_err());
 }
 
 #[test]

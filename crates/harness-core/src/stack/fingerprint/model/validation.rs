@@ -279,12 +279,20 @@ fn lifecycle_state_is_valid(
     payload: &RuntimeExecutableFingerprintPayload,
     primary: &RuntimeProbeFailure,
 ) -> bool {
-    let has_termination_or_reap = payload.failures.iter().any(|failure| {
-        matches!(
-            failure.kind,
-            RuntimeProbeFailureKind::TerminationFailed | RuntimeProbeFailureKind::ReapFailed
-        )
-    });
+    let termination_or_reap_count = payload
+        .failures
+        .iter()
+        .filter(|failure| {
+            matches!(
+                failure.kind,
+                RuntimeProbeFailureKind::TerminationFailed | RuntimeProbeFailureKind::ReapFailed
+            )
+        })
+        .count();
+    if termination_or_reap_count > 1 {
+        return false;
+    }
+    let has_termination_or_reap = termination_or_reap_count == 1;
     let has_output_drain = payload
         .failures
         .iter()
