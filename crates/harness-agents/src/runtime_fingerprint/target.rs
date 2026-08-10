@@ -290,14 +290,21 @@ fn supervise_initial_stop(
         _ => return verification_cleanup(child, pre_exec, stdout, stderr),
     }
     if unsafe {
-        libc::ptrace(
+        super::probe::ptrace(
             libc::PTRACE_SETOPTIONS,
             child.pid(),
-            0,
-            super::probe::PTRACE_GUARD_OPTIONS,
+            std::ptr::null_mut(),
+            super::probe::ptrace_word(super::probe::PTRACE_GUARD_OPTIONS as usize),
         )
     } != 0
-        || unsafe { libc::ptrace(libc::PTRACE_CONT, child.pid(), 0, 0) } != 0
+        || unsafe {
+            super::probe::ptrace(
+                libc::PTRACE_CONT,
+                child.pid(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } != 0
     {
         return verification_cleanup(child, pre_exec, stdout, stderr);
     }
@@ -417,13 +424,21 @@ pub(super) fn wait_event(
         if Instant::now() >= deadline {
             return Err(RuntimeFingerprintProduceError::ExecutionVerificationUnavailable);
         }
-        std::thread::yield_now();
+        super::probe::pause_for_status_check(deadline)
+            .map_err(|()| RuntimeFingerprintProduceError::ExecutionVerificationUnavailable)?;
     }
 }
 
 pub(super) fn is_exec_event(pid: libc::pid_t) -> bool {
     let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-    (unsafe { libc::ptrace(libc::PTRACE_GETSIGINFO, pid, 0, &mut info) }) == 0
+    (unsafe {
+        super::probe::ptrace(
+            libc::PTRACE_GETSIGINFO,
+            pid,
+            std::ptr::null_mut(),
+            std::ptr::from_mut(&mut info).cast(),
+        )
+    }) == 0
         && info.si_signo == libc::SIGTRAP
         && info.si_code == libc::SIGTRAP | (libc::PTRACE_EVENT_EXEC << 8)
 }
@@ -468,7 +483,15 @@ fn child_main(context: &TargetChildContext<'_>) -> ! {
             SETUP_WORKING_DIRECTORY as i32,
         );
     }
-    if unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) } != 0 {
+    if unsafe {
+        super::probe::ptrace(
+            libc::PTRACE_TRACEME,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
         child_write_frame(descriptors.pre_exec, CHILD_SETUP_FAILED, SETUP_TRACE as i32);
     }
     let pid = unsafe { libc::getpid() };

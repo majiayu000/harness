@@ -123,6 +123,25 @@ pub(super) const CHILD_GO: u8 = 5;
 pub(super) const PTRACE_GUARD_OPTIONS: libc::c_int =
     libc::PTRACE_O_TRACEEXEC | libc::PTRACE_O_TRACESYSGOOD | libc::PTRACE_O_EXITKILL;
 
+#[cfg(target_env = "gnu")]
+pub(super) type PtraceRequest = libc::c_uint;
+#[cfg(not(target_env = "gnu"))]
+pub(super) type PtraceRequest = libc::c_int;
+
+pub(super) unsafe fn ptrace(
+    request: PtraceRequest,
+    pid: libc::pid_t,
+    address: *mut libc::c_void,
+    data: *mut libc::c_void,
+) -> libc::c_long {
+    // SAFETY: every Linux ptrace call supplies the fixed four-argument ABI described by ptrace(2).
+    unsafe { libc::ptrace(request, pid, address, data) }
+}
+
+pub(super) fn ptrace_word(value: usize) -> *mut libc::c_void {
+    std::ptr::without_provenance_mut(value)
+}
+
 pub(super) fn registration_error(
     role: super::RuntimeOwnedChildRole,
     stage: super::RuntimeChildRegistrationStage,
@@ -249,6 +268,12 @@ pub(super) fn waitid_pidfd(
     nowait: bool,
     deadline: Instant,
 ) -> Result<(libc::pid_t, libc::c_int, libc::c_int), ()> {
+    let mut descriptor = [libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    poll_until_ready(&mut descriptor, deadline).map_err(|_| ())?;
     loop {
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
         let options = libc::WEXITED | libc::WNOHANG | if nowait { libc::WNOWAIT } else { 0 };
@@ -256,6 +281,9 @@ pub(super) fn waitid_pidfd(
         let result =
             unsafe { libc::waitid(libc::P_PIDFD, pidfd as libc::id_t, &mut info, options) };
         if result != 0 {
+            if last_errno() == libc::EINTR && Instant::now() < deadline {
+                continue;
+            }
             return Err(());
         }
         // SAFETY: waitid initialized the siginfo union for SIGCHLD when si_pid is nonzero.
@@ -263,11 +291,65 @@ pub(super) fn waitid_pidfd(
         if seen != 0 {
             return Ok((seen, info.si_code, unsafe { info.si_status() }));
         }
-        if Instant::now() >= deadline {
-            return Err(());
-        }
-        std::thread::yield_now();
+        return Err(());
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PollFailure {
+    Timeout,
+    System,
+}
+
+pub(super) fn poll_until_ready(
+    descriptors: &mut [libc::pollfd],
+    deadline: Instant,
+) -> Result<(), PollFailure> {
+    if descriptors.is_empty() {
+        return Err(PollFailure::System);
+    }
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(PollFailure::Timeout);
+        };
+        let rounded_millis = remaining
+            .as_millis()
+            .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+        let timeout = rounded_millis.min(libc::c_int::MAX as u128) as libc::c_int;
+        for descriptor in descriptors.iter_mut() {
+            descriptor.revents = 0;
+        }
+        // SAFETY: descriptors is a live writable pollfd slice for the duration of this call.
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                timeout,
+            )
+        };
+        if result > 0 {
+            return if descriptors
+                .iter()
+                .any(|descriptor| descriptor.revents & libc::POLLNVAL != 0)
+            {
+                Err(PollFailure::System)
+            } else {
+                Ok(())
+            };
+        }
+        if result == 0 {
+            return Err(PollFailure::Timeout);
+        }
+        if last_errno() != libc::EINTR {
+            return Err(PollFailure::System);
+        }
+    }
+}
+
+pub(super) fn pause_for_status_check(deadline: Instant) -> Result<(), ()> {
+    let remaining = deadline.checked_duration_since(Instant::now()).ok_or(())?;
+    std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
+    Ok(())
 }
 
 pub(super) fn child_reset_signal_dispositions() -> bool {

@@ -20,11 +20,11 @@ pub(super) enum SyscallStop {
 pub(super) fn read_syscall_stop(pid: libc::pid_t) -> Option<SyscallStop> {
     let mut info = [0_u8; 128];
     let size = unsafe {
-        libc::ptrace(
+        super::probe::ptrace(
             libc::PTRACE_GET_SYSCALL_INFO,
             pid,
-            info.len(),
-            info.as_mut_ptr(),
+            super::probe::ptrace_word(info.len()),
+            info.as_mut_ptr().cast(),
         )
     };
     if size < 24 || read_u32(&info, 4) != expected_audit_arch() {

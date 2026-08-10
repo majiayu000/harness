@@ -267,14 +267,21 @@ fn validate_ptrace(
 ) -> Result<(), ()> {
     // SAFETY: pid is the registered gated child and these requests do not deliver signals.
     if unsafe {
-        libc::ptrace(
+        super::probe::ptrace(
             libc::PTRACE_SEIZE,
             pid,
-            0,
-            super::probe::PTRACE_GUARD_OPTIONS,
+            std::ptr::null_mut(),
+            super::probe::ptrace_word(super::probe::PTRACE_GUARD_OPTIONS as usize),
         )
     } != 0
-        || unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) } != 0
+        || unsafe {
+            super::probe::ptrace(
+                libc::PTRACE_INTERRUPT,
+                pid,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } != 0
         || !wait_for_stop(pidfd, pid, deadline)
         || super::probe::write_byte(gate, super::probe::CHILD_GO).is_err()
     {
@@ -322,7 +329,15 @@ fn validate_exec_stop(
     deadline: Instant,
     registry: &super::registry::OwnerRegistry,
 ) -> Result<(), ()> {
-    if unsafe { libc::ptrace(libc::PTRACE_CONT, pid, 0, 0) } != 0 {
+    if unsafe {
+        super::probe::ptrace(
+            libc::PTRACE_CONT,
+            pid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
         return Err(());
     }
     let event = super::target::wait_event(pidfd, pid, deadline, None).map_err(|_| ())?;
@@ -337,7 +352,14 @@ fn validate_exec_stop(
         return Err(());
     }
     // SAFETY: the child remains stopped at its verified exec event and may now run the fixed image.
-    (unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) } == 0)
+    (unsafe {
+        super::probe::ptrace(
+            libc::PTRACE_DETACH,
+            pid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0)
         .then_some(())
         .ok_or(())
 }
@@ -348,7 +370,14 @@ fn resume_to_syscall_stop(
     deadline: Instant,
 ) -> Result<super::syscall_guard::SyscallStop, ()> {
     // SAFETY: PTRACE_SYSCALL resumes only the registered traced child.
-    if unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) } != 0
+    if unsafe {
+        super::probe::ptrace(
+            libc::PTRACE_SYSCALL,
+            pid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } != 0
         || !wait_for_stop(pidfd, pid, deadline)
     {
         return Err(());
@@ -380,12 +409,27 @@ fn is_expected_mutation(number: u64, arguments: [u64; 6]) -> bool {
 fn suppress_syscall(pid: libc::pid_t) -> Result<(), ()> {
     let mut registers = unsafe { std::mem::zeroed::<libc::user_regs_struct>() };
     // SAFETY: the exact traced child is stopped at syscall entry and registers is writable.
-    if unsafe { libc::ptrace(libc::PTRACE_GETREGS, pid, 0, &mut registers) } != 0 {
+    if unsafe {
+        super::probe::ptrace(
+            libc::PTRACE_GETREGS,
+            pid,
+            std::ptr::null_mut(),
+            std::ptr::from_mut(&mut registers).cast(),
+        )
+    } != 0
+    {
         return Err(());
     }
     registers.orig_rax = u64::MAX;
     // SAFETY: only the syscall-number register is changed before the entry is resumed.
-    (unsafe { libc::ptrace(libc::PTRACE_SETREGS, pid, 0, &registers) } == 0)
+    (unsafe {
+        super::probe::ptrace(
+            libc::PTRACE_SETREGS,
+            pid,
+            std::ptr::null_mut(),
+            std::ptr::from_ref(&registers).cast_mut().cast(),
+        )
+    } == 0)
         .then_some(())
         .ok_or(())
 }
@@ -401,11 +445,11 @@ fn suppress_syscall(pid: libc::pid_t) -> Result<(), ()> {
     };
     // SAFETY: NT_PRSTATUS reads the complete stopped task register set.
     if unsafe {
-        libc::ptrace(
+        super::probe::ptrace(
             libc::PTRACE_GETREGSET,
             pid,
-            NT_PRSTATUS as *mut libc::c_void,
-            &mut get_register_vector,
+            super::probe::ptrace_word(NT_PRSTATUS),
+            std::ptr::from_mut(&mut get_register_vector).cast(),
         )
     } != 0
     {
@@ -418,11 +462,11 @@ fn suppress_syscall(pid: libc::pid_t) -> Result<(), ()> {
     };
     // SAFETY: arm64 requires both NO_SYSCALL and an explicit x0 result when skipping a syscall.
     if unsafe {
-        libc::ptrace(
+        super::probe::ptrace(
             libc::PTRACE_SETREGSET,
             pid,
-            NT_PRSTATUS as *mut libc::c_void,
-            &mut set_register_vector,
+            super::probe::ptrace_word(NT_PRSTATUS),
+            std::ptr::from_mut(&mut set_register_vector).cast(),
         )
     } != 0
     {
@@ -435,11 +479,11 @@ fn suppress_syscall(pid: libc::pid_t) -> Result<(), ()> {
     };
     // SAFETY: NT_ARM_SYSTEM_CALL writes the stopped task's dedicated syscall-number field.
     (unsafe {
-        libc::ptrace(
+        super::probe::ptrace(
             libc::PTRACE_SETREGSET,
             pid,
-            NT_ARM_SYSTEM_CALL as *mut libc::c_void,
-            &mut vector,
+            super::probe::ptrace_word(NT_ARM_SYSTEM_CALL),
+            std::ptr::from_mut(&mut vector).cast(),
         )
     } == 0)
         .then_some(())
@@ -469,7 +513,9 @@ fn wait_for_stop(pidfd: libc::c_int, pid: libc::pid_t, deadline: Instant) -> boo
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::yield_now();
+        if super::probe::pause_for_status_check(deadline).is_err() {
+            return false;
+        }
     }
 }
 
@@ -530,25 +576,35 @@ fn bootstrap_pid_fallback(
             },
         );
     }
-    let mut status = 0;
+    let mut descriptor = [libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    if super::probe::poll_until_ready(&mut descriptor, deadline).is_err() {
+        return Err(
+            RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
+                role,
+                operation: super::RuntimeChildCleanupOperation::Reap,
+            },
+        );
+    }
     loop {
+        let mut status = 0;
         // SAFETY: pid is the capability direct child and pidfd remains held until return.
         let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if result == pid {
             return Ok(());
         }
-        if result < 0 && super::probe::last_errno() == libc::EINTR {
+        if result < 0 && super::probe::last_errno() == libc::EINTR && Instant::now() < deadline {
             continue;
         }
-        if result < 0 || Instant::now() >= deadline {
-            return Err(
-                RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
-                    role,
-                    operation: super::RuntimeChildCleanupOperation::Reap,
-                },
-            );
-        }
-        std::thread::yield_now();
+        return Err(
+            RuntimeFingerprintProduceError::ChildRegistrationCleanupIncomplete {
+                role,
+                operation: super::RuntimeChildCleanupOperation::Reap,
+            },
+        );
     }
 }
 

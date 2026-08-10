@@ -101,31 +101,30 @@ impl OutputCapture {
         }
     }
 
-    fn drain_available(&mut self) -> Result<(), CaptureFailure> {
+    fn drain_available(&mut self, deadline: Instant) -> Result<(), CaptureFailure> {
         drain_stream(
             &mut self.stdout_fd,
             &mut self.stdout,
             self.stderr.len(),
             self.limit,
+            deadline,
         )?;
         drain_stream(
             &mut self.stderr_fd,
             &mut self.stderr,
             self.stdout.len(),
             self.limit,
+            deadline,
         )
     }
 
     fn complete(&mut self, deadline: Instant) -> Result<(Vec<u8>, Vec<u8>), CaptureFailure> {
         while self.stdout_fd >= 0 || self.stderr_fd >= 0 {
-            self.drain_available()?;
+            self.drain_available(deadline)?;
             if self.stdout_fd < 0 && self.stderr_fd < 0 {
                 break;
             }
-            if Instant::now() >= deadline {
-                return Err(CaptureFailure::Timeout);
-            }
-            std::thread::yield_now();
+            self.wait_for_activity(deadline)?;
         }
         Ok((
             std::mem::take(&mut self.stdout),
@@ -135,17 +134,35 @@ impl OutputCapture {
 
     fn drain_to_eof(&mut self, deadline: Instant) -> Result<(), CaptureFailure> {
         while self.stdout_fd >= 0 || self.stderr_fd >= 0 {
-            drain_discard_stream(&mut self.stdout_fd)?;
-            drain_discard_stream(&mut self.stderr_fd)?;
+            drain_discard_stream(&mut self.stdout_fd, deadline)?;
+            drain_discard_stream(&mut self.stderr_fd, deadline)?;
             if self.stdout_fd < 0 && self.stderr_fd < 0 {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
-                return Err(CaptureFailure::Timeout);
-            }
-            std::thread::yield_now();
+            self.wait_for_activity(deadline)?;
         }
         Ok(())
+    }
+
+    fn wait_for_activity(&self, deadline: Instant) -> Result<(), CaptureFailure> {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self.stdout_fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.stderr_fd,
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+        ];
+        super::probe::poll_until_ready(&mut descriptors, deadline).map_err(
+            |failure| match failure {
+                super::probe::PollFailure::Timeout => CaptureFailure::Timeout,
+                super::probe::PollFailure::System => CaptureFailure::Read,
+            },
+        )
     }
 
     fn close(&mut self) {
@@ -193,7 +210,7 @@ pub(super) fn run(
         if super::probe::ensure_owner_running(stop_requested).is_err() {
             return verification_failure(child, capture);
         }
-        if let Err(failure) = capture.drain_available() {
+        if let Err(failure) = capture.drain_available(deadline) {
             return semantic_cleanup(child, capture, capture_failure(failure, max_output_bytes)?);
         }
         if Instant::now() >= deadline {
@@ -284,12 +301,26 @@ pub(super) fn run(
 }
 
 fn resume_syscall(pid: libc::pid_t, signal: libc::c_int) -> bool {
-    (unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, signal) }) == 0
+    (unsafe {
+        super::probe::ptrace(
+            libc::PTRACE_SYSCALL,
+            pid,
+            std::ptr::null_mut(),
+            super::probe::ptrace_word(signal as usize),
+        )
+    }) == 0
 }
 
 fn valid_signal_delivery_stop(pid: libc::pid_t, signal: libc::c_int) -> bool {
     let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-    (unsafe { libc::ptrace(libc::PTRACE_GETSIGINFO, pid, 0, &mut info) }) == 0
+    (unsafe {
+        super::probe::ptrace(
+            libc::PTRACE_GETSIGINFO,
+            pid,
+            std::ptr::null_mut(),
+            std::ptr::from_mut(&mut info).cast(),
+        )
+    }) == 0
         && info.si_signo == signal
         && signal_code_is_delivery(info.si_code)
 }
@@ -303,6 +334,7 @@ fn drain_stream(
     destination: &mut Vec<u8>,
     other_len: usize,
     limit: usize,
+    deadline: Instant,
 ) -> Result<(), CaptureFailure> {
     if *fd < 0 {
         return Ok(());
@@ -328,8 +360,11 @@ fn drain_stream(
             return Ok(());
         }
         let errno = super::probe::last_errno();
-        if errno == libc::EINTR {
+        if errno == libc::EINTR && Instant::now() < deadline {
             continue;
+        }
+        if errno == libc::EINTR {
+            return Err(CaptureFailure::Timeout);
         }
         return if errno == libc::EAGAIN {
             Ok(())
@@ -339,7 +374,7 @@ fn drain_stream(
     }
 }
 
-fn drain_discard_stream(fd: &mut libc::c_int) -> Result<(), CaptureFailure> {
+fn drain_discard_stream(fd: &mut libc::c_int, deadline: Instant) -> Result<(), CaptureFailure> {
     if *fd < 0 {
         return Ok(());
     }
@@ -355,7 +390,8 @@ fn drain_discard_stream(fd: &mut libc::c_int) -> Result<(), CaptureFailure> {
             return Ok(());
         }
         match super::probe::last_errno() {
-            libc::EINTR => continue,
+            libc::EINTR if Instant::now() < deadline => continue,
+            libc::EINTR => return Err(CaptureFailure::Timeout),
             libc::EAGAIN => return Ok(()),
             _ => return Err(CaptureFailure::Read),
         }

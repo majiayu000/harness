@@ -244,7 +244,7 @@ impl OwnerRegistry {
             }
             if result < 0 {
                 let errno = last_errno();
-                if errno == libc::EINTR {
+                if errno == libc::EINTR && Instant::now() < deadline {
                     continue;
                 }
                 if errno == libc::ECHILD {
@@ -261,7 +261,9 @@ impl OwnerRegistry {
                     RuntimeChildCleanupOperation::Reap,
                 ));
             }
-            std::thread::yield_now();
+            super::probe::pause_for_status_check(deadline).map_err(|()| {
+                pre_registration_cleanup_error(role, RuntimeChildCleanupOperation::Reap)
+            })?;
         }
     }
 
@@ -528,6 +530,12 @@ fn pidfd_send_kill(pidfd: libc::c_int) -> Result<(), ()> {
 }
 
 fn waitid_pidfd(pidfd: libc::c_int, deadline: Instant) -> Result<libc::pid_t, ()> {
+    let mut descriptor = [libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    super::probe::poll_until_ready(&mut descriptor, deadline).map_err(|_| ())?;
     loop {
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
         let result = unsafe {
@@ -539,7 +547,7 @@ fn waitid_pidfd(pidfd: libc::c_int, deadline: Instant) -> Result<libc::pid_t, ()
             )
         };
         if result != 0 {
-            if last_errno() == libc::EINTR {
+            if last_errno() == libc::EINTR && Instant::now() < deadline {
                 continue;
             }
             return Err(());
@@ -548,10 +556,7 @@ fn waitid_pidfd(pidfd: libc::c_int, deadline: Instant) -> Result<libc::pid_t, ()
         if seen != 0 {
             return Ok(seen);
         }
-        if Instant::now() >= deadline {
-            return Err(());
-        }
-        std::thread::yield_now();
+        return Err(());
     }
 }
 

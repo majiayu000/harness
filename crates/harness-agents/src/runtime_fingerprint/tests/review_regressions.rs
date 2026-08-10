@@ -151,6 +151,45 @@ fn readiness_failures_preserve_deadline_and_channel_semantics() {
     ));
 }
 
+#[test]
+fn poll_wait_wakes_for_delayed_pipe_data_and_preserves_timeout() {
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    let writer = pipe[1];
+    let delayed_write = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(unsafe { libc::write(writer, c"x".as_ptr().cast(), 1) }, 1);
+        probe::close_fd(writer);
+    });
+    let mut descriptor = [libc::pollfd {
+        fd: pipe[0],
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    }];
+    assert_eq!(
+        probe::poll_until_ready(
+            &mut descriptor,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ),
+        Ok(())
+    );
+    assert!(delayed_write.join().is_ok());
+    probe::close_fd(pipe[0]);
+
+    let mut timeout = [libc::pollfd {
+        fd: -1,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    assert_eq!(
+        probe::poll_until_ready(&mut timeout, std::time::Instant::now()),
+        Err(probe::PollFailure::Timeout)
+    );
+}
+
 #[tokio::test]
 async fn repository_inspection_retains_the_exact_nonexecuted_identity() {
     let repository = tempfile::tempdir().unwrap();
