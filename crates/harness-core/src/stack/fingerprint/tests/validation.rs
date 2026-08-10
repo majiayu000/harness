@@ -56,6 +56,28 @@ fn successful_payload(
     )
 }
 
+fn repository_payload(
+    attempts: Vec<RuntimeResolutionAttempt>,
+    executable: Option<RuntimeExecutableIdentity>,
+    version: Option<RuntimeVersionFacts>,
+    failures: Vec<RuntimeProbeFailure>,
+) -> Result<RuntimeExecutableFingerprintPayload, AgentStackFingerprintError> {
+    let source = AgentStackSource::new(
+        AgentStackSourceScope::Repository,
+        "config/runtime-profile.toml",
+    )
+    .unwrap();
+    runtime_payload_from_configured_source(
+        ConfiguredRuntimeSource::from_exact_source_bytes(source, b"repository runtime").unwrap(),
+        LocalExecutableRuntimeKind::CodexExec,
+        RuntimeCommandForm::UnixBare,
+        attempts,
+        executable,
+        version,
+        failures,
+    )
+}
+
 fn assert_parser_rejects_identity(
     payload: RuntimeExecutableFingerprintPayload,
     identity: Option<RuntimeExecutableIdentity>,
@@ -247,6 +269,63 @@ fn version_product_line_respects_output_capture_ceiling() {
             }
         }
     }
+}
+
+#[test]
+fn repository_source_stops_at_the_identity_only_inspection_state() {
+    assert!(repository_payload(
+        vec![runtime_attempt(
+            b"repository-runtime",
+            RuntimeResolutionAttemptOutcome::InspectionTarget,
+            RuntimeExecSequence::None,
+        )],
+        Some(runtime_identity(false, false)),
+        None,
+        vec![RuntimeProbeFailure::with_detail(
+            RuntimeProbeFailureKind::ProbeNotAuthorized,
+            RuntimeProbeFailureDetail::ConfigurationSourceRepository,
+        )
+        .unwrap()],
+    )
+    .is_ok());
+    assert!(repository_payload(
+        vec![runtime_attempt(
+            b"missing",
+            RuntimeResolutionAttemptOutcome::Absent,
+            RuntimeExecSequence::None,
+        )],
+        None,
+        None,
+        vec![RuntimeProbeFailure::new(RuntimeProbeFailureKind::PathNotFound).unwrap()],
+    )
+    .is_ok());
+
+    assert!(repository_payload(
+        vec![runtime_attempt(
+            b"executed",
+            RuntimeResolutionAttemptOutcome::ExecStarted,
+            RuntimeExecSequence::Single,
+        )],
+        Some(runtime_identity(true, true)),
+        Some(runtime_version()),
+        Vec::new(),
+    )
+    .is_err());
+    assert!(repository_payload(
+        vec![runtime_attempt(
+            b"executed",
+            RuntimeResolutionAttemptOutcome::ExecStarted,
+            RuntimeExecSequence::Single,
+        )],
+        Some(runtime_identity(true, true)),
+        None,
+        vec![RuntimeProbeFailure::with_detail(
+            RuntimeProbeFailureKind::NonzeroExit,
+            RuntimeProbeFailureDetail::ExitCode(1),
+        )
+        .unwrap()],
+    )
+    .is_err());
 }
 
 #[test]

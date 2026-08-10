@@ -60,7 +60,51 @@ pub(super) fn payload_is_valid(payload: &RuntimeExecutableFingerprintPayload) ->
             .executable
             .as_ref()
             .is_none_or(executable_identity_is_valid)
+        && repository_source_state_is_valid(payload)
         && observation_state_is_valid(payload)
+}
+
+fn repository_source_state_is_valid(payload: &RuntimeExecutableFingerprintPayload) -> bool {
+    if payload.role_binding.base_source().scope() != crate::stack::AgentStackSourceScope::Repository
+    {
+        return true;
+    }
+    if payload.version.is_some() || payload.failures.len() != 1 {
+        return false;
+    }
+    if !payload.resolution_attempts.iter().all(|attempt| {
+        attempt.exec_sequence == RuntimeExecSequence::None
+            && matches!(
+                attempt.outcome,
+                RuntimeResolutionAttemptOutcome::Absent
+                    | RuntimeResolutionAttemptOutcome::NotRegular
+                    | RuntimeResolutionAttemptOutcome::NotExecutable
+                    | RuntimeResolutionAttemptOutcome::InspectionFailed
+                    | RuntimeResolutionAttemptOutcome::InspectionTarget
+                    | RuntimeResolutionAttemptOutcome::InterpreterAuthorizationUnavailable
+            )
+    }) {
+        return false;
+    }
+    matches!(
+        (&payload.failures[0].kind, &payload.failures[0].detail),
+        (
+            RuntimeProbeFailureKind::PathNotFound
+                | RuntimeProbeFailureKind::PathUnusable
+                | RuntimeProbeFailureKind::CandidateLimitExceeded
+                | RuntimeProbeFailureKind::OpenFailed
+                | RuntimeProbeFailureKind::MetadataUnavailable
+                | RuntimeProbeFailureKind::ExecutableTooLarge
+                | RuntimeProbeFailureKind::ReadFailed
+                | RuntimeProbeFailureKind::NotRegularFile
+                | RuntimeProbeFailureKind::NotExecutable
+                | RuntimeProbeFailureKind::InterpreterAuthorizationUnavailable,
+            None,
+        ) | (
+            RuntimeProbeFailureKind::ProbeNotAuthorized,
+            Some(RuntimeProbeFailureDetail::ConfigurationSourceRepository),
+        )
+    )
 }
 
 fn executable_identity_is_valid(identity: &RuntimeExecutableIdentity) -> bool {
