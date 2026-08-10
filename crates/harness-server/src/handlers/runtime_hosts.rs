@@ -358,7 +358,7 @@ pub async fn claim_runtime_job_for_runtime_host(
     let resource_limits = match eval_resource_limit_enforcement_for_job(&job) {
         Ok(Some(resource_limits)) => {
             if !host_supports_eval_resource_limits {
-                return defer_runtime_host_resource_limit_claim(
+                let (status, response) = defer_runtime_host_resource_limit_claim(
                     store.as_ref(),
                     &host_id,
                     lease_expires_at,
@@ -366,6 +366,7 @@ pub async fn claim_runtime_job_for_runtime_host(
                     "runtime host lacks eval_resource_limits capability",
                 )
                 .await;
+                return (status, Json(response));
             }
             Some(resource_limits)
         }
@@ -442,7 +443,7 @@ async fn defer_runtime_host_resource_limit_claim(
     lease_expires_at: DateTime<Utc>,
     job: &RuntimeJob,
     reason: &str,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> (StatusCode, serde_json::Value) {
     let not_before =
         Utc::now() + chrono::TimeDelta::seconds(RESOURCE_LIMIT_CAPABILITY_RETRY_DELAY_SECS);
     match store
@@ -473,7 +474,7 @@ async fn defer_runtime_host_resource_limit_claim(
             }
             (
                 StatusCode::OK,
-                Json(json!({
+                json!({
                     "claimed": false,
                     "deferred": true,
                     "runtime_job_id": job.id.as_str(),
@@ -481,7 +482,7 @@ async fn defer_runtime_host_resource_limit_claim(
                     "not_before": not_before,
                     "reason": reason,
                     "required_capability": EVAL_RESOURCE_LIMITS_CAPABILITY,
-                })),
+                }),
             )
         }
         Ok(None) => {
@@ -490,7 +491,7 @@ async fn defer_runtime_host_resource_limit_claim(
                 host_id = %host_id,
                 "runtime host resource-limit claim defer ignored because the host no longer owns the lease"
             );
-            (StatusCode::OK, Json(json!({ "claimed": false })))
+            (StatusCode::OK, json!({ "claimed": false }))
         }
         Err(error) => {
             tracing::error!(
@@ -501,7 +502,7 @@ async fn defer_runtime_host_resource_limit_claim(
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to defer runtime job: {error}") })),
+                json!({ "error": format!("failed to defer runtime job: {error}") }),
             )
         }
     }
@@ -642,8 +643,8 @@ pub async fn complete_runtime_job_for_runtime_host(
     };
     let result =
         crate::workflow_runtime_worker::strip_caller_transcript_unavailable_signal(req.result);
-    if let Err(response) = validate_eval_resource_limit_report(&job, &result) {
-        return response;
+    if let Err((status, response)) = validate_eval_resource_limit_report(&job, &result) {
+        return (status, Json(response));
     }
     let (result, transcript) = match prepare_runtime_transcript(&job, result) {
         Ok(prepared) => prepared,
@@ -846,11 +847,11 @@ fn runtime_job_activity(job: &RuntimeJob) -> String {
 fn validate_eval_resource_limit_report(
     job: &RuntimeJob,
     result: &ActivityResult,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(), (StatusCode, serde_json::Value)> {
     let Some(expected_limits) = eval_resource_limit_enforcement_for_job(job).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("invalid eval resource limits: {error}") })),
+            json!({ "error": format!("invalid eval resource limits: {error}") }),
         )
     })?
     else {
@@ -865,39 +866,39 @@ fn validate_eval_resource_limit_report(
     else {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            json!({
                 "error": "eval runtime job completion requires resource_limit_report artifact"
-            })),
+            }),
         ));
     };
     let report: ResourceLimitReport = serde_json::from_value(report_value).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("invalid resource_limit_report artifact: {error}") })),
+            json!({ "error": format!("invalid resource_limit_report artifact: {error}") }),
         )
     })?;
     if report.limits.effective != expected_limits.effective {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            json!({
                 "error": "resource_limit_report limits do not match claimed eval resource limits"
-            })),
+            }),
         ));
     }
     if !resource_usage_has_evidence(&report.usage) {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            json!({
                 "error": "resource_limit_report requires usage evidence"
-            })),
+            }),
         ));
     }
     if report.reason.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({
+            json!({
                 "error": "resource_limit_report requires a non-empty reason"
-            })),
+            }),
         ));
     }
     Ok(())
@@ -1010,7 +1011,7 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(
-            err.1 .0["error"],
+            err.1["error"],
             "eval runtime job completion requires resource_limit_report artifact"
         );
     }
@@ -1093,7 +1094,7 @@ mod tests {
             .expect_err("empty usage should fail closed");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(
-            err.1 .0["error"],
+            err.1["error"],
             "resource_limit_report requires usage evidence"
         );
 
@@ -1115,7 +1116,7 @@ mod tests {
             .expect_err("empty reason should fail closed");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(
-            err.1 .0["error"],
+            err.1["error"],
             "resource_limit_report requires a non-empty reason"
         );
     }

@@ -4,10 +4,10 @@ use super::{
 };
 use crate::runtime::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeCommandDispatcher,
-    RuntimeJobStatus, RuntimeProfile, SubmissionMode, ValidationContext, WorkflowCommand,
-    WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition,
-    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID,
+    RuntimeJobStatus, RuntimeKind, RuntimeProfile, SubmissionMode, ValidationContext,
+    WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision,
+    WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
+    WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -221,6 +221,7 @@ pub async fn dispatch_eval_case_workflow(
     runtime_profile: RuntimeProfile,
     input: EvalCaseWorkflowInput<'_>,
 ) -> anyhow::Result<EvalCaseDispatchOutcome> {
+    ensure_eval_runtime_profile_supports_resource_limits(&runtime_profile, input)?;
     let enqueue = enqueue_eval_case_workflow(store, input).await?;
     let outcomes = RuntimeCommandDispatcher::new(store, runtime_profile)
         .dispatch_pending()
@@ -239,6 +240,23 @@ pub async fn dispatch_eval_case_workflow(
         enqueue,
         dispatched_jobs,
     })
+}
+
+fn ensure_eval_runtime_profile_supports_resource_limits(
+    runtime_profile: &RuntimeProfile,
+    input: EvalCaseWorkflowInput<'_>,
+) -> anyhow::Result<()> {
+    if runtime_profile.kind == RuntimeKind::RemoteHost
+        || input.case.resource_limits.effective.is_empty()
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "resource-limited eval case {} requires a remote_host runtime profile; profile `{}` is `{}`",
+        input.case.case_id,
+        runtime_profile.name,
+        runtime_profile.kind.as_str()
+    );
 }
 
 pub async fn cleanup_cancelled_eval_run(
@@ -761,7 +779,7 @@ mod tests {
 
         let outcome = dispatch_eval_case_workflow(
             &store,
-            RuntimeProfile::new("codex", RuntimeKind::CodexExec),
+            RuntimeProfile::new("remote-host-default", RuntimeKind::RemoteHost),
             EvalCaseWorkflowInput {
                 eval_run_id: "run-1",
                 case: &case,
@@ -791,6 +809,37 @@ mod tests {
             jobs[0].input["command"]["pull_request_mode"],
             EVAL_PR_DRAFT_MODE
         );
+        Ok(())
+    }
+
+    #[test]
+    fn eval_run_rejects_local_runtime_profile_for_resource_limited_cases() -> anyhow::Result<()> {
+        let case = EvalBenchmarkCase {
+            case_id: "owner/repo#42".to_string(),
+            repo: "owner/repo".to_string(),
+            issue: 42,
+            base_commit: "abcdef1".to_string(),
+            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
+            timeout_secs: 120,
+            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
+                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
+        };
+
+        let err = ensure_eval_runtime_profile_supports_resource_limits(
+            &RuntimeProfile::new("codex", RuntimeKind::CodexExec),
+            EvalCaseWorkflowInput {
+                eval_run_id: "run-1",
+                case: &case,
+                project_id: "/repo",
+                task_id: "eval-task-1",
+                additional_prompt: None,
+            },
+        )
+        .expect_err("resource-limited evals should not dispatch to local profiles");
+
+        assert!(err
+            .to_string()
+            .contains("requires a remote_host runtime profile"));
         Ok(())
     }
 }

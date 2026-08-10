@@ -279,7 +279,16 @@ pub fn validate_resource_limit_backend(
     limits: &ResourceLimits,
     backend: ResourceLimitBackend,
 ) -> Result<(), ResourceLimitError> {
-    if backend == ResourceLimitBackend::UnixProcess || limits.is_empty() {
+    if limits.is_empty() {
+        return Ok(());
+    }
+    if backend == ResourceLimitBackend::UnixProcess {
+        if limits.disk_bytes.is_some() {
+            return Err(ResourceLimitError::UnsupportedBackend {
+                backend: "unix_process",
+                limit: ResourceLimitKind::Disk,
+            });
+        }
         return Ok(());
     }
     let limit = limits
@@ -332,7 +341,7 @@ pub fn wrap_unix_command_with_resource_limits(
     wrapped_args.extend(args.iter().cloned());
 
     Ok(WrappedCommand {
-        program: PathBuf::from("/bin/sh"),
+        program: unix_resource_limit_shell(limits),
         args: wrapped_args,
         engine: super::SandboxEngine::None,
     })
@@ -477,20 +486,25 @@ fn unix_resource_limit_script(limits: &ResourceLimits, use_timeout: bool) -> Str
     if let Some(pids) = limits.pids {
         lines.push(format!("ulimit -u {pids}"));
     }
-    if let Some(disk_bytes) = limits.disk_bytes {
-        lines.push(format!("ulimit -f {}", ceil_div(disk_bytes, 512)));
-    }
     if use_timeout {
         let wall_time_secs = limits.wall_time_secs.expect("timeout requested");
         lines.push("timeout_bin=$1".to_string());
         lines.push("shift".to_string());
         lines.push(format!(
-            "exec \"$timeout_bin\" --kill-after=5s {wall_time_secs}s \"$@\""
+            "exec \"$timeout_bin\" --kill-after=5s {wall_time_secs}s /bin/sh -c '\"$@\"; status=$?; if [ \"$status\" -eq 124 ]; then exit 125; fi; exit \"$status\"' harness-resource-command \"$@\""
         ));
     } else {
         lines.push("exec \"$@\"".to_string());
     }
     lines.join("\n")
+}
+
+fn unix_resource_limit_shell(limits: &ResourceLimits) -> PathBuf {
+    if limits.pids.is_some() {
+        PathBuf::from("/bin/bash")
+    } else {
+        PathBuf::from("/bin/sh")
+    }
 }
 
 fn ceil_div(value: u64, divisor: u64) -> u64 {
@@ -587,14 +601,33 @@ mod tests {
     }
 
     #[test]
+    fn resource_limits_reject_disk_on_unix_process_backend() {
+        let limits = ResourceLimits {
+            disk_bytes: Some(MIN_DISK_BYTES),
+            ..ResourceLimits::default()
+        };
+
+        let err = validate_resource_limit_backend(&limits, ResourceLimitBackend::UnixProcess)
+            .expect_err("unix process backend cannot enforce aggregate disk usage");
+
+        assert!(matches!(
+            err,
+            ResourceLimitError::UnsupportedBackend {
+                backend: "unix_process",
+                limit: ResourceLimitKind::Disk,
+            }
+        ));
+    }
+
+    #[test]
     fn resource_limits_build_unix_wrapper_with_process_limits() {
         let limits = ResourceLimits {
             cpu_time_secs: Some(9),
             memory_bytes: Some(MIN_MEMORY_BYTES + 1),
             pids: Some(32),
-            disk_bytes: Some(MIN_DISK_BYTES + 1),
             output_bytes: Some(4096),
             wall_time_secs: Some(11),
+            ..ResourceLimits::default()
         };
         let wrapped = wrap_unix_command_with_resource_limits(
             Path::new("/usr/bin/env"),
@@ -605,13 +638,14 @@ mod tests {
         .expect("wrapper should build");
         let script = wrapped.args[1].to_string_lossy();
 
-        assert_eq!(wrapped.program, PathBuf::from("/bin/sh"));
+        assert_eq!(wrapped.program, PathBuf::from("/bin/bash"));
         assert!(script.starts_with("set -e\n"));
         assert!(script.contains("ulimit -t 9"));
         assert!(script.contains("ulimit -v 16385"));
         assert!(script.contains("ulimit -u 32"));
-        assert!(script.contains("ulimit -f 2049"));
-        assert!(script.contains("exec \"$timeout_bin\" --kill-after=5s 11s \"$@\""));
+        assert!(!script.contains("ulimit -f"));
+        assert!(script.contains("exec \"$timeout_bin\" --kill-after=5s 11s /bin/sh -c"));
+        assert!(script.contains("exit 125"));
         assert_eq!(
             wrapped.args[3..],
             [
@@ -722,5 +756,15 @@ mod tests {
             false,
         );
         assert_eq!(normal, None);
+
+        let remapped_command_status = classify_resource_termination(
+            ResourceProcessStatus {
+                exit_code: Some(125),
+                signal: None,
+            },
+            &limits,
+            false,
+        );
+        assert_eq!(remapped_command_status, None);
     }
 }
