@@ -1,0 +1,14 @@
+{
+  "schema_version": "eval-run-attestation/v0.1",
+  "provider": "offline-oidc",
+  "signature": "offline:sha256:e3f4a217195b1282ea5a452e1e5967d363931a00be66638f4710f9f89faace34",
+  "payload_digest": "sha256:e3f4a217195b1282ea5a452e1e5967d363931a00be66638f4710f9f89faace34",
+  "claims": {
+    "runner_identity": "repo:majiayu000/harness:ref:refs/heads/main:workflow:harness-eval",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "stack_id": "agent-stack:majiayu000/harness:eval:core",
+    "suite_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "manifest_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "decision": "approved"
+  }
+}

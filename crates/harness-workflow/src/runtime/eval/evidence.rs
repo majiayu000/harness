@@ -1,3 +1,4 @@
+use super::attestation::EvalAttestationSummary;
 use super::model::{
     Confidence, RuntimeErrorKind, RuntimeJobSnapshot, RuntimeSnapshot, UsageSnapshot,
 };
@@ -23,6 +24,8 @@ pub struct EvalCaseEvidence {
     pub case_id: String,
     pub workflow_id: Option<String>,
     pub status: EvalEvidenceStatus,
+    #[serde(default)]
+    pub attestation: EvalAttestationSummary,
     pub runtime: Option<RuntimeSnapshot>,
     pub usage: Vec<UsageSnapshot>,
     pub submission: Option<EvalSubmissionEvidence>,
@@ -142,6 +145,7 @@ pub fn collect_eval_case_evidence_from_records(
         case_id: case_id.to_string(),
         workflow_id,
         status,
+        attestation: EvalAttestationSummary::unsigned(),
         runtime,
         usage,
         submission,

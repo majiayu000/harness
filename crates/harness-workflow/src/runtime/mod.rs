@@ -90,15 +90,20 @@ pub use dispatch_barrier::{
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
 pub use errors::RuntimeJobNotFoundError;
 pub use eval::{
-    collect_eval_case_evidence, collect_eval_case_evidence_from_records, diff_eval_run_reports,
-    dispatch_eval_case_workflow, enqueue_eval_case_workflow, eval_report_dry_run,
-    eval_report_from_evidence, parse_benchmark_manifest_str, score_pr_repair_eval,
-    EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseDispatchOutcome, EvalCaseEnqueueOutcome,
-    EvalCaseEvidence, EvalCaseTransition, EvalCaseTransitionKind, EvalCaseWorkflowInput,
-    EvalCaseWorkflowPlan, EvalEvidenceStatus, EvalQualityGateEvidence, EvalReportCase,
-    EvalReportCaseStatus, EvalReportError, EvalReportMetricDelta, EvalReportMetrics, EvalRunReport,
-    EvalRunReportDiff, EvalSubmissionEvidence, ManifestError, ScoringError,
-    DEFAULT_CASE_TIMEOUT_SECS, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
+    classify_eval_run_attestation, collect_eval_case_evidence,
+    collect_eval_case_evidence_from_records, diff_eval_run_reports, dispatch_eval_case_workflow,
+    enqueue_eval_case_workflow, eval_report_dry_run, eval_report_from_evidence,
+    eval_run_attestation_payload_digest, parse_benchmark_manifest_str, score_pr_repair_eval,
+    verify_eval_run_attestation, EvalAttestationDecision, EvalAttestationSummary,
+    EvalAttestationTrust, EvalAttestationVerificationError, EvalBenchmarkCase,
+    EvalBenchmarkManifest, EvalCaseDispatchOutcome, EvalCaseEnqueueOutcome, EvalCaseEvidence,
+    EvalCaseTransition, EvalCaseTransitionKind, EvalCaseWorkflowInput, EvalCaseWorkflowPlan,
+    EvalEvidenceStatus, EvalQualityGateEvidence, EvalReportCase, EvalReportCaseStatus,
+    EvalReportError, EvalReportMetricDelta, EvalReportMetrics, EvalRunAttestation,
+    EvalRunAttestationClaims, EvalRunAttestationExpected, EvalRunReport, EvalRunReportDiff,
+    EvalSubmissionEvidence, KeylessOidcProvider, KeylessOidcVerification, ManifestError,
+    ScoringError, VerifiedEvalRunAttestation, DEFAULT_CASE_TIMEOUT_SECS, EVAL_BRANCH_PREFIX,
+    EVAL_PR_DRAFT_MODE, EVAL_RUN_ATTESTATION_SCHEMA_VERSION,
 };
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use memory_retrieval::{

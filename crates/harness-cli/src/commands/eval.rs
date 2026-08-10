@@ -204,11 +204,12 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
     output.push_str("cases:\n");
     for case in &report.cases {
         output.push_str(&format!(
-            "- {} {}#{} status={} tokens={} cost_usd_micros={} base_commit={}\n",
+            "- {} {}#{} status={} attestation={} tokens={} cost_usd_micros={} base_commit={}\n",
             case.case_id,
             case.repo,
             case.issue,
             case_status_label(case.status),
+            attestation_trust_label(case.attestation_trust),
             case.total_tokens,
             case.cost_usd_micros,
             case.base_commit
@@ -269,6 +270,16 @@ fn case_status_label(status: EvalReportCaseStatus) -> &'static str {
     }
 }
 
+fn attestation_trust_label(
+    trust: harness_workflow::runtime::eval::EvalAttestationTrust,
+) -> &'static str {
+    match trust {
+        harness_workflow::runtime::eval::EvalAttestationTrust::Unsigned => "unsigned",
+        harness_workflow::runtime::eval::EvalAttestationTrust::Unverified => "unverified",
+        harness_workflow::runtime::eval::EvalAttestationTrust::Verified => "verified",
+    }
+}
+
 fn transition_kind_label(kind: EvalCaseTransitionKind) -> &'static str {
     match kind {
         EvalCaseTransitionKind::Added => "added",
@@ -295,7 +306,7 @@ mod tests {
     use clap::Parser;
     use harness_workflow::runtime::eval::model::{Confidence, UsageSnapshot};
     use harness_workflow::runtime::{
-        EvalEvidenceStatus, EvalQualityGateEvidence, EvalSubmissionEvidence,
+        EvalAttestationSummary, EvalEvidenceStatus, EvalQualityGateEvidence, EvalSubmissionEvidence,
     };
 
     fn sample_eval_manifest() -> EvalBenchmarkManifest {
@@ -584,6 +595,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             case_id: case_id.to_string(),
             workflow_id: Some(format!("workflow-{case_id}")),
             status,
+            attestation: EvalAttestationSummary::unsigned(),
             runtime: None,
             usage,
             submission: Some(EvalSubmissionEvidence {

@@ -1,3 +1,4 @@
+use super::attestation::EvalAttestationTrust;
 use super::evidence::{EvalCaseEvidence, EvalEvidenceStatus};
 use super::manifest::EvalBenchmarkManifest;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,8 @@ pub struct EvalReportCase {
     pub verify_commands: Vec<String>,
     pub status: EvalReportCaseStatus,
     pub passed: bool,
+    #[serde(default)]
+    pub attestation_trust: EvalAttestationTrust,
     pub workflow_id: Option<String>,
     pub total_tokens: u64,
     pub cost_usd_micros: u64,
@@ -129,6 +132,7 @@ pub fn eval_report_dry_run(
             verify_commands: case.verify_commands.clone(),
             status: EvalReportCaseStatus::Pending,
             passed: false,
+            attestation_trust: EvalAttestationTrust::Unsigned,
             workflow_id: None,
             total_tokens: 0,
             cost_usd_micros: 0,
@@ -179,6 +183,7 @@ pub fn eval_report_from_evidence(
                 verify_commands: case.verify_commands.clone(),
                 status: EvalReportCaseStatus::Failed,
                 passed: false,
+                attestation_trust: EvalAttestationTrust::Unsigned,
                 workflow_id: None,
                 total_tokens: 0,
                 cost_usd_micros: 0,
@@ -253,6 +258,7 @@ fn report_case_from_evidence(
         verify_commands: case.verify_commands.clone(),
         status,
         passed,
+        attestation_trust: evidence.attestation.trust,
         workflow_id: evidence.workflow_id,
         total_tokens,
         cost_usd_micros,
