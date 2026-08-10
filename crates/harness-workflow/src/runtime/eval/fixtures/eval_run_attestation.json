@@ -1,14 +1,16 @@
 {
   "schema_version": "eval-run-attestation/v0.1",
   "provider": "offline-oidc",
-  "signature": "offline:sha256:e3f4a217195b1282ea5a452e1e5967d363931a00be66638f4710f9f89faace34",
-  "payload_digest": "sha256:e3f4a217195b1282ea5a452e1e5967d363931a00be66638f4710f9f89faace34",
+  "signature": "offline:sha256:2d214efc2169535fca12ca9d197b71eca199a335a37afe30e7d13b862fbce9bc",
+  "payload_digest": "sha256:2d214efc2169535fca12ca9d197b71eca199a335a37afe30e7d13b862fbce9bc",
   "claims": {
     "runner_identity": "repo:majiayu000/harness:ref:refs/heads/main:workflow:harness-eval",
     "commit": "0123456789abcdef0123456789abcdef01234567",
     "stack_id": "agent-stack:majiayu000/harness:eval:core",
     "suite_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
     "manifest_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "eval_run_id": "harness-core-20260810T000000Z",
+    "evidence_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
     "decision": "approved"
   }
 }

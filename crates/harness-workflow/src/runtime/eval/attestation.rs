@@ -21,25 +21,75 @@ pub enum EvalAttestationTrust {
     Verified,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+const VERIFIED_SUMMARY_DESERIALIZATION_ERROR: &str =
+    "verified attestation summaries must be reconstructed by signature verification";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EvalAttestationSummary {
-    pub trust: EvalAttestationTrust,
+    trust: EvalAttestationTrust,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runner_identity: Option<String>,
+    runner_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit: Option<String>,
+    commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stack_id: Option<String>,
+    stack_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suite_digest: Option<String>,
+    suite_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_digest: Option<String>,
+    manifest_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decision: Option<EvalAttestationDecision>,
+    eval_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_error: Option<String>,
+    evidence_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision: Option<EvalAttestationDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EvalAttestationSummaryWire {
+    #[serde(default)]
+    trust: EvalAttestationTrust,
+    provider: Option<String>,
+    runner_identity: Option<String>,
+    commit: Option<String>,
+    stack_id: Option<String>,
+    suite_digest: Option<String>,
+    manifest_digest: Option<String>,
+    eval_run_id: Option<String>,
+    evidence_digest: Option<String>,
+    decision: Option<EvalAttestationDecision>,
+    verification_error: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for EvalAttestationSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut wire = EvalAttestationSummaryWire::deserialize(deserializer)?;
+        if wire.trust == EvalAttestationTrust::Verified {
+            wire.trust = EvalAttestationTrust::Unverified;
+            wire.verification_error
+                .get_or_insert_with(|| VERIFIED_SUMMARY_DESERIALIZATION_ERROR.to_string());
+        }
+        Ok(Self {
+            trust: wire.trust,
+            provider: wire.provider,
+            runner_identity: wire.runner_identity,
+            commit: wire.commit,
+            stack_id: wire.stack_id,
+            suite_digest: wire.suite_digest,
+            manifest_digest: wire.manifest_digest,
+            eval_run_id: wire.eval_run_id,
+            evidence_digest: wire.evidence_digest,
+            decision: wire.decision,
+            verification_error: wire.verification_error,
+        })
+    }
 }
 
 impl Default for EvalAttestationSummary {
@@ -58,13 +108,15 @@ impl EvalAttestationSummary {
             stack_id: None,
             suite_digest: None,
             manifest_digest: None,
+            eval_run_id: None,
+            evidence_digest: None,
             decision: None,
             verification_error: None,
         }
     }
 
-    pub fn verified(attestation: &EvalRunAttestation) -> Self {
-        Self::from_attestation(attestation, EvalAttestationTrust::Verified, None)
+    pub fn verified(verification: &VerifiedEvalRunAttestation) -> Self {
+        Self::from_verified_attestation(verification)
     }
 
     pub fn unverified(
@@ -96,9 +148,71 @@ impl EvalAttestationSummary {
             stack_id: Some(attestation.claims.stack_id.clone()),
             suite_digest: Some(attestation.claims.suite_digest.clone()),
             manifest_digest: Some(attestation.claims.manifest_digest.clone()),
+            eval_run_id: Some(attestation.claims.eval_run_id.clone()),
+            evidence_digest: Some(attestation.claims.evidence_digest.clone()),
             decision: Some(attestation.claims.decision),
             verification_error,
         }
+    }
+
+    fn from_verified_attestation(verification: &VerifiedEvalRunAttestation) -> Self {
+        Self {
+            trust: EvalAttestationTrust::Verified,
+            provider: Some(verification.provider.clone()),
+            runner_identity: Some(verification.claims.runner_identity.clone()),
+            commit: Some(verification.claims.commit.clone()),
+            stack_id: Some(verification.claims.stack_id.clone()),
+            suite_digest: Some(verification.claims.suite_digest.clone()),
+            manifest_digest: Some(verification.claims.manifest_digest.clone()),
+            eval_run_id: Some(verification.claims.eval_run_id.clone()),
+            evidence_digest: Some(verification.claims.evidence_digest.clone()),
+            decision: Some(verification.claims.decision),
+            verification_error: None,
+        }
+    }
+
+    pub fn trust(&self) -> EvalAttestationTrust {
+        self.trust
+    }
+
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    pub fn runner_identity(&self) -> Option<&str> {
+        self.runner_identity.as_deref()
+    }
+
+    pub fn commit(&self) -> Option<&str> {
+        self.commit.as_deref()
+    }
+
+    pub fn stack_id(&self) -> Option<&str> {
+        self.stack_id.as_deref()
+    }
+
+    pub fn suite_digest(&self) -> Option<&str> {
+        self.suite_digest.as_deref()
+    }
+
+    pub fn manifest_digest(&self) -> Option<&str> {
+        self.manifest_digest.as_deref()
+    }
+
+    pub fn eval_run_id(&self) -> Option<&str> {
+        self.eval_run_id.as_deref()
+    }
+
+    pub fn evidence_digest(&self) -> Option<&str> {
+        self.evidence_digest.as_deref()
+    }
+
+    pub fn decision(&self) -> Option<EvalAttestationDecision> {
+        self.decision
+    }
+
+    pub fn verification_error(&self) -> Option<&str> {
+        self.verification_error.as_deref()
     }
 }
 
@@ -109,6 +223,8 @@ pub struct EvalRunAttestationClaims {
     pub stack_id: String,
     pub suite_digest: String,
     pub manifest_digest: String,
+    pub eval_run_id: String,
+    pub evidence_digest: String,
     pub decision: EvalAttestationDecision,
 }
 
@@ -154,10 +270,28 @@ pub struct KeylessOidcVerification {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedEvalRunAttestation {
-    pub provider: String,
-    pub claims: EvalRunAttestationClaims,
-    pub audience: String,
-    pub subjects: Vec<String>,
+    provider: String,
+    claims: EvalRunAttestationClaims,
+    audience: String,
+    subjects: Vec<String>,
+}
+
+impl VerifiedEvalRunAttestation {
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn claims(&self) -> &EvalRunAttestationClaims {
+        &self.claims
+    }
+
+    pub fn audience(&self) -> &str {
+        &self.audience
+    }
+
+    pub fn subjects(&self) -> &[String] {
+        &self.subjects
+    }
 }
 
 pub trait KeylessOidcProvider {
@@ -326,10 +460,12 @@ pub fn verify_eval_run_attestation(
             actual: verification.audience,
         });
     }
-    if verification.subjects != expected.subjects {
+    let expected_subjects = sorted_subjects(&expected.subjects);
+    let actual_subjects = sorted_subjects(&verification.subjects);
+    if actual_subjects != expected_subjects {
         return Err(EvalAttestationVerificationError::SubjectsMismatch {
-            expected: expected.subjects.clone(),
-            actual: verification.subjects,
+            expected: expected_subjects,
+            actual: actual_subjects,
         });
     }
 
@@ -351,7 +487,7 @@ pub fn classify_eval_run_attestation(
     };
 
     match verify_eval_run_attestation(attestation, expected, provider) {
-        Ok(_) => EvalAttestationSummary::verified(attestation),
+        Ok(verification) => EvalAttestationSummary::verified(&verification),
         Err(error) => EvalAttestationSummary::unverified(attestation, &error),
     }
 }
@@ -372,6 +508,12 @@ fn compare_claims(
         "manifest_digest",
         &expected.manifest_digest,
         &actual.manifest_digest,
+    )?;
+    compare_claim("eval_run_id", &expected.eval_run_id, &actual.eval_run_id)?;
+    compare_digest(
+        "evidence_digest",
+        &expected.evidence_digest,
+        &actual.evidence_digest,
     )?;
     if expected.decision != actual.decision {
         return Err(EvalAttestationVerificationError::ClaimMismatch {
@@ -439,7 +581,13 @@ fn validate_prefixed_sha256(value: &str) -> Result<(), EvalAttestationVerificati
 }
 
 fn is_valid_commit(value: &str) -> bool {
-    (7..=40).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sorted_subjects(subjects: &[String]) -> Vec<String> {
+    let mut sorted = subjects.to_vec();
+    sorted.sort();
+    sorted
 }
 
 #[cfg(test)]
@@ -501,6 +649,11 @@ mod tests {
             .expect("fixture should deserialize")
     }
 
+    fn resign_offline(attestation: &mut EvalRunAttestation) {
+        attestation.payload_digest = eval_run_attestation_payload_digest(&attestation.claims);
+        attestation.signature = format!("offline:{}", attestation.payload_digest);
+    }
+
     fn fixture_expected() -> EvalRunAttestationExpected {
         let attestation = fixture_attestation();
         EvalRunAttestationExpected {
@@ -531,6 +684,63 @@ mod tests {
     }
 
     #[test]
+    fn verifier_accepts_sha256_length_commit_hashes() {
+        let mut attestation = fixture_attestation();
+        attestation.claims.commit =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        resign_offline(&mut attestation);
+
+        let mut expected = fixture_expected();
+        expected.claims = attestation.claims.clone();
+        expected.subjects = vec![
+            "repo:majiayu000/harness".to_string(),
+            format!("commit:{}", attestation.claims.commit),
+        ];
+
+        let verified = verify_eval_run_attestation(&attestation, &expected, &OfflineProvider)
+            .expect("64-character commit hashes should verify");
+
+        assert_eq!(verified.claims.commit, attestation.claims.commit);
+    }
+
+    #[test]
+    fn verifier_rejects_abbreviated_commit_hashes() {
+        let mut attestation = fixture_attestation();
+        attestation.claims.commit = "0123456".to_string();
+        resign_offline(&mut attestation);
+
+        let mut expected = fixture_expected();
+        expected.claims = attestation.claims.clone();
+        expected.subjects = vec![
+            "repo:majiayu000/harness".to_string(),
+            format!("commit:{}", attestation.claims.commit),
+        ];
+
+        let error = verify_eval_run_attestation(&attestation, &expected, &OfflineProvider)
+            .expect_err("abbreviated commit hashes should not verify");
+
+        assert!(matches!(
+            error,
+            EvalAttestationVerificationError::ClaimMismatch {
+                field: "commit",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn verifier_compares_subjects_without_order_sensitivity() {
+        let attestation = fixture_attestation();
+        let mut expected = fixture_expected();
+        expected.subjects.reverse();
+
+        let verified = verify_eval_run_attestation(&attestation, &expected, &OfflineProvider)
+            .expect("subject order should not affect verification");
+
+        assert_eq!(verified.subjects, expected.subjects);
+    }
+
+    #[test]
     fn fixture_payload_digest_binds_every_attested_claim() {
         let mut attestation = fixture_attestation();
         attestation.claims.decision = EvalAttestationDecision::Rejected;
@@ -543,6 +753,50 @@ mod tests {
             error,
             EvalAttestationVerificationError::PayloadDigestMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn fixture_payload_digest_binds_run_and_evidence_identity() {
+        let mut run_tamper = fixture_attestation();
+        run_tamper.claims.eval_run_id = "other-run".to_string();
+        let run_error =
+            verify_eval_run_attestation(&run_tamper, &fixture_expected(), &OfflineProvider)
+                .expect_err("modified eval_run_id should invalidate payload digest");
+        assert!(matches!(
+            run_error,
+            EvalAttestationVerificationError::PayloadDigestMismatch { .. }
+        ));
+
+        let mut evidence_tamper = fixture_attestation();
+        evidence_tamper.claims.evidence_digest =
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444".to_string();
+        let evidence_error =
+            verify_eval_run_attestation(&evidence_tamper, &fixture_expected(), &OfflineProvider)
+                .expect_err("modified evidence_digest should invalidate payload digest");
+        assert!(matches!(
+            evidence_error,
+            EvalAttestationVerificationError::PayloadDigestMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn deserialized_summary_cannot_forge_verified_trust() {
+        let summary: EvalAttestationSummary = serde_json::from_str(
+            r#"{
+                "trust": "verified",
+                "provider": "offline-oidc",
+                "decision": "approved"
+            }"#,
+        )
+        .expect("summary should deserialize");
+
+        assert_eq!(summary.trust(), EvalAttestationTrust::Unverified);
+        assert_eq!(summary.decision(), Some(EvalAttestationDecision::Approved));
+        assert_eq!(
+            summary.verification_error(),
+            Some(VERIFIED_SUMMARY_DESERIALIZATION_ERROR)
+        );
+        assert!(!summary.is_approved());
     }
 
     #[test]

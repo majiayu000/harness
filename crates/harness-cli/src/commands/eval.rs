@@ -2,7 +2,8 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 use harness_workflow::runtime::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
-    parse_benchmark_manifest_str, EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseTransitionKind,
+    parse_benchmark_manifest_str, EvalAttestationDecision, EvalAttestationTrust,
+    EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseTransition, EvalCaseTransitionKind,
     EvalReportCaseStatus, EvalRunReport, EvalRunReportDiff,
 };
 use serde::Deserialize;
@@ -209,7 +210,7 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
             case.repo,
             case.issue,
             case_status_label(case.status),
-            attestation_trust_label(case.attestation_trust),
+            attestation_label(case.attestation_trust, case.attestation_decision),
             case.total_tokens,
             case.cost_usd_micros,
             case.base_commit
@@ -246,10 +247,14 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
     ));
     output.push_str("transitions:\n");
     for transition in &diff.transitions {
+        let attestation_change = render_attestation_change(transition)
+            .map(|change| format!(" {change}"))
+            .unwrap_or_default();
         output.push_str(&format!(
-            "- {} {}\n",
+            "- {} {}{}\n",
             transition.case_id,
-            transition_kind_label(transition.transition)
+            transition_kind_label(transition.transition),
+            attestation_change
         ));
     }
     output
@@ -270,14 +275,57 @@ fn case_status_label(status: EvalReportCaseStatus) -> &'static str {
     }
 }
 
-fn attestation_trust_label(
-    trust: harness_workflow::runtime::eval::EvalAttestationTrust,
-) -> &'static str {
+fn attestation_label(
+    trust: EvalAttestationTrust,
+    decision: Option<EvalAttestationDecision>,
+) -> String {
+    let trust = attestation_trust_label(trust);
+    decision
+        .map(|decision| format!("{trust}:{}", attestation_decision_label(decision)))
+        .unwrap_or_else(|| trust.to_string())
+}
+
+fn attestation_trust_label(trust: EvalAttestationTrust) -> &'static str {
     match trust {
-        harness_workflow::runtime::eval::EvalAttestationTrust::Unsigned => "unsigned",
-        harness_workflow::runtime::eval::EvalAttestationTrust::Unverified => "unverified",
-        harness_workflow::runtime::eval::EvalAttestationTrust::Verified => "verified",
+        EvalAttestationTrust::Unsigned => "unsigned",
+        EvalAttestationTrust::Unverified => "unverified",
+        EvalAttestationTrust::Verified => "verified",
     }
+}
+
+fn attestation_decision_label(decision: EvalAttestationDecision) -> &'static str {
+    match decision {
+        EvalAttestationDecision::Approved => "approved",
+        EvalAttestationDecision::Rejected => "rejected",
+    }
+}
+
+fn render_attestation_change(transition: &EvalCaseTransition) -> Option<String> {
+    if transition.baseline_attestation_trust == transition.candidate_attestation_trust
+        && transition.baseline_attestation_decision == transition.candidate_attestation_decision
+    {
+        return None;
+    }
+    Some(format!(
+        "attestation={}->{}",
+        optional_attestation_label(
+            transition.baseline_attestation_trust,
+            transition.baseline_attestation_decision
+        ),
+        optional_attestation_label(
+            transition.candidate_attestation_trust,
+            transition.candidate_attestation_decision
+        )
+    ))
+}
+
+fn optional_attestation_label(
+    trust: Option<EvalAttestationTrust>,
+    decision: Option<EvalAttestationDecision>,
+) -> String {
+    trust
+        .map(|trust| attestation_label(trust, decision))
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn transition_kind_label(kind: EvalCaseTransitionKind) -> &'static str {
@@ -444,7 +492,20 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         assert_eq!(report.metrics.total_cost_usd_micros, 50);
         assert!(rendered.contains("pass@1: 0.5000"));
         assert!(rendered.contains("pass^3: 0.8750"));
+        assert!(rendered.contains("attestation=unsigned"));
         assert!(rendered.contains("missing_evidence: case_evidence"));
+    }
+
+    #[test]
+    fn eval_report_text_distinguishes_verified_rejections() {
+        let mut report = eval_report_dry_run(&sample_eval_manifest(), "run-dry", 3)
+            .unwrap_or_else(|error| panic!("dry run report should build: {error}"));
+        report.cases[0].attestation_trust = EvalAttestationTrust::Verified;
+        report.cases[0].attestation_decision = Some(EvalAttestationDecision::Rejected);
+
+        let rendered = render_run_report(&report);
+
+        assert!(rendered.contains("attestation=verified:rejected"));
     }
 
     #[test]
@@ -511,6 +572,106 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         assert!(rendered.contains("pass_to_fail"));
         assert!(rendered.contains("tokens delta: -20"));
         assert!(rendered.contains("cost_usd_micros delta: -10"));
+    }
+
+    #[test]
+    fn eval_report_diff_text_and_json_include_attestation_changes() {
+        let mut baseline = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "baseline",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Passed,
+                vec![usage_snapshot(100, 40)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("baseline report should build: {error}"));
+        baseline.cases[0].attestation_trust = EvalAttestationTrust::Verified;
+        baseline.cases[0].attestation_decision = Some(EvalAttestationDecision::Approved);
+
+        let candidate = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "candidate",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Passed,
+                vec![usage_snapshot(100, 40)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
+
+        let diff = diff_eval_run_reports(&baseline, &candidate);
+        let transition = diff
+            .transitions
+            .iter()
+            .find(|transition| transition.case_id == "case-pass")
+            .expect("case-pass transition should exist");
+        assert_eq!(
+            transition.baseline_attestation_trust,
+            Some(EvalAttestationTrust::Verified)
+        );
+        assert_eq!(
+            transition.candidate_attestation_trust,
+            Some(EvalAttestationTrust::Unsigned)
+        );
+        assert_eq!(
+            transition.baseline_attestation_decision,
+            Some(EvalAttestationDecision::Approved)
+        );
+
+        let rendered = render_diff_report(&diff);
+
+        assert!(
+            rendered.contains("case-pass unchanged_pass attestation=verified:approved->unsigned")
+        );
+    }
+
+    #[test]
+    fn eval_report_evidence_input_downgrades_forged_verified_summary() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let evidence_path = tempdir.path().join("evidence.json");
+        fs::write(
+            &evidence_path,
+            r#"[
+                {
+                    "eval_run_id": "run-1",
+                    "case_id": "case-pass",
+                    "workflow_id": "workflow-case-pass",
+                    "status": "passed",
+                    "attestation": {
+                        "trust": "verified",
+                        "provider": "offline-oidc",
+                        "decision": "approved"
+                    },
+                    "runtime": null,
+                    "usage": [],
+                    "submission": null,
+                    "quality_gate": null,
+                    "missing_evidence": []
+                }
+            ]"#,
+        )
+        .unwrap_or_else(|error| panic!("evidence should write: {error}"));
+
+        let evidence = read_evidence(&evidence_path)
+            .unwrap_or_else(|error| panic!("evidence should parse: {error}"));
+        let report = eval_report_from_evidence(&sample_eval_manifest(), "run-1", 3, evidence)
+            .unwrap_or_else(|error| panic!("report should build: {error}"));
+
+        assert_eq!(
+            report.cases[0].attestation_trust,
+            EvalAttestationTrust::Unverified
+        );
+        assert_eq!(
+            report.cases[0].attestation_decision,
+            Some(EvalAttestationDecision::Approved)
+        );
+        assert!(!render_run_report(&report).contains("attestation=verified"));
     }
 
     #[test]

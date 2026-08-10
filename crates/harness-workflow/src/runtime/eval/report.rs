@@ -1,4 +1,4 @@
-use super::attestation::EvalAttestationTrust;
+use super::attestation::{EvalAttestationDecision, EvalAttestationTrust};
 use super::evidence::{EvalCaseEvidence, EvalEvidenceStatus};
 use super::manifest::EvalBenchmarkManifest;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,8 @@ pub struct EvalReportCase {
     pub passed: bool,
     #[serde(default)]
     pub attestation_trust: EvalAttestationTrust,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_decision: Option<EvalAttestationDecision>,
     pub workflow_id: Option<String>,
     pub total_tokens: u64,
     pub cost_usd_micros: u64,
@@ -80,6 +82,14 @@ pub struct EvalCaseTransition {
     pub transition: EvalCaseTransitionKind,
     pub baseline_status: Option<EvalReportCaseStatus>,
     pub candidate_status: Option<EvalReportCaseStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_attestation_trust: Option<EvalAttestationTrust>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_attestation_trust: Option<EvalAttestationTrust>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_attestation_decision: Option<EvalAttestationDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_attestation_decision: Option<EvalAttestationDecision>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +143,7 @@ pub fn eval_report_dry_run(
             status: EvalReportCaseStatus::Pending,
             passed: false,
             attestation_trust: EvalAttestationTrust::Unsigned,
+            attestation_decision: None,
             workflow_id: None,
             total_tokens: 0,
             cost_usd_micros: 0,
@@ -184,6 +195,7 @@ pub fn eval_report_from_evidence(
                 status: EvalReportCaseStatus::Failed,
                 passed: false,
                 attestation_trust: EvalAttestationTrust::Unsigned,
+                attestation_decision: None,
                 workflow_id: None,
                 total_tokens: 0,
                 cost_usd_micros: 0,
@@ -222,6 +234,12 @@ pub fn diff_eval_run_reports(
                 transition: transition_kind(baseline_case, candidate_case),
                 baseline_status: baseline_case.map(|case| case.status),
                 candidate_status: candidate_case.map(|case| case.status),
+                baseline_attestation_trust: baseline_case.map(|case| case.attestation_trust),
+                candidate_attestation_trust: candidate_case.map(|case| case.attestation_trust),
+                baseline_attestation_decision: baseline_case
+                    .and_then(|case| case.attestation_decision),
+                candidate_attestation_decision: candidate_case
+                    .and_then(|case| case.attestation_decision),
             }
         })
         .collect::<Vec<_>>();
@@ -258,7 +276,8 @@ fn report_case_from_evidence(
         verify_commands: case.verify_commands.clone(),
         status,
         passed,
-        attestation_trust: evidence.attestation.trust,
+        attestation_trust: evidence.attestation.trust(),
+        attestation_decision: evidence.attestation.decision(),
         workflow_id: evidence.workflow_id,
         total_tokens,
         cost_usd_micros,
