@@ -202,6 +202,18 @@ fn selected_output_digest_matches_runtime_version_grammar() {
                 )
                 .unwrap();
                 assert!(successful_payload(kind, ambiguous).is_err());
+
+                for nonblank in [b"noise".as_slice(), b"\xff".as_slice()] {
+                    let nonblank = Sha256Digest::from_bytes(nonblank);
+                    let (stdout, stderr) = match stream {
+                        RuntimeVersionStream::Stdout => (selected.clone(), nonblank),
+                        RuntimeVersionStream::Stderr => (nonblank, selected.clone()),
+                    };
+                    let impossible =
+                        RuntimeVersionFacts::new("1.2.3".to_owned(), stdout, stderr, stream)
+                            .unwrap();
+                    assert!(successful_payload(kind, impossible).is_err());
+                }
             }
         }
 
@@ -329,6 +341,28 @@ fn repository_source_stops_at_the_identity_only_inspection_state() {
 }
 
 #[test]
+fn configuration_source_repository_denial_requires_repository_scope() {
+    assert!(runtime_payload_with_facts(
+        LocalExecutableRuntimeKind::CodexExec,
+        RuntimeCommandForm::UnixBare,
+        vec![runtime_attempt(
+            b"runner-source",
+            RuntimeResolutionAttemptOutcome::InspectionTarget,
+            RuntimeExecSequence::None,
+        )],
+        Some(runtime_identity(false, false)),
+        None,
+        vec![RuntimeProbeFailure::with_detail(
+            RuntimeProbeFailureKind::ProbeNotAuthorized,
+            RuntimeProbeFailureDetail::ConfigurationSourceRepository,
+        )
+        .unwrap()],
+    )
+    .is_err());
+    assert!(inspection_payload(Some(runtime_identity(false, false))).is_ok());
+}
+
+#[test]
 fn failed_candidate_and_pre_checkpoint_failures_forbid_identity() {
     for identity in [runtime_identity(false, false), runtime_identity(true, true)] {
         assert!(runtime_payload_with_facts(
@@ -358,6 +392,47 @@ fn failed_candidate_and_pre_checkpoint_failures_forbid_identity() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn initial_inspection_failures_require_no_exec_sequence() {
+    for kind in [
+        RuntimeProbeFailureKind::OpenFailed,
+        RuntimeProbeFailureKind::MetadataUnavailable,
+        RuntimeProbeFailureKind::ExecutableTooLarge,
+        RuntimeProbeFailureKind::ReadFailed,
+    ] {
+        let payload = |sequence| {
+            runtime_payload_with_facts(
+                LocalExecutableRuntimeKind::CodexExec,
+                RuntimeCommandForm::UnixBare,
+                vec![runtime_attempt(
+                    b"inspection-failed",
+                    RuntimeResolutionAttemptOutcome::InspectionFailed,
+                    sequence,
+                )],
+                None,
+                None,
+                vec![RuntimeProbeFailure::new(kind).unwrap()],
+            )
+        };
+        assert!(payload(RuntimeExecSequence::None).is_ok());
+        assert!(payload(RuntimeExecSequence::EtxtbsyThenCheckpointAfter150Ms).is_err());
+    }
+
+    assert!(runtime_payload_with_facts(
+        LocalExecutableRuntimeKind::CodexExec,
+        RuntimeCommandForm::UnixBare,
+        vec![runtime_attempt(
+            b"post-exec-metadata",
+            RuntimeResolutionAttemptOutcome::ExecStarted,
+            RuntimeExecSequence::Single,
+        )],
+        None,
+        None,
+        vec![RuntimeProbeFailure::new(RuntimeProbeFailureKind::MetadataUnavailable).unwrap()],
+    )
+    .is_ok());
 }
 
 #[test]

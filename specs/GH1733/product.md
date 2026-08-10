@@ -661,7 +661,8 @@ attempt vocabularies are normative in `runtime-product.md`.
       both matching streams, unparseable output, and conflicting matching
       streams. Blank fixtures cover empty and every mixture of HT/LF/CR/SP as
       allowed, VT/FF/NUL/NBSP as nonblank, lone CR as legal only in the
-      unselected blank stream. Precedence fixtures prove capture overflow/read
+      unselected blank stream, and canonical SHA-256-of-empty evidence for any
+      validated unselected blank spelling. Precedence fixtures prove capture overflow/read
       failure wins first; after complete capture, signal or nonzero exit is the
       sole semantic failure; only zero exit can yield invalid UTF-8, blank,
       unparseable, or ambiguous output. Implementation audits forbid generic

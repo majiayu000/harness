@@ -140,6 +140,9 @@ fn version_is_valid(
         RuntimeVersionStream::Stdout => (&version.stdout_sha256, &version.stderr_sha256),
         RuntimeVersionStream::Stderr => (&version.stderr_sha256, &version.stdout_sha256),
     };
+    if *unselected_digest != Sha256Digest::from_bytes(b"") {
+        return false;
+    }
     let mut selected_matches = false;
     for line_ending in ["", "\n", "\r\n"] {
         if product.len() + line_ending.len() > super::super::RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES {
@@ -149,9 +152,6 @@ fn version_is_valid(
         output.push_str(&product);
         output.push_str(line_ending);
         let digest = Sha256Digest::from_bytes(output.as_bytes());
-        if digest == *unselected_digest {
-            return false;
-        }
         selected_matches |= digest == *selected_digest;
     }
     selected_matches
@@ -321,6 +321,7 @@ fn observation_state_is_valid(payload: &RuntimeExecutableFingerprintPayload) -> 
             primary.len() == 1
                 && lifecycle_state_is_valid(payload, primary[0])
                 && primary_failure_matches(
+                    payload.role_binding.base_source().scope(),
                     payload.command_form,
                     &payload.resolution_attempts,
                     payload.executable.as_ref(),
@@ -382,6 +383,7 @@ fn lifecycle_state_is_valid(
 }
 
 fn primary_failure_matches(
+    source_scope: crate::stack::AgentStackSourceScope,
     form: RuntimeCommandForm,
     attempts: &[RuntimeResolutionAttempt],
     executable: Option<&RuntimeExecutableIdentity>,
@@ -435,11 +437,15 @@ fn primary_failure_matches(
                 && no_final_identity
         }
         K::OpenFailed | K::ExecutableTooLarge | K::ReadFailed => {
-            final_outcome_is(O::InspectionFailed) && no_final_identity
+            final_outcome_is(O::InspectionFailed)
+                && final_sequence_is(RuntimeExecSequence::None)
+                && no_final_identity
         }
         K::MetadataUnavailable => {
             no_final_identity
-                && (final_outcome_is(O::InspectionFailed) || final_outcome_is(O::ExecStarted))
+                && ((final_outcome_is(O::InspectionFailed)
+                    && final_sequence_is(RuntimeExecSequence::None))
+                    || final_outcome_is(O::ExecStarted))
         }
         K::NotRegularFile => {
             matches!(
@@ -463,7 +469,9 @@ fn primary_failure_matches(
         }
         K::ProbeNotAuthorized => match failure.detail {
             Some(D::ConfigurationSourceRepository) => {
-                final_outcome_is(O::InspectionTarget) && inspection_identity
+                source_scope == crate::stack::AgentStackSourceScope::Repository
+                    && final_outcome_is(O::InspectionTarget)
+                    && inspection_identity
             }
             Some(D::ResolvedTargetRepository) => {
                 (final_outcome_is(O::InspectionTarget) && inspection_identity)

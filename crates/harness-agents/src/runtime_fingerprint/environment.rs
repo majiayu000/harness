@@ -90,6 +90,9 @@ pub fn windows_working_directory_digest(
             RuntimeLaunchInputLimitKind::WorkingDirectory,
         ));
     }
+    if units.is_empty() || units.contains(&0) {
+        return Err(RuntimeFingerprintProduceError::InvalidLaunchContext);
+    }
     let mut framed =
         Vec::with_capacity(WORKING_DIRECTORY_DIGEST_DOMAIN.len() + units.len() * 2 + 16);
     framed.extend_from_slice(WORKING_DIRECTORY_DIGEST_DOMAIN);
@@ -163,11 +166,16 @@ fn output_version(
     stderr: &[u8],
     selected_stream: RuntimeVersionStream,
 ) -> Result<RuntimeOutputClassification, RuntimeFingerprintProduceError> {
+    let blank_digest = Sha256Digest::from_bytes(b"");
+    let (stdout_sha256, stderr_sha256) = match selected_stream {
+        RuntimeVersionStream::Stdout => (Sha256Digest::from_bytes(stdout), blank_digest),
+        RuntimeVersionStream::Stderr => (blank_digest, Sha256Digest::from_bytes(stderr)),
+    };
     Ok(RuntimeOutputClassification::Version(
         RuntimeVersionFacts::new(
             normalized_version,
-            Sha256Digest::from_bytes(stdout),
-            Sha256Digest::from_bytes(stderr),
+            stdout_sha256,
+            stderr_sha256,
             selected_stream,
         )?,
     ))

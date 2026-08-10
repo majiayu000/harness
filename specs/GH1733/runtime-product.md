@@ -45,6 +45,8 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    u64be(device) || u64be(inode))`. Open or metadata failure is typed
    `working_directory_unavailable` and emits no fingerprint; the raw path,
    device, and inode are never serialized.
+   Both platform spellings must be nonempty and contain no NUL unit; the pure
+   Windows digest helper applies the 65,536-unit limit before this shape gate.
 
    Every Unix candidate is a private closed reference: `absolute(path)` or
    `working_directory_relative(path)`. Qualified relative commands and
@@ -550,9 +552,12 @@ with `product.md`, `runtime-observation.md`, `runtime-supervision.md`,
    the other is ASCII blank. Two matching streams,
    even with the same version, are `ambiguous_version`; one match plus nonblank
    invalid output or any other nonblank mismatch is `unparseable_version`; two
-   blank streams are `empty_output`. The exact bounded stdout and stderr byte
-   digests and selected stream are retained only on success. No failure may
-   yield `failures = []` or fabricate a normalized value.
+   blank streams are `empty_output`. On success, the selected stream and its
+   exact bounded byte digest are retained; after the other stream passes UTF-8
+   and ASCII blank validation, its digest field is canonicalized to SHA-256 of
+   empty bytes. This makes the blank invariant strictly import-verifiable
+   without retaining raw output. No failure may yield `failures = []` or
+   fabricate a normalized value.
 10. **B-010:** Runtime environment evidence is derived from this exact closed
     v0.1 policy; callers provide values but never names, sensitivity, evidence
     inclusion, or probe exposure:
@@ -702,7 +707,7 @@ failure, initial-call `handle_execution_unavailable`, or
 `etxtbsy_then_checkpoint_after_150_ms` requires an exact first `ETXTBSY` and a
 repeated authorization/identity checkpoint. It permits
 `retry_not_authorized`, `retry_authorization_unavailable`, or
-`inspection_failed` without a second helper, and
+`inspection_failed` with `identity_changed` without a second helper, and
 `supervision_setup_failed` when the second registered target's retained
 working-directory entry or trace setup fails before target handle exec;
 exec-time `interpreter_authorization_unavailable`,

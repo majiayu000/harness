@@ -233,7 +233,8 @@ signal from `AwaitInitialExecExit`, internal `AwaitTermination`, or any other
 illegal trace state is no-envelope `ExecutionVerificationUnavailable`.
 Only a zero exit reaches UTF-8 validation, blank classification, grammar
 parsing, and stream selection. Successful version evidence computes and
-retains both exact SHA-256 stream digests.
+retains the exact selected-stream SHA-256 digest and canonicalizes the other,
+validated ASCII-blank stream to the SHA-256 digest of empty bytes.
 
 The closed runtime kind selects a whole-stream grammar. Codex Exec and Codex
 JSON-RPC accept exactly `codex-cli <VERSION>`; Claude Code accepts exactly
@@ -268,7 +269,10 @@ Both complete streams are parsed independently before selection:
 
 On a zero exit, invalid UTF-8 yields `invalid_utf8`; no grammar or blank
 failure is also recorded. Signal and nonzero outcomes never inspect bytes for a
-semantic parsing failure. The payload records the selected stream plus both
-exact digests only on success. Changing a product output grammar requires a new
-schema grammar revision, not a heuristic first-token fallback. This implements
-B-009.
+semantic parsing failure. On success, the payload records the selected stream,
+the exact selected-stream digest, and the canonical SHA-256 digest of empty
+bytes for the unselected stream after that stream has passed UTF-8 and ASCII
+blank validation. This canonical blank evidence keeps strict import validation
+closed without retaining raw output. Changing a product output grammar requires
+a new schema grammar revision, not a heuristic first-token fallback. This
+implements B-009.

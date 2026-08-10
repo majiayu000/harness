@@ -16,7 +16,7 @@ mod owner;
 ))]
 mod review_regressions;
 use harness_core::stack::fingerprint::RuntimeCommandForm;
-use harness_core::stack::{AgentStackSource, AgentStackSourceScope};
+use harness_core::stack::{AgentStackSource, AgentStackSourceScope, Sha256Digest};
 use serde_json::json;
 
 fn source(name: &str) -> ConfiguredRuntimeSource {
@@ -217,6 +217,23 @@ fn windows_working_directory_digest_vector_is_fixed() {
         windows_working_directory_digest(&units).unwrap().as_str(),
         "90e7e9eb468b08a8b8b5161fb2211bcba076a30439db72f7d6761d6398372085"
     );
+    assert!(matches!(
+        windows_working_directory_digest(&[]),
+        Err(RuntimeFingerprintProduceError::InvalidLaunchContext)
+    ));
+    assert!(matches!(
+        windows_working_directory_digest(&[u16::from(b'C'), 0, u16::from(b'X')]),
+        Err(RuntimeFingerprintProduceError::InvalidLaunchContext)
+    ));
+    let mut oversized_with_nul =
+        vec![u16::from(b'X'); RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS + 1];
+    oversized_with_nul[0] = 0;
+    assert!(matches!(
+        windows_working_directory_digest(&oversized_with_nul),
+        Err(RuntimeFingerprintProduceError::LaunchInputLimitExceeded(
+            RuntimeLaunchInputLimitKind::WorkingDirectory
+        ))
+    ));
 }
 
 #[test]
@@ -402,9 +419,15 @@ fn runtime_whole_output_grammars_and_stream_selection_are_exact() {
         RuntimeTermination::Exit(0),
     )
     .unwrap();
+    let codex = serde_json::to_value(codex).unwrap();
+    assert_eq!(codex["normalized_version"], "1.2.3-alpha-1+Build.7");
     assert_eq!(
-        serde_json::to_value(codex).unwrap()["normalized_version"],
-        "1.2.3-alpha-1+Build.7"
+        codex["stdout_sha256"],
+        Sha256Digest::from_bytes(b"codex-cli 1.2.3-alpha-1+Build.7\r\n").as_str()
+    );
+    assert_eq!(
+        codex["stderr_sha256"],
+        Sha256Digest::from_bytes(b"").as_str()
     );
     assert_eq!(
         serde_json::to_value(claude).unwrap()["selected_stream"],
