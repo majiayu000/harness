@@ -16,6 +16,59 @@ pub struct IngestSignalRequest {
     pub payload: serde_json::Value,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkflowEvidenceQuery {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub suite: Option<String>,
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub include_payload: Option<bool>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowEvidenceArtifact {
+    pub id: String,
+    pub workflow_id: String,
+    pub command_id: Option<String>,
+    pub runtime_job_id: Option<String>,
+    pub project_id: String,
+    pub commit_sha: Option<String>,
+    pub stack: String,
+    pub suite: String,
+    pub baseline: Option<String>,
+    pub decision: String,
+    pub schema: String,
+    pub digest: String,
+    pub trust: String,
+    pub location: serde_json::Value,
+    pub retention_class: String,
+    pub payload: Option<serde_json::Value>,
+    pub payload_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub payload_expired_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowEvidenceExportResponse {
+    pub schema: String,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub limit: i64,
+    pub count: usize,
+    pub records: Vec<WorkflowEvidenceArtifact>,
+}
+
 mod private {
     pub trait Sealed {}
 }
@@ -52,3 +105,12 @@ impl RestDto for crate::methods::RpcResponse {}
 
 impl private::Sealed for IngestSignalRequest {}
 impl RestDto for IngestSignalRequest {}
+
+impl private::Sealed for WorkflowEvidenceQuery {}
+impl RestDto for WorkflowEvidenceQuery {}
+
+impl private::Sealed for WorkflowEvidenceArtifact {}
+impl RestDto for WorkflowEvidenceArtifact {}
+
+impl private::Sealed for WorkflowEvidenceExportResponse {}
+impl RestDto for WorkflowEvidenceExportResponse {}
