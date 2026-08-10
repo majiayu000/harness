@@ -283,8 +283,11 @@ impl SkillStore {
                 if skill.trigger_patterns.is_empty() || !allows_auto_injection(skill, prompt) {
                     return None;
                 }
+                if skill_trigger_relevance(prompt, skill).score <= 0.0 {
+                    return None;
+                }
                 let relevance = skill_prompt_relevance(prompt, skill);
-                (relevance.score > 0.0).then_some((skill, relevance.score))
+                Some((skill, relevance.score))
             })
             .collect::<Vec<_>>();
         matches.sort_by(|(left, left_score), (right, right_score)| {
@@ -693,6 +696,15 @@ fn skill_prompt_relevance(prompt: &str, skill: &Skill) -> LexicalRelevanceScore 
     fields.push(RetrievalField::new(&skill.name, 0.8));
     fields.push(RetrievalField::new(&skill.description, 1.2));
     fields.push(RetrievalField::new(&skill.content, 0.25));
+    score_lexical_relevance(prompt, &fields)
+}
+
+fn skill_trigger_relevance(prompt: &str, skill: &Skill) -> LexicalRelevanceScore {
+    let fields = skill
+        .trigger_patterns
+        .iter()
+        .map(|pattern| RetrievalField::new(pattern, 2.0))
+        .collect::<Vec<_>>();
     score_lexical_relevance(prompt, &fields)
 }
 

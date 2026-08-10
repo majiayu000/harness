@@ -58,7 +58,7 @@ pub fn score_lexical_relevance(
         let field_term_count = normalized_field.split_whitespace().count();
         if (1..=8).contains(&field_term_count)
             && !normalized_field.is_empty()
-            && normalized_query.contains(&normalized_field)
+            && contains_token_phrase(&normalized_query, &normalized_field)
         {
             phrase_bonus = phrase_bonus.max(0.20 * weight.min(2.0));
         }
@@ -136,6 +136,16 @@ fn normalize_phrase(text: &str) -> String {
     tokenize(text).join(" ")
 }
 
+fn contains_token_phrase(normalized_text: &str, normalized_phrase: &str) -> bool {
+    let text_terms = normalized_text.split_whitespace().collect::<Vec<_>>();
+    let phrase_terms = normalized_phrase.split_whitespace().collect::<Vec<_>>();
+    !phrase_terms.is_empty()
+        && phrase_terms.len() <= text_terms.len()
+        && text_terms
+            .windows(phrase_terms.len())
+            .any(|window| window == phrase_terms.as_slice())
+}
+
 fn is_stopword(term: &str) -> bool {
     matches!(
         term,
@@ -207,5 +217,20 @@ mod tests {
         );
 
         assert_eq!(score, LexicalRelevanceScore::none(3));
+    }
+
+    #[test]
+    fn lexical_relevance_does_not_phrase_match_inside_tokens() {
+        let score = score_lexical_relevance(
+            "cargo build failed",
+            &[RetrievalField::new("go build", 2.0)],
+        );
+
+        assert!(
+            score.score < 0.7,
+            "score should not receive a phrase bonus from 'cargo', was {}",
+            score.score
+        );
+        assert_eq!(score.matched_terms, 1);
     }
 }

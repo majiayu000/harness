@@ -18,6 +18,7 @@ pub(super) async fn repo_memory_for_prompt_packet(
     store: Option<&WorkflowRuntimeStore>,
     workflow: Option<&WorkflowInstance>,
     job: &RuntimeJob,
+    prompt_task_text: Option<&str>,
 ) -> RepoMemoryPromptContext {
     if !memory_enabled {
         return RepoMemoryPromptContext::default();
@@ -26,7 +27,7 @@ pub(super) async fn repo_memory_for_prompt_packet(
         return RepoMemoryPromptContext::default();
     };
     let activity = activity_name(job);
-    let task_text = repo_memory_task_text(workflow, job);
+    let task_text = repo_memory_task_text(workflow, job, prompt_task_text);
     let Some(store) = store else {
         return RepoMemoryPromptContext {
             records: Vec::new(),
@@ -114,8 +115,18 @@ fn repo_for_memory_prompt(workflow: Option<&WorkflowInstance>, job: &RuntimeJob)
         .map(str::to_string)
 }
 
-fn repo_memory_task_text(workflow: Option<&WorkflowInstance>, job: &RuntimeJob) -> Option<String> {
+fn repo_memory_task_text(
+    workflow: Option<&WorkflowInstance>,
+    job: &RuntimeJob,
+    prompt_task_text: Option<&str>,
+) -> Option<String> {
     let mut parts = Vec::new();
+    if let Some(prompt_task_text) = prompt_task_text
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        parts.push(prompt_task_text.to_string());
+    }
     if let Some(workflow) = workflow {
         if let Ok(subject) = serde_json::to_string(&workflow.subject) {
             parts.push(subject);
@@ -153,7 +164,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_flag_degraded_disabled_flag_skips_prompt_memory_lookup() {
-        let context = repo_memory_for_prompt_packet(false, None, None, &repo_runtime_job()).await;
+        let context =
+            repo_memory_for_prompt_packet(false, None, None, &repo_runtime_job(), None).await;
 
         assert!(context.records.is_empty());
         assert!(context.degradation.is_none());
@@ -162,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn memory_flag_degraded_enabled_store_unavailable_records_degradation() {
         let job = repo_runtime_job();
-        let context = repo_memory_for_prompt_packet(true, None, None, &job).await;
+        let context = repo_memory_for_prompt_packet(true, None, None, &job, None).await;
 
         assert!(context.records.is_empty());
         let Some(degradation) = context.degradation else {
@@ -176,5 +188,15 @@ mod tests {
         assert_eq!(degradation.artifact["repo"], "owner/repo");
         assert_eq!(degradation.artifact["activity"], "implement_issue");
         assert_eq!(degradation.artifact["memory_enabled"], true);
+    }
+
+    #[test]
+    fn repo_memory_task_text_includes_resolved_prompt_text() {
+        let job = repo_runtime_job();
+        let text = repo_memory_task_text(None, &job, Some("fix rust toolchain cache failures"))
+            .expect("task text exists");
+
+        assert!(text.contains("fix rust toolchain cache failures"));
+        assert!(text.contains("implement_issue"));
     }
 }

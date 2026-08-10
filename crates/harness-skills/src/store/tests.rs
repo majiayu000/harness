@@ -331,6 +331,22 @@ fn match_prompt_ranks_more_relevant_skill_first() {
 }
 
 #[test]
+fn match_prompt_requires_trigger_overlap_before_auxiliary_fields() {
+    let mut store = SkillStore::new();
+    store.skills.push(make_skill_with_patterns(
+        "review",
+        SkillLocation::System,
+        "implement feature",
+        &["code review"],
+        "system",
+    ));
+
+    let matches = store.match_prompt("implement feature support");
+
+    assert!(matches.is_empty());
+}
+
+#[test]
 fn match_prompt_skips_skills_without_patterns() {
     let mut store = SkillStore::new();
     store

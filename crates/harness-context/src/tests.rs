@@ -317,6 +317,18 @@ fn skills_provider_ranks_by_lexical_relevance() {
 }
 
 #[test]
+fn skills_provider_requires_trigger_overlap_before_auxiliary_fields() {
+    let provider =
+        SkillsProvider::new(vec![skill("review", "implement feature", &["code review"])]);
+    let mut request = req();
+    request.task_profile.prompt = Some("implement feature support".to_string());
+
+    let items = provider.propose(&request).expect("provider succeeds");
+
+    assert!(items.is_empty());
+}
+
+#[test]
 fn providers_include_active_exec_plans_for_matching_project() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut plan = harness_exec::plan::ExecPlan::from_spec("# Ship context composer", dir.path())

@@ -69,8 +69,10 @@ impl ContextProvider for SkillsProvider {
             .skills
             .iter()
             .filter_map(|skill| {
-                let relevance = skill_context_relevance(prompt, skill);
-                if skill.trigger_patterns.is_empty() || relevance > 0.0 {
+                if skill.trigger_patterns.is_empty() {
+                    Some((skill.clone(), 0.15))
+                } else if skill_trigger_relevance(prompt, skill) > 0.0 {
+                    let relevance = skill_context_relevance(prompt, skill);
                     Some((skill.clone(), relevance))
                 } else {
                     None
@@ -108,9 +110,6 @@ impl ContextProvider for SkillsProvider {
 }
 
 fn skill_context_relevance(prompt: &str, skill: &Skill) -> f64 {
-    if skill.trigger_patterns.is_empty() {
-        return 0.15;
-    }
     let mut fields = Vec::with_capacity(skill.trigger_patterns.len() + 3);
     for pattern in &skill.trigger_patterns {
         fields.push(RetrievalField::new(pattern, 2.0));
@@ -118,6 +117,15 @@ fn skill_context_relevance(prompt: &str, skill: &Skill) -> f64 {
     fields.push(RetrievalField::new(&skill.name, 0.8));
     fields.push(RetrievalField::new(&skill.description, 1.2));
     fields.push(RetrievalField::new(&skill.content, 0.25));
+    score_lexical_relevance(prompt, &fields).score
+}
+
+fn skill_trigger_relevance(prompt: &str, skill: &Skill) -> f64 {
+    let fields = skill
+        .trigger_patterns
+        .iter()
+        .map(|pattern| RetrievalField::new(pattern, 2.0))
+        .collect::<Vec<_>>();
     score_lexical_relevance(prompt, &fields).score
 }
 

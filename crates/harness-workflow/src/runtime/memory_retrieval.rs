@@ -103,18 +103,33 @@ fn rank_repo_memory_candidates(
 ) {
     let activity_class = activity_class.trim();
     let query = repo_memory_relevance_query(activity_class, task_text);
-    candidates.sort_by(|left, right| {
-        let left_activity_mismatch = left.activity_class != activity_class;
-        let right_activity_mismatch = right.activity_class != activity_class;
-        let left_relevance = repo_memory_relevance(left, &query);
-        let right_relevance = repo_memory_relevance(right, &query);
-        left_activity_mismatch
-            .cmp(&right_activity_mismatch)
-            .then_with(|| right_relevance.total_cmp(&left_relevance))
-            .then_with(|| right.use_count.cmp(&left.use_count))
-            .then_with(|| right.created_at.cmp(&left.created_at))
-            .then_with(|| left.id.cmp(&right.id))
+    let mut ranked = candidates
+        .iter()
+        .cloned()
+        .map(|record| RankedRepoMemoryCandidate {
+            activity_mismatch: record.activity_class != activity_class,
+            relevance: repo_memory_relevance(&record, &query),
+            record,
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        left.activity_mismatch
+            .cmp(&right.activity_mismatch)
+            .then_with(|| right.relevance.total_cmp(&left.relevance))
+            .then_with(|| right.record.use_count.cmp(&left.record.use_count))
+            .then_with(|| right.record.created_at.cmp(&left.record.created_at))
+            .then_with(|| left.record.id.cmp(&right.record.id))
     });
+    for (target, ranked) in candidates.iter_mut().zip(ranked) {
+        *target = ranked.record;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RankedRepoMemoryCandidate {
+    record: RepoMemoryRecord,
+    activity_mismatch: bool,
+    relevance: f64,
 }
 
 fn repo_memory_relevance_query(activity_class: &str, task_text: Option<&str>) -> String {
