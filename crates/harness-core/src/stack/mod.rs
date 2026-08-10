@@ -5,6 +5,9 @@ use std::fmt;
 use std::path::Path;
 use thiserror::Error;
 pub mod capability_evidence;
+mod diff;
+#[cfg(test)]
+mod diff_tests;
 pub mod inventory;
 #[cfg(test)]
 mod inventory_tests;
@@ -14,6 +17,11 @@ mod protective_control_diff_tests;
 mod source_locator;
 #[cfg(test)]
 mod tests;
+pub use diff::{
+    stack_diff, AgentStackDiffChangeKind, AgentStackDiffComponentEvidence, AgentStackDiffError,
+    AgentStackDiffFact, AgentStackDiffFactKind, AgentStackDiffField, AgentStackDiffSide,
+    AgentStackDiffSnapshot, AgentStackDiffValue,
+};
 pub use inventory::{
     inventory_repository_stack, AgentStackEntryClass, AgentStackInventory,
     AgentStackInventoryEntry, AgentStackInventoryError, AgentStackInventoryErrorKind,
