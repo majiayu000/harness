@@ -299,6 +299,71 @@ fn local_review_changes_requested_result_routes_to_feedback_repair() {
 }
 
 #[test]
+fn local_review_changes_requested_with_unresolved_review_threads_routes_to_feedback_repair() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 1914,
+        "pr_url": "https://github.com/majiayu000/harness/pull/1914",
+    }));
+    let summary =
+        "Local review found two unresolved review threads on PR #1914 and requested changes.";
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, summary)
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            json!({
+                "pr_number": 1914,
+                "pr_url": "https://github.com/majiayu000/harness/pull/1914",
+            }),
+        ))
+        .with_artifact(ActivityArtifact::new(
+            "local_review_findings",
+            json!({
+                "unresolved_review_threads": [
+                    {
+                        "path": "AGENTS.md",
+                        "line": 61,
+                        "body": "Use the review verdicts accepted by the parser."
+                    },
+                    {
+                        "path": "CLAUDE.md",
+                        "line": 14,
+                        "body": "Require Codex-variable stripping in equivalent launchers."
+                    }
+                ],
+                "blockers": [
+                    "two unresolved review threads"
+                ]
+            }),
+        ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("local review changes should request repair");
+
+    assert_eq!(decision.decision, "address_local_review_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+    assert_eq!(decision.reason, summary);
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
+    assert_eq!(
+        decision.commands[0].dedupe_key,
+        format!("local-review:{}:1914:address:command-1", instance.id)
+    );
+    assert_eq!(decision.commands[0].command["source"], "local_review");
+    assert_eq!(decision.commands[0].command["review_summary"], summary);
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("local review changes-requested decision should validate");
+}
+
+#[test]
 fn local_review_blocked_result_routes_to_blocked() {
     let instance = issue_instance("local_review_gate").with_server_data(json!({
         "pr_number": 77,
