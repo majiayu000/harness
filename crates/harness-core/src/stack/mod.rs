@@ -5,7 +5,6 @@ use std::fmt;
 use std::path::Path;
 use thiserror::Error;
 pub mod capability_evidence;
-pub mod fingerprint;
 pub mod inventory;
 #[cfg(test)]
 mod inventory_tests;
