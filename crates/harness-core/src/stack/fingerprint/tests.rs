@@ -176,7 +176,7 @@ fn runtime_identity(
 ) -> RuntimeExecutableIdentity {
     RuntimeExecutableIdentity::new(
         1,
-        Some(0o755),
+        Some(0o100_755),
         Sha256Digest::from_bytes(b"executable"),
         checkpoint_consistent_path,
         exec_stop_consistent_handle,
@@ -186,8 +186,8 @@ fn runtime_identity(
 fn runtime_version() -> RuntimeVersionFacts {
     RuntimeVersionFacts::new(
         "1.2.3".to_owned(),
-        Sha256Digest::from_bytes(b"stdout"),
-        Sha256Digest::from_bytes(b"stderr"),
+        Sha256Digest::from_bytes(b"codex-cli 1.2.3"),
+        Sha256Digest::from_bytes(b""),
         RuntimeVersionStream::Stdout,
     )
     .unwrap()

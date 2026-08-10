@@ -55,11 +55,50 @@ pub(super) fn payload_is_valid(payload: &RuntimeExecutableFingerprintPayload) ->
         && payload
             .version
             .as_ref()
-            .is_none_or(|version| normalized_version_is_valid(&version.normalized_version))
-        && payload.executable.as_ref().is_none_or(|identity| {
-            identity.file_size_bytes > 0 && identity.unix_mode.is_some_and(|mode| mode & 0o111 != 0)
-        })
+            .is_none_or(|version| version_is_valid(payload.runtime_kind, version))
+        && payload
+            .executable
+            .as_ref()
+            .is_none_or(executable_identity_is_valid)
         && observation_state_is_valid(payload)
+}
+
+fn executable_identity_is_valid(identity: &RuntimeExecutableIdentity) -> bool {
+    const UNIX_MODE_TYPE_MASK: u32 = 0o170_000;
+    const UNIX_MODE_REGULAR_FILE: u32 = 0o100_000;
+
+    identity.file_size_bytes > 0
+        && identity.file_size_bytes <= super::super::RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES
+        && identity.unix_mode.is_some_and(|mode| {
+            mode & UNIX_MODE_TYPE_MASK == UNIX_MODE_REGULAR_FILE && mode & 0o111 != 0
+        })
+}
+
+fn version_is_valid(
+    runtime_kind: LocalExecutableRuntimeKind,
+    version: &RuntimeVersionFacts,
+) -> bool {
+    if !normalized_version_is_valid(&version.normalized_version) {
+        return false;
+    }
+    let product = match runtime_kind {
+        LocalExecutableRuntimeKind::CodexExec | LocalExecutableRuntimeKind::CodexJsonrpc => {
+            format!("codex-cli {}", version.normalized_version)
+        }
+        LocalExecutableRuntimeKind::ClaudeCode => {
+            format!("{} (Claude Code)", version.normalized_version)
+        }
+    };
+    let selected_digest = match version.selected_stream {
+        RuntimeVersionStream::Stdout => &version.stdout_sha256,
+        RuntimeVersionStream::Stderr => &version.stderr_sha256,
+    };
+    ["", "\n", "\r\n"].iter().any(|line_ending| {
+        let mut output = String::with_capacity(product.len() + line_ending.len());
+        output.push_str(&product);
+        output.push_str(line_ending);
+        Sha256Digest::from_bytes(output.as_bytes()) == *selected_digest
+    })
 }
 
 fn attempts_are_valid(form: RuntimeCommandForm, attempts: &[RuntimeResolutionAttempt]) -> bool {

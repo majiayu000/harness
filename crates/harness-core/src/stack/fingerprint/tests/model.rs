@@ -749,7 +749,7 @@ fn complete_runtime_and_mcp_payload_digest_vectors_are_fixed() {
     .unwrap();
     assert_eq!(
         runtime.fingerprint_digest().as_str(),
-        "790a4d64d91542aa9f808fffb0f18ad599b853eeae7ba476fb6ce940dd6f2fa5"
+        "0de643860aa3cf1510b3e6f1d2ff7c15437c9861b9bb58ba0b37c2cae27ad83a"
     );
     assert_eq!(
         mcp.fingerprint_digest().as_str(),

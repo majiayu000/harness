@@ -38,6 +38,24 @@ fn failed_execution_payload(
     )
 }
 
+fn successful_payload(
+    kind: LocalExecutableRuntimeKind,
+    version: RuntimeVersionFacts,
+) -> Result<RuntimeExecutableFingerprintPayload, AgentStackFingerprintError> {
+    runtime_payload_with_facts(
+        kind,
+        RuntimeCommandForm::UnixBare,
+        vec![runtime_attempt(
+            b"executed",
+            RuntimeResolutionAttemptOutcome::ExecStarted,
+            RuntimeExecSequence::Single,
+        )],
+        Some(runtime_identity(true, true)),
+        Some(version),
+        Vec::new(),
+    )
+}
+
 fn assert_parser_rejects_identity(
     payload: RuntimeExecutableFingerprintPayload,
     identity: Option<RuntimeExecutableIdentity>,
@@ -86,6 +104,77 @@ fn post_reap_failure_requires_the_executed_identity_shape() {
         Some(runtime_identity(true, false)),
     ] {
         assert_parser_rejects_identity(valid.clone(), identity);
+    }
+}
+
+#[test]
+fn executable_identity_matches_the_producer_file_contract() {
+    let digest = Sha256Digest::from_bytes(b"executable");
+    for (file_size_bytes, unix_mode) in [
+        (0, Some(0o100_755)),
+        (
+            RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES + 1,
+            Some(0o100_755),
+        ),
+        (1, Some(0o040_755)),
+        (1, Some(0o100_644)),
+        (1, None),
+    ] {
+        assert!(
+            failed_execution_payload(Some(RuntimeExecutableIdentity::new(
+                file_size_bytes,
+                unix_mode,
+                digest.clone(),
+                true,
+                true,
+            )))
+            .is_err()
+        );
+    }
+    assert!(
+        failed_execution_payload(Some(RuntimeExecutableIdentity::new(
+            RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES,
+            Some(0o100_755),
+            digest,
+            true,
+            true,
+        )))
+        .is_ok()
+    );
+}
+
+#[test]
+fn selected_output_digest_matches_runtime_version_grammar() {
+    for (kind, product) in [
+        (LocalExecutableRuntimeKind::CodexExec, "codex-cli 1.2.3"),
+        (LocalExecutableRuntimeKind::CodexJsonrpc, "codex-cli 1.2.3"),
+        (
+            LocalExecutableRuntimeKind::ClaudeCode,
+            "1.2.3 (Claude Code)",
+        ),
+    ] {
+        for line_ending in ["", "\n", "\r\n"] {
+            let selected = Sha256Digest::from_bytes(format!("{product}{line_ending}").as_bytes());
+            let blank = Sha256Digest::from_bytes(b"");
+            for stream in [RuntimeVersionStream::Stdout, RuntimeVersionStream::Stderr] {
+                let (stdout, stderr) = match stream {
+                    RuntimeVersionStream::Stdout => (selected.clone(), blank.clone()),
+                    RuntimeVersionStream::Stderr => (blank.clone(), selected.clone()),
+                };
+                let version =
+                    RuntimeVersionFacts::new("1.2.3".to_owned(), stdout, stderr, stream).unwrap();
+                assert!(successful_payload(kind, version).is_ok());
+            }
+        }
+
+        let impossible = RuntimeVersionFacts::new(
+            "1.2.3".to_owned(),
+            Sha256Digest::from_bytes(b"arbitrary output"),
+            Sha256Digest::from_bytes(b""),
+            RuntimeVersionStream::Stdout,
+        )
+        .unwrap();
+        assert!(successful_payload(kind, impossible).is_err());
     }
 }
 
