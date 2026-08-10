@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const WORKFLOW_RUN_EVIDENCE_SCHEMA: &str = "harness.workflow.run_evidence.v1";
@@ -7,6 +8,8 @@ pub const WORKFLOW_RUN_EVIDENCE_DEFAULT_LIMIT: i64 = 100;
 pub const WORKFLOW_RUN_EVIDENCE_MAX_LIMIT: i64 = 500;
 pub const WORKFLOW_RUN_EVIDENCE_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
 pub const WORKFLOW_RUN_EVIDENCE_RETENTION_MAX_BATCH: i64 = 1000;
+const WORKFLOW_RUN_EVIDENCE_PAYLOAD_RETENTION_DAYS: i64 = 30;
+const WORKFLOW_RUN_EVIDENCE_COMPLETION_TRUST: &str = "server_persisted_runtime_completion";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkflowRunEvidence {
@@ -127,65 +130,8 @@ impl WorkflowRuntimeStore {
         &self,
         input: WorkflowRunEvidenceInput,
     ) -> anyhow::Result<WorkflowRunEvidence> {
-        validate_run_evidence_input(&input)?;
-        let id = input
-            .id
-            .clone()
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let mut tx = self.pool.begin().await?;
-        let command_id = resolve_run_evidence_command_link_tx(
-            &mut tx,
-            &input.workflow_id,
-            input.command_id.as_deref(),
-            input.runtime_job_id.as_deref(),
-        )
-        .await?;
-        let location = serde_json::to_string(&input.location)?;
-        let payload = input
-            .payload
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let inserted = sqlx::query(
-            "INSERT INTO workflow_run_evidence
-                (id, workflow_id, command_id, runtime_job_id, project_id, commit_sha,
-                 stack, suite, baseline, decision, evidence_schema, digest, trust,
-                 location, retention_class, payload, payload_expires_at)
-             VALUES
-                ($1, $2, $3, $4, $5, $6,
-                 $7, $8, $9, $10, $11, $12, $13,
-                 $14::jsonb, $15, $16::jsonb, $17)
-             ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(&id)
-        .bind(&input.workflow_id)
-        .bind(&command_id)
-        .bind(&input.runtime_job_id)
-        .bind(&input.project_id)
-        .bind(&input.commit_sha)
-        .bind(&input.stack)
-        .bind(&input.suite)
-        .bind(&input.baseline)
-        .bind(&input.decision)
-        .bind(&input.evidence_schema)
-        .bind(&input.digest)
-        .bind(&input.trust)
-        .bind(&location)
-        .bind(&input.retention_class)
-        .bind(&payload)
-        .bind(input.payload_expires_at)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            == 1;
-
-        let record = select_workflow_run_evidence_by_id_tx(&mut tx, &id, true)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("workflow run evidence was not persisted"))?;
-        if !inserted {
-            ensure_idempotent_run_evidence_replay(&record, &input, command_id.as_deref())?;
-        }
+        let record = record_workflow_run_evidence_tx(&mut tx, input).await?;
         tx.commit().await?;
         Ok(record)
     }
@@ -199,7 +145,13 @@ impl WorkflowRuntimeStore {
             "SELECT id, workflow_id, command_id, runtime_job_id, project_id, commit_sha,
                     stack, suite, baseline, decision, evidence_schema, digest, trust,
                     location::text AS location_json, retention_class,
-                    CASE WHEN $7::boolean THEN payload::text ELSE NULL END AS payload_json,
+                    CASE
+                        WHEN $7::boolean
+                         AND payload_expired_at IS NULL
+                         AND (payload_expires_at IS NULL OR payload_expires_at > CURRENT_TIMESTAMP)
+                        THEN payload::text
+                        ELSE NULL
+                    END AS payload_json,
                     payload_expires_at, payload_expired_at, created_at, updated_at
              FROM workflow_run_evidence
              WHERE ($1::text IS NULL OR project_id = $1)
@@ -274,6 +226,131 @@ impl WorkflowRuntimeStore {
     }
 }
 
+pub(in crate::runtime::store) async fn record_workflow_run_evidence_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    input: WorkflowRunEvidenceInput,
+) -> anyhow::Result<WorkflowRunEvidence> {
+    validate_run_evidence_input(&input)?;
+    let id = input
+        .id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let command_id = resolve_run_evidence_command_link_tx(
+        tx,
+        &input.workflow_id,
+        input.command_id.as_deref(),
+        input.runtime_job_id.as_deref(),
+    )
+    .await?;
+    let location = serde_json::to_string(&input.location)?;
+    let payload = input
+        .payload
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let inserted: Option<WorkflowRunEvidenceRow> = sqlx::query_as(
+        "INSERT INTO workflow_run_evidence
+                (id, workflow_id, command_id, runtime_job_id, project_id, commit_sha,
+                 stack, suite, baseline, decision, evidence_schema, digest, trust,
+                 location, retention_class, payload, payload_expires_at)
+             VALUES
+                ($1, $2, $3, $4, $5, $6,
+                 $7, $8, $9, $10, $11, $12, $13,
+                 $14::jsonb, $15, $16::jsonb, $17)
+             ON CONFLICT (id) DO NOTHING
+             RETURNING id, workflow_id, command_id, runtime_job_id, project_id, commit_sha,
+                       stack, suite, baseline, decision, evidence_schema, digest, trust,
+                       location::text AS location_json, retention_class,
+                       payload::text AS payload_json, payload_expires_at, payload_expired_at,
+                       created_at, updated_at",
+    )
+    .bind(&id)
+    .bind(&input.workflow_id)
+    .bind(&command_id)
+    .bind(&input.runtime_job_id)
+    .bind(&input.project_id)
+    .bind(&input.commit_sha)
+    .bind(&input.stack)
+    .bind(&input.suite)
+    .bind(&input.baseline)
+    .bind(&input.decision)
+    .bind(&input.evidence_schema)
+    .bind(&input.digest)
+    .bind(&input.trust)
+    .bind(&location)
+    .bind(&input.retention_class)
+    .bind(&payload)
+    .bind(input.payload_expires_at)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    if let Some(row) = inserted {
+        return WorkflowRunEvidence::try_from(row);
+    }
+
+    let record = select_workflow_run_evidence_by_id_tx(tx, &id, true)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workflow run evidence was not persisted"))?;
+    ensure_idempotent_run_evidence_replay(&record, &input, command_id.as_deref())?;
+    Ok(record)
+}
+
+pub(in crate::runtime::store) async fn record_runtime_completion_evidence_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow: &WorkflowInstance,
+    command: &WorkflowCommandRecord,
+    job: &RuntimeJob,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    decision: Option<&WorkflowDecisionRecord>,
+) -> anyhow::Result<WorkflowRunEvidence> {
+    let prompt = latest_runtime_prompt_packet_tx(tx, &job.id).await?;
+    let payload =
+        bounded_runtime_completion_payload(event, result, decision, prompt.digest.as_deref())?;
+    let digest = evidence_payload_digest(&json!({
+        "schema": WORKFLOW_RUN_EVIDENCE_SCHEMA,
+        "workflow_id": workflow.id.as_str(),
+        "command_id": command.id.as_str(),
+        "runtime_job_id": job.id.as_str(),
+        "activity_result": result,
+        "decision": decision,
+    }))?;
+    record_workflow_run_evidence_tx(
+        tx,
+        WorkflowRunEvidenceInput {
+            id: Some(format!("runtime-completion:{}", job.id)),
+            workflow_id: workflow.id.clone(),
+            command_id: Some(command.id.clone()),
+            runtime_job_id: Some(job.id.clone()),
+            project_id: project_id_for_completion_evidence(workflow, job, prompt.packet.as_ref()),
+            commit_sha: commit_sha_for_completion_evidence(workflow, job, result),
+            stack: job.runtime_profile.clone(),
+            suite: completion_suite(job, result),
+            baseline: baseline_for_completion_evidence(workflow, job, prompt.packet.as_ref()),
+            decision: decision
+                .map(|record| record.decision.decision.clone())
+                .unwrap_or_else(|| "no_runtime_decision".to_string()),
+            evidence_schema: WORKFLOW_RUN_EVIDENCE_SCHEMA.to_string(),
+            digest,
+            trust: WORKFLOW_RUN_EVIDENCE_COMPLETION_TRUST.to_string(),
+            location: runtime_completion_location(
+                event,
+                command,
+                job,
+                decision,
+                prompt.digest.as_deref(),
+            ),
+            retention_class: "runtime_completion".to_string(),
+            payload: Some(payload),
+            payload_expires_at: event.created_at.checked_add_signed(chrono::Duration::days(
+                WORKFLOW_RUN_EVIDENCE_PAYLOAD_RETENTION_DAYS,
+            )),
+        },
+    )
+    .await
+}
+
 impl TryFrom<WorkflowRunEvidenceRow> for WorkflowRunEvidence {
     type Error = anyhow::Error;
 
@@ -313,7 +390,6 @@ async fn resolve_run_evidence_command_link_tx(
     command_id: Option<&str>,
     runtime_job_id: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    let mut resolved_command_id = command_id.map(str::to_string);
     if let Some(runtime_job_id) = runtime_job_id {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT command.workflow_id, job.command_id
@@ -329,18 +405,16 @@ async fn resolve_run_evidence_command_link_tx(
         };
         anyhow::ensure!(
             job_workflow_id == workflow_id,
-            "runtime job `{runtime_job_id}` belongs to workflow `{job_workflow_id}`, not `{workflow_id}`"
-        );
-        if let Some(command_id) = &resolved_command_id {
+                "runtime job `{runtime_job_id}` belongs to workflow `{job_workflow_id}`, not `{workflow_id}`"
+            );
+        if let Some(command_id) = command_id {
             anyhow::ensure!(
-                command_id == &job_command_id,
+                command_id == job_command_id,
                 "runtime job `{runtime_job_id}` belongs to command `{job_command_id}`, not `{command_id}`"
             );
-        } else {
-            resolved_command_id = Some(job_command_id);
         }
-    }
-    if let Some(command_id) = &resolved_command_id {
+        return Ok(Some(job_command_id));
+    } else if let Some(command_id) = command_id {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
                 .bind(command_id)
@@ -351,10 +425,11 @@ async fn resolve_run_evidence_command_link_tx(
         };
         anyhow::ensure!(
             command_workflow_id == workflow_id,
-            "workflow command `{command_id}` belongs to workflow `{command_workflow_id}`, not `{workflow_id}`"
-        );
+                "workflow command `{command_id}` belongs to workflow `{command_workflow_id}`, not `{workflow_id}`"
+            );
+        return Ok(Some(command_id.to_string()));
     }
-    Ok(resolved_command_id)
+    Ok(None)
 }
 
 async fn select_workflow_run_evidence_by_id_tx(
@@ -409,6 +484,12 @@ fn ensure_idempotent_run_evidence_replay(
 ) -> anyhow::Result<()> {
     let payload_matches =
         existing.payload == input.payload || existing.payload_expired_at.is_some();
+    let payload_expires_at_matches = existing
+        .payload_expires_at
+        .map(|value| value.timestamp_micros())
+        == input
+            .payload_expires_at
+            .map(|value| value.timestamp_micros());
     anyhow::ensure!(
         existing.workflow_id == input.workflow_id
             && existing.command_id.as_deref() == command_id
@@ -424,7 +505,7 @@ fn ensure_idempotent_run_evidence_replay(
             && existing.trust == input.trust
             && existing.location == input.location
             && existing.retention_class == input.retention_class
-            && existing.payload_expires_at == input.payload_expires_at
+            && payload_expires_at_matches
             && payload_matches,
         "workflow run evidence id `{}` already exists with different metadata",
         existing.id
@@ -437,4 +518,198 @@ fn blank_to_none(value: Option<&str>) -> Option<&str> {
         let value = value.trim();
         (!value.is_empty()).then_some(value)
     })
+}
+
+#[derive(Debug, Default)]
+struct RuntimePromptPacketEvidence {
+    digest: Option<String>,
+    packet: Option<Value>,
+}
+
+async fn latest_runtime_prompt_packet_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    runtime_job_id: &str,
+) -> anyhow::Result<RuntimePromptPacketEvidence> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT data #>> '{event,prompt_packet_digest}',
+                (data #> '{event,prompt_packet}')::text
+         FROM runtime_events
+         WHERE runtime_job_id = $1
+           AND event_type = 'RuntimePromptPrepared'
+         ORDER BY sequence DESC
+         LIMIT 1",
+    )
+    .bind(runtime_job_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((digest, packet_json)) = row else {
+        return Ok(RuntimePromptPacketEvidence::default());
+    };
+    let packet = packet_json
+        .filter(|raw| raw != "null")
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()?;
+    Ok(RuntimePromptPacketEvidence { digest, packet })
+}
+
+fn runtime_completion_location(
+    event: &WorkflowEvent,
+    command: &WorkflowCommandRecord,
+    job: &RuntimeJob,
+    decision: Option<&WorkflowDecisionRecord>,
+    prompt_packet_digest: Option<&str>,
+) -> Value {
+    let mut location = json!({
+        "kind": "runtime_completion",
+        "workflow_event_id": event.id.as_str(),
+        "runtime_job_id": job.id.as_str(),
+        "command_id": command.id.as_str(),
+        "runtime_job_output": {
+            "table": "runtime_jobs",
+            "column": "data.output"
+        }
+    });
+    if let Some(decision) = decision {
+        location["decision_id"] = json!(decision.id.as_str());
+        location["decision_accepted"] = json!(decision.accepted);
+    }
+    if let Some(prompt_packet_digest) = prompt_packet_digest {
+        location["prompt_packet_digest"] = json!(prompt_packet_digest);
+    }
+    location
+}
+
+fn bounded_runtime_completion_payload(
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    decision: Option<&WorkflowDecisionRecord>,
+    prompt_packet_digest: Option<&str>,
+) -> anyhow::Result<Value> {
+    let full = json!({
+        "workflow_event_id": event.id.as_str(),
+        "prompt_packet_digest": prompt_packet_digest,
+        "decision_id": decision.map(|record| record.id.as_str()),
+        "decision_accepted": decision.map(|record| record.accepted),
+        "activity_result": result,
+    });
+    if serde_json::to_vec(&full)?.len() <= WORKFLOW_RUN_EVIDENCE_PAYLOAD_MAX_BYTES {
+        return Ok(full);
+    }
+    Ok(json!({
+        "workflow_event_id": event.id.as_str(),
+        "prompt_packet_digest": prompt_packet_digest,
+        "decision_id": decision.map(|record| record.id.as_str()),
+        "decision_accepted": decision.map(|record| record.accepted),
+        "activity": result.activity.as_str(),
+        "status": result.status,
+        "summary": result.summary.as_str(),
+        "artifact_count": result.artifacts.len(),
+        "signal_count": result.signals.len(),
+        "validation_count": result.validation.len(),
+        "payload_truncated": true,
+    }))
+}
+
+fn evidence_payload_digest(value: &Value) -> anyhow::Result<String> {
+    Ok(format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(value)?)
+    ))
+}
+
+fn project_id_for_completion_evidence(
+    workflow: &WorkflowInstance,
+    job: &RuntimeJob,
+    prompt_packet: Option<&Value>,
+) -> String {
+    string_field(&workflow.data, "project_id")
+        .or_else(|| string_field(&job.input, "project_id"))
+        .or_else(|| string_path(&job.input, &["command", "project_id"]))
+        .or_else(|| prompt_packet.and_then(|packet| string_path(packet, &["project", "root"])))
+        .unwrap_or_else(|| workflow.id.clone())
+}
+
+fn commit_sha_for_completion_evidence(
+    workflow: &WorkflowInstance,
+    job: &RuntimeJob,
+    result: &ActivityResult,
+) -> Option<String> {
+    result
+        .artifacts
+        .iter()
+        .find_map(|artifact| {
+            string_any_field(
+                &artifact.artifact,
+                &["head_sha", "head_oid", "commit_sha", "merge_commit_sha"],
+            )
+        })
+        .or_else(|| string_any_field(&workflow.data, &["head_sha", "pr_head_sha", "commit_sha"]))
+        .or_else(|| string_any_field(&job.input, &["head_sha", "pr_head_sha", "commit_sha"]))
+        .or_else(|| {
+            job.input.get("command").and_then(|command| {
+                string_any_field(command, &["head_sha", "pr_head_sha", "commit_sha"])
+            })
+        })
+}
+
+fn completion_suite(job: &RuntimeJob, result: &ActivityResult) -> String {
+    if !result.activity.trim().is_empty() {
+        return result.activity.clone();
+    }
+    string_field(&job.input, "activity").unwrap_or_else(|| "workflow_activity".to_string())
+}
+
+fn baseline_for_completion_evidence(
+    workflow: &WorkflowInstance,
+    job: &RuntimeJob,
+    prompt_packet: Option<&Value>,
+) -> Option<String> {
+    baseline_string(&workflow.data)
+        .or_else(|| baseline_string(&job.input))
+        .or_else(|| job.input.get("command").and_then(baseline_string))
+        .or_else(|| prompt_packet.and_then(prompt_packet_base_ref))
+}
+
+fn baseline_string(value: &Value) -> Option<String> {
+    string_any_field(
+        value,
+        &[
+            "baseline",
+            "base_ref",
+            "target_base_ref",
+            "expected_base_ref",
+        ],
+    )
+}
+
+fn prompt_packet_base_ref(prompt_packet: &Value) -> Option<String> {
+    let base = prompt_packet.pointer("/workflow_file/config/base")?;
+    let remote = string_field(base, "remote").unwrap_or_else(|| "origin".to_string());
+    let branch = string_field(base, "branch")?;
+    Some(format!("{remote}/{branch}"))
+}
+
+fn string_any_field(value: &Value, fields: &[&str]) -> Option<String> {
+    fields.iter().find_map(|field| string_field(value, field))
+}
+
+fn string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn string_path(value: &Value, path: &[&str]) -> Option<String> {
+    let mut cursor = value;
+    for segment in path {
+        cursor = cursor.get(*segment)?;
+    }
+    cursor
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }

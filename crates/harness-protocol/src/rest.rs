@@ -36,7 +36,7 @@ pub struct WorkflowEvidenceQuery {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct WorkflowEvidenceArtifact {
     pub id: String,
     pub workflow_id: String,
@@ -60,7 +60,7 @@ pub struct WorkflowEvidenceArtifact {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct WorkflowEvidenceExportResponse {
     pub schema: String,
     pub generated_at: chrono::DateTime<chrono::Utc>,

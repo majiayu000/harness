@@ -667,18 +667,6 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                 payload_expired_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT workflow_run_evidence_workflow_id_fkey
-                    FOREIGN KEY (workflow_id)
-                    REFERENCES workflow_instances(id)
-                    ON DELETE CASCADE,
-                CONSTRAINT workflow_run_evidence_command_id_fkey
-                    FOREIGN KEY (command_id)
-                    REFERENCES workflow_commands(id)
-                    ON DELETE SET NULL,
-                CONSTRAINT workflow_run_evidence_runtime_job_id_fkey
-                    FOREIGN KEY (runtime_job_id)
-                    REFERENCES runtime_jobs(id)
-                    ON DELETE SET NULL,
                 CONSTRAINT workflow_run_evidence_required_text_not_blank
                     CHECK (
                         btrim(id) <> ''
@@ -702,8 +690,18 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                 ON workflow_run_evidence (suite, created_at DESC);
               CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_decision_time
                 ON workflow_run_evidence (decision, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_created_time
+                ON workflow_run_evidence (created_at DESC, id DESC);
               CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_payload_expiry
                 ON workflow_run_evidence (payload_expires_at)
-                WHERE payload IS NOT NULL AND payload_expires_at IS NOT NULL",
+                WHERE payload IS NOT NULL AND payload_expires_at IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_workflow_id
+                ON workflow_run_evidence (workflow_id);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_command_id
+                ON workflow_run_evidence (command_id)
+                WHERE command_id IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_runtime_job_id
+                ON workflow_run_evidence (runtime_job_id)
+                WHERE runtime_job_id IS NOT NULL",
     },
 ];
