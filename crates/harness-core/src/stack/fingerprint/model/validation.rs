@@ -89,16 +89,28 @@ fn version_is_valid(
             format!("{} (Claude Code)", version.normalized_version)
         }
     };
-    let selected_digest = match version.selected_stream {
-        RuntimeVersionStream::Stdout => &version.stdout_sha256,
-        RuntimeVersionStream::Stderr => &version.stderr_sha256,
+    if product.len() > super::super::RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES {
+        return false;
+    }
+    let (selected_digest, unselected_digest) = match version.selected_stream {
+        RuntimeVersionStream::Stdout => (&version.stdout_sha256, &version.stderr_sha256),
+        RuntimeVersionStream::Stderr => (&version.stderr_sha256, &version.stdout_sha256),
     };
-    ["", "\n", "\r\n"].iter().any(|line_ending| {
+    let mut selected_matches = false;
+    for line_ending in ["", "\n", "\r\n"] {
+        if product.len() + line_ending.len() > super::super::RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES {
+            continue;
+        }
         let mut output = String::with_capacity(product.len() + line_ending.len());
         output.push_str(&product);
         output.push_str(line_ending);
-        Sha256Digest::from_bytes(output.as_bytes()) == *selected_digest
-    })
+        let digest = Sha256Digest::from_bytes(output.as_bytes());
+        if digest == *unselected_digest {
+            return false;
+        }
+        selected_matches |= digest == *selected_digest;
+    }
+    selected_matches
 }
 
 fn attempts_are_valid(form: RuntimeCommandForm, attempts: &[RuntimeResolutionAttempt]) -> bool {

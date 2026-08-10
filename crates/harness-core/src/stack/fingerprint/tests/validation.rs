@@ -164,6 +164,22 @@ fn selected_output_digest_matches_runtime_version_grammar() {
                 let version =
                     RuntimeVersionFacts::new("1.2.3".to_owned(), stdout, stderr, stream).unwrap();
                 assert!(successful_payload(kind, version).is_ok());
+
+                let competing_ending = if line_ending.is_empty() { "\n" } else { "" };
+                let competing =
+                    Sha256Digest::from_bytes(format!("{product}{competing_ending}").as_bytes());
+                let (ambiguous_stdout, ambiguous_stderr) = match stream {
+                    RuntimeVersionStream::Stdout => (selected.clone(), competing),
+                    RuntimeVersionStream::Stderr => (competing, selected.clone()),
+                };
+                let ambiguous = RuntimeVersionFacts::new(
+                    "1.2.3".to_owned(),
+                    ambiguous_stdout,
+                    ambiguous_stderr,
+                    stream,
+                )
+                .unwrap();
+                assert!(successful_payload(kind, ambiguous).is_err());
             }
         }
 
@@ -175,6 +191,61 @@ fn selected_output_digest_matches_runtime_version_grammar() {
         )
         .unwrap();
         assert!(successful_payload(kind, impossible).is_err());
+    }
+}
+
+#[test]
+fn version_product_line_respects_output_capture_ceiling() {
+    for (kind, product_prefix, product_suffix) in [
+        (LocalExecutableRuntimeKind::CodexExec, "codex-cli ", ""),
+        (LocalExecutableRuntimeKind::CodexJsonrpc, "codex-cli ", ""),
+        (LocalExecutableRuntimeKind::ClaudeCode, "", " (Claude Code)"),
+    ] {
+        for line_ending in ["", "\n", "\r\n"] {
+            let version_prefix = "1.2.3+";
+            let fixed_output_bytes = product_prefix.len()
+                + version_prefix.len()
+                + product_suffix.len()
+                + line_ending.len();
+            let normalized_version = format!(
+                "{version_prefix}{}",
+                "a".repeat(RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES - fixed_output_bytes)
+            );
+            let product = format!("{product_prefix}{normalized_version}{product_suffix}");
+            let exact_output = format!("{product}{line_ending}");
+            assert_eq!(exact_output.len(), RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES);
+
+            let oversized_version = format!("{normalized_version}a");
+            let oversized_output =
+                format!("{product_prefix}{oversized_version}{product_suffix}{line_ending}");
+            assert_eq!(
+                oversized_output.len(),
+                RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES + 1
+            );
+
+            for stream in [RuntimeVersionStream::Stdout, RuntimeVersionStream::Stderr] {
+                let blank = Sha256Digest::from_bytes(b"");
+                let exact_digest = Sha256Digest::from_bytes(exact_output.as_bytes());
+                let (stdout, stderr) = match stream {
+                    RuntimeVersionStream::Stdout => (exact_digest, blank.clone()),
+                    RuntimeVersionStream::Stderr => (blank.clone(), exact_digest),
+                };
+                let exact =
+                    RuntimeVersionFacts::new(normalized_version.clone(), stdout, stderr, stream)
+                        .unwrap();
+                assert!(successful_payload(kind, exact).is_ok());
+
+                let oversized_digest = Sha256Digest::from_bytes(oversized_output.as_bytes());
+                let (stdout, stderr) = match stream {
+                    RuntimeVersionStream::Stdout => (oversized_digest, blank.clone()),
+                    RuntimeVersionStream::Stderr => (blank.clone(), oversized_digest),
+                };
+                let oversized =
+                    RuntimeVersionFacts::new(oversized_version.clone(), stdout, stderr, stream)
+                        .unwrap();
+                assert!(successful_payload(kind, oversized).is_err());
+            }
+        }
     }
 }
 

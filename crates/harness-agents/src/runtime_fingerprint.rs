@@ -118,14 +118,15 @@ pub use executable::{
     classify_static_linux_elf, runtime_working_directory_identity_digest, LinuxElfArchitecture,
     LinuxStaticElfClassification,
 };
-pub use harness_core::stack::fingerprint::RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES;
+pub use harness_core::stack::fingerprint::{
+    RUNTIME_FINGERPRINT_MAX_EXECUTABLE_BYTES, RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES,
+};
 pub use windows_candidate::WindowsResolvedCandidate;
 pub use windows_resolution::{
     resolve_windows_command, WindowsResolution, WindowsResolutionContextEvidence,
     WindowsResolutionInput,
 };
 
-pub const RUNTIME_FINGERPRINT_MAX_OUTPUT_BYTES: usize = 65_536;
 pub const RUNTIME_FINGERPRINT_MAX_LAUNCH_INPUT_UNITS: usize = 65_536;
 pub const RUNTIME_FINGERPRINT_MAX_OBSERVATION_ENV_ENTRIES: usize = 1_024;
 pub const RUNTIME_FINGERPRINT_MAX_ENVIRONMENT_KEY_UNITS: usize = 1_024;
