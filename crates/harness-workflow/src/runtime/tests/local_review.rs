@@ -224,6 +224,124 @@ fn local_review_changes_requested_uses_completed_command_dedupe_key() {
 }
 
 #[test]
+fn local_review_passed_result_routes_to_awaiting_feedback() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Local review passed.")
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_PASSED_SIGNAL,
+            json!({ "pr_number": 77 }),
+        ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("local review pass should wait for remote feedback");
+
+    assert_eq!(decision.decision, "local_review_passed");
+    assert_eq!(decision.next_state, "awaiting_feedback");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(decision.commands[0].command_type, WorkflowCommandType::Wait);
+    assert_eq!(
+        decision.commands[0].dedupe_key,
+        "local-review:job-1:77:passed"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("local review passed decision should validate");
+}
+
+#[test]
+fn local_review_changes_requested_result_routes_to_feedback_repair() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Local review requested fixes.")
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+            }),
+        ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("local review changes should request repair");
+
+    assert_eq!(decision.decision, "address_local_review_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
+    assert_eq!(
+        decision.commands[0].dedupe_key,
+        format!("local-review:{}:77:address:command-1", instance.id)
+    );
+    assert_eq!(decision.commands[0].command["source"], "local_review");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("local review changes-requested decision should validate");
+}
+
+#[test]
+fn local_review_blocked_result_routes_to_blocked() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(
+        LOCAL_REVIEW_ACTIVITY,
+        "Local review could not inspect the PR context.",
+    )
+    .with_signal(ActivitySignal::new(
+        super::super::LOCAL_REVIEW_BLOCKED_SIGNAL,
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+        }),
+    ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("local review blocked should block workflow");
+
+    assert_eq!(decision.decision, "local_review_blocked");
+    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkBlocked
+    );
+    assert_eq!(
+        decision.commands[0].dedupe_key,
+        "local-review:job-1:77:blocked"
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("local review blocked decision should validate");
+}
+
+#[test]
 fn local_review_success_without_outcome_signal_blocks_invalid_output() {
     let instance = issue_instance("local_review_gate");
     let result = ActivityResult::succeeded(
