@@ -1,11 +1,13 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
+use harness_workflow::runtime::eval::model::EvalGrade;
 use harness_workflow::runtime::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
     parse_benchmark_manifest_str, EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseTransitionKind,
     EvalReportCaseStatus, EvalRunReport, EvalRunReportDiff,
 };
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +50,12 @@ pub struct EvalDiffArgs {
     pub baseline: PathBuf,
     /// Candidate eval run report JSON
     pub candidate: PathBuf,
+    /// Fail when pass@1 or pass^k drops by more than this amount
+    #[arg(long)]
+    pub max_pass_drop: Option<f64>,
+    /// Fail when a previously passing case newly fails an F-cap hard gate
+    #[arg(long)]
+    pub fail_on_new_f_gate: bool,
     /// Print JSON instead of the compact text diff
     #[arg(long)]
     pub json: bool,
@@ -104,7 +112,12 @@ fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
         );
     }
     let diff = diff_eval_run_reports(&baseline, &candidate);
-    emit_diff(&diff, args.json, args.output.as_deref())
+    let regressions = eval_diff_regressions(&baseline, &candidate, &diff, &args)?;
+    emit_diff(&diff, args.json, args.output.as_deref())?;
+    if regressions.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!("eval regression gate failed:\n{}", regressions.join("\n"))
 }
 
 fn read_eval_manifest(path: &Path) -> anyhow::Result<EvalBenchmarkManifest> {
@@ -225,6 +238,20 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
                 case.missing_evidence.join(", ")
             ));
         }
+        if let Some(final_grade) = case.final_grade {
+            output.push_str(&format!("  final_grade: {}\n", grade_label(final_grade)));
+        }
+        if !case.failed_hard_gates.is_empty() {
+            let gates = case
+                .failed_hard_gates
+                .iter()
+                .map(|gate| {
+                    let cap = gate.grade_cap.map(grade_label).unwrap_or("none");
+                    format!("{:?}(cap={cap})", gate.name)
+                })
+                .collect::<Vec<_>>();
+            output.push_str(&format!("  failed_hard_gates: {}\n", gates.join(", ")));
+        }
     }
     output
 }
@@ -281,6 +308,85 @@ fn transition_kind_label(kind: EvalCaseTransitionKind) -> &'static str {
     }
 }
 
+fn grade_label(grade: EvalGrade) -> &'static str {
+    match grade {
+        EvalGrade::F => "F",
+        EvalGrade::D => "D",
+        EvalGrade::C => "C",
+        EvalGrade::B => "B",
+        EvalGrade::A => "A",
+    }
+}
+
+fn eval_diff_regressions(
+    baseline: &EvalRunReport,
+    candidate: &EvalRunReport,
+    diff: &EvalRunReportDiff,
+    args: &EvalDiffArgs,
+) -> anyhow::Result<Vec<String>> {
+    let mut regressions = Vec::new();
+    if let Some(max_pass_drop) = args.max_pass_drop {
+        if !max_pass_drop.is_finite() || !(0.0..=1.0).contains(&max_pass_drop) {
+            anyhow::bail!("--max-pass-drop must be between 0.0 and 1.0");
+        }
+        if diff.delta.pass_at_1_delta < -max_pass_drop {
+            regressions.push(format!(
+                "pass@1 drop {:+.4} exceeded max drop {:.4}",
+                diff.delta.pass_at_1_delta, max_pass_drop
+            ));
+        }
+        if diff.delta.pass_to_k_delta < -max_pass_drop {
+            regressions.push(format!(
+                "pass^{} drop {:+.4} exceeded max drop {:.4}",
+                diff.k, diff.delta.pass_to_k_delta, max_pass_drop
+            ));
+        }
+    }
+
+    if args.fail_on_new_f_gate {
+        regressions.extend(new_f_cap_gate_regressions(baseline, candidate));
+    }
+    Ok(regressions)
+}
+
+fn new_f_cap_gate_regressions(baseline: &EvalRunReport, candidate: &EvalRunReport) -> Vec<String> {
+    let baseline_by_case = baseline
+        .cases
+        .iter()
+        .map(|case| (case.case_id.as_str(), case))
+        .collect::<BTreeMap<_, _>>();
+
+    candidate
+        .cases
+        .iter()
+        .filter_map(|candidate_case| {
+            let baseline_case = baseline_by_case.get(candidate_case.case_id.as_str())?;
+            if !baseline_case.passed || candidate_case.passed {
+                return None;
+            }
+            let gates = candidate_case
+                .failed_hard_gates
+                .iter()
+                .filter(|gate| gate.grade_cap == Some(EvalGrade::F))
+                .filter(|gate| {
+                    !baseline_case.failed_hard_gates.iter().any(|baseline_gate| {
+                        baseline_gate.name == gate.name
+                            && baseline_gate.grade_cap == Some(EvalGrade::F)
+                    })
+                })
+                .map(|gate| format!("{:?}", gate.name))
+                .collect::<Vec<_>>();
+            (!gates.is_empty()).then(|| {
+                format!(
+                    "{} newly failed F-cap hard gate(s): {}",
+                    candidate_case.case_id,
+                    gates.join(", ")
+                )
+            })
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum EvidenceInput {
@@ -293,9 +399,11 @@ mod tests {
     use super::super::{Cli, Command};
     use super::*;
     use clap::Parser;
-    use harness_workflow::runtime::eval::model::{Confidence, UsageSnapshot};
+    use harness_workflow::runtime::eval::model::{
+        Confidence, EvalGrade, HardGateName, UsageSnapshot,
+    };
     use harness_workflow::runtime::{
-        EvalEvidenceStatus, EvalQualityGateEvidence, EvalSubmissionEvidence,
+        EvalEvidenceStatus, EvalQualityGateEvidence, EvalReportFailedGate, EvalSubmissionEvidence,
     };
 
     fn sample_eval_manifest() -> EvalBenchmarkManifest {
@@ -363,6 +471,9 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             "diff",
             "baseline.json",
             "candidate.json",
+            "--max-pass-drop",
+            "0.1",
+            "--fail-on-new-f-gate",
             "--json",
         ])
         .unwrap_or_else(|error| panic!("eval diff command should parse: {error}"));
@@ -372,6 +483,8 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             } => {
                 assert_eq!(args.baseline, PathBuf::from("baseline.json"));
                 assert_eq!(args.candidate, PathBuf::from("candidate.json"));
+                assert_eq!(args.max_pass_drop, Some(0.1));
+                assert!(args.fail_on_new_f_gate);
                 assert!(args.json);
             }
             _ => panic!("expected eval diff command"),
@@ -529,6 +642,8 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         let error = match diff_eval_reports(EvalDiffArgs {
             baseline: baseline_path.clone(),
             candidate: candidate_path.clone(),
+            max_pass_drop: None,
+            fail_on_new_f_gate: false,
             json: false,
             output: None,
         }) {
@@ -549,6 +664,8 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         let error = match diff_eval_reports(EvalDiffArgs {
             baseline: baseline_path,
             candidate: candidate_path,
+            max_pass_drop: None,
+            fail_on_new_f_gate: false,
             json: false,
             output: None,
         }) {
@@ -557,6 +674,154 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         };
 
         assert!(error.to_string().contains("different k values"));
+    }
+
+    #[test]
+    fn eval_report_diff_preserves_exit_zero_without_gate_flags() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let baseline_path = tempdir.path().join("baseline.json");
+        let candidate_path = tempdir.path().join("candidate.json");
+        let baseline = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "baseline",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Passed,
+                vec![usage_snapshot(100, 40)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("baseline report should build: {error}"));
+        let candidate = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "candidate",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Failed,
+                vec![usage_snapshot(80, 30)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
+        write_report(&baseline_path, &baseline);
+        write_report(&candidate_path, &candidate);
+
+        diff_eval_reports(EvalDiffArgs {
+            baseline: baseline_path,
+            candidate: candidate_path,
+            max_pass_drop: None,
+            fail_on_new_f_gate: false,
+            json: false,
+            output: None,
+        })
+        .unwrap_or_else(|error| panic!("ungated diff should stay exit-zero: {error}"));
+    }
+
+    #[test]
+    fn eval_report_diff_fails_when_pass_drop_exceeds_threshold() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let baseline_path = tempdir.path().join("baseline.json");
+        let candidate_path = tempdir.path().join("candidate.json");
+        let baseline = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "baseline",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Passed,
+                vec![usage_snapshot(100, 40)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("baseline report should build: {error}"));
+        let candidate = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "candidate",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Failed,
+                vec![usage_snapshot(80, 30)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
+        write_report(&baseline_path, &baseline);
+        write_report(&candidate_path, &candidate);
+
+        let error = match diff_eval_reports(EvalDiffArgs {
+            baseline: baseline_path,
+            candidate: candidate_path,
+            max_pass_drop: Some(0.1),
+            fail_on_new_f_gate: false,
+            json: false,
+            output: None,
+        }) {
+            Ok(_) => panic!("threshold breach should fail"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("pass@1 drop"));
+        assert!(message.contains("pass^3 drop"));
+    }
+
+    #[test]
+    fn eval_report_diff_fails_on_new_f_cap_gate_when_enabled() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let baseline_path = tempdir.path().join("baseline.json");
+        let candidate_path = tempdir.path().join("candidate.json");
+        let baseline = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "baseline",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Passed,
+                vec![usage_snapshot(100, 40)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("baseline report should build: {error}"));
+        let mut candidate = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "candidate",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Failed,
+                vec![usage_snapshot(80, 30)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
+        candidate.cases[0].failed_hard_gates = vec![EvalReportFailedGate {
+            name: HardGateName::TargetCorrectness,
+            grade_cap: Some(EvalGrade::F),
+        }];
+        write_report(&baseline_path, &baseline);
+        write_report(&candidate_path, &candidate);
+
+        let error = match diff_eval_reports(EvalDiffArgs {
+            baseline: baseline_path,
+            candidate: candidate_path,
+            max_pass_drop: None,
+            fail_on_new_f_gate: true,
+            json: false,
+            output: None,
+        }) {
+            Ok(_) => panic!("new F-cap gate should fail"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("case-pass"));
+        assert!(message.contains("TargetCorrectness"));
     }
 
     #[test]
@@ -600,6 +865,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                 validation_passed: true,
                 validation_commands: vec!["cargo test".to_string()],
             }),
+            quality: None,
             missing_evidence,
         }
     }
@@ -619,5 +885,14 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             token_confidence: Confidence::Observed,
             cost_confidence: Confidence::Estimated,
         }
+    }
+
+    fn write_report(path: &Path, report: &EvalRunReport) {
+        fs::write(
+            path,
+            serde_json::to_string_pretty(report)
+                .unwrap_or_else(|error| panic!("report should serialize: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("report should write: {error}"));
     }
 }
