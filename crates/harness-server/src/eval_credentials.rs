@@ -1,8 +1,10 @@
 use chrono::{DateTime, Utc};
+use harness_core::agent::AGENT_SECRETLESS_ENV_ENV;
 use harness_workflow::runtime::RuntimeJob;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::fmt;
 
 pub(crate) const EVAL_CREDENTIAL_ENVIRONMENT_SCHEMA_VERSION: &str =
@@ -10,14 +12,12 @@ pub(crate) const EVAL_CREDENTIAL_ENVIRONMENT_SCHEMA_VERSION: &str =
 
 const DEFAULT_PLAIN_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
-    "HOME",
     "USER",
     "LOGNAME",
     "SHELL",
     "TMPDIR",
     "TEMP",
     "TMP",
-    "CARGO_HOME",
     "CARGO_TARGET_DIR",
     "RUSTUP_HOME",
     "RUST_BACKTRACE",
@@ -46,7 +46,7 @@ pub(crate) struct StrippedEvalEnvKey {
     pub class: EvalSecretEnvClass,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct EvalCredentialRequirement {
     pub id: String,
     pub env_var: String,
@@ -55,7 +55,7 @@ pub(crate) struct EvalCredentialRequirement {
     pub required: bool,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct EvalCredentialGrant {
     pub requirement_id: String,
     pub env_var: String,
@@ -167,6 +167,12 @@ pub(crate) enum EvalCredentialEnvironmentError {
     DuplicateCredentialEnvVar {
         env_var: String,
     },
+    InvalidCredentialRequirements {
+        error: String,
+    },
+    InvalidCredentialGrants {
+        error: String,
+    },
 }
 
 impl fmt::Display for EvalCredentialEnvironmentError {
@@ -214,6 +220,12 @@ impl fmt::Display for EvalCredentialEnvironmentError {
             Self::DuplicateCredentialEnvVar { env_var } => {
                 write!(f, "multiple credential grants target env var `{env_var}`")
             }
+            Self::InvalidCredentialRequirements { error } => {
+                write!(f, "invalid credential requirements: {error}")
+            }
+            Self::InvalidCredentialGrants { error } => {
+                write!(f, "invalid credential grants: {error}")
+            }
         }
     }
 }
@@ -227,16 +239,31 @@ pub(crate) fn default_plain_env_allowlist() -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn build_default_eval_command_environment() -> EvalCredentialEnvironment {
-    let ambient = std::env::vars().collect::<HashMap<_, _>>();
-    build_eval_credential_environment(
-        &ambient,
-        &default_plain_env_allowlist(),
-        &[],
-        &[],
-        Utc::now(),
-    )
-    .expect("default eval command environment has no credential grants")
+pub(crate) fn eval_credential_environment_for_job(
+    job: &RuntimeJob,
+) -> Result<Option<EvalCredentialEnvironment>, EvalCredentialEnvironmentError> {
+    if !is_eval_runtime_job(job) {
+        return Ok(None);
+    }
+    let ambient = ambient_env_utf8();
+    eval_credential_environment_for_job_with_ambient(job, &ambient).map(Some)
+}
+
+pub(crate) fn apply_eval_environment_to_spawn_env(
+    job: &RuntimeJob,
+    env_vars: &mut HashMap<String, String>,
+) -> Result<Option<EvalCredentialEnvironmentAudit>, EvalCredentialEnvironmentError> {
+    let Some(environment) = eval_credential_environment_for_job(job)? else {
+        return Ok(None);
+    };
+    env_vars.extend(
+        environment
+            .variables()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    env_vars.insert(AGENT_SECRETLESS_ENV_ENV.to_string(), "1".to_string());
+    Ok(Some(environment.audit().clone()))
 }
 
 pub(crate) fn build_eval_credential_environment(
@@ -319,26 +346,34 @@ pub(crate) fn build_eval_credential_environment(
     })
 }
 
-pub(crate) fn runtime_host_eval_environment_policy(
+pub(crate) fn runtime_host_eval_environment(
     job: &RuntimeJob,
-) -> Option<EvalCredentialEnvironmentAudit> {
+) -> Result<Option<EvalCredentialEnvironment>, EvalCredentialEnvironmentError> {
     if !is_eval_runtime_job(job) {
-        return None;
+        return Ok(None);
     }
+    eval_credential_environment_for_job_with_ambient(job, &HashMap::new()).map(Some)
+}
+
+fn eval_credential_environment_for_job_with_ambient(
+    job: &RuntimeJob,
+    ambient_env: &HashMap<String, String>,
+) -> Result<EvalCredentialEnvironment, EvalCredentialEnvironmentError> {
     let allowlist =
         plain_env_allowlist_from_job_input(&job.input).unwrap_or_else(default_plain_env_allowlist);
-    let environment =
-        build_eval_credential_environment(&HashMap::new(), &allowlist, &[], &[], Utc::now())
-            .expect("runtime-host eval policy has no credential grants");
-    Some(environment.audit().clone())
+    let requirements = credential_requirements_from_job_input(&job.input)?;
+    let grants = credential_grants_from_job_input(&job.input)?;
+    build_eval_credential_environment(ambient_env, &allowlist, &requirements, &grants, Utc::now())
 }
 
 pub(crate) fn attach_runtime_host_eval_environment_policy(
     job: &mut RuntimeJob,
-) -> Option<EvalCredentialEnvironmentAudit> {
-    let credential_environment = runtime_host_eval_environment_policy(job)?;
-    attach_eval_policy_to_input(&mut job.input, &credential_environment);
-    Some(credential_environment)
+) -> Result<Option<EvalCredentialEnvironment>, EvalCredentialEnvironmentError> {
+    let Some(credential_environment) = runtime_host_eval_environment(job)? else {
+        return Ok(None);
+    };
+    attach_eval_policy_to_input(&mut job.input, credential_environment.audit());
+    Ok(Some(credential_environment))
 }
 
 fn requirements_by_id(
@@ -418,6 +453,9 @@ pub(crate) fn secret_env_class(key: &str) -> Option<EvalSecretEnvClass> {
     if is_wrapper_env(&key) {
         return Some(EvalSecretEnvClass::Wrapper);
     }
+    if is_credential_path_env(&key) {
+        return Some(EvalSecretEnvClass::Generic);
+    }
     if is_provider_env(&key) {
         return Some(EvalSecretEnvClass::Provider);
     }
@@ -475,13 +513,21 @@ fn is_github_env(key: &str) -> bool {
 }
 
 fn is_cloud_env(key: &str) -> bool {
-    key.starts_with("AWS_")
-        || key.starts_with("AZURE_")
-        || key.starts_with("GCLOUD_")
-        || key.starts_with("GCP_")
-        || key.starts_with("CLOUDSDK_")
+    matches!(
+        key,
+        "AWS_ACCESS_KEY_ID"
+            | "AWS_SECRET_ACCESS_KEY"
+            | "AWS_SESSION_TOKEN"
+            | "AWS_SECURITY_TOKEN"
+            | "AWS_WEB_IDENTITY_TOKEN_FILE"
+            | "AZURE_CLIENT_CERTIFICATE_PATH"
+            | "AZURE_CLIENT_SECRET"
+            | "AZURE_FEDERATED_TOKEN_FILE"
+            | "CLOUDSDK_AUTH_ACCESS_TOKEN"
+            | "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"
+            | "GCP_SERVICE_ACCOUNT_KEY"
+    ) || key.ends_with("_CREDENTIALS_FILE")
         || key == "GOOGLE_APPLICATION_CREDENTIALS"
-        || key == "GOOGLE_CLOUD_PROJECT"
         || key == "KUBECONFIG"
         || key == "DOCKER_CONFIG"
 }
@@ -503,6 +549,19 @@ fn is_generic_secret_env(key: &str) -> bool {
         || key.contains("CREDENTIAL")
 }
 
+fn is_credential_path_env(key: &str) -> bool {
+    matches!(
+        key,
+        "HOME"
+            | "CARGO_HOME"
+            | "NETRC"
+            | "NPM_CONFIG_USERCONFIG"
+            | "PIP_CONFIG_FILE"
+            | "DOCKER_CONFIG"
+            | "KUBECONFIG"
+    )
+}
+
 fn is_eval_runtime_job(job: &RuntimeJob) -> bool {
     job.input.get("eval").is_some() || job.input.pointer("/command/eval").is_some()
 }
@@ -510,6 +569,31 @@ fn is_eval_runtime_job(job: &RuntimeJob) -> bool {
 fn plain_env_allowlist_from_job_input(input: &Value) -> Option<Vec<String>> {
     value_string_array(input.pointer("/eval/plain_env_allowlist"))
         .or_else(|| value_string_array(input.pointer("/command/eval/plain_env_allowlist")))
+}
+
+fn credential_requirements_from_job_input(
+    input: &Value,
+) -> Result<Vec<EvalCredentialRequirement>, EvalCredentialEnvironmentError> {
+    parse_eval_array(input, "credential_requirements")
+        .map_err(|error| EvalCredentialEnvironmentError::InvalidCredentialRequirements { error })
+}
+
+fn credential_grants_from_job_input(
+    input: &Value,
+) -> Result<Vec<EvalCredentialGrant>, EvalCredentialEnvironmentError> {
+    parse_eval_array(input, "credential_grants")
+        .map_err(|error| EvalCredentialEnvironmentError::InvalidCredentialGrants { error })
+}
+
+fn parse_eval_array<T: for<'de> Deserialize<'de>>(
+    input: &Value,
+    field: &str,
+) -> Result<Vec<T>, String> {
+    let pointers = [format!("/eval/{field}"), format!("/command/eval/{field}")];
+    let Some(value) = pointers.iter().find_map(|pointer| input.pointer(pointer)) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(value.clone()).map_err(|error| error.to_string())
 }
 
 fn attach_eval_policy_to_input(input: &mut Value, policy: &EvalCredentialEnvironmentAudit) {
@@ -537,263 +621,16 @@ fn value_string_array(value: Option<&Value>) -> Option<Vec<String>> {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-    use serde_json::json;
-
-    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect()
-    }
-
-    fn allowlist(keys: &[&str]) -> Vec<String> {
-        keys.iter().map(|key| key.to_string()).collect()
-    }
-
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).single().unwrap()
-    }
-
-    fn requirement() -> EvalCredentialRequirement {
-        EvalCredentialRequirement {
-            id: "github-pr-write".to_string(),
-            env_var: "GITHUB_TOKEN".to_string(),
-            scope: vec!["repo:owner/repo:pull_request:write".to_string()],
-            audience: "github.com".to_string(),
-            required: true,
-        }
-    }
-
-    fn grant(value: &str, expires_at: DateTime<Utc>) -> EvalCredentialGrant {
-        EvalCredentialGrant {
-            requirement_id: "github-pr-write".to_string(),
-            env_var: "GITHUB_TOKEN".to_string(),
-            issuer: "github_app_installation".to_string(),
-            scope: vec!["repo:owner/repo:pull_request:write".to_string()],
-            audience: "github.com".to_string(),
-            expires_at,
-            value: value.to_string(),
-        }
-    }
-
-    #[test]
-    fn eval_credentials_builds_environment_from_plain_allowlist() {
-        let environment = build_eval_credential_environment(
-            &env(&[("PATH", "/bin"), ("SAFE_FLAG", "1"), ("UNLISTED", "hidden")]),
-            &allowlist(&["PATH", "SAFE_FLAG"]),
-            &[],
-            &[],
-            at(100),
-        )
-        .unwrap();
-
-        assert_eq!(environment.variables()["PATH"], "/bin");
-        assert_eq!(environment.variables()["SAFE_FLAG"], "1");
-        assert!(!environment.variables().contains_key("UNLISTED"));
-        assert_eq!(environment.audit().plain_env_keys, ["PATH", "SAFE_FLAG"]);
-    }
-
-    #[test]
-    fn eval_credentials_strips_provider_github_cloud_ssh_and_wrapper_secrets() {
-        let environment = build_eval_credential_environment(
-            &env(&[
-                ("OPENAI_API_KEY", "sk-secret-provider"),
-                ("GITHUB_TOKEN", "ghp-secret"),
-                ("AWS_ACCESS_KEY_ID", "cloud-secret"),
-                ("SSH_AUTH_SOCK", "/tmp/ssh.sock"),
-                ("CLAUDE_CODE_ENTRYPOINT", "wrapper"),
-                ("SAFE_FLAG", "ok"),
-            ]),
-            &allowlist(&[
-                "OPENAI_API_KEY",
-                "GITHUB_TOKEN",
-                "AWS_ACCESS_KEY_ID",
-                "SSH_AUTH_SOCK",
-                "CLAUDE_CODE_ENTRYPOINT",
-                "SAFE_FLAG",
-            ]),
-            &[],
-            &[],
-            at(100),
-        )
-        .unwrap();
-
-        assert_eq!(environment.variables().len(), 1);
-        assert_eq!(environment.variables()["SAFE_FLAG"], "ok");
-        let stripped = environment
-            .audit()
-            .stripped_env
-            .iter()
-            .map(|item| (item.key.as_str(), item.class))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            stripped,
-            [
-                ("AWS_ACCESS_KEY_ID", EvalSecretEnvClass::Cloud),
-                ("CLAUDE_CODE_ENTRYPOINT", EvalSecretEnvClass::Wrapper),
-                ("GITHUB_TOKEN", EvalSecretEnvClass::GitHub),
-                ("OPENAI_API_KEY", EvalSecretEnvClass::Provider),
-                ("SSH_AUTH_SOCK", EvalSecretEnvClass::Ssh),
-            ]
-        );
-    }
-
-    #[test]
-    fn eval_credentials_records_grant_metadata_without_secret_value() {
-        let secret = "ghs_very_secret_runtime_token";
-        let requirement = requirement();
-        let grant = grant(secret, at(200));
-        let environment = build_eval_credential_environment(
-            &env(&[("PATH", "/bin")]),
-            &allowlist(&["PATH"]),
-            std::slice::from_ref(&requirement),
-            std::slice::from_ref(&grant),
-            at(100),
-        )
-        .unwrap();
-
-        assert_eq!(environment.variables()["GITHUB_TOKEN"], secret);
-        let audit_json = serde_json::to_string(environment.audit()).unwrap();
-        assert!(audit_json.contains("github_app_installation"));
-        assert!(audit_json.contains("repo:owner/repo:pull_request:write"));
-        assert!(audit_json.contains("github.com"));
-        assert!(!audit_json.contains(secret));
-        assert!(!format!("{environment:?}").contains(secret));
-        assert!(!format!("{grant:?}").contains(secret));
-    }
-
-    #[test]
-    fn eval_credentials_rejects_expired_scope_and_audience_mismatched_grants() {
-        let requirement = requirement();
-
-        let expired = build_eval_credential_environment(
-            &env(&[]),
-            &[],
-            std::slice::from_ref(&requirement),
-            &[grant("secret", at(100))],
-            at(100),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            expired,
-            EvalCredentialEnvironmentError::ExpiredGrant { .. }
-        ));
-
-        let mut wrong_scope = grant("secret", at(200));
-        wrong_scope.scope = vec!["repo:owner/repo:contents:write".to_string()];
-        let scope_error = build_eval_credential_environment(
-            &env(&[]),
-            &[],
-            std::slice::from_ref(&requirement),
-            &[wrong_scope],
-            at(100),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            scope_error,
-            EvalCredentialEnvironmentError::GrantScopeMismatch { .. }
-        ));
-
-        let mut wrong_audience = grant("secret", at(200));
-        wrong_audience.audience = "api.github.com".to_string();
-        let audience_error = build_eval_credential_environment(
-            &env(&[]),
-            &[],
-            std::slice::from_ref(&requirement),
-            &[wrong_audience],
-            at(100),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            audience_error,
-            EvalCredentialEnvironmentError::GrantAudienceMismatch { .. }
-        ));
-    }
-
-    #[test]
-    fn eval_credentials_rejects_undeclared_or_missing_credential_requirements() {
-        let missing =
-            build_eval_credential_environment(&env(&[]), &[], &[requirement()], &[], at(100))
-                .unwrap_err();
-        assert!(matches!(
-            missing,
-            EvalCredentialEnvironmentError::MissingRequiredCredentialGrant { .. }
-        ));
-
-        let undeclared = build_eval_credential_environment(
-            &env(&[]),
-            &[],
-            &[],
-            &[grant("secret", at(200))],
-            at(100),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            undeclared,
-            EvalCredentialEnvironmentError::UndeclaredCredentialGrant { .. }
-        ));
-    }
-
-    #[test]
-    fn eval_credentials_runtime_host_policy_marks_eval_jobs_secretless() {
-        let mut job = RuntimeJob::pending(
-            "command-1",
-            harness_workflow::runtime::RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({
-                "activity": "implement_issue",
-                "command": {
-                    "eval": {
-                        "eval_run_id": "run-1",
-                        "plain_env_allowlist": ["SAFE_FLAG", "GITHUB_TOKEN"]
-                    }
-                }
-            }),
-        );
-        job.id = "runtime-job-1".to_string();
-
-        let policy = runtime_host_eval_environment_policy(&job).unwrap();
-
-        assert_eq!(policy.secret_inheritance, "empty_by_default");
-        assert_eq!(policy.plain_env_allowlist, ["GITHUB_TOKEN", "SAFE_FLAG"]);
-        assert!(policy.plain_env_keys.is_empty());
-        assert_eq!(policy.stripped_env.len(), 1);
-        assert_eq!(policy.stripped_env[0].key, "GITHUB_TOKEN");
-        assert_eq!(policy.stripped_env[0].class, EvalSecretEnvClass::GitHub);
-    }
-
-    #[test]
-    fn eval_credentials_attaches_policy_to_eval_runtime_job_payload() {
-        let mut job = RuntimeJob::pending(
-            "command-1",
-            harness_workflow::runtime::RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({
-                "activity": "implement_issue",
-                "command": {
-                    "eval": {
-                        "eval_run_id": "run-1",
-                        "plain_env_allowlist": ["PATH", "GITHUB_TOKEN"]
-                    }
-                }
-            }),
-        );
-        job.id = "runtime-job-1".to_string();
-
-        let policy = attach_runtime_host_eval_environment_policy(&mut job).unwrap();
-
-        assert_eq!(
-            job.input["command"]["eval"]["credential_environment"]["schema"],
-            EVAL_CREDENTIAL_ENVIRONMENT_SCHEMA_VERSION
-        );
-        assert_eq!(
-            job.input["command"]["eval"]["credential_environment"]["secret_inheritance"],
-            "empty_by_default"
-        );
-        assert_eq!(policy.stripped_env[0].key, "GITHUB_TOKEN");
-    }
+fn ambient_env_utf8() -> HashMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((os_string_to_string(key)?, os_string_to_string(value)?)))
+        .collect()
 }
+
+fn os_string_to_string(value: OsString) -> Option<String> {
+    value.into_string().ok()
+}
+
+#[cfg(test)]
+#[path = "eval_credentials_tests.rs"]
+mod eval_credentials_tests;

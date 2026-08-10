@@ -40,16 +40,19 @@ pub(super) async fn run_validation_commands(
     workspace_root: &Path,
     commands: &[String],
     timeout: Duration,
+    credential_environment: Option<&crate::eval_credentials::EvalCredentialEnvironment>,
 ) -> ServerValidationRun {
-    let credential_environment = crate::eval_credentials::build_default_eval_command_environment();
     if commands.iter().all(|command| command.trim().is_empty()) {
+        let mut digest = json!({
+            "commands": [],
+            "cwd": workspace_root.display().to_string(),
+            "startup_error": "validation_commands_missing",
+        });
+        if let Some(credential_environment) = credential_environment {
+            digest["credential_environment"] = json!(credential_environment.audit());
+        }
         return ServerValidationRun {
-            digest: json!({
-                "commands": [],
-                "cwd": workspace_root.display().to_string(),
-                "credential_environment": credential_environment.audit(),
-                "startup_error": "validation_commands_missing",
-            }),
+            digest,
             failure: Some(ServerValidationFailure {
                 error: "validation_commands_missing: the quality gate has no configured \
                         validation commands; an unvalidated gate never passes"
@@ -69,7 +72,7 @@ pub(super) async fn run_validation_commands(
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         let entry =
-            run_single_command(workspace_root, command, remaining, &credential_environment).await;
+            run_single_command(workspace_root, command, remaining, credential_environment).await;
         let failed = entry.get("exit_code").and_then(Value::as_i64) != Some(0)
             || entry.get("startup_error").is_some();
         entries.push(entry);
@@ -80,15 +83,15 @@ pub(super) async fn run_validation_commands(
         }
     }
 
-    ServerValidationRun {
-        digest: json!({
-            "commands": entries,
-            "cwd": workspace_root.display().to_string(),
-            "credential_environment": credential_environment.audit(),
-            "total_duration_ms": started.elapsed().as_millis() as u64,
-        }),
-        failure,
+    let mut digest = json!({
+        "commands": entries,
+        "cwd": workspace_root.display().to_string(),
+        "total_duration_ms": started.elapsed().as_millis() as u64,
+    });
+    if let Some(credential_environment) = credential_environment {
+        digest["credential_environment"] = json!(credential_environment.audit());
     }
+    ServerValidationRun { digest, failure }
 }
 
 fn server_validation_failure_for_entry(command: &str, entry: &Value) -> ServerValidationFailure {
@@ -117,7 +120,7 @@ async fn run_single_command(
     workspace_root: &Path,
     command: &str,
     timeout: Duration,
-    credential_environment: &crate::eval_credentials::EvalCredentialEnvironment,
+    credential_environment: Option<&crate::eval_credentials::EvalCredentialEnvironment>,
 ) -> Value {
     let started = Instant::now();
     let mut parts = command.split_whitespace();
@@ -128,11 +131,12 @@ async fn run_single_command(
     process
         .args(parts)
         .current_dir(workspace_root)
-        .env_clear()
-        .envs(credential_environment.variables())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if let Some(credential_environment) = credential_environment {
+        process.env_clear().envs(credential_environment.variables());
+    }
     let output = match tokio::time::timeout(timeout, process.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
@@ -245,6 +249,7 @@ mod tests {
             dir.path(),
             &["true".to_string(), "true".to_string()],
             Duration::from_secs(30),
+            None,
         )
         .await;
         assert!(run.failure.is_none());
@@ -305,7 +310,7 @@ test -n "$PATH" || exit 45
             dir.path(),
             command,
             Duration::from_secs(30),
-            &credential_environment,
+            Some(&credential_environment),
         )
         .await;
 
@@ -345,6 +350,7 @@ test -n "$PATH" || exit 45
             dir.path(),
             &["false".to_string(), "true".to_string()],
             Duration::from_secs(30),
+            None,
         )
         .await;
         assert!(run.failure.is_some());
@@ -364,7 +370,8 @@ test -n "$PATH" || exit 45
     async fn missing_commands_never_pass() {
         let dir = workspace();
         let run =
-            run_validation_commands(dir.path(), &[" ".to_string()], Duration::from_secs(5)).await;
+            run_validation_commands(dir.path(), &[" ".to_string()], Duration::from_secs(5), None)
+                .await;
         let failure = run.failure.as_ref().expect("missing commands must fail");
         assert!(failure.error.contains("validation_commands_missing"));
         let result = apply_server_validation(
@@ -383,6 +390,7 @@ test -n "$PATH" || exit 45
             dir.path(),
             &["definitely-not-a-real-binary-gh1766".to_string()],
             Duration::from_secs(5),
+            None,
         )
         .await;
         let failure = run.failure.as_ref().expect("spawn failure must fail");
@@ -403,6 +411,7 @@ test -n "$PATH" || exit 45
             dir.path(),
             &["sleep 5".to_string()],
             Duration::from_millis(100),
+            None,
         )
         .await;
         let failure = run.failure.as_ref().expect("timeout must fail");

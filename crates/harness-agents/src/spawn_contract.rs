@@ -28,7 +28,7 @@ use egress::{
 };
 use spawn_env::{
     container_env_vars, container_image, docker_process_env, host_process_env, isolation_tier,
-    network_allowlist, review_git_safe_workspace, ContainerEnv,
+    network_allowlist, review_git_safe_workspace, secretless_env_requested, ContainerEnv,
 };
 
 pub(crate) fn agent_container_image(env_vars: &HashMap<String, String>) -> String {
@@ -242,7 +242,7 @@ impl AgentSpawnContract for HostSpawn {
             current_dir: input.project_root.to_path_buf(),
             child_workspace: input.project_root.to_path_buf(),
             process_env,
-            clear_inherited_env: false,
+            clear_inherited_env: secretless_env_requested(input.env_vars),
             sandbox_engine: wrapped_command.engine,
             egress_proxy_lease: None,
             egress_verification: if egress_route.is_some() {

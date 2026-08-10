@@ -364,7 +364,61 @@ pub async fn claim_runtime_job_for_runtime_host(
     let runtime_job_id = job.id.clone();
     let lease_generation = job.lease_generation;
     let credential_environment =
-        crate::eval_credentials::attach_runtime_host_eval_environment_policy(&mut job);
+        match crate::eval_credentials::attach_runtime_host_eval_environment_policy(&mut job) {
+            Ok(environment) => environment,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        json!({ "error": format!("invalid eval credential environment: {error}") }),
+                    ),
+                );
+            }
+        };
+    if let Some(credential_environment) = credential_environment.as_ref() {
+        match store.get_command(&job.command_id).await {
+            Ok(Some(command)) => {
+                if let Err(error) = store
+                    .append_event(
+                        &command.workflow_id,
+                        "RuntimeHostEvalCredentialPolicyIssued",
+                        "runtime_host_claim",
+                        json!({
+                            "runtime_job_id": job.id.clone(),
+                            "host_id": host_id.clone(),
+                            "credential_environment": credential_environment.audit(),
+                        }),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        runtime_job_id = %job.id,
+                        host_id = %host_id,
+                        error = %error,
+                        "failed to persist remote eval credential policy audit"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "failed to persist eval credential policy audit" })),
+                    );
+                }
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "runtime job command missing during claim" })),
+                );
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        json!({ "error": format!("failed to load runtime job command: {error}") }),
+                    ),
+                );
+            }
+        }
+    }
     let mut response = json!({
         "claimed": true,
         "runtime_job": job,
@@ -373,7 +427,8 @@ pub async fn claim_runtime_job_for_runtime_host(
         "lease_generation": lease_generation,
     });
     if let Some(credential_environment) = credential_environment {
-        response["credential_environment"] = json!(credential_environment);
+        response["credential_environment"] = json!(credential_environment.audit());
+        response["credential_environment_variables"] = json!(credential_environment.variables());
     }
     (StatusCode::OK, Json(response))
 }

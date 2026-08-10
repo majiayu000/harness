@@ -255,6 +255,20 @@ async fn runtime_job_claim_endpoint_includes_eval_credential_environment_policy(
     assert_eq!(policy["stripped_env"][1]["key"], "GITHUB_TOKEN");
     assert_eq!(policy["stripped_env"][1]["class"], "github");
     assert_eq!(json["credential_environment"], *policy);
+    assert_eq!(
+        json["credential_environment_variables"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(0)
+    );
+    let events = store
+        .events_for("runtime-host-test-command-eval-credential-policy")
+        .await?;
+    assert!(events.iter().any(|event| {
+        event.event_type == "RuntimeHostEvalCredentialPolicyIssued"
+            && event.event["runtime_job_id"] == job.id
+            && event.event["credential_environment"] == *policy
+    }));
     Ok(())
 }
 

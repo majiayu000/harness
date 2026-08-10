@@ -13,6 +13,7 @@ pub const AGENT_NETWORK_ALLOWLIST_ENV: &str = "HARNESS_AGENT_NETWORK_ALLOWLIST";
 pub const AGENT_OUTPUT_SCHEMA_PATH_ENV: &str = "HARNESS_AGENT_OUTPUT_SCHEMA_PATH";
 pub const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
 pub const AGENT_EGRESS_PROXY_IMAGE_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY_IMAGE";
+pub const AGENT_SECRETLESS_ENV_ENV: &str = "HARNESS_AGENT_SECRETLESS_ENV";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

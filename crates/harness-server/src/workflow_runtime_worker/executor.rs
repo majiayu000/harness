@@ -217,6 +217,15 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 } else {
                     isolation_spawn_env_vars(&job)
                 };
+                if !correction_only {
+                    crate::eval_credentials::apply_eval_environment_to_spawn_env(
+                        &job,
+                        &mut env_vars,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("invalid eval credential environment: {error}")
+                    })?;
+                }
                 let permission_profile = RuntimePermissionProfile::resolve(
                     resolved_settings.permission_mode,
                     resolved_settings.allowed_tools.clone(),

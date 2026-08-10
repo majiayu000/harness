@@ -643,3 +643,41 @@ async fn host_spawn_filters_spawn_control_env() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn host_spawn_can_clear_inherited_environment() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut env_vars = HashMap::new();
+    env_vars.insert(AGENT_ISOLATION_TIER_ENV.to_string(), "host".to_string());
+    env_vars.insert(
+        harness_core::agent::AGENT_SECRETLESS_ENV_ENV.to_string(),
+        "1".to_string(),
+    );
+    env_vars.insert("PATH".to_string(), "/bin:/usr/bin".to_string());
+    env_vars.insert("GITHUB_TOKEN".to_string(), "scoped-token".to_string());
+    let args = vec![OsString::from("exec")];
+    let sandbox_spec = SandboxSpec::new(SandboxMode::DangerFullAccess, root.path());
+
+    let spawn = prepare_agent_spawn(input(
+        Path::new("codex"),
+        &args,
+        root.path(),
+        &sandbox_spec,
+        &env_vars,
+    ))
+    .await?;
+
+    assert!(spawn.clear_inherited_env);
+    assert_eq!(
+        spawn.process_env.get("PATH"),
+        Some(&"/bin:/usr/bin".to_string())
+    );
+    assert_eq!(
+        spawn.process_env.get("GITHUB_TOKEN"),
+        Some(&"scoped-token".to_string())
+    );
+    assert!(!spawn
+        .process_env
+        .contains_key(harness_core::agent::AGENT_SECRETLESS_ENV_ENV));
+    Ok(())
+}
