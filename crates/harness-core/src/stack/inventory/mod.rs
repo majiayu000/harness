@@ -6,6 +6,7 @@ use super::{
     AgentStackTrustLevel, Sha256Digest,
 };
 use cap_std::fs::{Dir, FileType, OpenOptions};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -72,7 +73,8 @@ impl AgentStackInventoryOptions {
 }
 
 /// Observed file or directory-presence class.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentStackEntryClass {
     RegularFile { unix_executable: Option<bool> },
     DirectoryPresence,

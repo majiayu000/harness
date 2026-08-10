@@ -11,6 +11,7 @@ mod inventory_tests;
 mod protective_control_diff;
 #[cfg(test)]
 mod protective_control_diff_tests;
+mod snapshot;
 mod source_locator;
 #[cfg(test)]
 mod tests;
@@ -25,6 +26,12 @@ pub use protective_control_diff::{
     AgentStackProtectionControlEvidence, AgentStackProtectionControlReason,
     AgentStackProtectionDiffKind, AgentStackProtectionFailureMode, AgentStackProtectionRole,
     AgentStackProtectionScope,
+};
+pub use snapshot::{
+    diff_agent_stack_snapshots, AgentStackSnapshot, AgentStackSnapshotChange,
+    AgentStackSnapshotChangeKind, AgentStackSnapshotChangedField, AgentStackSnapshotDiff,
+    AgentStackSnapshotDiffCounts, AgentStackSnapshotDiffError, AgentStackSnapshotEntry,
+    AgentStackSnapshotError, AgentStackSnapshotParseError, AgentStackSnapshotScope,
 };
 #[cfg(test)]
 use source_locator::root_keys_match_for_test;
