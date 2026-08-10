@@ -4,6 +4,7 @@ use harness_core::store_backend::{PostgresBackend, StoreLocation};
 use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
 use harness_exec::plan::ExecPlan;
 use sqlx::postgres::PgPool;
+use sqlx::{Postgres, Transaction};
 use std::path::Path;
 
 pub const PLAN_DB_SCHEMA: &str = "plan_db";
@@ -198,6 +199,25 @@ impl PlanDb {
         .bind(plan.id.as_str())
         .bind(&data)
         .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        plan: &ExecPlan,
+    ) -> anyhow::Result<()> {
+        let data = crate::jsonb::to_jsonb_string(plan)?;
+        sqlx::query(
+            "INSERT INTO exec_plans (store_key, id, data) VALUES ($1, $2, $3::jsonb)
+             ON CONFLICT(store_key, id) DO UPDATE SET data = EXCLUDED.data,
+                 updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(&self.store_key)
+        .bind(plan.id.as_str())
+        .bind(&data)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }

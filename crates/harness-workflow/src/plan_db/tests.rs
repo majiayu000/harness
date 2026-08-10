@@ -1,5 +1,7 @@
 use super::*;
-use crate::issue_lifecycle::IssueWorkflowStore;
+use crate::issue_lifecycle::{
+    IssueLifecycleEvent, IssueLifecycleEventKind, IssueWorkflowInstance, IssueWorkflowStore,
+};
 use crate::runtime::{WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject};
 use futures::FutureExt;
 use harness_core::db::{pg_open_pool, pg_open_pool_schematized, resolve_database_url, PgMigrator};
@@ -84,18 +86,22 @@ async fn shared_pool_stores_can_participate_in_one_transaction() -> anyhow::Resu
         let issue_store = IssueWorkflowStore::open_with_shared_pool(pool.clone()).await?;
         let runtime_store = WorkflowRuntimeStore::open_with_shared_pool(pool.clone()).await?;
 
+        let mut tx = pool.begin().await?;
         let plan = ExecPlan::from_spec("# Shared pool plan", Path::new("/tmp/shared-pool"))?;
-        plan_db.upsert(&plan).await?;
+        plan_db.upsert_in_tx(&mut tx, &plan).await?;
+        let mut issue_workflow =
+            IssueWorkflowInstance::new("/tmp/shared-pool", Some("owner/repo".to_string()), 1801);
+        issue_workflow.apply_event(
+            IssueLifecycleEvent::new(IssueLifecycleEventKind::IssueScheduled)
+                .with_task_id("shared-pool-task"),
+        )?;
         issue_store
-            .record_issue_scheduled(
-                "/tmp/shared-pool",
-                Some("owner/repo"),
-                1801,
-                "shared-pool-task",
-                &[],
-                false,
-            )
+            .upsert_workflow_in_tx(&mut tx, &issue_workflow)
             .await?;
+        assert_eq!(
+            issue_workflow.active_task_id.as_deref(),
+            Some("shared-pool-task")
+        );
         let instance = WorkflowInstance::new(
             "github_issue_pr",
             1,
@@ -103,9 +109,12 @@ async fn shared_pool_stores_can_participate_in_one_transaction() -> anyhow::Resu
             WorkflowSubject::new("issue", "1801"),
         )
         .with_id("shared-pool-workflow");
-        runtime_store.upsert_instance(&instance).await?;
+        assert!(
+            runtime_store
+                .insert_instance_if_absent_in_tx(&mut tx, &instance)
+                .await?
+        );
 
-        let mut tx = pool.begin().await?;
         let plan_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM exec_plans")
             .fetch_one(&mut *tx)
             .await?;
@@ -115,11 +124,20 @@ async fn shared_pool_stores_can_participate_in_one_transaction() -> anyhow::Resu
         let workflow_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_instances")
             .fetch_one(&mut *tx)
             .await?;
-        tx.commit().await?;
-
         assert_eq!(plan_count, 1);
         assert_eq!(issue_count, 1);
         assert_eq!(workflow_count, 1);
+        tx.rollback().await?;
+
+        assert!(plan_db.get(&plan.id).await?.is_none());
+        assert!(issue_store
+            .get_by_issue("/tmp/shared-pool", Some("owner/repo"), 1801)
+            .await?
+            .is_none());
+        assert!(runtime_store
+            .get_instance("shared-pool-workflow")
+            .await?
+            .is_none());
         Ok::<(), anyhow::Error>(())
     })
     .catch_unwind()

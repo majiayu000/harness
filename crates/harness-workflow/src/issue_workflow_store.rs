@@ -138,6 +138,24 @@ impl IssueWorkflowStore {
         Ok(())
     }
 
+    pub async fn upsert_workflow_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        workflow: &IssueWorkflowInstance,
+    ) -> anyhow::Result<()> {
+        let data = serde_json::to_string(workflow)?;
+        sqlx::query(
+            "INSERT INTO issue_workflows (id, data) VALUES ($1, $2)
+             ON CONFLICT(id) DO UPDATE SET data = EXCLUDED.data,
+                 updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(&workflow.id)
+        .bind(&data)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     pub async fn insert_if_absent(&self, workflow: &IssueWorkflowInstance) -> anyhow::Result<bool> {
         let data = serde_json::to_string(workflow)?;
         let result = sqlx::query(
@@ -597,18 +615,34 @@ impl IssueWorkflowStore {
             issue_number,
         );
         let mut tx = self.pool.begin().await?;
-        self.insert_placeholder(&mut tx, &wf_id, &placeholder)
+        let workflow = self
+            .update_issue_row_in_tx(&mut tx, &wf_id, &placeholder, repo, f)
             .await?;
+        tx.commit().await?;
+        Ok(workflow)
+    }
+
+    async fn update_issue_row_in_tx<F>(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        wf_id: &str,
+        placeholder: &IssueWorkflowInstance,
+        repo: Option<&str>,
+        f: F,
+    ) -> anyhow::Result<IssueWorkflowInstance>
+    where
+        F: FnOnce(&mut IssueWorkflowInstance) -> anyhow::Result<()>,
+    {
+        self.insert_placeholder(tx, wf_id, placeholder).await?;
         let mut workflow = self
-            .load_for_update_by_id(&mut tx, &wf_id)
+            .load_for_update_by_id(tx, wf_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("workflow row disappeared after placeholder insert"))?;
         if workflow.repo.is_none() {
             workflow.repo = repo.map(|r| r.to_string());
         }
         f(&mut workflow)?;
-        self.upsert_in_tx(&mut tx, &workflow).await?;
-        tx.commit().await?;
+        self.upsert_in_tx(tx, &workflow).await?;
         Ok(workflow)
     }
 
