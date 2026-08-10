@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const PASS_DROP_EPSILON: f64 = 1e-9;
+
 #[derive(Subcommand)]
 pub enum EvalCommand {
     /// Emit an eval report from a manifest and collected case evidence
@@ -329,13 +331,13 @@ fn eval_diff_regressions(
         if !max_pass_drop.is_finite() || !(0.0..=1.0).contains(&max_pass_drop) {
             anyhow::bail!("--max-pass-drop must be between 0.0 and 1.0");
         }
-        if diff.delta.pass_at_1_delta < -max_pass_drop {
+        if pass_drop_exceeds(diff.delta.pass_at_1_delta, max_pass_drop) {
             regressions.push(format!(
                 "pass@1 drop {:+.4} exceeded max drop {:.4}",
                 diff.delta.pass_at_1_delta, max_pass_drop
             ));
         }
-        if diff.delta.pass_to_k_delta < -max_pass_drop {
+        if pass_drop_exceeds(diff.delta.pass_to_k_delta, max_pass_drop) {
             regressions.push(format!(
                 "pass^{} drop {:+.4} exceeded max drop {:.4}",
                 diff.k, diff.delta.pass_to_k_delta, max_pass_drop
@@ -347,6 +349,10 @@ fn eval_diff_regressions(
         regressions.extend(new_f_cap_gate_regressions(baseline, candidate));
     }
     Ok(regressions)
+}
+
+fn pass_drop_exceeds(delta: f64, max_pass_drop: f64) -> bool {
+    -delta > max_pass_drop + PASS_DROP_EPSILON
 }
 
 fn new_f_cap_gate_regressions(baseline: &EvalRunReport, candidate: &EvalRunReport) -> Vec<String> {
@@ -361,7 +367,7 @@ fn new_f_cap_gate_regressions(baseline: &EvalRunReport, candidate: &EvalRunRepor
         .iter()
         .filter_map(|candidate_case| {
             let baseline_case = baseline_by_case.get(candidate_case.case_id.as_str())?;
-            if !baseline_case.passed || candidate_case.passed {
+            if !baseline_case.passed {
                 return None;
             }
             let gates = candidate_case
@@ -403,7 +409,8 @@ mod tests {
         Confidence, EvalGrade, HardGateName, UsageSnapshot,
     };
     use harness_workflow::runtime::{
-        EvalEvidenceStatus, EvalQualityGateEvidence, EvalReportFailedGate, EvalSubmissionEvidence,
+        EvalEvidenceStatus, EvalQualityGateEvidence, EvalReportCase, EvalReportFailedGate,
+        EvalReportMetrics, EvalSubmissionEvidence,
     };
 
     fn sample_eval_manifest() -> EvalBenchmarkManifest {
@@ -771,7 +778,29 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
     }
 
     #[test]
-    fn eval_report_diff_fails_on_new_f_cap_gate_when_enabled() {
+    fn eval_report_diff_allows_pass_drop_at_threshold() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let baseline_path = tempdir.path().join("baseline.json");
+        let candidate_path = tempdir.path().join("candidate.json");
+        let baseline = report_with_pass_count("baseline", 10, 8);
+        let candidate = report_with_pass_count("candidate", 10, 7);
+        write_report(&baseline_path, &baseline);
+        write_report(&candidate_path, &candidate);
+
+        diff_eval_reports(EvalDiffArgs {
+            baseline: baseline_path,
+            candidate: candidate_path,
+            max_pass_drop: Some(0.1),
+            fail_on_new_f_gate: false,
+            json: false,
+            output: None,
+        })
+        .unwrap_or_else(|error| panic!("exact threshold drop should pass: {error}"));
+    }
+
+    #[test]
+    fn eval_report_diff_fails_on_new_f_cap_gate_even_when_candidate_passed() {
         let tempdir = tempfile::tempdir()
             .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
         let baseline_path = tempdir.path().join("baseline.json");
@@ -794,7 +823,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             3,
             vec![case_evidence(
                 "case-pass",
-                EvalEvidenceStatus::Failed,
+                EvalEvidenceStatus::Passed,
                 vec![usage_snapshot(80, 30)],
                 Vec::new(),
             )],
@@ -884,6 +913,55 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             cost_usd_micros: Some(cost_usd_micros),
             token_confidence: Confidence::Observed,
             cost_confidence: Confidence::Estimated,
+        }
+    }
+
+    fn report_with_pass_count(run_id: &str, total_cases: u64, passed_cases: u64) -> EvalRunReport {
+        let pass_at_1 = passed_cases as f64 / total_cases as f64;
+        let cases = (0..total_cases)
+            .map(|index| {
+                let passed = index < passed_cases;
+                EvalReportCase {
+                    case_id: format!("case-{index:02}"),
+                    repo: "majiayu000/harness".to_string(),
+                    issue: 1400 + index,
+                    base_commit: "b308b380".to_string(),
+                    verify_commands: vec!["cargo test".to_string()],
+                    status: if passed {
+                        EvalReportCaseStatus::Passed
+                    } else {
+                        EvalReportCaseStatus::Failed
+                    },
+                    passed,
+                    final_grade: None,
+                    failed_hard_gates: Vec::new(),
+                    workflow_id: Some(format!("workflow-{index:02}")),
+                    total_tokens: 0,
+                    cost_usd_micros: 0,
+                    missing_evidence: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        EvalRunReport {
+            run_id: run_id.to_string(),
+            suite: "harness-core".to_string(),
+            k: 1,
+            metrics: EvalReportMetrics {
+                total_cases,
+                scored_cases: total_cases,
+                passed_cases,
+                failed_cases: total_cases - passed_cases,
+                pending_cases: 0,
+                infra_failed_cases: 0,
+                pass_at_1,
+                pass_to_k: pass_at_1,
+                total_tokens: 0,
+                avg_tokens_per_scored_case: Some(0.0),
+                total_cost_usd_micros: 0,
+                avg_cost_usd_micros_per_scored_case: Some(0.0),
+            },
+            cases,
         }
     }
 
