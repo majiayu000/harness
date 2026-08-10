@@ -576,6 +576,13 @@ mod tests {
             issue: 42,
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: None,
+            verdict: None,
             timeout_secs: 120,
         };
         let input = EvalCaseWorkflowInput {
@@ -658,6 +665,13 @@ mod tests {
             issue: 42,
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_cleanup".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: None,
+            verdict: None,
             timeout_secs: 120,
         };
         let outcome = enqueue_eval_case_workflow(
@@ -743,6 +757,13 @@ mod tests {
             issue: 42,
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: None,
+            verdict: None,
             timeout_secs: 120,
         };
 
