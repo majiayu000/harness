@@ -23,6 +23,7 @@ printf 'root done\n'
     let request = AgentRequest {
         prompt: "ignored".to_string(),
         project_root: dir.path().to_path_buf(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         ..AgentRequest::default()
     };
 
@@ -71,6 +72,7 @@ printf 'second\n'
     let request = AgentRequest {
         prompt: "ignored".to_string(),
         project_root: dir.path().to_path_buf(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         ..AgentRequest::default()
     };
 
@@ -148,6 +150,7 @@ async fn execute_stream_timeout_drop_does_not_leave_hanging_process() {
     let request = AgentRequest {
         prompt: "ignored".to_string(),
         project_root: dir.path().to_path_buf(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         ..AgentRequest::default()
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(8);

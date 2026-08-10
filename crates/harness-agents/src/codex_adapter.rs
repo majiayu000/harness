@@ -1,6 +1,6 @@
 use crate::streaming::capture_agent_stderr_diagnostics;
 use async_trait::async_trait;
-use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::agent::{AgentAdapter, AgentEvent, AgentRequest, ApprovalDecision};
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig, SandboxMode};
 use harness_sandbox::SandboxSpec;
 use serde_json::{json, Value};
@@ -31,7 +31,7 @@ use self::protocol::{sandbox_mode_value, sandbox_policy_value};
 async fn prepare_app_server_spawn(
     cli_path: &std::path::Path,
     cloud: &CodexCloudConfig,
-    req: &TurnRequest,
+    req: &AgentRequest,
 ) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
     let args = [
         OsString::from("app-server"),
@@ -128,7 +128,7 @@ fn cloud_setup_env_removals(cloud: &CodexCloudConfig) -> Vec<String> {
     }
 }
 
-fn app_server_stall_timeout(req: &TurnRequest) -> Option<Duration> {
+fn app_server_stall_timeout(req: &AgentRequest) -> Option<Duration> {
     req.timeout_secs
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
@@ -142,6 +142,47 @@ pub enum ParsedCodexMessage {
     Response { id: Value, result: Value },
     Ignore,
 }
+
+fn normalize_codex_turn_event(
+    event: AgentEvent,
+    output_buf: &mut String,
+    emitted_agent_completion: &mut bool,
+) -> Option<AgentEvent> {
+    match event {
+        AgentEvent::MessageDelta { text } => {
+            output_buf.push_str(&text);
+            Some(AgentEvent::MessageDelta { text })
+        }
+        AgentEvent::ItemCompleted { item } => {
+            if let harness_core::types::Item::AgentReasoning { content } = &item {
+                output_buf.clear();
+                output_buf.push_str(content);
+                *emitted_agent_completion = true;
+            }
+            Some(AgentEvent::ItemCompleted { item })
+        }
+        AgentEvent::TurnCompleted { output } => {
+            if *emitted_agent_completion {
+                output_buf.clear();
+                return None;
+            }
+            let content = if output.is_empty() {
+                std::mem::take(output_buf)
+            } else {
+                output
+            };
+            if content.is_empty() {
+                None
+            } else {
+                Some(AgentEvent::ItemCompleted {
+                    item: harness_core::types::Item::AgentReasoning { content },
+                })
+            }
+        }
+        other => Some(other),
+    }
+}
+
 impl CodexAdapter {
     pub fn new(cli_path: PathBuf) -> Self {
         let config = CodexAgentConfig {
@@ -162,7 +203,7 @@ impl CodexAdapter {
         }
     }
 
-    fn effective_turn_request(&self, mut req: TurnRequest) -> TurnRequest {
+    fn effective_turn_request(&self, mut req: AgentRequest) -> AgentRequest {
         if req.model.is_none() {
             req.model = Some(self.default_model.clone());
         }
@@ -290,7 +331,7 @@ impl CodexAdapter {
 
     async fn ensure_child(
         &self,
-        req: &TurnRequest,
+        req: &AgentRequest,
         state: &mut AdapterState,
     ) -> harness_core::error::Result<()> {
         let requested_fingerprint =
@@ -502,7 +543,7 @@ impl AgentAdapter for CodexAdapter {
 
     async fn start_turn(
         &self,
-        req: TurnRequest,
+        req: AgentRequest,
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         let req = self.effective_turn_request(req);
@@ -562,6 +603,8 @@ impl AgentAdapter for CodexAdapter {
         let mut turn_completed = false;
         let mut receiver_closed = false;
         let mut stdout_closed = false;
+        let mut output_buf = String::new();
+        let mut emitted_agent_completion = false;
         let stall_timeout = app_server_stall_timeout(&req);
         let read_result = async {
             while let Some(message) =
@@ -589,9 +632,15 @@ impl AgentAdapter for CodexAdapter {
                         if is_terminal {
                             self.clear_active_turn_id().await;
                         }
-                        if tx.send(event).await.is_err() {
-                            receiver_closed = true;
-                            break;
+                        if let Some(event) = normalize_codex_turn_event(
+                            event,
+                            &mut output_buf,
+                            &mut emitted_agent_completion,
+                        ) {
+                            if tx.send(event).await.is_err() {
+                                receiver_closed = true;
+                                break;
+                            }
                         }
                         if is_terminal {
                             turn_completed = true;
@@ -708,7 +757,7 @@ mod spawn_policy_tests {
     async fn ready_child_restarts_when_spawn_policy_changes() -> anyhow::Result<()> {
         let project = tempfile::tempdir()?;
         let adapter = CodexAdapter::new(project.path().join("missing-codex"));
-        let request = TurnRequest {
+        let request = AgentRequest {
             prompt: "ping".to_string(),
             prompt_layers: None,
             project_root: project.path().to_path_buf(),
@@ -719,6 +768,7 @@ mod spawn_policy_tests {
             sandbox_mode: Some(SandboxMode::DangerFullAccess),
             approval_policy: None,
             allowed_tools: None,
+            max_budget_usd: None,
             context: Vec::new(),
             timeout_secs: None,
             env_vars: HashMap::new(),

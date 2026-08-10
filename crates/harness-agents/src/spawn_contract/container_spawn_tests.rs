@@ -29,8 +29,8 @@ fn string_args(spawn: &PreparedAgentSpawn) -> Vec<String> {
         .collect()
 }
 
-fn policy_request() -> TurnRequest {
-    TurnRequest {
+fn policy_request() -> AgentRequest {
+    AgentRequest {
         prompt: "first prompt".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
@@ -41,6 +41,7 @@ fn policy_request() -> TurnRequest {
         sandbox_mode: Some(SandboxMode::DangerFullAccess),
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: Vec::new(),
         timeout_secs: Some(30),
         env_vars: HashMap::new(),

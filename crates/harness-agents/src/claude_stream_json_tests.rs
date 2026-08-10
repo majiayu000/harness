@@ -43,7 +43,7 @@ fn parse_tool_use() {
 fn parse_tool_result() {
     let line = r#"{"type": "tool_result", "output": "file contents here"}"#;
     let event = parse_stream_json_line(line).unwrap();
-    assert!(matches!(event, AgentEvent::ItemCompleted));
+    assert!(matches!(event, AgentEvent::ItemCompletedKind));
 }
 
 #[test]

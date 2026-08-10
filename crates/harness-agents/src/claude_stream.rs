@@ -96,10 +96,10 @@ fn apply_claude_stream_event(
         AgentEvent::ToolOutputDelta { item_id, text } => {
             emitted_items.push(StreamItem::ToolOutputDelta { item_id, text });
         }
-        AgentEvent::ItemStartedPayload { item } => {
+        AgentEvent::ItemStarted { item } => {
             emitted_items.push(StreamItem::ItemStarted { item });
         }
-        AgentEvent::ItemCompletedPayload { item } => {
+        AgentEvent::ItemCompleted { item } => {
             emitted_items.push(StreamItem::ItemCompleted { item });
         }
         AgentEvent::ApprovalRequest { id, command } => {
@@ -138,9 +138,10 @@ fn apply_claude_stream_event(
         }
         AgentEvent::EgressVerifiedAtDispatch
         | AgentEvent::TurnStarted
-        | AgentEvent::ItemStarted { .. }
-        | AgentEvent::ItemCompleted
-        | AgentEvent::TokenUsage { .. } => {}
+        | AgentEvent::ItemStartedKind { .. }
+        | AgentEvent::ItemCompletedKind
+        | AgentEvent::TokenUsage { .. }
+        | AgentEvent::Done => {}
     }
 }
 
@@ -161,13 +162,18 @@ pub(crate) fn parse_claude_stream_output(stdout: &str) -> ParsedClaudeStreamOutp
 fn stream_item_label(item: &StreamItem) -> &'static str {
     match item {
         StreamItem::EgressVerifiedAtDispatch => "egress_verification",
+        StreamItem::TurnStarted => "turn_started",
         StreamItem::ItemStarted { .. } => "item_started",
+        StreamItem::ItemStartedKind { .. } => "item_started",
         StreamItem::MessageDelta { .. } => "message_delta",
         StreamItem::ToolOutputDelta { .. } => "tool_output_delta",
+        StreamItem::ToolCall { .. } => "tool_call",
         StreamItem::ItemCompleted { .. } => "item_completed",
+        StreamItem::ItemCompletedKind => "item_completed",
         StreamItem::TokenUsage { .. } => "token_usage",
         StreamItem::Warning { .. } => "warning",
         StreamItem::Error { .. } => "error",
+        StreamItem::TurnCompleted { .. } => "turn_completed",
         StreamItem::ApprovalRequest { .. } => "approval_request",
         StreamItem::Done => "done",
     }

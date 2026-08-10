@@ -1,13 +1,11 @@
 //! Tests for the runtime turn lifecycle, split out of `turn_lifecycle.rs`
 //! to keep that file under the repository file-size ceiling.
 
-use super::turn_lifecycle::{
-    bridge_agent_event, run_turn_lifecycle_with_options, TurnLifecycleOptions,
-};
+use super::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
 use crate::{server::HarnessServer, thread_manager::ThreadManager};
-use harness_agents::registry::{AdapterExecutionStrategy, AgentRegistry};
+use harness_agents::registry::AgentRegistry;
 use harness_core::agent::{
-    AgentAdapter, AgentEvent, AgentRequest, AgentResponse, CodeAgent, StreamItem, TurnRequest,
+    AgentAdapter, AgentEvent, AgentRequest, AgentResponse, CodeAgent, StreamItem,
 };
 use harness_core::config::HarnessConfig;
 use harness_core::error::HarnessError;
@@ -105,12 +103,14 @@ impl AgentAdapter for CountingAdapter {
 
     async fn start_turn(
         &self,
-        _req: TurnRequest,
+        _req: AgentRequest,
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         self.calls.fetch_add(1, Ordering::AcqRel);
-        tx.send(AgentEvent::TurnCompleted {
-            output: "adapter done".to_string(),
+        tx.send(AgentEvent::ItemCompleted {
+            item: Item::AgentReasoning {
+                content: "adapter done".to_string(),
+            },
         })
         .await
         .map_err(|error| HarnessError::AgentExecution(format!("adapter closed: {error}")))?;
@@ -137,12 +137,14 @@ impl AgentAdapter for InterruptTrackingAdapter {
 
     async fn start_turn(
         &self,
-        _req: TurnRequest,
+        _req: AgentRequest,
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         self.release.notified().await;
-        tx.send(AgentEvent::TurnCompleted {
-            output: "adapter done after interrupt".to_string(),
+        tx.send(AgentEvent::ItemCompleted {
+            item: Item::AgentReasoning {
+                content: "adapter done after interrupt".to_string(),
+            },
         })
         .await
         .map_err(|error| HarnessError::AgentExecution(format!("adapter closed: {error}")))?;
@@ -169,15 +171,11 @@ fn server_with_codex_counts(
     registry.register("codex", Arc::new(CountingAgent { calls: agent_calls }));
     let adapter_calls_for_factory = adapter_calls.clone();
     registry
-        .register_adapter_factory_with_strategy(
-            "codex",
-            move || {
-                Arc::new(CountingAdapter {
-                    calls: adapter_calls_for_factory.clone(),
-                })
-            },
-            AdapterExecutionStrategy::ExecuteTurns,
-        )
+        .register_turn_backend_factory("codex", move || {
+            Arc::new(CountingAdapter {
+                calls: adapter_calls_for_factory.clone(),
+            })
+        })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     Ok(Arc::new(HarnessServer::new(
@@ -336,16 +334,12 @@ async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
     let interrupt_calls_for_factory = interrupt_calls.clone();
     let release_for_factory = Arc::new(tokio::sync::Notify::new());
     registry
-        .register_adapter_factory_with_strategy(
-            "codex",
-            move || {
-                Arc::new(InterruptTrackingAdapter {
-                    interrupt_calls: interrupt_calls_for_factory.clone(),
-                    release: release_for_factory.clone(),
-                })
-            },
-            AdapterExecutionStrategy::ExecuteTurns,
-        )
+        .register_turn_backend_factory("codex", move || {
+            Arc::new(InterruptTrackingAdapter {
+                interrupt_calls: interrupt_calls_for_factory.clone(),
+                release: release_for_factory.clone(),
+            })
+        })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
     let turn_id = start_test_turn(&server, root.path())?;
@@ -380,130 +374,4 @@ async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
     assert_eq!(turn.status, TurnStatus::Failed);
     Ok(())
-}
-
-#[test]
-fn bridge_preserves_warning_and_token_usage_events() {
-    let mut output_buf = String::new();
-    let mut warning_completion = false;
-    let mut usage_completion = false;
-
-    let warning = bridge_agent_event(
-        AgentEvent::Warning {
-            message: "careful".into(),
-        },
-        &mut output_buf,
-        &mut warning_completion,
-    );
-    let usage = bridge_agent_event(
-        AgentEvent::TokenUsage {
-            usage: TokenUsage {
-                input_tokens: 1,
-                output_tokens: 2,
-                total_tokens: 3,
-                cost_usd: 0.0,
-            },
-        },
-        &mut output_buf,
-        &mut usage_completion,
-    );
-
-    assert_eq!(
-        warning,
-        Some(StreamItem::Warning {
-            message: "careful".into()
-        })
-    );
-    assert_eq!(
-        usage,
-        Some(StreamItem::TokenUsage {
-            usage: TokenUsage {
-                input_tokens: 1,
-                output_tokens: 2,
-                total_tokens: 3,
-                cost_usd: 0.0,
-            }
-        })
-    );
-}
-
-#[test]
-fn bridge_preserves_egress_verification_event() {
-    let mut output_buf = String::new();
-    let mut emitted_agent_completion = false;
-
-    assert_eq!(
-        bridge_agent_event(
-            AgentEvent::EgressVerifiedAtDispatch,
-            &mut output_buf,
-            &mut emitted_agent_completion,
-        ),
-        Some(StreamItem::EgressVerifiedAtDispatch)
-    );
-    assert!(output_buf.is_empty());
-    assert!(!emitted_agent_completion);
-}
-
-#[test]
-fn bridge_uses_buffered_output_when_turn_completed_payload_is_empty() {
-    let mut output_buf = String::new();
-    let mut emitted_agent_completion = false;
-    let _ = bridge_agent_event(
-        AgentEvent::MessageDelta {
-            text: "hello".into(),
-        },
-        &mut output_buf,
-        &mut emitted_agent_completion,
-    );
-    let completed = bridge_agent_event(
-        AgentEvent::TurnCompleted {
-            output: String::new(),
-        },
-        &mut output_buf,
-        &mut emitted_agent_completion,
-    );
-
-    assert_eq!(
-        completed,
-        Some(StreamItem::ItemCompleted {
-            item: Item::AgentReasoning {
-                content: "hello".into()
-            }
-        })
-    );
-    assert!(output_buf.is_empty());
-}
-
-#[test]
-fn bridge_suppresses_duplicate_turn_completed_after_agent_message_completion() {
-    let mut output_buf = String::new();
-    let mut emitted_agent_completion = false;
-    let item_completed = bridge_agent_event(
-        AgentEvent::ItemCompletedPayload {
-            item: Item::AgentReasoning {
-                content: "done".into(),
-            },
-        },
-        &mut output_buf,
-        &mut emitted_agent_completion,
-    );
-    let turn_completed = bridge_agent_event(
-        AgentEvent::TurnCompleted {
-            output: "done".into(),
-        },
-        &mut output_buf,
-        &mut emitted_agent_completion,
-    );
-
-    assert_eq!(
-        item_completed,
-        Some(StreamItem::ItemCompleted {
-            item: Item::AgentReasoning {
-                content: "done".into()
-            }
-        })
-    );
-    assert!(emitted_agent_completion);
-    assert_eq!(turn_completed, None);
-    assert!(output_buf.is_empty());
 }
