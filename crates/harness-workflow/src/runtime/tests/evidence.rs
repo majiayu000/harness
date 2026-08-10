@@ -128,6 +128,7 @@ async fn workflow_run_evidence_migration_creates_query_indexes() -> anyhow::Resu
             SELECT 1
             FROM information_schema.tables
             WHERE table_name = 'workflow_run_evidence'
+              AND table_schema = current_schema()
         )",
     )
     .fetch_one(store.pool())
@@ -138,6 +139,7 @@ async fn workflow_run_evidence_migration_creates_query_indexes() -> anyhow::Resu
         "SELECT COUNT(*)
          FROM pg_indexes
          WHERE tablename = 'workflow_run_evidence'
+           AND schemaname = current_schema()
            AND indexname = ANY($1::text[])",
     )
     .bind(vec![
