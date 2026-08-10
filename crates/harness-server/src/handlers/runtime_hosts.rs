@@ -363,16 +363,19 @@ pub async fn claim_runtime_job_for_runtime_host(
 
     let runtime_job_id = job.id.clone();
     let lease_generation = job.lease_generation;
-    (
-        StatusCode::OK,
-        Json(json!({
-            "claimed": true,
-            "runtime_job": job,
-            "runtime_job_id": runtime_job_id,
-            "lease_expires_at": lease_expires_at,
-            "lease_generation": lease_generation,
-        })),
-    )
+    let credential_environment =
+        crate::eval_credentials::attach_runtime_host_eval_environment_policy(&mut job);
+    let mut response = json!({
+        "claimed": true,
+        "runtime_job": job,
+        "runtime_job_id": runtime_job_id,
+        "lease_expires_at": lease_expires_at,
+        "lease_generation": lease_generation,
+    });
+    if let Some(credential_environment) = credential_environment {
+        response["credential_environment"] = json!(credential_environment);
+    }
+    (StatusCode::OK, Json(response))
 }
 
 async fn complete_runtime_host_preflight_failure(

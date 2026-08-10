@@ -22,6 +22,7 @@ pub mod complexity_router;
 pub mod contract_validator;
 pub mod dashboard;
 pub mod db;
+pub(crate) mod eval_credentials;
 pub mod event_replay;
 pub(crate) mod feishu_client;
 pub(crate) mod github_auth;

@@ -41,11 +41,13 @@ pub(super) async fn run_validation_commands(
     commands: &[String],
     timeout: Duration,
 ) -> ServerValidationRun {
+    let credential_environment = crate::eval_credentials::build_default_eval_command_environment();
     if commands.iter().all(|command| command.trim().is_empty()) {
         return ServerValidationRun {
             digest: json!({
                 "commands": [],
                 "cwd": workspace_root.display().to_string(),
+                "credential_environment": credential_environment.audit(),
                 "startup_error": "validation_commands_missing",
             }),
             failure: Some(ServerValidationFailure {
@@ -66,7 +68,8 @@ pub(super) async fn run_validation_commands(
             continue;
         }
         let remaining = timeout.saturating_sub(started.elapsed());
-        let entry = run_single_command(workspace_root, command, remaining).await;
+        let entry =
+            run_single_command(workspace_root, command, remaining, &credential_environment).await;
         let failed = entry.get("exit_code").and_then(Value::as_i64) != Some(0)
             || entry.get("startup_error").is_some();
         entries.push(entry);
@@ -81,6 +84,7 @@ pub(super) async fn run_validation_commands(
         digest: json!({
             "commands": entries,
             "cwd": workspace_root.display().to_string(),
+            "credential_environment": credential_environment.audit(),
             "total_duration_ms": started.elapsed().as_millis() as u64,
         }),
         failure,
@@ -109,7 +113,12 @@ fn server_validation_failure_for_entry(command: &str, entry: &Value) -> ServerVa
     }
 }
 
-async fn run_single_command(workspace_root: &Path, command: &str, timeout: Duration) -> Value {
+async fn run_single_command(
+    workspace_root: &Path,
+    command: &str,
+    timeout: Duration,
+    credential_environment: &crate::eval_credentials::EvalCredentialEnvironment,
+) -> Value {
     let started = Instant::now();
     let mut parts = command.split_whitespace();
     let Some(program) = parts.next() else {
@@ -119,6 +128,8 @@ async fn run_single_command(workspace_root: &Path, command: &str, timeout: Durat
     process
         .args(parts)
         .current_dir(workspace_root)
+        .env_clear()
+        .envs(credential_environment.variables())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -243,6 +254,88 @@ mod tests {
         assert!(server_validation_digest_passed(&result));
         let digest = server_validation_digest_artifact(&result).expect("digest attached");
         assert_eq!(digest["commands"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_environment_strips_secrets_and_keeps_allowlisted_plain_values(
+    ) -> anyhow::Result<()> {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = workspace();
+        let script = dir.path().join("assert-secretless-env");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+test -z "${OPENAI_API_KEY+x}" || exit 42
+test -z "${GITHUB_TOKEN+x}" || exit 43
+test "$SAFE_FLAG" = "ok" || exit 44
+test -n "$PATH" || exit 45
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&script)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions)?;
+
+        let ambient_env = HashMap::from([
+            ("PATH".to_string(), "/bin:/usr/bin".to_string()),
+            ("SAFE_FLAG".to_string(), "ok".to_string()),
+            ("OPENAI_API_KEY".to_string(), "sk-secret".to_string()),
+            ("GITHUB_TOKEN".to_string(), "ghp-secret".to_string()),
+        ]);
+        let plain_env_allowlist = ["PATH", "SAFE_FLAG", "OPENAI_API_KEY", "GITHUB_TOKEN"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let credential_environment = crate::eval_credentials::build_eval_credential_environment(
+            &ambient_env,
+            &plain_env_allowlist,
+            &[],
+            &[],
+            chrono::Utc::now(),
+        )?;
+        let command = script.to_str().expect("temp path is utf-8");
+        assert!(
+            !command.chars().any(char::is_whitespace),
+            "test command path must not contain whitespace"
+        );
+
+        let entry = run_single_command(
+            dir.path(),
+            command,
+            Duration::from_secs(30),
+            &credential_environment,
+        )
+        .await;
+
+        assert_eq!(entry["exit_code"], 0);
+        assert_eq!(credential_environment.variables()["SAFE_FLAG"], "ok");
+        assert!(!credential_environment
+            .variables()
+            .contains_key("OPENAI_API_KEY"));
+        assert!(!credential_environment
+            .variables()
+            .contains_key("GITHUB_TOKEN"));
+        assert_eq!(
+            credential_environment
+                .audit()
+                .stripped_env
+                .iter()
+                .map(|item| (item.key.as_str(), item.class))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "GITHUB_TOKEN",
+                    crate::eval_credentials::EvalSecretEnvClass::GitHub
+                ),
+                (
+                    "OPENAI_API_KEY",
+                    crate::eval_credentials::EvalSecretEnvClass::Provider
+                ),
+            ]
+        );
+        Ok(())
     }
 
     #[tokio::test]
