@@ -11,6 +11,12 @@ const DEFAULT_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_PIDS: u64 = 512;
 const DEFAULT_DISK_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const DEFAULT_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_CPU_TIME_SECS: u64 = 1;
+const MIN_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
+const MIN_PIDS: u64 = 16;
+const MIN_DISK_BYTES: u64 = 1024 * 1024;
+const MIN_OUTPUT_BYTES: u64 = 1024;
+const MIN_WALL_TIME_SECS: u64 = 1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
@@ -65,8 +71,8 @@ impl ResourceLimits {
     }
 
     pub fn cap_by(self, maxima: Self) -> Result<CappedResourceLimits, ResourceLimitError> {
-        self.validate_nonzero("requested")?;
-        maxima.validate_nonzero("maximum")?;
+        self.validate_enforceable("requested")?;
+        maxima.validate_enforceable("maximum")?;
 
         let mut effective = self;
         let mut caps = Vec::new();
@@ -120,10 +126,21 @@ impl ResourceLimits {
         })
     }
 
-    fn validate_nonzero(&self, owner: &'static str) -> Result<(), ResourceLimitError> {
+    fn validate_enforceable(&self, owner: &'static str) -> Result<(), ResourceLimitError> {
         for (kind, value) in self.fields() {
             if value == Some(0) {
                 return Err(ResourceLimitError::InvalidLimit { owner, limit: kind });
+            }
+            let (Some(value), Some(minimum)) = (value, minimum_for(kind)) else {
+                continue;
+            };
+            if value < minimum {
+                return Err(ResourceLimitError::LimitBelowMinimum {
+                    owner,
+                    limit: kind,
+                    minimum,
+                    actual: value,
+                });
             }
         }
         Ok(())
@@ -239,6 +256,13 @@ pub enum ResourceLimitError {
         owner: &'static str,
         limit: ResourceLimitKind,
     },
+    #[error("{owner} resource limit `{limit}` must be at least {minimum} (got {actual})")]
+    LimitBelowMinimum {
+        owner: &'static str,
+        limit: ResourceLimitKind,
+        minimum: u64,
+        actual: u64,
+    },
     #[error("resource limit backend `{backend}` cannot enforce `{limit}`")]
     UnsupportedBackend {
         backend: &'static str,
@@ -275,7 +299,7 @@ pub fn wrap_unix_command_with_resource_limits(
     limits: &ResourceLimits,
     timeout_program: Option<&Path>,
 ) -> Result<WrappedCommand, ResourceLimitError> {
-    limits.validate_nonzero("requested")?;
+    limits.validate_enforceable("requested")?;
     validate_resource_limit_backend(limits, ResourceLimitBackend::UnixProcess)?;
 
     if limits.is_empty() {
@@ -293,13 +317,15 @@ pub fn wrap_unix_command_with_resource_limits(
         });
     }
 
-    let script = unix_resource_limit_script(limits, timeout_program.is_some());
+    let use_timeout = limits.wall_time_secs.is_some();
+    let script = unix_resource_limit_script(limits, use_timeout);
     let mut wrapped_args = vec![
         OsString::from("-c"),
         OsString::from(script),
         OsString::from("harness-resource-limits"),
     ];
-    if let Some(timeout_program) = timeout_program {
+    if use_timeout {
+        let timeout_program = timeout_program.expect("timeout backend checked above");
         wrapped_args.push(timeout_program.as_os_str().to_os_string());
     }
     wrapped_args.push(program.as_os_str().to_os_string());
@@ -375,6 +401,14 @@ impl OutputLimitTracker {
                 limit: ResourceLimitKind::Output,
             });
         }
+        if limit_bytes < MIN_OUTPUT_BYTES {
+            return Err(ResourceLimitError::LimitBelowMinimum {
+                owner: "requested",
+                limit: ResourceLimitKind::Output,
+                minimum: MIN_OUTPUT_BYTES,
+                actual: limit_bytes,
+            });
+        }
         Ok(Self {
             limit_bytes,
             observed_bytes: 0,
@@ -395,6 +429,18 @@ impl OutputLimitTracker {
 
     pub fn observed_bytes(&self) -> u64 {
         self.observed_bytes
+    }
+}
+
+fn minimum_for(resource: ResourceLimitKind) -> Option<u64> {
+    match resource {
+        ResourceLimitKind::CpuTime => Some(MIN_CPU_TIME_SECS),
+        ResourceLimitKind::Memory => Some(MIN_MEMORY_BYTES),
+        ResourceLimitKind::Pids => Some(MIN_PIDS),
+        ResourceLimitKind::Disk => Some(MIN_DISK_BYTES),
+        ResourceLimitKind::Output => Some(MIN_OUTPUT_BYTES),
+        ResourceLimitKind::WallTime => Some(MIN_WALL_TIME_SECS),
+        ResourceLimitKind::UnknownQuota => None,
     }
 }
 
@@ -421,7 +467,7 @@ fn cap_field(
 }
 
 fn unix_resource_limit_script(limits: &ResourceLimits, use_timeout: bool) -> String {
-    let mut lines = Vec::new();
+    let mut lines = vec!["set -e".to_string()];
     if let Some(cpu_time_secs) = limits.cpu_time_secs {
         lines.push(format!("ulimit -t {cpu_time_secs}"));
     }
@@ -459,17 +505,17 @@ mod tests {
     fn resource_limits_cap_requests_by_operator_maxima() {
         let requested = ResourceLimits {
             cpu_time_secs: Some(120),
-            memory_bytes: Some(2_048),
+            memory_bytes: Some(32 * 1024 * 1024),
             pids: Some(64),
-            disk_bytes: Some(4_096),
+            disk_bytes: Some(4 * 1024 * 1024),
             output_bytes: Some(2_048),
             wall_time_secs: Some(180),
         };
         let maxima = ResourceLimits {
             cpu_time_secs: Some(60),
-            memory_bytes: Some(1_024),
+            memory_bytes: Some(16 * 1024 * 1024),
             pids: Some(128),
-            disk_bytes: Some(2_048),
+            disk_bytes: Some(2 * 1024 * 1024),
             output_bytes: Some(1_024),
             wall_time_secs: Some(90),
         };
@@ -477,9 +523,9 @@ mod tests {
         let capped = requested.cap_by(maxima).expect("limits should cap");
 
         assert_eq!(capped.effective.cpu_time_secs, Some(60));
-        assert_eq!(capped.effective.memory_bytes, Some(1_024));
+        assert_eq!(capped.effective.memory_bytes, Some(16 * 1024 * 1024));
         assert_eq!(capped.effective.pids, Some(64));
-        assert_eq!(capped.effective.disk_bytes, Some(2_048));
+        assert_eq!(capped.effective.disk_bytes, Some(2 * 1024 * 1024));
         assert_eq!(capped.effective.output_bytes, Some(1_024));
         assert_eq!(capped.effective.wall_time_secs, Some(90));
         assert_eq!(capped.caps.len(), 5);
@@ -498,6 +544,24 @@ mod tests {
             err,
             ResourceLimitError::InvalidLimit {
                 limit: ResourceLimitKind::CpuTime,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resource_limits_reject_starvation_thresholds() {
+        let err = ResourceLimits {
+            memory_bytes: Some(MIN_MEMORY_BYTES - 1),
+            ..ResourceLimits::default()
+        }
+        .cap_by(ResourceLimits::operator_default_maxima())
+        .expect_err("below-minimum limit should fail closed");
+
+        assert!(matches!(
+            err,
+            ResourceLimitError::LimitBelowMinimum {
+                limit: ResourceLimitKind::Memory,
                 ..
             }
         ));
@@ -526,9 +590,9 @@ mod tests {
     fn resource_limits_build_unix_wrapper_with_process_limits() {
         let limits = ResourceLimits {
             cpu_time_secs: Some(9),
-            memory_bytes: Some(2049),
+            memory_bytes: Some(MIN_MEMORY_BYTES + 1),
             pids: Some(32),
-            disk_bytes: Some(1025),
+            disk_bytes: Some(MIN_DISK_BYTES + 1),
             output_bytes: Some(4096),
             wall_time_secs: Some(11),
         };
@@ -542,10 +606,11 @@ mod tests {
         let script = wrapped.args[1].to_string_lossy();
 
         assert_eq!(wrapped.program, PathBuf::from("/bin/sh"));
+        assert!(script.starts_with("set -e\n"));
         assert!(script.contains("ulimit -t 9"));
-        assert!(script.contains("ulimit -v 3"));
+        assert!(script.contains("ulimit -v 16385"));
         assert!(script.contains("ulimit -u 32"));
-        assert!(script.contains("ulimit -f 3"));
+        assert!(script.contains("ulimit -f 2049"));
         assert!(script.contains("exec \"$timeout_bin\" --kill-after=5s 11s \"$@\""));
         assert_eq!(
             wrapped.args[3..],
@@ -578,20 +643,46 @@ mod tests {
     }
 
     #[test]
-    fn resource_limits_track_output_limit() {
-        let mut tracker = OutputLimitTracker::new(4).expect("valid limit");
+    fn resource_limits_do_not_invoke_timeout_without_wall_time_limit() {
+        let limits = ResourceLimits {
+            memory_bytes: Some(MIN_MEMORY_BYTES),
+            ..ResourceLimits::default()
+        };
 
-        tracker.observe_chunk(b"ab").expect("under limit");
+        let wrapped = wrap_unix_command_with_resource_limits(
+            Path::new("/usr/bin/env"),
+            &[OsString::from("true")],
+            &limits,
+            Some(Path::new("/usr/bin/timeout")),
+        )
+        .expect("process-only wrapper should build");
+        let script = wrapped.args[1].to_string_lossy();
+
+        assert!(script.contains("ulimit -v 16384"));
+        assert!(script.contains("exec \"$@\""));
+        assert_eq!(
+            wrapped.args[3..],
+            [OsString::from("/usr/bin/env"), OsString::from("true")]
+        );
+    }
+
+    #[test]
+    fn resource_limits_track_output_limit() {
+        let mut tracker = OutputLimitTracker::new(1024).expect("valid limit");
+
+        let under_limit = vec![b'a'; 512];
+        tracker.observe_chunk(&under_limit).expect("under limit");
+        let over_limit = vec![b'b'; 513];
         let err = tracker
-            .observe_chunk(b"cde")
+            .observe_chunk(&over_limit)
             .expect_err("chunk crossing the limit should fail");
 
-        assert_eq!(tracker.observed_bytes(), 2);
+        assert_eq!(tracker.observed_bytes(), 512);
         assert!(matches!(
             err,
             ResourceLimitError::OutputLimitExceeded {
-                limit_bytes: 4,
-                observed_bytes: 5
+                limit_bytes: 1024,
+                observed_bytes: 1025
             }
         ));
     }

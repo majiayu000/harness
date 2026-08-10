@@ -252,7 +252,7 @@ default_timeout_secs = 120
 
 [max_resource_limits]
 cpu_time_secs = 60
-memory_bytes = 1024
+memory_bytes = 16777216
 output_bytes = 2048
 wall_time_secs = 90
 
@@ -261,14 +261,14 @@ repo = "majiayu000/harness"
 issue = 1437
 base_commit = "b308b380"
 verify_commands = ["cargo test"]
-resource_limits = { cpu_time_secs = 120, memory_bytes = 4096, output_bytes = 1024, wall_time_secs = 180 }
+resource_limits = { cpu_time_secs = 120, memory_bytes = 33554432, output_bytes = 1024, wall_time_secs = 180 }
 "#;
 
         let manifest = parse_benchmark_manifest_str(input).expect("manifest should parse");
         let limits = &manifest.cases[0].resource_limits;
 
         assert_eq!(limits.effective.cpu_time_secs, Some(60));
-        assert_eq!(limits.effective.memory_bytes, Some(1024));
+        assert_eq!(limits.effective.memory_bytes, Some(16777216));
         assert_eq!(limits.effective.output_bytes, Some(1024));
         assert_eq!(limits.effective.wall_time_secs, Some(90));
         assert_eq!(limits.caps.len(), 3);

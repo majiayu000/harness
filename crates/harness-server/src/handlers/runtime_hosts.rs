@@ -20,6 +20,8 @@ use std::{collections::BTreeMap, sync::Arc};
 pub(crate) mod lease;
 pub use lease::renew_runtime_job_lease_for_runtime_host;
 
+const RESOURCE_LIMIT_CAPABILITY_RETRY_DELAY_SECS: i64 = 30;
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterRuntimeHostRequest {
     pub host_id: String,
@@ -356,18 +358,12 @@ pub async fn claim_runtime_job_for_runtime_host(
     let resource_limits = match eval_resource_limit_enforcement_for_job(&job) {
         Ok(Some(resource_limits)) => {
             if !host_supports_eval_resource_limits {
-                let result = eval_resource_limit_preflight_failure(
-                    &job,
-                    "runtime host lacks eval_resource_limits capability",
-                    Some(resource_limits),
-                );
-                return complete_runtime_host_preflight_failure(
-                    &state,
+                return defer_runtime_host_resource_limit_claim(
                     store.as_ref(),
                     &host_id,
                     lease_expires_at,
                     &job,
-                    result,
+                    "runtime host lacks eval_resource_limits capability",
                 )
                 .await;
             }
@@ -402,15 +398,11 @@ pub async fn claim_runtime_job_for_runtime_host(
             )
             .await
         {
-            tracing::error!(
+            tracing::warn!(
                 runtime_job_id = %job.id,
                 host_id = %host_id,
                 %error,
-                "runtime host failed to record eval resource-limit enforcement"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "failed to record eval resource-limit enforcement" })),
+                "runtime host claim succeeded but eval resource-limit event recording failed"
             );
         }
     }
@@ -442,6 +434,77 @@ pub async fn claim_runtime_job_for_runtime_host(
         response["resource_limits"] = json!(resource_limits);
     }
     (StatusCode::OK, Json(response))
+}
+
+async fn defer_runtime_host_resource_limit_claim(
+    store: &WorkflowRuntimeStore,
+    host_id: &str,
+    lease_expires_at: DateTime<Utc>,
+    job: &RuntimeJob,
+    reason: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let not_before =
+        Utc::now() + chrono::TimeDelta::seconds(RESOURCE_LIMIT_CAPABILITY_RETRY_DELAY_SECS);
+    match store
+        .defer_runtime_job_claim_if_owned(&job.id, host_id, lease_expires_at, not_before)
+        .await
+    {
+        Ok(Some(deferred)) => {
+            if let Err(error) = store
+                .record_runtime_event(
+                    &job.id,
+                    "RuntimeJobClaimDeferred",
+                    json!({
+                        "owner": host_id,
+                        "not_before": not_before,
+                        "reason": reason,
+                        "claim_api": "runtime_host",
+                        "required_capability": EVAL_RESOURCE_LIMITS_CAPABILITY,
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(
+                    runtime_job_id = %job.id,
+                    host_id = %host_id,
+                    %error,
+                    "runtime host resource-limit claim defer succeeded but event recording failed"
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "claimed": false,
+                    "deferred": true,
+                    "runtime_job_id": job.id.as_str(),
+                    "runtime_job": deferred,
+                    "not_before": not_before,
+                    "reason": reason,
+                    "required_capability": EVAL_RESOURCE_LIMITS_CAPABILITY,
+                })),
+            )
+        }
+        Ok(None) => {
+            tracing::warn!(
+                runtime_job_id = %job.id,
+                host_id = %host_id,
+                "runtime host resource-limit claim defer ignored because the host no longer owns the lease"
+            );
+            (StatusCode::OK, Json(json!({ "claimed": false })))
+        }
+        Err(error) => {
+            tracing::error!(
+                runtime_job_id = %job.id,
+                host_id = %host_id,
+                %error,
+                "runtime host failed to defer resource-limit-incompatible runtime job"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to defer runtime job: {error}") })),
+            )
+        }
+    }
 }
 
 async fn complete_runtime_host_preflight_failure(
@@ -821,7 +884,32 @@ fn validate_eval_resource_limit_report(
             })),
         ));
     }
+    if !resource_usage_has_evidence(&report.usage) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "resource_limit_report requires usage evidence"
+            })),
+        ));
+    }
+    if report.reason.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "resource_limit_report requires a non-empty reason"
+            })),
+        ));
+    }
     Ok(())
+}
+
+fn resource_usage_has_evidence(usage: &harness_sandbox::ResourceUsage) -> bool {
+    usage.cpu_time_millis.is_some()
+        || usage.peak_memory_bytes.is_some()
+        || usage.peak_pids.is_some()
+        || usage.disk_bytes.is_some()
+        || usage.output_bytes.is_some()
+        || usage.wall_time_millis.is_some()
 }
 
 fn ensure_runtime_state_persistence_available(
@@ -966,6 +1054,70 @@ mod tests {
 
         validate_eval_resource_limit_report(&job, &result)
             .expect("matching resource report should be accepted");
+    }
+
+    #[test]
+    fn eval_resource_limit_report_requires_usage_evidence_and_reason() {
+        let limits = ResourceLimits::evaluation_defaults(45)
+            .cap_by(ResourceLimits::operator_default_maxima())
+            .expect("limits should cap");
+        let job = RuntimeJob::pending(
+            "cmd-1",
+            RuntimeKind::RemoteHost,
+            "remote-host-default",
+            json!({
+                "activity": "implement_issue",
+                "command": {
+                    "eval": {
+                        "eval_run_id": "run-1",
+                        "case_id": "case-1",
+                        "timeout_secs": 45,
+                        "resource_limits": limits.clone()
+                    }
+                }
+            }),
+        );
+        let empty_usage = ActivityResult::succeeded("implement_issue", "done").with_artifact(
+            ActivityArtifact::new(
+                "resource_limit_report",
+                json!(ResourceLimitReport {
+                    limits: limits.clone(),
+                    usage: harness_sandbox::ResourceUsage::default(),
+                    termination: None,
+                    reason: "completed within resource limits".to_string(),
+                }),
+            ),
+        );
+
+        let err = validate_eval_resource_limit_report(&job, &empty_usage)
+            .expect_err("empty usage should fail closed");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1 .0["error"],
+            "resource_limit_report requires usage evidence"
+        );
+
+        let empty_reason = ActivityResult::succeeded("implement_issue", "done").with_artifact(
+            ActivityArtifact::new(
+                "resource_limit_report",
+                json!(ResourceLimitReport {
+                    limits,
+                    usage: harness_sandbox::ResourceUsage {
+                        wall_time_millis: Some(1000),
+                        ..Default::default()
+                    },
+                    termination: None,
+                    reason: " ".to_string(),
+                }),
+            ),
+        );
+        let err = validate_eval_resource_limit_report(&job, &empty_reason)
+            .expect_err("empty reason should fail closed");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1 .0["error"],
+            "resource_limit_report requires a non-empty reason"
+        );
     }
 
     #[tokio::test]
