@@ -14,6 +14,14 @@ use linux::linux_network_only_bwrap_args;
 use linux::{linux_bwrap_args, linux_landlock_args};
 mod network_policy;
 pub use network_policy::NetworkPolicy;
+mod resource_limits;
+pub use resource_limits::{
+    classify_resource_termination, validate_resource_limit_backend,
+    wrap_unix_command_with_resource_limits, CappedResourceLimits, OutputLimitTracker,
+    ResourceLimitBackend, ResourceLimitCap, ResourceLimitError, ResourceLimitKind,
+    ResourceLimitReport, ResourceLimits, ResourceProcessStatus, ResourceTermination, ResourceUsage,
+    EVAL_RESOURCE_LIMITS_CAPABILITY,
+};
 
 // Intentional scope: keep VCS/agent metadata immutable inside workspace-write mode.
 // `.env` is user-managed project content and is not forced read-only here.

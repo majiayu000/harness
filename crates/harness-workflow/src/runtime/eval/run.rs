@@ -505,6 +505,7 @@ fn eval_case_submitted_data(input: EvalCaseWorkflowInput<'_>, last_decision: &st
             "base_commit": input.case.base_commit,
             "verify_commands": input.case.verify_commands,
             "timeout_secs": input.case.timeout_secs,
+            "resource_limits": input.case.resource_limits,
             "branch_prefix": EVAL_BRANCH_PREFIX,
             "pull_request_mode": EVAL_PR_DRAFT_MODE,
         },
@@ -529,6 +530,7 @@ fn with_eval_command_metadata(
                 "base_commit": input.case.base_commit,
                 "verify_commands": input.case.verify_commands,
                 "timeout_secs": input.case.timeout_secs,
+                "resource_limits": input.case.resource_limits,
                 "branch_prefix": EVAL_BRANCH_PREFIX,
                 "pull_request_mode": EVAL_PR_DRAFT_MODE,
             }),
@@ -569,7 +571,7 @@ mod tests {
     use crate::runtime::{RuntimeKind, RuntimeProfile, WorkflowRuntimeStore};
 
     #[test]
-    fn eval_run_plan_marks_issue_submission_for_draft_prs() {
+    fn eval_run_plan_marks_issue_submission_for_draft_prs() -> anyhow::Result<()> {
         let case = EvalBenchmarkCase {
             case_id: "owner/repo#42".to_string(),
             repo: "owner/repo".to_string(),
@@ -577,6 +579,8 @@ mod tests {
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
             timeout_secs: 120,
+            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
+                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
         };
         let input = EvalCaseWorkflowInput {
             eval_run_id: "run-1",
@@ -616,12 +620,17 @@ mod tests {
         let command = &decision.commands[0].command;
         assert_eq!(command["activity"], "implement_issue");
         assert_eq!(command["eval"]["eval_run_id"], "run-1");
+        assert_eq!(
+            command["eval"]["resource_limits"]["effective"]["wall_time_secs"],
+            120
+        );
         assert_eq!(command["branch_prefix"], EVAL_BRANCH_PREFIX);
         assert_eq!(command["pull_request_mode"], EVAL_PR_DRAFT_MODE);
         assert_eq!(
             command["validation_commands"][0],
             "cargo test -p harness-workflow eval_run"
         );
+        Ok(())
     }
 
     #[test]
@@ -659,6 +668,8 @@ mod tests {
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_cleanup".to_string()],
             timeout_secs: 120,
+            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
+                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
         };
         let outcome = enqueue_eval_case_workflow(
             &store,
@@ -744,6 +755,8 @@ mod tests {
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
             timeout_secs: 120,
+            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
+                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
         };
 
         let outcome = dispatch_eval_case_workflow(
@@ -766,6 +779,10 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].input["activity"], "implement_issue");
         assert_eq!(jobs[0].input["command"]["eval"]["eval_run_id"], "run-1");
+        assert_eq!(
+            jobs[0].input["command"]["eval"]["resource_limits"]["effective"]["output_bytes"],
+            64 * 1024 * 1024
+        );
         assert_eq!(
             jobs[0].input["command"]["branch_prefix"],
             EVAL_BRANCH_PREFIX

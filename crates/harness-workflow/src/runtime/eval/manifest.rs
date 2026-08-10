@@ -1,3 +1,4 @@
+use harness_sandbox::{CappedResourceLimits, ResourceLimits};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::{error::Error, fmt};
@@ -18,6 +19,7 @@ pub struct EvalBenchmarkCase {
     pub base_commit: String,
     pub verify_commands: Vec<String>,
     pub timeout_secs: u64,
+    pub resource_limits: CappedResourceLimits,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +48,10 @@ struct RawManifest {
     suite: String,
     #[serde(default)]
     default_timeout_secs: Option<u64>,
+    #[serde(default)]
+    default_resource_limits: ResourceLimits,
+    #[serde(default)]
+    max_resource_limits: ResourceLimits,
     cases: Vec<RawCase>,
 }
 
@@ -59,6 +65,8 @@ struct RawCase {
     verify_commands: Vec<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    resource_limits: ResourceLimits,
 }
 
 pub fn parse_benchmark_manifest_str(input: &str) -> Result<EvalBenchmarkManifest, ManifestError> {
@@ -79,6 +87,8 @@ fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, Manifes
         .default_timeout_secs
         .unwrap_or(DEFAULT_CASE_TIMEOUT_SECS);
     validate_timeout(default_timeout_secs, "default_timeout_secs")?;
+    let operator_maxima =
+        ResourceLimits::operator_default_maxima().overlay(raw.max_resource_limits);
 
     let mut seen_case_ids = BTreeSet::new();
     let mut cases = Vec::with_capacity(raw.cases.len());
@@ -96,6 +106,11 @@ fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, Manifes
         let verify_commands = normalize_verify_commands(case.verify_commands, index)?;
         let timeout_secs = case.timeout_secs.unwrap_or(default_timeout_secs);
         validate_timeout(timeout_secs, "timeout_secs")?;
+        let resource_limits = ResourceLimits::evaluation_defaults(timeout_secs)
+            .overlay(raw.default_resource_limits)
+            .overlay(case.resource_limits)
+            .cap_by(operator_maxima)
+            .map_err(|error| ManifestError::new(format!("invalid resource_limits: {error}")))?;
         let case_id = case
             .case_id
             .map(|id| non_empty(id, "case_id"))
@@ -114,6 +129,7 @@ fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, Manifes
             base_commit,
             verify_commands,
             timeout_secs,
+            resource_limits,
         });
     }
 
@@ -216,8 +232,63 @@ timeout_secs = 1800
         assert_eq!(manifest.cases.len(), 2);
         assert_eq!(manifest.cases[0].case_id, "majiayu000/harness#1437");
         assert_eq!(manifest.cases[0].timeout_secs, 7200);
+        assert_eq!(
+            manifest.cases[0].resource_limits.effective.wall_time_secs,
+            Some(7200)
+        );
         assert_eq!(manifest.cases[1].case_id, "stall-timeout-control");
         assert_eq!(manifest.cases[1].timeout_secs, 1800);
+        assert_eq!(
+            manifest.cases[1].resource_limits.effective.cpu_time_secs,
+            Some(1800)
+        );
+    }
+
+    #[test]
+    fn eval_manifest_caps_resource_limits_by_operator_maxima() {
+        let input = r#"
+suite = "harness-core"
+default_timeout_secs = 120
+
+[max_resource_limits]
+cpu_time_secs = 60
+memory_bytes = 1024
+output_bytes = 2048
+wall_time_secs = 90
+
+[[cases]]
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "b308b380"
+verify_commands = ["cargo test"]
+resource_limits = { cpu_time_secs = 120, memory_bytes = 4096, output_bytes = 1024, wall_time_secs = 180 }
+"#;
+
+        let manifest = parse_benchmark_manifest_str(input).expect("manifest should parse");
+        let limits = &manifest.cases[0].resource_limits;
+
+        assert_eq!(limits.effective.cpu_time_secs, Some(60));
+        assert_eq!(limits.effective.memory_bytes, Some(1024));
+        assert_eq!(limits.effective.output_bytes, Some(1024));
+        assert_eq!(limits.effective.wall_time_secs, Some(90));
+        assert_eq!(limits.caps.len(), 3);
+    }
+
+    #[test]
+    fn eval_manifest_rejects_zero_resource_limits() {
+        let input = r#"
+suite = "harness-core"
+
+[[cases]]
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "b308b380"
+verify_commands = ["cargo test"]
+resource_limits = { memory_bytes = 0 }
+"#;
+
+        let err = parse_benchmark_manifest_str(input).expect_err("zero limit should fail");
+        assert!(err.to_string().contains("resource limit `memory`"));
     }
 
     #[test]
