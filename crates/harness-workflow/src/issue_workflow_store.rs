@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use harness_core::db::{Migration, PgStoreContext};
+use harness_core::db::{Migration, PgMigrator, PgStoreContext};
 use sqlx::postgres::PgPool;
 use sqlx::Postgres;
 use std::path::Path;
@@ -41,6 +41,7 @@ static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
               WHERE data::jsonb->>'pr_number' IS NOT NULL",
     },
 ];
+const ISSUE_WORKFLOW_SHARED_POOL_MIGRATIONS_TABLE: &str = "issue_workflow_schema_migrations";
 
 #[cfg(test)]
 tokio::task_local! {
@@ -106,6 +107,21 @@ impl IssueWorkflowStore {
             .open_migrated_pool_with_setup_pool(setup_pool, ISSUE_WORKFLOW_MIGRATIONS)
             .await?;
         Ok(Self { pool })
+    }
+
+    pub async fn open_with_shared_pool(pool: PgPool) -> anyhow::Result<Self> {
+        PgMigrator::new_with_table(
+            &pool,
+            ISSUE_WORKFLOW_MIGRATIONS,
+            ISSUE_WORKFLOW_SHARED_POOL_MIGRATIONS_TABLE,
+        )?
+        .run()
+        .await?;
+        Ok(Self { pool })
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     pub async fn upsert(&self, workflow: &IssueWorkflowInstance) -> anyhow::Result<()> {

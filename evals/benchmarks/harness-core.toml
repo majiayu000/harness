@@ -67,7 +67,7 @@ case_id = "gh1430-runtime-circuit-breaker"
 repo = "majiayu000/harness"
 issue = 1430
 base_commit = "966b9110c5a9b3f6c9e862c9ebbcb22da1acb4c5"
-verify_commands = ["cargo test -p harness-server circuit_breaker"]
+verify_commands = ["cargo test -p harness-server hook_circuit_breaker"]
 
 # PR #1424 closed GH-1415.
 [[cases]]

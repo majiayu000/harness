@@ -610,11 +610,32 @@ fn pg_duplicate_column_error(statement: &str, error: &sqlx::Error) -> bool {
 pub struct PgMigrator<'a> {
     pool: &'a PgPool,
     migrations: &'a [Migration],
+    migration_table: &'a str,
 }
 
 impl<'a> PgMigrator<'a> {
     pub fn new(pool: &'a PgPool, migrations: &'a [Migration]) -> Self {
-        Self { pool, migrations }
+        Self {
+            pool,
+            migrations,
+            migration_table: "schema_migrations",
+        }
+    }
+
+    /// Use a store-specific migration ledger when multiple logical stores share
+    /// one PostgreSQL schema and their migration version numbers would
+    /// otherwise collide in the default `schema_migrations` table.
+    pub fn new_with_table(
+        pool: &'a PgPool,
+        migrations: &'a [Migration],
+        migration_table: &'a str,
+    ) -> anyhow::Result<Self> {
+        validate_schema_name(migration_table)?;
+        Ok(Self {
+            pool,
+            migrations,
+            migration_table,
+        })
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -653,20 +674,25 @@ impl<'a> PgMigrator<'a> {
     }
 
     async fn run_locked(&self, conn: &mut PgConnection) -> anyhow::Result<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
+        let create_migrations_table = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 version     BIGINT PRIMARY KEY,
                 description TEXT NOT NULL,
                 applied_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
-        )
-        .execute(&mut *conn)
-        .await?;
+            self.migration_table
+        );
+        sqlx::query(&create_migrations_table)
+            .execute(&mut *conn)
+            .await?;
 
-        let rows: Vec<(i64,)> =
-            sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version ASC")
-                .fetch_all(&mut *conn)
-                .await?;
+        let select_versions = format!(
+            "SELECT version FROM {} ORDER BY version ASC",
+            self.migration_table
+        );
+        let rows: Vec<(i64,)> = sqlx::query_as(&select_versions)
+            .fetch_all(&mut *conn)
+            .await?;
         let applied: HashSet<u32> = rows.into_iter().map(|(v,)| v as u32).collect();
 
         let mut pending: Vec<&Migration> = self
@@ -706,7 +732,11 @@ impl<'a> PgMigrator<'a> {
                 }
             }
         }
-        sqlx::query("INSERT INTO schema_migrations (version, description) VALUES ($1, $2)")
+        let insert_migration = format!(
+            "INSERT INTO {} (version, description) VALUES ($1, $2)",
+            self.migration_table
+        );
+        sqlx::query(&insert_migration)
             .bind(migration.version as i64)
             .bind(migration.description)
             .execute(&mut *tx)
