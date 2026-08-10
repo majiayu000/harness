@@ -145,16 +145,22 @@ pub fn eval_report_from_evidence(
     evidence: Vec<EvalCaseEvidence>,
 ) -> Result<EvalRunReport, EvalReportError> {
     validate_k(k)?;
-    let mut known_case_ids = BTreeSet::new();
+    let mut known_cases = BTreeMap::new();
     for case in &manifest.cases {
-        known_case_ids.insert(case.case_id.as_str());
+        known_cases.insert(case.case_id.as_str(), case);
     }
 
     let mut evidence_by_case = BTreeMap::new();
     for case_evidence in evidence {
-        if !known_case_ids.contains(case_evidence.case_id.as_str()) {
+        let Some(case) = known_cases.get(case_evidence.case_id.as_str()) else {
             return Err(EvalReportError::new(format!(
                 "evidence references unknown case_id `{}`",
+                case_evidence.case_id
+            )));
+        };
+        if let Some(blocker) = case.replay_blocker() {
+            return Err(EvalReportError::new(format!(
+                "evidence references non-replayable case_id `{}`: {blocker}",
                 case_evidence.case_id
             )));
         }
@@ -171,6 +177,19 @@ pub fn eval_report_from_evidence(
         .iter()
         .map(|case| match evidence_by_case.remove(&case.case_id) {
             Some(evidence) => report_case_from_evidence(case, evidence),
+            None if let Some(blocker) = case.replay_blocker() => EvalReportCase {
+                case_id: case.case_id.clone(),
+                repo: case.repo.clone(),
+                issue: case.issue,
+                base_commit: case.base_commit.clone(),
+                verify_commands: case.verify_commands.clone(),
+                status: EvalReportCaseStatus::Pending,
+                passed: false,
+                workflow_id: None,
+                total_tokens: 0,
+                cost_usd_micros: 0,
+                missing_evidence: vec![blocker.to_string()],
+            },
             None => EvalReportCase {
                 case_id: case.case_id.clone(),
                 repo: case.repo.clone(),
@@ -396,4 +415,77 @@ fn validate_k(k: u32) -> Result<(), EvalReportError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::manifest::{EvalBenchmarkCase, EvalCaseVerdict, EvalCommitResolution};
+    use super::*;
+
+    #[test]
+    fn historical_replay_manifest_pending_case_stays_pending_without_evidence() {
+        let manifest = manifest_with_case(non_replayable_case());
+
+        let report =
+            eval_report_from_evidence(&manifest, "run-1", 1, Vec::new()).expect("report builds");
+
+        assert_eq!(report.cases[0].status, EvalReportCaseStatus::Pending);
+        assert!(!report.cases[0].passed);
+        assert_eq!(report.metrics.pending_cases, 1);
+        assert_eq!(report.metrics.failed_cases, 0);
+        assert_eq!(
+            report.cases[0].missing_evidence,
+            vec!["commit_resolution is pending"]
+        );
+    }
+
+    #[test]
+    fn historical_replay_manifest_rejects_evidence_for_pending_case() {
+        let manifest = manifest_with_case(non_replayable_case());
+
+        let err = eval_report_from_evidence(&manifest, "run-1", 1, vec![evidence("pending-case")])
+            .expect_err("pending case evidence must fail");
+
+        assert!(err.to_string().contains("non-replayable case_id"));
+        assert!(err.to_string().contains("commit_resolution is pending"));
+    }
+
+    fn manifest_with_case(case: EvalBenchmarkCase) -> EvalBenchmarkManifest {
+        EvalBenchmarkManifest {
+            suite: "harness-historical-replay".to_string(),
+            cases: vec![case],
+        }
+    }
+
+    fn non_replayable_case() -> EvalBenchmarkCase {
+        EvalBenchmarkCase {
+            case_id: "pending-case".to_string(),
+            repo: "owner/repo".to_string(),
+            issue: 42,
+            base_commit: "abcdef1".to_string(),
+            verify_commands: vec!["cargo test".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: Some(EvalCommitResolution::Pending),
+            verdict: Some(EvalCaseVerdict::Pending),
+            timeout_secs: 120,
+        }
+    }
+
+    fn evidence(case_id: &str) -> EvalCaseEvidence {
+        EvalCaseEvidence {
+            eval_run_id: "run-1".to_string(),
+            case_id: case_id.to_string(),
+            workflow_id: Some("workflow-1".to_string()),
+            status: EvalEvidenceStatus::Passed,
+            runtime: None,
+            usage: Vec::new(),
+            submission: None,
+            quality_gate: None,
+            missing_evidence: Vec::new(),
+        }
+    }
 }

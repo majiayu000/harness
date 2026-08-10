@@ -27,6 +27,26 @@ pub struct EvalBenchmarkCase {
     pub timeout_secs: u64,
 }
 
+impl EvalBenchmarkCase {
+    pub fn replay_blocker(&self) -> Option<&'static str> {
+        match self.commit_resolution {
+            Some(EvalCommitResolution::Pending) => Some("commit_resolution is pending"),
+            Some(EvalCommitResolution::Resolved) if self.resolution_commits.is_empty() => {
+                Some("resolved commit_resolution has no resolution_commits")
+            }
+            None if self.verdict == Some(EvalCaseVerdict::Replayable) => {
+                Some("replayable verdict has no commit_resolution")
+            }
+            _ if self.verdict == Some(EvalCaseVerdict::Pending) => Some("verdict is pending"),
+            _ => None,
+        }
+    }
+
+    pub fn is_replayable(&self) -> bool {
+        self.replay_blocker().is_none()
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvalCaseRisk {
@@ -517,6 +537,11 @@ verdict = "pending"
         );
         assert_eq!(manifest.cases[0].verdict, Some(EvalCaseVerdict::Pending));
         assert!(manifest.cases[0].resolution_commits.is_empty());
+        assert_eq!(
+            manifest.cases[0].replay_blocker(),
+            Some("commit_resolution is pending")
+        );
+        assert!(!manifest.cases[0].is_replayable());
     }
 
     #[test]
@@ -610,5 +635,72 @@ paths = ["../Cargo.toml"]
             .expect("GH-1717 case exists");
         assert_eq!(gh1717.resolution_prs, vec![1723, 1724]);
         assert_eq!(gh1717.resolution_commits.len(), 2);
+    }
+
+    #[test]
+    fn historical_replay_manifest_uses_non_skipping_oracles() {
+        let manifest = parse_benchmark_manifest_str(include_str!(
+            "../../../../../evals/benchmarks/harness-historical-replay.toml"
+        ))
+        .expect("historical replay manifest should parse");
+
+        assert_command_contains(
+            &manifest,
+            1716,
+            "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server --lib task_db::queries_recovery_tests",
+        );
+        assert_command_contains(
+            &manifest,
+            1704,
+            "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server 'http::tests::runtime_transcript_route_tests::exact_replay_preflight_fails_terminal_on_missing_or_corrupt_transcript' -- --exact",
+        );
+        assert_command_contains(
+            &manifest,
+            1707,
+            "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart",
+        );
+        assert_command_contains(
+            &manifest,
+            1434,
+            "bash scripts/archive-phase1-data.sh && test -s archives/phase1-*/RESTORE.md",
+        );
+        assert_command_contains(&manifest, 1574, "phase1-replay-report.json");
+        assert_command_contains(&manifest, 1686, "bun-version-file: .bun-version");
+        assert_command_contains(
+            &manifest,
+            1717,
+            "cargo test -p harness-server context_rpc_preview_with_supplied_items_returns_manifest --lib",
+        );
+        assert_command_contains(&manifest, 1717, "cargo tree -p harness-protocol");
+        assert_command_contains(
+            &manifest,
+            1717,
+            "cargo test -p harness-protocol context_preview_defaults_and_empty_collections_are_equivalent --lib",
+        );
+        assert_command_contains(
+            &manifest,
+            1717,
+            "cargo test -p harness-server context_preview_conversion_is_deterministic_and_order_preserving --lib",
+        );
+        assert_command_contains(
+            &manifest,
+            1717,
+            "python3 checks/check_workflow.py --repo . --spec-dir specs/GH1717",
+        );
+    }
+
+    fn assert_command_contains(manifest: &EvalBenchmarkManifest, issue: u64, expected: &str) {
+        let case = manifest
+            .cases
+            .iter()
+            .find(|case| case.issue == issue)
+            .unwrap_or_else(|| panic!("GH-{issue} case exists"));
+        assert!(
+            case.verify_commands
+                .iter()
+                .any(|command| command.contains(expected)),
+            "{} missing command containing {expected}",
+            case.case_id
+        );
     }
 }

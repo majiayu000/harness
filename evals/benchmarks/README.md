@@ -38,4 +38,4 @@ Historical replay cases can also record structured replay metadata:
 - `resolution_prs` and `resolution_commits` record the commit-resolution pair.
 - `commit_resolution` is `resolved` or `pending`.
 - `verdict` is `replayable` or `pending`; pending commit pairs must not be
-  marked replayable.
+  marked replayable, dispatched, or counted from collected evidence.
