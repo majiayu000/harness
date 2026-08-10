@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 const BLOCKING_SIGNAL_TYPES: &[&str] = &[
     "ChangesRequested",
     "ChecksFailed",
+    "LocalReviewPassed",
     "LocalReviewChangesRequested",
     "LocalReviewBlocked",
     "QualityBlocked",
@@ -166,29 +167,24 @@ fn declared_local_review_outcome(
         return None;
     }
 
-    let changes_requested = result
-        .signals
-        .iter()
-        .any(|signal| signal.signal_type == LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL);
-    let blocked = result
-        .signals
-        .iter()
-        .any(|signal| signal.signal_type == LOCAL_REVIEW_BLOCKED_SIGNAL);
-    let passed = result
-        .signals
-        .iter()
-        .any(|signal| signal.signal_type == LOCAL_REVIEW_PASSED_SIGNAL);
-    if u8::from(changes_requested) + u8::from(blocked) + u8::from(passed) != 1 {
+    let mut declared_count = 0;
+    let mut declared_outcome = None;
+    for signal in &result.signals {
+        let outcome = match signal.signal_type.as_str() {
+            LOCAL_REVIEW_PASSED_SIGNAL => LocalReviewOutcome::Passed,
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL => LocalReviewOutcome::ChangesRequested,
+            LOCAL_REVIEW_BLOCKED_SIGNAL => LocalReviewOutcome::Blocked,
+            _ => continue,
+        };
+        declared_count += 1;
+        declared_outcome = Some(outcome);
+    }
+
+    if declared_count != 1 {
         return None;
     }
 
-    if changes_requested {
-        Some(LocalReviewOutcome::ChangesRequested)
-    } else if blocked {
-        Some(LocalReviewOutcome::Blocked)
-    } else {
-        Some(LocalReviewOutcome::Passed)
-    }
+    declared_outcome
 }
 
 fn is_local_review_outcome_signal(signal_type: &str) -> bool {
@@ -487,6 +483,32 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_declared_local_review_outcomes_downgrade() {
+        for signal_type in [
+            LOCAL_REVIEW_PASSED_SIGNAL,
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            LOCAL_REVIEW_BLOCKED_SIGNAL,
+        ] {
+            let claimed = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Review completed.")
+                .with_signal(ActivitySignal::new(signal_type, json!({})))
+                .with_signal(ActivitySignal::new(signal_type, json!({})));
+
+            let (changed, result) =
+                enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+            assert!(
+                changed,
+                "duplicate {signal_type} declarations must fail closed"
+            );
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec![format!("signal:{signal_type}")]
+            );
+        }
+    }
+
+    #[test]
     fn local_review_blocker_evidence_still_downgrades_without_declared_outcome() {
         let claimed = ActivityResult::succeeded(
             LOCAL_REVIEW_ACTIVITY,
@@ -520,6 +542,7 @@ mod tests {
             (None, LOCAL_REVIEW_ACTIVITY),
         ] {
             for signal_type in [
+                LOCAL_REVIEW_PASSED_SIGNAL,
                 LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
                 LOCAL_REVIEW_BLOCKED_SIGNAL,
             ] {

@@ -407,6 +407,52 @@ fn local_review_blocked_result_routes_to_blocked() {
 }
 
 #[test]
+fn duplicate_identical_local_review_outcome_blocks_invalid_output() {
+    let instance = issue_instance("local_review_gate");
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Local review passed.")
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_PASSED_SIGNAL,
+            json!({ "pr_number": 77 }),
+        ))
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_PASSED_SIGNAL,
+            json!({ "pr_number": 77 }),
+        ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("duplicate local review outcomes should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("without exactly one"));
+}
+
+#[test]
+fn mixed_local_review_outcomes_block_invalid_output() {
+    let instance = issue_instance("local_review_gate");
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Local review was ambiguous.")
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_PASSED_SIGNAL,
+            json!({ "pr_number": 77 }),
+        ))
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            json!({ "pr_number": 77 }),
+        ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("mixed local review outcomes should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("without exactly one"));
+}
+
+#[test]
 fn local_review_success_without_outcome_signal_blocks_invalid_output() {
     let instance = issue_instance("local_review_gate");
     let result = ActivityResult::succeeded(
