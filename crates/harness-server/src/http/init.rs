@@ -434,7 +434,7 @@ pub(crate) fn build_completion_callback(
                 if let task_runner::TaskStatus::Done = &task.status {
                     if let Some(pr_url) = task.pr_url.as_deref() {
                         if let Some((owner, repo, pr_num)) =
-                            harness_core::prompts::parse_github_pr_url(pr_url)
+                            harness_agents::output_parsing::parse_github_pr_url(pr_url)
                         {
                             let resolved_token =
                                 crate::github_auth::resolve_github_token(github_token.as_deref());

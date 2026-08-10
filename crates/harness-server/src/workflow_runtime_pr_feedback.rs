@@ -611,7 +611,7 @@ async fn latest_observed_pr_fact_for_instance(
 fn pr_repo_for_fact_lookup(data: &serde_json::Value) -> Option<String> {
     optional_string_field(data, "repo").or_else(|| {
         optional_string_field(data, "pr_url").and_then(|pr_url| {
-            harness_core::prompts::parse_github_pr_url(pr_url.trim())
+            harness_agents::output_parsing::parse_github_pr_url(pr_url.trim())
                 .map(|(owner, repo, _)| format!("{owner}/{repo}"))
         })
     })
