@@ -92,13 +92,18 @@ pub use errors::RuntimeJobNotFoundError;
 pub use eval::{
     collect_eval_case_evidence, collect_eval_case_evidence_from_records, diff_eval_run_reports,
     dispatch_eval_case_workflow, enqueue_eval_case_workflow, eval_report_dry_run,
-    eval_report_from_evidence, parse_benchmark_manifest_str, score_pr_repair_eval,
+    eval_report_from_evidence, historical_replay_command_digest, parse_benchmark_manifest_str,
+    parse_historical_replay_cohort_str, score_pr_repair_eval, validate_historical_replay_cohort,
     EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseDispatchOutcome, EvalCaseEnqueueOutcome,
     EvalCaseEvidence, EvalCaseTransition, EvalCaseTransitionKind, EvalCaseWorkflowInput,
     EvalCaseWorkflowPlan, EvalEvidenceStatus, EvalQualityGateEvidence, EvalReportCase,
     EvalReportCaseStatus, EvalReportError, EvalReportMetricDelta, EvalReportMetrics, EvalRunReport,
-    EvalRunReportDiff, EvalSubmissionEvidence, ManifestError, ScoringError,
+    EvalRunReportDiff, EvalSubmissionEvidence, HistoricalReplayCase, HistoricalReplayCohort,
+    HistoricalReplayCohortVerdict, HistoricalReplayCommandEvidence, HistoricalReplayCommandRun,
+    HistoricalReplayComparison, HistoricalReplayError, HistoricalReplayIssueSnapshot,
+    HistoricalReplayPullRequestSnapshot, HistoricalReplayVerification, ManifestError, ScoringError,
     DEFAULT_CASE_TIMEOUT_SECS, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
+    HISTORICAL_REPLAY_COHORT_SCHEMA,
 };
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use memory_retrieval::{
