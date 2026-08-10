@@ -158,6 +158,87 @@ impl AgentAdapter for InterruptTrackingAdapter {
     }
 }
 
+struct TurnCompletedAdapter {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for TurnCompletedAdapter {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: AgentRequest,
+        tx: mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        tx.send(AgentEvent::MessageDelta {
+            text: "adapter ".to_string(),
+        })
+        .await
+        .map_err(|error| HarnessError::AgentExecution(format!("adapter closed: {error}")))?;
+        tx.send(AgentEvent::TurnCompleted {
+            output: "adapter done".to_string(),
+        })
+        .await
+        .map_err(|error| HarnessError::AgentExecution(format!("adapter closed: {error}")))?;
+        Ok(())
+    }
+}
+
+struct ControlTrackingAdapter {
+    interrupt_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for ControlTrackingAdapter {
+    fn name(&self) -> &str {
+        "codex-control"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: AgentRequest,
+        _tx: mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        unreachable!("control backend must not execute turns")
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        self.interrupt_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+struct PendingTurnAdapter {
+    start_calls: Arc<AtomicUsize>,
+    interrupt_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for PendingTurnAdapter {
+    fn name(&self) -> &str {
+        "codex-turn"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: AgentRequest,
+        _tx: mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        self.start_calls.fetch_add(1, Ordering::AcqRel);
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        self.interrupt_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
 fn server_with_codex_counts(
     root: &std::path::Path,
     agent_calls: Arc<AtomicUsize>,
@@ -246,6 +327,52 @@ async fn lifecycle_uses_registered_turn_adapter_by_default() -> anyhow::Result<(
         .get_turn(&thread_id, &turn_id)
         .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
     assert_eq!(turn.status, TurnStatus::Completed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_persists_turn_completed_output_from_turn_backend() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let agent_calls = Arc::new(AtomicUsize::new(0));
+    let adapter_calls = Arc::new(AtomicUsize::new(0));
+    let mut config = HarnessConfig::default();
+    config.server.project_root = root.path().to_path_buf();
+    config.agents.default_agent = "codex".to_string();
+    let mut registry = AgentRegistry::new("codex");
+    registry.register("codex", Arc::new(CountingAgent { calls: agent_calls }));
+    let adapter_calls_for_factory = adapter_calls.clone();
+    registry
+        .register_turn_backend_factory("codex", move || {
+            Arc::new(TurnCompletedAdapter {
+                calls: adapter_calls_for_factory.clone(),
+            })
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let turn_id = start_test_turn(&server, root.path())?;
+
+    run_test_turn(
+        server.clone(),
+        root.path(),
+        turn_id.clone(),
+        TurnLifecycleOptions::default(),
+    )
+    .await?;
+
+    assert_eq!(adapter_calls.load(Ordering::Acquire), 1);
+    let thread_id = server
+        .thread_manager
+        .find_thread_for_turn(&turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should belong to a thread"))?;
+    let turn = server
+        .thread_manager
+        .get_turn(&thread_id, &turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
+    assert_eq!(turn.status, TurnStatus::Completed);
+    assert!(turn
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::AgentReasoning { content } if content == "adapter done")));
     Ok(())
 }
 
@@ -363,6 +490,71 @@ async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
         interrupt_calls.load(Ordering::Acquire),
         1,
         "pre-fired lease-lost must interrupt the agent"
+    );
+    let thread_id = server
+        .thread_manager
+        .find_thread_for_turn(&turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should belong to a thread"))?;
+    let turn = server
+        .thread_manager
+        .get_turn(&thread_id, &turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
+    assert_eq!(turn.status, TurnStatus::Failed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_interrupts_registered_control_backend_when_turn_factory_exists(
+) -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let agent_calls = Arc::new(AtomicUsize::new(0));
+    let control_interrupts = Arc::new(AtomicUsize::new(0));
+    let turn_starts = Arc::new(AtomicUsize::new(0));
+    let turn_interrupts = Arc::new(AtomicUsize::new(0));
+    let mut config = HarnessConfig::default();
+    config.server.project_root = root.path().to_path_buf();
+    config.agents.default_agent = "codex".to_string();
+    let mut registry = AgentRegistry::new("codex");
+    registry.register("codex", Arc::new(CountingAgent { calls: agent_calls }));
+    registry
+        .register_adapter(
+            "codex",
+            Arc::new(ControlTrackingAdapter {
+                interrupt_calls: control_interrupts.clone(),
+            }),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let turn_starts_for_factory = turn_starts.clone();
+    let turn_interrupts_for_factory = turn_interrupts.clone();
+    registry
+        .register_turn_backend_factory("codex", move || {
+            Arc::new(PendingTurnAdapter {
+                start_calls: turn_starts_for_factory.clone(),
+                interrupt_calls: turn_interrupts_for_factory.clone(),
+            })
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let turn_id = start_test_turn(&server, root.path())?;
+    let (lease_lost, receiver) = tokio::sync::watch::channel(false);
+    let _ = lease_lost.send(true);
+
+    run_test_turn(
+        server.clone(),
+        root.path(),
+        turn_id.clone(),
+        TurnLifecycleOptions {
+            lease_lost: Some(receiver),
+            ..TurnLifecycleOptions::default()
+        },
+    )
+    .await?;
+
+    assert_eq!(control_interrupts.load(Ordering::Acquire), 1);
+    assert_eq!(
+        turn_interrupts.load(Ordering::Acquire),
+        0,
+        "active control must use the registered control backend, not the turn execution backend"
     );
     let thread_id = server
         .thread_manager

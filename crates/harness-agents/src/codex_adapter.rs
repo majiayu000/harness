@@ -143,46 +143,6 @@ pub enum ParsedCodexMessage {
     Ignore,
 }
 
-fn normalize_codex_turn_event(
-    event: AgentEvent,
-    output_buf: &mut String,
-    emitted_agent_completion: &mut bool,
-) -> Option<AgentEvent> {
-    match event {
-        AgentEvent::MessageDelta { text } => {
-            output_buf.push_str(&text);
-            Some(AgentEvent::MessageDelta { text })
-        }
-        AgentEvent::ItemCompleted { item } => {
-            if let harness_core::types::Item::AgentReasoning { content } = &item {
-                output_buf.clear();
-                output_buf.push_str(content);
-                *emitted_agent_completion = true;
-            }
-            Some(AgentEvent::ItemCompleted { item })
-        }
-        AgentEvent::TurnCompleted { output } => {
-            if *emitted_agent_completion {
-                output_buf.clear();
-                return None;
-            }
-            let content = if output.is_empty() {
-                std::mem::take(output_buf)
-            } else {
-                output
-            };
-            if content.is_empty() {
-                None
-            } else {
-                Some(AgentEvent::ItemCompleted {
-                    item: harness_core::types::Item::AgentReasoning { content },
-                })
-            }
-        }
-        other => Some(other),
-    }
-}
-
 impl CodexAdapter {
     pub fn new(cli_path: PathBuf) -> Self {
         let config = CodexAgentConfig {
@@ -603,8 +563,6 @@ impl AgentAdapter for CodexAdapter {
         let mut turn_completed = false;
         let mut receiver_closed = false;
         let mut stdout_closed = false;
-        let mut output_buf = String::new();
-        let mut emitted_agent_completion = false;
         let stall_timeout = app_server_stall_timeout(&req);
         let read_result = async {
             while let Some(message) =
@@ -632,15 +590,9 @@ impl AgentAdapter for CodexAdapter {
                         if is_terminal {
                             self.clear_active_turn_id().await;
                         }
-                        if let Some(event) = normalize_codex_turn_event(
-                            event,
-                            &mut output_buf,
-                            &mut emitted_agent_completion,
-                        ) {
-                            if tx.send(event).await.is_err() {
-                                receiver_closed = true;
-                                break;
-                            }
+                        if tx.send(event).await.is_err() {
+                            receiver_closed = true;
+                            break;
                         }
                         if is_terminal {
                             turn_completed = true;

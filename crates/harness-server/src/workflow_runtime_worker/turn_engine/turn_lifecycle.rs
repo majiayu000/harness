@@ -1,5 +1,6 @@
 use super::helpers::{
     emit_runtime_notification, mark_turn_failed, process_stream_item, RuntimeUsageContext,
+    StreamCompletionState,
 };
 use harness_core::agent::{AgentRequest, StreamItem};
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
@@ -131,9 +132,10 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let adapter_opt = if options.force_code_agent {
         None
     } else {
-        execution_adapter
-            .clone()
-            .or_else(|| server.agent_registry.get_adapter(&agent_name))
+        server
+            .agent_registry
+            .get_adapter(&agent_name)
+            .or_else(|| execution_adapter.clone())
     };
 
     // Register as live adapter (RAII guard for cleanup on turn exit).
@@ -224,6 +226,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let mut stream_closed = false;
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut stream_error: Option<String> = None;
+    let mut completion_state = StreamCompletionState::default();
     let mut last_activity = Instant::now();
     let execution_deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
     let execution_timeout = async {
@@ -253,6 +256,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         if let StreamItem::Error { message } = &item {
                             stream_error.get_or_insert_with(|| message.clone());
                         }
+                        let Some(item) = completion_state.normalize(item) else {
+                            continue;
+                        };
                         let budget_stop = process_stream_item(
                             &server,
                             &notify_tx,
