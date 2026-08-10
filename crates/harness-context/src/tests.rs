@@ -1,6 +1,8 @@
-use crate::providers::{ExecPlanProvider, StaticProvider};
+use crate::providers::{ExecPlanProvider, SkillsProvider, StaticProvider};
 use crate::*;
 use harness_core::types::{ProjectId, ThreadId};
+use harness_core::types::{SkillId, SkillLocation};
+use harness_skills::store::{Skill, SkillGovernanceStatus};
 
 fn req() -> ComposeRequest {
     ComposeRequest {
@@ -26,6 +28,30 @@ fn item(id: &str, class: ItemClass, content_len: usize, priority: Priority) -> C
         ],
         dedupe_key: None,
         instruction_bearing: false,
+    }
+}
+
+fn skill(name: &str, description: &str, trigger_patterns: &[&str]) -> Skill {
+    Skill {
+        id: SkillId::new(),
+        name: name.to_string(),
+        description: description.to_string(),
+        content: format!("# {name}\n{description}"),
+        trigger_patterns: trigger_patterns
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+        version: "1.0.0".to_string(),
+        author: "test".to_string(),
+        location: SkillLocation::System,
+        content_hash: format!("hash-{name}"),
+        usage_count: 0,
+        last_used: None,
+        quality_score: 0.5,
+        scored_samples: 0,
+        governance_status: SkillGovernanceStatus::Active,
+        canary_ratio: 1.0,
+        last_scored: None,
     }
 }
 
@@ -261,6 +287,33 @@ fn manifest_serialization_omits_item_content() {
 
     assert!(manifest_json.contains("rule:secret"));
     assert!(!manifest_json.contains(secret_content));
+}
+
+#[test]
+fn skills_provider_matches_reversed_prompt_terms() {
+    let provider = SkillsProvider::new(vec![skill("review", "review code", &["code review"])]);
+    let mut request = req();
+    request.task_profile.prompt = Some("please review code changes before merging".to_string());
+
+    let items = provider.propose(&request).expect("provider succeeds");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id.as_str(), "skill:review");
+    assert!(items[0].relevance > 0.7);
+}
+
+#[test]
+fn skills_provider_ranks_by_lexical_relevance() {
+    let provider = SkillsProvider::new(vec![
+        skill("build-fix", "fix builds", &["build error"]),
+        skill("review", "review code", &["code review"]),
+    ]);
+    let mut request = req();
+    request.task_profile.prompt = Some("review code changes before merging".to_string());
+
+    let items = provider.propose(&request).expect("provider succeeds");
+
+    assert_eq!(items[0].id.as_str(), "skill:review");
 }
 
 #[test]

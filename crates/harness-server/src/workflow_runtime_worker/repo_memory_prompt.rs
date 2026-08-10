@@ -26,6 +26,7 @@ pub(super) async fn repo_memory_for_prompt_packet(
         return RepoMemoryPromptContext::default();
     };
     let activity = activity_name(job);
+    let task_text = repo_memory_task_text(workflow, job);
     let Some(store) = store else {
         return RepoMemoryPromptContext {
             records: Vec::new(),
@@ -39,7 +40,12 @@ pub(super) async fn repo_memory_for_prompt_packet(
         };
     };
     match store
-        .retrieve_repo_memory_records(&repo, &activity, RepoMemoryRetrievalOptions::default())
+        .retrieve_repo_memory_records_for_task(
+            &repo,
+            &activity,
+            task_text.as_deref(),
+            RepoMemoryRetrievalOptions::default(),
+        )
         .await
     {
         Ok(records) => RepoMemoryPromptContext {
@@ -106,6 +112,26 @@ fn repo_for_memory_prompt(workflow: Option<&WorkflowInstance>, job: &RuntimeJob)
         .map(str::trim)
         .filter(|repo| !repo.is_empty())
         .map(str::to_string)
+}
+
+fn repo_memory_task_text(workflow: Option<&WorkflowInstance>, job: &RuntimeJob) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(workflow) = workflow {
+        if let Ok(subject) = serde_json::to_string(&workflow.subject) {
+            parts.push(subject);
+        }
+        if let Ok(data) = serde_json::to_string(&workflow.data) {
+            parts.push(data);
+        }
+    }
+    if let Ok(input) = serde_json::to_string(&job.input) {
+        parts.push(input);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
 }
 
 #[cfg(test)]
