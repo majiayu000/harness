@@ -285,6 +285,20 @@ fn validate_case(case: &HistoricalReplayCase) -> Result<(), HistoricalReplayErro
     non_empty(&replay.command, "replay.command")?;
     validate_run_digest(case, "baseline", &replay.baseline)?;
     validate_run_digest(case, "candidate", &replay.candidate)?;
+    validate_declared_run_outcome(
+        &case.case_id,
+        "baseline",
+        "comparison.baseline_outcome",
+        &case.comparison.baseline_outcome,
+        &replay.baseline,
+    )?;
+    validate_declared_run_outcome(
+        &case.case_id,
+        "candidate",
+        "comparison.candidate_outcome",
+        &case.comparison.candidate_outcome,
+        &replay.candidate,
+    )?;
     if replay.baseline.commit != pr.merge_parent_base_commit {
         return Err(HistoricalReplayError::new(format!(
             "{} baseline commit does not match merge parent",
@@ -339,6 +353,40 @@ fn validate_case(case: &HistoricalReplayCase) -> Result<(), HistoricalReplayErro
     }
     non_empty(&case.summary, "summary")?;
     Ok(())
+}
+
+fn validate_declared_run_outcome(
+    case_id: &str,
+    phase: &str,
+    outcome_field: &str,
+    declared_outcome: &str,
+    run: &HistoricalReplayCommandRun,
+) -> Result<(), HistoricalReplayError> {
+    let expected = expected_run_outcome(run);
+    if run.status != expected {
+        return Err(HistoricalReplayError::new(format!(
+            "{case_id} {phase} status `{}` contradicts command result; expected `{expected}`",
+            run.status
+        )));
+    }
+    if declared_outcome != expected {
+        return Err(HistoricalReplayError::new(format!(
+            "{case_id} {outcome_field} `{declared_outcome}` contradicts command result; expected `{expected}`"
+        )));
+    }
+    Ok(())
+}
+
+fn expected_run_outcome(run: &HistoricalReplayCommandRun) -> &'static str {
+    if run.exit_code == 0 {
+        if run.tests_run > 0 {
+            "passed"
+        } else {
+            "passed_zero_tests"
+        }
+    } else {
+        "failed"
+    }
 }
 
 fn validate_run_digest(
@@ -422,5 +470,45 @@ mod tests {
             .cases
             .iter()
             .any(|case| case.case_id == "gh1707-coverage-recovery"));
+    }
+
+    #[test]
+    fn historical_replay_rejects_candidate_status_that_contradicts_passing_run() {
+        let mut cohort: serde_json::Value =
+            serde_json::from_str(ASC_030_COHORT).expect("fixture should be JSON");
+        cohort["cases"][0]["replay"]["candidate"]["status"] = "failed".into();
+        let case_id = cohort["cases"][0]["case_id"]
+            .as_str()
+            .expect("case id")
+            .to_string();
+        let command = cohort["cases"][0]["replay"]["command"]
+            .as_str()
+            .expect("command")
+            .to_string();
+        let run = serde_json::from_value::<HistoricalReplayCommandRun>(
+            cohort["cases"][0]["replay"]["candidate"].clone(),
+        )
+        .expect("candidate run should deserialize");
+        cohort["cases"][0]["replay"]["candidate"]["evidence_sha256"] =
+            historical_replay_command_digest(&case_id, "candidate", &command, &run).into();
+
+        let input = serde_json::to_string(&cohort).expect("fixture should serialize");
+        let error = parse_historical_replay_cohort_str(&input)
+            .expect_err("contradictory candidate status should fail validation");
+
+        assert!(error.to_string().contains("candidate status"));
+    }
+
+    #[test]
+    fn historical_replay_rejects_candidate_outcome_that_contradicts_passing_run() {
+        let mut cohort: serde_json::Value =
+            serde_json::from_str(ASC_030_COHORT).expect("fixture should be JSON");
+        cohort["cases"][0]["comparison"]["candidate_outcome"] = "failed".into();
+
+        let input = serde_json::to_string(&cohort).expect("fixture should serialize");
+        let error = parse_historical_replay_cohort_str(&input)
+            .expect_err("contradictory candidate outcome should fail validation");
+
+        assert!(error.to_string().contains("comparison.candidate_outcome"));
     }
 }
