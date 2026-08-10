@@ -58,7 +58,7 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 
 ## PR Workflow
 
-- Before merging, every PR must receive a fresh-context review from an agent process that did not author the changes. The reviewer must return `APPROVE` or `REQUEST_CHANGES` with concrete findings; missing or unparseable output is not approval.
+- Before merging, every PR must receive a fresh-context review from an agent process that did not author the changes. The reviewer must put `APPROVED` on the last non-empty line when no blockers remain, or list each blocking finding on its own line prefixed with `ISSUE:`; missing or unparseable output is not approval.
 - External review bots are optional advisors. Address valid feedback when it arrives, but bot silence, quota exhaustion, or service failure does not block a merge.
 - Address valid reviewer findings before merge. Record the reason for rejecting false positives in the handoff; posting that reason to the PR requires operator approval.
 - Merging requires explicit operator approval, a passing `CI Result` check, and squash merge.
