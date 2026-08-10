@@ -1,0 +1,122 @@
+name: agent-stack
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      baseline_path:
+        description: "Reviewed baseline path on the base branch"
+        required: false
+        default: "evals/baselines/agent-stack/latest.json"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.AGENT_STACK_REGRESSION_ENABLED == 'true' }}
+    env:
+      BASELINE_PATH: ${{ inputs.baseline_path || vars.AGENT_STACK_REGRESSION_BASELINE || 'evals/baselines/agent-stack/latest.json' }}
+      CANDIDATE_DECISION_PATH: ${{ runner.temp }}/agent-stack-regression/candidate-decision.json
+      EVIDENCE_DIR: artifacts/agent-stack-regression
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Harness CLI
+        run: cargo build -p harness-cli --locked
+
+      - name: Prepare fail-closed decision input
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+          SUBJECT: ${{ github.repository }}@${{ github.sha }}
+        run: |
+          set -euo pipefail
+          rm -rf "$EVIDENCE_DIR"
+          mkdir -p "$EVIDENCE_DIR" "$(dirname "$CANDIDATE_DECISION_PATH")"
+          BASELINE_COPY="$EVIDENCE_DIR/base-baseline.json"
+          INPUT_JSON="$EVIDENCE_DIR/promotion-input.json"
+          if ! git show "${BASE_SHA}:${BASELINE_PATH}" > "$BASELINE_COPY" 2>"$EVIDENCE_DIR/baseline.stderr"; then
+            python3 - "$INPUT_JSON" <<'PY'
+          import json
+          import os
+          import sys
+
+          payload = {
+              "suite": "agent-stack",
+              "subject": os.environ["SUBJECT"],
+              "baseline": f'{os.environ["BASELINE_PATH"]}@{os.environ["BASE_SHA"]}',
+              "candidate": os.environ["CANDIDATE_DECISION_PATH"],
+              "decision": "NO_BASELINE",
+              "no_change": True,
+              "gaps": ["reviewed base-branch baseline was not found"],
+              "rules": [
+                  "required check name is agent-stack / regression",
+                  "local or PR-authored evidence is not treated as trusted",
+              ],
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2)
+              handle.write("\n")
+          PY
+            exit 0
+          fi
+
+          if [ ! -s "$CANDIDATE_DECISION_PATH" ]; then
+            python3 - "$INPUT_JSON" <<'PY'
+          import json
+          import os
+          import sys
+
+          payload = {
+              "suite": "agent-stack",
+              "subject": os.environ["SUBJECT"],
+              "baseline": f'{os.environ["BASELINE_PATH"]}@{os.environ["BASE_SHA"]}',
+              "candidate": os.environ["CANDIDATE_DECISION_PATH"],
+              "decision": "ENGINE_ERROR",
+              "no_change": False,
+              "engine_error": "agent-stack regression engine did not produce a candidate decision",
+              "rules": [
+                  "required check name is agent-stack / regression",
+                  "REVIEW, BLOCK, no-baseline, and engine errors fail this check",
+                  "local or PR-authored evidence is not treated as trusted",
+              ],
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2)
+              handle.write("\n")
+          PY
+          else
+            cp "$CANDIDATE_DECISION_PATH" "$INPUT_JSON"
+          fi
+
+      - name: Render decision summary
+        run: |
+          set +e
+          target/debug/harness eval promotion-summary \
+            --input "$EVIDENCE_DIR/promotion-input.json" \
+            --output "$EVIDENCE_DIR/promotion-summary.json" \
+            --markdown-output "$EVIDENCE_DIR/step-summary.md"
+          status=$?
+          set -e
+          cat "$EVIDENCE_DIR/step-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Upload regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-stack-regression-evidence
+          path: artifacts/agent-stack-regression
+          if-no-files-found: error
+          retention-days: 14
