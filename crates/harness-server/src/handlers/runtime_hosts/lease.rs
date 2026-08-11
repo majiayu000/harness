@@ -43,6 +43,8 @@ pub struct ClaimRuntimeJobRequest {
 pub struct RenewRuntimeJobLeaseRequest {
     pub lease_generation: u64,
     pub lease_expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub lease_proof: Option<Uuid>,
     pub renewal_id: Uuid,
     #[serde(default)]
     lease_secs: OptionalLeaseSecs,
@@ -86,6 +88,7 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
             runtime_job_id: &runtime_job_id,
             owner: &host_id,
             lease_generation: req.lease_generation,
+            lease_proof: req.lease_proof,
             previous_expires_at: req.lease_expires_at,
             renewal_id: req.renewal_id,
             lease_secs,
@@ -99,16 +102,37 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
             lease_generation,
             lease_expires_at,
             replayed,
-        }) => (
-            StatusCode::OK,
-            Json(json!({
-                "renewed": true,
-                "runtime_job_id": runtime_job_id,
-                "lease_generation": lease_generation,
-                "lease_expires_at": lease_expires_at,
-                "replayed": replayed,
-            })),
-        ),
+        }) => match store
+            .remote_runtime_job_lease_proof(
+                &runtime_job_id,
+                &host_id,
+                lease_generation,
+                lease_expires_at,
+            )
+            .await
+        {
+            Ok(Some(lease_proof)) => (
+                StatusCode::OK,
+                Json(json!({
+                    "renewed": true,
+                    "runtime_job_id": runtime_job_id,
+                    "lease_generation": lease_generation,
+                    "lease_expires_at": lease_expires_at,
+                    "lease_proof": lease_proof,
+                    "replayed": replayed,
+                })),
+            ),
+            Ok(None) => workflow_store_unavailable_response(),
+            Err(error) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    runtime_job_id = %runtime_job_id,
+                    %error,
+                    "renewed runtime job lease proof lookup failed"
+                );
+                workflow_store_unavailable_response()
+            }
+        },
         Ok(RuntimeJobLeaseRenewalOutcome::LeaseLost { .. }) => lease_lost_response(),
         Ok(RuntimeJobLeaseRenewalOutcome::NotFound) => (
             StatusCode::NOT_FOUND,
@@ -156,7 +180,7 @@ fn validated_runtime_host_lease_secs(
 fn invalid_duration_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
-        Json(json!({ "error": "lease_secs must be between 1 and 3600" })),
+        Json(json!({ "error": "lease_secs must be between 1 and 60" })),
     )
 }
 
@@ -170,7 +194,7 @@ pub(super) fn lease_lost_response() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-fn workflow_store_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
+pub(super) fn workflow_store_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
     crate::http::api_error::ApiError::store_unavailable("workflow runtime store").into_status_json()
 }
 
@@ -193,9 +217,9 @@ mod tests {
             now + TimeDelta::seconds(1)
         );
         assert_eq!(
-            runtime_host_lease_expires_at_at(now, Some(3600))
+            runtime_host_lease_expires_at_at(now, Some(60))
                 .expect("maximum duration must be valid"),
-            now + TimeDelta::seconds(3600)
+            now + TimeDelta::seconds(60)
         );
     }
 
@@ -218,7 +242,7 @@ mod tests {
     #[test]
     fn runtime_job_lease_duration_rejects_zero_oversized_and_null() {
         assert!(validated_runtime_host_lease_secs(Some(0)).is_err());
-        assert!(validated_runtime_host_lease_secs(Some(3601)).is_err());
+        assert!(validated_runtime_host_lease_secs(Some(61)).is_err());
         assert!(validated_runtime_host_lease_secs(Some(u64::MAX)).is_err());
 
         let request = json!({

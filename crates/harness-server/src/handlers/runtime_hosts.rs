@@ -6,14 +6,16 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use harness_workflow::runtime::{
-    prepare_runtime_transcript, ActivityResult, RuntimeJob, RuntimeJobClaimDecision,
-    RuntimeJobClaimGuard, RuntimeJobNotFoundError, RuntimeKind, WorkflowRuntimeStore,
+    ActivityResult, RuntimeJob, RuntimeJobClaimDecision, RuntimeJobClaimGuard,
+    RuntimeJobCompletionLease, RuntimeKind, WorkflowRuntimeStore,
 };
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 
+pub(crate) mod completion;
 pub(crate) mod lease;
+pub use completion::{complete_runtime_job_for_runtime_host, CompleteRuntimeJobRequest};
 pub use lease::renew_runtime_job_lease_for_runtime_host;
 
 #[derive(Debug, Deserialize)]
@@ -22,14 +24,6 @@ pub struct RegisterRuntimeHostRequest {
     pub display_name: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CompleteRuntimeJobRequest {
-    pub lease_expires_at: DateTime<Utc>,
-    #[serde(default)]
-    pub lease_generation: Option<u64>,
-    pub result: ActivityResult,
 }
 
 pub async fn list_runtime_hosts(
@@ -363,6 +357,27 @@ pub async fn claim_runtime_job_for_runtime_host(
 
     let runtime_job_id = job.id.clone();
     let lease_generation = job.lease_generation;
+    let lease_proof = match store
+        .remote_runtime_job_lease_proof(
+            &runtime_job_id,
+            &host_id,
+            lease_generation,
+            lease_expires_at,
+        )
+        .await
+    {
+        Ok(Some(proof)) => proof,
+        Ok(None) => return lease::workflow_store_unavailable_response(),
+        Err(error) => {
+            tracing::error!(
+                runtime_job_id = %runtime_job_id,
+                host_id = %host_id,
+                %error,
+                "runtime host claim proof lookup failed"
+            );
+            return lease::workflow_store_unavailable_response();
+        }
+    };
     (
         StatusCode::OK,
         Json(json!({
@@ -371,6 +386,7 @@ pub async fn claim_runtime_job_for_runtime_host(
             "runtime_job_id": runtime_job_id,
             "lease_expires_at": lease_expires_at,
             "lease_generation": lease_generation,
+            "lease_proof": lease_proof,
         })),
     )
 }
@@ -397,12 +413,31 @@ async fn complete_runtime_host_preflight_failure(
             );
         }
     };
+    let lease_proof = match store
+        .remote_runtime_job_lease_proof(&job.id, host_id, job.lease_generation, lease_expires_at)
+        .await
+    {
+        Ok(Some(proof)) => Some(proof),
+        Ok(None) => return lease::workflow_store_unavailable_response(),
+        Err(error) => {
+            tracing::error!(
+                runtime_job_id = %job.id,
+                host_id = %host_id,
+                %error,
+                "runtime host preflight completion proof lookup failed"
+            );
+            return lease::workflow_store_unavailable_response();
+        }
+    };
     let completion = match store
         .commit_runtime_activity_completion_if_owned_with_generation(
             &job.id,
-            host_id,
-            lease_expires_at,
-            Some(job.lease_generation),
+            RuntimeJobCompletionLease::remote(
+                host_id,
+                lease_expires_at,
+                job.lease_generation,
+                lease_proof,
+            ),
             &result,
         )
         .await
@@ -461,145 +496,6 @@ async fn complete_runtime_host_preflight_failure(
             "claimed": false,
             "preflight_failed": true,
             "runtime_job_id": job.id,
-            "runtime_job": runtime_job,
-            "workflow_event": completion.workflow_event,
-            "decision": completion.decision,
-        })),
-    )
-}
-
-pub async fn complete_runtime_job_for_runtime_host(
-    State(state): State<Arc<AppState>>,
-    Path((host_id, runtime_job_id)): Path<(String, String)>,
-    Json(req): Json<CompleteRuntimeJobRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
-    if !state.runtime_hosts.hosts.contains_key(&host_id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("runtime host '{host_id}' is not registered") })),
-        );
-    }
-    if !state.runtime_hosts.is_active(&host_id) {
-        return lease::lease_lost_response();
-    }
-    let store = match workflow_runtime_store(&state) {
-        Ok(store) => store,
-        Err(response) => return response,
-    };
-    let job = match store.get_runtime_job(&runtime_job_id).await {
-        Ok(Some(job)) => job,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": format!("runtime job not found: {runtime_job_id}") })),
-            );
-        }
-        Err(error) => {
-            tracing::error!(
-                host_id = %host_id,
-                runtime_job_id = %runtime_job_id,
-                %error,
-                "runtime host failed to load workflow runtime job before completion"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "failed to load runtime job" })),
-            );
-        }
-    };
-    let result =
-        crate::workflow_runtime_worker::strip_caller_transcript_unavailable_signal(req.result);
-    let (result, transcript) = match prepare_runtime_transcript(&job, result) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("invalid runtime transcript source: {error}") })),
-            );
-        }
-    };
-    let result_payload = match serde_json::to_value(&result) {
-        Ok(value) => value,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("invalid activity result: {e}") })),
-            );
-        }
-    };
-
-    let completion = match store
-        .commit_runtime_activity_completion_with_transcript_if_owned_with_generation(
-            &runtime_job_id,
-            &host_id,
-            req.lease_expires_at,
-            req.lease_generation,
-            &result,
-            transcript.as_ref(),
-        )
-        .await
-    {
-        Ok(Some(completion)) => completion,
-        Ok(None) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "completed": false,
-                    "error": "runtime job lease is not owned by this host"
-                })),
-            );
-        }
-        Err(e) if e.downcast_ref::<RuntimeJobNotFoundError>().is_some() => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": e.to_string() })),
-            );
-        }
-        Err(e) => {
-            tracing::error!(
-                host_id = %host_id,
-                runtime_job_id = %runtime_job_id,
-                error = %e,
-                "runtime host failed to complete workflow runtime job"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to complete runtime job: {e}") })),
-            );
-        }
-    };
-
-    if let Err(e) = store
-        .record_runtime_event(&runtime_job_id, "ActivityResultReady", result_payload)
-        .await
-    {
-        tracing::warn!(
-            runtime_job_id = %runtime_job_id,
-            error = %e,
-            "runtime host completion succeeded but runtime event recording failed"
-        );
-    }
-
-    let mut runtime_job = completion.runtime_job;
-    if let Err(e) = crate::workflow_runtime_worker::record_runtime_circuit_breaker_completion(
-        state.as_ref(),
-        store.as_ref(),
-        &mut runtime_job,
-    )
-    .await
-    {
-        tracing::warn!(
-            runtime_job_id = %runtime_job_id,
-            error = %e,
-            "runtime host completion succeeded but circuit breaker update failed"
-        );
-    }
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "completed": true,
             "runtime_job": runtime_job,
             "workflow_event": completion.workflow_event,
             "decision": completion.decision,

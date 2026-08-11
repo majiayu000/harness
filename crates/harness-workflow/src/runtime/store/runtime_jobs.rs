@@ -249,15 +249,24 @@ impl WorkflowRuntimeStore {
         let data = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
         let runtime_kind = enum_str(&job.runtime_kind)?;
-        let mut tx = self.pool.begin().await?;
         let workflow_id: Option<(String,)> =
             sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
                 .bind(command_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&self.pool)
                 .await?;
         let Some((workflow_id,)) = workflow_id else {
             anyhow::bail!("workflow command not found: {command_id}");
         };
+        let mut tx = self.pool.begin().await?;
+        let workflow = select_instance_for_update_tx(&mut tx, &workflow_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow instance not found: {workflow_id}"))?;
+        if workflow.is_terminal() {
+            anyhow::bail!(
+                "cannot enqueue runtime job for terminal workflow {workflow_id} ({})",
+                workflow.state
+            );
+        }
         sqlx::query(
             "INSERT INTO runtime_jobs
                 (id, command_id, runtime_kind, runtime_profile, status, not_before, data)

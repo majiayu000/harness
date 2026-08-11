@@ -259,6 +259,7 @@ fn parse_external_id_handles_issue_pr_and_none() {
 fn classify_pr_state_handles_merged_and_closed() {
     assert_eq!(
         classify_pr_state(&GitHubPullState {
+            number: None,
             state: "closed".to_string(),
             merged_at: Some("2024-01-01T00:00:00Z".to_string()),
         }),
@@ -266,6 +267,7 @@ fn classify_pr_state_handles_merged_and_closed() {
     );
     assert_eq!(
         classify_pr_state(&GitHubPullState {
+            number: None,
             state: "closed".to_string(),
             merged_at: None,
         }),
@@ -277,6 +279,7 @@ fn classify_pr_state_handles_merged_and_closed() {
 fn classify_issue_state_handles_open_and_closed() {
     assert_eq!(
         classify_issue_state(&GitHubIssueState {
+            number: None,
             state: "open".to_string(),
             state_reason: None,
         }),
@@ -284,6 +287,7 @@ fn classify_issue_state_handles_open_and_closed() {
     );
     assert_eq!(
         classify_issue_state(&GitHubIssueState {
+            number: None,
             state: "closed".to_string(),
             state_reason: None,
         }),
@@ -499,7 +503,7 @@ async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> 
     let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let api_base = github_state_server(vec![(
         "/repos/owner/repo/pulls/77",
-        r#"{"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
+        r#"{"number":77,"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
     )])
     .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
@@ -588,7 +592,7 @@ async fn run_once_reconciles_runtime_closed_pr_workflow() -> anyhow::Result<()> 
     let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let api_base = github_state_server(vec![(
         "/repos/owner/repo/pulls/88",
-        r#"{"state":"closed","merged_at":null}"#,
+        r#"{"number":88,"state":"closed","merged_at":null}"#,
     )])
     .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
@@ -676,7 +680,7 @@ async fn ready_to_merge_reconciliation_waits_for_configured_age() -> anyhow::Res
     let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let api_base = github_state_server(vec![(
         "/repos/owner/repo/pulls/99",
-        r#"{"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
+        r#"{"number":99,"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
     )])
     .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
@@ -714,7 +718,7 @@ async fn ready_to_merge_reconciliation_marks_merged_pr_done() -> anyhow::Result<
     let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let api_base = github_state_server(vec![(
         "/repos/owner/repo/pulls/100",
-        r#"{"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
+        r#"{"number":100,"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
     )])
     .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
@@ -756,7 +760,7 @@ async fn ready_to_merge_reconciliation_alerts_for_open_pr_after_ttl() -> anyhow:
     let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let api_base = github_state_server(vec![(
         "/repos/owner/repo/pulls/101",
-        r#"{"state":"open","merged_at":null}"#,
+        r#"{"number":101,"state":"open","merged_at":null}"#,
     )])
     .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);

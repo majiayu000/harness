@@ -9,7 +9,7 @@ async fn local_review_gate_runtime_reconciliation_marks_merged_pr_done() -> anyh
     let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let api_base = github_state_server(vec![(
         "/repos/owner/repo/pulls/79",
-        r#"{"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
+        r#"{"number":79,"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
     )])
     .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);

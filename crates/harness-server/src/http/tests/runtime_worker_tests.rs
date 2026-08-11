@@ -77,7 +77,6 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
             }),
         )
         .await?;
-
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,
         "worker-test",
@@ -708,7 +707,10 @@ async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyh
         }),
         harness_workflow::runtime::DataProvenance::Server,
     );
-    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let mut active_workflow = workflow.clone();
+    active_workflow.state = "implementing".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &active_workflow)
+        .await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-125");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -731,6 +733,7 @@ async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyh
             }),
         )
         .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,

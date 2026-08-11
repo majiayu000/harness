@@ -531,7 +531,9 @@ async fn workflow_runtime_recovery_endpoints_cover_contract() -> anyhow::Result<
         let mut data = serde_json::json!({"issue_number": issue_number});
         if state_name == "failed" { data["error_kind"] = serde_json::json!("timeout"); }
         let workflow = route_issue_workflow(&workflow_id, state_name, issue_number, data.clone());
-        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+        let mut active_workflow = workflow.clone();
+        active_workflow.state = "implementing".to_string();
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &active_workflow).await?;
         let original = WorkflowCommand::new(WorkflowCommandType::EnqueueActivity, format!("{workflow_id}-original"), serde_json::json!({"activity": "implement_issue", "repo": "owner/repo", "issue_number": issue_number}));
         let runtime_job_id = enqueue_route_test_runtime_job(store, &workflow.id, &original).await?;
         data["last_stop"] = serde_json::json!({"state": state_name, "activity": "implement_issue", "runtime_job_id": runtime_job_id});

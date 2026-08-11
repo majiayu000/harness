@@ -364,7 +364,7 @@ mod tests {
         let workflow = WorkflowInstance::new(
             PROMPT_TASK_DEFINITION_ID,
             1,
-            "cancelled",
+            "running",
             WorkflowSubject::new("prompt", "retry-cancellation-cleanup"),
         )
         .with_id("retry-cancellation-cleanup");
@@ -411,6 +411,11 @@ mod tests {
         store.record_decision(&decision_record).await?;
         store
             .enqueue_command(&workflow.id, Some(&decision_record.id), &cancellation)
+            .await?;
+        let mut cancelled = workflow.clone();
+        cancelled.state = "cancelled".to_string();
+        cancelled.version += 1;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &cancelled)
             .await?;
 
         let outcome = cancel_submission_by_workflow_id(&store, &workflow.id).await?;

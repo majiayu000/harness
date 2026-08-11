@@ -493,6 +493,8 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
         format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
         json!({
             "lease_expires_at": lease_expires_at,
+            "lease_generation": claimed["lease_generation"],
+            "lease_proof": claimed["lease_proof"],
             "result": result,
         }),
     )
@@ -556,6 +558,8 @@ async fn runtime_job_completion_endpoint_persists_transcript_before_accepting_re
         format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
         json!({
             "lease_expires_at": lease_expires_at,
+            "lease_generation": claimed["lease_generation"],
+            "lease_proof": claimed["lease_proof"],
             "result": result,
         }),
     )
@@ -606,6 +610,8 @@ async fn runtime_job_completion_endpoint_returns_not_found_for_missing_job() -> 
         "/api/runtime-hosts/host-a/runtime-jobs/missing-job/complete".to_string(),
         json!({
             "lease_expires_at": chrono::Utc::now(),
+            "lease_generation": 1,
+            "lease_proof": uuid::Uuid::new_v4(),
             "result": result,
         }),
     )
@@ -642,8 +648,9 @@ async fn runtime_job_lease_renewal_is_fenced_idempotent_and_sanitized() -> anyho
     let request = json!({
         "lease_generation": claimed["lease_generation"],
         "lease_expires_at": claimed["lease_expires_at"],
+        "lease_proof": claimed["lease_proof"],
         "renewal_id": uuid::Uuid::new_v4(),
-        "lease_secs": 120,
+        "lease_secs": 60,
     });
     let uri = format!(
         "/api/runtime-hosts/host-a/runtime-jobs/{}/lease/renew",
@@ -672,6 +679,7 @@ async fn runtime_job_lease_renewal_is_fenced_idempotent_and_sanitized() -> anyho
         json!({
             "lease_generation": lease_generation + 1,
             "lease_expires_at": renewed["lease_expires_at"],
+            "lease_proof": renewed["lease_proof"],
             "result": result,
         }),
     )
@@ -700,6 +708,7 @@ async fn runtime_job_lease_renewal_is_fenced_idempotent_and_sanitized() -> anyho
         json!({
             "lease_generation": lease_generation,
             "lease_expires_at": renewed["lease_expires_at"],
+            "lease_proof": renewed["lease_proof"],
             "result": ActivityResult::failed(
                 "remote_check",
                 "Remote host reported a failed activity.",
@@ -721,13 +730,14 @@ async fn runtime_job_lease_renewal_rejects_invalid_duration_as_bad_request() -> 
     let app = runtime_hosts_workflow_app(state);
     register_host(&app, "host-a").await?;
 
-    for lease_secs in [json!(0), json!(3601), json!(null)] {
+    for lease_secs in [json!(0), json!(61), json!(null)] {
         let (status, _) = post_json_with_status(
             &app,
             "/api/runtime-hosts/host-a/runtime-jobs/missing/lease/renew".to_string(),
             json!({
                 "lease_generation": 1,
                 "lease_expires_at": Utc::now(),
+                "lease_proof": uuid::Uuid::new_v4(),
                 "renewal_id": uuid::Uuid::new_v4(),
                 "lease_secs": lease_secs,
             }),

@@ -62,7 +62,10 @@ async fn seed_stopped_instance(
     )
     .with_id(id.to_string())
     .with_server_data(data);
-    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let mut active_workflow = workflow.clone();
+    active_workflow.state = "implementing".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &active_workflow)
+        .await?;
     let command = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         format!("{id}-source"),

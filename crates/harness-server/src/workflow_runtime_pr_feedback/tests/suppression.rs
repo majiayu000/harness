@@ -14,6 +14,23 @@ async fn open_suppression_store(
     Ok(Some((dir, store)))
 }
 
+async fn store_failed_child_with_command(
+    store: &WorkflowRuntimeStore,
+    child: &WorkflowInstance,
+    command: &WorkflowCommand,
+) -> anyhow::Result<()> {
+    let mut inspecting_child = child.clone();
+    inspecting_child.state = "inspecting".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &inspecting_child)
+        .await?;
+    let command_id = store.enqueue_command(&child.id, None, command).await?;
+    store
+        .mark_command_status(&command_id, WorkflowCommandStatus::Failed)
+        .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, child).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn completed_inspecting_child_does_not_block_next_feedback_sweep() -> anyhow::Result<()> {
     let Some((dir, store)) = open_suppression_store().await? else {
@@ -117,15 +134,9 @@ async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyho
     )
     .with_id("pr-feedback-child-failed")
     .with_parent(workflow_id.clone());
-    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &child).await?;
     let child_command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
-    let child_command_id = store
-        .enqueue_command(&child.id, None, &child_command)
-        .await?;
-    store
-        .mark_command_status(&child_command_id, WorkflowCommandStatus::Failed)
-        .await?;
+    store_failed_child_with_command(&store, &child, &child_command).await?;
 
     assert!(
         has_active_pr_feedback_command(
@@ -534,15 +545,9 @@ async fn failed_pr_feedback_child_allows_sweep_after_changed_observed_fact() -> 
         "remote_fact_hash": "sha256:old",
         "remote_fact_activity_at": "2026-07-30T00:00:00Z",
     }));
-    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &child).await?;
     let child_command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
-    let child_command_id = store
-        .enqueue_command(&child.id, None, &child_command)
-        .await?;
-    store
-        .mark_command_status(&child_command_id, WorkflowCommandStatus::Failed)
-        .await?;
+    store_failed_child_with_command(&store, &child, &child_command).await?;
     let observed_fact_at = chrono::Utc::now() - chrono::Duration::minutes(5);
     let snapshot = RemoteFactSnapshot::new(
         "github",
@@ -614,15 +619,9 @@ async fn explicit_pr_feedback_request_starts_local_review_before_remote_suppress
     )
     .with_id("pr-feedback-child-failed-explicit-request")
     .with_parent(workflow_id.clone());
-    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &child).await?;
     let child_command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
-    let child_command_id = store
-        .enqueue_command(&child.id, None, &child_command)
-        .await?;
-    store
-        .mark_command_status(&child_command_id, WorkflowCommandStatus::Failed)
-        .await?;
+    store_failed_child_with_command(&store, &child, &child_command).await?;
 
     let outcome = request_pr_feedback_sweep_for_pr(
         &store,
@@ -694,15 +693,9 @@ async fn failed_pr_feedback_child_respects_disabled_suppression_window() -> anyh
     )
     .with_id("pr-feedback-child-failed")
     .with_parent(workflow_id.clone());
-    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &child).await?;
     let child_command =
         WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-pr-feedback-77");
-    let child_command_id = store
-        .enqueue_command(&child.id, None, &child_command)
-        .await?;
-    store
-        .mark_command_status(&child_command_id, WorkflowCommandStatus::Failed)
-        .await?;
+    store_failed_child_with_command(&store, &child, &child_command).await?;
 
     assert!(
         !has_active_pr_feedback_command(&store, &workflow_id, 0).await?,

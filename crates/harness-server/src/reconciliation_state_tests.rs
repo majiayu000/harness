@@ -4,6 +4,7 @@ use super::*;
 fn classify_pr_state_handles_merged_and_closed() {
     assert_eq!(
         classify_pr_state(&GitHubPullState {
+            number: None,
             state: "closed".to_string(),
             merged_at: Some("2024-01-01T00:00:00Z".to_string()),
         }),
@@ -11,6 +12,7 @@ fn classify_pr_state_handles_merged_and_closed() {
     );
     assert_eq!(
         classify_pr_state(&GitHubPullState {
+            number: None,
             state: "closed".to_string(),
             merged_at: None,
         }),
@@ -22,6 +24,7 @@ fn classify_pr_state_handles_merged_and_closed() {
 fn classify_issue_state_preserves_completion_reason() {
     assert_eq!(
         classify_issue_state(&GitHubIssueState {
+            number: None,
             state: "open".to_string(),
             state_reason: None,
         }),
@@ -29,6 +32,7 @@ fn classify_issue_state_preserves_completion_reason() {
     );
     assert_eq!(
         classify_issue_state(&GitHubIssueState {
+            number: None,
             state: "closed".to_string(),
             state_reason: Some("not_planned".to_string()),
         }),
@@ -36,6 +40,7 @@ fn classify_issue_state_preserves_completion_reason() {
     );
     assert_eq!(
         classify_issue_state(&GitHubIssueState {
+            number: None,
             state: "closed".to_string(),
             state_reason: Some("completed".to_string()),
         }),

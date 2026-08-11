@@ -381,7 +381,16 @@ pub(super) async fn commit_decision_instance_tx(
         anyhow::bail!("workflow decision instance write can only preserve or release its lease");
     }
     require_next_instance_version(current, target)?;
-    upsert_instance_row_tx(tx, target).await
+    upsert_instance_row_tx(tx, target).await?;
+    if target.is_terminal() {
+        super::runtime_job_state::cancel_unfinished_runtime_jobs_for_terminal_workflow_tx(
+            tx,
+            &target.id,
+            &target.state,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 pub(super) async fn commit_rejected_initial_failure_instance_tx(

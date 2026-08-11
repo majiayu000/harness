@@ -69,7 +69,20 @@ impl WorkflowRuntimeStore {
         command: &WorkflowCommand,
         status: WorkflowCommandStatus,
     ) -> anyhow::Result<String> {
-        command_store::insert(&self.pool, workflow_id, decision_id, command, status).await
+        let mut tx = self.pool.begin().await?;
+        let workflow = select_instance_for_update_tx(&mut tx, workflow_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow instance not found: {workflow_id}"))?;
+        if workflow.is_terminal() {
+            anyhow::bail!(
+                "cannot enqueue command for terminal workflow {workflow_id} ({})",
+                workflow.state
+            );
+        }
+        let command_id =
+            command_store::insert_tx(&mut tx, workflow_id, decision_id, command, status).await?;
+        tx.commit().await?;
+        Ok(command_id)
     }
 
     pub async fn commands_for(

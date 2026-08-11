@@ -1,9 +1,12 @@
 use super::*;
 use crate::runtime::model::{WorkflowCommandType, WorkflowEvidence, WorkflowSubject};
-use crate::runtime::{DataProvenance, PromptContinuationPolicy};
+use crate::runtime::{DataProvenance, PromptContinuationPolicy, RuntimeJobStatus, RuntimeKind};
+use chrono::Utc;
 use harness_core::db::resolve_database_url;
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::Duration;
 
 fn pin_error_instance(id: &str) -> WorkflowInstance {
     WorkflowInstance::new(
@@ -71,6 +74,226 @@ fn completion_continuation_is_persisted_as_agent_data() -> anyhow::Result<()> {
             .and_then(|sidecar| sidecar.provenance_for("/continuation")),
         Some(DataProvenance::Agent)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_decision_cancels_pending_and_running_runtime_jobs() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("terminal-job-cleanup.db")).await?;
+    let current = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "terminal-job-cleanup"),
+    )
+    .with_id("terminal-job-cleanup")
+    .with_server_data(json!({ "prompt_ref": "terminal-job-cleanup" }));
+    store
+        .force_upsert_lifecycle_state_for_test(&current)
+        .await?;
+
+    let first_command = store
+        .enqueue_command(
+            &current.id,
+            None,
+            &WorkflowCommand::enqueue_activity("first", "terminal:first"),
+        )
+        .await?;
+    let second_command = store
+        .enqueue_command(
+            &current.id,
+            None,
+            &WorkflowCommand::enqueue_activity("second", "terminal:second"),
+        )
+        .await?;
+    let first_job = store
+        .enqueue_runtime_job(
+            &first_command,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "first", "workflow_id": current.id }),
+        )
+        .await?;
+    let second_job = store
+        .enqueue_runtime_job(
+            &second_command,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "second", "workflow_id": current.id }),
+        )
+        .await?;
+    store
+        .claim_next_runtime_job(
+            "terminal-test-worker",
+            Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await?
+        .expect("first runtime job should be claimed");
+
+    let decision = WorkflowDecision::new(
+        &current.id,
+        "implementing",
+        "finish",
+        "done",
+        "workflow completed",
+    );
+    let record = WorkflowDecisionRecord::accepted(decision, None);
+    let mut target = current.clone();
+    target.state = "done".to_string();
+    target.version += 1;
+    let mut tx = store.pool.begin().await?;
+    insert_decision_record_once_tx(&mut tx, &record).await?;
+    commit_decision_instance_tx(&mut tx, &current, &target, &record, false).await?;
+    tx.commit().await?;
+
+    for job_id in [&first_job.id, &second_job.id] {
+        let job = store
+            .get_runtime_job(job_id)
+            .await?
+            .expect("runtime job should remain auditable");
+        assert_eq!(job.status, RuntimeJobStatus::Cancelled);
+    }
+    assert!(store
+        .commands_for(&current.id)
+        .await?
+        .iter()
+        .all(|command| command.status == WorkflowCommandStatus::Cancelled.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_transition_fences_concurrent_command_and_job_enqueue() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store =
+        Arc::new(WorkflowRuntimeStore::open(&dir.path().join("terminal-enqueue-fence.db")).await?);
+
+    let command_workflow = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "command-fence"),
+    )
+    .with_id("terminal-command-fence")
+    .with_server_data(json!({ "prompt_ref": "command-fence" }));
+    store
+        .force_upsert_lifecycle_state_for_test(&command_workflow)
+        .await?;
+    let command_decision = WorkflowDecision::new(
+        &command_workflow.id,
+        "implementing",
+        "finish",
+        "done",
+        "workflow completed",
+    );
+    let command_record = WorkflowDecisionRecord::accepted(command_decision, None);
+    let mut command_target = command_workflow.clone();
+    command_target.state = "done".to_string();
+    command_target.version += 1;
+    let mut terminal_tx = store.pool.begin().await?;
+    select_instance_for_update_tx(&mut terminal_tx, &command_workflow.id)
+        .await?
+        .expect("workflow should be locked");
+    insert_decision_record_once_tx(&mut terminal_tx, &command_record).await?;
+    commit_decision_instance_tx(
+        &mut terminal_tx,
+        &command_workflow,
+        &command_target,
+        &command_record,
+        false,
+    )
+    .await?;
+    let enqueue_store = Arc::clone(&store);
+    let workflow_id = command_workflow.id.clone();
+    let command_enqueue = tokio::spawn(async move {
+        enqueue_store
+            .enqueue_command(
+                &workflow_id,
+                None,
+                &WorkflowCommand::enqueue_activity("late", "terminal:late-command"),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !command_enqueue.is_finished(),
+        "command enqueue must wait behind the terminal instance lock"
+    );
+    terminal_tx.commit().await?;
+    let command_error = command_enqueue
+        .await?
+        .expect_err("command enqueue after terminal commit must fail");
+    assert!(command_error.to_string().contains("terminal workflow"));
+
+    let job_workflow = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "job-fence"),
+    )
+    .with_id("terminal-job-fence")
+    .with_server_data(json!({ "prompt_ref": "job-fence" }));
+    store
+        .force_upsert_lifecycle_state_for_test(&job_workflow)
+        .await?;
+    let command_id = store
+        .enqueue_command(
+            &job_workflow.id,
+            None,
+            &WorkflowCommand::enqueue_activity("late", "terminal:late-job"),
+        )
+        .await?;
+    let job_decision = WorkflowDecision::new(
+        &job_workflow.id,
+        "implementing",
+        "finish",
+        "done",
+        "workflow completed",
+    );
+    let job_record = WorkflowDecisionRecord::accepted(job_decision, None);
+    let mut job_target = job_workflow.clone();
+    job_target.state = "done".to_string();
+    job_target.version += 1;
+    let mut terminal_tx = store.pool.begin().await?;
+    select_instance_for_update_tx(&mut terminal_tx, &job_workflow.id)
+        .await?
+        .expect("workflow should be locked");
+    insert_decision_record_once_tx(&mut terminal_tx, &job_record).await?;
+    commit_decision_instance_tx(
+        &mut terminal_tx,
+        &job_workflow,
+        &job_target,
+        &job_record,
+        false,
+    )
+    .await?;
+    let enqueue_store = Arc::clone(&store);
+    let job_enqueue = tokio::spawn(async move {
+        enqueue_store
+            .enqueue_runtime_job(
+                &command_id,
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({ "activity": "late" }),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !job_enqueue.is_finished(),
+        "runtime job enqueue must wait behind the terminal instance lock"
+    );
+    terminal_tx.commit().await?;
+    let job_error = job_enqueue
+        .await?
+        .expect_err("runtime job enqueue after terminal commit must fail");
+    assert!(job_error.to_string().contains("terminal workflow"));
     Ok(())
 }
 

@@ -513,7 +513,7 @@ async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyho
     terminal_producer.state = "done".to_string();
     force_upsert_lifecycle_state_for_test(&store, &terminal_producer).await?;
 
-    let dependent = issue_instance("failed")
+    let mut dependent = issue_instance("implementing")
         .with_id("missing-pin-dependent")
         .with_server_data(json!({
             "stop_reason_code": "runtime_transcript_lost",
@@ -531,6 +531,10 @@ async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyho
         }),
     );
     store.enqueue_command(&dependent.id, None, &replay).await?;
+    dependent.state = "failed".to_string();
+    store
+        .force_upsert_lifecycle_state_for_test(&dependent)
+        .await?;
     sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
         .bind(&artifact_ref)
         .execute(store.pool())
@@ -586,7 +590,7 @@ async fn lost_transcript_consumer_and_producer_remain_pinned_until_recovery() ->
     terminal_producer.state = "done".to_string();
     force_upsert_lifecycle_state_for_test(&store, &terminal_producer).await?;
 
-    let consumer = issue_instance("failed")
+    let mut consumer = issue_instance("implementing")
         .with_id("lost-family-consumer")
         .with_server_data(json!({
             "stop_reason_code": "runtime_transcript_lost",
@@ -604,6 +608,10 @@ async fn lost_transcript_consumer_and_producer_remain_pinned_until_recovery() ->
         }),
     );
     store.enqueue_command(&consumer.id, None, &replay).await?;
+    consumer.state = "failed".to_string();
+    store
+        .force_upsert_lifecycle_state_for_test(&consumer)
+        .await?;
     sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
         .bind(&artifact_ref)
         .execute(store.pool())

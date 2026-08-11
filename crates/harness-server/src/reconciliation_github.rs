@@ -15,12 +15,16 @@ pub(crate) enum GitHubState {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct GitHubPullState {
+    #[serde(default)]
+    pub(super) number: Option<u64>,
     pub(super) state: String,
     pub(super) merged_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct GitHubIssueState {
+    #[serde(default)]
+    pub(super) number: Option<u64>,
     pub(super) state: String,
     #[serde(default)]
     pub(super) state_reason: Option<String>,
@@ -98,6 +102,9 @@ pub(crate) async fn fetch_pr_state_by_slug_with_token(
     else {
         return GitHubState::Unknown;
     };
+    if state.number != Some(pr_num) {
+        return GitHubState::Unknown;
+    }
     classify_pr_state(&state)
 }
 
@@ -114,5 +121,8 @@ pub(crate) async fn fetch_issue_state_with_token(
     else {
         return GitHubState::Unknown;
     };
+    if state.number != Some(issue_num) {
+        return GitHubState::Unknown;
+    }
     classify_issue_state(&state)
 }

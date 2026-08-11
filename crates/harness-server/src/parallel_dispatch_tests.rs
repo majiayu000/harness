@@ -211,7 +211,10 @@ async fn concurrent_subtasks_release_pool_slots_before_creating_all_workspaces(
             auto_cleanup: true,
             ..Default::default()
         },
-        crate::workspace_pool::WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        crate::workspace_pool::WorkspacePoolConfig::new_for_local_pool_tests(
+            1,
+            std::collections::HashMap::new(),
+        ),
         None,
     )?);
     let agent = Arc::new(SequencedAgent::new(["first", "second", "third"]));

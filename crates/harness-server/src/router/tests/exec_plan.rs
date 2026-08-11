@@ -36,7 +36,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
     let project_svc =
         crate::services::project::DefaultProjectService::new(_project_svc_tmp, dir.to_path_buf());
     let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
-    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+    let execution_svc = crate::services::execution::DefaultExecutionService::new_for_tests(
         Arc::new(server.config.clone()),
         None,
         None,

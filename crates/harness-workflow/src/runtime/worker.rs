@@ -1,6 +1,6 @@
 use super::model::{
-    ActivityResult, ActivityStatus, RuntimeJob, RuntimeKind, RuntimeProfile, WorkflowCommand,
-    WorkflowCommandRecord, WorkflowInstance,
+    ActivityResult, ActivityStatus, RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile,
+    WorkflowCommand, WorkflowCommandRecord, WorkflowInstance,
 };
 use super::store::WorkflowRuntimeStore;
 use anyhow::Context;
@@ -8,6 +8,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use std::time::Duration as StdDuration;
+
+const RUNTIME_JOB_CANCELLATION_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 
 #[async_trait]
 pub trait RuntimeJobExecutor: Send + Sync {
@@ -174,27 +176,32 @@ impl<'a> RuntimeWorker<'a> {
             )
             .await?
         else {
+            if let Some(current) = self.store.get_runtime_job(&job.id).await? {
+                if current.status == RuntimeJobStatus::Cancelled
+                    && current.lease_generation == job.lease_generation
+                {
+                    return Ok(Some(current));
+                }
+            }
             // The lease was lost mid-turn. The completed work must not
             // vanish: persist it to the dead-letter table so reconciliation
             // can decide whether it still applies (GH-1878).
-            if let Err(dlq_error) = self
-                .store
+            self.store
                 .record_lease_expired_completion(
                     &job.id,
                     &self.owner,
+                    job.lease_generation,
                     lease_expires_at,
                     &result,
                     transcript.as_ref(),
                 )
                 .await
-            {
-                tracing::error!(
-                    runtime_job_id = %job.id,
-                    owner = %self.owner,
-                    error = %dlq_error,
-                    "failed to record lease-expired completion to dead-letter"
-                );
-            }
+                .with_context(|| {
+                    format!(
+                        "failed to durably record stale completion for runtime job {}",
+                        job.id
+                    )
+                })?;
             tracing::warn!(
                 runtime_job_id = %job.id,
                 owner = %self.owner,
@@ -255,11 +262,15 @@ impl<'a> RuntimeWorker<'a> {
         let activity = runtime_job_activity_name(job);
         let execution = executor.execute(job.clone());
         tokio::pin!(execution);
+        let cancellation_poll = tokio::time::interval(RUNTIME_JOB_CANCELLATION_POLL_INTERVAL);
+        tokio::pin!(cancellation_poll);
+        let renewal_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + renewal_interval,
+            renewal_interval,
+        );
+        tokio::pin!(renewal_tick);
 
         loop {
-            let renewal_sleep = tokio::time::sleep(renewal_interval);
-            tokio::pin!(renewal_sleep);
-
             tokio::select! {
                 result = &mut execution => {
                     return Ok(RuntimeJobExecution {
@@ -267,39 +278,92 @@ impl<'a> RuntimeWorker<'a> {
                         lease_expires_at,
                     });
                 }
-                _ = &mut renewal_sleep => {
+                _ = cancellation_poll.tick() => {
+                    match self.store.runtime_job_matches_running_lease(job).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            executor.cancel_execution(job).await;
+                            let cleanup_grace = std::time::Duration::from_secs(30);
+                            let result = match tokio::time::timeout(cleanup_grace, &mut execution)
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => ActivityResult::cancelled(
+                                    activity,
+                                    "Runtime job was cancelled while the agent was running; agent cleanup exceeded the grace period.",
+                                ),
+                            };
+                            return Ok(RuntimeJobExecution {
+                                result,
+                                lease_expires_at,
+                            });
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                runtime_job_id = %job.id,
+                                owner = %self.owner,
+                                error = %error,
+                                "runtime job cancellation poll failed; retaining execution until the lease renewal fence"
+                            );
+                        }
+                    }
+                }
+                _ = renewal_tick.tick() => {
                     let next_lease_expires_at = Utc::now() + self.lease_ttl;
-                    let Some(updated) = self.store
+                    let renewal = self.store
                         .extend_runtime_job_lease_if_owned(
                             &job.id,
                             &self.owner,
                             lease_expires_at,
                             next_lease_expires_at,
                         )
-                        .await?
-                    else {
-                        // Lease lost mid-turn: cancel the in-flight agent and
-                        // wait for the executor's cleanup (agent termination +
-                        // workspace release) so a reclaimer never sees a
-                        // dirty tree. Bounded by a grace period; if cleanup
-                        // does not finish, the future is dropped and the
-                        // workspace reaper is the backstop (GH-1877).
-                        executor.cancel_execution(job).await;
-                        let cleanup_grace = std::time::Duration::from_secs(30);
-                        let result = match tokio::time::timeout(cleanup_grace, &mut execution)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => ActivityResult::failed(
-                                activity,
-                                "Runtime job lease was lost before the agent completed.",
-                                "Another runtime worker reclaimed the job after this worker's lease expired; agent cleanup exceeded the grace period.",
-                            ),
-                        };
-                        return Ok(RuntimeJobExecution {
-                            result,
-                            lease_expires_at,
-                        });
+                        .await;
+                    let updated = match renewal {
+                        Ok(Some(updated)) => updated,
+                        Ok(None) => {
+                            // Lease lost mid-turn: cancel the in-flight agent and
+                            // wait for the executor's cleanup (agent termination +
+                            // workspace release) so a reclaimer never sees a
+                            // dirty tree. Bounded by a grace period; if cleanup
+                            // does not finish, the future is dropped and the
+                            // workspace reaper is the backstop (GH-1877).
+                            executor.cancel_execution(job).await;
+                            let cleanup_grace = std::time::Duration::from_secs(30);
+                            let result = match tokio::time::timeout(cleanup_grace, &mut execution)
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => ActivityResult::failed(
+                                    activity,
+                                    "Runtime job lease was lost before the agent completed.",
+                                    "Another runtime worker reclaimed the job after this worker's lease expired; agent cleanup exceeded the grace period.",
+                                ),
+                            };
+                            return Ok(RuntimeJobExecution {
+                                result,
+                                lease_expires_at,
+                            });
+                        }
+                        Err(error) => {
+                            executor.cancel_execution(job).await;
+                            let cleanup_grace = std::time::Duration::from_secs(30);
+                            if tokio::time::timeout(cleanup_grace, &mut execution)
+                                .await
+                                .is_err()
+                            {
+                                tracing::error!(
+                                    runtime_job_id = %job.id,
+                                    owner = %self.owner,
+                                    "runtime job lease renewal failed and agent cleanup exceeded the grace period"
+                                );
+                            }
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "runtime job {} lease renewal failed after agent cancellation",
+                                    job.id
+                                )
+                            });
+                        }
                     };
                     lease_expires_at = updated
                         .lease

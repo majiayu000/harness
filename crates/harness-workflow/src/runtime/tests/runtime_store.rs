@@ -1,4 +1,8 @@
 use super::*;
+use crate::runtime::store::runtime_job_leases::{
+    postgres_timestamp_ceil, RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRequest,
+};
+use crate::runtime::RuntimeJobCompletionLease;
 #[rustfmt::skip]
 #[tokio::test]
 async fn runtime_turn_reservation_is_atomic_and_replay_safe() -> anyhow::Result<()> {
@@ -471,6 +475,142 @@ async fn runtime_jobs_migration_rewrites_legacy_expired_statuses() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn remote_lease_proof_migration_preserves_inflight_legacy_leases() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("workflow_runtime.db");
+    let store = WorkflowRuntimeStore::open(&db_path).await?;
+    let complete_job = enqueue_test_runtime_job(
+        &store,
+        "legacy-proof-complete",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({ "activity": "legacy_complete" }),
+    )
+    .await?;
+    let renew_job = enqueue_test_runtime_job(
+        &store,
+        "legacy-proof-renew",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({ "activity": "legacy_renew" }),
+    )
+    .await?;
+
+    sqlx::query("DROP TRIGGER IF EXISTS trg_runtime_job_lease_issuance ON runtime_jobs")
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DROP FUNCTION IF EXISTS record_runtime_job_lease_issuance()")
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS runtime_job_lease_issuances")
+        .execute(store.pool())
+        .await?;
+    sqlx::query("ALTER TABLE runtime_job_completions_dlq DROP COLUMN IF EXISTS lease_generation")
+        .execute(store.pool())
+        .await?;
+    sqlx::query(
+        "ALTER TABLE runtime_job_lease_renewal_receipts
+         DROP COLUMN IF EXISTS legacy_proofless",
+    )
+    .execute(store.pool())
+    .await?;
+    sqlx::query("DELETE FROM schema_migrations WHERE version = 27")
+        .execute(store.pool())
+        .await?;
+
+    let first_expiry = postgres_timestamp_ceil(Utc::now() + Duration::minutes(5))
+        .expect("ordinary test timestamp must normalize");
+    let claimed_complete = store
+        .claim_next_runtime_job_for_runtime_kind(
+            RuntimeKind::RemoteHost,
+            "legacy-host",
+            first_expiry,
+        )
+        .await?
+        .expect("legacy completion job should be claimed");
+    assert_eq!(claimed_complete.id, complete_job.id);
+    let second_expiry = postgres_timestamp_ceil(Utc::now() + Duration::minutes(5))
+        .expect("ordinary test timestamp must normalize");
+    let claimed_renew = store
+        .claim_next_runtime_job_for_runtime_kind(
+            RuntimeKind::RemoteHost,
+            "legacy-host",
+            second_expiry,
+        )
+        .await?
+        .expect("legacy renewal job should be claimed");
+    assert_eq!(claimed_renew.id, renew_job.id);
+    drop(store);
+
+    let store = WorkflowRuntimeStore::open(&db_path).await?;
+    let legacy_proof_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM runtime_job_lease_issuances
+         WHERE owner = 'legacy-host' AND lease_proof IS NULL",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(legacy_proof_count, 2);
+
+    let completed = store
+        .commit_runtime_activity_completion_if_owned_with_generation(
+            &claimed_complete.id,
+            RuntimeJobCompletionLease::remote(
+                "legacy-host",
+                first_expiry,
+                claimed_complete.lease_generation,
+                None,
+            ),
+            &ActivityResult::succeeded("legacy_complete", "legacy completion preserved"),
+        )
+        .await?;
+    assert!(
+        completed.is_some(),
+        "legacy proofless completion must survive v27"
+    );
+
+    let renewal_id = uuid::Uuid::new_v4();
+    let renewed = store
+        .renew_remote_host_runtime_job_lease(RuntimeJobLeaseRenewalRequest {
+            runtime_job_id: &claimed_renew.id,
+            owner: "legacy-host",
+            lease_generation: claimed_renew.lease_generation,
+            lease_proof: None,
+            previous_expires_at: second_expiry,
+            renewal_id,
+            lease_secs: 60,
+            now: Utc::now(),
+            max_lease_secs: 60,
+            owner_active: true,
+        })
+        .await?;
+    let RuntimeJobLeaseRenewalOutcome::Renewed {
+        lease_expires_at,
+        replayed: false,
+        ..
+    } = renewed
+    else {
+        anyhow::bail!("legacy proofless renewal should succeed once: {renewed:?}");
+    };
+    assert!(
+        store
+            .remote_runtime_job_lease_proof(
+                &claimed_renew.id,
+                "legacy-host",
+                claimed_renew.lease_generation,
+                lease_expires_at,
+            )
+            .await?
+            .is_some(),
+        "first legacy renewal must rotate to a proof-bearing issuance"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn nonterminal_listing_uses_definition_specific_terminal_states() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
@@ -624,8 +764,9 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
     let active_child = quality_gate_instance("checking")
         .with_id("active-family-child")
         .with_parent(&active_parent.id);
+    let terminal_parent_live = project_issue_instance("/project-a", 401, "implementing");
     for instance in [
-        &terminal_parent,
+        &terminal_parent_live,
         &terminal_child,
         &active_parent,
         &active_child,
@@ -654,6 +795,9 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
         .await?;
     store
         .record_runtime_event(&runtime_job.id, "RuntimePromptPrepared", json!({}))
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&terminal_parent)
         .await?;
     sqlx::query(
         "INSERT INTO workflow_artifacts (id, workflow_id, runtime_job_id, artifact_type, data)
@@ -848,6 +992,7 @@ async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result
         .record_lease_expired_completion(
             &first_claim.id,
             "worker-a",
+            first_claim.lease_generation,
             first_lease_expires_at,
             &result,
             None,
@@ -901,6 +1046,7 @@ async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result
         .record_lease_expired_completion(
             &first_claim.id,
             "worker-a",
+            first_claim.lease_generation,
             first_lease_expires_at,
             &result,
             None,
@@ -913,6 +1059,175 @@ async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result
     .fetch_one(store.pool())
     .await?;
     assert_eq!(dlq_count_after, 1, "DLQ must keep one record per job");
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_expired_completion_rolls_back_dlq_when_event_insert_fails() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    enqueue_test_runtime_job(
+        &store,
+        "command-dlq-atomic-event",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
+    let claimed = store
+        .claim_next_runtime_job("worker-a", Utc::now() + Duration::minutes(5))
+        .await?
+        .expect("runtime job should be claimable");
+    let lease_expires_at = claimed.lease.as_ref().expect("lease exists").expires_at;
+    sqlx::query(
+        "CREATE FUNCTION reject_lease_expired_event_for_test()
+         RETURNS TRIGGER AS $$
+         BEGIN
+           RAISE EXCEPTION 'injected runtime event failure';
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(store.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_lease_expired_event_for_test
+         BEFORE INSERT ON runtime_events
+         FOR EACH ROW
+         WHEN (NEW.event_type = 'LeaseExpiredCompletionRecorded')
+         EXECUTE FUNCTION reject_lease_expired_event_for_test()",
+    )
+    .execute(store.pool())
+    .await?;
+
+    let result = ActivityResult::succeeded("check", "atomic DLQ result");
+    store
+        .record_lease_expired_completion(
+            &claimed.id,
+            "worker-a",
+            claimed.lease_generation,
+            lease_expires_at,
+            &result,
+            None,
+        )
+        .await
+        .expect_err("event failure must fail the whole DLQ transaction");
+    let dlq_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&claimed.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        dlq_count, 0,
+        "failed event insert must roll back the DLQ row"
+    );
+
+    sqlx::query("DROP TRIGGER reject_lease_expired_event_for_test ON runtime_events")
+        .execute(store.pool())
+        .await?;
+    sqlx::query("DROP FUNCTION reject_lease_expired_event_for_test()")
+        .execute(store.pool())
+        .await?;
+    store
+        .record_lease_expired_completion(
+            &claimed.id,
+            "worker-a",
+            claimed.lease_generation,
+            lease_expires_at,
+            &result,
+            None,
+        )
+        .await?;
+    let (dlq_count, event_count): (i64, i64) = sqlx::query_as(
+        "SELECT
+           (SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1),
+           (SELECT COUNT(*) FROM runtime_events
+            WHERE runtime_job_id = $1 AND event_type = 'LeaseExpiredCompletionRecorded')",
+    )
+    .bind(&claimed.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!((dlq_count, event_count), (1, 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_stale_completion_cannot_dead_letter_after_terminal_transition() -> anyhow::Result<()>
+{
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store =
+        Arc::new(WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?);
+    enqueue_test_runtime_job(
+        &store,
+        "remote-stale-terminal-race",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({ "activity": "remote_check" }),
+    )
+    .await?;
+    let expired_at = postgres_timestamp_ceil(Utc::now() - Duration::seconds(1))
+        .expect("ordinary test timestamp must normalize");
+    let claimed = store
+        .claim_next_runtime_job_for_runtime_kind(RuntimeKind::RemoteHost, "host-a", expired_at)
+        .await?
+        .expect("remote job should be claimed");
+    let proof = store
+        .remote_runtime_job_lease_proof(&claimed.id, "host-a", claimed.lease_generation, expired_at)
+        .await?;
+
+    let mut terminal_tx = store.pool.begin().await?;
+    sqlx::query("SELECT id FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+        .bind(&claimed.id)
+        .execute(&mut *terminal_tx)
+        .await?;
+    let stale_store = Arc::clone(&store);
+    let stale_job_id = claimed.id.clone();
+    let stale_generation = claimed.lease_generation;
+    let stale = tokio::spawn(async move {
+        stale_store
+            .record_remote_stale_completion_if_issued(
+                &stale_job_id,
+                RuntimeJobCompletionLease::remote("host-a", expired_at, stale_generation, proof),
+                &ActivityResult::succeeded("remote_check", "late result"),
+                None,
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !stale.is_finished(),
+        "stale recorder must wait for the job lock"
+    );
+    sqlx::query(
+        "UPDATE runtime_jobs
+         SET status = 'succeeded',
+             data = jsonb_set(jsonb_set(data, '{status}', '\"succeeded\"'), '{lease}', 'null')
+         WHERE id = $1",
+    )
+    .bind(&claimed.id)
+    .execute(&mut *terminal_tx)
+    .await?;
+    terminal_tx.commit().await?;
+
+    assert!(
+        !stale.await??,
+        "terminal same-generation result is a duplicate"
+    );
+    let dlq_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&claimed.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(dlq_count, 0);
     Ok(())
 }
 
@@ -966,6 +1281,7 @@ async fn lease_expired_completion_persists_transcript_payload() -> anyhow::Resul
         .record_lease_expired_completion(
             &claimed.id,
             "worker-a",
+            claimed.lease_generation,
             lease_expires_at,
             &result,
             pending.as_ref(),

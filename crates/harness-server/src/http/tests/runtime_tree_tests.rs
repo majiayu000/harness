@@ -629,6 +629,13 @@ async fn set_recovery_source_job(
     workflow_id: &str,
     command: harness_workflow::runtime::WorkflowCommand,
 ) -> anyhow::Result<String> {
+    let mut workflow = store
+        .get_instance(workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing workflow {workflow_id}"))?;
+    let terminal_state = workflow.state.clone();
+    workflow.state = "implementing".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command_id = store.enqueue_command(workflow_id, None, &command).await?;
     let job = store
         .enqueue_runtime_job(
@@ -639,10 +646,7 @@ async fn set_recovery_source_job(
         )
         .await?;
     let runtime_job_id = job.id.clone();
-    let mut workflow = store
-        .get_instance(workflow_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("missing workflow {workflow_id}"))?;
+    workflow.state = terminal_state;
     let mut last_stop = workflow.data["last_stop"].clone();
     last_stop["runtime_job_id"] = serde_json::json!(runtime_job_id.clone());
     workflow.set_data_field(

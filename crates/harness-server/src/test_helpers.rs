@@ -325,7 +325,7 @@ async fn make_state_inner(
         )
         .await?,
     );
-    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+    let execution_svc = crate::services::execution::DefaultExecutionService::new_for_tests(
         Arc::new(server.config.clone()),
         Some(workflow_runtime_store.clone()),
         None,

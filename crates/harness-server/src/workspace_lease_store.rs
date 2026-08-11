@@ -1,7 +1,9 @@
 use crate::task_runner::TaskId;
 use harness_core::db::PgStoreContext;
 use serde::{Deserialize, Serialize};
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPool;
+use sqlx::Postgres;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
@@ -25,10 +27,55 @@ pub(crate) struct WorkspaceLeaseRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceLeaseStore {
     pool: PgPool,
+    repository_lock_pool: PgPool,
     store_key: String,
 }
 
+pub(crate) struct RepositoryWriteLease {
+    _connection: tokio::sync::Mutex<PoolConnection<Postgres>>,
+}
+
 impl WorkspaceLeaseStore {
+    #[cfg(test)]
+    pub(crate) fn repository_lock_pool_capacity(&self) -> u32 {
+        self.repository_lock_pool.options().get_max_connections()
+    }
+
+    pub(crate) async fn try_acquire_repository_write_lease(
+        &self,
+        project_key: &str,
+    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
+        let mut connection = loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.repository_lock_pool.acquire(),
+            )
+            .await
+            {
+                Ok(Ok(connection)) => break connection,
+                Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => {
+                    tracing::debug!(
+                        project_key,
+                        "repository advisory-lock pool is full; waiting for an active lease"
+                    );
+                }
+                Ok(Err(error)) => return Err(error.into()),
+            }
+        };
+        let (acquired,): (bool,) =
+            sqlx::query_as("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+                .bind(project_key)
+                .fetch_one(&mut *connection)
+                .await?;
+        if !acquired {
+            return Ok(None);
+        }
+        connection.close_on_drop();
+        Ok(Some(RepositoryWriteLease {
+            _connection: tokio::sync::Mutex::new(connection),
+        }))
+    }
+
     pub(crate) async fn open_shared_with_data_dir(
         context: &PgStoreContext,
         setup_pool: &PgPool,
@@ -44,7 +91,15 @@ impl WorkspaceLeaseStore {
         store_key: String,
     ) -> anyhow::Result<Self> {
         let pool = context.open_pool_with_setup_pool(setup_pool).await?;
-        Ok(Self { pool, store_key })
+        // Session-level advisory locks must retain their connection for the
+        // full workspace lifetime. Keep those connections in a dedicated pool
+        // so a single-writer project cannot starve workspace lease queries.
+        let repository_lock_pool = context.open_runtime_pool().await?;
+        Ok(Self {
+            pool,
+            repository_lock_pool,
+            store_key,
+        })
     }
 
     #[cfg(test)]
@@ -53,7 +108,12 @@ impl WorkspaceLeaseStore {
         let store_key = context.schema().to_owned();
         let pool = context.open_pool().await?;
         ensure_workspace_leases_table(&pool).await?;
-        Ok(Self { pool, store_key })
+        let repository_lock_pool = context.open_runtime_pool().await?;
+        Ok(Self {
+            pool,
+            repository_lock_pool,
+            store_key,
+        })
     }
 
     pub(crate) async fn try_acquire_lease(

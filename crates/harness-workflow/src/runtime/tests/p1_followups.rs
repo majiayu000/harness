@@ -57,7 +57,7 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = issue_instance("done");
+    let mut instance = issue_instance("implementing");
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;
@@ -71,6 +71,10 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
         None,
     )
     .await?;
+    instance.state = "done".to_string();
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let worker = RuntimeWorker::new(&store, "runtime-1");
     let executor = CountingRuntimeExecutor {

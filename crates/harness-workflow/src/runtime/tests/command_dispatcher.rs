@@ -344,11 +344,13 @@ async fn runtime_command_dispatcher_skips_terminal_workflow_before_enqueue() -> 
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = project_issue_instance("/project-a", 123, "cancelled");
+    let mut instance = project_issue_instance("/project-a", 123, "implementing");
     store.force_upsert_lifecycle_state_for_test(&instance).await?;
     let command =
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-cancelled-implement");
     let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    instance.state = "cancelled".to_string();
+    store.force_upsert_lifecycle_state_for_test(&instance).await?;
     let dispatcher = RuntimeCommandDispatcher::new(
         &store,
         RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc),

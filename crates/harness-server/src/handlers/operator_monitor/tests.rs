@@ -838,7 +838,6 @@ async fn store_stopped_workflow_with_source(
     command: WorkflowCommand,
 ) -> anyhow::Result<WorkflowInstance> {
     let workflow = workflow(state, data).with_id(workflow_id.to_string());
-    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let workflow = attach_recovery_source_job(store, workflow, command).await?;
     Ok(workflow)
 }
@@ -858,7 +857,6 @@ async fn store_quality_gate_workflow(
     )
     .with_id(workflow_id.to_string())
     .with_server_data(data);
-    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     attach_recovery_source_job(store, workflow, command).await
 }
 
@@ -867,6 +865,10 @@ async fn attach_recovery_source_job(
     mut workflow: WorkflowInstance,
     command: WorkflowCommand,
 ) -> anyhow::Result<WorkflowInstance> {
+    let mut active_workflow = workflow.clone();
+    active_workflow.state = "implementing".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &active_workflow)
+        .await?;
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let job = store
         .enqueue_runtime_job(

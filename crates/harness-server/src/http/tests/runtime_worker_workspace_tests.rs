@@ -81,6 +81,7 @@ async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup
             owner_session: workspace_mgr.owner_session.clone(),
             run_generation: 1,
             _pool_permit: None,
+            _repository_write_lease: None,
         },
     );
     workspace_mgr

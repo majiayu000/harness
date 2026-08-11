@@ -517,3 +517,56 @@ pub(super) async fn cancel_unfinished_runtime_jobs_for_commands_tx(
     }
     Ok(rows.len())
 }
+
+pub(super) async fn cancel_unfinished_runtime_jobs_for_terminal_workflow_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+    terminal_state: &str,
+) -> anyhow::Result<usize> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT id FROM workflow_commands
+         WHERE workflow_id = $1
+           AND status IN ('pending', 'dispatching', 'dispatched', 'deferred')
+         ORDER BY id
+         FOR UPDATE",
+    )
+    .bind(workflow_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let cancellations = rows
+        .iter()
+        .map(|(command_id,)| {
+            RuntimeJobCancellation::new(
+                command_id,
+                "workflow_terminal",
+                format!(
+                    "Workflow {workflow_id} reached terminal state {terminal_state}; unfinished runtime work was cancelled."
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let cancelled_jobs = cancel_unfinished_runtime_jobs_for_commands_tx(tx, &cancellations).await?;
+    let command_ids = rows
+        .into_iter()
+        .map(|(command_id,)| command_id)
+        .collect::<Vec<_>>();
+    sqlx::query(
+        "UPDATE workflow_commands
+         SET status = $2,
+             dispatch_owner = NULL,
+             dispatch_lease_expires_at = NULL,
+             dispatch_not_before = NULL,
+             dispatch_barrier = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ANY($1::text[])",
+    )
+    .bind(&command_ids)
+    .bind(WorkflowCommandStatus::Cancelled.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(cancelled_jobs)
+}

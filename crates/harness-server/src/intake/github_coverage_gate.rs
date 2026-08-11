@@ -703,7 +703,9 @@ mod tests {
             }),
             DataProvenance::Server,
         );
-        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+        let mut active_workflow = workflow.clone();
+        active_workflow.state = "implementing".to_string();
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &active_workflow)
             .await?;
 
         let command = WorkflowCommand::enqueue_activity(

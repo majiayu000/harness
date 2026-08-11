@@ -617,6 +617,7 @@ mod tests {
                 owner_session: manager.owner_session.clone(),
                 run_generation: 1,
                 _pool_permit: None,
+                _repository_write_lease: None,
             },
         );
         manager.active_paths.insert(workspace_path, task_id.clone());
@@ -737,6 +738,7 @@ mod tests {
                 owner_session: manager.owner_session.clone(),
                 run_generation: 1,
                 _pool_permit: None,
+                _repository_write_lease: None,
             },
         );
         crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(

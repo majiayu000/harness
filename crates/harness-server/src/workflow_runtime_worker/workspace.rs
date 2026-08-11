@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::time::{timeout, Duration as TokioDuration};
 
 use super::data_helpers::activity_name;
+use crate::workspace_lease_store::RepositoryWriteLease;
 
 pub(super) struct PreparedRuntimeWorkspace {
     pub run_project: PathBuf,
@@ -19,6 +20,7 @@ pub(super) struct PreparedRuntimeWorkspace {
     pub before_remove_hook: Option<String>,
     pub hook_timeout_secs: u64,
     pub finish_action: RuntimeWorkspaceFinishAction,
+    pub _repository_write_lease: Option<RepositoryWriteLease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,19 @@ pub(super) async fn prepare_runtime_workspace(
     match workflow_document.config.workspace.strategy.as_str() {
         "worktree" => {}
         "source" => {
+            let repository_write_lease = match state.concurrency.workspace_mgr.as_ref() {
+                Some(workspace_mgr) => {
+                    workspace_mgr
+                        .acquire_repository_write_lease_if_single_writer(source_project_root)
+                        .await?
+                }
+                None if source_project_is_configured_single_writer(state, source_project_root) => {
+                    anyhow::bail!(
+                        "single-writer source workspace requires the PostgreSQL workspace lease store"
+                    );
+                }
+                None => None,
+            };
             if let Some(hook) = workflow_document.config.hooks.before_run.as_deref() {
                 run_workflow_hook(
                     "before_run",
@@ -54,6 +69,7 @@ pub(super) async fn prepare_runtime_workspace(
                 before_remove_hook: None,
                 hook_timeout_secs: workflow_document.config.hooks.timeout_secs,
                 finish_action: RuntimeWorkspaceFinishAction::Release,
+                _repository_write_lease: repository_write_lease,
             });
         }
         strategy => anyhow::bail!("unsupported workflow workspace strategy: {strategy}"),
@@ -140,6 +156,7 @@ pub(super) async fn prepare_runtime_workspace(
             job,
             workflow,
         ),
+        _repository_write_lease: None,
     })
 }
 
@@ -259,6 +276,34 @@ fn validate_workspace_cleanup_policy(cleanup: &str) -> anyhow::Result<()> {
         "after_run" | "on_terminal" => Ok(()),
         cleanup => anyhow::bail!("unsupported workflow workspace cleanup policy: {cleanup}"),
     }
+}
+
+fn source_project_is_configured_single_writer(
+    state: &AppState,
+    source_project_root: &Path,
+) -> bool {
+    let project_key = crate::workspace_pool::project_limit_key(source_project_root);
+    if state
+        .core
+        .server
+        .config
+        .concurrency
+        .per_project
+        .iter()
+        .any(|(project, limit)| {
+            crate::workspace_pool::project_limit_key(Path::new(project)) == project_key
+                && *limit == 1
+        })
+    {
+        return true;
+    }
+    if state.core.server.startup_projects.iter().any(|project| {
+        crate::workspace_pool::project_limit_key(&project.root) == project_key
+            && project.max_concurrent == Some(1)
+    }) {
+        return true;
+    }
+    state.core.server.config.concurrency.max_concurrent_tasks == 1
 }
 
 pub(super) fn runtime_workspace_finish_action(

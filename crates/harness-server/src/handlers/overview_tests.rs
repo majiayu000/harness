@@ -360,6 +360,7 @@ async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()>
                 owner_session: format!("session-{i}"),
                 run_generation: 1,
                 _pool_permit: None,
+                _repository_write_lease: None,
             },
         );
     }

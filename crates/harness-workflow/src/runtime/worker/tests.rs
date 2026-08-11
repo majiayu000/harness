@@ -369,3 +369,217 @@ async fn lease_lost_cancels_execution_and_waits_for_cleanup() -> anyhow::Result<
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn database_cancellation_interrupts_running_execution_without_dlq() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = Arc::new(WorkflowRuntimeStore::open(&dir.path().join("database-cancel.db")).await?);
+    let job = enqueue_test_runtime_job(
+        store.as_ref(),
+        "database-cancel",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let executor = LeaseLostExecutor {
+        cancel_calls: Arc::clone(&cancel_calls),
+        release: Arc::clone(&release),
+    };
+    let worker = RuntimeWorker::new(store.as_ref(), "database-cancel-worker")
+        .with_lease_ttl(Duration::minutes(5));
+    let cancel_store = Arc::clone(&store);
+    let command_id = job.command_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel_store
+            .cancel_command_and_unfinished_runtime_jobs(
+                &command_id,
+                "workflow_terminal",
+                "workflow became terminal",
+            )
+            .await
+            .expect("database cancellation should apply");
+    });
+
+    let completed = worker
+        .run_once(&executor)
+        .await?
+        .expect("database cancellation should return the durable terminal job");
+
+    assert_eq!(completed.status, RuntimeJobStatus::Cancelled);
+    assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+    let (dlq_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&job.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        dlq_count, 0,
+        "intentional cancellation must not enter the DLQ"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_completion_is_dlq_recorded_when_another_worker_already_succeeded(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store =
+        Arc::new(WorkflowRuntimeStore::open(&dir.path().join("stale-after-success.db")).await?);
+    let job = enqueue_test_runtime_job(
+        store.as_ref(),
+        "stale-after-success",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let executor = LeaseLostExecutor {
+        cancel_calls: Arc::clone(&cancel_calls),
+        release: Arc::clone(&release),
+    };
+    let worker =
+        RuntimeWorker::new(store.as_ref(), "stale-worker").with_lease_ttl(Duration::minutes(5));
+    let pool = store.pool().clone();
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        sqlx::query(
+            r#"UPDATE runtime_jobs
+               SET status = 'succeeded',
+                   data = jsonb_set(
+                       jsonb_set(data, '{status}', '"succeeded"'),
+                       '{lease}', 'null'
+                   )
+               WHERE id = $1"#,
+        )
+        .bind(&job_id)
+        .execute(&pool)
+        .await
+        .expect("competing completion should update the durable job");
+    });
+
+    let completed = worker.run_once(&executor).await?;
+    assert!(
+        completed.is_none(),
+        "stale worker must not own the completion"
+    );
+    assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+    let (dlq_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&job.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(dlq_count, 1, "stale work must remain durable in the DLQ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_from_newer_lease_generation_keeps_stale_completion_in_dlq(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("newer-cancellation.db")).await?;
+    let job = enqueue_test_runtime_job(
+        &store,
+        "newer-cancellation",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let executor = LeaseLostExecutor {
+        cancel_calls: Arc::clone(&cancel_calls),
+        release,
+    };
+    let worker =
+        RuntimeWorker::new(&store, "stale-generation-worker").with_lease_ttl(Duration::minutes(5));
+    let pool = store.pool().clone();
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        sqlx::query(
+            r#"UPDATE runtime_jobs
+               SET status = 'cancelled',
+                   data = jsonb_set(
+                       jsonb_set(
+                           jsonb_set(data, '{status}', '"cancelled"'),
+                           '{lease_generation}', '2'
+                       ),
+                       '{lease}', 'null'
+                   )
+               WHERE id = $1"#,
+        )
+        .bind(&job_id)
+        .execute(&pool)
+        .await
+        .expect("newer cancellation should update the durable job");
+    });
+
+    assert!(worker.run_once(&executor).await?.is_none());
+    assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+    let (dlq_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&job.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(dlq_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_renewal_database_error_cancels_agent_before_returning() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("renewal-db-error.db")).await?;
+    enqueue_test_runtime_job(
+        &store,
+        "renewal-db-error",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let executor = LeaseLostExecutor {
+        cancel_calls: Arc::clone(&cancel_calls),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let pool = store.pool().clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        pool.close().await;
+    });
+
+    let error = RuntimeWorker::new(&store, "renewal-db-error-worker")
+        .with_lease_ttl(Duration::seconds(2))
+        .run_once(&executor)
+        .await
+        .expect_err("closed database pool must fail lease renewal");
+    assert!(error.to_string().contains("lease renewal failed"));
+    assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}

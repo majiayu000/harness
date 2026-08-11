@@ -1,5 +1,7 @@
 use crate::task_runner::{TaskId, TaskSummary};
-use crate::workspace_lease_store::{WorkspaceLeaseRecord, WorkspaceLeaseStore};
+use crate::workspace_lease_store::{
+    RepositoryWriteLease, WorkspaceLeaseRecord, WorkspaceLeaseStore,
+};
 use crate::workspace_pool::{
     select_available_slot, workspace_slot_key, WorkspacePool, WorkspacePoolConfig,
 };
@@ -76,6 +78,7 @@ pub(crate) struct ActiveWorkspace {
     pub(crate) owner_session: String,
     pub(crate) run_generation: u32,
     pub(crate) _pool_permit: Option<OwnedSemaphorePermit>,
+    pub(crate) _repository_write_lease: Option<RepositoryWriteLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +256,34 @@ impl WorkspaceManager {
             pool: WorkspacePool::new(pool_config),
             lease_store,
         })
+    }
+
+    pub(crate) async fn acquire_repository_write_lease_if_single_writer(
+        &self,
+        source_repo: &Path,
+    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
+        if !self.pool.requires_repository_write_lease(source_repo) {
+            return Ok(None);
+        }
+        let store = self.lease_store.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "single-writer repository execution requires the PostgreSQL workspace lease store"
+            )
+        })?;
+        let project_key = crate::workspace_pool::project_limit_key(source_repo);
+        loop {
+            if let Some(lease) = store
+                .try_acquire_repository_write_lease(&project_key)
+                .await?
+            {
+                return Ok(Some(lease));
+            }
+            tracing::debug!(
+                project_key = %project_key,
+                "workspace pool waiting for the PostgreSQL repository write lease"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     fn release_active_path(&self, task_id: &TaskId, workspace_path: &Path) {

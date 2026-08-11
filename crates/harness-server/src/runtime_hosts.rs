@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: i64 = 60;
 pub const DEFAULT_LEASE_SECS: i64 = 60;
-pub const MAX_LEASE_SECS: i64 = 3600;
+/// Remote workers must re-check the durable lease at least once per minute so
+/// terminal workflow cancellation reaches their agent process promptly.
+pub const MAX_LEASE_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -379,9 +379,22 @@ async fn runtime_worker_renews_running_job_lease_until_completion() -> anyhow::R
         RuntimeWorker::new(store.as_ref(), "runtime-2").with_lease_ttl(Duration::seconds(2));
     let second_claim = second_worker.run_once(&second_executor).await?;
     let _ = finish_tx.send(());
-    let completed = worker_handle
-        .await??
-        .expect("first worker should complete the runtime job");
+    let completed = worker_handle.await??;
+    let completed = match completed {
+        Some(completed) => completed,
+        None => {
+            let current = store.get_runtime_job(&job.id).await?;
+            let event_types = store
+                .runtime_events_for(&job.id)
+                .await?
+                .into_iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>();
+            anyhow::bail!(
+                "first worker lost its completion: current={current:?} events={event_types:?}"
+            );
+        }
+    };
 
     assert!(second_claim.is_none());
     assert_eq!(second_calls.load(Ordering::SeqCst), 0);

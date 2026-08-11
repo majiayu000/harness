@@ -9,7 +9,7 @@ async fn blocked_runtime_reconciliation_marks_merged_pr_done() -> anyhow::Result
     let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let api_base = github_state_server(vec![(
         "/repos/owner/repo/pulls/103",
-        r#"{"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
+        r#"{"number":103,"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
     )])
     .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
@@ -113,7 +113,7 @@ async fn blocked_runtime_reconciliation_marks_slug_only_merged_pr_done() -> anyh
     let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
     let api_base = github_state_server(vec![(
         "/repos/owner/repo/pulls/104",
-        r#"{"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
+        r#"{"number":104,"state":"closed","merged_at":"2026-05-10T00:00:00Z"}"#,
     )])
     .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);

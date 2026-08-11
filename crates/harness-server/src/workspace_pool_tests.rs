@@ -131,6 +131,39 @@ async fn pool_slot_reuse_preserves_released_same_task_workspace() {
 }
 
 #[tokio::test]
+async fn single_writer_workspace_fails_closed_without_postgres_lease_store() -> anyhow::Result<()> {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        },
+        WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        None,
+    )?;
+
+    let error = manager
+        .create_workspace(
+            &harness_core::types::TaskId("missing-global-lease".to_string()),
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await
+        .expect_err("single-writer mode must reject execution without PostgreSQL lease store");
+    assert!(error
+        .to_string()
+        .contains("PostgreSQL workspace lease store"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn remove_workspace_keeps_in_memory_slot_until_cleanup_finishes() -> anyhow::Result<()> {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());
@@ -144,7 +177,7 @@ async fn remove_workspace_keeps_in_memory_slot_until_cleanup_finishes() -> anyho
             hook_timeout_secs: 5,
             ..Default::default()
         },
-        WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        WorkspacePoolConfig::new_for_local_pool_tests(1, std::collections::HashMap::new()),
         None,
     )?);
     let first_task = harness_core::types::TaskId("in-memory-remove-first".to_string());
@@ -358,7 +391,7 @@ async fn create_workspace_waits_when_project_pool_is_full() {
     let mgr = std::sync::Arc::new(
         WorkspaceManager::new_with_pool(
             config,
-            WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+            WorkspacePoolConfig::new_for_local_pool_tests(1, std::collections::HashMap::new()),
             None,
         )
         .expect("new"),
@@ -432,7 +465,7 @@ async fn create_workspace_enforces_project_capacity_across_repo_slugs() {
     let mgr = std::sync::Arc::new(
         WorkspaceManager::new_with_pool(
             config,
-            WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+            WorkspacePoolConfig::new_for_local_pool_tests(1, std::collections::HashMap::new()),
             None,
         )
         .expect("new"),

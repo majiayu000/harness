@@ -63,8 +63,11 @@ async fn reconcile_disk_removes_closed_issue_workspace() {
     )
     .expect("write record");
 
-    let api_base =
-        github_state_server("/repos/myorg/my-repo/issues/42", r#"{"state":"closed"}"#).await;
+    let api_base = github_state_server(
+        "/repos/myorg/my-repo/issues/42",
+        r#"{"number":42,"state":"closed"}"#,
+    )
+    .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
     let summary = mgr
@@ -113,8 +116,11 @@ async fn reconcile_disk_removes_closed_issue_pool_slot_workspace() {
             .is_some(),
         "owner record should retain parseable repo identity"
     );
-    let api_base =
-        github_state_server("/repos/myorg/my-repo/issues/42", r#"{"state":"closed"}"#).await;
+    let api_base = github_state_server(
+        "/repos/myorg/my-repo/issues/42",
+        r#"{"number":42,"state":"closed"}"#,
+    )
+    .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
     let summary = mgr
@@ -169,8 +175,11 @@ async fn reconcile_disk_skips_live_persisted_lease_from_other_manager() -> anyho
         .await
         .expect("create pool slot workspace");
 
-    let api_base =
-        github_state_server("/repos/myorg/my-repo/issues/42", r#"{"state":"closed"}"#).await;
+    let api_base = github_state_server(
+        "/repos/myorg/my-repo/issues/42",
+        r#"{"number":42,"state":"closed"}"#,
+    )
+    .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
     let summary = mgr_b
@@ -249,8 +258,11 @@ async fn reconcile_disk_releases_dead_persisted_lease_before_cleanup() -> anyhow
     };
     assert!(store.try_acquire_lease(&stale_record).await?);
 
-    let api_base =
-        github_state_server("/repos/myorg/my-repo/issues/42", r#"{"state":"closed"}"#).await;
+    let api_base = github_state_server(
+        "/repos/myorg/my-repo/issues/42",
+        r#"{"number":42,"state":"closed"}"#,
+    )
+    .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
     let summary = reconciler
@@ -432,8 +444,11 @@ async fn reconcile_disk_skips_open_issue_workspace() {
     )
     .expect("write record");
 
-    let api_base =
-        github_state_server("/repos/myorg/my-repo/issues/7", r#"{"state":"open"}"#).await;
+    let api_base = github_state_server(
+        "/repos/myorg/my-repo/issues/7",
+        r#"{"number":7,"state":"open"}"#,
+    )
+    .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
     let summary = mgr

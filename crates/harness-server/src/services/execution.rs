@@ -64,6 +64,7 @@ pub struct DefaultExecutionService {
     workflow_runtime_store: Option<Arc<WorkflowRuntimeStore>>,
     project_registry: Option<Arc<ProjectRegistry>>,
     allowed_project_roots: Vec<PathBuf>,
+    verify_remote_subject_state: bool,
 }
 
 struct PreparedRuntimeIssueSubmission {
@@ -144,6 +145,23 @@ impl DefaultExecutionService {
             workflow_runtime_store,
             project_registry,
             allowed_project_roots,
+            verify_remote_subject_state: true,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(
+        server_config: Arc<HarnessConfig>,
+        workflow_runtime_store: Option<Arc<WorkflowRuntimeStore>>,
+        project_registry: Option<Arc<ProjectRegistry>>,
+        allowed_project_roots: Vec<PathBuf>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            server_config,
+            workflow_runtime_store,
+            project_registry,
+            allowed_project_roots,
+            verify_remote_subject_state: false,
         })
     }
 
@@ -382,6 +400,7 @@ impl DefaultExecutionService {
         req.project = Some(canonical.clone());
         workflow_runtime_submission::fill_missing_repo_from_project(&mut req).await;
         Self::populate_external_id(&mut req);
+        self.ensure_remote_subject_open(&req).await?;
 
         if !self.runtime_submission_enabled(&canonical)? {
             return Err(EnqueueTaskError::Internal(
@@ -453,6 +472,79 @@ impl DefaultExecutionService {
                 self.submit_pr_feedback_to_workflow_runtime(*prepared).await
             }
         }
+    }
+
+    async fn ensure_remote_subject_open(
+        &self,
+        req: &CreateTaskRequest,
+    ) -> Result<(), EnqueueTaskError> {
+        if !self.verify_remote_subject_state || (req.issue.is_none() && req.pr.is_none()) {
+            return Ok(());
+        }
+        let repo = req
+            .repo
+            .as_deref()
+            .map(str::trim)
+            .filter(|repo| !repo.is_empty())
+            .ok_or_else(|| {
+                EnqueueTaskError::BadRequest(
+                    "GitHub issue/PR submissions require a repository slug".to_string(),
+                )
+            })?;
+        if !valid_github_repo_slug(repo) {
+            return Err(EnqueueTaskError::BadRequest(format!(
+                "invalid GitHub repository slug: {repo}"
+            )));
+        }
+        let token = self.server_config.server.github_token.as_deref();
+        let (subject, state) = if let Some(issue_number) = req.issue {
+            (
+                format!("issue #{issue_number}"),
+                crate::reconciliation::fetch_issue_state_with_token(repo, issue_number, token)
+                    .await,
+            )
+        } else if let Some(pr_number) = req.pr {
+            (
+                format!("PR #{pr_number}"),
+                crate::reconciliation::fetch_pr_state_by_slug_with_token(repo, pr_number, token)
+                    .await,
+            )
+        } else {
+            return Ok(());
+        };
+        validate_remote_subject_open(&subject, repo, state)
+    }
+}
+
+fn valid_github_repo_slug(repo: &str) -> bool {
+    let mut segments = repo.split('/');
+    let (Some(owner), Some(name), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    [owner, name].into_iter().all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    })
+}
+
+fn validate_remote_subject_open(
+    subject: &str,
+    repo: &str,
+    state: crate::reconciliation::GitHubState,
+) -> Result<(), EnqueueTaskError> {
+    match state {
+        crate::reconciliation::GitHubState::Open => Ok(()),
+        crate::reconciliation::GitHubState::Unknown => Err(EnqueueTaskError::Internal(format!(
+            "could not verify that GitHub {subject} in {repo} is open"
+        ))),
+        state => Err(EnqueueTaskError::BadRequest(format!(
+            "GitHub {subject} in {repo} is not open ({state:?})"
+        ))),
     }
 }
 

@@ -172,6 +172,14 @@ fn cancellation_decision(workflow_id: &str, marker: &WorkflowCommand) -> Workflo
     .with_command(marker.clone())
 }
 
+async fn force_cancelled(
+    store: &WorkflowRuntimeStore,
+    instance: &mut WorkflowInstance,
+) -> anyhow::Result<()> {
+    instance.state = "cancelled".to_string();
+    store.force_upsert_lifecycle_state_for_test(instance).await
+}
+
 /// Cleanup may proceed: the live marker was minted by the latest accepted
 /// decision, and that decision is what placed the instance in `cancelled`.
 #[tokio::test]
@@ -181,7 +189,7 @@ async fn cancellation_cleanup_honors_marker_bound_to_current_decision() -> anyho
     }
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = workflow("gh1865-cancel-bound", "cancelled");
+    let mut instance = workflow("gh1865-cancel-bound", "running");
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;
@@ -193,6 +201,7 @@ async fn cancellation_cleanup_honors_marker_bound_to_current_decision() -> anyho
     store
         .enqueue_command(&instance.id, Some(&record.id), &marker)
         .await?;
+    force_cancelled(&store, &mut instance).await?;
 
     let stored = store
         .get_instance(&instance.id)
@@ -217,7 +226,7 @@ async fn cancellation_cleanup_rejects_detached_marker() -> anyhow::Result<()> {
     }
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = workflow("gh1865-cancel-detached", "cancelled");
+    let mut instance = workflow("gh1865-cancel-detached", "running");
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;
@@ -226,6 +235,7 @@ async fn cancellation_cleanup_rejects_detached_marker() -> anyhow::Result<()> {
     let activity_id = store.enqueue_command(&instance.id, None, &activity).await?;
     let marker = cancellation_marker("gh1865-cancel-detached-marker");
     store.enqueue_command(&instance.id, None, &marker).await?;
+    force_cancelled(&store, &mut instance).await?;
 
     let stored = store
         .get_instance(&instance.id)
@@ -260,7 +270,7 @@ async fn cancellation_cleanup_rejects_marker_for_rejected_decision() -> anyhow::
     }
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = workflow("gh1865-cancel-rejected", "cancelled");
+    let mut instance = workflow("gh1865-cancel-rejected", "running");
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;
@@ -275,6 +285,7 @@ async fn cancellation_cleanup_rejects_marker_for_rejected_decision() -> anyhow::
     store
         .enqueue_command(&instance.id, Some(&record.id), &marker)
         .await?;
+    force_cancelled(&store, &mut instance).await?;
 
     let stored = store
         .get_instance(&instance.id)
@@ -300,7 +311,7 @@ async fn cancellation_cleanup_rejects_marker_from_older_generation() -> anyhow::
     }
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = workflow("gh1865-cancel-old-generation", "cancelled");
+    let mut instance = workflow("gh1865-cancel-old-generation", "running");
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;
@@ -312,6 +323,7 @@ async fn cancellation_cleanup_rejects_marker_from_older_generation() -> anyhow::
     store
         .enqueue_command(&instance.id, Some(&cancelled_record.id), &marker)
         .await?;
+    force_cancelled(&store, &mut instance).await?;
 
     // A newer accepted decision reopened the workflow; the instance row in
     // this fixture still says `cancelled`, which is exactly the stale view a
@@ -353,7 +365,7 @@ async fn cancellation_cleanup_rejects_superseded_marker() -> anyhow::Result<()> 
     }
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = workflow("gh1865-cancel-superseded", "cancelled");
+    let mut instance = workflow("gh1865-cancel-superseded", "running");
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;
@@ -386,6 +398,7 @@ async fn cancellation_cleanup_rejects_superseded_marker() -> anyhow::Result<()> 
     store
         .enqueue_command(&instance.id, Some(&replacement_record.id), &replacement)
         .await?;
+    force_cancelled(&store, &mut instance).await?;
 
     let marker = store
         .get_command(&marker_id)

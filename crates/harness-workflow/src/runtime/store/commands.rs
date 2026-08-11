@@ -116,19 +116,6 @@ impl WorkflowRuntimeStore {
     }
 }
 
-pub(super) async fn insert(
-    pool: &PgPool,
-    workflow_id: &str,
-    decision_id: Option<&str>,
-    command: &WorkflowCommand,
-    status: WorkflowCommandStatus,
-) -> anyhow::Result<String> {
-    let mut tx = pool.begin().await?;
-    let id = insert_tx(&mut tx, workflow_id, decision_id, command, status).await?;
-    tx.commit().await?;
-    Ok(id)
-}
-
 pub(super) async fn insert_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
@@ -190,17 +177,14 @@ pub(super) async fn enqueue_runtime_job_for_command(
         anyhow::bail!("workflow command not found: {command_id}");
     };
     let mut tx = pool.begin().await?;
-    let workflow = if dispatch_claim.is_some() {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
-                .bind(&workflow_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        row.map(|(data,)| workflow_instance_from_persisted_json(&data))
-            .transpose()?
-    } else {
-        None
-    };
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
+            .bind(&workflow_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let workflow = row
+        .map(|(data,)| workflow_instance_from_persisted_json(&data))
+        .transpose()?;
     let command_row: Option<(String, Option<String>, i64)> = sqlx::query_as(
         "SELECT status, dispatch_owner, dispatch_claim_generation
          FROM workflow_commands WHERE id = $1 FOR UPDATE",
@@ -268,6 +252,30 @@ pub(super) async fn enqueue_runtime_job_for_command(
             tx.rollback().await?;
             return Ok(RuntimeJobEnqueueOutcome::StaleClaim);
         }
+    } else if let Some(workflow) = workflow.as_ref().filter(|workflow| workflow.is_terminal()) {
+        let terminal_status = if workflow.state == "cancelled" {
+            WorkflowCommandStatus::Cancelled
+        } else {
+            WorkflowCommandStatus::Skipped
+        };
+        sqlx::query(
+            "UPDATE workflow_commands SET status = $2, dispatch_owner = NULL,
+                dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,
+                dispatch_barrier = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND status IN ($3, $4, $5, $6)",
+        )
+        .bind(command_id)
+        .bind(terminal_status.as_str())
+        .bind(WorkflowCommandStatus::Pending.as_str())
+        .bind(WorkflowCommandStatus::Dispatching.as_str())
+        .bind(WorkflowCommandStatus::Dispatched.as_str())
+        .bind(WorkflowCommandStatus::Deferred.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(RuntimeJobEnqueueOutcome::WorkflowTerminal {
+            status: terminal_status,
+        });
     } else if command_status != WorkflowCommandStatus::Pending {
         tx.rollback().await?;
         return Ok(match existing {
