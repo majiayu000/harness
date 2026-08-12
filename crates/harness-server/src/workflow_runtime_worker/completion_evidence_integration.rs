@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use super::data_helpers::activity_name;
 use super::pr_binding_verification::{attach_pr_binding_verification, result_claims_pr_binding};
-use super::server_validation::{apply_server_validation, run_validation_commands};
+use super::server_validation::{
+    apply_server_validation, run_validation_commands, ValidationCommandSpec,
+};
 
 /// Apply the completion-evidence pipeline to an agent-turn activity result.
 ///
@@ -73,27 +75,49 @@ pub(super) async fn apply_completion_evidence(
 fn validation_commands_for_job(
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
-) -> Vec<String> {
-    let from_value = |value: Option<&Value>| -> Option<Vec<String>> {
-        let commands: Vec<String> = value?
-            .as_array()?
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
-            .map(str::to_string)
-            .collect();
-        if commands.is_empty() {
-            None
-        } else {
-            Some(commands)
-        }
-    };
-    from_value(job.input.get("validation_commands"))
+) -> Vec<ValidationCommandSpec> {
+    validation_command_argv_from_value(job.input.get("validation_commands_argv"))
         .or_else(|| {
-            from_value(workflow.and_then(|workflow| workflow.data.get("validation_commands")))
+            validation_command_argv_from_value(
+                workflow.and_then(|workflow| workflow.data.get("validation_commands_argv")),
+            )
+        })
+        .or_else(|| validation_command_strings_from_value(job.input.get("validation_commands")))
+        .or_else(|| {
+            validation_command_strings_from_value(
+                workflow.and_then(|workflow| workflow.data.get("validation_commands")),
+            )
         })
         .unwrap_or_default()
+}
+
+fn validation_command_argv_from_value(value: Option<&Value>) -> Option<Vec<ValidationCommandSpec>> {
+    let commands = value?
+        .as_array()?
+        .iter()
+        .filter_map(|command| {
+            let argv = command
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            ValidationCommandSpec::from_argv(argv)
+        })
+        .collect::<Vec<_>>();
+    (!commands.is_empty()).then_some(commands)
+}
+
+fn validation_command_strings_from_value(
+    value: Option<&Value>,
+) -> Option<Vec<ValidationCommandSpec>> {
+    let commands = value?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(ValidationCommandSpec::from_legacy_string)
+        .collect::<Vec<_>>();
+    (!commands.is_empty()).then_some(commands)
 }
 
 #[cfg(test)]
@@ -120,7 +144,10 @@ mod tests {
         }));
         assert_eq!(
             validation_commands_for_job(&job, None),
-            vec!["cargo test".to_string(), "cargo clippy".to_string()]
+            vec![
+                ValidationCommandSpec::from_legacy_string("cargo test").unwrap(),
+                ValidationCommandSpec::from_legacy_string("cargo clippy").unwrap()
+            ]
         );
 
         let job = job_with_input(json!({ "activity": QUALITY_GATE_ACTIVITY }));
@@ -133,8 +160,28 @@ mod tests {
         .with_server_data(json!({ "validation_commands": ["cargo fmt --all -- --check"] }));
         assert_eq!(
             validation_commands_for_job(&job, Some(&workflow)),
-            vec!["cargo fmt --all -- --check".to_string()]
+            vec![ValidationCommandSpec::from_legacy_string("cargo fmt --all -- --check").unwrap()]
         );
         assert!(validation_commands_for_job(&job, None).is_empty());
+    }
+
+    #[test]
+    fn validation_commands_prefer_argv_arrays_over_legacy_strings() {
+        let job = job_with_input(json!({
+            "activity": QUALITY_GATE_ACTIVITY,
+            "validation_commands_argv": [["cargo", "test", "-p", "harness-workflow"]],
+            "validation_commands": ["cargo test should-not-run"],
+        }));
+
+        assert_eq!(
+            validation_commands_for_job(&job, None),
+            vec![ValidationCommandSpec::from_argv(vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "harness-workflow".to_string()
+            ])
+            .unwrap()]
+        );
     }
 }

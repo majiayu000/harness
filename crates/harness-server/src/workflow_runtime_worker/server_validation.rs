@@ -34,15 +34,57 @@ pub(super) struct ServerValidationFailure {
     pub error_kind: ActivityErrorKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ValidationCommandSpec {
+    display: String,
+    argv: Vec<String>,
+}
+
+impl ValidationCommandSpec {
+    pub(super) fn from_argv(argv: Vec<String>) -> Option<Self> {
+        let argv = argv
+            .into_iter()
+            .map(|arg| arg.trim().to_string())
+            .filter(|arg| !arg.is_empty())
+            .collect::<Vec<_>>();
+        if argv.is_empty() {
+            return None;
+        }
+        Some(Self {
+            display: argv.join(" "),
+            argv,
+        })
+    }
+
+    pub(super) fn from_legacy_string(command: &str) -> Option<Self> {
+        let argv = command
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        Self::from_argv(argv).map(|mut spec| {
+            spec.display = command.trim().to_string();
+            spec
+        })
+    }
+
+    fn program(&self) -> &str {
+        &self.argv[0]
+    }
+
+    fn args(&self) -> &[String] {
+        &self.argv[1..]
+    }
+}
+
 /// Execute `commands` sequentially in `workspace_root`, stopping at the
 /// first failure. Every started command records an entry in the digest.
 pub(super) async fn run_validation_commands(
     workspace_root: &Path,
-    commands: &[String],
+    commands: &[ValidationCommandSpec],
     timeout: Duration,
     credential_environment: Option<&crate::eval_credentials::EvalCredentialEnvironment>,
 ) -> ServerValidationRun {
-    if commands.iter().all(|command| command.trim().is_empty()) {
+    if commands.is_empty() {
         let mut digest = json!({
             "commands": [],
             "cwd": workspace_root.display().to_string(),
@@ -66,10 +108,6 @@ pub(super) async fn run_validation_commands(
     let mut entries = Vec::new();
     let mut failure = None;
     for command in commands {
-        let command = command.trim();
-        if command.is_empty() {
-            continue;
-        }
         let remaining = timeout.saturating_sub(started.elapsed());
         let entry =
             run_single_command(workspace_root, command, remaining, credential_environment).await;
@@ -78,7 +116,7 @@ pub(super) async fn run_validation_commands(
         entries.push(entry);
         if failed {
             let last = entries.last().cloned().unwrap_or(Value::Null);
-            failure = Some(server_validation_failure_for_entry(command, &last));
+            failure = Some(server_validation_failure_for_entry(&command.display, &last));
             break;
         }
     }
@@ -118,18 +156,14 @@ fn server_validation_failure_for_entry(command: &str, entry: &Value) -> ServerVa
 
 async fn run_single_command(
     workspace_root: &Path,
-    command: &str,
+    command: &ValidationCommandSpec,
     timeout: Duration,
     credential_environment: Option<&crate::eval_credentials::EvalCredentialEnvironment>,
 ) -> Value {
     let started = Instant::now();
-    let mut parts = command.split_whitespace();
-    let Some(program) = parts.next() else {
-        return command_entry(command, workspace_root, None, "", 0, Some("empty command"));
-    };
-    let mut process = tokio::process::Command::new(program);
+    let mut process = tokio::process::Command::new(command.program());
     process
-        .args(parts)
+        .args(command.args())
         .current_dir(workspace_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -181,7 +215,7 @@ async fn run_single_command(
 }
 
 fn command_entry(
-    command: &str,
+    command: &ValidationCommandSpec,
     cwd: &Path,
     exit_code: Option<i64>,
     output_sha256: &str,
@@ -189,7 +223,8 @@ fn command_entry(
     startup_error: Option<&str>,
 ) -> Value {
     let mut entry = json!({
-        "command": command,
+        "command": command.display.clone(),
+        "argv": command.argv.clone(),
         "cwd": cwd.display().to_string(),
         "duration_ms": duration_ms,
     });
@@ -242,12 +277,16 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
+    fn command_spec(command: &str) -> ValidationCommandSpec {
+        ValidationCommandSpec::from_legacy_string(command).expect("valid command")
+    }
+
     #[tokio::test]
     async fn passing_commands_record_digest_and_keep_result() {
         let dir = workspace();
         let run = run_validation_commands(
             dir.path(),
-            &["true".to_string(), "true".to_string()],
+            &[command_spec("true"), command_spec("true")],
             Duration::from_secs(30),
             None,
         )
@@ -259,6 +298,7 @@ mod tests {
         assert!(server_validation_digest_passed(&result));
         let digest = server_validation_digest_artifact(&result).expect("digest attached");
         assert_eq!(digest["commands"].as_array().map(Vec::len), Some(2));
+        assert_eq!(digest["commands"][0]["argv"][0], "true");
     }
 
     #[cfg(unix)]
@@ -308,7 +348,7 @@ test -n "$PATH" || exit 45
 
         let entry = run_single_command(
             dir.path(),
-            command,
+            &command_spec(command),
             Duration::from_secs(30),
             Some(&credential_environment),
         )
@@ -348,7 +388,7 @@ test -n "$PATH" || exit 45
         let dir = workspace();
         let run = run_validation_commands(
             dir.path(),
-            &["false".to_string(), "true".to_string()],
+            &[command_spec("false"), command_spec("true")],
             Duration::from_secs(30),
             None,
         )
@@ -369,9 +409,7 @@ test -n "$PATH" || exit 45
     #[tokio::test]
     async fn missing_commands_never_pass() {
         let dir = workspace();
-        let run =
-            run_validation_commands(dir.path(), &[" ".to_string()], Duration::from_secs(5), None)
-                .await;
+        let run = run_validation_commands(dir.path(), &[], Duration::from_secs(5), None).await;
         let failure = run.failure.as_ref().expect("missing commands must fail");
         assert!(failure.error.contains("validation_commands_missing"));
         let result = apply_server_validation(
@@ -388,7 +426,7 @@ test -n "$PATH" || exit 45
         let dir = workspace();
         let run = run_validation_commands(
             dir.path(),
-            &["definitely-not-a-real-binary-gh1766".to_string()],
+            &[command_spec("definitely-not-a-real-binary-gh1766")],
             Duration::from_secs(5),
             None,
         )
@@ -409,7 +447,10 @@ test -n "$PATH" || exit 45
         let dir = workspace();
         let run = run_validation_commands(
             dir.path(),
-            &["sleep 5".to_string()],
+            &[
+                ValidationCommandSpec::from_argv(vec!["sleep".to_string(), "5".to_string()])
+                    .unwrap(),
+            ],
             Duration::from_millis(100),
             None,
         )

@@ -1,16 +1,19 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
+use harness_core::config::HarnessConfig;
 use harness_workflow::runtime::eval::model::EvalGrade;
 use harness_workflow::runtime::{
-    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
+    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence, execute_eval_manifest,
     parse_benchmark_manifest_str, EvalAttestationDecision, EvalAttestationTrust,
     EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseInfrastructureStatus, EvalCaseTransition,
-    EvalCaseTransitionKind, EvalReportCaseStatus, EvalRunReport, EvalRunReportDiff,
+    EvalCaseTransitionKind, EvalExecuteConfig, EvalReportCaseStatus, EvalRunReport,
+    EvalRunReportDiff, WorkflowRuntimeStore,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const PASS_DROP_EPSILON: f64 = 1e-9;
 
@@ -39,6 +42,18 @@ pub struct EvalRunArgs {
     /// Validate the manifest and list cases without requiring collected evidence
     #[arg(long)]
     pub dry_run: bool,
+    /// Execute replayable cases through the workflow runtime and collect evidence
+    #[arg(long)]
+    pub execute: bool,
+    /// Project root used as the runtime project_id. Defaults to the current directory.
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+    /// Seconds between workflow-runtime terminal-state polls during --execute
+    #[arg(long, default_value_t = 5)]
+    pub poll_interval_secs: u64,
+    /// Additional prompt appended to the eval runtime instructions during --execute
+    #[arg(long)]
+    pub additional_prompt: Option<String>,
     /// Print JSON instead of the compact text report
     #[arg(long)]
     pub json: bool,
@@ -67,16 +82,20 @@ pub struct EvalDiffArgs {
     pub output: Option<PathBuf>,
 }
 
-pub async fn run(cmd: EvalCommand) -> anyhow::Result<()> {
+pub async fn run(config: &HarnessConfig, cmd: EvalCommand) -> anyhow::Result<()> {
     match cmd {
-        EvalCommand::Run(args) => run_eval_report(args).await,
+        EvalCommand::Run(args) => run_eval_report(config, args).await,
         EvalCommand::Diff(args) => diff_eval_reports(args),
     }
 }
 
-async fn run_eval_report(args: EvalRunArgs) -> anyhow::Result<()> {
-    if args.dry_run && args.evidence.is_some() {
-        anyhow::bail!("use either --dry-run or --evidence, not both");
+async fn run_eval_report(config: &HarnessConfig, args: EvalRunArgs) -> anyhow::Result<()> {
+    let selected_modes = [args.dry_run, args.evidence.is_some(), args.execute]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+    if selected_modes > 1 {
+        anyhow::bail!("use only one of --dry-run, --evidence, or --execute");
     }
 
     let manifest = read_eval_manifest(&args.manifest)?;
@@ -88,13 +107,54 @@ async fn run_eval_report(args: EvalRunArgs) -> anyhow::Result<()> {
     } else if let Some(evidence_path) = args.evidence.as_ref() {
         let evidence = read_evidence(evidence_path)?;
         eval_report_from_evidence(&manifest, run_id, args.k, evidence)?
+    } else if args.execute {
+        let project_root = eval_project_root(args.project.as_deref())?;
+        let store = open_eval_runtime_store(config, &project_root).await?;
+        let mut execute_config =
+            EvalExecuteConfig::new(run_id, args.k, project_root.display().to_string());
+        execute_config.poll_interval = Duration::from_secs(args.poll_interval_secs.max(1));
+        execute_config.additional_prompt = args.additional_prompt;
+        execute_eval_manifest(&store, &manifest, execute_config).await?
     } else {
         anyhow::bail!(
-            "live eval execution is not wired to the CLI yet; pass --evidence to report collected evidence or --dry-run to validate the manifest"
+            "live eval execution requires --execute; pass --evidence to report collected evidence or --dry-run to validate the manifest"
         );
     };
 
     emit_report(&report, args.json, args.output.as_deref())
+}
+
+fn eval_project_root(project: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let root = match project {
+        Some(project) => project.to_path_buf(),
+        None => std::env::current_dir().context("failed to resolve current directory")?,
+    };
+    std::fs::canonicalize(&root)
+        .with_context(|| format!("failed to resolve eval project root {}", root.display()))
+}
+
+async fn open_eval_runtime_store(
+    config: &HarnessConfig,
+    project_root: &Path,
+) -> anyhow::Result<WorkflowRuntimeStore> {
+    let workflow_config = harness_core::config::workflow::load_workflow_config(project_root)
+        .with_context(|| {
+            format!(
+                "failed to load workflow runtime config from {}",
+                project_root.display()
+            )
+        })?;
+    let schema = format!("{}_runtime", workflow_config.storage.schema_namespace);
+    WorkflowRuntimeStore::open_with_database_url_and_schema(
+        config.server.database_url.as_deref(),
+        &schema,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "--execute requires a configured workflow runtime store; failed to open schema `{schema}`"
+        )
+    })
 }
 
 fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
@@ -609,8 +669,40 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                 assert_eq!(args.evidence, Some(PathBuf::from("evidence.json")));
                 assert_eq!(args.run_id.as_deref(), Some("run-1"));
                 assert_eq!(args.k, 5);
+                assert!(!args.execute);
+                assert_eq!(args.poll_interval_secs, 5);
                 assert!(args.json);
                 assert_eq!(args.output, Some(PathBuf::from("report.json")));
+            }
+            _ => panic!("expected eval run command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "harness",
+            "eval",
+            "run",
+            "--manifest",
+            "evals/benchmarks/harness-core.toml",
+            "--execute",
+            "--project",
+            ".",
+            "--poll-interval-secs",
+            "1",
+            "--additional-prompt",
+            "Use the small slice.",
+        ])
+        .unwrap_or_else(|error| panic!("eval execute command should parse: {error}"));
+        match cli.command {
+            Command::Eval {
+                cmd: EvalCommand::Run(args),
+            } => {
+                assert!(args.execute);
+                assert_eq!(args.project, Some(PathBuf::from(".")));
+                assert_eq!(args.poll_interval_secs, 1);
+                assert_eq!(
+                    args.additional_prompt.as_deref(),
+                    Some("Use the small slice.")
+                );
             }
             _ => panic!("expected eval run command"),
         }
@@ -639,6 +731,69 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             }
             _ => panic!("expected eval diff command"),
         }
+    }
+
+    #[tokio::test]
+    async fn eval_report_execute_is_mutually_exclusive_with_collect_only_modes() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let manifest_path = tempdir.path().join("manifest.toml");
+        fs::write(
+            &manifest_path,
+            r#"
+suite = "harness-core"
+
+[[cases]]
+case_id = "case-pass"
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "b308b380"
+verify_commands = ["cargo test -p harness-workflow eval_report"]
+"#,
+        )
+        .unwrap_or_else(|error| panic!("manifest should write: {error}"));
+
+        let error = run_eval_report(
+            &harness_core::config::HarnessConfig::default(),
+            EvalRunArgs {
+                manifest: manifest_path.clone(),
+                evidence: Some(tempdir.path().join("evidence.json")),
+                run_id: Some("run-1".to_string()),
+                k: 3,
+                dry_run: false,
+                execute: true,
+                project: None,
+                poll_interval_secs: 5,
+                additional_prompt: None,
+                json: false,
+                output: None,
+            },
+        )
+        .await
+        .expect_err("--execute and --evidence should be rejected before store access");
+
+        assert!(error.to_string().contains("use only one"));
+
+        let error = run_eval_report(
+            &harness_core::config::HarnessConfig::default(),
+            EvalRunArgs {
+                manifest: manifest_path,
+                evidence: None,
+                run_id: Some("run-1".to_string()),
+                k: 3,
+                dry_run: false,
+                execute: false,
+                project: None,
+                poll_interval_secs: 5,
+                additional_prompt: None,
+                json: false,
+                output: None,
+            },
+        )
+        .await
+        .expect_err("omitting --execute should preserve collect-only error");
+
+        assert!(error.to_string().contains("requires --execute"));
     }
 
     #[test]

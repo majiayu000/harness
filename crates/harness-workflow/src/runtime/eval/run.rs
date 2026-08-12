@@ -593,6 +593,7 @@ fn eval_case_submitted_data(input: EvalCaseWorkflowInput<'_>, last_decision: &st
             "branch_prefix": EVAL_BRANCH_PREFIX,
             "pull_request_mode": EVAL_PR_DRAFT_MODE,
             "isolation": eval_isolation_metadata(&input.case.isolation),
+            "verify_commands_argv": validation_commands_argv(&input.case.verify_commands),
         },
         "last_decision": last_decision,
         "execution_path": "workflow_runtime",
@@ -619,6 +620,7 @@ fn with_eval_command_metadata(
                 "branch_prefix": EVAL_BRANCH_PREFIX,
                 "pull_request_mode": EVAL_PR_DRAFT_MODE,
                 "isolation": eval_isolation_metadata(&input.case.isolation),
+                "verify_commands_argv": validation_commands_argv(&input.case.verify_commands),
             }),
         );
         object.insert("branch_prefix".to_string(), json!(EVAL_BRANCH_PREFIX));
@@ -628,8 +630,25 @@ fn with_eval_command_metadata(
             "validation_commands".to_string(),
             json!(input.case.verify_commands),
         );
+        object.insert(
+            "validation_commands_argv".to_string(),
+            json!(validation_commands_argv(&input.case.verify_commands)),
+        );
     }
     decision
+}
+
+fn validation_commands_argv(commands: &[String]) -> Vec<Vec<String>> {
+    commands
+        .iter()
+        .map(|command| {
+            command
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|argv| !argv.is_empty())
+        .collect()
 }
 
 fn eval_isolation_metadata(isolation: &EvalIsolationProfile) -> Value {
@@ -752,6 +771,14 @@ mod tests {
         assert_eq!(
             command["validation_commands"][0],
             "cargo test -p harness-workflow eval_run"
+        );
+        assert_eq!(
+            command["validation_commands_argv"][0],
+            json!(["cargo", "test", "-p", "harness-workflow", "eval_run"])
+        );
+        assert_eq!(
+            command["eval"]["verify_commands_argv"][0],
+            json!(["cargo", "test", "-p", "harness-workflow", "eval_run"])
         );
         Ok(())
     }
