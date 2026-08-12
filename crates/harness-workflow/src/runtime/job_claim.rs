@@ -1,5 +1,5 @@
 use super::store::runtime_job_leases::{
-    append_runtime_event_tx, delete_all_runtime_job_lease_receipts_tx,
+    append_runtime_event_tx, delete_all_runtime_job_lease_receipts_tx, postgres_timestamp_floor,
 };
 use super::store::{enum_str, to_jsonb_string};
 use super::{RuntimeJob, RuntimeKind, WorkflowRuntimeStore};
@@ -84,6 +84,11 @@ impl WorkflowRuntimeStore {
         };
 
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        let expires_at = if records_remote_host_audit {
+            postgres_timestamp_floor(expires_at)
+        } else {
+            expires_at
+        };
         let reclaimed = job.status == super::RuntimeJobStatus::Running;
         job.claim(owner, expires_at);
         let updated = to_jsonb_string(&job)?;
