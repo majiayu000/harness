@@ -105,7 +105,7 @@ async fn shared_pool_stores_can_participate_in_one_transaction() -> anyhow::Resu
         let instance = WorkflowInstance::new(
             "github_issue_pr",
             1,
-            "implementing",
+            "discovered",
             WorkflowSubject::new("issue", "1801"),
         )
         .with_id("shared-pool-workflow");
