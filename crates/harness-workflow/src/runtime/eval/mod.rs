@@ -25,7 +25,8 @@ pub use manifest::{
     DEFAULT_CASE_TIMEOUT_SECS,
 };
 pub use report::{
-    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence, EvalCaseTransition,
+    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
+    EvalCaseInfrastructureStatus, EvalCaseTransition, EvalCaseTransitionCounts,
     EvalCaseTransitionKind, EvalReportCase, EvalReportCaseStatus, EvalReportError,
     EvalReportFailedGate, EvalReportMetricDelta, EvalReportMetrics, EvalRunReport,
     EvalRunReportDiff,
