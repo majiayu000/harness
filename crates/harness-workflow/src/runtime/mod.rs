@@ -96,9 +96,9 @@ pub use eval::{
     EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseDispatchOutcome, EvalCaseEnqueueOutcome,
     EvalCaseEvidence, EvalCaseTransition, EvalCaseTransitionKind, EvalCaseWorkflowInput,
     EvalCaseWorkflowPlan, EvalEvidenceStatus, EvalQualityGateEvidence, EvalReportCase,
-    EvalReportCaseStatus, EvalReportError, EvalReportMetricDelta, EvalReportMetrics, EvalRunReport,
-    EvalRunReportDiff, EvalSubmissionEvidence, ManifestError, ScoringError,
-    DEFAULT_CASE_TIMEOUT_SECS, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
+    EvalReportCaseStatus, EvalReportError, EvalReportFailedGate, EvalReportMetricDelta,
+    EvalReportMetrics, EvalRunReport, EvalRunReportDiff, EvalSubmissionEvidence, ManifestError,
+    ScoringError, DEFAULT_CASE_TIMEOUT_SECS, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
 };
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use memory_retrieval::{
