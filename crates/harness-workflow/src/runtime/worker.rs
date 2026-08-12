@@ -261,7 +261,7 @@ impl<'a> RuntimeWorker<'a> {
         let activity = runtime_job_activity_name(job);
         let execution = executor.execute(job.clone());
         tokio::pin!(execution);
-        let cancellation_poll = tokio::time::interval(RUNTIME_JOB_CANCELLATION_POLL_INTERVAL);
+        let cancellation_poll = runtime_job_cancellation_poll();
         tokio::pin!(cancellation_poll);
         let renewal_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + renewal_interval,
@@ -498,6 +498,13 @@ struct RuntimeJobExecution {
 fn runtime_lease_renewal_interval(lease_ttl: Duration) -> StdDuration {
     let lease_ttl_secs = lease_ttl.num_seconds().max(1) as u64;
     StdDuration::from_secs((lease_ttl_secs / 2).clamp(1, 30))
+}
+
+fn runtime_job_cancellation_poll() -> tokio::time::Interval {
+    tokio::time::interval_at(
+        tokio::time::Instant::now() + RUNTIME_JOB_CANCELLATION_POLL_INTERVAL,
+        RUNTIME_JOB_CANCELLATION_POLL_INTERVAL,
+    )
 }
 
 fn runtime_job_activity_name(job: &RuntimeJob) -> String {

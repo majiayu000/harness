@@ -74,6 +74,18 @@ async fn enqueue_test_runtime_job(
         .await
 }
 
+#[tokio::test(start_paused = true)]
+async fn cancellation_poll_waits_before_its_first_database_probe() -> anyhow::Result<()> {
+    let mut poll = runtime_job_cancellation_poll();
+    let first_tick = tokio::spawn(async move { poll.tick().await });
+    tokio::task::yield_now().await;
+    assert!(!first_tick.is_finished());
+
+    tokio::time::advance(RUNTIME_JOB_CANCELLATION_POLL_INTERVAL).await;
+    first_tick.await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn preflight_result_completes_job_before_runtime_turn_starts() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
