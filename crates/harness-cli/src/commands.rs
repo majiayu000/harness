@@ -15,7 +15,6 @@ mod runtime;
 #[cfg(test)]
 mod runtime_log_tests;
 mod serve;
-mod stack;
 mod status;
 
 const RUNTIME_LOG_PREFIX: &str = "harness-serve-";
@@ -133,12 +132,6 @@ pub enum Command {
     Eval {
         #[command(subcommand)]
         cmd: eval::EvalCommand,
-    },
-
-    /// Repository Agent Stack snapshot and diff commands
-    Stack {
-        #[command(subcommand)]
-        cmd: stack::StackCommand,
     },
 
     /// Display the current version
@@ -1010,10 +1003,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
         Command::Eval { cmd } => {
             eval::run(cmd).await?;
-        }
-
-        Command::Stack { cmd } => {
-            stack::run(cmd)?;
         }
 
         Command::Plan { cmd } => match cmd {
