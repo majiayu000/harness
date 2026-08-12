@@ -330,6 +330,7 @@ pub enum StreamItem {
     ItemCompleted { item: Item },
     TokenUsage { usage: TokenUsage },
     Warning { message: String },
+    TurnCancelled { message: String },
     Error { message: String },
     ApprovalRequest { id: String, command: String },
     Done,
@@ -356,6 +357,13 @@ pub enum TaskComplexity {
 // === Streaming Agent Adapter (new, coexists with CodeAgent) ===
 
 /// Events emitted by an agent adapter during a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDiagnosticSeverity {
+    Warning,
+    Error,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -392,8 +400,15 @@ pub enum AgentEvent {
     Warning {
         message: String,
     },
+    Diagnostic {
+        severity: AgentDiagnosticSeverity,
+        message: String,
+    },
     TurnCompleted {
         output: String,
+    },
+    TurnCancelled {
+        message: String,
     },
     Error {
         message: String,

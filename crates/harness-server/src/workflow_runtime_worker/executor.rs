@@ -150,6 +150,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 self.state.core.workflow_runtime_store.as_deref(),
                 workflow.as_ref(),
                 &job,
+                prompt_task_request.prompt_text(),
             )
             .await;
             let prompt_packet = build_runtime_prompt_packet(

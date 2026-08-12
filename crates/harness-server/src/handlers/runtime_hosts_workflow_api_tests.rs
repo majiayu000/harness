@@ -62,6 +62,14 @@ pub(super) async fn make_test_state_with_runtime_store(
 }
 
 pub(crate) async fn register_host(app: &Router, host_id: &str) -> anyhow::Result<()> {
+    register_host_with_capabilities(app, host_id, Vec::new()).await
+}
+
+pub(crate) async fn register_host_with_capabilities(
+    app: &Router,
+    host_id: &str,
+    capabilities: Vec<&str>,
+) -> anyhow::Result<()> {
     let response = app
         .clone()
         .oneshot(
@@ -69,7 +77,9 @@ pub(crate) async fn register_host(app: &Router, host_id: &str) -> anyhow::Result
                 .method("POST")
                 .uri("/api/runtime-hosts/register")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({ "host_id": host_id }).to_string()))?,
+                .body(Body::from(
+                    json!({ "host_id": host_id, "capabilities": capabilities }).to_string(),
+                ))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -480,6 +490,66 @@ async fn runtime_job_claim_endpoint_defers_open_circuit_profile() -> anyhow::Res
     assert_eq!(events[0].event_type, "RuntimeJobClaimed");
     assert_eq!(events[1].event_type, "RuntimeJobClaimDeferred");
     assert_eq!(events[1].event["claim_api"], "runtime_host");
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_claim_endpoint_defers_eval_job_without_resource_limit_capability(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host(&app, "host-a").await?;
+
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "eval-missing-capability",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "implement_issue",
+            "command": {
+                "activity": "implement_issue",
+                "eval": {
+                    "eval_run_id": "run-1",
+                    "case_id": "case-1",
+                    "timeout_secs": 45
+                }
+            }
+        }),
+    )
+    .await?;
+    let before_claim = Utc::now();
+
+    let json = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    assert_eq!(json["claimed"], false);
+    assert_eq!(json["deferred"], true);
+    assert_eq!(json["runtime_job_id"], job.id);
+    assert_eq!(json["required_capability"], "eval_resource_limits");
+    let deferred = store
+        .get_runtime_job(&job.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("eval job should still exist"))?;
+    assert_eq!(deferred.status, RuntimeJobStatus::Pending);
+    assert!(deferred.lease.is_none());
+    assert!(deferred
+        .not_before
+        .is_some_and(|not_before| not_before > before_claim));
+    let events = store.runtime_events_for(&job.id).await?;
+    assert_eq!(events[0].event_type, "RuntimeJobClaimed");
+    assert_eq!(events[1].event_type, "RuntimeJobClaimDeferred");
+    assert_eq!(
+        events[1].event["required_capability"],
+        "eval_resource_limits"
+    );
     Ok(())
 }
 
