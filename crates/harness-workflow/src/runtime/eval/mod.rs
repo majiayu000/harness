@@ -4,6 +4,7 @@
 //! through the normal workflow runtime; this module only owns manifest parsing
 //! deterministic scoring primitives, and standard-path eval dispatch helpers.
 
+pub mod attestation;
 mod data;
 pub mod evidence;
 pub mod manifest;
@@ -16,6 +17,13 @@ mod run_concurrency_tests;
 pub mod scoring;
 mod transition_outcome;
 
+pub use attestation::{
+    classify_eval_run_attestation, eval_run_attestation_payload_digest,
+    verify_eval_run_attestation, EvalAttestationDecision, EvalAttestationSummary,
+    EvalAttestationTrust, EvalAttestationVerificationError, EvalRunAttestation,
+    EvalRunAttestationClaims, EvalRunAttestationExpected, KeylessOidcProvider,
+    KeylessOidcVerification, VerifiedEvalRunAttestation, EVAL_RUN_ATTESTATION_SCHEMA_VERSION,
+};
 pub use evidence::{
     collect_eval_case_evidence, collect_eval_case_evidence_from_records, EvalCaseEvidence,
     EvalEvidenceStatus, EvalQualityGateEvidence, EvalSubmissionEvidence,
