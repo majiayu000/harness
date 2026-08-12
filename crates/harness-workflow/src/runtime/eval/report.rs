@@ -816,6 +816,7 @@ mod tests {
             resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
                 .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
                 .expect("default resource limits should be valid"),
+            isolation: crate::runtime::eval::manifest::EvalIsolationProfile::default(),
         }
     }
 
@@ -831,6 +832,7 @@ mod tests {
             attestation: EvalAttestationSummary::unsigned(),
             quality_gate: None,
             quality: None,
+            isolation: None,
             missing_evidence: Vec::new(),
         }
     }
@@ -962,6 +964,7 @@ mod tests {
                     resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(3600)
                         .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
                         .expect("default resource limits should be valid"),
+                    isolation: crate::runtime::eval::manifest::EvalIsolationProfile::default(),
                 })
                 .collect(),
         }
@@ -992,6 +995,7 @@ mod tests {
             submission: None,
             quality_gate: None,
             quality: None,
+            isolation: None,
             missing_evidence,
         }
     }

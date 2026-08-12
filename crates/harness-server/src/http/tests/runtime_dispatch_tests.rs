@@ -377,6 +377,103 @@ async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fall
 }
 
 #[tokio::test]
+async fn eval_isolation_command_policy_selects_remote_host_runtime_job() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-eval-isolation");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let mut state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .isolation_availability =
+        harness_core::config::isolation::IsolationAvailability::new(vec![
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Host,
+            ),
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Container,
+            ),
+        ]);
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1750"),
+    )
+    .with_id("eval-isolation-issue-1750")
+    .with_server_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 1750,
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
+        "eval-isolation-implement",
+        serde_json::json!({
+            "activity": "implement_issue",
+            "eval": {
+                "timeout_secs": 1800,
+                "isolation": {
+                    "tier": "container",
+                    "runtime_kind": "remote_host",
+                    "runtime_profile": "eval-isolated-runtime-host",
+                    "sandbox": "workspace-write",
+                    "backend": "container_runtime_host",
+                    "image": "harness-eval-runner:local",
+                    "lifecycle": "ephemeral",
+                    "cleanup_required": true
+                }
+            }
+        }),
+    );
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-default-codex",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 1);
+    assert_eq!(tick.deferred, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].runtime_kind,
+        harness_workflow::runtime::RuntimeKind::RemoteHost
+    );
+    assert_eq!(jobs[0].runtime_profile, "eval-isolated-runtime-host");
+    assert_eq!(jobs[0].input["isolation"]["tier"], "container");
+    assert_eq!(
+        jobs[0].input["runtime_profile"]["sandbox"],
+        "workspace-write"
+    );
+    assert_eq!(jobs[0].input["runtime_profile"]["timeout_secs"], 1800);
+    assert_eq!(
+        jobs[0].input["command"]["eval"]["isolation"]["image"],
+        "harness-eval-runner:local"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

@@ -1,4 +1,4 @@
-use super::manifest::EvalBenchmarkCase;
+use super::manifest::{EvalBenchmarkCase, EvalIsolationProfile};
 use super::run::*;
 use crate::runtime::{DataProvenance, WorkflowCommandStatus, WorkflowRuntimeStore};
 use harness_core::db::resolve_database_url;
@@ -23,6 +23,7 @@ fn benchmark_case(case_id: &str) -> EvalBenchmarkCase {
         resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
             .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
             .expect("default resource limits should be valid"),
+        isolation: EvalIsolationProfile::default(),
     }
 }
 
