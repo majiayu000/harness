@@ -687,12 +687,31 @@ fn eval_required_isolation_resolution(
             command.id
         );
     }
+    let network_allowlist = isolation
+        .get("network_allowlist")
+        .map(|value| {
+            serde_json::from_value::<Vec<String>>(value.clone()).with_context(|| {
+                format!(
+                    "eval command {} has invalid eval.isolation.network_allowlist: {value}",
+                    command.id
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let network_policy = harness_sandbox::EvalNetworkPolicy::for_allowlist(&network_allowlist)
+        .with_context(|| {
+            format!(
+                "eval command {} has invalid eval.isolation.network_allowlist",
+                command.id
+            )
+        })?;
 
     Ok(Some(IsolationTierResolution {
         tier,
         reason: "eval command required container isolation tier from policy".to_string(),
         trust_class: IsolationTrustClass::NonCollaborator,
-        network_allowlist: Vec::new(),
+        network_allowlist: network_policy.network_allowlist,
     }))
 }
 
@@ -912,6 +931,40 @@ mod tests {
         assert_eq!(resolution.tier, IsolationTier::Container);
         assert_eq!(resolution.trust_class, IsolationTrustClass::NonCollaborator);
         assert!(resolution.reason.contains("eval command required"));
+        Ok(())
+    }
+
+    #[test]
+    fn eval_isolation_command_policy_normalizes_network_allowlist() -> anyhow::Result<()> {
+        let command = command_record(WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "eval-implement",
+            json!({
+                "activity": "implement_issue",
+                "eval": {
+                    "timeout_secs": 1800,
+                    "isolation": {
+                        "tier": "container",
+                        "runtime_kind": "remote_host",
+                        "runtime_profile": "eval-isolated-runtime-host",
+                        "sandbox": "workspace-write",
+                        "backend": "container_runtime_host",
+                        "image": "harness-eval-runner:local",
+                        "lifecycle": "ephemeral",
+                        "cleanup_required": true,
+                        "network_allowlist": [" GitHub.COM. ", "api.github.com"]
+                    }
+                }
+            }),
+        ));
+
+        let resolution =
+            isolation_resolution_for_command(None, &command, &IsolationConfig::default())?;
+
+        assert_eq!(
+            resolution.network_allowlist,
+            vec!["github.com".to_string(), "api.github.com".to_string()]
+        );
         Ok(())
     }
 

@@ -103,3 +103,128 @@ fn linux_network_only_bwrap_isolates_the_process_tree() {
     assert!(args.contains(&OsString::from("--unshare-pid")));
     assert!(args.contains(&OsString::from("--die-with-parent")));
 }
+
+#[test]
+fn eval_network_policy_defaults_to_deny_inbound_and_outbound() {
+    let policy = EvalNetworkPolicy::for_allowlist(&[]).unwrap();
+
+    assert_eq!(policy.inbound, EvalNetworkAccess::Deny);
+    assert_eq!(policy.outbound, EvalNetworkAccess::Deny);
+    assert!(policy.network_allowlist.is_empty());
+
+    let report = EvalNetworkPolicyReport {
+        enforced: true,
+        policy: policy.clone(),
+        grants: Vec::new(),
+        connections: vec![NetworkConnectionMetadata {
+            direction: NetworkDirection::Outbound,
+            host: Some("denied.invalid".to_string()),
+            port: Some(443),
+            protocol: Some(NetworkProtocol::Tcp),
+            decision: NetworkDecision::Denied,
+            reason: "empty eval allowlist denies outbound connections".to_string(),
+            bytes_sent: None,
+            bytes_received: None,
+        }],
+        payloads_recorded: false,
+        reason: "container network policy denied all eval networking".to_string(),
+    };
+
+    report.validate_against(&policy).unwrap();
+}
+
+#[test]
+fn eval_network_policy_allows_trusted_dns_allowlist_grants_without_payloads() {
+    let policy = EvalNetworkPolicy::for_allowlist(&[
+        " GitHub.COM. ".to_string(),
+        "api.github.com".to_string(),
+    ])
+    .unwrap();
+
+    assert_eq!(
+        policy.network_allowlist,
+        vec!["github.com".to_string(), "api.github.com".to_string()]
+    );
+    assert_eq!(policy.inbound, EvalNetworkAccess::Deny);
+    assert_eq!(policy.outbound, EvalNetworkAccess::Allowlist);
+
+    let report = EvalNetworkPolicyReport {
+        enforced: true,
+        policy: policy.clone(),
+        grants: vec![
+            NetworkPolicyGrant {
+                direction: NetworkDirection::Outbound,
+                host: "github.com".to_string(),
+                port: Some(443),
+                protocol: Some(NetworkProtocol::Https),
+            },
+            NetworkPolicyGrant {
+                direction: NetworkDirection::Outbound,
+                host: "api.github.com".to_string(),
+                port: Some(443),
+                protocol: Some(NetworkProtocol::Https),
+            },
+        ],
+        connections: vec![NetworkConnectionMetadata {
+            direction: NetworkDirection::Outbound,
+            host: Some("github.com".to_string()),
+            port: Some(443),
+            protocol: Some(NetworkProtocol::Https),
+            decision: NetworkDecision::Allowed,
+            reason: "host matched trusted eval network allowlist".to_string(),
+            bytes_sent: Some(128),
+            bytes_received: Some(256),
+        }],
+        payloads_recorded: false,
+        reason: "recorded grants and connection metadata only".to_string(),
+    };
+
+    report.validate_against(&policy).unwrap();
+}
+
+#[test]
+fn eval_network_policy_rejects_ambiguous_dns_allowlist_entries() {
+    for host in [
+        "https://github.com",
+        "*.github.com",
+        "127.0.0.1",
+        "localhost",
+        "github.com:443",
+        "github.com/path",
+    ] {
+        let error = EvalNetworkPolicy::for_allowlist(&[host.to_string()])
+            .expect_err("ambiguous eval allowlist host should fail closed");
+
+        assert!(matches!(
+            error,
+            NetworkPolicyReportError::InvalidAllowlistHost { .. }
+        ));
+    }
+}
+
+#[test]
+fn eval_network_policy_report_rejects_unsupported_allowed_connections() {
+    let policy = EvalNetworkPolicy::for_allowlist(&[]).unwrap();
+    let report = EvalNetworkPolicyReport {
+        enforced: true,
+        policy: policy.clone(),
+        grants: Vec::new(),
+        connections: vec![NetworkConnectionMetadata {
+            direction: NetworkDirection::Outbound,
+            host: Some("github.com".to_string()),
+            port: Some(443),
+            protocol: Some(NetworkProtocol::Https),
+            decision: NetworkDecision::Allowed,
+            reason: "backend reported an outbound connection despite deny-all policy".to_string(),
+            bytes_sent: None,
+            bytes_received: None,
+        }],
+        payloads_recorded: false,
+        reason: "backend reported enforcement".to_string(),
+    };
+
+    assert_eq!(
+        report.validate_against(&policy),
+        Err(NetworkPolicyReportError::UnexpectedAllowedConnection)
+    );
+}

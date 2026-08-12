@@ -303,7 +303,7 @@ fn eval_case_isolation_config(case: &EvalBenchmarkCase) -> IsolationConfig {
             trust: IsolationTrustClass::NonCollaborator,
             tier: case.isolation.tier,
         }],
-        network_allowlist: Vec::new(),
+        network_allowlist: case.isolation.network_allowlist.clone(),
     }
 }
 
@@ -640,6 +640,7 @@ fn eval_isolation_metadata(isolation: &EvalIsolationProfile) -> Value {
         "sandbox": isolation.sandbox,
         "backend": isolation.backend,
         "image": isolation.image,
+        "network_allowlist": isolation.network_allowlist,
         "lifecycle": isolation.lifecycle,
         "cleanup_required": isolation.cleanup_required,
     })
@@ -718,6 +719,10 @@ mod tests {
             initial.data["eval"]["isolation"]["runtime_profile"],
             "eval-isolated-runtime-host"
         );
+        assert_eq!(
+            initial.data["eval"]["isolation"]["network_allowlist"],
+            json!([])
+        );
         assert_eq!(initial.data["eval"]["isolation"]["lifecycle"], "ephemeral");
         assert_eq!(initial.data["eval"]["isolation"]["cleanup_required"], true);
 
@@ -749,6 +754,7 @@ mod tests {
         assert_eq!(command["pull_request_mode"], EVAL_PR_DRAFT_MODE);
         assert_eq!(command["eval"]["isolation"]["tier"], "container");
         assert_eq!(command["eval"]["isolation"]["runtime_kind"], "remote_host");
+        assert_eq!(command["eval"]["isolation"]["network_allowlist"], json!([]));
         assert_eq!(
             command["validation_commands"][0],
             "cargo test -p harness-workflow eval_run"
@@ -762,6 +768,34 @@ mod tests {
         assert!(prompt.contains("open only a draft pull request"));
         assert!(prompt.contains("harness-eval/ branch prefix"));
         assert!(prompt.contains("Use the small implementation slice."));
+    }
+
+    #[test]
+    fn eval_run_isolation_config_preserves_trusted_network_allowlist() {
+        let mut case = EvalBenchmarkCase {
+            case_id: "owner/repo#42".to_string(),
+            repo: "owner/repo".to_string(),
+            issue: 42,
+            base_commit: "abcdef1".to_string(),
+            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: None,
+            verdict: None,
+            timeout_secs: 120,
+            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
+                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
+                .expect("default resource limits should be valid"),
+            isolation: EvalIsolationProfile::default(),
+        };
+        case.isolation.network_allowlist = vec!["api.github.com".to_string()];
+
+        let config = eval_case_isolation_config(&case);
+
+        assert_eq!(config.network_allowlist, vec!["api.github.com".to_string()]);
     }
 
     #[test]

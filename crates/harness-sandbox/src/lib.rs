@@ -13,7 +13,11 @@ use linux::linux_network_only_bwrap_args;
 #[cfg(any(target_os = "linux", test))]
 use linux::{linux_bwrap_args, linux_landlock_args};
 mod network_policy;
-pub use network_policy::NetworkPolicy;
+pub use network_policy::{
+    EvalNetworkAccess, EvalNetworkPolicy, EvalNetworkPolicyReport, NetworkConnectionMetadata,
+    NetworkDecision, NetworkDirection, NetworkPolicy, NetworkPolicyGrant, NetworkPolicyReportError,
+    NetworkProtocol, EVAL_NETWORK_POLICY_CAPABILITY,
+};
 mod resource_limits;
 pub use resource_limits::{
     classify_resource_termination, validate_resource_limit_backend,

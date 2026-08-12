@@ -6,7 +6,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use harness_sandbox::{
-    CappedResourceLimits, ResourceLimitReport, ResourceLimits, EVAL_RESOURCE_LIMITS_CAPABILITY,
+    CappedResourceLimits, EvalNetworkPolicy, EvalNetworkPolicyReport, ResourceLimitReport,
+    ResourceLimits, EVAL_NETWORK_POLICY_CAPABILITY, EVAL_RESOURCE_LIMITS_CAPABILITY,
 };
 use harness_workflow::runtime::{
     prepare_runtime_transcript, ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob,
@@ -256,7 +257,9 @@ pub async fn claim_runtime_job_for_runtime_host(
         );
     }
     let host_supports_eval_resource_limits =
-        runtime_host_supports_eval_resource_limits(&state, &host_id);
+        runtime_host_supports_capability(&state, &host_id, EVAL_RESOURCE_LIMITS_CAPABILITY);
+    let host_supports_eval_network_policy =
+        runtime_host_supports_capability(&state, &host_id, EVAL_NETWORK_POLICY_CAPABILITY);
     let store = match workflow_runtime_store(&state) {
         Ok(store) => store,
         Err(response) => return response,
@@ -358,12 +361,13 @@ pub async fn claim_runtime_job_for_runtime_host(
     let resource_limits = match eval_resource_limit_enforcement_for_job(&job) {
         Ok(Some(resource_limits)) => {
             if !host_supports_eval_resource_limits {
-                let (status, response) = defer_runtime_host_resource_limit_claim(
+                let (status, response) = defer_runtime_host_capability_claim(
                     store.as_ref(),
                     &host_id,
                     lease_expires_at,
                     &job,
                     "runtime host lacks eval_resource_limits capability",
+                    EVAL_RESOURCE_LIMITS_CAPABILITY,
                 )
                 .await;
                 return (status, Json(response));
@@ -404,6 +408,60 @@ pub async fn claim_runtime_job_for_runtime_host(
                 host_id = %host_id,
                 %error,
                 "runtime host claim succeeded but eval resource-limit event recording failed"
+            );
+        }
+    }
+
+    let network_policy = match eval_network_policy_enforcement_for_job(&job) {
+        Ok(Some(network_policy)) => {
+            if !host_supports_eval_network_policy {
+                let (status, response) = defer_runtime_host_capability_claim(
+                    store.as_ref(),
+                    &host_id,
+                    lease_expires_at,
+                    &job,
+                    "runtime host lacks eval_network_policy capability",
+                    EVAL_NETWORK_POLICY_CAPABILITY,
+                )
+                .await;
+                return (status, Json(response));
+            }
+            Some(network_policy)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            let result = eval_network_policy_preflight_failure(&job, &error, None);
+            return complete_runtime_host_preflight_failure(
+                &state,
+                store.as_ref(),
+                &host_id,
+                lease_expires_at,
+                &job,
+                result,
+            )
+            .await;
+        }
+    };
+
+    if let Some(network_policy) = &network_policy {
+        set_eval_network_policy_enforcement(&mut job, network_policy);
+        if let Err(error) = store
+            .record_runtime_event(
+                &job.id,
+                "EvalNetworkPolicyApplied",
+                json!({
+                    "host_id": host_id.as_str(),
+                    "network_policy": network_policy,
+                    "reason": "runtime host claim",
+                }),
+            )
+            .await
+        {
+            tracing::warn!(
+                runtime_job_id = %job.id,
+                host_id = %host_id,
+                %error,
+                "runtime host claim succeeded but eval network-policy event recording failed"
             );
         }
     }
@@ -494,15 +552,19 @@ pub async fn claim_runtime_job_for_runtime_host(
     if let Some(resource_limits) = resource_limits {
         response["resource_limits"] = json!(resource_limits);
     }
+    if let Some(network_policy) = network_policy {
+        response["network_policy"] = json!(network_policy);
+    }
     (StatusCode::OK, Json(response))
 }
 
-async fn defer_runtime_host_resource_limit_claim(
+async fn defer_runtime_host_capability_claim(
     store: &WorkflowRuntimeStore,
     host_id: &str,
     lease_expires_at: DateTime<Utc>,
     job: &RuntimeJob,
     reason: &str,
+    required_capability: &str,
 ) -> (StatusCode, serde_json::Value) {
     let not_before =
         Utc::now() + chrono::TimeDelta::seconds(RESOURCE_LIMIT_CAPABILITY_RETRY_DELAY_SECS);
@@ -520,7 +582,7 @@ async fn defer_runtime_host_resource_limit_claim(
                         "not_before": not_before,
                         "reason": reason,
                         "claim_api": "runtime_host",
-                        "required_capability": EVAL_RESOURCE_LIMITS_CAPABILITY,
+                        "required_capability": required_capability,
                     }),
                 )
                 .await
@@ -529,7 +591,7 @@ async fn defer_runtime_host_resource_limit_claim(
                     runtime_job_id = %job.id,
                     host_id = %host_id,
                     %error,
-                    "runtime host resource-limit claim defer succeeded but event recording failed"
+                    "runtime host capability claim defer succeeded but event recording failed"
                 );
             }
             (
@@ -541,7 +603,7 @@ async fn defer_runtime_host_resource_limit_claim(
                     "runtime_job": deferred,
                     "not_before": not_before,
                     "reason": reason,
-                    "required_capability": EVAL_RESOURCE_LIMITS_CAPABILITY,
+                    "required_capability": required_capability,
                 }),
             )
         }
@@ -549,7 +611,7 @@ async fn defer_runtime_host_resource_limit_claim(
             tracing::warn!(
                 runtime_job_id = %job.id,
                 host_id = %host_id,
-                "runtime host resource-limit claim defer ignored because the host no longer owns the lease"
+                "runtime host capability claim defer ignored because the host no longer owns the lease"
             );
             (StatusCode::OK, json!({ "claimed": false }))
         }
@@ -558,7 +620,7 @@ async fn defer_runtime_host_resource_limit_claim(
                 runtime_job_id = %job.id,
                 host_id = %host_id,
                 %error,
-                "runtime host failed to defer resource-limit-incompatible runtime job"
+                "runtime host failed to defer capability-incompatible runtime job"
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -703,6 +765,9 @@ pub async fn complete_runtime_job_for_runtime_host(
     };
     let result =
         crate::workflow_runtime_worker::strip_caller_transcript_unavailable_signal(req.result);
+    if let Err((status, response)) = validate_eval_network_policy_report(&job, &result) {
+        return (status, Json(response));
+    }
     if let Err((status, response)) = validate_eval_resource_limit_report(&job, &result) {
         return (status, Json(response));
     }
@@ -803,11 +868,15 @@ pub async fn complete_runtime_job_for_runtime_host(
     )
 }
 
-fn runtime_host_supports_eval_resource_limits(state: &Arc<AppState>, host_id: &str) -> bool {
+fn runtime_host_supports_capability(
+    state: &Arc<AppState>,
+    host_id: &str,
+    required_capability: &str,
+) -> bool {
     state.runtime_hosts.hosts.get(host_id).is_some_and(|host| {
         host.capabilities
             .iter()
-            .any(|capability| capability == EVAL_RESOURCE_LIMITS_CAPABILITY)
+            .any(|capability| capability == required_capability)
     })
 }
 
@@ -848,6 +917,41 @@ fn eval_metadata(input: &Value) -> Option<&Value> {
         .pointer("/command/eval")
         .or_else(|| input.get("eval"))
         .filter(|value| value.is_object())
+}
+
+fn eval_network_policy_enforcement_for_job(
+    job: &RuntimeJob,
+) -> Result<Option<EvalNetworkPolicy>, String> {
+    let Some(eval) = eval_metadata(&job.input) else {
+        return Ok(None);
+    };
+    let network_allowlist = job
+        .input
+        .pointer("/isolation/network_allowlist")
+        .or_else(|| eval.pointer("/isolation/network_allowlist"))
+        .map(|value| {
+            serde_json::from_value::<Vec<String>>(value.clone())
+                .map_err(|error| format!("invalid eval network_allowlist: {error}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    EvalNetworkPolicy::for_allowlist(&network_allowlist)
+        .map(Some)
+        .map_err(|error| format!("invalid eval network policy: {error}"))
+}
+
+fn set_eval_network_policy_enforcement(job: &mut RuntimeJob, network_policy: &EvalNetworkPolicy) {
+    let value = json!(network_policy);
+    if let Some(eval) = job
+        .input
+        .pointer_mut("/command/eval")
+        .and_then(Value::as_object_mut)
+    {
+        eval.insert("network_policy".to_string(), value.clone());
+    }
+    if let Some(eval) = job.input.get_mut("eval").and_then(Value::as_object_mut) {
+        eval.insert("network_policy".to_string(), value);
+    }
 }
 
 fn set_eval_resource_limit_enforcement(
@@ -891,6 +995,30 @@ fn eval_resource_limit_preflight_failure(
     ))
 }
 
+fn eval_network_policy_preflight_failure(
+    job: &RuntimeJob,
+    error: &str,
+    network_policy: Option<EvalNetworkPolicy>,
+) -> ActivityResult {
+    let mut artifact = json!({
+        "enforced": false,
+        "reason": error,
+    });
+    if let Some(network_policy) = network_policy {
+        artifact["network_policy"] = json!(network_policy);
+    }
+    ActivityResult::failed(
+        runtime_job_activity(job),
+        "Evaluation network policy could not be enforced.",
+        error,
+    )
+    .with_error_kind(ActivityErrorKind::Configuration)
+    .with_artifact(ActivityArtifact::new(
+        "network_policy_enforcement",
+        artifact,
+    ))
+}
+
 fn runtime_job_activity(job: &RuntimeJob) -> String {
     job.input
         .get("activity")
@@ -902,6 +1030,48 @@ fn runtime_job_activity(job: &RuntimeJob) -> String {
         })
         .unwrap_or("remote_host")
         .to_string()
+}
+
+fn validate_eval_network_policy_report(
+    job: &RuntimeJob,
+    result: &ActivityResult,
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    let Some(expected_policy) = eval_network_policy_enforcement_for_job(job).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": format!("invalid eval network policy: {error}") }),
+        )
+    })?
+    else {
+        return Ok(());
+    };
+
+    let Some(report_value) = result
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "network_policy_report")
+        .map(|artifact| artifact.artifact.clone())
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "eval runtime job completion requires network_policy_report artifact"
+            }),
+        ));
+    };
+    let report: EvalNetworkPolicyReport =
+        serde_json::from_value(report_value).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                json!({ "error": format!("invalid network_policy_report artifact: {error}") }),
+            )
+        })?;
+    report.validate_against(&expected_policy).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": format!("network_policy_report is not valid: {error}") }),
+        )
+    })
 }
 
 fn validate_eval_resource_limit_report(
@@ -1045,6 +1215,162 @@ mod tests {
         assert_eq!(limits.effective.wall_time_secs, Some(45));
         assert_eq!(limits.effective.cpu_time_secs, Some(45));
         assert_eq!(limits.effective.output_bytes, Some(64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn eval_network_policy_defaults_to_deny_all_when_missing() {
+        let job = RuntimeJob::pending(
+            "cmd-1",
+            RuntimeKind::RemoteHost,
+            "remote-host-default",
+            json!({
+                "activity": "implement_issue",
+                "command": {
+                    "eval": {
+                        "eval_run_id": "run-1",
+                        "case_id": "case-1",
+                        "timeout_secs": 45
+                    }
+                }
+            }),
+        );
+
+        let policy = eval_network_policy_enforcement_for_job(&job)
+            .expect("policy should parse")
+            .expect("eval job should require network policy");
+
+        assert_eq!(policy.inbound, harness_sandbox::EvalNetworkAccess::Deny);
+        assert_eq!(policy.outbound, harness_sandbox::EvalNetworkAccess::Deny);
+        assert!(policy.network_allowlist.is_empty());
+    }
+
+    #[test]
+    fn eval_network_policy_report_is_required_for_eval_completion() {
+        let job = RuntimeJob::pending(
+            "cmd-1",
+            RuntimeKind::RemoteHost,
+            "remote-host-default",
+            json!({
+                "activity": "implement_issue",
+                "command": {
+                    "eval": {
+                        "eval_run_id": "run-1",
+                        "case_id": "case-1",
+                        "timeout_secs": 45
+                    }
+                }
+            }),
+        );
+        let result = ActivityResult::succeeded("implement_issue", "done");
+
+        let err = validate_eval_network_policy_report(&job, &result)
+            .expect_err("missing network report should fail closed");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1["error"],
+            "eval runtime job completion requires network_policy_report artifact"
+        );
+    }
+
+    #[test]
+    fn eval_network_policy_report_accepts_matching_allowlist_metadata() {
+        let job = RuntimeJob::pending(
+            "cmd-1",
+            RuntimeKind::RemoteHost,
+            "remote-host-default",
+            json!({
+                "activity": "implement_issue",
+                "isolation": {
+                    "network_allowlist": ["api.github.com"]
+                },
+                "command": {
+                    "eval": {
+                        "eval_run_id": "run-1",
+                        "case_id": "case-1",
+                        "timeout_secs": 45
+                    }
+                }
+            }),
+        );
+        let result = ActivityResult::succeeded("implement_issue", "done").with_artifact(
+            ActivityArtifact::new(
+                "network_policy_report",
+                json!({
+                    "enforced": true,
+                    "policy": {
+                        "inbound": "deny",
+                        "outbound": "allowlist",
+                        "network_allowlist": ["api.github.com"],
+                    },
+                    "grants": [{
+                        "direction": "outbound",
+                        "host": "api.github.com",
+                        "port": 443,
+                        "protocol": "https",
+                    }],
+                    "connections": [{
+                        "direction": "outbound",
+                        "host": "api.github.com",
+                        "port": 443,
+                        "protocol": "https",
+                        "decision": "allowed",
+                        "reason": "host matched trusted eval allowlist",
+                        "bytes_sent": 512,
+                        "bytes_received": 1024,
+                    }],
+                    "payloads_recorded": false,
+                    "reason": "runtime host enforced eval network policy",
+                }),
+            ),
+        );
+
+        validate_eval_network_policy_report(&job, &result)
+            .expect("matching network policy report should be accepted");
+    }
+
+    #[test]
+    fn eval_network_policy_report_rejects_payload_recording() {
+        let job = RuntimeJob::pending(
+            "cmd-1",
+            RuntimeKind::RemoteHost,
+            "remote-host-default",
+            json!({
+                "activity": "implement_issue",
+                "command": {
+                    "eval": {
+                        "eval_run_id": "run-1",
+                        "case_id": "case-1",
+                        "timeout_secs": 45
+                    }
+                }
+            }),
+        );
+        let result = ActivityResult::succeeded("implement_issue", "done").with_artifact(
+            ActivityArtifact::new(
+                "network_policy_report",
+                json!({
+                    "enforced": true,
+                    "policy": {
+                        "inbound": "deny",
+                        "outbound": "deny",
+                        "network_allowlist": [],
+                    },
+                    "grants": [],
+                    "connections": [],
+                    "payloads_recorded": true,
+                    "reason": "runtime host recorded network details",
+                }),
+            ),
+        );
+
+        let err = validate_eval_network_policy_report(&job, &result)
+            .expect_err("payload recording must fail closed");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("must not record payloads")));
     }
 
     #[test]
