@@ -9,8 +9,7 @@ use serde_json::Value;
 use starlark_syntax::syntax::ast::{Argument, AstExpr, AstLiteral, Expr};
 use starlark_syntax::syntax::module::AstModuleFields;
 use starlark_syntax::syntax::{AstModule, Dialect};
-use std::ffi::OsStr;
-use std::path::Path;
+use std::{collections::BTreeSet, ffi::OsStr, path::Path};
 
 pub(super) fn extract_typed(
     component: &AgentStackComponent,
@@ -24,22 +23,23 @@ pub(super) fn extract_typed(
         return;
     }
 
-    let Some(format) = file_format(locator) else {
-        return;
-    };
-    if format == FileFormat::Starlark {
+    if Path::new(locator).extension().and_then(OsStr::to_str) == Some("star") {
         collect_starlark_prefix_rules(component, locator, text, raw, failures);
         return;
     }
+    let Some(format) = file_format(locator) else {
+        return;
+    };
     let Some(source) = format.source(text) else {
         return;
     };
+    let (root_name, parse_rule_id, label) = format.metadata();
     match format.parse(source) {
         Ok(value) => {
             collect_explicit_capabilities(
                 component,
                 &value,
-                format.root_name(),
+                root_name,
                 rule_id_for_explicit(component.kind()),
                 raw,
                 failures,
@@ -52,20 +52,69 @@ pub(super) fn extract_typed(
         Err(()) => failures.push(AgentStackCapabilityExtractionFailure::new(
             component,
             AgentStackCapabilityExtractionFailureKind::ParseFailed,
-            Some(format.parse_rule_id()),
-            format!("{locator} is not valid {}", format.label()),
+            Some(parse_rule_id),
+            format!("{locator} is not valid {label}"),
         )),
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileFormat {
-    Json,
-    Json5,
-    Toml,
-    Yaml,
-    Markdown,
-    Starlark,
+#[derive(Debug, Clone, Copy)]
+#[rustfmt::skip]
+enum FileFormat { Json, Json5, Toml, Yaml, Markdown }
+
+const MAX_JSON5_DEPTH: usize = 128;
+
+#[derive(Clone, Copy)]
+#[rustfmt::skip]
+enum Json5State { Code, String(u8), LineComment, BlockComment }
+
+fn validate_json5_structure(text: &str) -> Result<(), ()> {
+    let bytes = text.as_bytes();
+    let mut state = Json5State::Code;
+    let mut depth = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match state {
+            Json5State::Code => match (byte, bytes.get(index + 1).copied()) {
+                (b'/', Some(b'/')) => {
+                    state = Json5State::LineComment;
+                    index += 1;
+                }
+                (b'/', Some(b'*')) => {
+                    state = Json5State::BlockComment;
+                    index += 1;
+                }
+                (b'\'' | b'"', _) => state = Json5State::String(byte),
+                (b'{' | b'[', _) => {
+                    depth += 1;
+                    if depth > MAX_JSON5_DEPTH {
+                        return Err(());
+                    }
+                }
+                (b'}' | b']', _) => depth = depth.saturating_sub(1),
+                _ => {}
+            },
+            Json5State::String(quote) => {
+                if byte == b'\\' {
+                    index += 1;
+                } else if byte == quote {
+                    state = Json5State::Code;
+                }
+            }
+            Json5State::LineComment if matches!(byte, b'\n' | b'\r') => state = Json5State::Code,
+            Json5State::BlockComment if byte == b'*' && bytes.get(index + 1) == Some(&b'/') => {
+                state = Json5State::Code;
+                index += 1;
+            }
+            Json5State::LineComment | Json5State::BlockComment => {}
+        }
+        index += 1;
+    }
+    match state {
+        Json5State::Code | Json5State::LineComment => Ok(()),
+        Json5State::String(_) | Json5State::BlockComment => Err(()),
+    }
 }
 
 impl FileFormat {
@@ -79,45 +128,24 @@ impl FileFormat {
     fn parse(self, text: &str) -> Result<Value, ()> {
         match self {
             Self::Json => serde_json::from_str(text).map_err(|_| ()),
-            Self::Json5 => json5::from_str(text).map_err(|_| ()),
+            Self::Json5 => {
+                validate_json5_structure(text).and_then(|()| json5::from_str(text).map_err(|_| ()))
+            }
             Self::Toml => toml::from_str::<toml::Value>(text)
                 .map_err(|_| ())
                 .and_then(|value| serde_json::to_value(value).map_err(|_| ())),
             Self::Yaml | Self::Markdown => serde_yaml::from_str(text).map_err(|_| ()),
-            Self::Starlark => unreachable!(),
         }
     }
 
-    fn root_name(self) -> &'static str {
+    #[rustfmt::skip]
+    fn metadata(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            Self::Markdown => "front_matter",
-            Self::Json => "json",
-            Self::Json5 => "json5",
-            Self::Toml => "toml",
-            Self::Yaml => "yaml",
-            Self::Starlark => unreachable!(),
-        }
-    }
-
-    fn parse_rule_id(self) -> &'static str {
-        match self {
-            Self::Json => "typed.json_parse",
-            Self::Json5 => "typed.json5_parse",
-            Self::Toml => "typed.toml_parse",
-            Self::Yaml => "typed.yaml_parse",
-            Self::Markdown => "typed.front_matter_parse",
-            Self::Starlark => "typed.starlark_parse",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Json => "JSON",
-            Self::Json5 => "JSON5",
-            Self::Toml => "TOML",
-            Self::Yaml => "YAML",
-            Self::Markdown => "YAML front matter",
-            Self::Starlark => "Starlark",
+            Self::Json => ("json", "typed.json_parse", "JSON"),
+            Self::Json5 => ("json5", "typed.json5_parse", "JSON5"),
+            Self::Toml => ("toml", "typed.toml_parse", "TOML"),
+            Self::Yaml => ("yaml", "typed.yaml_parse", "YAML"),
+            Self::Markdown => ("front_matter", "typed.front_matter_parse", "YAML front matter"),
         }
     }
 }
@@ -130,7 +158,6 @@ fn file_format(locator: &str) -> Option<FileFormat> {
         Some("toml") => Some(FileFormat::Toml),
         Some("yaml") | Some("yml") => Some(FileFormat::Yaml),
         Some("md") | Some("mdc") => Some(FileFormat::Markdown),
-        Some("star") => Some(FileFormat::Starlark),
         _ => None,
     }
 }
@@ -254,32 +281,73 @@ fn is_capability_key(key: &str) -> bool {
     )
 }
 
-fn collect_mcp_capabilities(value: &Value, raw: &mut Vec<RawCapability>) {
-    let mut seen = std::collections::BTreeSet::new();
-    collect_mcp_schema_capabilities_inner(value, raw, &mut seen);
-    seen.clear();
-    collect_mcp_server_capabilities(value, raw, &mut seen);
+fn push_inferred_once(
+    raw: &mut Vec<RawCapability>,
+    seen: &mut BTreeSet<&'static str>,
+    capability: AgentStackCapability,
+    rule_id: &'static str,
+    reason: String,
+) {
+    if seen.insert(capability.as_str()) {
+        raw.push(inferred_raw(
+            capability,
+            rule_id,
+            reason,
+            AgentStackCapabilityExtractionConfidence::Medium,
+        ));
+    }
 }
 
-fn collect_mcp_schema_capabilities_inner(
+fn collect_mcp_capabilities(value: &Value, raw: &mut Vec<RawCapability>) {
+    visit_mcp(value, raw, &mut BTreeSet::new(), &mut BTreeSet::new());
+}
+
+#[rustfmt::skip]
+const MCP_SERVER_FIELDS: [(&str, AgentStackCapability); 5] = [
+    ("command", AgentStackCapability::Shell), ("args", AgentStackCapability::Shell), ("url", AgentStackCapability::Network),
+    ("headers", AgentStackCapability::SecretRead), ("env", AgentStackCapability::SecretRead),
+];
+
+fn visit_mcp(
     value: &Value,
     raw: &mut Vec<RawCapability>,
-    seen: &mut std::collections::BTreeSet<&'static str>,
+    schema_seen: &mut BTreeSet<&'static str>,
+    server_seen: &mut BTreeSet<&'static str>,
 ) {
     match value {
         Value::Object(map) => {
             for key in ["inputSchema", "input_schema"] {
                 if let Some(schema) = map.get(key) {
-                    infer_schema_capabilities(schema, raw, seen);
+                    infer_schema_capabilities(schema, raw, schema_seen);
+                }
+            }
+            for key in ["mcpServers", "mcp_servers"] {
+                if let Some(servers) = map.get(key).and_then(Value::as_object) {
+                    for (name, server) in servers {
+                        for (field, capability) in MCP_SERVER_FIELDS {
+                            if server.get(field).is_some_and(has_nonempty_value) {
+                                push_inferred_once(
+                                    raw,
+                                    server_seen,
+                                    capability,
+                                    "mcp.server_declaration",
+                                    format!(
+                                        "MCP server `{name}` field `{field}` indicates {}",
+                                        capability.as_str()
+                                    ),
+                                );
+                            }
+                        }
+                    }
                 }
             }
             for child in map.values() {
-                collect_mcp_schema_capabilities_inner(child, raw, seen);
+                visit_mcp(child, raw, schema_seen, server_seen);
             }
         }
         Value::Array(items) => {
             for child in items {
-                collect_mcp_schema_capabilities_inner(child, raw, seen);
+                visit_mcp(child, raw, schema_seen, server_seen);
             }
         }
         _ => {}
@@ -289,22 +357,21 @@ fn collect_mcp_schema_capabilities_inner(
 fn infer_schema_capabilities(
     schema: &Value,
     raw: &mut Vec<RawCapability>,
-    seen: &mut std::collections::BTreeSet<&'static str>,
+    seen: &mut BTreeSet<&'static str>,
 ) {
     if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
         for (name, property) in properties {
             for capability in capabilities_for_schema_field(name, property) {
-                if seen.insert(capability.as_str()) {
-                    raw.push(inferred_raw(
-                        capability,
-                        "mcp.input_schema",
-                        format!(
-                            "MCP input schema field `{name}` indicates {}",
-                            capability.as_str()
-                        ),
-                        AgentStackCapabilityExtractionConfidence::Medium,
-                    ));
-                }
+                push_inferred_once(
+                    raw,
+                    seen,
+                    capability,
+                    "mcp.input_schema",
+                    format!(
+                        "MCP input schema field `{name}` indicates {}",
+                        capability.as_str()
+                    ),
+                );
             }
             infer_schema_capabilities(property, raw, seen);
         }
@@ -322,111 +389,55 @@ fn infer_schema_capabilities(
     }
 }
 
-fn collect_mcp_server_capabilities(
-    value: &Value,
-    raw: &mut Vec<RawCapability>,
-    seen: &mut std::collections::BTreeSet<&'static str>,
-) {
-    match value {
-        Value::Object(map) => {
-            for key in ["mcpServers", "mcp_servers"] {
-                if let Some(servers) = map.get(key).and_then(Value::as_object) {
-                    for (name, server) in servers {
-                        for (field, capability) in [
-                            ("command", AgentStackCapability::Shell),
-                            ("args", AgentStackCapability::Shell),
-                            ("url", AgentStackCapability::Network),
-                            ("headers", AgentStackCapability::SecretRead),
-                            ("env", AgentStackCapability::SecretRead),
-                        ] {
-                            if server.get(field).is_some() && seen.insert(capability.as_str()) {
-                                raw.push(inferred_raw(
-                                    capability,
-                                    "mcp.server_declaration",
-                                    format!(
-                                        "MCP server `{name}` field `{field}` indicates {}",
-                                        capability.as_str()
-                                    ),
-                                    AgentStackCapabilityExtractionConfidence::Medium,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            for child in map.values() {
-                collect_mcp_server_capabilities(child, raw, seen);
-            }
-        }
-        Value::Array(items) => {
-            for child in items {
-                collect_mcp_server_capabilities(child, raw, seen);
-            }
-        }
-        _ => {}
-    }
-}
-
+#[rustfmt::skip]
 fn capabilities_for_schema_field(name: &str, property: &Value) -> Vec<AgentStackCapability> {
+    use AgentStackCapability::{
+        Destructive, FileWrite, Network, ProductionWrite, SecretRead, Shell,
+    };
+    let patterns: &[(&[&str], AgentStackCapability)] = &[
+        (&["command", "cmd", "shell", "script", "argv", "args"], Shell),
+        (&["path", "file", "filename", "output", "write"], FileWrite),
+        (&["url", "uri", "endpoint", "host", "repo", "repository"], Network),
+        (&["token", "secret", "api_key", "apikey", "password", "credential"], SecretRead),
+        (&["delete", "remove", "overwrite", "force"], Destructive),
+        (&["production", "deploy", "cluster", "namespace"], ProductionWrite),
+    ];
     let mut capabilities = Vec::new();
-    let normalized = name.to_ascii_lowercase();
-    push_if_schema_name_matches(
-        &mut capabilities,
-        &normalized,
-        &["command", "cmd", "shell", "script", "argv", "args"],
-        AgentStackCapability::Shell,
-    );
-    push_if_schema_name_matches(
-        &mut capabilities,
-        &normalized,
-        &["path", "file", "filename", "output", "write"],
-        AgentStackCapability::FileWrite,
-    );
-    push_if_schema_name_matches(
-        &mut capabilities,
-        &normalized,
-        &["url", "uri", "endpoint", "host", "repo", "repository"],
-        AgentStackCapability::Network,
-    );
-    push_if_schema_name_matches(
-        &mut capabilities,
-        &normalized,
-        &[
-            "token",
-            "secret",
-            "api_key",
-            "apikey",
-            "password",
-            "credential",
-        ],
-        AgentStackCapability::SecretRead,
-    );
-    push_if_schema_name_matches(
-        &mut capabilities,
-        &normalized,
-        &["delete", "remove", "overwrite", "force"],
-        AgentStackCapability::Destructive,
-    );
-    push_if_schema_name_matches(
-        &mut capabilities,
-        &normalized,
-        &["production", "deploy", "cluster", "namespace"],
-        AgentStackCapability::ProductionWrite,
-    );
+    for &(needles, capability) in patterns {
+        if schema_name_matches(name, needles) {
+            push_unique(&mut capabilities, capability);
+        }
+    }
     if property.get("format").and_then(Value::as_str) == Some("uri") {
-        push_unique(&mut capabilities, AgentStackCapability::Network);
+        push_unique(&mut capabilities, Network);
     }
     capabilities
 }
 
-fn push_if_schema_name_matches(
-    capabilities: &mut Vec<AgentStackCapability>,
-    name: &str,
-    needles: &[&str],
-    capability: AgentStackCapability,
-) {
-    if needles.iter().any(|needle| name.contains(needle)) {
-        push_unique(capabilities, capability);
+fn schema_name_matches(name: &str, needles: &[&str]) -> bool {
+    let name = name.as_bytes();
+    needles.iter().any(|needle| {
+        let needle = needle.as_bytes();
+        name.windows(needle.len()).enumerate().any(|(start, part)| {
+            let end = start + part.len();
+            let boundary = |left: u8, right: u8| {
+                !left.is_ascii_alphanumeric()
+                    || right.is_ascii_uppercase() && left.is_ascii_lowercase()
+            };
+            part.eq_ignore_ascii_case(needle)
+                && (start == 0 || boundary(name[start - 1], name[start]))
+                && (end == name.len() || boundary(name[end - 1], name[end]))
+        })
+    })
+}
+
+fn has_nonempty_value(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(values) => values.iter().any(has_nonempty_value),
+        Value::Object(values) => values.values().any(has_nonempty_value),
+        Value::Bool(_) | Value::Number(_) => true,
     }
 }
 
@@ -438,57 +449,74 @@ fn collect_policy_prefix_rules(value: &Value, raw: &mut Vec<RawCapability>) {
     else {
         return;
     };
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for (index, rule) in rules.iter().enumerate() {
-        let tokens = rule.get("pattern").map(pattern_tokens).unwrap_or_default();
+        let Some(pattern) = rule.get("pattern").and_then(pattern_tokens) else {
+            continue;
+        };
         let decision = rule
             .get("decision")
             .and_then(Value::as_str)
             .unwrap_or("unspecified");
-        for capability in classify_command_tokens(&tokens) {
-            if seen.insert(capability.as_str()) {
-                raw.push(inferred_raw(
-                    capability,
-                    "policy.prefix_rule",
-                    format!(
-                        "policy prefix rule {index} with decision `{decision}` controls a command associated with {}",
-                        capability.as_str()
-                    ),
-                    AgentStackCapabilityExtractionConfidence::Medium,
-                ));
-            }
+        for capability in classify_command_pattern(&pattern) {
+            push_inferred_once(
+                raw,
+                &mut seen,
+                capability,
+                "policy.prefix_rule",
+                format!("policy prefix rule {index} with decision `{decision}` controls a command associated with {}", capability.as_str()),
+            );
         }
     }
 }
 
-fn pattern_tokens(value: &Value) -> Vec<String> {
-    let mut tokens = Vec::new();
+type CommandPattern = Vec<Vec<String>>;
+
+fn pattern_tokens(value: &Value) -> Option<CommandPattern> {
     match value {
-        Value::Array(items) => {
-            for item in items {
-                match item {
-                    Value::String(value) => tokens.push(value.clone()),
-                    Value::Object(map) => {
-                        if let Some(token) = map.get("token").and_then(Value::as_str) {
-                            tokens.push(token.to_owned());
-                        }
-                        if let Some(alternatives) = map.get("any_of").and_then(Value::as_array) {
-                            tokens.extend(
-                                alternatives
-                                    .iter()
-                                    .filter_map(Value::as_str)
-                                    .map(str::to_owned),
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Value::String(value) => tokens.push(value.clone()),
-        _ => {}
+        Value::Array(items) if !items.is_empty() => items.iter().map(pattern_position).collect(),
+        Value::String(value) => Some(vec![vec![trimmed_token(value)?]]),
+        _ => None,
     }
-    tokens
+}
+
+fn pattern_position(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::String(value) => Some(vec![trimmed_token(value)?]),
+        Value::Object(map) => match (map.get("token"), map.get("any_of")) {
+            (Some(Value::String(token)), None) => Some(vec![trimmed_token(token)?]),
+            (None, Some(Value::Array(alternatives))) if !alternatives.is_empty() => alternatives
+                .iter()
+                .map(|value| trimmed_token(value.as_str()?))
+                .collect(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn trimmed_token(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn classify_command_pattern(pattern: &CommandPattern) -> Vec<AgentStackCapability> {
+    let mut capabilities = Vec::new();
+    let tail = pattern
+        .iter()
+        .skip(1)
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    for head in &pattern[0] {
+        let tokens = std::iter::once(head.clone())
+            .chain(tail.iter().cloned())
+            .collect::<Vec<_>>();
+        for capability in classify_command_tokens(&tokens) {
+            push_unique(&mut capabilities, capability);
+        }
+    }
+    capabilities
 }
 
 fn collect_starlark_prefix_rules(
@@ -519,7 +547,7 @@ fn collect_starlark_prefix_rules(
         }
     };
     let mut index = 0;
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     ast.statement().visit_expr(|expr| {
         let Expr::Call(function, arguments) = &expr.node else {
             return;
@@ -539,7 +567,7 @@ fn collect_starlark_prefix_rules(
         let decision = argument("decision")
             .and_then(starlark_string)
             .unwrap_or("unspecified");
-        let Some(tokens) = argument("pattern").and_then(starlark_pattern_tokens) else {
+        let Some(pattern) = argument("pattern").and_then(starlark_pattern_tokens) else {
             failures.push(AgentStackCapabilityExtractionFailure::new(
                 component,
                 AgentStackCapabilityExtractionFailureKind::InvalidDeclaration,
@@ -549,15 +577,14 @@ fn collect_starlark_prefix_rules(
             index += 1;
             return;
         };
-        for capability in classify_command_tokens(&tokens) {
-            if seen.insert(capability.as_str()) {
-                raw.push(inferred_raw(
-                    capability,
-                    "policy.prefix_rule",
-                    format!("Starlark prefix rule {index} with decision `{decision}` controls a command associated with {}", capability.as_str()),
-                    AgentStackCapabilityExtractionConfidence::Medium,
-                ));
-            }
+        for capability in classify_command_pattern(&pattern) {
+            push_inferred_once(
+                raw,
+                &mut seen,
+                capability,
+                "policy.prefix_rule",
+                format!("Starlark prefix rule {index} with decision `{decision}` controls a command associated with {}", capability.as_str()),
+            );
         }
         index += 1;
     });
@@ -570,22 +597,21 @@ fn starlark_string(expr: &AstExpr) -> Option<&str> {
     }
 }
 
-fn starlark_pattern_tokens(expr: &AstExpr) -> Option<Vec<String>> {
+fn starlark_pattern_tokens(expr: &AstExpr) -> Option<CommandPattern> {
     let Expr::List(items) = &expr.node else {
         return None;
     };
     let mut tokens = Vec::new();
     for item in items {
-        match &item.node {
-            Expr::Literal(AstLiteral::String(value)) => tokens.push(value.node.clone()),
-            Expr::List(alternatives) => tokens.extend(
-                alternatives
-                    .iter()
-                    .filter_map(starlark_string)
-                    .map(str::to_owned),
-            ),
+        let position = match &item.node {
+            Expr::Literal(AstLiteral::String(value)) => vec![trimmed_token(&value.node)?],
+            Expr::List(alternatives) if !alternatives.is_empty() => alternatives
+                .iter()
+                .map(|value| trimmed_token(starlark_string(value)?))
+                .collect::<Option<_>>()?,
             _ => return None,
-        }
+        };
+        tokens.push(position);
     }
     (!tokens.is_empty()).then_some(tokens)
 }

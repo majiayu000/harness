@@ -24,12 +24,14 @@ use static_patterns::extract_static;
 use typed::extract_typed;
 
 const DEFAULT_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AgentStackCapabilityExtractionOptions {
     root: PathBuf,
     inventory_options: super::AgentStackInventoryOptions,
     max_file_bytes: u64,
+    max_total_bytes: u64,
 }
 
 #[rustfmt::skip]
@@ -39,6 +41,7 @@ impl AgentStackCapabilityExtractionOptions {
             inventory_options: super::AgentStackInventoryOptions::new(root.clone()),
             root,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
         }
     }
 
@@ -49,10 +52,12 @@ impl AgentStackCapabilityExtractionOptions {
         if max_file_bytes == 0 || max_file_bytes == u64::MAX {
             return Err(AgentStackCapabilityExtractionError::InvalidOptions);
         }
+        self.max_total_bytes = DEFAULT_MAX_TOTAL_BYTES.max(max_file_bytes);
         self.inventory_options = self
             .inventory_options
             .clone()
             .with_max_file_bytes(max_file_bytes)
+            .and_then(|options| options.with_max_total_bytes(self.max_total_bytes))
             .map_err(|_| AgentStackCapabilityExtractionError::InvalidOptions)?;
         self.max_file_bytes = max_file_bytes;
         Ok(self)
@@ -71,39 +76,22 @@ pub enum AgentStackCapabilityExtractionError {
     Inventory(#[source] AgentStackInventoryError),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentStackCapabilityExtractionConfidence {
-    Low,
-    Medium,
-    High,
+macro_rules! wire_enum {
+    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name { $($variant),+ }
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+        }
+    };
 }
-
 #[rustfmt::skip]
-impl AgentStackCapabilityExtractionConfidence {
-    pub const fn as_str(self) -> &'static str { match self {
-        Self::Low => "low", Self::Medium => "medium", Self::High => "high",
-    }}
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentStackCapabilityExtractionFailureKind {
-    ReadFailed,
-    LimitExceeded,
-    ParseFailed,
-    InvalidDeclaration,
-    EvidenceValidation,
-}
-
+wire_enum!(AgentStackCapabilityExtractionConfidence { Low => "low", Medium => "medium", High => "high" });
 #[rustfmt::skip]
-impl AgentStackCapabilityExtractionFailureKind {
-    pub const fn as_str(self) -> &'static str { match self {
-        Self::ReadFailed => "read_failed", Self::LimitExceeded => "limit_exceeded",
-        Self::ParseFailed => "parse_failed", Self::InvalidDeclaration => "invalid_declaration",
-        Self::EvidenceValidation => "evidence_validation",
-    }}
-}
+wire_enum!(AgentStackCapabilityExtractionFailureKind { ReadFailed => "read_failed", LimitExceeded => "limit_exceeded", ParseFailed => "parse_failed", InvalidDeclaration => "invalid_declaration", EvidenceValidation => "evidence_validation" });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentStackCapabilityExtractionFailure {
@@ -207,20 +195,28 @@ pub fn extract_repository_capability_evidence(
 
     let mut evidence = Vec::new();
     let mut failures = Vec::new();
+    let mut remaining_bytes = options.max_total_bytes;
     for entry in inventory.entries() {
         let component = entry.component();
         let locator = component.source().locator().as_str();
         if !is_supported_control(component.kind(), locator) {
             continue;
         }
-        let Some(text) = read_text(
+        let text = match read_text(
             &root,
             component,
             locator,
             options.max_file_bytes,
-            &mut failures,
-        ) else {
-            continue;
+            &mut remaining_bytes,
+        ) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err((kind, reason)) => {
+                failures.push(AgentStackCapabilityExtractionFailure::new(
+                    component, kind, None, reason,
+                ));
+                continue;
+            }
         };
         let mut typed = Vec::new();
         extract_typed(component, locator, &text, &mut typed, &mut failures);
@@ -256,8 +252,14 @@ fn read_text(
     component: &AgentStackComponent,
     locator: &str,
     max_file_bytes: u64,
-    failures: &mut Vec<AgentStackCapabilityExtractionFailure>,
-) -> Option<String> {
+    remaining_bytes: &mut u64,
+) -> Result<Option<String>, (AgentStackCapabilityExtractionFailureKind, String)> {
+    if *remaining_bytes == 0 {
+        return Err((
+            AgentStackCapabilityExtractionFailureKind::LimitExceeded,
+            format!("{locator} exceeds the capability extraction total byte limit"),
+        ));
+    }
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -265,50 +267,49 @@ fn read_text(
         use cap_std::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut file = match root.open_with(locator, &options) {
-        Ok(file) => file.take(max_file_bytes + 1),
-        Err(_) => {
-            failures.push(AgentStackCapabilityExtractionFailure::new(
-                component,
+    let read_limit = max_file_bytes.min(*remaining_bytes) + 1;
+    let mut file = root
+        .open_with(locator, &options)
+        .map_err(|_| {
+            (
                 AgentStackCapabilityExtractionFailureKind::ReadFailed,
-                None,
                 format!("failed to open {locator} for capability extraction"),
-            ));
-            return None;
-        }
-    };
+            )
+        })?
+        .take(read_limit);
     let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        failures.push(AgentStackCapabilityExtractionFailure::new(
-            component,
-            AgentStackCapabilityExtractionFailureKind::ReadFailed,
-            None,
-            format!("failed to read {locator} for capability extraction"),
-        ));
-        return None;
-    }
-    if bytes.len() as u64 > max_file_bytes {
-        failures.push(AgentStackCapabilityExtractionFailure::new(
-            component,
+    let read_result = file.read_to_end(&mut bytes);
+    let bytes_read = bytes.len() as u64;
+    let total_exceeded = bytes_read > *remaining_bytes;
+    *remaining_bytes = remaining_bytes.saturating_sub(bytes_read);
+    if total_exceeded {
+        return Err((
             AgentStackCapabilityExtractionFailureKind::LimitExceeded,
-            None,
+            format!("{locator} exceeds the capability extraction total byte limit"),
+        ));
+    }
+    read_result.map_err(|_| {
+        (
+            AgentStackCapabilityExtractionFailureKind::ReadFailed,
+            format!("failed to read {locator} for capability extraction"),
+        )
+    })?;
+    if bytes.len() as u64 > max_file_bytes {
+        return Err((
+            AgentStackCapabilityExtractionFailureKind::LimitExceeded,
             format!("{locator} exceeds the capability extraction byte limit"),
         ));
-        return None;
     }
     if component
         .integrity()
         .is_some_and(|expected| expected != &Sha256Digest::from_bytes(&bytes))
     {
-        failures.push(AgentStackCapabilityExtractionFailure::new(
-            component,
+        return Err((
             AgentStackCapabilityExtractionFailureKind::ReadFailed,
-            None,
             format!("{locator} changed after inventory; capability extraction skipped it"),
         ));
-        return None;
     }
-    String::from_utf8(bytes).ok()
+    Ok(String::from_utf8(bytes).ok())
 }
 
 fn append_validated(
@@ -390,18 +391,12 @@ fn scope_for_capability(capability: AgentStackCapability) -> AgentStackCapabilit
     }
 }
 
+#[rustfmt::skip]
 fn evidence_sort_key(item: &AgentStackCapabilityExtractionEvidence) -> (String, String, String) {
-    (
-        item.component().source().locator().as_str().to_owned(),
-        item.evidence().capability().as_str().to_owned(),
-        item.rule_id().to_owned(),
-    )
+    (item.component().source().locator().as_str().to_owned(), item.evidence().capability().as_str().to_owned(), item.rule_id().to_owned())
 }
 
+#[rustfmt::skip]
 fn failure_sort_key(item: &AgentStackCapabilityExtractionFailure) -> (String, String, String) {
-    (
-        item.component().source().locator().as_str().to_owned(),
-        item.kind().as_str().to_owned(),
-        item.reason().to_owned(),
-    )
+    (item.component().source().locator().as_str().to_owned(), item.kind().as_str().to_owned(), item.reason().to_owned())
 }

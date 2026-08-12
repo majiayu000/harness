@@ -2,6 +2,7 @@ use super::{inferred_raw, push_unique, AgentStackCapabilityExtractionConfidence,
 use crate::stack::{AgentStackCapability, AgentStackComponent, AgentStackComponentKind};
 
 const MAX_STATIC_LINES: usize = 256;
+const MAX_STATIC_LINE_BYTES: usize = 4096;
 
 pub(super) fn extract_static(
     component: &AgentStackComponent,
@@ -13,7 +14,10 @@ pub(super) fn extract_static(
     }
     let mut by_capability = std::collections::BTreeMap::<&'static str, RawCapability>::new();
     for line in text.lines().take(MAX_STATIC_LINES) {
-        for tokens in shell_commands_outside_quotes(line) {
+        let Some(commands) = shell_commands_outside_quotes(line) else {
+            continue;
+        };
+        for tokens in commands {
             for capability in classify_command_tokens(&tokens) {
                 by_capability.entry(capability.as_str()).or_insert_with(|| {
                     inferred_raw(
@@ -33,40 +37,38 @@ pub(super) fn extract_static(
 }
 
 pub(super) fn classify_command_tokens(tokens: &[String]) -> Vec<AgentStackCapability> {
+    use AgentStackCapability::{Destructive, FileWrite, Network, ProductionWrite, Shell};
     let mut capabilities = Vec::new();
     let Some(program) = tokens.first().map(|token| command_basename(token)) else {
         return capabilities;
     };
     match program {
         "bash" | "sh" | "zsh" | "fish" | "python" | "python3" | "node" | "ruby" | "perl" => {
-            push_unique(&mut capabilities, AgentStackCapability::Shell);
+            capabilities.push(Shell);
         }
         "curl" | "wget" | "ssh" | "scp" | "rsync" => {
-            push_unique(&mut capabilities, AgentStackCapability::Network);
+            capabilities.push(Network);
         }
-        "rm" | "rmdir" | "unlink" => {
-            push_unique(&mut capabilities, AgentStackCapability::Destructive);
-            push_unique(&mut capabilities, AgentStackCapability::FileWrite);
-        }
+        "rm" | "rmdir" | "unlink" => capabilities.extend([Destructive, FileWrite]),
         "mv" | "cp" | "touch" | "mkdir" | "tee" | "chmod" | "chown" => {
-            push_unique(&mut capabilities, AgentStackCapability::FileWrite);
+            capabilities.push(FileWrite);
         }
         "git" => classify_git(tokens, &mut capabilities),
         "gh" => {
-            push_unique(&mut capabilities, AgentStackCapability::Network);
+            capabilities.push(Network);
             if contains_any(tokens, &["delete", "edit", "merge", "close", "release"]) {
-                push_unique(&mut capabilities, AgentStackCapability::ProductionWrite);
+                capabilities.push(ProductionWrite);
             }
         }
         "kubectl" | "helm" | "terraform" | "aws" | "gcloud" | "az" | "docker" => {
-            push_unique(&mut capabilities, AgentStackCapability::Network);
+            capabilities.push(Network);
             if contains_any(
                 tokens,
                 &[
                     "apply", "delete", "destroy", "deploy", "push", "release", "update",
                 ],
             ) {
-                push_unique(&mut capabilities, AgentStackCapability::ProductionWrite);
+                capabilities.push(ProductionWrite);
             }
         }
         _ => {}
@@ -74,20 +76,34 @@ pub(super) fn classify_command_tokens(tokens: &[String]) -> Vec<AgentStackCapabi
     capabilities
 }
 
-fn shell_commands_outside_quotes(line: &str) -> Vec<Vec<String>> {
+fn shell_commands_outside_quotes(line: &str) -> Option<Vec<Vec<String>>> {
+    if line.len() > MAX_STATIC_LINE_BYTES {
+        return None;
+    }
     let mut commands = Vec::new();
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote = None;
+    let mut escaped = false;
     for ch in line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
         if let Some(active) = quote {
             if ch == active {
                 quote = None;
+            } else if active == '"' && ch == '\\' {
+                escaped = true;
+            } else {
+                current.push(ch);
             }
             continue;
         }
         match ch {
             '\'' | '"' => quote = Some(ch),
+            '\\' => escaped = true,
             '#' => break,
             ';' | '|' | '&' | '(' | ')' => {
                 push_token(&mut tokens, &mut current);
@@ -99,9 +115,12 @@ fn shell_commands_outside_quotes(line: &str) -> Vec<Vec<String>> {
             _ => current.push(ch),
         }
     }
+    if quote.is_some() || escaped {
+        return None;
+    }
     push_token(&mut tokens, &mut current);
     push_command(&mut commands, &mut tokens);
-    commands
+    Some(commands)
 }
 
 fn push_token(tokens: &mut Vec<String>, current: &mut String) {
@@ -111,12 +130,25 @@ fn push_token(tokens: &mut Vec<String>, current: &mut String) {
 }
 
 fn push_command(commands: &mut Vec<Vec<String>>, tokens: &mut Vec<String>) {
-    while tokens.first().is_some_and(|token| token.contains('=')) {
-        tokens.remove(0);
+    let command = std::mem::take(tokens);
+    let start = command
+        .iter()
+        .position(|token| !is_assignment(token))
+        .unwrap_or(command.len());
+    if start < command.len() {
+        commands.push(command.into_iter().skip(start).collect());
     }
-    if !tokens.is_empty() {
-        commands.push(std::mem::take(tokens));
-    }
+}
+
+fn is_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn command_basename(token: &str) -> &str {
@@ -136,7 +168,5 @@ fn classify_git(tokens: &[String], capabilities: &mut Vec<AgentStackCapability>)
 }
 
 fn contains_any(tokens: &[String], needles: &[&str]) -> bool {
-    tokens
-        .iter()
-        .any(|token| needles.iter().any(|needle| token == needle))
+    tokens.iter().any(|token| needles.contains(&token.as_str()))
 }
