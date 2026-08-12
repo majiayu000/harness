@@ -43,6 +43,11 @@ use runtime_timeout::runtime_profile_with_timeout_fallback;
 #[path = "executor/egress_evidence.rs"]
 mod egress_evidence;
 use egress_evidence::AgentEgressEvidence;
+#[path = "executor/capability_evidence.rs"]
+mod capability_evidence;
+use capability_evidence::{
+    capability_evidence_artifact, CapabilityEvidencePolicy, RuntimeCapabilityEvidenceInput,
+};
 #[path = "executor/permission_profile.rs"]
 mod permission_profile;
 use permission_profile::RuntimePermissionProfile;
@@ -308,6 +313,27 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     egress_verified_at_dispatch.load(Ordering::Acquire),
                     attempt_number,
                 ));
+                attempt_enforcement_artifacts.push(capability_evidence_artifact(
+                    RuntimeCapabilityEvidenceInput {
+                        runtime_job_id: job.id.as_str(),
+                        activity: &activity,
+                        attempt: attempt_number,
+                        runtime_kind: job.runtime_kind,
+                        sandbox_mode: if correction_only {
+                            harness_core::config::agents::SandboxMode::ReadOnly
+                        } else {
+                            resolved_settings.sandbox_mode
+                        },
+                        permission_mode: permission_profile.permission_mode,
+                        allowed_tools: permission_profile.allowed_tools.as_deref(),
+                        tool_allowlist_enforcement: resolved_settings.tool_allowlist_enforcement,
+                        correction_only,
+                        project_root: &project_root,
+                        items: &turn.items,
+                        observed_at: chrono::Utc::now(),
+                        policy: CapabilityEvidencePolicy::BestEffort,
+                    },
+                )?);
                 let mut result = activity_result_from_turn_with_workflow(
                     &job,
                     &turn.status,
