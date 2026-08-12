@@ -82,6 +82,9 @@ pub(crate) mod test_helpers;
 mod runtime_hosts_tests;
 
 #[cfg(test)]
+mod historical_replay_tests;
+
+#[cfg(test)]
 mod runtime_state_store_tests;
 
 #[cfg(test)]

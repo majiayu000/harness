@@ -1,0 +1,218 @@
+{
+  "schema": "harness.eval.historical_replay_cohort.v1",
+  "cohort_id": "asc-030-gh1715-gh1716-gh1707",
+  "issue_number": 1759,
+  "generated_at": "2026-08-10T15:35:27Z",
+  "cases": [
+    {
+      "case_id": "gh1715-lifecycle-transitions",
+      "issue": {
+        "number": 1715,
+        "title": "fix(workflow): reject illegal legacy issue lifecycle transitions",
+        "url": "https://github.com/majiayu000/harness/issues/1715",
+        "state": "closed",
+        "closed_at": "2026-07-26T00:10:03Z"
+      },
+      "closing_pr": {
+        "number": 1721,
+        "title": "fix(workflow): validate legacy issue lifecycle transitions",
+        "url": "https://github.com/majiayu000/harness/pull/1721",
+        "state": "merged",
+        "merged_at": "2026-07-26T00:10:02Z",
+        "base_ref": "main",
+        "github_base_ref_oid": "af5bcd26033b550cb4d0b6ddb16ff959df65a7aa",
+        "merge_parent_base_commit": "af5bcd26033b550cb4d0b6ddb16ff959df65a7aa",
+        "head_commit": "bd2e5c8cc63e3ea2ea45d34f937953837c98efa9",
+        "merge_commit": "f340f03316cab2a1930daec4b72f02a47b3007e2",
+        "closing_issue_numbers": [
+          1715
+        ]
+      },
+      "artifacts": [
+        "specs/GH1715/product.md",
+        "specs/GH1715/tech.md",
+        "specs/GH1715/tasks.md",
+        "crates/harness-workflow/src/issue_lifecycle_tests.rs"
+      ],
+      "replay": {
+        "command": "cargo test -p harness-workflow issue_lifecycle_transition_matrix --lib",
+        "baseline": {
+          "commit": "af5bcd26033b550cb4d0b6ddb16ff959df65a7aa",
+          "exit_code": 0,
+          "tests_run": 0,
+          "status": "passed_zero_tests",
+          "output_summary": "exit=0; tests=0 passed, 0 failed, 519 filtered out",
+          "evidence_sha256": "0a7bba62bc74202e8b06597827a7522805173f230d9aadfc6c86891d57897217"
+        },
+        "candidate": {
+          "commit": "f340f03316cab2a1930daec4b72f02a47b3007e2",
+          "exit_code": 0,
+          "tests_run": 1,
+          "status": "passed",
+          "output_summary": "exit=0; tests=1 passed, 0 failed, 532 filtered out",
+          "evidence_sha256": "7f71d6eeb2c0bf178055a0d0b6fdea3ef8a8780edd67c9e4b683445193d6b716"
+        }
+      },
+      "comparison": {
+        "baseline_outcome": "passed_zero_tests",
+        "candidate_outcome": "passed",
+        "false_positives": [
+          "baseline command exited 0 because the focused test did not exist at the baseline commit"
+        ],
+        "false_negatives": [],
+        "infrastructure_failures": [],
+        "verdict": "candidate retains executable lifecycle transition evidence; baseline command is a zero-test false positive"
+      },
+      "verification": {
+        "closing_reference_verified": true,
+        "commit_objects_verified": true,
+        "ancestry_verified": true,
+        "command_digests_verified": true
+      },
+      "summary": "The closing PR is merged and closes GH-1715. The isolated candidate run executes the introduced lifecycle transition matrix test, while the isolated baseline returns success with zero matching tests."
+    },
+    {
+      "case_id": "gh1716-recovery-cas",
+      "issue": {
+        "number": 1716,
+        "title": "fix(task-db): fail closed on startup recovery CAS conflicts",
+        "url": "https://github.com/majiayu000/harness/issues/1716",
+        "state": "closed",
+        "closed_at": "2026-07-26T00:11:14Z"
+      },
+      "closing_pr": {
+        "number": 1722,
+        "title": "fix(recovery): fail closed on legacy task CAS conflicts",
+        "url": "https://github.com/majiayu000/harness/pull/1722",
+        "state": "merged",
+        "merged_at": "2026-07-26T00:11:13Z",
+        "base_ref": "main",
+        "github_base_ref_oid": "af5bcd26033b550cb4d0b6ddb16ff959df65a7aa",
+        "merge_parent_base_commit": "f340f03316cab2a1930daec4b72f02a47b3007e2",
+        "head_commit": "f266c2597cfc0369f1a6813befe4bdec4f1b06aa",
+        "merge_commit": "3bdfbb85e1548eec18fff3b8ccf6b22347bba7ba",
+        "closing_issue_numbers": [
+          1716
+        ]
+      },
+      "artifacts": [
+        "specs/GH1716/product.md",
+        "specs/GH1716/tech.md",
+        "specs/GH1716/tasks.md",
+        "crates/harness-server/src/task_db/queries_recovery_tests.rs",
+        "crates/harness-server/src/event_replay_tests.rs"
+      ],
+      "replay": {
+        "command": "cargo test -p harness-server write_outcomes_are_closed_and_exclusive --lib",
+        "baseline": {
+          "commit": "f340f03316cab2a1930daec4b72f02a47b3007e2",
+          "exit_code": 0,
+          "tests_run": 0,
+          "status": "passed_zero_tests",
+          "output_summary": "exit=0; tests=0 passed, 0 failed, 1326 filtered out",
+          "evidence_sha256": "80eb7ddb8437b4977df872d776770b6da6cde25c18e92735b02bc1053ccc2540"
+        },
+        "candidate": {
+          "commit": "3bdfbb85e1548eec18fff3b8ccf6b22347bba7ba",
+          "exit_code": 0,
+          "tests_run": 1,
+          "status": "passed",
+          "output_summary": "exit=0; tests=1 passed, 0 failed, 1337 filtered out",
+          "evidence_sha256": "86fef2a255bd2490e14a20d86089a1e36fc78e9affe5a6fd4114df2dd4c7156f"
+        }
+      },
+      "comparison": {
+        "baseline_outcome": "passed_zero_tests",
+        "candidate_outcome": "passed",
+        "false_positives": [
+          "baseline command exited 0 because the focused test did not exist at the merge-parent baseline"
+        ],
+        "false_negatives": [],
+        "infrastructure_failures": [],
+        "verdict": "candidate retains executable CAS outcome evidence; baseline command is a zero-test false positive"
+      },
+      "verification": {
+        "closing_reference_verified": true,
+        "commit_objects_verified": true,
+        "ancestry_verified": true,
+        "command_digests_verified": true
+      },
+      "summary": "The closing PR is merged and closes GH-1716. The replay uses the merge commit first parent as the isolated baseline because GitHub still reports the older PR baseRefOid."
+    },
+    {
+      "case_id": "gh1707-coverage-recovery",
+      "issue": {
+        "number": 1707,
+        "title": "Rebuild issue coverage from GitHub closing PRs after runtime persistence loss",
+        "url": "https://github.com/majiayu000/harness/issues/1707",
+        "state": "closed",
+        "closed_at": "2026-07-21T08:49:50Z"
+      },
+      "closing_pr": {
+        "number": 1709,
+        "title": "fix(intake): recover issue coverage from closing PRs",
+        "url": "https://github.com/majiayu000/harness/pull/1709",
+        "state": "merged",
+        "merged_at": "2026-07-21T08:49:49Z",
+        "base_ref": "main",
+        "github_base_ref_oid": "505961e3c38bd575650e876baec29c820ec00a7e",
+        "merge_parent_base_commit": "505961e3c38bd575650e876baec29c820ec00a7e",
+        "head_commit": "91441177dd5998675dca0b6ffe411977ea6812ce",
+        "merge_commit": "e0b3507e703d70d484a22a51512ecfee86e9f1a7",
+        "closing_issue_numbers": [
+          1707
+        ]
+      },
+      "artifacts": [
+        "specs/GH1707/product.md",
+        "specs/GH1707/tech.md",
+        "specs/GH1707/tasks.md",
+        "crates/harness-server/src/intake/github_coverage_recovery_tests.rs",
+        "crates/harness-server/src/intake/github_coverage_gate.rs"
+      ],
+      "replay": {
+        "command": "cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart --lib",
+        "baseline": {
+          "commit": "505961e3c38bd575650e876baec29c820ec00a7e",
+          "exit_code": 0,
+          "tests_run": 0,
+          "status": "passed_zero_tests",
+          "output_summary": "exit=0; tests=0 passed, 0 failed, 1579 filtered out",
+          "evidence_sha256": "400eec1280954ed50c3be423e99b82f7eca9ceb83aa0240f16fa1b1d5def6731"
+        },
+        "candidate": {
+          "commit": "e0b3507e703d70d484a22a51512ecfee86e9f1a7",
+          "exit_code": 0,
+          "tests_run": 1,
+          "status": "passed",
+          "output_summary": "exit=0; tests=1 passed, 0 failed, 1604 filtered out",
+          "evidence_sha256": "aee48ac4ac7f668210c95801e64c8e1bb35c872bd9c15a3a4d1cfd981abf5cc3"
+        }
+      },
+      "comparison": {
+        "baseline_outcome": "passed_zero_tests",
+        "candidate_outcome": "passed",
+        "false_positives": [
+          "baseline command exited 0 because the focused test did not exist at the baseline commit"
+        ],
+        "false_negatives": [],
+        "infrastructure_failures": [],
+        "verdict": "candidate retains executable coverage recovery evidence; baseline command is a zero-test false positive"
+      },
+      "verification": {
+        "closing_reference_verified": true,
+        "commit_objects_verified": true,
+        "ancestry_verified": true,
+        "command_digests_verified": true
+      },
+      "summary": "The closing PR is merged and closes GH-1707. The isolated candidate run executes the recovered ready-PR idempotency test, while the isolated baseline has no matching test."
+    }
+  ],
+  "verdict": {
+    "cases_total": 3,
+    "candidate_passed": 3,
+    "baseline_false_positives": 3,
+    "infrastructure_failures": 0,
+    "verdict": "completed_with_baseline_false_positives"
+  }
+}
