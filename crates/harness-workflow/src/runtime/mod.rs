@@ -188,10 +188,14 @@ pub use store::{
     WorkflowChildStart, WorkflowChildStartOutcome, WorkflowCoverageRecoveryExpected,
     WorkflowCoverageRecoveryOutcome, WorkflowCoverageRecoveryTransition,
     WorkflowDecisionTransition, WorkflowPrBindingRepairOutcome, WorkflowRejectedDecisionTransition,
-    WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
-    WorkflowRuntimeStore, WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
-    WorkflowSubmissionFilter, WorkflowSubmissionHourlyDone, WorkflowSubmissionMetrics,
-    WorkflowSubmissionProjectMetrics, WorkflowSubmissionPromptPayload,
+    WorkflowRunEvidence, WorkflowRunEvidenceExport, WorkflowRunEvidenceInput,
+    WorkflowRunEvidenceQuery, WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,
+    WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore, WorkflowSubmissionDecisionCommit,
+    WorkflowSubmissionDecisionTransition, WorkflowSubmissionFilter, WorkflowSubmissionHourlyDone,
+    WorkflowSubmissionMetrics, WorkflowSubmissionProjectMetrics, WorkflowSubmissionPromptPayload,
+    WORKFLOW_RUN_EVIDENCE_DEFAULT_LIMIT, WORKFLOW_RUN_EVIDENCE_EXPORT_SCHEMA,
+    WORKFLOW_RUN_EVIDENCE_MAX_LIMIT, WORKFLOW_RUN_EVIDENCE_PAYLOAD_MAX_BYTES,
+    WORKFLOW_RUN_EVIDENCE_RETENTION_MAX_BATCH, WORKFLOW_RUN_EVIDENCE_SCHEMA,
 };
 pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,
