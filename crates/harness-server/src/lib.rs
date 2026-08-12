@@ -64,6 +64,7 @@ pub(crate) mod task_queue;
 pub mod task_runner;
 pub mod thread_manager;
 pub mod trusted_proxy;
+pub(crate) mod validation_executor;
 pub mod webhook;
 pub mod websocket;
 #[cfg(test)]

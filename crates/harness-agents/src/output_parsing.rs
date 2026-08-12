@@ -1,4 +1,10 @@
-use super::last_non_empty_line;
+fn last_non_empty_line(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrReviewPrepOutcome {
