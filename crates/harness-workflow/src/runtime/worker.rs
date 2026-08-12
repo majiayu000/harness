@@ -94,6 +94,11 @@ impl<'a> RuntimeWorker<'a> {
         else {
             return Ok(None);
         };
+        lease_expires_at = job
+            .lease
+            .as_ref()
+            .map(|lease| lease.expires_at)
+            .ok_or_else(|| anyhow::anyhow!("claimed runtime job is missing its lease"))?;
 
         if let Some(claim_guard) = self.claim_guard {
             match claim_guard.before_execute(&job, Utc::now(), lease_expires_at) {

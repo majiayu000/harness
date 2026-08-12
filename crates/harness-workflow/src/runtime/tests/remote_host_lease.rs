@@ -621,7 +621,9 @@ async fn runtime_store_remote_host_lease_expired_receipt_is_cleaned_before_rejec
     let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
     let store = remote_lease_store().await?;
     let now = Utc::now();
-    let expiry = now + Duration::seconds(1);
+    let expiry = (now + Duration::seconds(1))
+        .with_nanosecond(999_999_999)
+        .expect("test expiry nanoseconds are valid");
     enqueue_remote_lease_job(&store, "receipt-expiry").await?;
     let claimed = store
         .claim_next_runtime_job_for_runtime_kind(RuntimeKind::RemoteHost, "host-a", expiry)

@@ -333,6 +333,7 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
+        let expires_at = runtime_job_leases::postgres_timestamp_floor(expires_at);
         let mut tx = self.pool.begin().await?;
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT job.id, job.data::text
