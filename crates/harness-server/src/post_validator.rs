@@ -1,12 +1,12 @@
 use crate::command_safety::validate_command_safety;
+use crate::validation_executor::{
+    ShellValidationExecutor, ValidationExecutor, ValidationOutcomeKind, ValidationRequest,
+};
 use async_trait::async_trait;
+use harness_agents::output_parsing;
 use harness_core::agent::{AgentRequest, AgentResponse};
 use harness_core::config::misc::ValidationConfig;
 use harness_core::interceptor::{InterceptResult, PostExecuteResult, TurnInterceptor};
-use harness_core::prompts;
-use harness_core::validation::{
-    ShellValidationExecutor, ValidationExecutor, ValidationOutcomeKind, ValidationRequest,
-};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -89,7 +89,7 @@ impl PostExecutionValidator {
             config,
             gh_bin: "gh".to_string(),
             github_token,
-            validation_executor: Arc::new(ShellValidationExecutor),
+            validation_executor: Arc::new(ShellValidationExecutor::new()),
         }
     }
 
@@ -307,10 +307,10 @@ impl TurnInterceptor for PostExecutionValidator {
         // a PR that does not exist. Runs only when all other validations pass
         // to avoid noisy failures from incomplete code.
         if errors.is_empty() {
-            if let Some(pr_url) = prompts::parse_pr_url(&resp.output) {
+            if let Some(pr_url) = output_parsing::parse_pr_url(&resp.output) {
                 // Guard: only verify URLs that look like a real GitHub PR
                 // (contain /pull/{number}).  Non-PR URLs are silently skipped.
-                if prompts::extract_pr_number(&pr_url).is_some() {
+                if output_parsing::extract_pr_number(&pr_url).is_some() {
                     // Use the full URL so the API targets the exact repo the
                     // agent used, not the repo of the current checkout.
                     // This prevents false passes (same PR number in local repo)

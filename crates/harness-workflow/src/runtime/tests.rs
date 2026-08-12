@@ -64,6 +64,7 @@ include!("tests/declarative_interpreter.rs");
 include!("tests/declarative_recovery_integration.rs");
 include!("tests/driverless_progress.rs");
 
+mod evidence;
 mod issue_planning;
 mod local_review;
 mod lock_order_stress;

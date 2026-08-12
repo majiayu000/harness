@@ -226,7 +226,7 @@ fn pr_feedback_snapshot_target_from_workflow(
                 .data
                 .get("pr_url")
                 .and_then(serde_json::Value::as_str)
-                .and_then(harness_core::prompts::parse_github_pr_url)
+                .and_then(harness_agents::output_parsing::parse_github_pr_url)
                 .map(|(owner, repo, _)| format!("{owner}/{repo}"))
         });
     let Some(repo) = repo else {

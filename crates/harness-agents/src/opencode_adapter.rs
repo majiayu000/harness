@@ -1,6 +1,6 @@
 use crate::streaming::capture_agent_stderr_diagnostics;
 use async_trait::async_trait;
-use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::agent::{AgentAdapter, AgentEvent, AgentRequest, ApprovalDecision};
 use harness_core::config::agents::{OpenCodeAgentConfig, SandboxMode};
 use harness_sandbox::SandboxSpec;
 use serde_json::{json, Value};
@@ -19,7 +19,7 @@ use self::protocol::request_id_string;
 pub use self::protocol::{parse_acp_message, ParsedAcpMessage};
 use self::protocol::{protocol_line_preview, request_id_from_string, response_id_matches};
 
-fn stall_timeout_for(req: &TurnRequest) -> Option<Duration> {
+fn stall_timeout_for(req: &AgentRequest) -> Option<Duration> {
     req.timeout_secs
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
@@ -27,7 +27,7 @@ fn stall_timeout_for(req: &TurnRequest) -> Option<Duration> {
 
 async fn prepare_acp_spawn(
     cli_path: &std::path::Path,
-    req: &TurnRequest,
+    req: &AgentRequest,
 ) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
     let args = [OsString::from("acp"), OsString::from("--cwd")];
     let sandbox_mode = req.sandbox_mode.unwrap_or(SandboxMode::DangerFullAccess);
@@ -126,7 +126,7 @@ impl OpenCodeAcpAdapter {
         }
     }
 
-    fn effective_turn_request(&self, mut req: TurnRequest) -> TurnRequest {
+    fn effective_turn_request(&self, mut req: AgentRequest) -> AgentRequest {
         if req.model.is_none() && !self.default_model.is_empty() {
             req.model = Some(self.default_model.clone());
         }
@@ -238,7 +238,7 @@ impl OpenCodeAcpAdapter {
 
     async fn ensure_child(
         &self,
-        req: &TurnRequest,
+        req: &AgentRequest,
         state: &mut AdapterState,
     ) -> harness_core::error::Result<()> {
         let requested_fingerprint =
@@ -430,7 +430,7 @@ impl OpenCodeAcpAdapter {
     }
 }
 
-fn session_config_options(req: &TurnRequest) -> Vec<Value> {
+fn session_config_options(req: &AgentRequest) -> Vec<Value> {
     let mut options = Vec::new();
     if let Some(model) = req.model.as_deref().filter(|value| !value.is_empty()) {
         options.push(json!({ "id": "model", "value": model }));
@@ -446,7 +446,7 @@ impl AgentAdapter for OpenCodeAcpAdapter {
 
     async fn start_turn(
         &self,
-        req: TurnRequest,
+        req: AgentRequest,
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         let req = self.effective_turn_request(req);
@@ -634,7 +634,7 @@ mod spawn_policy_tests {
     async fn ready_child_restarts_when_spawn_policy_changes() -> anyhow::Result<()> {
         let project = tempfile::tempdir()?;
         let adapter = OpenCodeAcpAdapter::new(project.path().join("missing-opencode"));
-        let request = TurnRequest {
+        let request = AgentRequest {
             prompt: "ping".to_string(),
             prompt_layers: None,
             project_root: project.path().to_path_buf(),
@@ -645,6 +645,7 @@ mod spawn_policy_tests {
             sandbox_mode: Some(SandboxMode::DangerFullAccess),
             approval_policy: None,
             allowed_tools: None,
+            max_budget_usd: None,
             context: Vec::new(),
             timeout_secs: None,
             env_vars: HashMap::new(),

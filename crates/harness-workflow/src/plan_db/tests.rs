@@ -1,7 +1,12 @@
 use super::*;
+use crate::issue_lifecycle::{
+    IssueLifecycleEvent, IssueLifecycleEventKind, IssueWorkflowInstance, IssueWorkflowStore,
+};
+use crate::runtime::{WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject};
 use futures::FutureExt;
 use harness_core::db::{pg_open_pool, pg_open_pool_schematized, resolve_database_url, PgMigrator};
 use harness_core::types::ExecPlanStatus;
+use std::path::Path;
 use std::sync::OnceLock;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
@@ -62,6 +67,92 @@ fn store_key_creates_data_dir_before_canonicalizing() -> anyhow::Result<()> {
     );
     assert_eq!(store_key, PlanDb::store_key_for_data_dir(&data_dir)?);
     Ok(())
+}
+
+#[tokio::test]
+async fn shared_pool_stores_can_participate_in_one_transaction() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let _permit = db_gate().acquire().await?;
+    let schema = unique_test_schema("workflow_shared_pool");
+    let setup_pool = pg_open_pool(&database_url).await?;
+    let context = PgStoreContext::from_schema(&schema, Some(&database_url))?;
+    let pool = context.open_pool_with_setup_pool(&setup_pool).await?;
+
+    let result = std::panic::AssertUnwindSafe(async {
+        let plan_db =
+            PlanDb::open_with_shared_pool(pool.clone(), schema.clone(), "shared-store").await?;
+        let issue_store = IssueWorkflowStore::open_with_shared_pool(pool.clone()).await?;
+        let runtime_store = WorkflowRuntimeStore::open_with_shared_pool(pool.clone()).await?;
+
+        let mut tx = pool.begin().await?;
+        let plan = ExecPlan::from_spec("# Shared pool plan", Path::new("/tmp/shared-pool"))?;
+        plan_db.upsert_in_tx(&mut tx, &plan).await?;
+        let mut issue_workflow =
+            IssueWorkflowInstance::new("/tmp/shared-pool", Some("owner/repo".to_string()), 1801);
+        issue_workflow.apply_event(
+            IssueLifecycleEvent::new(IssueLifecycleEventKind::IssueScheduled)
+                .with_task_id("shared-pool-task"),
+        )?;
+        issue_store
+            .upsert_workflow_in_tx(&mut tx, &issue_workflow)
+            .await?;
+        assert_eq!(
+            issue_workflow.active_task_id.as_deref(),
+            Some("shared-pool-task")
+        );
+        let instance = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "discovered",
+            WorkflowSubject::new("issue", "1801"),
+        )
+        .with_id("shared-pool-workflow");
+        assert!(
+            runtime_store
+                .insert_instance_if_absent_in_tx(&mut tx, &instance)
+                .await?
+        );
+
+        let plan_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM exec_plans")
+            .fetch_one(&mut *tx)
+            .await?;
+        let issue_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM issue_workflows")
+            .fetch_one(&mut *tx)
+            .await?;
+        let workflow_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_instances")
+            .fetch_one(&mut *tx)
+            .await?;
+        assert_eq!(plan_count, 1);
+        assert_eq!(issue_count, 1);
+        assert_eq!(workflow_count, 1);
+        tx.rollback().await?;
+
+        assert!(plan_db.get(&plan.id).await?.is_none());
+        assert!(issue_store
+            .get_by_issue("/tmp/shared-pool", Some("owner/repo"), 1801)
+            .await?
+            .is_none());
+        assert!(runtime_store
+            .get_instance("shared-pool-workflow")
+            .await?
+            .is_none());
+        Ok::<(), anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
+
+    pool.close().await;
+    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(&setup_pool)
+        .await;
+    setup_pool.close().await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 #[tokio::test]

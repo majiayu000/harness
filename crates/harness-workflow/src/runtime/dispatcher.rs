@@ -1,5 +1,7 @@
 use super::dispatcher_throttle::{daily_throttle_breach, ThrottleBandRequest};
-use super::model::{RuntimeJob, RuntimeProfile, WorkflowCommandRecord, WorkflowInstance};
+use super::model::{
+    RuntimeJob, RuntimeKind, RuntimeProfile, WorkflowCommandRecord, WorkflowInstance,
+};
 use super::store::{
     cost_usd_from_micros, cost_usd_to_micros, ClaimedCommandTerminalOutcome,
     RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
@@ -14,7 +16,7 @@ use super::{
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
 use harness_core::config::isolation::{
-    IsolationAvailability, IsolationConfig, IsolationTrustClass,
+    IsolationAvailability, IsolationConfig, IsolationTier, IsolationTrustClass,
 };
 use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 use serde_json::{json, Value};
@@ -279,15 +281,16 @@ impl<'a> RuntimeCommandDispatcher<'a> {
 
         let activity = command.command.runtime_activity_key().to_string();
         let mut runtime_profile = self.profile_for_command(&command).await?;
+        apply_eval_runtime_profile_policy(&mut runtime_profile, &command)?;
         apply_candidate_runtime_budget(&mut runtime_profile, &command.command.command)?;
         let isolation =
-            isolation_resolution_for_instance(instance.as_ref(), &self.isolation_config)
+            isolation_resolution_for_command(instance.as_ref(), &command, &self.isolation_config)
                 .with_context(|| {
-                    format!(
-                        "failed to resolve isolation tier for workflow {}",
-                        command.workflow_id
-                    )
-                })?;
+                format!(
+                    "failed to resolve isolation tier for workflow {}",
+                    command.workflow_id
+                )
+            })?;
         if let Err(error) = self
             .isolation_availability
             .ensure_tier_available(isolation.tier)
@@ -640,10 +643,14 @@ fn positive_u32(value: &Value, field: &str) -> anyhow::Result<u32> {
     Ok(raw as u32)
 }
 
-fn isolation_resolution_for_instance(
+fn isolation_resolution_for_command(
     instance: Option<&super::model::WorkflowInstance>,
+    command: &WorkflowCommandRecord,
     config: &IsolationConfig,
 ) -> anyhow::Result<IsolationTierResolution> {
+    if let Some(resolution) = eval_required_isolation_resolution(command)? {
+        return Ok(resolution);
+    }
     let metadata = match instance {
         Some(instance) => IsolationTaskMetadata {
             author_trust_class: author_trust_class_from_data(&instance.data)?,
@@ -651,6 +658,117 @@ fn isolation_resolution_for_instance(
         None => IsolationTaskMetadata::default(),
     };
     Ok(resolve_isolation_tier(metadata, config))
+}
+
+fn eval_required_isolation_resolution(
+    command: &WorkflowCommandRecord,
+) -> anyhow::Result<Option<IsolationTierResolution>> {
+    let Some(isolation) = command.command.command.pointer("/eval/isolation") else {
+        return Ok(None);
+    };
+    let Some(raw_tier) = isolation.get("tier") else {
+        anyhow::bail!("eval command {} is missing eval.isolation.tier", command.id);
+    };
+    let tier: IsolationTier = serde_json::from_value(raw_tier.clone()).with_context(|| {
+        format!(
+            "eval command {} has invalid eval.isolation.tier: {raw_tier}",
+            command.id
+        )
+    })?;
+    if tier == IsolationTier::Host {
+        anyhow::bail!(
+            "eval command {} requested host isolation, which is not valid for untrusted eval cases",
+            command.id
+        );
+    }
+    if tier == IsolationTier::Microvm {
+        anyhow::bail!(
+            "eval command {} requested microvm isolation, which is reserved but not implemented",
+            command.id
+        );
+    }
+
+    Ok(Some(IsolationTierResolution {
+        tier,
+        reason: "eval command required container isolation tier from policy".to_string(),
+        trust_class: IsolationTrustClass::NonCollaborator,
+        network_allowlist: Vec::new(),
+    }))
+}
+
+fn apply_eval_runtime_profile_policy(
+    profile: &mut RuntimeProfile,
+    command: &WorkflowCommandRecord,
+) -> anyhow::Result<()> {
+    let Some(isolation) = command.command.command.pointer("/eval/isolation") else {
+        return Ok(());
+    };
+    let runtime_kind = required_runtime_kind(isolation, "runtime_kind").with_context(|| {
+        format!(
+            "eval command {} has invalid eval isolation runtime profile policy",
+            command.id
+        )
+    })?;
+    if runtime_kind != RuntimeKind::RemoteHost {
+        anyhow::bail!(
+            "eval command {} requires runtime_kind remote_host, got `{}`",
+            command.id,
+            runtime_kind.as_str()
+        );
+    }
+    let runtime_profile =
+        required_string_field(isolation, "runtime_profile").with_context(|| {
+            format!(
+                "eval command {} has invalid eval isolation runtime profile policy",
+                command.id
+            )
+        })?;
+    let sandbox = required_string_field(isolation, "sandbox").with_context(|| {
+        format!(
+            "eval command {} has invalid eval isolation runtime profile policy",
+            command.id
+        )
+    })?;
+    if sandbox != "workspace-write" {
+        anyhow::bail!(
+            "eval command {} requires sandbox workspace-write, got `{sandbox}`",
+            command.id
+        );
+    }
+    profile.kind = runtime_kind;
+    profile.name = runtime_profile.to_string();
+    profile.model = None;
+    profile.reasoning_effort = None;
+    profile.sandbox = Some(sandbox.to_string());
+    profile.approval_policy = None;
+    profile.timeout_secs = eval_timeout_secs(command).or(profile.timeout_secs);
+    Ok(())
+}
+
+fn required_runtime_kind(value: &Value, field: &str) -> anyhow::Result<RuntimeKind> {
+    let Some(raw) = value.get(field) else {
+        anyhow::bail!("{field} is required");
+    };
+    serde_json::from_value(raw.clone()).with_context(|| format!("{field} is invalid: {raw}"))
+}
+
+fn required_string_field<'a>(value: &'a Value, field: &str) -> anyhow::Result<&'a str> {
+    let Some(raw) = value.get(field).and_then(Value::as_str).map(str::trim) else {
+        anyhow::bail!("{field} is required");
+    };
+    if raw.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    Ok(raw)
+}
+
+fn eval_timeout_secs(command: &WorkflowCommandRecord) -> Option<u64> {
+    command
+        .command
+        .command
+        .pointer("/eval/timeout_secs")
+        .and_then(Value::as_u64)
+        .filter(|timeout| *timeout > 0)
 }
 
 fn author_trust_class_from_data(
@@ -692,7 +810,9 @@ fn retry_not_before_for_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::RuntimeKind;
+    use crate::runtime::{
+        RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
+    };
 
     #[test]
     fn profile_selector_uses_default_profile_without_activity_override() {
@@ -761,5 +881,113 @@ mod tests {
         assert_eq!(profile.kind, RuntimeKind::ClaudeCode);
         assert_eq!(profile.name, "custom-feedback");
         assert_eq!(profile.timeout_secs, Some(7200));
+    }
+
+    #[test]
+    fn eval_isolation_command_policy_overrides_host_defaults() -> anyhow::Result<()> {
+        let command = command_record(WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "eval-implement",
+            json!({
+                "activity": "implement_issue",
+                "eval": {
+                    "timeout_secs": 1800,
+                    "isolation": {
+                        "tier": "container",
+                        "runtime_kind": "remote_host",
+                        "runtime_profile": "eval-isolated-runtime-host",
+                        "sandbox": "workspace-write",
+                        "backend": "container_runtime_host",
+                        "image": "harness-eval-runner:local",
+                        "lifecycle": "ephemeral",
+                        "cleanup_required": true
+                    }
+                }
+            }),
+        ));
+
+        let resolution =
+            isolation_resolution_for_command(None, &command, &IsolationConfig::default())?;
+
+        assert_eq!(resolution.tier, IsolationTier::Container);
+        assert_eq!(resolution.trust_class, IsolationTrustClass::NonCollaborator);
+        assert!(resolution.reason.contains("eval command required"));
+        Ok(())
+    }
+
+    #[test]
+    fn eval_isolation_command_policy_selects_remote_host_profile() -> anyhow::Result<()> {
+        let command = command_record(WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "eval-implement",
+            json!({
+                "activity": "implement_issue",
+                "eval": {
+                    "timeout_secs": 1800,
+                    "isolation": {
+                        "tier": "container",
+                        "runtime_kind": "remote_host",
+                        "runtime_profile": "eval-isolated-runtime-host",
+                        "sandbox": "workspace-write",
+                        "backend": "container_runtime_host",
+                        "image": "harness-eval-runner:local",
+                        "lifecycle": "ephemeral",
+                        "cleanup_required": true
+                    }
+                }
+            }),
+        ));
+        let mut profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+
+        apply_eval_runtime_profile_policy(&mut profile, &command)?;
+
+        assert_eq!(profile.kind, RuntimeKind::RemoteHost);
+        assert_eq!(profile.name, "eval-isolated-runtime-host");
+        assert_eq!(profile.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(profile.timeout_secs, Some(1800));
+        assert_eq!(profile.model, None);
+        assert_eq!(profile.reasoning_effort, None);
+        Ok(())
+    }
+
+    #[test]
+    fn eval_isolation_command_policy_rejects_host_tier() {
+        let command = command_record(WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "eval-implement",
+            json!({
+                "activity": "implement_issue",
+                "eval": {
+                    "isolation": {
+                        "tier": "host"
+                    }
+                }
+            }),
+        ));
+
+        let error = isolation_resolution_for_command(None, &command, &IsolationConfig::default())
+            .expect_err("host eval isolation must fail");
+
+        assert!(error.to_string().contains("requested host isolation"));
+    }
+
+    fn command_record(command: WorkflowCommand) -> WorkflowCommandRecord {
+        WorkflowCommandRecord {
+            id: "command-1".to_string(),
+            workflow_id: "workflow-1".to_string(),
+            decision_id: None,
+            status: WorkflowCommandStatus::Pending,
+            dispatch_owner: None,
+            dispatch_lease_expires_at: None,
+            dispatch_not_before: None,
+            dispatch_attempt_count: 0,
+            dispatch_claim_generation: 0,
+            dispatch_barrier: None,
+            command,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            attempt_generation: 1,
+            superseded_by_command_id: None,
+        }
     }
 }

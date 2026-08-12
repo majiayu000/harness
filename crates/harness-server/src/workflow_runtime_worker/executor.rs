@@ -150,6 +150,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 self.state.core.workflow_runtime_store.as_deref(),
                 workflow.as_ref(),
                 &job,
+                prompt_task_request.prompt_text(),
             )
             .await;
             let prompt_packet = build_runtime_prompt_packet(
@@ -217,6 +218,15 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 } else {
                     isolation_spawn_env_vars(&job)
                 };
+                if !correction_only {
+                    crate::eval_credentials::apply_eval_environment_to_spawn_env(
+                        &job,
+                        &mut env_vars,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("invalid eval credential environment: {error}")
+                    })?;
+                }
                 let permission_profile = RuntimePermissionProfile::resolve(
                     resolved_settings.permission_mode,
                     resolved_settings.allowed_tools.clone(),

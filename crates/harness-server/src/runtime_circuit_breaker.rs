@@ -447,9 +447,7 @@ mod tests {
             FailureClass::ZeroOutputSpawnFailure
         );
         assert_eq!(
-            classify_agent_failure(
-                "codex exited with exit status: 1: stderr=[Reading additional input"
-            ),
+            classify_agent_failure("codex exited: usage limit reached; try again later"),
             FailureClass::QuotaInteractiveWait
         );
         assert_eq!(
@@ -507,7 +505,7 @@ mod tests {
     fn success_clears_closed_counts() {
         let registry = test_registry();
         let now = Utc::now();
-        registry.record_failure("codex", "job-1", FailureClass::Unclassified, now);
+        registry.record_failure("codex", "job-1", FailureClass::QuotaInteractiveWait, now);
 
         registry.record_success("codex", "job-2", now);
 
@@ -520,7 +518,12 @@ mod tests {
         let registry = test_registry();
         let now = Utc::now();
         for _ in 0..3 {
-            registry.record_failure("codex", "failing-job", FailureClass::Unclassified, now);
+            registry.record_failure(
+                "codex",
+                "failing-job",
+                FailureClass::QuotaInteractiveWait,
+                now,
+            );
         }
 
         let later = now + Duration::seconds(11);
@@ -536,7 +539,12 @@ mod tests {
             registry.before_execute(&probe, later, later + Duration::minutes(5)),
             RuntimeJobClaimDecision::Proceed
         );
-        let events = registry.record_failure("codex", &probe.id, FailureClass::Unclassified, later);
+        let events = registry.record_failure(
+            "codex",
+            &probe.id,
+            FailureClass::QuotaInteractiveWait,
+            later,
+        );
 
         assert_eq!(events[0].kind, CircuitBreakerEventKind::Opened);
         assert_eq!(
@@ -645,9 +653,9 @@ mod tests {
     fn interleaved_failure_classes_count_independently() {
         let registry = test_registry();
         let now = Utc::now();
-        registry.record_failure("codex", "job-1", FailureClass::Unclassified, now);
-        registry.record_failure("codex", "job-2", FailureClass::CliMissingFile, now);
-        registry.record_failure("codex", "job-3", FailureClass::Unclassified, now);
+        registry.record_failure("codex", "job-1", FailureClass::QuotaInteractiveWait, now);
+        registry.record_failure("codex", "job-2", FailureClass::ZeroOutputSpawnFailure, now);
+        registry.record_failure("codex", "job-3", FailureClass::QuotaInteractiveWait, now);
 
         assert!(registry.defer_open_profiles(now).is_empty());
         assert_eq!(registry.snapshots(now)[0].state, "closed");
@@ -658,7 +666,7 @@ mod tests {
         let registry = test_registry();
         let now = Utc::now();
         for _ in 0..3 {
-            registry.record_failure("codex", "job-1", FailureClass::Unclassified, now);
+            registry.record_failure("codex", "job-1", FailureClass::QuotaInteractiveWait, now);
         }
 
         let event = registry.reset("codex", now);

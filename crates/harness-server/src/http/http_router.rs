@@ -78,6 +78,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(get_workflow_runtime_tree),
         )
         .route(
+            "/api/workflows/runtime/evidence",
+            get(runtime_submission_routes::get_evidence),
+        )
+        .route(
+            "/api/workflows/runtime/evidence/export",
+            get(runtime_submission_routes::get_evidence_export),
+        )
+        .route(
             "/api/workflows/runtime/submissions",
             get(task_query_routes::list_runtime_submissions)
                 .post(task_routes::create_runtime_submission),

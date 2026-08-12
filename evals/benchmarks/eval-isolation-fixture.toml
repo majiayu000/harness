@@ -1,0 +1,19 @@
+suite = "eval-isolation-fixture"
+default_timeout_secs = 1800
+
+[isolation]
+tier = "container"
+runtime_kind = "remote_host"
+runtime_profile = "eval-isolated-runtime-host"
+sandbox = "workspace-write"
+backend = "container_runtime_host"
+image = "harness-eval-runner:local"
+lifecycle = "ephemeral"
+cleanup_required = true
+
+[[cases]]
+case_id = "eval-isolation-policy-binding"
+repo = "majiayu000/harness"
+issue = 1750
+base_commit = "716eaf35"
+verify_commands = ["cargo test -p harness-workflow eval_isolation"]

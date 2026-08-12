@@ -62,6 +62,14 @@ pub(super) async fn make_test_state_with_runtime_store(
 }
 
 pub(crate) async fn register_host(app: &Router, host_id: &str) -> anyhow::Result<()> {
+    register_host_with_capabilities(app, host_id, Vec::new()).await
+}
+
+pub(crate) async fn register_host_with_capabilities(
+    app: &Router,
+    host_id: &str,
+    capabilities: Vec<&str>,
+) -> anyhow::Result<()> {
     let response = app
         .clone()
         .oneshot(
@@ -69,7 +77,9 @@ pub(crate) async fn register_host(app: &Router, host_id: &str) -> anyhow::Result
                 .method("POST")
                 .uri("/api/runtime-hosts/register")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({ "host_id": host_id }).to_string()))?,
+                .body(Body::from(
+                    json!({ "host_id": host_id, "capabilities": capabilities }).to_string(),
+                ))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -188,6 +198,88 @@ async fn runtime_job_claim_endpoint_claims_remote_host_jobs_only() -> anyhow::Re
         .await?
         .expect("local job should remain pending");
     assert_eq!(local.status, RuntimeJobStatus::Pending);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_claim_endpoint_includes_eval_credential_environment_policy(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "command-eval-credential-policy",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "implement_issue",
+            "workflow_id": "wf-eval",
+            "runtime_profile": {
+                "name": "remote-host-default",
+                "kind": "remote_host"
+            },
+            "command": {
+                "eval": {
+                    "eval_run_id": "run-1",
+                    "timeout_secs": 45,
+                    "plain_env_allowlist": [
+                        "SAFE_FLAG",
+                        "GITHUB_TOKEN",
+                        "AWS_SECRET_ACCESS_KEY"
+                    ]
+                }
+            }
+        }),
+    )
+    .await?;
+
+    let json = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    assert_eq!(json["claimed"], true);
+    assert_eq!(json["runtime_job_id"], job.id);
+    let policy = &json["runtime_job"]["input"]["command"]["eval"]["credential_environment"];
+    assert_eq!(
+        policy["schema"],
+        crate::eval_credentials::EVAL_CREDENTIAL_ENVIRONMENT_SCHEMA_VERSION
+    );
+    assert_eq!(policy["secret_inheritance"], "empty_by_default");
+    assert_eq!(policy["plain_env_allowlist"][0], "AWS_SECRET_ACCESS_KEY");
+    assert_eq!(policy["plain_env_allowlist"][1], "GITHUB_TOKEN");
+    assert_eq!(policy["plain_env_allowlist"][2], "SAFE_FLAG");
+    assert_eq!(policy["plain_env_keys"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        policy["credential_grants"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(policy["stripped_env"][0]["key"], "AWS_SECRET_ACCESS_KEY");
+    assert_eq!(policy["stripped_env"][0]["class"], "cloud");
+    assert_eq!(policy["stripped_env"][1]["key"], "GITHUB_TOKEN");
+    assert_eq!(policy["stripped_env"][1]["class"], "github");
+    assert_eq!(json["credential_environment"], *policy);
+    assert_eq!(
+        json["credential_environment_variables"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(0)
+    );
+    let events = store
+        .events_for("runtime-host-test-command-eval-credential-policy")
+        .await?;
+    assert!(events.iter().any(|event| {
+        event.event_type == "RuntimeHostEvalCredentialPolicyIssued"
+            && event.event["runtime_job_id"] == job.id
+            && event.event["credential_environment"] == *policy
+    }));
     Ok(())
 }
 
@@ -399,6 +491,66 @@ async fn runtime_job_claim_endpoint_defers_open_circuit_profile() -> anyhow::Res
     assert_eq!(events[0].event_type, "RuntimeJobClaimed");
     assert_eq!(events[1].event_type, "RuntimeJobClaimDeferred");
     assert_eq!(events[1].event["claim_api"], "runtime_host");
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_claim_endpoint_defers_eval_job_without_resource_limit_capability(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host(&app, "host-a").await?;
+
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "eval-missing-capability",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "implement_issue",
+            "command": {
+                "activity": "implement_issue",
+                "eval": {
+                    "eval_run_id": "run-1",
+                    "case_id": "case-1",
+                    "timeout_secs": 45
+                }
+            }
+        }),
+    )
+    .await?;
+    let before_claim = Utc::now();
+
+    let json = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    assert_eq!(json["claimed"], false);
+    assert_eq!(json["deferred"], true);
+    assert_eq!(json["runtime_job_id"], job.id);
+    assert_eq!(json["required_capability"], "eval_resource_limits");
+    let deferred = store
+        .get_runtime_job(&job.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("eval job should still exist"))?;
+    assert_eq!(deferred.status, RuntimeJobStatus::Pending);
+    assert!(deferred.lease.is_none());
+    assert!(deferred
+        .not_before
+        .is_some_and(|not_before| not_before > before_claim));
+    let events = store.runtime_events_for(&job.id).await?;
+    assert_eq!(events[0].event_type, "RuntimeJobClaimed");
+    assert_eq!(events[1].event_type, "RuntimeJobClaimDeferred");
+    assert_eq!(
+        events[1].event["required_capability"],
+        "eval_resource_limits"
+    );
     Ok(())
 }
 

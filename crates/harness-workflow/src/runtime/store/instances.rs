@@ -106,13 +106,24 @@ impl WorkflowRuntimeStore {
         &self,
         instance: &WorkflowInstance,
     ) -> anyhow::Result<bool> {
-        validate_instance_for_persistence(instance)?;
         let mut tx = self.pool.begin().await?;
-        let inserted = insert_validated_canonical_initial_instance_tx(&mut tx, instance).await?;
-        if inserted {
-            record_instance_created_event_tx(&mut tx, instance).await?;
-        }
+        let inserted = self
+            .insert_instance_if_absent_in_tx(&mut tx, instance)
+            .await?;
         tx.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn insert_instance_if_absent_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        instance: &WorkflowInstance,
+    ) -> anyhow::Result<bool> {
+        validate_instance_for_persistence(instance)?;
+        let inserted = insert_validated_canonical_initial_instance_tx(tx, instance).await?;
+        if inserted {
+            record_instance_created_event_tx(tx, instance).await?;
+        }
         Ok(inserted)
     }
 

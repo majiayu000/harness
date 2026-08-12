@@ -40,10 +40,23 @@ pub(super) async fn apply_completion_evidence(
     let mut result = result;
     if activity_name(job) == QUALITY_GATE_ACTIVITY && result.status == ActivityStatus::Succeeded {
         let commands = validation_commands_for_job(job, workflow);
+        let credential_environment =
+            match crate::eval_credentials::eval_credential_environment_for_job(job) {
+                Ok(environment) => environment,
+                Err(error) => {
+                    return ActivityResult::failed(
+                        QUALITY_GATE_ACTIVITY,
+                        "Quality gate eval credential environment was invalid.",
+                        error.to_string(),
+                    )
+                    .with_error_kind(harness_workflow::runtime::ActivityErrorKind::Configuration);
+                }
+            };
         let run = run_validation_commands(
             workspace_root,
             &commands,
             Duration::from_secs(policy.quality_gate_validation_timeout_secs),
+            credential_environment.as_ref(),
         )
         .await;
         result = apply_server_validation(result, run);

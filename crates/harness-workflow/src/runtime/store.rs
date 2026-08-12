@@ -13,7 +13,7 @@ use super::transcript::PendingRuntimeTranscript;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
-use harness_core::db::PgStoreContext;
+use harness_core::db::{PgMigrator, PgStoreContext};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
@@ -46,6 +46,8 @@ mod definitions;
 mod driverless_progress;
 #[path = "store/events.rs"]
 mod events;
+#[path = "store/evidence.rs"]
+mod evidence;
 #[path = "store/instance_helpers.rs"]
 mod instance_helpers;
 #[path = "store/instances.rs"]
@@ -94,6 +96,13 @@ pub use coverage_recovery::{
 pub(in crate::runtime) use decision_provenance::insert_decision_record_once_tx;
 pub use decision_provenance::DecisionProvenanceConflict;
 pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};
+pub use evidence::{
+    WorkflowRunEvidence, WorkflowRunEvidenceExport, WorkflowRunEvidenceInput,
+    WorkflowRunEvidenceQuery, WORKFLOW_RUN_EVIDENCE_DEFAULT_LIMIT,
+    WORKFLOW_RUN_EVIDENCE_EXPORT_SCHEMA, WORKFLOW_RUN_EVIDENCE_MAX_LIMIT,
+    WORKFLOW_RUN_EVIDENCE_PAYLOAD_MAX_BYTES, WORKFLOW_RUN_EVIDENCE_RETENTION_MAX_BATCH,
+    WORKFLOW_RUN_EVIDENCE_SCHEMA,
+};
 pub use pr_binding_repair::WorkflowPrBindingRepairOutcome;
 pub(in crate::runtime) use prompt_payloads::insert_prompt_payload_tx;
 pub use prompt_payloads::PromptPayloadIntegrityError;
@@ -127,6 +136,7 @@ pub struct WorkflowRuntimeStore {
     /// so a store opened without explicit wiring only records decisions.
     pub(super) budget_policy: RuntimeBudgetPolicy,
 }
+const WORKFLOW_RUNTIME_SHARED_POOL_MIGRATIONS_TABLE: &str = "workflow_runtime_schema_migrations";
 pub struct WorkflowInstancePage {
     pub instances: Vec<WorkflowInstance>,
     pub total: i64,
@@ -342,6 +352,19 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
+        Ok(Self {
+            pool,
+            budget_policy: RuntimeBudgetPolicy::default(),
+        })
+    }
+    pub async fn open_with_shared_pool(pool: PgPool) -> anyhow::Result<Self> {
+        PgMigrator::new_with_table(
+            &pool,
+            WORKFLOW_RUNTIME_MIGRATIONS,
+            WORKFLOW_RUNTIME_SHARED_POOL_MIGRATIONS_TABLE,
+        )?
+        .run()
+        .await?;
         Ok(Self {
             pool,
             budget_policy: RuntimeBudgetPolicy::default(),

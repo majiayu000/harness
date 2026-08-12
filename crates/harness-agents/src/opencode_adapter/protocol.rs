@@ -80,11 +80,13 @@ fn parse_acp_notification(value: &Value) -> Option<ParsedAcpMessage> {
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     match status {
-                        "in_progress" => Some(ParsedAcpMessage::Event(AgentEvent::ItemStarted {
-                            item_type: "tool_call".into(),
-                        })),
+                        "in_progress" => {
+                            Some(ParsedAcpMessage::Event(AgentEvent::ItemStartedKind {
+                                item_type: "tool_call".into(),
+                            }))
+                        }
                         "completed" | "error" => {
-                            Some(ParsedAcpMessage::Event(AgentEvent::ItemCompleted))
+                            Some(ParsedAcpMessage::Event(AgentEvent::ItemCompletedKind))
                         }
                         _ => Some(ParsedAcpMessage::Ignore),
                     }

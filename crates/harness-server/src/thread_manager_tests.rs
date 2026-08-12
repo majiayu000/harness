@@ -1,6 +1,6 @@
 use crate::thread_manager::ThreadManager;
 use async_trait::async_trait;
-use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::agent::{AgentAdapter, AgentEvent, AgentRequest, ApprovalDecision};
 use harness_core::types::{AgentId, Item, ThreadId, TokenUsage, TurnId, TurnStatus};
 use std::path::PathBuf;
 use std::sync::{
@@ -485,7 +485,7 @@ impl AgentAdapter for AlwaysUnsupportedAdapter {
     }
     async fn start_turn(
         &self,
-        _req: TurnRequest,
+        _req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         Ok(())
@@ -520,7 +520,7 @@ impl AgentAdapter for TrackingAdapter {
     }
     async fn start_turn(
         &self,
-        _req: TurnRequest,
+        _req: AgentRequest,
         _tx: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         Ok(())
