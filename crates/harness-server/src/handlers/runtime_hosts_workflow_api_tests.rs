@@ -202,6 +202,88 @@ async fn runtime_job_claim_endpoint_claims_remote_host_jobs_only() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn runtime_job_claim_endpoint_includes_eval_credential_environment_policy(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "command-eval-credential-policy",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "implement_issue",
+            "workflow_id": "wf-eval",
+            "runtime_profile": {
+                "name": "remote-host-default",
+                "kind": "remote_host"
+            },
+            "command": {
+                "eval": {
+                    "eval_run_id": "run-1",
+                    "timeout_secs": 45,
+                    "plain_env_allowlist": [
+                        "SAFE_FLAG",
+                        "GITHUB_TOKEN",
+                        "AWS_SECRET_ACCESS_KEY"
+                    ]
+                }
+            }
+        }),
+    )
+    .await?;
+
+    let json = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    assert_eq!(json["claimed"], true);
+    assert_eq!(json["runtime_job_id"], job.id);
+    let policy = &json["runtime_job"]["input"]["command"]["eval"]["credential_environment"];
+    assert_eq!(
+        policy["schema"],
+        crate::eval_credentials::EVAL_CREDENTIAL_ENVIRONMENT_SCHEMA_VERSION
+    );
+    assert_eq!(policy["secret_inheritance"], "empty_by_default");
+    assert_eq!(policy["plain_env_allowlist"][0], "AWS_SECRET_ACCESS_KEY");
+    assert_eq!(policy["plain_env_allowlist"][1], "GITHUB_TOKEN");
+    assert_eq!(policy["plain_env_allowlist"][2], "SAFE_FLAG");
+    assert_eq!(policy["plain_env_keys"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        policy["credential_grants"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(policy["stripped_env"][0]["key"], "AWS_SECRET_ACCESS_KEY");
+    assert_eq!(policy["stripped_env"][0]["class"], "cloud");
+    assert_eq!(policy["stripped_env"][1]["key"], "GITHUB_TOKEN");
+    assert_eq!(policy["stripped_env"][1]["class"], "github");
+    assert_eq!(json["credential_environment"], *policy);
+    assert_eq!(
+        json["credential_environment_variables"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(0)
+    );
+    let events = store
+        .events_for("runtime-host-test-command-eval-credential-policy")
+        .await?;
+    assert!(events.iter().any(|event| {
+        event.event_type == "RuntimeHostEvalCredentialPolicyIssued"
+            && event.event["runtime_job_id"] == job.id
+            && event.event["credential_environment"] == *policy
+    }));
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_claim_endpoint_hydrates_verified_exact_replay_transcript() -> anyhow::Result<()>
 {
     let dir = tempfile::tempdir()?;
