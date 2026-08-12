@@ -100,7 +100,7 @@ fn select_repo_memory_records(
 }
 
 fn rank_repo_memory_candidates(
-    candidates: &mut [RepoMemoryRecord],
+    candidates: &mut Vec<RepoMemoryRecord>,
     activity_class: &str,
     task_text: Option<&str>,
 ) {
@@ -110,9 +110,8 @@ fn rank_repo_memory_candidates(
         RetrievalQuery::new(RetrievalSurface::RepoMemory, &query_text, candidates.len())
             .with_activity_class(activity_class);
     let retriever = LexicalKnowledgeRetriever;
-    let mut ranked = candidates
-        .iter()
-        .cloned()
+    let mut ranked = std::mem::take(candidates)
+        .into_iter()
         .map(|record| RankedRepoMemoryCandidate {
             activity_mismatch: record.activity_class != activity_class,
             relevance: repo_memory_relevance(&retriever, &record, &retrieval_query),
@@ -127,9 +126,7 @@ fn rank_repo_memory_candidates(
             .then_with(|| right.record.created_at.cmp(&left.record.created_at))
             .then_with(|| left.record.id.cmp(&right.record.id))
     });
-    for (target, ranked) in candidates.iter_mut().zip(ranked) {
-        *target = ranked.record;
-    }
+    *candidates = ranked.into_iter().map(|ranked| ranked.record).collect();
 }
 
 #[derive(Debug, Clone)]

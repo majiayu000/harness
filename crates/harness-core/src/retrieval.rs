@@ -148,11 +148,10 @@ pub fn score_retrieval_candidate(
     query: &RetrievalQuery<'_>,
     candidate: RetrievalCandidate<'_>,
 ) -> Result<f64, RetrievalError> {
-    let candidate_id = candidate.id.to_string();
     Ok(retriever
         .rank(query, std::slice::from_ref(&candidate))?
         .into_iter()
-        .find(|scored| scored.id == candidate_id)
+        .find(|scored| scored.id == candidate.id)
         .map(|scored| scored.score)
         .unwrap_or(0.0))
 }
