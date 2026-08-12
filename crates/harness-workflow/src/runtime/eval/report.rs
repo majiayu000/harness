@@ -1,5 +1,6 @@
 use super::evidence::{EvalCaseEvidence, EvalEvidenceStatus};
 use super::manifest::EvalBenchmarkManifest;
+use super::model::{EvalGrade, GateStatus, HardGateName, QualitySnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, fmt};
@@ -44,6 +45,10 @@ pub struct EvalReportCase {
     pub passed: bool,
     #[serde(default)]
     pub explicit_evidence: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_grade: Option<EvalGrade>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_hard_gates: Vec<EvalReportFailedGate>,
     pub workflow_id: Option<String>,
     #[serde(default)]
     pub terminal_state: Option<String>,
@@ -52,6 +57,12 @@ pub struct EvalReportCase {
     pub total_tokens: u64,
     pub cost_usd_micros: u64,
     pub missing_evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalReportFailedGate {
+    pub name: HardGateName,
+    pub grade_cap: Option<EvalGrade>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +211,8 @@ pub fn eval_report_dry_run(
             status: EvalReportCaseStatus::Pending,
             passed: false,
             explicit_evidence: false,
+            final_grade: None,
+            failed_hard_gates: Vec::new(),
             workflow_id: None,
             terminal_state: None,
             infrastructure_status: EvalCaseInfrastructureStatus::Unknown,
@@ -254,6 +267,8 @@ pub fn eval_report_from_evidence(
                 status: EvalReportCaseStatus::Skipped,
                 passed: false,
                 explicit_evidence: false,
+                final_grade: None,
+                failed_hard_gates: Vec::new(),
                 workflow_id: None,
                 terminal_state: None,
                 infrastructure_status: EvalCaseInfrastructureStatus::MissingEvidence,
@@ -345,6 +360,7 @@ fn report_case_from_evidence(
     let status = evidence_case_status(&evidence, passed);
     let terminal_state = evidence_terminal_state(&evidence);
     let infrastructure_status = evidence_infrastructure_status(&evidence, status);
+    let (final_grade, failed_hard_gates) = quality_summary(evidence.quality.as_ref());
     EvalReportCase {
         case_id: case.case_id.clone(),
         repo: case.repo.clone(),
@@ -355,6 +371,8 @@ fn report_case_from_evidence(
         status,
         passed,
         explicit_evidence: true,
+        final_grade,
+        failed_hard_gates,
         workflow_id: evidence.workflow_id,
         terminal_state,
         infrastructure_status,
@@ -362,6 +380,24 @@ fn report_case_from_evidence(
         cost_usd_micros,
         missing_evidence: evidence.missing_evidence,
     }
+}
+
+fn quality_summary(
+    quality: Option<&QualitySnapshot>,
+) -> (Option<EvalGrade>, Vec<EvalReportFailedGate>) {
+    let Some(quality) = quality else {
+        return (None, Vec::new());
+    };
+    let failed_hard_gates = quality
+        .hard_gates
+        .iter()
+        .filter(|gate| gate.status == GateStatus::Fail)
+        .map(|gate| EvalReportFailedGate {
+            name: gate.name,
+            grade_cap: gate.grade_cap,
+        })
+        .collect();
+    (Some(quality.final_grade), failed_hard_gates)
 }
 
 fn evidence_case_status(evidence: &EvalCaseEvidence, passed: bool) -> EvalReportCaseStatus {
@@ -789,6 +825,9 @@ mod tests {
                     base_commit: "abcdef1".to_string(),
                     verify_commands: vec![format!("cargo test {case_id}")],
                     timeout_secs: 3600,
+                    resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(3600)
+                        .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
+                        .expect("default resource limits should be valid"),
                 })
                 .collect(),
         }
@@ -817,6 +856,7 @@ mod tests {
             usage: Vec::new(),
             submission: None,
             quality_gate: None,
+            quality: None,
             missing_evidence,
         }
     }
@@ -843,6 +883,8 @@ mod tests {
             status,
             passed: status == EvalReportCaseStatus::Passed,
             explicit_evidence,
+            final_grade: None,
+            failed_hard_gates: Vec::new(),
             workflow_id: Some(format!("workflow-{case_id}")),
             terminal_state: Some(format!("terminal-{}", case_status_suffix(status))),
             infrastructure_status: match status {
