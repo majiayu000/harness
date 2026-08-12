@@ -6,6 +6,7 @@ use super::capability_evidence::{
 use super::inventory::{inventory_with_root, AgentStackInventoryError};
 use super::{
     AgentStackCapability, AgentStackComponent, AgentStackComponentKind, AgentStackTrustLevel,
+    Sha256Digest,
 };
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,11 @@ impl AgentStackCapabilityExtractionOptions {
         if max_file_bytes == 0 || max_file_bytes == u64::MAX {
             return Err(AgentStackCapabilityExtractionError::InvalidOptions);
         }
+        self.inventory_options = self
+            .inventory_options
+            .clone()
+            .with_max_file_bytes(max_file_bytes)
+            .map_err(|_| AgentStackCapabilityExtractionError::InvalidOptions)?;
         self.max_file_bytes = max_file_bytes;
         Ok(self)
     }
@@ -324,6 +330,18 @@ fn read_text(
             AgentStackCapabilityExtractionFailureKind::LimitExceeded,
             None,
             format!("{locator} exceeds the capability extraction byte limit"),
+        ));
+        return None;
+    }
+    if component
+        .integrity()
+        .is_some_and(|expected| expected != &Sha256Digest::from_bytes(&bytes))
+    {
+        failures.push(AgentStackCapabilityExtractionFailure::new(
+            component,
+            AgentStackCapabilityExtractionFailureKind::ReadFailed,
+            None,
+            format!("{locator} changed after inventory; capability extraction skipped it"),
         ));
         return None;
     }

@@ -45,6 +45,66 @@ fn capability_rows(
 }
 
 #[test]
+fn raised_file_limit_is_applied_to_inventory_and_extraction() {
+    let dir = tmp();
+    let padding = "x".repeat(1024 * 1024);
+    write_file(
+        dir.path(),
+        ".mcp.json",
+        format!(r#"{{"capabilities":["network"],"padding":"{padding}"}}"#).as_bytes(),
+    );
+
+    let options = AgentStackCapabilityExtractionOptions::new(dir.path().to_path_buf())
+        .with_max_file_bytes(2 * 1024 * 1024)
+        .expect("valid raised limit");
+    let extraction = extract_repository_capability_evidence(&options)
+        .expect("raised limit reaches inventory and extraction");
+
+    assert!(capability_rows(&extraction)
+        .iter()
+        .any(|(locator, capability, rule_id, _)| locator == ".mcp.json"
+            && *capability == AgentStackCapability::Network
+            && rule_id == "mcp.explicit_capabilities"));
+}
+
+#[test]
+fn changed_content_is_rejected_after_inventory() {
+    let dir = tmp();
+    write_file(dir.path(), ".mcp.json", br#"{"capabilities":["network"]}"#);
+    let options = AgentStackCapabilityExtractionOptions::new(dir.path().to_path_buf());
+    let root = Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).expect("open root");
+    let inventory = inventory_with_root(&root, &options.inventory_options).expect("inventory");
+    let component = inventory
+        .entries()
+        .iter()
+        .find(|entry| entry.component().source().locator().as_str() == ".mcp.json")
+        .expect("MCP component")
+        .component();
+    write_file(
+        dir.path(),
+        ".mcp.json",
+        br#"{"capabilities":["destructive"]}"#,
+    );
+
+    let mut failures = Vec::new();
+    let text = read_text(
+        &root,
+        component,
+        ".mcp.json",
+        options.max_file_bytes,
+        &mut failures,
+    );
+
+    assert!(text.is_none());
+    assert_eq!(failures.len(), 1);
+    assert_eq!(
+        failures[0].kind(),
+        AgentStackCapabilityExtractionFailureKind::ReadFailed
+    );
+    assert!(failures[0].reason().contains("changed after inventory"));
+}
+
+#[test]
 fn capability_extraction_reads_mcp_policy_and_hook_declarations() {
     let dir = tmp();
     write_file(
