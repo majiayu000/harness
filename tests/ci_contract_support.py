@@ -435,8 +435,9 @@ def create_autoloading_pytest_plugin(root: Path) -> Path:
     return python
 
 
-RUST_OR_CI_CHANGED = (
-    "needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'"
+SCOPED_CHECKS_CHANGED = (
+    "needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true' || "
+    "needs.changed.outputs.agent_assets == 'true'"
 )
 DATABASE_URL = "postgres://postgres:postgres@localhost:5432/harness_test"
 
@@ -472,6 +473,15 @@ FILTERS = block(
       - '!crates/harness-core/**'
       - '!crates/harness-workflow/**'
       - '!crates/harness-agents/**'
+    agent_assets:
+      - 'skills/**'
+      - 'rules/**'
+      - '.harness/guards/**'
+      - '.harness/sg/**'
+      - '.githooks/**'
+      - 'config/*.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
     """
 )
 
@@ -481,7 +491,7 @@ TEST_SCOPE = block(
     # changed; otherwise scope cargo test to the affected package sets.
     # harness-server is always excluded from `cargo test` because its
     # tests run via the dedicated fast/db profile scripts below.
-    if [ "$WORKSPACE_CHANGED" = "true" ] || [ "$CI_CHANGED" = "true" ] || [ "$OTHER_CRATES_CHANGED" = "true" ]; then
+    if [ "$WORKSPACE_CHANGED" = "true" ] || [ "$CI_CHANGED" = "true" ] || [ "$OTHER_CRATES_CHANGED" = "true" ] || [ "$AGENT_ASSETS_CHANGED" = "true" ]; then
       echo "packages=--workspace --exclude harness-server" >> "$GITHUB_OUTPUT"
       echo "run_server=true" >> "$GITHUB_OUTPUT"
       exit 0
@@ -526,6 +536,11 @@ CI_RESULT_ENV = {
     "HARNESS_CI_RESULT_CLIPPY": "${{ needs.clippy.result }}",
     "HARNESS_CI_RESULT_TEST": "${{ needs.test.result }}",
     "HARNESS_CI_RESULT_AUDIT": "${{ needs.audit.result }}",
+    "HARNESS_CI_REQUIRE_SCOPED_JOBS": (
+        "${{ needs.changed.outputs.rust == 'true' || "
+        "needs.changed.outputs.ci == 'true' || "
+        "needs.changed.outputs.agent_assets == 'true' }}"
+    ),
 }
 
 EXPECTED_JOBS: dict[str, YamlValue] = {
@@ -534,7 +549,15 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "runs-on": "ubuntu-latest",
         "outputs": {
             name: f"${{{{ steps.filter.outputs.{name} }}}}"
-            for name in ("rust", "server", "agents", "ci", "workspace", "other_crates")
+            for name in (
+                "rust",
+                "server",
+                "agents",
+                "ci",
+                "workspace",
+                "other_crates",
+                "agent_assets",
+            )
         },
         "steps": [
             {"uses": "actions/checkout@v4"},
@@ -549,7 +572,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "name": "Storage Legacy Openers",
         "runs-on": "ubuntu-latest",
         "needs": "changed",
-        "if": RUST_OR_CI_CHANGED,
+        "if": SCOPED_CHECKS_CHANGED,
         "steps": [
             {"uses": "actions/checkout@v4"},
             {"run": "python3 scripts/check_storage_legacy_openers.py --self-test"},
@@ -585,7 +608,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "name": "Format",
         "runs-on": "ubuntu-latest",
         "needs": "changed",
-        "if": RUST_OR_CI_CHANGED,
+        "if": SCOPED_CHECKS_CHANGED,
         "steps": [
             {"uses": "actions/checkout@v4"},
             {
@@ -599,7 +622,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "name": "Web Build",
         "runs-on": "ubuntu-latest",
         "needs": "changed",
-        "if": RUST_OR_CI_CHANGED,
+        "if": SCOPED_CHECKS_CHANGED,
         "steps": [
             {"uses": "actions/checkout@v4"},
             {
@@ -631,7 +654,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "name": "Clippy",
         "runs-on": "ubuntu-latest",
         "needs": "[changed, web-build]",
-        "if": RUST_OR_CI_CHANGED,
+        "if": SCOPED_CHECKS_CHANGED,
         "env": {"HARNESS_SKIP_WEB_BUILD": '"1"'},
         "steps": [
             {"uses": "actions/checkout@v4"},
@@ -651,7 +674,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "name": "Test",
         "runs-on": "ubuntu-latest",
         "needs": "[changed, web-build]",
-        "if": RUST_OR_CI_CHANGED,
+        "if": SCOPED_CHECKS_CHANGED,
         "timeout-minutes": "15",
         "env": {"HARNESS_SKIP_WEB_BUILD": '"1"'},
         "services": {
@@ -705,6 +728,9 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
                     ),
                     "SERVER_CHANGED": "${{ needs.changed.outputs.server }}",
                     "AGENTS_CHANGED": "${{ needs.changed.outputs.agents }}",
+                    "AGENT_ASSETS_CHANGED": (
+                        "${{ needs.changed.outputs.agent_assets }}"
+                    ),
                 },
                 "run": TEST_SCOPE,
             },
@@ -730,7 +756,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "name": "Security Audit",
         "runs-on": "ubuntu-latest",
         "needs": "changed",
-        "if": RUST_OR_CI_CHANGED,
+        "if": SCOPED_CHECKS_CHANGED,
         "permissions": {"contents": "read", "checks": "write"},
         "steps": [
             {"uses": "actions/checkout@v4"},

@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 
 KNOWN_RESULTS = {"success", "skipped", "failure", "cancelled"}
 RESULT_ENV_PREFIX = "HARNESS_CI_RESULT_"
+REQUIRE_SCOPED_JOBS_ENV = "HARNESS_CI_REQUIRE_SCOPED_JOBS"
 EXPECTED_RESULT_ENV = {
     "changed": f"{RESULT_ENV_PREFIX}CHANGED",
     "storage-legacy-openers": f"{RESULT_ENV_PREFIX}STORAGE_LEGACY_OPENERS",
@@ -30,6 +31,12 @@ def evaluate_results(environment: Mapping[str, str]) -> tuple[list[str], list[st
     provided_env = {
         name for name in environment if name.startswith(RESULT_ENV_PREFIX)
     }
+    require_scoped_jobs = environment.get(REQUIRE_SCOPED_JOBS_ENV)
+
+    if require_scoped_jobs not in {"true", "false"}:
+        errors.append(
+            f"{REQUIRE_SCOPED_JOBS_ENV} must be exactly 'true' or 'false'"
+        )
 
     for name in sorted(expected_env - provided_env):
         errors.append(f"missing required job result environment variable: {name}")
@@ -43,7 +50,9 @@ def evaluate_results(environment: Mapping[str, str]) -> tuple[list[str], list[st
         if result not in KNOWN_RESULTS:
             errors.append(f"unknown result for {name}: {result!r}")
         elif result != "success" and not (
-            result == "skipped" and name not in UNCONDITIONAL_JOBS
+            result == "skipped"
+            and name not in UNCONDITIONAL_JOBS
+            and require_scoped_jobs == "false"
         ):
             failures.append(f"{name}={result}")
 

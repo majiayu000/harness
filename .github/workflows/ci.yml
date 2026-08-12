@@ -21,6 +21,7 @@ jobs:
       ci: ${{ steps.filter.outputs.ci }}
       workspace: ${{ steps.filter.outputs.workspace }}
       other_crates: ${{ steps.filter.outputs.other_crates }}
+      agent_assets: ${{ steps.filter.outputs.agent_assets }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -57,12 +58,21 @@ jobs:
               - '!crates/harness-core/**'
               - '!crates/harness-workflow/**'
               - '!crates/harness-agents/**'
+            agent_assets:
+              - 'skills/**'
+              - 'rules/**'
+              - '.harness/guards/**'
+              - '.harness/sg/**'
+              - '.githooks/**'
+              - 'config/*.md'
+              - 'AGENTS.md'
+              - 'CLAUDE.md'
 
   storage-legacy-openers:
     name: Storage Legacy Openers
     runs-on: ubuntu-latest
     needs: changed
-    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true' || needs.changed.outputs.agent_assets == 'true'
     steps:
       - uses: actions/checkout@v4
       - run: python3 scripts/check_storage_legacy_openers.py --self-test
@@ -97,7 +107,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     needs: changed
-    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true' || needs.changed.outputs.agent_assets == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -110,7 +120,7 @@ jobs:
     name: Web Build
     runs-on: ubuntu-latest
     needs: changed
-    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true' || needs.changed.outputs.agent_assets == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -132,7 +142,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     needs: [changed, web-build]
-    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true' || needs.changed.outputs.agent_assets == 'true'
     env:
       # harness-server's build.rs reuses the prebuilt web/dist artifact
       # instead of invoking bun again.
@@ -154,7 +164,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     needs: [changed, web-build]
-    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true' || needs.changed.outputs.agent_assets == 'true'
     timeout-minutes: 15
     env:
       # harness-server's build.rs reuses the prebuilt web/dist artifact
@@ -197,12 +207,13 @@ jobs:
           OTHER_CRATES_CHANGED: ${{ needs.changed.outputs.other_crates }}
           SERVER_CHANGED: ${{ needs.changed.outputs.server }}
           AGENTS_CHANGED: ${{ needs.changed.outputs.agents }}
+          AGENT_ASSETS_CHANGED: ${{ needs.changed.outputs.agent_assets }}
         run: |
           # Full workspace when workspace-level files or unclassified crates
           # changed; otherwise scope cargo test to the affected package sets.
           # harness-server is always excluded from `cargo test` because its
           # tests run via the dedicated fast/db profile scripts below.
-          if [ "$WORKSPACE_CHANGED" = "true" ] || [ "$CI_CHANGED" = "true" ] || [ "$OTHER_CRATES_CHANGED" = "true" ]; then
+          if [ "$WORKSPACE_CHANGED" = "true" ] || [ "$CI_CHANGED" = "true" ] || [ "$OTHER_CRATES_CHANGED" = "true" ] || [ "$AGENT_ASSETS_CHANGED" = "true" ]; then
             echo "packages=--workspace --exclude harness-server" >> "$GITHUB_OUTPUT"
             echo "run_server=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -251,7 +262,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     needs: changed
-    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true'
+    if: needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true' || needs.changed.outputs.agent_assets == 'true'
     permissions:
       contents: read
       checks: write
@@ -279,4 +290,5 @@ jobs:
           HARNESS_CI_RESULT_CLIPPY: ${{ needs.clippy.result }}
           HARNESS_CI_RESULT_TEST: ${{ needs.test.result }}
           HARNESS_CI_RESULT_AUDIT: ${{ needs.audit.result }}
+          HARNESS_CI_REQUIRE_SCOPED_JOBS: ${{ needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true' || needs.changed.outputs.agent_assets == 'true' }}
         run: python3 scripts/check_ci_results.py
