@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use harness_core::db::DbEntity;
 use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -145,27 +144,6 @@ impl ExecPlan {
     /// Deserialize from Markdown (cross-session recovery).
     pub fn from_markdown(content: &str) -> anyhow::Result<Self> {
         crate::markdown::from_markdown(content)
-    }
-}
-
-const EXEC_PLAN_CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS exec_plans (
-    id         TEXT PRIMARY KEY,
-    data       TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-)";
-
-impl DbEntity for ExecPlan {
-    fn table_name() -> &'static str {
-        "exec_plans"
-    }
-
-    fn id(&self) -> &str {
-        self.id.as_str()
-    }
-
-    fn create_table_sql() -> &'static str {
-        EXEC_PLAN_CREATE_TABLE_SQL
     }
 }
 

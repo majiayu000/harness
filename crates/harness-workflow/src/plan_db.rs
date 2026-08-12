@@ -1,12 +1,14 @@
 use anyhow::Context;
-use harness_core::db::{Migration, PgStoreContext};
+use harness_core::db::{Migration, PgMigrator, PgStoreContext};
 use harness_core::store_backend::{PostgresBackend, StoreLocation};
 use harness_core::{types::ExecPlanId, types::ExecPlanStatus};
 use harness_exec::plan::ExecPlan;
 use sqlx::postgres::PgPool;
+use sqlx::{Postgres, Transaction};
 use std::path::Path;
 
 pub const PLAN_DB_SCHEMA: &str = "plan_db";
+const PLAN_DB_SHARED_POOL_MIGRATIONS_TABLE: &str = "plan_db_schema_migrations";
 
 static PLAN_MIGRATIONS: &[Migration] = &[
     Migration {
@@ -143,8 +145,28 @@ impl PlanDb {
         })
     }
 
+    pub async fn open_with_shared_pool(
+        pool: PgPool,
+        schema: impl Into<String>,
+        store_key: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        PgMigrator::new_with_table(&pool, PLAN_MIGRATIONS, PLAN_DB_SHARED_POOL_MIGRATIONS_TABLE)?
+            .run()
+            .await?;
+        Ok(Self {
+            pool,
+            schema: schema.into(),
+            store_key: store_key.into(),
+            update_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
     pub fn schema(&self) -> &str {
         &self.schema
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     pub fn store_key_for_data_dir(data_dir: &Path) -> anyhow::Result<String> {
@@ -177,6 +199,25 @@ impl PlanDb {
         .bind(plan.id.as_str())
         .bind(&data)
         .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        plan: &ExecPlan,
+    ) -> anyhow::Result<()> {
+        let data = crate::jsonb::to_jsonb_string(plan)?;
+        sqlx::query(
+            "INSERT INTO exec_plans (store_key, id, data) VALUES ($1, $2, $3::jsonb)
+             ON CONFLICT(store_key, id) DO UPDATE SET data = EXCLUDED.data,
+                 updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(&self.store_key)
+        .bind(plan.id.as_str())
+        .bind(&data)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }

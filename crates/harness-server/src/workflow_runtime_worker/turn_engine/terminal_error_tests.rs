@@ -1,8 +1,8 @@
 use super::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
 use crate::{server::HarnessServer, thread_manager::ThreadManager};
-use harness_agents::registry::{AdapterExecutionStrategy, AgentRegistry};
+use harness_agents::registry::AgentRegistry;
 use harness_core::agent::{
-    AgentAdapter, AgentEvent, AgentRequest, AgentResponse, CodeAgent, StreamItem, TurnRequest,
+    AgentAdapter, AgentEvent, AgentRequest, AgentResponse, CodeAgent, StreamItem,
 };
 use harness_core::config::HarnessConfig;
 use harness_core::error::HarnessError;
@@ -62,7 +62,7 @@ impl AgentAdapter for TerminalErrorAdapter {
 
     async fn start_turn(
         &self,
-        _req: TurnRequest,
+        _req: AgentRequest,
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         self.calls.fetch_add(1, Ordering::AcqRel);
@@ -93,16 +93,12 @@ fn server_with_terminal_error_adapter(
     registry.register("codex", Arc::new(UnusedAgent { calls: agent_calls }));
     let adapter_error_for_factory = adapter_error.clone();
     registry
-        .register_adapter_factory_with_strategy(
-            "codex",
-            move || {
-                Arc::new(TerminalErrorAdapter {
-                    calls: adapter_calls.clone(),
-                    message: adapter_error_for_factory.clone(),
-                })
-            },
-            AdapterExecutionStrategy::ExecuteTurns,
-        )
+        .register_turn_backend_factory("codex", move || {
+            Arc::new(TerminalErrorAdapter {
+                calls: adapter_calls.clone(),
+                message: adapter_error_for_factory.clone(),
+            })
+        })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     Ok(Arc::new(HarnessServer::new(

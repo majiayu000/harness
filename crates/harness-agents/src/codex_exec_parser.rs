@@ -294,14 +294,20 @@ pub(crate) async fn stream_codex_exec_output(
         for item in emitted_items {
             let item_label = match &item {
                 StreamItem::EgressVerifiedAtDispatch => "egress_verification",
+                StreamItem::TurnStarted => "turn_started",
                 StreamItem::ItemStarted { .. } => "item_started",
+                StreamItem::ItemStartedKind { .. } => "item_started",
                 StreamItem::MessageDelta { .. } => "message_delta",
                 StreamItem::ToolOutputDelta { .. } => "tool_output_delta",
+                StreamItem::ToolCall { .. } => "tool_call",
                 StreamItem::ItemCompleted { .. } => "item_completed",
+                StreamItem::ItemCompletedKind => "item_completed",
                 StreamItem::TokenUsage { .. } => "token_usage",
                 StreamItem::Warning { .. } => "warning",
+                StreamItem::Diagnostic { .. } => "diagnostic",
                 StreamItem::TurnCancelled { .. } => "turn_cancelled",
                 StreamItem::Error { .. } => "error",
+                StreamItem::TurnCompleted { .. } => "turn_completed",
                 StreamItem::ApprovalRequest { .. } => "approval_request",
                 StreamItem::Done => "done",
             };
