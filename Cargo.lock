@@ -1450,6 +1450,8 @@ name = "harness-sandbox"
 version = "0.6.34"
 dependencies = [
  "harness-core",
+ "libc",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -1526,6 +1528,7 @@ dependencies = [
  "harness-core",
  "harness-exec",
  "harness-observe",
+ "harness-sandbox",
  "serde",
  "serde_json",
  "serde_yaml",

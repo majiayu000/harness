@@ -20,6 +20,7 @@ pub mod interceptor;
 pub mod lang_detect;
 pub mod prompts;
 pub mod proof_of_work;
+pub mod retrieval;
 pub mod review;
 pub mod run_id;
 pub mod run_registry;

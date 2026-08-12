@@ -232,6 +232,28 @@ async fn runtime_graph_rejects_orphan_references() -> anyhow::Result<()> {
     .expect_err("workflow artifact without a runtime job should be rejected");
     assert_constraint_error(error, "workflow_artifacts_runtime_job_id_fkey");
 
+    let inserted = sqlx::query(
+        "INSERT INTO workflow_run_evidence
+            (id, workflow_id, runtime_job_id, project_id, stack, suite, decision,
+             evidence_schema, digest, trust, location, retention_class)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)",
+    )
+    .bind("retained-evidence-links")
+    .bind("missing-workflow")
+    .bind("missing-runtime-job")
+    .bind("/project")
+    .bind("codex-default")
+    .bind("acceptance")
+    .bind("accepted")
+    .bind("harness.test.evidence.v1")
+    .bind("sha256:abc")
+    .bind("agent")
+    .bind("{}")
+    .bind("short")
+    .execute(store.pool())
+    .await?;
+    assert_eq!(inserted.rows_affected(), 1);
+
     store
         .record_runtime_event(
             &runtime_job.id,
