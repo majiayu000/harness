@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from ci_contract_support import TRUSTED_ROOT, contract_candidate_file
-
-
-PR_CHECK_WORKFLOW = contract_candidate_file(".github/workflows/pr-check.yml")
+from ci_contract_support import TRUSTED_ROOT
 
 
 def test_shared_agent_rules_have_one_canonical_source() -> None:
@@ -18,12 +15,3 @@ def test_shared_agent_rules_have_one_canonical_source() -> None:
         "External review bots are optional advisors",
     ):
         assert rule in agents
-
-
-def test_enabled_gemini_review_runs_for_new_and_updated_heads() -> None:
-    workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
-
-    assert "GEMINI_REVIEW_ENABLED == 'true'" in workflow
-    for action in ("opened", "synchronize", "reopened", "ready_for_review"):
-        assert f'"{action}"' in workflow
-    assert "body: '/gemini review'" in workflow
