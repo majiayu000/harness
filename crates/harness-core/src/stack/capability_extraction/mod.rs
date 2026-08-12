@@ -32,6 +32,7 @@ pub struct AgentStackCapabilityExtractionOptions {
     max_file_bytes: u64,
 }
 
+#[rustfmt::skip]
 impl AgentStackCapabilityExtractionOptions {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -57,9 +58,7 @@ impl AgentStackCapabilityExtractionOptions {
         Ok(self)
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
+    pub fn root(&self) -> &Path { &self.root }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -80,14 +79,11 @@ pub enum AgentStackCapabilityExtractionConfidence {
     High,
 }
 
+#[rustfmt::skip]
 impl AgentStackCapabilityExtractionConfidence {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
+    pub const fn as_str(self) -> &'static str { match self {
+        Self::Low => "low", Self::Medium => "medium", Self::High => "high",
+    }}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -100,16 +96,13 @@ pub enum AgentStackCapabilityExtractionFailureKind {
     EvidenceValidation,
 }
 
+#[rustfmt::skip]
 impl AgentStackCapabilityExtractionFailureKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadFailed => "read_failed",
-            Self::LimitExceeded => "limit_exceeded",
-            Self::ParseFailed => "parse_failed",
-            Self::InvalidDeclaration => "invalid_declaration",
-            Self::EvidenceValidation => "evidence_validation",
-        }
-    }
+    pub const fn as_str(self) -> &'static str { match self {
+        Self::ReadFailed => "read_failed", Self::LimitExceeded => "limit_exceeded",
+        Self::ParseFailed => "parse_failed", Self::InvalidDeclaration => "invalid_declaration",
+        Self::EvidenceValidation => "evidence_validation",
+    }}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,6 +113,7 @@ pub struct AgentStackCapabilityExtractionFailure {
     reason: String,
 }
 
+#[rustfmt::skip]
 impl AgentStackCapabilityExtractionFailure {
     fn new(
         component: &AgentStackComponent,
@@ -135,21 +129,10 @@ impl AgentStackCapabilityExtractionFailure {
         }
     }
 
-    pub fn component(&self) -> &AgentStackComponent {
-        &self.component
-    }
-
-    pub const fn kind(&self) -> AgentStackCapabilityExtractionFailureKind {
-        self.kind
-    }
-
-    pub fn rule_id(&self) -> Option<&str> {
-        self.rule_id.as_deref()
-    }
-
-    pub fn reason(&self) -> &str {
-        &self.reason
-    }
+    pub fn component(&self) -> &AgentStackComponent { &self.component }
+    pub const fn kind(&self) -> AgentStackCapabilityExtractionFailureKind { self.kind }
+    pub fn rule_id(&self) -> Option<&str> { self.rule_id.as_deref() }
+    pub fn reason(&self) -> &str { &self.reason }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -161,6 +144,7 @@ pub struct AgentStackCapabilityExtractionEvidence {
     confidence: AgentStackCapabilityExtractionConfidence,
 }
 
+#[rustfmt::skip]
 impl AgentStackCapabilityExtractionEvidence {
     fn new(
         component: &AgentStackComponent,
@@ -183,29 +167,12 @@ impl AgentStackCapabilityExtractionEvidence {
         })
     }
 
-    pub fn component(&self) -> &AgentStackComponent {
-        &self.component
-    }
-
-    pub fn evidence(&self) -> &AgentStackCapabilityEvidence {
-        &self.evidence
-    }
-
-    pub const fn capability(&self) -> AgentStackCapability {
-        self.evidence.capability()
-    }
-
-    pub fn rule_id(&self) -> &str {
-        &self.rule_id
-    }
-
-    pub fn reason(&self) -> &str {
-        &self.reason
-    }
-
-    pub const fn confidence(&self) -> AgentStackCapabilityExtractionConfidence {
-        self.confidence
-    }
+    pub fn component(&self) -> &AgentStackComponent { &self.component }
+    pub fn evidence(&self) -> &AgentStackCapabilityEvidence { &self.evidence }
+    pub const fn capability(&self) -> AgentStackCapability { self.evidence.capability() }
+    pub fn rule_id(&self) -> &str { &self.rule_id }
+    pub fn reason(&self) -> &str { &self.reason }
+    pub const fn confidence(&self) -> AgentStackCapabilityExtractionConfidence { self.confidence }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -214,14 +181,10 @@ pub struct AgentStackCapabilityExtraction {
     failures: Vec<AgentStackCapabilityExtractionFailure>,
 }
 
+#[rustfmt::skip]
 impl AgentStackCapabilityExtraction {
-    pub fn evidence(&self) -> &[AgentStackCapabilityExtractionEvidence] {
-        &self.evidence
-    }
-
-    pub fn failures(&self) -> &[AgentStackCapabilityExtractionFailure] {
-        &self.failures
-    }
+    pub fn evidence(&self) -> &[AgentStackCapabilityExtractionEvidence] { &self.evidence }
+    pub fn failures(&self) -> &[AgentStackCapabilityExtractionFailure] { &self.failures }
 }
 
 #[derive(Debug, Clone)]

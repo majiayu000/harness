@@ -13,19 +13,20 @@ pub(super) fn extract_static(
     }
     let mut by_capability = std::collections::BTreeMap::<&'static str, RawCapability>::new();
     for line in text.lines().take(MAX_STATIC_LINES) {
-        let tokens = shell_tokens_outside_quotes(line);
-        for capability in classify_command_tokens(&tokens) {
-            by_capability.entry(capability.as_str()).or_insert_with(|| {
-                inferred_raw(
-                    capability,
-                    "hook.static_command",
-                    format!(
-                        "{locator} invokes a command associated with {}",
-                        capability.as_str()
-                    ),
-                    AgentStackCapabilityExtractionConfidence::Low,
-                )
-            });
+        for tokens in shell_commands_outside_quotes(line) {
+            for capability in classify_command_tokens(&tokens) {
+                by_capability.entry(capability.as_str()).or_insert_with(|| {
+                    inferred_raw(
+                        capability,
+                        "hook.static_command",
+                        format!(
+                            "{locator} invokes a command associated with {}",
+                            capability.as_str()
+                        ),
+                        AgentStackCapabilityExtractionConfidence::Low,
+                    )
+                });
+            }
         }
     }
     by_capability.into_values().collect()
@@ -73,7 +74,8 @@ pub(super) fn classify_command_tokens(tokens: &[String]) -> Vec<AgentStackCapabi
     capabilities
 }
 
-fn shell_tokens_outside_quotes(line: &str) -> Vec<String> {
+fn shell_commands_outside_quotes(line: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote = None;
@@ -87,22 +89,33 @@ fn shell_tokens_outside_quotes(line: &str) -> Vec<String> {
         match ch {
             '\'' | '"' => quote = Some(ch),
             '#' => break,
-            ch if ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '<' | '>') => {
+            ';' | '|' | '&' | '(' | ')' => {
                 push_token(&mut tokens, &mut current);
+                push_command(&mut commands, &mut tokens);
+            }
+            ch if ch.is_whitespace() || matches!(ch, '<' | '>') => {
+                push_token(&mut tokens, &mut current)
             }
             _ => current.push(ch),
         }
     }
     push_token(&mut tokens, &mut current);
-    while tokens.first().is_some_and(|token| token.contains('=')) {
-        tokens.remove(0);
-    }
-    tokens
+    push_command(&mut commands, &mut tokens);
+    commands
 }
 
 fn push_token(tokens: &mut Vec<String>, current: &mut String) {
     if !current.is_empty() {
         tokens.push(std::mem::take(current));
+    }
+}
+
+fn push_command(commands: &mut Vec<Vec<String>>, tokens: &mut Vec<String>) {
+    while tokens.first().is_some_and(|token| token.contains('=')) {
+        tokens.remove(0);
+    }
+    if !tokens.is_empty() {
+        commands.push(std::mem::take(tokens));
     }
 }
 
