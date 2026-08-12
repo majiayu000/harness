@@ -209,7 +209,7 @@ async fn runtime_job_claim_endpoint_includes_eval_credential_environment_policy(
         return Ok(());
     };
     let app = runtime_hosts_workflow_app(state);
-    register_host(&app, "host-a").await?;
+    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
 
     let job = enqueue_runtime_host_test_job(
         &store,
@@ -226,6 +226,7 @@ async fn runtime_job_claim_endpoint_includes_eval_credential_environment_policy(
             "command": {
                 "eval": {
                     "eval_run_id": "run-1",
+                    "timeout_secs": 45,
                     "plain_env_allowlist": [
                         "SAFE_FLAG",
                         "GITHUB_TOKEN",
