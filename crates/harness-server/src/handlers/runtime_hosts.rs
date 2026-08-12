@@ -284,18 +284,6 @@ pub async fn claim_runtime_job_for_runtime_host(
             );
         }
     };
-    let lease_expires_at = match job.lease.as_ref().map(|lease| lease.expires_at) {
-        Some(lease_expires_at) => lease_expires_at,
-        None => {
-            tracing::error!(
-                runtime_job_id = %job.id,
-                host_id = %host_id,
-                "runtime host claimed a job without a durable lease"
-            );
-            return lease::workflow_store_unavailable_response();
-        }
-    };
-
     match state
         .runtime_circuit_breakers
         .before_execute(&job, Utc::now(), lease_expires_at)

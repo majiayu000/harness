@@ -33,7 +33,6 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
-        let expires_at = super::store::runtime_job_leases::postgres_timestamp_floor(expires_at);
         let records_remote_host_audit = only_runtime_kind == Some(RuntimeKind::RemoteHost);
         let only_runtime_kind = only_runtime_kind
             .map(|runtime_kind| enum_str(&runtime_kind))

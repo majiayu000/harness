@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::store::runtime_job_leases::{
-    postgres_timestamp_ceil, postgres_timestamp_floor, RuntimeJobLeaseRenewalOutcome,
-    RuntimeJobLeaseRenewalRejection, RuntimeJobLeaseRenewalRequest,
+    postgres_timestamp_ceil, RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRejection,
+    RuntimeJobLeaseRenewalRequest,
 };
 use crate::runtime::RuntimeJobCompletionLease;
 use tokio::sync::Barrier;
@@ -80,12 +80,7 @@ async fn renewal<'a>(
     now: DateTime<Utc>,
 ) -> anyhow::Result<RuntimeJobLeaseRenewalRequest<'a>> {
     let lease_proof = store
-        .remote_runtime_job_lease_proof(
-            &job.id,
-            owner,
-            job.lease_generation,
-            postgres_timestamp_floor(previous_expires_at),
-        )
+        .remote_runtime_job_lease_proof(&job.id, owner, job.lease_generation, previous_expires_at)
         .await?;
     Ok(RuntimeJobLeaseRenewalRequest {
         runtime_job_id: &job.id,

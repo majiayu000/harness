@@ -220,7 +220,9 @@ async fn runtime_store_running_lease_match_accepts_renewed_generation() -> anyho
         json!({ "activity": "start_child_workflow" }),
     )
     .await?;
-    let initial_expires_at = Utc::now() - Duration::seconds(1);
+    let initial_expires_at = (Utc::now() - Duration::seconds(1))
+        .with_nanosecond(999_999_999)
+        .expect("test lease nanoseconds are valid");
     let claimed = store
         .claim_next_runtime_job("runtime-1", initial_expires_at)
         .await?
