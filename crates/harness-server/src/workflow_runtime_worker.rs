@@ -697,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_job_failure_class_falls_back_to_error_text() -> anyhow::Result<()> {
+    fn runtime_job_failure_class_does_not_treat_stdin_banner_as_quota() -> anyhow::Result<()> {
         let mut job = RuntimeJob::pending(
             "command-1",
             harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
@@ -711,10 +711,7 @@ mod tests {
         );
         job.complete(&result)?;
 
-        assert_eq!(
-            runtime_job_failure_class(&job),
-            FailureClass::QuotaInteractiveWait
-        );
+        assert_eq!(runtime_job_failure_class(&job), FailureClass::Unclassified);
         Ok(())
     }
 

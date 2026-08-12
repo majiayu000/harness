@@ -1,7 +1,7 @@
 use super::*;
 use harness_workflow::runtime::{
     RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowInstance,
-    WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    WorkflowRunEvidenceInput, WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 
 #[tokio::test]
@@ -1015,6 +1015,108 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         )
         .await?;
     assert_eq!(proof_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_evidence_export_route_filters_records() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("issue", "issue:1757"),
+    )
+    .with_id("runtime-evidence-route-workflow")
+    .with_server_data(serde_json::json!({
+        "task_id": "runtime-evidence-route",
+        "project_id": "/project-evidence",
+        "repo": "owner/repo",
+        "issue_number": 1757
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let command_id = store
+        .enqueue_command(
+            &workflow.id,
+            None,
+            &WorkflowCommand::enqueue_activity("implement_issue", "runtime-evidence-route"),
+        )
+        .await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({"activity": "implement_issue"}),
+        )
+        .await?;
+    store
+        .record_workflow_run_evidence(WorkflowRunEvidenceInput {
+            id: Some("runtime-evidence-route-record".to_string()),
+            workflow_id: workflow.id.clone(),
+            command_id: Some(command_id),
+            runtime_job_id: Some(job.id.clone()),
+            project_id: "/project-evidence".to_string(),
+            commit_sha: Some("abc123".to_string()),
+            stack: "codex-default".to_string(),
+            suite: "acceptance".to_string(),
+            baseline: Some("origin/main".to_string()),
+            decision: "accepted".to_string(),
+            evidence_schema: "harness.test.evidence.v1".to_string(),
+            digest: "sha256:abc123".to_string(),
+            trust: "agent_reported_sanitized".to_string(),
+            location: serde_json::json!({
+                "kind": "workflow_artifact",
+                "artifact_ref": "artifact-1"
+            }),
+            retention_class: "short".to_string(),
+            payload: Some(serde_json::json!({"bounded": true})),
+            payload_expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+        })
+        .await?;
+
+    let response = runtime_submission_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/evidence/export?project_id=%2Fproject-evidence&suite=acceptance&decision=accepted&include_payload=true&limit=10")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(
+        body["schema"],
+        harness_workflow::runtime::WORKFLOW_RUN_EVIDENCE_EXPORT_SCHEMA
+    );
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["records"][0]["workflow_id"], workflow.id);
+    assert_eq!(body["records"][0]["runtime_job_id"], job.id);
+    assert_eq!(body["records"][0]["commit_sha"], "abc123");
+    assert_eq!(body["records"][0]["schema"], "harness.test.evidence.v1");
+    assert_eq!(body["records"][0]["digest"], "sha256:abc123");
+    assert_eq!(
+        body["records"][0]["payload"],
+        serde_json::json!({"bounded": true})
+    );
     Ok(())
 }
 

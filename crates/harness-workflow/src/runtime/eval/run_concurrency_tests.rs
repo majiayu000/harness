@@ -20,6 +20,9 @@ fn benchmark_case(case_id: &str) -> EvalBenchmarkCase {
         commit_resolution: None,
         verdict: None,
         timeout_secs: 120,
+        resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
+            .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
+            .expect("default resource limits should be valid"),
     }
 }
 

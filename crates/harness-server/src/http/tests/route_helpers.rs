@@ -231,6 +231,14 @@ pub(super) fn runtime_submission_app(state: Arc<AppState>) -> Router {
                 .post(task_routes::create_runtime_submission),
         )
         .route(
+            "/api/workflows/runtime/evidence",
+            get(runtime_submission_routes::get_evidence),
+        )
+        .route(
+            "/api/workflows/runtime/evidence/export",
+            get(runtime_submission_routes::get_evidence_export),
+        )
+        .route(
             "/api/workflows/runtime/submissions/{id}",
             get(task_query_routes::get_runtime_submission),
         )
