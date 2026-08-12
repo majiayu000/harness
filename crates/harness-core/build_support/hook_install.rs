@@ -1,27 +1,96 @@
 use std::fs;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 const GIT_DIR_PREFIX: &str = "gitdir: ";
+const MANAGED_HOOK: &[u8] = b"#!/bin/sh\n\
+# harness-managed-pre-commit-v1\n\
+set -eu\n\
+repo_root=$(pwd -P)\n\
+exec \"$repo_root/.githooks/pre-commit\" \"$@\"\n";
 
-pub fn install_pre_commit_hook(workspace_root: &Path) -> io::Result<Option<PathBuf>> {
+#[derive(Debug, Eq, PartialEq)]
+pub enum InstallOutcome {
+    Installed(PathBuf),
+    AlreadyManaged(PathBuf),
+    UnmanagedHookPreserved(PathBuf),
+    MissingSource,
+    NotRepository,
+}
+
+pub fn install_pre_commit_hook(workspace_root: &Path) -> io::Result<InstallOutcome> {
     let source = workspace_root.join(".githooks").join("pre-commit");
     if !source.is_file() {
-        return Ok(None);
+        return Ok(InstallOutcome::MissingSource);
     }
 
     let Some(common_git_dir) = resolve_common_git_dir(workspace_root)? else {
-        return Ok(None);
+        return Ok(InstallOutcome::NotRepository);
     };
     let hooks_dir = common_git_dir.join("hooks");
     fs::create_dir_all(&hooks_dir)?;
 
     let destination = hooks_dir.join("pre-commit");
-    if fs::read(&destination).ok().as_deref() != Some(fs::read(&source)?.as_slice()) {
-        fs::copy(&source, &destination)?;
+    match fs::read(&destination) {
+        Ok(existing) if existing == MANAGED_HOOK => {
+            make_executable(&destination)?;
+            return Ok(InstallOutcome::AlreadyManaged(destination));
+        }
+        Ok(_) => return Ok(InstallOutcome::UnmanagedHookPreserved(destination)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-    make_executable(&destination)?;
-    Ok(Some(destination))
+
+    install_atomically(&hooks_dir, &destination)
+}
+
+fn install_atomically(hooks_dir: &Path, destination: &Path) -> io::Result<InstallOutcome> {
+    let (temporary, mut file) = create_temporary_hook(hooks_dir)?;
+    let result = (|| {
+        file.write_all(MANAGED_HOOK)?;
+        file.sync_all()?;
+        make_executable(&temporary)?;
+
+        match fs::hard_link(&temporary, destination) {
+            Ok(()) => Ok(InstallOutcome::Installed(destination.to_path_buf())),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::read(destination)? == MANAGED_HOOK {
+                    make_executable(destination)?;
+                    Ok(InstallOutcome::AlreadyManaged(destination.to_path_buf()))
+                } else {
+                    Ok(InstallOutcome::UnmanagedHookPreserved(
+                        destination.to_path_buf(),
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    })();
+    drop(file);
+    let cleanup = fs::remove_file(temporary);
+    match (result, cleanup) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(outcome), Ok(())) => Ok(outcome),
+    }
+}
+
+fn create_temporary_hook(hooks_dir: &Path) -> io::Result<(PathBuf, fs::File)> {
+    for attempt in 0..16 {
+        let path = hooks_dir.join(format!(
+            ".pre-commit.harness-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to reserve a temporary pre-commit hook path",
+    ))
 }
 
 pub fn resolve_common_git_dir(workspace_root: &Path) -> io::Result<Option<PathBuf>> {

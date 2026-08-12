@@ -31,7 +31,12 @@ CI_RESULT_CHECK = ROOT / "scripts" / "check_ci_results.py"
 WHITESPACE_CHECK = ROOT / "scripts" / "check_committed_whitespace.py"
 
 CI_RESULT_ENV_PREFIX = "HARNESS_CI_RESULT_"
-CI_REQUIRE_SCOPED_JOBS_ENV = "HARNESS_CI_REQUIRE_SCOPED_JOBS"
+CI_CHANGED_ENV_PREFIX = "HARNESS_CI_CHANGED_"
+CI_CHANGED_ENV = {
+    "HARNESS_CI_CHANGED_RUST",
+    "HARNESS_CI_CHANGED_CI",
+    "HARNESS_CI_CHANGED_AGENT_ASSETS",
+}
 ZERO_OBJECT_ID = "0" * 40
 UNREACHABLE_OBJECT_ID = "f" * 40
 
@@ -81,7 +86,7 @@ def test_scoped_ci_pipeline_contract() -> None:
         ({"HARNESS_CI_RESULT_FMT": "unknown"}, None, None, [], 2),
         (
             {
-                CI_REQUIRE_SCOPED_JOBS_ENV: "true",
+                "HARNESS_CI_CHANGED_RUST": "true",
                 "HARNESS_CI_RESULT_TEST": "skipped",
             },
             None,
@@ -89,10 +94,11 @@ def test_scoped_ci_pipeline_contract() -> None:
             [],
             1,
         ),
-        ({CI_REQUIRE_SCOPED_JOBS_ENV: "invalid"}, None, None, [], 2),
+        ({"HARNESS_CI_CHANGED_RUST": "invalid"}, None, None, [], 2),
         ({}, "HARNESS_CI_RESULT_AUDIT", None, [], 2),
-        ({}, CI_REQUIRE_SCOPED_JOBS_ENV, None, [], 2),
+        ({}, "HARNESS_CI_CHANGED_CI", None, [], 2),
         ({}, None, ("HARNESS_CI_RESULT_BOGUS", "success"), [], 2),
+        ({}, None, ("HARNESS_CI_CHANGED_BOGUS", "false"), [], 2),
         ({}, None, None, ["changed=success"], 2),
     ],
 )
@@ -107,7 +113,7 @@ def test_ci_result_script_fails_closed(
         name: value
         for name, value in os.environ.items()
         if not name.startswith(CI_RESULT_ENV_PREFIX)
-        and name != CI_REQUIRE_SCOPED_JOBS_ENV
+        and not name.startswith(CI_CHANGED_ENV_PREFIX)
     }
     environment.update(
         {
@@ -116,7 +122,7 @@ def test_ci_result_script_fails_closed(
             if name.startswith(CI_RESULT_ENV_PREFIX)
         }
     )
-    environment[CI_REQUIRE_SCOPED_JOBS_ENV] = "false"
+    environment.update({name: "false" for name in CI_CHANGED_ENV})
     environment.update(updates)
     if removed is not None:
         environment.pop(removed)

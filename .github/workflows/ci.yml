@@ -59,14 +59,31 @@ jobs:
               - '!crates/harness-workflow/**'
               - '!crates/harness-agents/**'
             agent_assets:
+              - '**/AGENTS.md'
+              - '**/AGENTS.override.md'
+              - '**/CLAUDE.md'
+              - 'WORKFLOW.md'
+              - 'MEMORY.md'
               - 'skills/**'
+              - '.claude/skills/**'
+              - '.codex/skills/**'
+              - '.agents/skills/**'
+              - '.harness/skills/**'
               - 'rules/**'
+              - '.harness/rules/**'
               - '.harness/guards/**'
               - '.harness/sg/**'
               - '.githooks/**'
+              - '.cursor/rules/**'
+              - '.vibeguard/**'
+              - '.remem/**'
+              - 'remem.toml'
+              - '.mcp.json'
+              - 'mcp.json'
+              - 'requirements.toml'
+              - '.harness/config.toml'
+              - 'harness.toml'
               - 'config/*.md'
-              - 'AGENTS.md'
-              - 'CLAUDE.md'
 
   storage-legacy-openers:
     name: Storage Legacy Openers
@@ -290,5 +307,7 @@ jobs:
           HARNESS_CI_RESULT_CLIPPY: ${{ needs.clippy.result }}
           HARNESS_CI_RESULT_TEST: ${{ needs.test.result }}
           HARNESS_CI_RESULT_AUDIT: ${{ needs.audit.result }}
-          HARNESS_CI_REQUIRE_SCOPED_JOBS: ${{ needs.changed.outputs.rust == 'true' || needs.changed.outputs.ci == 'true' || needs.changed.outputs.agent_assets == 'true' }}
+          HARNESS_CI_CHANGED_RUST: ${{ needs.changed.outputs.rust }}
+          HARNESS_CI_CHANGED_CI: ${{ needs.changed.outputs.ci }}
+          HARNESS_CI_CHANGED_AGENT_ASSETS: ${{ needs.changed.outputs.agent_assets }}
         run: python3 scripts/check_ci_results.py

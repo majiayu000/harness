@@ -14,7 +14,14 @@ fn main() {
     let hook = workspace_root.join(".githooks").join("pre-commit");
     println!("cargo:rerun-if-changed={}", hook.display());
 
-    if let Err(error) = hook_install::install_pre_commit_hook(workspace_root) {
-        println!("cargo:warning=unable to install the project pre-commit hook: {error}");
+    match hook_install::install_pre_commit_hook(workspace_root) {
+        Ok(hook_install::InstallOutcome::UnmanagedHookPreserved(path)) => println!(
+            "cargo:warning=preserving unmanaged pre-commit hook at {}; configure core.hooksPath=.githooks to use the project hook",
+            path.display()
+        ),
+        Err(error) => {
+            println!("cargo:warning=unable to install the project pre-commit hook: {error}")
+        }
+        Ok(_) => {}
     }
 }

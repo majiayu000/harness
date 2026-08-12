@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 
 KNOWN_RESULTS = {"success", "skipped", "failure", "cancelled"}
 RESULT_ENV_PREFIX = "HARNESS_CI_RESULT_"
-REQUIRE_SCOPED_JOBS_ENV = "HARNESS_CI_REQUIRE_SCOPED_JOBS"
+CHANGED_ENV_PREFIX = "HARNESS_CI_CHANGED_"
 EXPECTED_RESULT_ENV = {
     "changed": f"{RESULT_ENV_PREFIX}CHANGED",
     "storage-legacy-openers": f"{RESULT_ENV_PREFIX}STORAGE_LEGACY_OPENERS",
@@ -22,6 +22,11 @@ EXPECTED_RESULT_ENV = {
     "audit": f"{RESULT_ENV_PREFIX}AUDIT",
 }
 UNCONDITIONAL_JOBS = {"changed", "repository-checks"}
+EXPECTED_CHANGED_ENV = {
+    "rust": f"{CHANGED_ENV_PREFIX}RUST",
+    "ci": f"{CHANGED_ENV_PREFIX}CI",
+    "agent-assets": f"{CHANGED_ENV_PREFIX}AGENT_ASSETS",
+}
 
 
 def evaluate_results(environment: Mapping[str, str]) -> tuple[list[str], list[str]]:
@@ -31,17 +36,31 @@ def evaluate_results(environment: Mapping[str, str]) -> tuple[list[str], list[st
     provided_env = {
         name for name in environment if name.startswith(RESULT_ENV_PREFIX)
     }
-    require_scoped_jobs = environment.get(REQUIRE_SCOPED_JOBS_ENV)
-
-    if require_scoped_jobs not in {"true", "false"}:
-        errors.append(
-            f"{REQUIRE_SCOPED_JOBS_ENV} must be exactly 'true' or 'false'"
-        )
+    expected_changed_env = set(EXPECTED_CHANGED_ENV.values())
+    provided_changed_env = {
+        name for name in environment if name.startswith(CHANGED_ENV_PREFIX)
+    }
 
     for name in sorted(expected_env - provided_env):
         errors.append(f"missing required job result environment variable: {name}")
     for name in sorted(provided_env - expected_env):
         errors.append(f"unexpected job result environment variable: {name}")
+    for name in sorted(expected_changed_env - provided_changed_env):
+        errors.append(f"missing required change output environment variable: {name}")
+    for name in sorted(provided_changed_env - expected_changed_env):
+        errors.append(f"unexpected change output environment variable: {name}")
+
+    changed_outputs: dict[str, str] = {}
+    for name, env_name in EXPECTED_CHANGED_ENV.items():
+        value = environment.get(env_name)
+        if value is None:
+            continue
+        if value not in {"true", "false"}:
+            errors.append(f"invalid change output for {name}: {value!r}")
+        else:
+            changed_outputs[name] = value
+
+    require_scoped_jobs = any(value == "true" for value in changed_outputs.values())
 
     for name, env_name in EXPECTED_RESULT_ENV.items():
         result = environment.get(env_name)
@@ -52,7 +71,7 @@ def evaluate_results(environment: Mapping[str, str]) -> tuple[list[str], list[st
         elif result != "success" and not (
             result == "skipped"
             and name not in UNCONDITIONAL_JOBS
-            and require_scoped_jobs == "false"
+            and not require_scoped_jobs
         ):
             failures.append(f"{name}={result}")
 
