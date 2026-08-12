@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod promotion_summary;
+use promotion_summary::EvalPromotionSummaryArgs;
+
 const PASS_DROP_EPSILON: f64 = 1e-9;
 
 #[derive(Subcommand)]
@@ -20,6 +23,9 @@ pub enum EvalCommand {
     Run(EvalRunArgs),
     /// Compare two saved eval run reports
     Diff(EvalDiffArgs),
+    /// Render a stable promotion decision summary for CI
+    #[command(name = "promotion-summary")]
+    PromotionSummary(EvalPromotionSummaryArgs),
 }
 
 #[derive(Args)]
@@ -71,6 +77,16 @@ pub async fn run(cmd: EvalCommand) -> anyhow::Result<()> {
     match cmd {
         EvalCommand::Run(args) => run_eval_report(args).await,
         EvalCommand::Diff(args) => diff_eval_reports(args),
+        EvalCommand::PromotionSummary(args) => {
+            let exit_code = promotion_summary::run_promotion_summary(args)?;
+            if exit_code == 0 {
+                Ok(())
+            } else {
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                std::process::exit(exit_code);
+            }
+        }
     }
 }
 
@@ -580,7 +596,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
     }
 
     #[test]
-    fn eval_report_cli_parses_run_and_diff_commands() {
+    fn eval_report_cli_parses_run_diff_and_promotion_summary_commands() {
         let cli = Cli::try_parse_from([
             "harness",
             "eval",
@@ -638,6 +654,40 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                 assert!(args.json);
             }
             _ => panic!("expected eval diff command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "harness",
+            "eval",
+            "promotion-summary",
+            "--candidate",
+            "candidate.json",
+            "--baseline",
+            "baseline.json",
+            "--max-pass-drop",
+            "0.1",
+            "--fail-on-new-f-gate",
+            "--format",
+            "json",
+            "--json-output",
+            "summary.json",
+            "--markdown-output",
+            "summary.md",
+        ])
+        .unwrap_or_else(|error| panic!("eval promotion-summary command should parse: {error}"));
+        match cli.command {
+            Command::Eval {
+                cmd: EvalCommand::PromotionSummary(args),
+            } => {
+                assert_eq!(args.candidate, PathBuf::from("candidate.json"));
+                assert_eq!(args.baseline, Some(PathBuf::from("baseline.json")));
+                assert_eq!(args.max_pass_drop, Some(0.1));
+                assert!(args.fail_on_new_f_gate);
+                assert_eq!(args.format, promotion_summary::PromotionOutputFormat::Json);
+                assert_eq!(args.json_output, Some(PathBuf::from("summary.json")));
+                assert_eq!(args.markdown_output, Some(PathBuf::from("summary.md")));
+            }
+            _ => panic!("expected eval promotion-summary command"),
         }
     }
 
