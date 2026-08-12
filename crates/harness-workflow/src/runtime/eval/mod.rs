@@ -27,7 +27,8 @@ pub use manifest::{
 pub use report::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence, EvalCaseTransition,
     EvalCaseTransitionKind, EvalReportCase, EvalReportCaseStatus, EvalReportError,
-    EvalReportMetricDelta, EvalReportMetrics, EvalRunReport, EvalRunReportDiff,
+    EvalReportFailedGate, EvalReportMetricDelta, EvalReportMetrics, EvalRunReport,
+    EvalRunReportDiff,
 };
 pub use run::{
     cleanup_cancelled_eval_run, dispatch_eval_case_workflow, enqueue_eval_case_workflow,

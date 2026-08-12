@@ -1,6 +1,8 @@
 use crate::streaming::capture_agent_stderr_diagnostics;
 use async_trait::async_trait;
-use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::agent::{
+    AgentAdapter, AgentDiagnosticSeverity, AgentEvent, ApprovalDecision, TurnRequest,
+};
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig, SandboxMode};
 use harness_sandbox::SandboxSpec;
 use serde_json::{json, Value};
@@ -142,6 +144,16 @@ pub enum ParsedCodexMessage {
     Response { id: Value, result: Value },
     Ignore,
 }
+
+fn log_codex_diagnostic(severity: AgentDiagnosticSeverity, message: &str) {
+    match severity {
+        AgentDiagnosticSeverity::Warning => tracing::warn!(agent = "codex", "{message}"),
+        AgentDiagnosticSeverity::Error => {
+            tracing::error!(agent = "codex", "non-terminal Codex diagnostic: {message}")
+        }
+    }
+}
+
 impl CodexAdapter {
     pub fn new(cli_path: PathBuf) -> Self {
         let config = CodexAgentConfig {
@@ -399,6 +411,12 @@ impl CodexAdapter {
                     Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
                         tracing::warn!(agent = "codex", "{message}");
                     }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+                        severity,
+                        message,
+                    })) => {
+                        log_codex_diagnostic(severity, &message);
+                    }
                     Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
                         return Err(harness_core::error::HarnessError::AgentExecution(message));
                     }
@@ -447,6 +465,12 @@ impl CodexAdapter {
                     }
                     Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
                         tracing::warn!(agent = "codex", "{message}");
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+                        severity,
+                        message,
+                    })) => {
+                        log_codex_diagnostic(severity, &message);
                     }
                     Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
                         return Err(harness_core::error::HarnessError::AgentExecution(message));
@@ -584,7 +608,9 @@ impl AgentAdapter for CodexAdapter {
                     ParsedCodexMessage::Event(event) => {
                         let is_terminal = matches!(
                             event,
-                            AgentEvent::TurnCompleted { .. } | AgentEvent::Error { .. }
+                            AgentEvent::TurnCompleted { .. }
+                                | AgentEvent::TurnCancelled { .. }
+                                | AgentEvent::Error { .. }
                         );
                         if is_terminal {
                             self.clear_active_turn_id().await;
