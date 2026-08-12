@@ -1,6 +1,9 @@
 use super::attestation::{EvalAttestationDecision, EvalAttestationTrust};
 use super::evidence::{EvalCaseEvidence, EvalEvidenceStatus};
-use super::manifest::EvalBenchmarkManifest;
+use super::manifest::{
+    eval_benchmark_manifest_digest, eval_benchmark_suite_digest, EvalBenchmarkManifest,
+    EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION,
+};
 use super::model::{EvalGrade, GateStatus, HardGateName, QualitySnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,6 +13,12 @@ use std::{error::Error, fmt};
 pub struct EvalRunReport {
     pub run_id: String,
     pub suite: String,
+    #[serde(default = "default_report_manifest_schema_version")]
+    pub manifest_schema_version: String,
+    #[serde(default)]
+    pub suite_digest: String,
+    #[serde(default)]
+    pub manifest_digest: String,
     pub k: u32,
     pub metrics: EvalReportMetrics,
     pub cases: Vec<EvalReportCase>,
@@ -95,6 +104,7 @@ pub struct EvalRunReportDiff {
     pub baseline_run_id: String,
     pub candidate_run_id: String,
     pub suite: String,
+    pub suite_digest: String,
     pub k: u32,
     pub delta: EvalReportMetricDelta,
     #[serde(default)]
@@ -328,7 +338,9 @@ pub fn eval_report_from_evidence(
 pub fn diff_eval_run_reports(
     baseline: &EvalRunReport,
     candidate: &EvalRunReport,
-) -> EvalRunReportDiff {
+) -> Result<EvalRunReportDiff, EvalReportError> {
+    validate_report_compatibility(baseline, candidate)?;
+
     let baseline_cases = baseline
         .cases
         .iter()
@@ -381,10 +393,11 @@ pub fn diff_eval_run_reports(
     let regression_ids = regression_ids_for(&transitions);
     let regression_count = regression_ids.len() as u64;
 
-    EvalRunReportDiff {
+    Ok(EvalRunReportDiff {
         baseline_run_id: baseline.run_id.clone(),
         candidate_run_id: candidate.run_id.clone(),
         suite: candidate.suite.clone(),
+        suite_digest: candidate.suite_digest.clone(),
         k: candidate.k,
         delta: EvalReportMetricDelta {
             pass_at_1_delta: candidate.metrics.pass_at_1 - baseline.metrics.pass_at_1,
@@ -398,7 +411,7 @@ pub fn diff_eval_run_reports(
         regression_count,
         regression_ids,
         transitions,
-    }
+    })
 }
 
 fn report_case_from_evidence(
@@ -519,6 +532,9 @@ fn report_from_cases(
     EvalRunReport {
         run_id: run_id.into(),
         suite: manifest.suite.clone(),
+        manifest_schema_version: manifest.schema_version.clone(),
+        suite_digest: eval_benchmark_suite_digest(manifest),
+        manifest_digest: eval_benchmark_manifest_digest(manifest),
         k,
         metrics: metrics_for_cases(k, &cases),
         cases,
@@ -706,6 +722,71 @@ fn validate_k(k: u32) -> Result<(), EvalReportError> {
     Ok(())
 }
 
+fn validate_report_compatibility(
+    baseline: &EvalRunReport,
+    candidate: &EvalRunReport,
+) -> Result<(), EvalReportError> {
+    validate_report_digests(baseline, "baseline")?;
+    validate_report_digests(candidate, "candidate")?;
+
+    if baseline.manifest_schema_version != candidate.manifest_schema_version {
+        return Err(EvalReportError::new(format!(
+            "cannot diff reports with different manifest schema versions: baseline={}, candidate={}",
+            baseline.manifest_schema_version, candidate.manifest_schema_version
+        )));
+    }
+    if baseline.suite_digest != candidate.suite_digest {
+        return Err(EvalReportError::new(format!(
+            "cannot diff reports from different suite digests: baseline={}, candidate={}; rerun or migrate reports with matching canonical manifest digest evidence",
+            baseline.suite_digest, candidate.suite_digest
+        )));
+    }
+    if baseline.k != candidate.k {
+        return Err(EvalReportError::new(format!(
+            "cannot diff reports with different k values: baseline={}, candidate={}",
+            baseline.k, candidate.k
+        )));
+    }
+    Ok(())
+}
+
+fn validate_report_digests(report: &EvalRunReport, label: &str) -> Result<(), EvalReportError> {
+    if report.manifest_schema_version.trim().is_empty() {
+        return Err(EvalReportError::new(format!(
+            "cannot diff {label} report without manifest_schema_version; rerun or migrate the report with canonical manifest digest evidence"
+        )));
+    }
+    validate_prefixed_sha256(&report.suite_digest, "suite_digest").map_err(|field| {
+        EvalReportError::new(format!(
+            "cannot diff {label} report with invalid {field}; rerun or migrate the report with canonical manifest digest evidence"
+        ))
+    })?;
+    validate_prefixed_sha256(&report.manifest_digest, "manifest_digest").map_err(|field| {
+        EvalReportError::new(format!(
+            "cannot diff {label} report with invalid {field}; rerun or migrate the report with canonical manifest digest evidence"
+        ))
+    })?;
+    Ok(())
+}
+
+fn validate_prefixed_sha256(value: &str, field: &'static str) -> Result<(), &'static str> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(field);
+    };
+    if hex.len() != 64
+        || !hex
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, 'a'..='f'))
+    {
+        return Err(field);
+    }
+    Ok(())
+}
+
+fn default_report_manifest_schema_version() -> String {
+    EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::attestation::EvalAttestationSummary;
@@ -713,6 +794,11 @@ mod tests {
     use super::super::model::RuntimeSnapshot;
     use super::super::EvalCaseEvidence;
     use super::*;
+
+    const TEST_SUITE_DIGEST: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const TEST_MANIFEST_DIGEST: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
     #[test]
     fn historical_replay_manifest_pending_case_stays_pending_without_evidence() {
@@ -752,6 +838,15 @@ mod tests {
         assert_eq!(report.metrics.failed_cases, 0);
         assert_eq!(report.metrics.skipped_cases, 1);
         assert_eq!(report.metrics.pass_at_1, 1.0);
+        assert_eq!(
+            report.manifest_schema_version,
+            EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            report.suite_digest,
+            eval_benchmark_suite_digest(&manifest(&["case-pass", "case-missing"]))
+        );
+        assert!(report.manifest_digest.starts_with("sha256:"));
 
         let missing = report
             .cases
@@ -791,8 +886,35 @@ mod tests {
         assert!(err.to_string().contains("commit_resolution is pending"));
     }
 
+    #[test]
+    fn eval_report_diff_rejects_missing_or_changed_suite_digest() {
+        let baseline = report(
+            "baseline",
+            vec![case("case-pass", EvalReportCaseStatus::Passed)],
+        );
+        let mut missing_digest = baseline.clone();
+        missing_digest.run_id = "missing".to_string();
+        missing_digest.suite_digest.clear();
+
+        let err = diff_eval_run_reports(&baseline, &missing_digest)
+            .expect_err("missing suite digest should reject diff");
+
+        assert!(err.to_string().contains("invalid suite_digest"));
+
+        let mut changed_digest = baseline.clone();
+        changed_digest.run_id = "changed".to_string();
+        changed_digest.suite_digest =
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333".to_string();
+
+        let err = diff_eval_run_reports(&baseline, &changed_digest)
+            .expect_err("changed suite digest should reject diff");
+
+        assert!(err.to_string().contains("different suite digests"));
+    }
+
     fn manifest_with_case(case: EvalBenchmarkCase) -> EvalBenchmarkManifest {
         EvalBenchmarkManifest {
+            schema_version: EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION.to_string(),
             suite: "harness-historical-replay".to_string(),
             cases: vec![case],
         }
@@ -872,7 +994,8 @@ mod tests {
             ],
         );
 
-        let diff = diff_eval_run_reports(&baseline, &candidate);
+        let diff = diff_eval_run_reports(&baseline, &candidate)
+            .unwrap_or_else(|error| panic!("diff should build: {error}"));
         let kinds = diff
             .transitions
             .iter()
@@ -944,6 +1067,7 @@ mod tests {
 
     fn manifest(case_ids: &[&str]) -> EvalBenchmarkManifest {
         EvalBenchmarkManifest {
+            schema_version: EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION.to_string(),
             suite: "harness-core".to_string(),
             cases: case_ids
                 .iter()
@@ -1004,6 +1128,9 @@ mod tests {
         EvalRunReport {
             run_id: run_id.to_string(),
             suite: "harness-core".to_string(),
+            manifest_schema_version: EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION.to_string(),
+            suite_digest: TEST_SUITE_DIGEST.to_string(),
+            manifest_digest: TEST_MANIFEST_DIGEST.to_string(),
             k: 3,
             metrics: metrics_for_cases(3, &cases),
             cases,

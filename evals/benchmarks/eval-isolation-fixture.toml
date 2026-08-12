@@ -1,3 +1,4 @@
+schema_version = "eval-benchmark-manifest/v0.1"
 suite = "eval-isolation-fixture"
 default_timeout_secs = 1800
 

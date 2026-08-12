@@ -100,21 +100,7 @@ async fn run_eval_report(args: EvalRunArgs) -> anyhow::Result<()> {
 fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
     let baseline = read_run_report(&args.baseline)?;
     let candidate = read_run_report(&args.candidate)?;
-    if baseline.suite != candidate.suite {
-        anyhow::bail!(
-            "cannot diff reports from different suites: baseline={}, candidate={}",
-            baseline.suite,
-            candidate.suite
-        );
-    }
-    if baseline.k != candidate.k {
-        anyhow::bail!(
-            "cannot diff reports with different k values: baseline={}, candidate={}",
-            baseline.k,
-            candidate.k
-        );
-    }
-    let diff = diff_eval_run_reports(&baseline, &candidate);
+    let diff = diff_eval_run_reports(&baseline, &candidate)?;
     let regressions = eval_diff_regressions(&baseline, &candidate, &diff, &args)?;
     emit_diff(&diff, args.json, args.output.as_deref())?;
     if regressions.is_empty() {
@@ -195,6 +181,10 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
         report.run_id, report.suite
     ));
     output.push_str(&format!(
+        "manifest: schema={} suite_digest={}\n",
+        report.manifest_schema_version, report.suite_digest
+    ));
+    output.push_str(&format!(
         "cases: total={} scored={} passed={} failed={} skipped={} pending={} infra_failed={}\n",
         metrics.total_cases,
         metrics.scored_cases,
@@ -269,6 +259,7 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
         "Eval diff {} -> {} ({})\n",
         diff.baseline_run_id, diff.candidate_run_id, diff.suite
     ));
+    output.push_str(&format!("suite_digest: {}\n", diff.suite_digest));
     output.push_str(&format!(
         "pass@1 delta: {:+.4}  pass^{} delta: {:+.4}\n",
         diff.delta.pass_at_1_delta, diff.k, diff.delta.pass_to_k_delta
@@ -554,11 +545,18 @@ mod tests {
     use harness_workflow::runtime::{
         EvalAttestationSummary, EvalEvidenceStatus, EvalIsolationEvidence, EvalQualityGateEvidence,
         EvalReportCase, EvalReportFailedGate, EvalReportMetrics, EvalSubmissionEvidence,
+        EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION,
     };
+
+    const TEST_SUITE_DIGEST: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const TEST_MANIFEST_DIGEST: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
     fn sample_eval_manifest() -> EvalBenchmarkManifest {
         parse_benchmark_manifest_str(
             r#"
+schema_version = "eval-benchmark-manifest/v0.1"
 suite = "harness-core"
 
 [[cases]]
@@ -773,6 +771,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         )
         .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
         let diff = diff_eval_run_reports(&baseline, &candidate);
+        let diff = diff.unwrap_or_else(|error| panic!("diff should build: {error}"));
         let rendered = render_diff_report(&diff);
 
         assert!(rendered.contains("pass_to_fail"));
@@ -812,6 +811,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
 
         let diff = diff_eval_run_reports(&baseline, &candidate);
+        let diff = diff.unwrap_or_else(|error| panic!("diff should build: {error}"));
         let transition = diff
             .transitions
             .iter()
@@ -881,7 +881,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
     }
 
     #[test]
-    fn eval_report_diff_rejects_suite_or_k_mismatch() {
+    fn eval_report_diff_allows_suite_rename_but_rejects_digest_or_k_mismatch() {
         let tempdir = tempfile::tempdir()
             .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
         let baseline_path = tempdir.path().join("baseline.json");
@@ -904,6 +904,24 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         )
         .unwrap_or_else(|error| panic!("candidate should write: {error}"));
 
+        diff_eval_reports(EvalDiffArgs {
+            baseline: baseline_path.clone(),
+            candidate: candidate_path.clone(),
+            max_pass_drop: None,
+            fail_on_new_f_gate: false,
+            json: false,
+            output: None,
+        })
+        .unwrap_or_else(|error| panic!("readable suite rename should not reject diff: {error}"));
+
+        candidate.suite_digest =
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333".to_string();
+        fs::write(
+            &candidate_path,
+            serde_json::to_string_pretty(&candidate)
+                .unwrap_or_else(|error| panic!("candidate should serialize: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("candidate should write: {error}"));
         let error = match diff_eval_reports(EvalDiffArgs {
             baseline: baseline_path.clone(),
             candidate: candidate_path.clone(),
@@ -912,13 +930,13 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             json: false,
             output: None,
         }) {
-            Ok(_) => panic!("different suites should be rejected"),
+            Ok(_) => panic!("different suite digests should be rejected"),
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("different suites"));
+        assert!(error.to_string().contains("different suite digests"));
 
-        candidate.suite = baseline.suite.clone();
+        candidate.suite_digest = baseline.suite_digest.clone();
         candidate.k = 5;
         fs::write(
             &candidate_path,
@@ -1223,6 +1241,9 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         EvalRunReport {
             run_id: run_id.to_string(),
             suite: "harness-core".to_string(),
+            manifest_schema_version: EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION.to_string(),
+            suite_digest: TEST_SUITE_DIGEST.to_string(),
+            manifest_digest: TEST_MANIFEST_DIGEST.to_string(),
             k: 1,
             metrics: EvalReportMetrics {
                 total_cases,

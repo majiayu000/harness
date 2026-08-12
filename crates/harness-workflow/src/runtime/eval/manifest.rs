@@ -2,9 +2,11 @@ use super::super::model::RuntimeKind;
 use harness_core::config::isolation::IsolationTier;
 use harness_sandbox::{CappedResourceLimits, ResourceLimits};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::{error::Error, fmt};
 
+pub const EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION: &str = "eval-benchmark-manifest/v0.1";
 pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 3_600;
 pub const DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE: &str = "eval-isolated-runtime-host";
 pub const DEFAULT_EVAL_ISOLATION_SANDBOX: &str = "workspace-write";
@@ -13,6 +15,7 @@ pub const DEFAULT_EVAL_ISOLATION_IMAGE: &str = "harness-eval-runner:local";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EvalBenchmarkManifest {
+    pub schema_version: String,
     pub suite: String,
     pub cases: Vec<EvalBenchmarkCase>,
 }
@@ -143,6 +146,8 @@ impl Error for ManifestError {}
 
 #[derive(Deserialize)]
 struct RawManifest {
+    #[serde(default = "default_eval_benchmark_manifest_schema_version")]
+    schema_version: String,
     suite: String,
     #[serde(default)]
     default_timeout_secs: Option<u64>,
@@ -191,7 +196,26 @@ pub fn parse_benchmark_manifest_str(input: &str) -> Result<EvalBenchmarkManifest
     normalize_manifest(raw)
 }
 
+pub fn eval_benchmark_suite_digest(manifest: &EvalBenchmarkManifest) -> String {
+    let material = SuiteDigestMaterial {
+        schema_version: &manifest.schema_version,
+        cases: sorted_cases(manifest),
+    };
+    prefixed_sha256_json(&material)
+}
+
+pub fn eval_benchmark_manifest_digest(manifest: &EvalBenchmarkManifest) -> String {
+    let material = ManifestDigestMaterial {
+        schema_version: &manifest.schema_version,
+        suite: &manifest.suite,
+        cases: sorted_cases(manifest),
+    };
+    prefixed_sha256_json(&material)
+}
+
 fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, ManifestError> {
+    let schema_version = non_empty(raw.schema_version, "schema_version")?;
+    validate_schema_version(&schema_version)?;
     let suite = non_empty(raw.suite, "suite")?;
     if raw.cases.is_empty() {
         return Err(ManifestError::new(
@@ -276,7 +300,45 @@ fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, Manifes
         });
     }
 
-    Ok(EvalBenchmarkManifest { suite, cases })
+    Ok(EvalBenchmarkManifest {
+        schema_version,
+        suite,
+        cases,
+    })
+}
+
+#[derive(Serialize)]
+struct SuiteDigestMaterial<'a> {
+    schema_version: &'a str,
+    cases: Vec<&'a EvalBenchmarkCase>,
+}
+
+#[derive(Serialize)]
+struct ManifestDigestMaterial<'a> {
+    schema_version: &'a str,
+    suite: &'a str,
+    cases: Vec<&'a EvalBenchmarkCase>,
+}
+
+fn sorted_cases(manifest: &EvalBenchmarkManifest) -> Vec<&EvalBenchmarkCase> {
+    let mut cases = manifest.cases.iter().collect::<Vec<_>>();
+    cases.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+    cases
+}
+
+fn prefixed_sha256_json<T: Serialize>(value: &T) -> String {
+    let encoded = serde_json::to_vec(value)
+        .expect("eval benchmark digest material serialization is infallible");
+    format!("sha256:{:x}", Sha256::digest(encoded))
+}
+
+fn validate_schema_version(schema_version: &str) -> Result<(), ManifestError> {
+    if schema_version != EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION {
+        return Err(ManifestError::new(format!(
+            "unsupported manifest schema_version `{schema_version}`; expected `{EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION}`"
+        )));
+    }
+    Ok(())
 }
 
 fn non_empty(value: String, field: &str) -> Result<String, ManifestError> {
@@ -551,11 +613,16 @@ fn default_cleanup_required() -> bool {
     true
 }
 
+fn default_eval_benchmark_manifest_schema_version() -> String {
+    EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const VALID_MANIFEST: &str = r#"
+schema_version = "eval-benchmark-manifest/v0.1"
 suite = "harness-core"
 default_timeout_secs = 7200
 
@@ -589,6 +656,12 @@ timeout_secs = 1800
         let manifest = parse_benchmark_manifest_str(VALID_MANIFEST).expect("manifest should parse");
 
         assert_eq!(manifest.suite, "harness-core");
+        assert_eq!(
+            manifest.schema_version,
+            EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION
+        );
+        assert!(eval_benchmark_suite_digest(&manifest).starts_with("sha256:"));
+        assert!(eval_benchmark_manifest_digest(&manifest).starts_with("sha256:"));
         assert_eq!(manifest.cases.len(), 2);
         assert_eq!(manifest.cases[0].case_id, "majiayu000/harness#1437");
         assert_eq!(manifest.cases[0].timeout_secs, 7200);
@@ -653,6 +726,121 @@ resource_limits = { cpu_time_secs = 120, memory_bytes = 33554432, output_bytes =
         assert_eq!(limits.effective.output_bytes, Some(1024));
         assert_eq!(limits.effective.wall_time_secs, Some(90));
         assert_eq!(limits.caps.len(), 3);
+    }
+
+    #[test]
+    fn eval_manifest_digest_binds_semantic_suite_identity() {
+        let left = parse_benchmark_manifest_str(
+            r#"
+schema_version = "eval-benchmark-manifest/v0.1"
+suite = "harness-core"
+default_timeout_secs = 7200
+
+[[cases]]
+case_id = "case-b"
+repo = "majiayu000/harness"
+issue = 1447
+base_commit = "69f5e113"
+verify_commands = ["cargo test -p harness-cli eval"]
+timeout_secs = 1800
+
+[[cases]]
+case_id = "case-a"
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "b308b380"
+verify_commands = ["cargo test -p harness-workflow eval_manifest"]
+"#,
+        )
+        .expect("left manifest should parse");
+        let right = parse_benchmark_manifest_str(
+            r#"
+schema_version="eval-benchmark-manifest/v0.1"
+suite="renamed-readable-suite"
+
+[[cases]]
+case_id="case-a"
+repo="majiayu000/harness"
+issue=1437
+base_commit="b308b380"
+verify_commands=["cargo test -p harness-workflow eval_manifest"]
+timeout_secs=7200
+
+[[cases]]
+case_id="case-b"
+repo="majiayu000/harness"
+issue=1447
+base_commit="69f5e113"
+verify_commands=["cargo test -p harness-cli eval"]
+timeout_secs=1800
+"#,
+        )
+        .expect("right manifest should parse");
+
+        assert_eq!(
+            eval_benchmark_suite_digest(&left),
+            eval_benchmark_suite_digest(&right)
+        );
+        assert_ne!(
+            eval_benchmark_manifest_digest(&left),
+            eval_benchmark_manifest_digest(&right)
+        );
+    }
+
+    #[test]
+    fn eval_manifest_digest_changes_for_meaningful_command_drift() {
+        let baseline = parse_benchmark_manifest_str(
+            r#"
+schema_version = "eval-benchmark-manifest/v0.1"
+suite = "harness-core"
+
+[[cases]]
+case_id = "case-a"
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "b308b380"
+verify_commands = ["cargo test -p harness-workflow eval_manifest"]
+"#,
+        )
+        .expect("baseline manifest should parse");
+        let candidate = parse_benchmark_manifest_str(
+            r#"
+schema_version = "eval-benchmark-manifest/v0.1"
+suite = "harness-core"
+
+[[cases]]
+case_id = "case-a"
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "b308b380"
+verify_commands = ["cargo test -p harness-workflow eval_report"]
+"#,
+        )
+        .expect("candidate manifest should parse");
+
+        assert_ne!(
+            eval_benchmark_suite_digest(&baseline),
+            eval_benchmark_suite_digest(&candidate)
+        );
+    }
+
+    #[test]
+    fn eval_manifest_rejects_unsupported_schema_version() {
+        let input = r#"
+schema_version = "eval-benchmark-manifest/v9"
+suite = "harness-core"
+
+[[cases]]
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "b308b380"
+verify_commands = ["cargo test"]
+"#;
+
+        let err = parse_benchmark_manifest_str(input).expect_err("unsupported schema should fail");
+        assert!(err
+            .to_string()
+            .contains("unsupported manifest schema_version"));
     }
 
     #[test]

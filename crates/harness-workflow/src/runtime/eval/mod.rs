@@ -38,11 +38,12 @@ pub use historical_replay::{
     HISTORICAL_REPLAY_COHORT_SCHEMA,
 };
 pub use manifest::{
-    parse_benchmark_manifest_str, EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseRisk,
-    EvalCaseVerdict, EvalCommitResolution, EvalIsolationLifecycle, EvalIsolationProfile,
-    ManifestError, DEFAULT_CASE_TIMEOUT_SECS, DEFAULT_EVAL_ISOLATION_BACKEND,
-    DEFAULT_EVAL_ISOLATION_IMAGE, DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE,
-    DEFAULT_EVAL_ISOLATION_SANDBOX,
+    eval_benchmark_manifest_digest, eval_benchmark_suite_digest, parse_benchmark_manifest_str,
+    EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseRisk, EvalCaseVerdict, EvalCommitResolution,
+    EvalIsolationLifecycle, EvalIsolationProfile, ManifestError, DEFAULT_CASE_TIMEOUT_SECS,
+    DEFAULT_EVAL_ISOLATION_BACKEND, DEFAULT_EVAL_ISOLATION_IMAGE,
+    DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE, DEFAULT_EVAL_ISOLATION_SANDBOX,
+    EVAL_BENCHMARK_MANIFEST_SCHEMA_VERSION,
 };
 pub use report::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,

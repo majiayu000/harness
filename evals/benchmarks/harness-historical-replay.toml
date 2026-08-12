@@ -1,3 +1,4 @@
+schema_version = "eval-benchmark-manifest/v0.1"
 suite = "harness-historical-replay"
 default_timeout_secs = 7200
 
