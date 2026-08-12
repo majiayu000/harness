@@ -2,18 +2,19 @@ use super::*;
 use harness_core::{agent::AgentDiagnosticSeverity, types::Item};
 use std::collections::HashMap;
 
-fn test_turn_request(project_root: PathBuf) -> TurnRequest {
-    TurnRequest {
+fn test_turn_request(project_root: PathBuf) -> AgentRequest {
+    AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root,
-        permission_mode: Default::default(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         model: None,
         reasoning_effort: None,
         execution_phase: None,
         sandbox_mode: None,
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),
@@ -86,7 +87,7 @@ fn parse_item_started_payload_notification() {
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
-        ParsedCodexMessage::Event(AgentEvent::ItemStartedPayload {
+        ParsedCodexMessage::Event(AgentEvent::ItemStarted {
             item: Item::ShellCommand {
                 command: "pwd".into(),
                 exit_code: None,
@@ -103,7 +104,7 @@ fn parse_item_completed_payload_notification() {
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
-        ParsedCodexMessage::Event(AgentEvent::ItemCompletedPayload {
+        ParsedCodexMessage::Event(AgentEvent::ItemCompleted {
             item: Item::AgentReasoning {
                 content: "done".into()
             }
@@ -308,17 +309,18 @@ fn approval_decision_result_uses_app_server_shape() {
 
 #[test]
 fn start_params_include_runtime_profile_overrides() {
-    let req = TurnRequest {
+    let req = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
-        permission_mode: Default::default(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         model: Some("gpt-runtime".to_string()),
         reasoning_effort: Some("medium".to_string()),
         execution_phase: None,
         sandbox_mode: Some(SandboxMode::WorkspaceWrite),
         approval_policy: Some("on-request".to_string()),
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: Some(60),
         env_vars: HashMap::new(),
@@ -375,17 +377,18 @@ fn configured_adapter_applies_defaults_identity_and_secret_filtering() {
     );
     let mut env_vars = HashMap::new();
     env_vars.insert("SETUP_SECRET".to_string(), "secret-value".to_string());
-    let request = TurnRequest {
+    let request = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
-        permission_mode: Default::default(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         model: None,
         reasoning_effort: None,
         execution_phase: None,
         sandbox_mode: None,
         approval_policy: Some("on-request".to_string()),
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars,
@@ -423,19 +426,20 @@ async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()
                 setup_secret_env: Vec::new(),
             },
         },
-        SandboxMode::WorkspaceWrite,
+        SandboxMode::DangerFullAccess,
     );
-    let request = TurnRequest {
+    let request = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: dir.path().to_path_buf(),
-        permission_mode: Default::default(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         model: None,
         reasoning_effort: None,
         execution_phase: None,
         sandbox_mode: None,
         approval_policy: Some("on-request".to_string()),
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),
@@ -443,12 +447,12 @@ async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()
     };
     let (tx, _rx) = mpsc::channel(4);
 
-    adapter
+    let error = adapter
         .start_turn(request, tx)
         .await
         .expect_err("missing codex executable should fail after setup");
 
-    assert!(marker.exists());
+    assert!(marker.exists(), "setup marker missing after error: {error}");
     Ok(())
 }
 
@@ -460,7 +464,7 @@ async fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow:
         harness_core::agent::AGENT_ISOLATION_TIER_ENV.to_string(),
         "container".to_string(),
     );
-    let request = TurnRequest {
+    let request = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: root.path().to_path_buf(),
@@ -471,6 +475,7 @@ async fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow:
         sandbox_mode: Some(SandboxMode::WorkspaceWrite),
         approval_policy: Some("on-request".to_string()),
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars,
@@ -709,7 +714,7 @@ async fn start_turn_missing_workspace_reports_workspace_missing() -> anyhow::Res
     let dir = tempfile::tempdir()?;
     let missing = dir.path().join("missing-workspace");
     let adapter = CodexAdapter::new(std::env::current_exe()?);
-    let request = TurnRequest {
+    let request = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: missing.clone(),
@@ -720,6 +725,7 @@ async fn start_turn_missing_workspace_reports_workspace_missing() -> anyhow::Res
         sandbox_mode: None,
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),
@@ -777,7 +783,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         state.child_workspace = Some(PathBuf::from("/tmp/project"));
     }
 
-    let req = TurnRequest {
+    let req = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
@@ -788,6 +794,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         sandbox_mode: None,
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),

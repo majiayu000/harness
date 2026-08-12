@@ -45,7 +45,7 @@ pub fn parse_stream_json_events(line: &str) -> Vec<AgentEvent> {
                 input,
             }]
         }
-        "tool_result" => vec![AgentEvent::ItemCompleted],
+        "tool_result" => vec![AgentEvent::ItemCompletedKind],
         "result" => match parse_result_failure_value(&v) {
             Some(message) => vec![AgentEvent::Error { message }],
             None => {
