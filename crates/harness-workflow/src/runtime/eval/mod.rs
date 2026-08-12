@@ -7,6 +7,7 @@
 pub mod attestation;
 mod data;
 pub mod evidence;
+pub mod execute;
 pub mod historical_replay;
 pub mod manifest;
 pub mod model;
@@ -29,6 +30,7 @@ pub use evidence::{
     collect_eval_case_evidence, collect_eval_case_evidence_from_records, EvalCaseEvidence,
     EvalEvidenceStatus, EvalIsolationEvidence, EvalQualityGateEvidence, EvalSubmissionEvidence,
 };
+pub use execute::{execute_manifest, EvalExecuteConfig, DEFAULT_EVAL_POLL_INTERVAL};
 pub use historical_replay::{
     historical_replay_command_digest, parse_historical_replay_cohort_str,
     validate_historical_replay_cohort, HistoricalReplayCase, HistoricalReplayCohort,

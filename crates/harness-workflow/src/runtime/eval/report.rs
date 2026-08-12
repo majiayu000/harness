@@ -459,6 +459,15 @@ fn evidence_case_status(evidence: &EvalCaseEvidence, passed: bool) -> EvalReport
     if evidence.status == EvalEvidenceStatus::Skipped {
         return EvalReportCaseStatus::Skipped;
     }
+    if matches!(
+        evidence.status,
+        EvalEvidenceStatus::TimedOut
+            | EvalEvidenceStatus::DispatchFailed
+            | EvalEvidenceStatus::EvidenceIncomplete
+            | EvalEvidenceStatus::BudgetExhausted
+    ) {
+        return EvalReportCaseStatus::Failed;
+    }
     if evidence.missing_evidence.iter().any(|missing| {
         matches!(
             missing.as_str(),
@@ -777,6 +786,34 @@ mod tests {
             passed.infrastructure_status,
             EvalCaseInfrastructureStatus::Healthy
         );
+    }
+
+    #[test]
+    fn eval_execute_terminal_failure_statuses_are_scored_failures() {
+        for status in [
+            EvalEvidenceStatus::TimedOut,
+            EvalEvidenceStatus::DispatchFailed,
+            EvalEvidenceStatus::EvidenceIncomplete,
+            EvalEvidenceStatus::BudgetExhausted,
+        ] {
+            let report = eval_report_from_evidence(
+                &manifest(&["case-fail"]),
+                "candidate",
+                1,
+                vec![evidence(
+                    "case-fail",
+                    status,
+                    vec!["case_timeout".to_string()],
+                    None,
+                )],
+            )
+            .expect("report should build");
+
+            assert_eq!(report.cases[0].status, EvalReportCaseStatus::Failed);
+            assert_eq!(report.metrics.scored_cases, 1);
+            assert_eq!(report.metrics.failed_cases, 1);
+            assert_eq!(report.metrics.skipped_cases, 0);
+        }
     }
 
     #[test]

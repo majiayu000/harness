@@ -1,16 +1,20 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
+use harness_core::config::{dirs::default_db_path, HarnessConfig};
+use harness_observe::event_store::EventStore;
 use harness_workflow::runtime::eval::model::EvalGrade;
 use harness_workflow::runtime::{
-    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
+    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence, execute_manifest,
     parse_benchmark_manifest_str, EvalAttestationDecision, EvalAttestationTrust,
     EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseInfrastructureStatus, EvalCaseTransition,
-    EvalCaseTransitionKind, EvalReportCaseStatus, EvalRunReport, EvalRunReportDiff,
+    EvalCaseTransitionKind, EvalExecuteConfig, EvalReportCaseStatus, EvalRunReport,
+    EvalRunReportDiff, WorkflowRuntimeStore,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const PASS_DROP_EPSILON: f64 = 1e-9;
 
@@ -39,6 +43,15 @@ pub struct EvalRunArgs {
     /// Validate the manifest and list cases without requiring collected evidence
     #[arg(long)]
     pub dry_run: bool,
+    /// Dispatch each replayable case through the workflow runtime and collect evidence in-process
+    #[arg(long)]
+    pub execute: bool,
+    /// Override each case timeout while executing
+    #[arg(long)]
+    pub case_timeout_secs: Option<u64>,
+    /// Poll interval while waiting for executed cases
+    #[arg(long, default_value_t = 5_000)]
+    pub poll_interval_ms: u64,
     /// Print JSON instead of the compact text report
     #[arg(long)]
     pub json: bool,
@@ -67,34 +80,131 @@ pub struct EvalDiffArgs {
     pub output: Option<PathBuf>,
 }
 
-pub async fn run(cmd: EvalCommand) -> anyhow::Result<()> {
+pub async fn run(cmd: EvalCommand, config: &HarnessConfig) -> anyhow::Result<()> {
     match cmd {
-        EvalCommand::Run(args) => run_eval_report(args).await,
+        EvalCommand::Run(args) => run_eval_report(args, config).await,
         EvalCommand::Diff(args) => diff_eval_reports(args),
     }
 }
 
-async fn run_eval_report(args: EvalRunArgs) -> anyhow::Result<()> {
-    if args.dry_run && args.evidence.is_some() {
-        anyhow::bail!("use either --dry-run or --evidence, not both");
+async fn run_eval_report(args: EvalRunArgs, config: &HarnessConfig) -> anyhow::Result<()> {
+    let selected_modes =
+        u8::from(args.dry_run) + u8::from(args.evidence.is_some()) + u8::from(args.execute);
+    if selected_modes > 1 {
+        anyhow::bail!("use only one of --execute, --dry-run, or --evidence");
     }
 
     let manifest = read_eval_manifest(&args.manifest)?;
     let run_id = args
         .run_id
+        .clone()
         .unwrap_or_else(|| default_run_id(&manifest.suite));
+    let output = eval_report_output_path(args.output.as_ref(), args.execute, &run_id)?;
     let report = if args.dry_run {
         eval_report_dry_run(&manifest, run_id, args.k)?
     } else if let Some(evidence_path) = args.evidence.as_ref() {
         let evidence = read_evidence(evidence_path)?;
         eval_report_from_evidence(&manifest, run_id, args.k, evidence)?
+    } else if args.execute {
+        execute_eval_report(&manifest, &run_id, args.k, &args, config).await?
     } else {
         anyhow::bail!(
-            "live eval execution is not wired to the CLI yet; pass --evidence to report collected evidence or --dry-run to validate the manifest"
+            "choose an eval run mode: pass --execute to dispatch cases, --evidence to report collected evidence, or --dry-run to validate the manifest"
         );
     };
 
-    emit_report(&report, args.json, args.output.as_deref())
+    emit_report(&report, args.json, output.as_deref())
+}
+
+async fn execute_eval_report(
+    manifest: &EvalBenchmarkManifest,
+    run_id: &str,
+    k: u32,
+    args: &EvalRunArgs,
+    config: &HarnessConfig,
+) -> anyhow::Result<EvalRunReport> {
+    if args.poll_interval_ms == 0 {
+        anyhow::bail!("--poll-interval-ms must be greater than zero");
+    }
+    if args.case_timeout_secs == Some(0) {
+        anyhow::bail!("--case-timeout-secs must be greater than zero");
+    }
+    if config.server.database_url.is_none() {
+        anyhow::bail!(
+            "--execute requires server.database_url or HARNESS_DATABASE_URL so the evaluator can use the workflow runtime store"
+        );
+    }
+    let store_path = default_db_path(&config.server.data_dir, "workflow_runtime");
+    let store = WorkflowRuntimeStore::open_with_database_url(
+        &store_path,
+        config.server.database_url.as_deref(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to open workflow runtime store at {}",
+            store_path.display()
+        )
+    })?;
+    let observe = EventStore::with_policies_and_otel_with_database_url(
+        &config.server.data_dir,
+        config.server.database_url.as_deref(),
+        config.observe.session_renewal_secs,
+        config.observe.log_retention_days,
+        &config.otel,
+    )
+    .await
+    .context("failed to open observe event store for eval execution")?;
+
+    let mut execute_config = EvalExecuteConfig::new(
+        run_id,
+        config.server.project_root.to_string_lossy().into_owned(),
+        k,
+    );
+    execute_config.poll_interval = Duration::from_millis(args.poll_interval_ms);
+    execute_config.case_timeout_override = args.case_timeout_secs.map(Duration::from_secs);
+
+    let report = execute_manifest(&store, &observe, manifest, execute_config).await;
+    observe.shutdown().await;
+    report
+}
+
+fn eval_report_output_path(
+    requested: Option<&PathBuf>,
+    execute: bool,
+    run_id: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let output = requested
+        .cloned()
+        .or_else(|| execute.then(|| default_execute_output_path(run_id)));
+    if execute {
+        let existing = output
+            .as_ref()
+            .map(|path| {
+                path.try_exists().with_context(|| {
+                    format!("failed to inspect eval output path {}", path.display())
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if existing {
+            let path = output
+                .as_ref()
+                .expect("existing output path should be present");
+            anyhow::bail!(
+                "eval execute report already exists at {}; choose a new --run-id or --output",
+                path.display()
+            );
+        }
+    }
+    Ok(output)
+}
+
+fn default_execute_output_path(run_id: &str) -> PathBuf {
+    PathBuf::from("artifacts")
+        .join("eval")
+        .join(run_id)
+        .join("report.json")
 }
 
 fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
@@ -609,8 +719,33 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                 assert_eq!(args.evidence, Some(PathBuf::from("evidence.json")));
                 assert_eq!(args.run_id.as_deref(), Some("run-1"));
                 assert_eq!(args.k, 5);
+                assert!(!args.execute);
                 assert!(args.json);
                 assert_eq!(args.output, Some(PathBuf::from("report.json")));
+            }
+            _ => panic!("expected eval run command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "harness",
+            "eval",
+            "run",
+            "--manifest",
+            "evals/benchmarks/harness-core.toml",
+            "--execute",
+            "--case-timeout-secs",
+            "30",
+            "--poll-interval-ms",
+            "250",
+        ])
+        .unwrap_or_else(|error| panic!("eval execute command should parse: {error}"));
+        match cli.command {
+            Command::Eval {
+                cmd: EvalCommand::Run(args),
+            } => {
+                assert!(args.execute);
+                assert_eq!(args.case_timeout_secs, Some(30));
+                assert_eq!(args.poll_interval_ms, 250);
             }
             _ => panic!("expected eval run command"),
         }
@@ -1123,6 +1258,25 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             .unwrap_or_else(|error| panic!("nested output should write: {error}"));
 
         assert!(output.exists());
+    }
+
+    #[test]
+    fn eval_execute_output_defaults_to_run_artifact_path_and_refuses_overwrite() {
+        let default = eval_report_output_path(None, true, "run-1")
+            .unwrap_or_else(|error| panic!("default execute output should resolve: {error}"));
+        assert_eq!(
+            default,
+            Some(PathBuf::from("artifacts/eval/run-1/report.json"))
+        );
+
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let existing = tempdir.path().join("report.json");
+        fs::write(&existing, "{}").unwrap_or_else(|error| panic!("report should write: {error}"));
+
+        let error = eval_report_output_path(Some(&existing), true, "run-1")
+            .expect_err("execute must refuse to overwrite an existing report");
+        assert!(error.to_string().contains("already exists"));
     }
 
     fn case_evidence(

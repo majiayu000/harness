@@ -18,6 +18,10 @@ pub enum EvalEvidenceStatus {
     Passed,
     Failed,
     Skipped,
+    TimedOut,
+    DispatchFailed,
+    EvidenceIncomplete,
+    BudgetExhausted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
