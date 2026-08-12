@@ -1,5 +1,9 @@
 use chrono::{DateTime, Utc};
-use harness_core::{types::SkillId, types::SkillLocation};
+use harness_core::{
+    retrieval::{score_lexical_relevance, LexicalRelevanceScore, RetrievalField},
+    types::SkillId,
+    types::SkillLocation,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -272,18 +276,27 @@ impl SkillStore {
     }
 
     pub fn match_prompt(&self, prompt: &str) -> Vec<&Skill> {
-        let prompt_lower = prompt.to_lowercase();
-        self.skills
+        let mut matches = self
+            .skills
             .iter()
-            .filter(|skill| {
-                !skill.trigger_patterns.is_empty()
-                    && skill
-                        .trigger_patterns
-                        .iter()
-                        .any(|p| prompt_lower.contains(&p.to_lowercase()))
-                    && allows_auto_injection(skill, prompt)
+            .filter_map(|skill| {
+                if skill.trigger_patterns.is_empty() || !allows_auto_injection(skill, prompt) {
+                    return None;
+                }
+                if skill_trigger_relevance(prompt, skill).score <= 0.0 {
+                    return None;
+                }
+                let relevance = skill_prompt_relevance(prompt, skill);
+                Some((skill, relevance.score))
             })
-            .collect()
+            .collect::<Vec<_>>();
+        matches.sort_by(|(left, left_score), (right, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| right.quality_score.total_cmp(&left.quality_score))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        matches.into_iter().map(|(skill, _score)| skill).collect()
     }
 
     /// Apply an outcome summary to a skill and update governance state.
@@ -673,6 +686,26 @@ fn allows_auto_injection(skill: &Skill, prompt: &str) -> bool {
         }
         SkillGovernanceStatus::Retired => false,
     }
+}
+
+fn skill_prompt_relevance(prompt: &str, skill: &Skill) -> LexicalRelevanceScore {
+    let mut fields = Vec::with_capacity(skill.trigger_patterns.len() + 3);
+    for pattern in &skill.trigger_patterns {
+        fields.push(RetrievalField::new(pattern, 2.0));
+    }
+    fields.push(RetrievalField::new(&skill.name, 0.8));
+    fields.push(RetrievalField::new(&skill.description, 1.2));
+    fields.push(RetrievalField::new(&skill.content, 0.25));
+    score_lexical_relevance(prompt, &fields)
+}
+
+fn skill_trigger_relevance(prompt: &str, skill: &Skill) -> LexicalRelevanceScore {
+    let fields = skill
+        .trigger_patterns
+        .iter()
+        .map(|pattern| RetrievalField::new(pattern, 2.0))
+        .collect::<Vec<_>>();
+    score_lexical_relevance(prompt, &fields)
 }
 
 fn in_canary_bucket(skill_id: &SkillId, prompt: &str, ratio: f64) -> bool {
