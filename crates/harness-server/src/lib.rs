@@ -11,10 +11,6 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_types))]
 #![cfg_attr(test, allow(clippy::disallowed_types))]
 
-// Modules extracted to `harness-workflow`; re-exported so existing `crate::*`
-// paths inside this crate continue to resolve without modification.
-pub use harness_workflow::checkpoint;
-pub use harness_workflow::circuit_breaker;
 pub mod alerting;
 pub mod assets;
 pub(crate) mod command_safety;
@@ -30,6 +26,7 @@ pub(crate) mod github_pr_hygiene;
 pub(crate) mod github_pr_merge;
 pub(crate) mod github_pr_snapshot;
 pub mod handlers;
+mod hook_circuit_breaker;
 pub mod hook_enforcer;
 pub mod http;
 pub mod intake;
@@ -62,18 +59,18 @@ pub mod services;
 pub mod skill_governor;
 pub mod stdio;
 pub mod task_db;
+pub(crate) mod task_queue;
+pub mod task_runner;
+pub mod thread_manager;
+pub mod trusted_proxy;
+pub mod webhook;
+pub mod websocket;
 #[cfg(test)]
 pub(crate) mod workflow_runtime_plan_issue;
 pub(crate) mod workflow_runtime_policy;
 pub(crate) mod workflow_runtime_pr_feedback;
 pub(crate) mod workflow_runtime_submission;
 pub(crate) mod workflow_runtime_worker;
-pub use harness_workflow::task_queue;
-pub mod task_runner;
-pub mod thread_manager;
-pub mod trusted_proxy;
-pub mod webhook;
-pub mod websocket;
 pub mod workspace;
 pub(crate) mod workspace_lease_store;
 pub(crate) mod workspace_pool;
@@ -83,6 +80,9 @@ pub(crate) mod test_helpers;
 
 #[cfg(test)]
 mod runtime_hosts_tests;
+
+#[cfg(test)]
+mod historical_replay_tests;
 
 #[cfg(test)]
 mod runtime_state_store_tests;

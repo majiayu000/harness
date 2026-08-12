@@ -1,5 +1,5 @@
 use crate::codex::{parse_codex_error_item_message, parse_codex_item, parse_codex_token_usage};
-use harness_core::agent::{AgentDiagnosticSeverity, AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::agent::{AgentDiagnosticSeverity, AgentEvent, AgentRequest, ApprovalDecision};
 use harness_core::config::agents::SandboxMode;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -61,7 +61,7 @@ pub(super) fn sandbox_policy_value(
     })
 }
 
-pub(super) fn thread_start_params(req: &TurnRequest, child_workspace: &Path) -> Value {
+pub(super) fn thread_start_params(req: &AgentRequest, child_workspace: &Path) -> Value {
     json!({
         "cwd": child_workspace,
         "model": req.model,
@@ -72,7 +72,7 @@ pub(super) fn thread_start_params(req: &TurnRequest, child_workspace: &Path) -> 
 }
 
 pub(super) fn turn_start_params(
-    req: &TurnRequest,
+    req: &AgentRequest,
     thread_id: &str,
     child_workspace: &Path,
 ) -> Value {
@@ -165,7 +165,7 @@ fn parse_app_server_agent_event(
         "item/started" => params
             .get("item")
             .and_then(parse_codex_item)
-            .map(|item| ParsedCodexMessage::Event(AgentEvent::ItemStartedPayload { item }))
+            .map(|item| ParsedCodexMessage::Event(AgentEvent::ItemStarted { item }))
             .unwrap_or(ParsedCodexMessage::Ignore),
         "item/completed" => params
             .get("item")
@@ -177,9 +177,7 @@ fn parse_app_server_agent_event(
                     })
                 } else {
                     parse_codex_item(item)
-                        .map(|item| {
-                            ParsedCodexMessage::Event(AgentEvent::ItemCompletedPayload { item })
-                        })
+                        .map(|item| ParsedCodexMessage::Event(AgentEvent::ItemCompleted { item }))
                         .unwrap_or(ParsedCodexMessage::Ignore)
                 }
             })
