@@ -359,6 +359,29 @@ pub(crate) async fn mark_turn_failed(
     tracing::error!("turn failed: {error}");
 }
 
+pub(crate) async fn mark_turn_cancelled(
+    server: &crate::server::HarnessServer,
+    notify_tx: &Option<crate::notify::NotifySender>,
+    notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
+    reason: String,
+) {
+    if let Err(err) = server.thread_manager.cancel_turn(thread_id, turn_id) {
+        tracing::warn!("failed to mark turn as cancelled: {err}");
+    }
+    emit_runtime_notification(
+        notify_tx,
+        notification_tx,
+        Notification::TurnCompleted {
+            turn_id: turn_id.clone(),
+            status: TurnStatus::Cancelled,
+            token_usage: harness_core::types::TokenUsage::default(),
+        },
+    );
+    tracing::info!("turn cancelled: {reason}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +396,38 @@ mod tests {
         RuntimeKind, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
     };
     use std::str::FromStr;
+
+    #[tokio::test]
+    async fn mark_turn_cancelled_transitions_turn_status() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = HarnessConfig::default();
+        config.server.project_root = dir.path().to_path_buf();
+        let server = HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("codex"));
+        let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+        let turn_id = server.thread_manager.start_turn(
+            &thread_id,
+            "prompt".to_string(),
+            AgentId::from_str("codex"),
+        )?;
+        let (notification_tx, _) = tokio::sync::broadcast::channel(16);
+
+        mark_turn_cancelled(
+            &server,
+            &None,
+            &notification_tx,
+            &thread_id,
+            &turn_id,
+            "codex turn interrupted".to_string(),
+        )
+        .await;
+
+        let turn = server
+            .thread_manager
+            .get_turn(&thread_id, &turn_id)
+            .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
+        assert_eq!(turn.status, TurnStatus::Cancelled);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn workflow_runtime_worker_token_usage_persists_runtime_usage() -> anyhow::Result<()> {

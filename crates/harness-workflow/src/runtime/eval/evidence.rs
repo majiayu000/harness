@@ -1,5 +1,7 @@
+use super::attestation::EvalAttestationSummary;
 use super::model::{
-    Confidence, RuntimeErrorKind, RuntimeJobSnapshot, RuntimeSnapshot, UsageSnapshot,
+    Confidence, QualitySnapshot, RuntimeErrorKind, RuntimeJobSnapshot, RuntimeSnapshot,
+    UsageSnapshot,
 };
 use crate::runtime::{
     ActivityErrorKind, ActivityResult, RuntimeEvent, RuntimeJob, RuntimeJobStatus,
@@ -15,6 +17,7 @@ use std::collections::BTreeMap;
 pub enum EvalEvidenceStatus {
     Passed,
     Failed,
+    Skipped,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -23,10 +26,14 @@ pub struct EvalCaseEvidence {
     pub case_id: String,
     pub workflow_id: Option<String>,
     pub status: EvalEvidenceStatus,
+    #[serde(default)]
+    pub attestation: EvalAttestationSummary,
     pub runtime: Option<RuntimeSnapshot>,
     pub usage: Vec<UsageSnapshot>,
     pub submission: Option<EvalSubmissionEvidence>,
     pub quality_gate: Option<EvalQualityGateEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<QualitySnapshot>,
     #[serde(default)]
     pub isolation: Option<EvalIsolationEvidence>,
     pub missing_evidence: Vec<String>,
@@ -163,10 +170,12 @@ pub fn collect_eval_case_evidence_from_records(
         case_id: case_id.to_string(),
         workflow_id,
         status,
+        attestation: EvalAttestationSummary::unsigned(),
         runtime,
         usage,
         submission,
         quality_gate,
+        quality: None,
         isolation,
         missing_evidence,
     }

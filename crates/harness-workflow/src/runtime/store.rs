@@ -46,6 +46,8 @@ mod definitions;
 mod driverless_progress;
 #[path = "store/events.rs"]
 mod events;
+#[path = "store/evidence.rs"]
+mod evidence;
 #[path = "store/instance_helpers.rs"]
 mod instance_helpers;
 #[path = "store/instances.rs"]
@@ -94,6 +96,13 @@ pub use coverage_recovery::{
 pub(in crate::runtime) use decision_provenance::insert_decision_record_once_tx;
 pub use decision_provenance::DecisionProvenanceConflict;
 pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};
+pub use evidence::{
+    WorkflowRunEvidence, WorkflowRunEvidenceExport, WorkflowRunEvidenceInput,
+    WorkflowRunEvidenceQuery, WORKFLOW_RUN_EVIDENCE_DEFAULT_LIMIT,
+    WORKFLOW_RUN_EVIDENCE_EXPORT_SCHEMA, WORKFLOW_RUN_EVIDENCE_MAX_LIMIT,
+    WORKFLOW_RUN_EVIDENCE_PAYLOAD_MAX_BYTES, WORKFLOW_RUN_EVIDENCE_RETENTION_MAX_BATCH,
+    WORKFLOW_RUN_EVIDENCE_SCHEMA,
+};
 pub use pr_binding_repair::WorkflowPrBindingRepairOutcome;
 pub(in crate::runtime) use prompt_payloads::insert_prompt_payload_tx;
 pub use prompt_payloads::PromptPayloadIntegrityError;
