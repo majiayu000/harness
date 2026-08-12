@@ -3,8 +3,9 @@ use clap::{Args, Subcommand};
 use harness_workflow::runtime::eval::model::EvalGrade;
 use harness_workflow::runtime::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
-    parse_benchmark_manifest_str, EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseTransitionKind,
-    EvalReportCaseStatus, EvalRunReport, EvalRunReportDiff,
+    parse_benchmark_manifest_str, EvalBenchmarkManifest, EvalCaseEvidence,
+    EvalCaseInfrastructureStatus, EvalCaseTransitionKind, EvalReportCaseStatus, EvalRunReport,
+    EvalRunReportDiff,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -194,11 +195,12 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
         report.run_id, report.suite
     ));
     output.push_str(&format!(
-        "cases: total={} scored={} passed={} failed={} pending={} infra_failed={}\n",
+        "cases: total={} scored={} passed={} failed={} skipped={} pending={} infra_failed={}\n",
         metrics.total_cases,
         metrics.scored_cases,
         metrics.passed_cases,
         metrics.failed_cases,
+        metrics.skipped_cases,
         metrics.pending_cases,
         metrics.infra_failed_cases
     ));
@@ -219,14 +221,16 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
     output.push_str("cases:\n");
     for case in &report.cases {
         output.push_str(&format!(
-            "- {} {}#{} status={} tokens={} cost_usd_micros={} base_commit={}\n",
+            "- {} {}#{} status={} infra={} tokens={} cost_usd_micros={} source_commit={} terminal_state={}\n",
             case.case_id,
             case.repo,
             case.issue,
             case_status_label(case.status),
+            infrastructure_status_label(case.infrastructure_status),
             case.total_tokens,
             case.cost_usd_micros,
-            case.base_commit
+            case_source_commit(case),
+            case.terminal_state.as_deref().unwrap_or("n/a")
         ));
         if !case.verify_commands.is_empty() {
             output.push_str(&format!(
@@ -272,12 +276,47 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
         "tokens delta: {:+}  cost_usd_micros delta: {:+}\n",
         diff.delta.total_tokens_delta, diff.delta.total_cost_usd_micros_delta
     ));
+    output.push_str(&format!(
+        "regressions: count={} ids={}\n",
+        diff.regression_count,
+        if diff.regression_ids.is_empty() {
+            "none".to_string()
+        } else {
+            diff.regression_ids.join(",")
+        }
+    ));
+    output.push_str(&format!(
+        "transition_counts: added={} removed={} pass_to_fail={} fail_to_pass={} pass_to_skip={} skip_to_pass={} fail_to_skip={} skip_to_fail={} status_changed={}\n",
+        diff.transition_counts.added,
+        diff.transition_counts.removed,
+        diff.transition_counts.pass_to_fail,
+        diff.transition_counts.fail_to_pass,
+        diff.transition_counts.pass_to_skip,
+        diff.transition_counts.skip_to_pass,
+        diff.transition_counts.fail_to_skip,
+        diff.transition_counts.skip_to_fail,
+        diff.transition_counts.status_changed
+    ));
     output.push_str("transitions:\n");
     for transition in &diff.transitions {
         output.push_str(&format!(
-            "- {} {}\n",
+            "- {} {} baseline_status={} candidate_status={} infra={} terminal={} source_commit={}\n",
             transition.case_id,
-            transition_kind_label(transition.transition)
+            transition_kind_label(transition.transition),
+            optional_case_status_label(transition.baseline_status),
+            optional_case_status_label(transition.candidate_status),
+            format_optional_infrastructure_transition(
+                transition.baseline_infrastructure_status,
+                transition.candidate_infrastructure_status
+            ),
+            format_optional_transition(
+                transition.baseline_terminal_state.as_deref(),
+                transition.candidate_terminal_state.as_deref()
+            ),
+            format_optional_transition(
+                transition.baseline_source_commit.as_deref(),
+                transition.candidate_source_commit.as_deref()
+            )
         ));
     }
     output
@@ -294,8 +333,49 @@ fn case_status_label(status: EvalReportCaseStatus) -> &'static str {
         EvalReportCaseStatus::Pending => "pending",
         EvalReportCaseStatus::Passed => "passed",
         EvalReportCaseStatus::Failed => "failed",
+        EvalReportCaseStatus::Skipped => "skipped",
         EvalReportCaseStatus::InfraFailed => "infra_failed",
     }
+}
+
+fn optional_case_status_label(status: Option<EvalReportCaseStatus>) -> &'static str {
+    status.map(case_status_label).unwrap_or("n/a")
+}
+
+fn infrastructure_status_label(status: EvalCaseInfrastructureStatus) -> &'static str {
+    match status {
+        EvalCaseInfrastructureStatus::Unknown => "unknown",
+        EvalCaseInfrastructureStatus::Healthy => "healthy",
+        EvalCaseInfrastructureStatus::MissingEvidence => "missing_evidence",
+        EvalCaseInfrastructureStatus::InfraFailed => "infra_failed",
+    }
+}
+
+fn case_source_commit(case: &harness_workflow::runtime::EvalReportCase) -> &str {
+    if case.source_commit.is_empty() {
+        &case.base_commit
+    } else {
+        &case.source_commit
+    }
+}
+
+fn format_optional_infrastructure_transition(
+    baseline: Option<EvalCaseInfrastructureStatus>,
+    candidate: Option<EvalCaseInfrastructureStatus>,
+) -> String {
+    format!(
+        "{}->{}",
+        baseline.map(infrastructure_status_label).unwrap_or("n/a"),
+        candidate.map(infrastructure_status_label).unwrap_or("n/a")
+    )
+}
+
+fn format_optional_transition(baseline: Option<&str>, candidate: Option<&str>) -> String {
+    format!(
+        "{}->{}",
+        baseline.unwrap_or("n/a"),
+        candidate.unwrap_or("n/a")
+    )
 }
 
 fn transition_kind_label(kind: EvalCaseTransitionKind) -> &'static str {
@@ -304,8 +384,13 @@ fn transition_kind_label(kind: EvalCaseTransitionKind) -> &'static str {
         EvalCaseTransitionKind::Removed => "removed",
         EvalCaseTransitionKind::UnchangedPass => "unchanged_pass",
         EvalCaseTransitionKind::UnchangedFail => "unchanged_fail",
+        EvalCaseTransitionKind::UnchangedSkip => "unchanged_skip",
         EvalCaseTransitionKind::PassToFail => "pass_to_fail",
         EvalCaseTransitionKind::FailToPass => "fail_to_pass",
+        EvalCaseTransitionKind::PassToSkip => "pass_to_skip",
+        EvalCaseTransitionKind::SkipToPass => "skip_to_pass",
+        EvalCaseTransitionKind::FailToSkip => "fail_to_skip",
+        EvalCaseTransitionKind::SkipToFail => "skip_to_fail",
         EvalCaseTransitionKind::StatusChanged => "status_changed",
     }
 }
@@ -546,13 +631,15 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         let rendered = render_run_report(&report);
 
         assert_eq!(report.metrics.total_cases, 2);
-        assert_eq!(report.metrics.scored_cases, 2);
+        assert_eq!(report.metrics.scored_cases, 1);
         assert_eq!(report.metrics.passed_cases, 1);
-        assert_eq!(report.metrics.failed_cases, 1);
+        assert_eq!(report.metrics.failed_cases, 0);
+        assert_eq!(report.metrics.skipped_cases, 1);
         assert_eq!(report.metrics.total_tokens, 120);
         assert_eq!(report.metrics.total_cost_usd_micros, 50);
-        assert!(rendered.contains("pass@1: 0.5000"));
-        assert!(rendered.contains("pass^3: 0.8750"));
+        assert!(rendered.contains("pass@1: 1.0000"));
+        assert!(rendered.contains("pass^3: 1.0000"));
+        assert!(rendered.contains("status=skipped"));
         assert!(rendered.contains("missing_evidence: case_evidence"));
     }
 
@@ -618,6 +705,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         let rendered = render_diff_report(&diff);
 
         assert!(rendered.contains("pass_to_fail"));
+        assert!(rendered.contains("regressions: count=1 ids=case-pass"));
         assert!(rendered.contains("tokens delta: -20"));
         assert!(rendered.contains("cost_usd_micros delta: -10"));
     }
@@ -926,6 +1014,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                     repo: "majiayu000/harness".to_string(),
                     issue: 1400 + index,
                     base_commit: "b308b380".to_string(),
+                    source_commit: "b308b380".to_string(),
                     verify_commands: vec!["cargo test".to_string()],
                     status: if passed {
                         EvalReportCaseStatus::Passed
@@ -933,9 +1022,12 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                         EvalReportCaseStatus::Failed
                     },
                     passed,
+                    explicit_evidence: true,
                     final_grade: None,
                     failed_hard_gates: Vec::new(),
                     workflow_id: Some(format!("workflow-{index:02}")),
+                    terminal_state: None,
+                    infrastructure_status: EvalCaseInfrastructureStatus::Healthy,
                     total_tokens: 0,
                     cost_usd_micros: 0,
                     missing_evidence: Vec::new(),
@@ -953,6 +1045,7 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                 passed_cases,
                 failed_cases: total_cases - passed_cases,
                 pending_cases: 0,
+                skipped_cases: 0,
                 infra_failed_cases: 0,
                 pass_at_1,
                 pass_to_k: pass_at_1,

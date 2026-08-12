@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 pub enum EvalEvidenceStatus {
     Passed,
     Failed,
+    Skipped,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
