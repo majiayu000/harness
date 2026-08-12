@@ -1,4 +1,4 @@
-use harness_core::agent::{AgentEgressMode, TurnRequest, AGENT_EGRESS_PROXY_IMAGE_ENV};
+use harness_core::agent::{AgentEgressMode, AgentRequest, AGENT_EGRESS_PROXY_IMAGE_ENV};
 #[cfg(test)]
 use harness_core::agent::{
     AGENT_CONTAINER_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV,
@@ -58,7 +58,7 @@ pub(crate) const REVIEW_GIT_SAFE_WORKSPACE_ENV: &str = "HARNESS_AGENT_REVIEW_GIT
 pub(crate) struct AdapterSpawnPolicyFingerprint([u8; 32]);
 
 pub(crate) fn adapter_spawn_policy_fingerprint(
-    req: &TurnRequest,
+    req: &AgentRequest,
     default_sandbox_mode: SandboxMode,
 ) -> AdapterSpawnPolicyFingerprint {
     let mut hasher = Sha256::new();
