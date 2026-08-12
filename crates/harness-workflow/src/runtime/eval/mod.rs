@@ -16,6 +16,7 @@ pub mod run;
 #[path = "run_concurrency_tests.rs"]
 mod run_concurrency_tests;
 pub mod scoring;
+pub mod suite_drift;
 mod transition_outcome;
 
 pub use attestation::{
@@ -58,3 +59,12 @@ pub use run::{
     EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
 };
 pub use scoring::{score_pr_repair_eval, ScoringError};
+pub use suite_drift::{
+    assess_eval_suite_drift, eval_suite_digest, eval_suite_drift_digest, EvalSuiteCaseChange,
+    EvalSuiteCaseChangeKind, EvalSuiteCaseDefinition, EvalSuiteCaseExpectations,
+    EvalSuiteCaseThresholds, EvalSuiteChangeDirection, EvalSuiteCommandsChange,
+    EvalSuiteDriftAssessment, EvalSuiteDriftDecision, EvalSuiteDriftPolicy, EvalSuiteDriftSummary,
+    EvalSuiteExpectationsChange, EvalSuiteMigrationApproverKind, EvalSuiteMigrationRecord,
+    EvalSuiteStringChange, EvalSuiteThresholdsChange, EVAL_SUITE_DIGEST_SCHEMA_VERSION,
+    EVAL_SUITE_MIGRATION_RECORD_SCHEMA_VERSION,
+};

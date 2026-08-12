@@ -1,11 +1,13 @@
 use anyhow::Context;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use harness_workflow::runtime::eval::model::EvalGrade;
 use harness_workflow::runtime::{
-    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
+    assess_eval_suite_drift, diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
     parse_benchmark_manifest_str, EvalAttestationDecision, EvalAttestationTrust,
     EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseInfrastructureStatus, EvalCaseTransition,
     EvalCaseTransitionKind, EvalReportCaseStatus, EvalRunReport, EvalRunReportDiff,
+    EvalSuiteDriftAssessment, EvalSuiteDriftDecision, EvalSuiteDriftPolicy,
+    EvalSuiteMigrationRecord,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -20,6 +22,8 @@ pub enum EvalCommand {
     Run(EvalRunArgs),
     /// Compare two saved eval run reports
     Diff(EvalDiffArgs),
+    /// Compare two benchmark manifests and require migration approval for drift
+    SuiteDrift(EvalSuiteDriftArgs),
 }
 
 #[derive(Args)]
@@ -67,10 +71,46 @@ pub struct EvalDiffArgs {
     pub output: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub struct EvalSuiteDriftArgs {
+    /// Baseline benchmark manifest path
+    pub baseline: PathBuf,
+    /// Candidate benchmark manifest path
+    pub candidate: PathBuf,
+    /// Versioned suite migration approval record JSON
+    #[arg(long)]
+    pub migration: Option<PathBuf>,
+    /// Policy to apply when drift has no valid approved migration record
+    #[arg(long, value_enum, default_value = "block")]
+    pub policy: EvalSuiteDriftPolicyArg,
+    /// Print JSON instead of the compact text assessment
+    #[arg(long)]
+    pub json: bool,
+    /// Also write the JSON assessment to this path
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum EvalSuiteDriftPolicyArg {
+    Block,
+    NeedsHuman,
+}
+
+impl From<EvalSuiteDriftPolicyArg> for EvalSuiteDriftPolicy {
+    fn from(value: EvalSuiteDriftPolicyArg) -> Self {
+        match value {
+            EvalSuiteDriftPolicyArg::Block => Self::Block,
+            EvalSuiteDriftPolicyArg::NeedsHuman => Self::NeedsHuman,
+        }
+    }
+}
+
 pub async fn run(cmd: EvalCommand) -> anyhow::Result<()> {
     match cmd {
         EvalCommand::Run(args) => run_eval_report(args).await,
         EvalCommand::Diff(args) => diff_eval_reports(args),
+        EvalCommand::SuiteDrift(args) => diff_eval_suite_drift(args),
     }
 }
 
@@ -123,11 +163,50 @@ fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
     anyhow::bail!("eval regression gate failed:\n{}", regressions.join("\n"))
 }
 
+fn diff_eval_suite_drift(args: EvalSuiteDriftArgs) -> anyhow::Result<()> {
+    let baseline = read_eval_manifest(&args.baseline)?;
+    let candidate = read_eval_manifest(&args.candidate)?;
+    let migration = args
+        .migration
+        .as_ref()
+        .map(|path| read_suite_migration_record(path))
+        .transpose()?;
+    let assessment = assess_eval_suite_drift(
+        &baseline,
+        &candidate,
+        migration.as_ref(),
+        EvalSuiteDriftPolicy::from(args.policy),
+    );
+    emit_suite_drift_assessment(&assessment, args.json, args.output.as_deref())?;
+    match assessment.decision {
+        EvalSuiteDriftDecision::NoDrift | EvalSuiteDriftDecision::Approved => Ok(()),
+        EvalSuiteDriftDecision::Block | EvalSuiteDriftDecision::NeedsHuman => anyhow::bail!(
+            "eval suite drift requires approval:\n{}",
+            assessment.blockers.join("\n")
+        ),
+    }
+}
+
 fn read_eval_manifest(path: &Path) -> anyhow::Result<EvalBenchmarkManifest> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read eval manifest at {}", path.display()))?;
     parse_benchmark_manifest_str(&content)
         .map_err(|error| anyhow::anyhow!("invalid eval manifest {}: {error}", path.display()))
+}
+
+fn read_suite_migration_record(path: &Path) -> anyhow::Result<EvalSuiteMigrationRecord> {
+    let content = fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read eval suite migration record at {}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&content).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid eval suite migration record {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn read_evidence(path: &Path) -> anyhow::Result<Vec<EvalCaseEvidence>> {
@@ -164,6 +243,20 @@ fn emit_diff(diff: &EvalRunReportDiff, json: bool, output: Option<&Path>) -> any
         println!("{}", serde_json::to_string_pretty(diff)?);
     } else {
         print!("{}", render_diff_report(diff));
+    }
+    Ok(())
+}
+
+fn emit_suite_drift_assessment(
+    assessment: &EvalSuiteDriftAssessment,
+    json: bool,
+    output: Option<&Path>,
+) -> anyhow::Result<()> {
+    write_json_output(assessment, output)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(assessment)?);
+    } else {
+        print!("{}", render_suite_drift_assessment(assessment));
     }
     Ok(())
 }
@@ -327,6 +420,87 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
     output
 }
 
+pub(crate) fn render_suite_drift_assessment(assessment: &EvalSuiteDriftAssessment) -> String {
+    let drift = &assessment.drift;
+    let mut output = String::new();
+    output.push_str("Eval suite drift assessment\n");
+    output.push_str(&format!(
+        "decision={} policy={}\n",
+        suite_drift_decision_label(assessment.decision),
+        suite_drift_policy_label(assessment.policy)
+    ));
+    output.push_str(&format!(
+        "suite_digest: baseline={} candidate={}\n",
+        assessment.baseline_suite_digest, assessment.candidate_suite_digest
+    ));
+    output.push_str(&format!("drift_digest: {}\n", assessment.drift_digest));
+    if let Some(migration_id) = assessment.approved_migration_id.as_deref() {
+        output.push_str(&format!("approved_migration_id: {migration_id}\n"));
+    }
+    if !assessment.blockers.is_empty() {
+        output.push_str("blockers:\n");
+        for blocker in &assessment.blockers {
+            output.push_str(&format!("- {blocker}\n"));
+        }
+    }
+    if let Some(suite_name) = &drift.suite_name {
+        output.push_str(&format!(
+            "suite_name: {} -> {}\n",
+            suite_name.baseline, suite_name.candidate
+        ));
+    }
+    output.push_str(&format!(
+        "changed_cases: count={}\n",
+        drift.changed_cases.len()
+    ));
+    for change in &drift.changed_cases {
+        output.push_str(&format!(
+            "- {} {:?} direction={}\n",
+            change.case_id,
+            change.kind,
+            suite_change_direction_label(change.direction)
+        ));
+    }
+    output.push_str(&format!(
+        "changed_commands: count={}\n",
+        drift.changed_commands.len()
+    ));
+    for change in &drift.changed_commands {
+        output.push_str(&format!(
+            "- {} direction={} baseline={} candidate={}\n",
+            change.case_id,
+            suite_change_direction_label(change.direction),
+            change.baseline.join(" && "),
+            change.candidate.join(" && ")
+        ));
+    }
+    output.push_str(&format!(
+        "changed_expectations: count={}\n",
+        drift.changed_expectations.len()
+    ));
+    for change in &drift.changed_expectations {
+        output.push_str(&format!(
+            "- {} direction={}\n",
+            change.case_id,
+            suite_change_direction_label(change.direction)
+        ));
+    }
+    output.push_str(&format!(
+        "changed_thresholds: count={}\n",
+        drift.changed_thresholds.len()
+    ));
+    for change in &drift.changed_thresholds {
+        output.push_str(&format!(
+            "- {} direction={} timeout_secs={}->{}\n",
+            change.case_id,
+            suite_change_direction_label(change.direction),
+            change.baseline.timeout_secs,
+            change.candidate.timeout_secs
+        ));
+    }
+    output
+}
+
 fn format_optional_float(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}"))
@@ -460,6 +634,32 @@ fn grade_label(grade: EvalGrade) -> &'static str {
         EvalGrade::C => "C",
         EvalGrade::B => "B",
         EvalGrade::A => "A",
+    }
+}
+
+fn suite_drift_decision_label(decision: EvalSuiteDriftDecision) -> &'static str {
+    match decision {
+        EvalSuiteDriftDecision::NoDrift => "no_drift",
+        EvalSuiteDriftDecision::Approved => "approved",
+        EvalSuiteDriftDecision::Block => "block",
+        EvalSuiteDriftDecision::NeedsHuman => "needs_human",
+    }
+}
+
+fn suite_drift_policy_label(policy: EvalSuiteDriftPolicy) -> &'static str {
+    match policy {
+        EvalSuiteDriftPolicy::Block => "block",
+        EvalSuiteDriftPolicy::NeedsHuman => "needs_human",
+    }
+}
+
+fn suite_change_direction_label(
+    direction: harness_workflow::runtime::EvalSuiteChangeDirection,
+) -> &'static str {
+    match direction {
+        harness_workflow::runtime::EvalSuiteChangeDirection::Changed => "changed",
+        harness_workflow::runtime::EvalSuiteChangeDirection::Strengthened => "strengthened",
+        harness_workflow::runtime::EvalSuiteChangeDirection::Weakened => "weakened",
     }
 }
 
@@ -638,6 +838,32 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                 assert!(args.json);
             }
             _ => panic!("expected eval diff command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "harness",
+            "eval",
+            "suite-drift",
+            "baseline.toml",
+            "candidate.toml",
+            "--migration",
+            "migration.json",
+            "--policy",
+            "needs-human",
+            "--json",
+        ])
+        .unwrap_or_else(|error| panic!("eval suite-drift command should parse: {error}"));
+        match cli.command {
+            Command::Eval {
+                cmd: EvalCommand::SuiteDrift(args),
+            } => {
+                assert_eq!(args.baseline, PathBuf::from("baseline.toml"));
+                assert_eq!(args.candidate, PathBuf::from("candidate.toml"));
+                assert_eq!(args.migration, Some(PathBuf::from("migration.json")));
+                assert!(matches!(args.policy, EvalSuiteDriftPolicyArg::NeedsHuman));
+                assert!(args.json);
+            }
+            _ => panic!("expected eval suite-drift command"),
         }
     }
 
@@ -1109,6 +1335,62 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         let message = error.to_string();
         assert!(message.contains("case-pass"));
         assert!(message.contains("TargetCorrectness"));
+    }
+
+    #[test]
+    fn eval_suite_drift_cli_fails_closed_and_writes_assessment() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let baseline_path = tempdir.path().join("baseline.toml");
+        let candidate_path = tempdir.path().join("candidate.toml");
+        let output_path = tempdir.path().join("suite-drift.json");
+        fs::write(
+            &baseline_path,
+            r#"
+suite = "harness-core"
+
+[[cases]]
+case_id = "case-pass"
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "b308b380"
+verify_commands = ["cargo test", "cargo clippy"]
+"#,
+        )
+        .unwrap_or_else(|error| panic!("baseline manifest should write: {error}"));
+        fs::write(
+            &candidate_path,
+            r#"
+suite = "harness-core"
+
+[[cases]]
+case_id = "case-pass"
+repo = "majiayu000/harness"
+issue = 1437
+base_commit = "b308b380"
+verify_commands = ["cargo test"]
+"#,
+        )
+        .unwrap_or_else(|error| panic!("candidate manifest should write: {error}"));
+
+        let error = diff_eval_suite_drift(EvalSuiteDriftArgs {
+            baseline: baseline_path,
+            candidate: candidate_path,
+            migration: None,
+            policy: EvalSuiteDriftPolicyArg::NeedsHuman,
+            json: false,
+            output: Some(output_path.clone()),
+        })
+        .expect_err("unapproved suite drift must fail closed");
+
+        assert!(error.to_string().contains("requires approval"));
+        let assessment: EvalSuiteDriftAssessment = serde_json::from_str(
+            &fs::read_to_string(output_path)
+                .unwrap_or_else(|error| panic!("assessment should be readable: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("assessment should parse: {error}"));
+        assert_eq!(assessment.decision, EvalSuiteDriftDecision::NeedsHuman);
+        assert_eq!(assessment.drift.changed_commands.len(), 1);
     }
 
     #[test]

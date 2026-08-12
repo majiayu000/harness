@@ -90,11 +90,11 @@ pub use dispatch_barrier::{
 pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimeProfileSelector};
 pub use errors::RuntimeJobNotFoundError;
 pub use eval::{
-    classify_eval_run_attestation, collect_eval_case_evidence,
+    assess_eval_suite_drift, classify_eval_run_attestation, collect_eval_case_evidence,
     collect_eval_case_evidence_from_records, diff_eval_run_reports, dispatch_eval_case_workflow,
     enqueue_eval_case_workflow, eval_isolated_runtime_profile, eval_report_dry_run,
-    eval_report_from_evidence, eval_run_attestation_payload_digest,
-    historical_replay_command_digest, parse_benchmark_manifest_str,
+    eval_report_from_evidence, eval_run_attestation_payload_digest, eval_suite_digest,
+    eval_suite_drift_digest, historical_replay_command_digest, parse_benchmark_manifest_str,
     parse_historical_replay_cohort_str, score_pr_repair_eval, validate_historical_replay_cohort,
     verify_eval_run_attestation, EvalAttestationDecision, EvalAttestationSummary,
     EvalAttestationTrust, EvalAttestationVerificationError, EvalBenchmarkCase,
@@ -105,14 +105,20 @@ pub use eval::{
     EvalIsolationProfile, EvalQualityGateEvidence, EvalReportCase, EvalReportCaseStatus,
     EvalReportError, EvalReportFailedGate, EvalReportMetricDelta, EvalReportMetrics,
     EvalRunAttestation, EvalRunAttestationClaims, EvalRunAttestationExpected, EvalRunReport,
-    EvalRunReportDiff, EvalSubmissionEvidence, HistoricalReplayCase, HistoricalReplayCohort,
+    EvalRunReportDiff, EvalSubmissionEvidence, EvalSuiteCaseChange, EvalSuiteCaseChangeKind,
+    EvalSuiteCaseDefinition, EvalSuiteCaseExpectations, EvalSuiteCaseThresholds,
+    EvalSuiteChangeDirection, EvalSuiteCommandsChange, EvalSuiteDriftAssessment,
+    EvalSuiteDriftDecision, EvalSuiteDriftPolicy, EvalSuiteDriftSummary,
+    EvalSuiteExpectationsChange, EvalSuiteMigrationApproverKind, EvalSuiteMigrationRecord,
+    EvalSuiteStringChange, EvalSuiteThresholdsChange, HistoricalReplayCase, HistoricalReplayCohort,
     HistoricalReplayCohortVerdict, HistoricalReplayCommandEvidence, HistoricalReplayCommandRun,
     HistoricalReplayComparison, HistoricalReplayError, HistoricalReplayIssueSnapshot,
     HistoricalReplayPullRequestSnapshot, HistoricalReplayVerification, KeylessOidcProvider,
     KeylessOidcVerification, ManifestError, ScoringError, VerifiedEvalRunAttestation,
     DEFAULT_CASE_TIMEOUT_SECS, DEFAULT_EVAL_ISOLATION_BACKEND, DEFAULT_EVAL_ISOLATION_IMAGE,
     DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE, DEFAULT_EVAL_ISOLATION_SANDBOX, EVAL_BRANCH_PREFIX,
-    EVAL_PR_DRAFT_MODE, EVAL_RUN_ATTESTATION_SCHEMA_VERSION, HISTORICAL_REPLAY_COHORT_SCHEMA,
+    EVAL_PR_DRAFT_MODE, EVAL_RUN_ATTESTATION_SCHEMA_VERSION, EVAL_SUITE_DIGEST_SCHEMA_VERSION,
+    EVAL_SUITE_MIGRATION_RECORD_SCHEMA_VERSION, HISTORICAL_REPLAY_COHORT_SCHEMA,
 };
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use memory_retrieval::{
