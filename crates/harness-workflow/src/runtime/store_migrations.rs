@@ -645,6 +645,67 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 27,
+        description: "retain workflow run evidence metadata and bounded payloads",
+        sql: "CREATE TABLE IF NOT EXISTS workflow_run_evidence (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                command_id TEXT,
+                runtime_job_id TEXT,
+                project_id TEXT NOT NULL,
+                commit_sha TEXT,
+                stack TEXT NOT NULL,
+                suite TEXT NOT NULL,
+                baseline TEXT,
+                decision TEXT NOT NULL,
+                evidence_schema TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                trust TEXT NOT NULL,
+                location JSONB NOT NULL,
+                retention_class TEXT NOT NULL,
+                payload JSONB,
+                payload_expires_at TIMESTAMPTZ,
+                payload_expired_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT workflow_run_evidence_required_text_not_blank
+                    CHECK (
+                        btrim(id) <> ''
+                        AND btrim(workflow_id) <> ''
+                        AND btrim(project_id) <> ''
+                        AND btrim(stack) <> ''
+                        AND btrim(suite) <> ''
+                        AND btrim(decision) <> ''
+                        AND btrim(evidence_schema) <> ''
+                        AND btrim(digest) <> ''
+                        AND btrim(trust) <> ''
+                        AND btrim(retention_class) <> ''
+                    )
+              );
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_project_time
+                ON workflow_run_evidence (project_id, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_commit_time
+                ON workflow_run_evidence (commit_sha, created_at DESC)
+                WHERE commit_sha IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_suite_time
+                ON workflow_run_evidence (suite, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_decision_time
+                ON workflow_run_evidence (decision, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_created_time
+                ON workflow_run_evidence (created_at DESC, id DESC);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_payload_expiry
+                ON workflow_run_evidence (payload_expires_at)
+                WHERE payload IS NOT NULL AND payload_expires_at IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_workflow_id
+                ON workflow_run_evidence (workflow_id);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_command_id
+                ON workflow_run_evidence (command_id)
+                WHERE command_id IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_runtime_job_id
+                ON workflow_run_evidence (runtime_job_id)
+                WHERE runtime_job_id IS NOT NULL",
+    },
+    Migration {
+        version: 28,
         description: "prove remote lease provenance for stale completion recovery",
         sql: "CREATE TABLE IF NOT EXISTS runtime_job_lease_issuances (
                 runtime_job_id TEXT NOT NULL,
@@ -652,7 +713,7 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                 owner TEXT NOT NULL,
                 lease_expires_at TIMESTAMPTZ NOT NULL,
                 -- NULL is reserved for the exact lease that was already
-                -- running when v27 was installed. Its first successful
+                -- running when v28 was installed. Its first successful
                 -- renewal rotates to a proof-bearing issuance. Every issuance
                 -- created after this migration receives a random proof.
                 lease_proof UUID DEFAULT gen_random_uuid(),

@@ -1,4 +1,4 @@
-use super::{lease, workflow_runtime_store};
+use super::{lease, validate_eval_resource_limit_report, workflow_runtime_store};
 use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use axum::{extract::State, http::StatusCode};
@@ -77,6 +77,9 @@ pub async fn complete_runtime_job_for_runtime_host(
     };
     let result =
         crate::workflow_runtime_worker::strip_caller_transcript_unavailable_signal(req.result);
+    if let Err((status, response)) = validate_eval_resource_limit_report(&job, &result) {
+        return (status, Json(response));
+    }
     let (result, transcript) = match prepare_runtime_transcript(&job, result) {
         Ok(prepared) => prepared,
         Err(error) => {

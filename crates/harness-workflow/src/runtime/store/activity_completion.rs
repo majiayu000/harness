@@ -156,11 +156,13 @@ impl WorkflowRuntimeStore {
         // Lock order 1/3: the workflow instance. `apply_runtime_completion_decision_tx`
         // needs this lock at the end of the transaction; taking it here instead
         // keeps this path from inverting the order used by command dispatch.
-        // A missing instance is fine — the `workflow_exists` check below owns
-        // that case, and locking an absent row is a no-op.
-        if let Some((workflow_id,)) = workflow_id_row.as_ref() {
-            transaction_helpers::select_instance_for_update_tx(&mut tx, workflow_id).await?;
-        }
+        // A missing instance is fine — the no-workflow path below owns that
+        // case, and locking an absent row is a no-op.
+        let locked_workflow = if let Some((workflow_id,)) = workflow_id_row.as_ref() {
+            transaction_helpers::select_instance_for_update_tx(&mut tx, workflow_id).await?
+        } else {
+            None
+        };
         // Lock order 2/3: the command.
         let command_row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
@@ -277,12 +279,7 @@ impl WorkflowRuntimeStore {
         command.dispatch_owner = None;
         command.dispatch_lease_expires_at = None;
 
-        let (workflow_exists,): (bool,) =
-            sqlx::query_as("SELECT EXISTS (SELECT 1 FROM workflow_instances WHERE id = $1)")
-                .bind(&command.workflow_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if !workflow_exists {
+        let Some(locked_workflow) = locked_workflow else {
             tx.commit().await?;
             return Ok(Some(RuntimeActivityCompletion {
                 runtime_job: job,
@@ -290,7 +287,7 @@ impl WorkflowRuntimeStore {
                 workflow_event: None,
                 decision: None,
             }));
-        }
+        };
 
         let active_start_child_workflow_commands =
             if command.command.command_type == WorkflowCommandType::StartChildWorkflow {
@@ -338,6 +335,17 @@ impl WorkflowRuntimeStore {
             lease.owner,
             &event,
             &self.budget_policy,
+        )
+        .await?;
+
+        super::evidence::record_runtime_completion_evidence_tx(
+            &mut tx,
+            &locked_workflow,
+            &command,
+            &job,
+            &event,
+            result,
+            decision_record.as_ref(),
         )
         .await?;
 
