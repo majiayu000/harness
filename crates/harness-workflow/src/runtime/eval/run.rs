@@ -126,6 +126,8 @@ pub async fn enqueue_eval_case_workflow(
     store: &WorkflowRuntimeStore,
     input: EvalCaseWorkflowInput<'_>,
 ) -> anyhow::Result<EvalCaseEnqueueOutcome> {
+    validate_eval_case_replayable(input.case)?;
+
     store
         .upsert_definition(
             &WorkflowDefinition::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, "GitHub issue PR workflow")
@@ -214,6 +216,13 @@ pub async fn enqueue_eval_case_workflow(
         },
         command_ids,
     })
+}
+
+fn validate_eval_case_replayable(case: &EvalBenchmarkCase) -> anyhow::Result<()> {
+    if let Some(blocker) = case.replay_blocker() {
+        anyhow::bail!("eval case {} is not replayable: {blocker}", case.case_id);
+    }
+    Ok(())
 }
 
 pub async fn dispatch_eval_case_workflow(
@@ -596,6 +605,13 @@ mod tests {
             issue: 42,
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: None,
+            verdict: None,
             timeout_secs: 120,
             resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
                 .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
@@ -660,6 +676,32 @@ mod tests {
     }
 
     #[test]
+    fn eval_run_rejects_pending_cases_before_dispatch() {
+        let case = EvalBenchmarkCase {
+            case_id: "pending-case".to_string(),
+            repo: "owner/repo".to_string(),
+            issue: 42,
+            base_commit: "abcdef1".to_string(),
+            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: Some(crate::runtime::eval::manifest::EvalCommitResolution::Pending),
+            verdict: Some(crate::runtime::eval::manifest::EvalCaseVerdict::Pending),
+            timeout_secs: 120,
+            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
+                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
+                .expect("default resource limits should be valid"),
+        };
+
+        let err =
+            validate_eval_case_replayable(&case).expect_err("pending case should not dispatch");
+        assert!(err.to_string().contains("commit_resolution is pending"));
+    }
+
+    #[test]
     fn eval_cleanup_summary_requires_zero_remaining_resources() {
         let mut summary = EvalRunCleanupSummary::new("run-1");
         assert!(summary.is_clean());
@@ -685,6 +727,13 @@ mod tests {
             issue: 42,
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_cleanup".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: None,
+            verdict: None,
             timeout_secs: 120,
             resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
                 .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
@@ -772,6 +821,13 @@ mod tests {
             issue: 42,
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: None,
+            verdict: None,
             timeout_secs: 120,
             resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
                 .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
@@ -820,6 +876,13 @@ mod tests {
             issue: 42,
             base_commit: "abcdef1".to_string(),
             verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
+            paths: Vec::new(),
+            risk: None,
+            evidence: Vec::new(),
+            resolution_prs: Vec::new(),
+            resolution_commits: Vec::new(),
+            commit_resolution: None,
+            verdict: None,
             timeout_secs: 120,
             resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
                 .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,

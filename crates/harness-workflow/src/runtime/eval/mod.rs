@@ -21,8 +21,8 @@ pub use evidence::{
     EvalEvidenceStatus, EvalQualityGateEvidence, EvalSubmissionEvidence,
 };
 pub use manifest::{
-    parse_benchmark_manifest_str, EvalBenchmarkCase, EvalBenchmarkManifest, ManifestError,
-    DEFAULT_CASE_TIMEOUT_SECS,
+    parse_benchmark_manifest_str, EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseRisk,
+    EvalCaseVerdict, EvalCommitResolution, ManifestError, DEFAULT_CASE_TIMEOUT_SECS,
 };
 pub use report::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
