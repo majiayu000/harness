@@ -14,7 +14,7 @@ name = "harness"
 path = "src/main.rs"
 
 [dependencies]
-harness-core = { workspace = true }
+harness-core = { workspace = true, features = ["db-postgres"] }
 harness-protocol = { workspace = true }
 harness-server = { workspace = true }
 harness-workflow = { workspace = true }

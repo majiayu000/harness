@@ -11,6 +11,7 @@ pub mod docker_reconciliation;
 pub mod opencode;
 pub mod opencode_adapter;
 mod output_capture;
+pub mod output_parsing;
 pub mod provider_backpressure;
 pub mod registry;
 pub mod scoped_token;

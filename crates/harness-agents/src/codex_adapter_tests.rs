@@ -1,19 +1,20 @@
 use super::*;
-use harness_core::types::Item;
+use harness_core::{agent::AgentDiagnosticSeverity, types::Item};
 use std::collections::HashMap;
 
-fn test_turn_request(project_root: PathBuf) -> TurnRequest {
-    TurnRequest {
+fn test_turn_request(project_root: PathBuf) -> AgentRequest {
+    AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root,
-        permission_mode: Default::default(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         model: None,
         reasoning_effort: None,
         execution_phase: None,
         sandbox_mode: None,
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),
@@ -86,7 +87,7 @@ fn parse_item_started_payload_notification() {
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
-        ParsedCodexMessage::Event(AgentEvent::ItemStartedPayload {
+        ParsedCodexMessage::Event(AgentEvent::ItemStarted {
             item: Item::ShellCommand {
                 command: "pwd".into(),
                 exit_code: None,
@@ -103,7 +104,7 @@ fn parse_item_completed_payload_notification() {
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
-        ParsedCodexMessage::Event(AgentEvent::ItemCompletedPayload {
+        ParsedCodexMessage::Event(AgentEvent::ItemCompleted {
             item: Item::AgentReasoning {
                 content: "done".into()
             }
@@ -117,7 +118,8 @@ fn parse_item_completed_error_notification() {
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
-        ParsedCodexMessage::Event(AgentEvent::Error {
+        ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+            severity: AgentDiagnosticSeverity::Error,
             message: "bad config".into()
         })
     );
@@ -129,7 +131,8 @@ fn parse_warning_notification() {
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
-        ParsedCodexMessage::Event(AgentEvent::Warning {
+        ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+            severity: AgentDiagnosticSeverity::Warning,
             message: "be careful".into()
         })
     );
@@ -141,8 +144,45 @@ fn parse_error_notification() {
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
-        ParsedCodexMessage::Event(AgentEvent::Error {
+        ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+            severity: AgentDiagnosticSeverity::Error,
             message: "boom".into()
+        })
+    );
+}
+
+#[test]
+fn parse_failed_turn_completed_notification_as_terminal_error() {
+    let line = r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"failed","items":[],"error":{"message":"model failed"}}}}"#;
+    let message = parse_codex_message(line).unwrap();
+    assert_eq!(
+        message,
+        ParsedCodexMessage::Event(AgentEvent::Error {
+            message: "model failed".into()
+        })
+    );
+}
+
+#[test]
+fn parse_interrupted_turn_completed_notification_as_cancellation() {
+    let line = r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted","items":[],"error":null}}}"#;
+    let message = parse_codex_message(line).unwrap();
+    assert_eq!(
+        message,
+        ParsedCodexMessage::Event(AgentEvent::TurnCancelled {
+            message: "codex turn interrupted".into()
+        })
+    );
+}
+
+#[test]
+fn parse_turn_completed_without_status_fails_closed() {
+    let line = r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[]}}}"#;
+    let message = parse_codex_message(line).unwrap();
+    assert_eq!(
+        message,
+        ParsedCodexMessage::Event(AgentEvent::Error {
+            message: "codex turn/completed omitted required turn.status".into()
         })
     );
 }
@@ -269,17 +309,18 @@ fn approval_decision_result_uses_app_server_shape() {
 
 #[test]
 fn start_params_include_runtime_profile_overrides() {
-    let req = TurnRequest {
+    let req = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
-        permission_mode: Default::default(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         model: Some("gpt-runtime".to_string()),
         reasoning_effort: Some("medium".to_string()),
         execution_phase: None,
         sandbox_mode: Some(SandboxMode::WorkspaceWrite),
         approval_policy: Some("on-request".to_string()),
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: Some(60),
         env_vars: HashMap::new(),
@@ -336,17 +377,18 @@ fn configured_adapter_applies_defaults_identity_and_secret_filtering() {
     );
     let mut env_vars = HashMap::new();
     env_vars.insert("SETUP_SECRET".to_string(), "secret-value".to_string());
-    let request = TurnRequest {
+    let request = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
-        permission_mode: Default::default(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         model: None,
         reasoning_effort: None,
         execution_phase: None,
         sandbox_mode: None,
         approval_policy: Some("on-request".to_string()),
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars,
@@ -384,19 +426,20 @@ async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()
                 setup_secret_env: Vec::new(),
             },
         },
-        SandboxMode::WorkspaceWrite,
+        SandboxMode::DangerFullAccess,
     );
-    let request = TurnRequest {
+    let request = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: dir.path().to_path_buf(),
-        permission_mode: Default::default(),
+        permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
         model: None,
         reasoning_effort: None,
         execution_phase: None,
         sandbox_mode: None,
         approval_policy: Some("on-request".to_string()),
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),
@@ -404,12 +447,12 @@ async fn configured_adapter_runs_cloud_setup_before_spawn() -> anyhow::Result<()
     };
     let (tx, _rx) = mpsc::channel(4);
 
-    adapter
+    let error = adapter
         .start_turn(request, tx)
         .await
         .expect_err("missing codex executable should fail after setup");
 
-    assert!(marker.exists());
+    assert!(marker.exists(), "setup marker missing after error: {error}");
     Ok(())
 }
 
@@ -421,7 +464,7 @@ async fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow:
         harness_core::agent::AGENT_ISOLATION_TIER_ENV.to_string(),
         "container".to_string(),
     );
-    let request = TurnRequest {
+    let request = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: root.path().to_path_buf(),
@@ -432,6 +475,7 @@ async fn app_server_spawn_honors_container_isolation_without_egress() -> anyhow:
         sandbox_mode: Some(SandboxMode::WorkspaceWrite),
         approval_policy: Some("on-request".to_string()),
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars,
@@ -571,7 +615,7 @@ async fn app_server_protocol_failures_reset_and_reap_child() -> anyhow::Result<(
     let scenarios = [
         ("", "initialize stalled"),
         (
-            r#"printf '%s\n' '{"method":"error","params":{"message":"init failed"}}'"#,
+            r#"printf '%s\n' '{"id":1,"error":{"message":"init failed"}}'"#,
             "init failed",
         ),
         (
@@ -582,7 +626,7 @@ async fn app_server_protocol_failures_reset_and_reap_child() -> anyhow::Result<(
             concat!(
                 r#"printf '%s\n' '{"id":1,"result":{}}'"#,
                 "\n",
-                r#"printf '%s\n' '{"method":"error","params":{"message":"thread failed"}}'"#,
+                r#"printf '%s\n' '{"id":2,"error":{"message":"thread failed"}}'"#,
             ),
             "thread failed",
         ),
@@ -670,7 +714,7 @@ async fn start_turn_missing_workspace_reports_workspace_missing() -> anyhow::Res
     let dir = tempfile::tempdir()?;
     let missing = dir.path().join("missing-workspace");
     let adapter = CodexAdapter::new(std::env::current_exe()?);
-    let request = TurnRequest {
+    let request = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: missing.clone(),
@@ -681,6 +725,7 @@ async fn start_turn_missing_workspace_reports_workspace_missing() -> anyhow::Res
         sandbox_mode: None,
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),
@@ -738,7 +783,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         state.child_workspace = Some(PathBuf::from("/tmp/project"));
     }
 
-    let req = TurnRequest {
+    let req = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
@@ -749,6 +794,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         sandbox_mode: None,
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),
@@ -772,6 +818,65 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
     assert!(state.stdout_lines.is_none());
     assert!(state.thread_id.is_none());
     assert!(state.active_turn_id.is_none());
+}
+
+#[tokio::test]
+async fn start_turn_continues_after_error_notification_until_completed() -> anyhow::Result<()> {
+    let project_root = tempfile::tempdir()?;
+    let adapter = CodexAdapter::new(PathBuf::from("codex"));
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(
+            r#"printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress","items":[]}}}'; printf '%s\n' '{"method":"error","params":{"threadId":"thread-1","turnId":"turn-1","willRetry":false,"error":{"message":"Skill descriptions were shortened to fit the skills context budget."}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[]}}}'; read _ || true"#,
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stdout should be piped"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stdin should be piped"))?;
+    {
+        let mut state = adapter.state.lock().await;
+        state.child = Some(crate::ManagedChild::new(child, "codex app-server test"));
+        state.stdin = Some(stdin);
+        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.thread_id = Some("thread-1".into());
+        state.child_workspace = Some(project_root.path().to_path_buf());
+    }
+
+    let request = test_turn_request(project_root.path().to_path_buf());
+    adapter.state.lock().await.spawn_policy_fingerprint = Some(
+        crate::spawn_contract::adapter_spawn_policy_fingerprint(&request, adapter.sandbox_mode),
+    );
+    let (tx, mut rx) = mpsc::channel(8);
+
+    adapter.start_turn(request, tx).await?;
+
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::Diagnostic {
+                severity: AgentDiagnosticSeverity::Error,
+                ..
+            }
+        )
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnCompleted { .. })),
+        "diagnostic notifications must not hide the explicit turn terminal event: {events:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]

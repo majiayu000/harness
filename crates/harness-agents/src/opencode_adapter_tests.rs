@@ -31,7 +31,7 @@ fn parse_tool_call_update_status_transitions() {
     let in_progress = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"in_progress"}}}"#;
     assert_eq!(
         parse_acp_message(in_progress).unwrap(),
-        ParsedAcpMessage::Event(AgentEvent::ItemStarted {
+        ParsedAcpMessage::Event(AgentEvent::ItemStartedKind {
             item_type: "tool_call".into()
         })
     );
@@ -39,7 +39,7 @@ fn parse_tool_call_update_status_transitions() {
     let completed = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"completed"}}}"#;
     assert_eq!(
         parse_acp_message(completed).unwrap(),
-        ParsedAcpMessage::Event(AgentEvent::ItemCompleted)
+        ParsedAcpMessage::Event(AgentEvent::ItemCompletedKind)
     );
 }
 
@@ -159,8 +159,8 @@ async fn stdout_reader_recognizes_container_canary_marker() -> anyhow::Result<()
     Ok(())
 }
 
-fn test_turn_request() -> TurnRequest {
-    TurnRequest {
+fn test_turn_request() -> AgentRequest {
+    AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp"),
@@ -171,6 +171,7 @@ fn test_turn_request() -> TurnRequest {
         sandbox_mode: None,
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: std::collections::HashMap::new(),

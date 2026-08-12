@@ -87,7 +87,7 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
                     harness_workflow::runtime::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
                     harness_workflow::runtime::LOCAL_REVIEW_BLOCKED_SIGNAL,
                 ])
-                .requires("at_least_one_local_review_outcome_signal")
+                .requires("exactly_one_local_review_outcome_signal")
         }
         (GITHUB_ISSUE_PR_DEFINITION_ID, "sweep_pr_feedback")
         | (GITHUB_ISSUE_PR_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY) => {

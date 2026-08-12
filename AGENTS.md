@@ -31,7 +31,7 @@ Validation workflow:
 
 ## Architecture
 
-Harness is an agent orchestration layer. It constructs prompts and manages lifecycle — agents (Codex CLI) decide how to execute.
+Harness is an agent orchestration layer. It constructs prompts and manages lifecycle; the selected coding agent decides how to execute.
 
 - ZERO `Command::new("gh")` or `Command::new("git")` calls inside harness crates — all GitHub/git interaction must be in agent prompts only
 - When testing Harness product behavior for "fix issue X" or "handle PR Y", delegate to harness server (`POST /api/workflows/runtime/submissions`). For direct repository maintenance in this checkout, implement and verify the requested code change directly unless the user explicitly asks to exercise the Harness server flow.
@@ -44,7 +44,7 @@ These names overlap in everyday speech but mean different things in code. Use th
 |---|---|---|
 | **workflow runtime** | Orchestration layer that decides what should happen next; event-sourced state machine with a command outbox. | `crates/harness-workflow/src/runtime/` |
 | **agent runtime** (a.k.a. `CodeAgent` / `AgentAdapter`) | Agent abstraction; receives an `AgentRequest` and returns a stream or response. | `crates/harness-core/src/agent.rs`, `crates/harness-agents/src/` |
-| **`RuntimeKind`** | Label the workflow layer attaches to an agent type (`CodexExec` / `CodexJsonrpc` / `ClaudeCode` / `AnthropicApi` / `RemoteHost`). | `crates/harness-workflow/src/runtime/model.rs` |
+| **`RuntimeKind`** | Label the workflow layer attaches to an agent implementation. Treat the enum definition as the source of truth; do not duplicate its variants in documentation. | `crates/harness-workflow/src/runtime/model.rs` |
 | **task** | Legacy execution unit; submissions are being migrated to flow through the workflow runtime instead. | `crates/harness-server/src/task_runner/` |
 | **runtime host** | Process instance that executes runtime jobs; can register remotely via `/api/runtime-hosts`. | `crates/harness-server/src/runtime_hosts.rs` |
 
@@ -58,9 +58,12 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 
 ## PR Workflow
 
-- After creating a PR, wait for the Codex review bot before merging
-- If the review bot leaves comments, address valid feedback before merge
-- If no comments or only false positives, proceed with merge
+- Before merging, every PR must receive a fresh-context review from an agent process that did not author the changes. Review output must be machine-parseable: direct reviews must put `APPROVED` on the last non-empty line when no blockers remain or prefix each blocking finding with `ISSUE:`; packaged review workflows may instead use their declared verdict field, such as `Assessment: APPROVE` or `Consensus: APPROVE`. Missing or unparseable output is not approval.
+- External review bots are optional advisors. Address valid feedback when it arrives, but bot silence, quota exhaustion, or service failure does not block a merge.
+- Address valid reviewer findings before merge. Record the reason for rejecting false positives in the handoff; posting that reason to the PR requires operator approval.
+- Merging requires explicit operator approval, a passing `CI Result` check, and squash merge.
+- Do not change `Cargo.toml` versions in feature or fix PRs; version bumps happen during releases.
+- Keep implementation PRs within the scope guard in `WORKFLOW.md` (currently 30 changed files and 1,500 added lines). If the work cannot fit, split it or obtain operator approval for the larger scope.
 - Resolving a review thread does not require separate user approval once its feedback has been verified as addressed.
 - Posting a new comment or reply remains an externally visible action and requires explicit user approval.
 
@@ -87,10 +90,10 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 - Prefer standard library over new dependencies
 - Run `cargo audit` before adding security-sensitive crates
 
-## VibeGuard Overrides (Harness-specific, from GC Learn 2026-03-19)
+## VibeGuard Overrides
 
 - RS-03 exempt: `fn main()` scope, `Mutex::lock().unwrap()`, `RwLock::{read,write}().unwrap()`
 - RS-13: only flag functions returning `()` or `Result<()>` — typed returns are transformers, not action functions
-- U-16 exempt: `**/prompts.rs` → 1200-line limit, `**/dispatch.rs` → 1000-line limit
+- U-16 exempt: `crates/harness-core/src/prompts/parsing.rs` → 1100-line limit; `crates/harness-cli/src/commands.rs` → 1700-line limit. Remove an exemption after the file is split below the default limit.
 - L1 exempt: new files matching `src/**/{mod,lib,main}.rs` (standard Rust module files)
 - gh/git guard: AGENTS.md rule is semantic (agent prompts only); bash guard should not double-block `cargo test` subprocesses

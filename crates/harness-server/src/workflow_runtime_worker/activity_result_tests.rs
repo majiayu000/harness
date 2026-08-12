@@ -1,5 +1,9 @@
 use super::*;
-use harness_workflow::runtime::{ActivityStatus, RuntimeKind, PROMPT_TASK_DEFINITION_ID};
+use harness_workflow::runtime::{
+    ActivityStatus, RuntimeKind, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
+    LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
+    PROMPT_TASK_DEFINITION_ID,
+};
 
 #[test]
 fn activity_result_from_turn_fails_when_no_fenced_block_present() {
@@ -364,6 +368,125 @@ fn activity_result_from_turn_preserves_prompt_nonzero_validation_report() {
         .signals
         .iter()
         .any(|signal| signal.signal_type == "ActivityStatusContractDowngraded"));
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "accepted");
+    assert_eq!(envelope["final_result"]["status"], "succeeded");
+}
+
+#[test]
+fn activity_result_from_turn_preserves_declared_local_review_outcomes() {
+    for (signal_type, summary) in [
+        (LOCAL_REVIEW_PASSED_SIGNAL, "Local review passed."),
+        (
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            "Local review requested fixes.",
+        ),
+        (
+            LOCAL_REVIEW_BLOCKED_SIGNAL,
+            "Local review could not complete.",
+        ),
+    ] {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": LOCAL_REVIEW_ACTIVITY
+            }),
+        );
+        let content = format!(
+            r#"Local review report.
+
+```harness-activity-result
+{{"activity":"{LOCAL_REVIEW_ACTIVITY}","status":"succeeded","summary":"{summary}","signals":[{{"signal_type":"{signal_type}","signal":{{"pr_number":77,"pr_url":"https://github.com/owner/repo/pull/77"}}}}]}}
+```"#
+        );
+        let items = vec![Item::AgentReasoning { content }];
+
+        let result = activity_result_from_turn_with_workflow(
+            &job,
+            &TurnStatus::Completed,
+            &items,
+            &ThreadId::from_str("thread-1"),
+            &TurnId::from_str("turn-1"),
+            "codex",
+            Path::new("/project"),
+            "digest-1",
+            Some(GITHUB_ISSUE_PR_DEFINITION_ID),
+        );
+
+        assert_eq!(result.activity, LOCAL_REVIEW_ACTIVITY);
+        assert_eq!(
+            result.status,
+            ActivityStatus::Succeeded,
+            "{signal_type} should remain available to the reducer"
+        );
+        assert!(result
+            .signals
+            .iter()
+            .any(|signal| signal.signal_type == signal_type));
+        assert!(!result
+            .signals
+            .iter()
+            .any(|signal| signal.signal_type == "ActivityStatusContractDowngraded"));
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "accepted");
+        assert_eq!(envelope["final_result"]["status"], "succeeded");
+    }
+}
+
+#[test]
+fn activity_result_from_turn_preserves_local_review_changes_requested_with_unresolved_threads() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": LOCAL_REVIEW_ACTIVITY
+        }),
+    );
+    let items = vec![Item::AgentReasoning {
+        content: r#"Local review report.
+
+```harness-activity-result
+{"activity":"run_local_review","status":"succeeded","summary":"Local review found two unresolved review threads on PR #1914 and requested changes.","artifacts":[{"artifact_type":"local_review_findings","artifact":{"unresolved_review_threads":[{"path":"AGENTS.md","line":61,"body":"Use the review verdicts accepted by the parser."},{"path":"CLAUDE.md","line":14,"body":"Require Codex-variable stripping in equivalent launchers."}],"blockers":["two unresolved review threads"]}}],"signals":[{"signal_type":"LocalReviewChangesRequested","signal":{"pr_number":1914,"pr_url":"https://github.com/majiayu000/harness/pull/1914"}}],"validation":[],"error":null,"error_kind":null}
+```"#
+            .to_string(),
+    }];
+
+    let result = activity_result_from_turn_with_workflow(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+        Some(GITHUB_ISSUE_PR_DEFINITION_ID),
+    );
+
+    assert_eq!(result.activity, LOCAL_REVIEW_ACTIVITY);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+    assert!(result
+        .signals
+        .iter()
+        .any(|signal| signal.signal_type == LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL));
+    assert!(!result
+        .signals
+        .iter()
+        .any(|signal| signal.signal_type == "ActivityStatusContractDowngraded"));
+    let findings = artifact_by_type(&result, "local_review_findings");
+    assert_eq!(
+        findings.artifact["unresolved_review_threads"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        findings.artifact["blockers"],
+        json!(["two unresolved review threads"])
+    );
     let envelope = envelope_artifact(&result);
     assert_eq!(envelope["outcome"], "accepted");
     assert_eq!(envelope["final_result"]["status"], "succeeded");

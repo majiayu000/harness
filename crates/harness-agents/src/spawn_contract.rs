@@ -1,4 +1,4 @@
-use harness_core::agent::{AgentEgressMode, TurnRequest, AGENT_EGRESS_PROXY_IMAGE_ENV};
+use harness_core::agent::{AgentEgressMode, AgentRequest, AGENT_EGRESS_PROXY_IMAGE_ENV};
 #[cfg(test)]
 use harness_core::agent::{
     AGENT_CONTAINER_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV,
@@ -28,7 +28,7 @@ use egress::{
 };
 use spawn_env::{
     container_env_vars, container_image, docker_process_env, host_process_env, isolation_tier,
-    network_allowlist, review_git_safe_workspace, ContainerEnv,
+    network_allowlist, review_git_safe_workspace, secretless_env_requested, ContainerEnv,
 };
 
 pub(crate) fn agent_container_image(env_vars: &HashMap<String, String>) -> String {
@@ -58,7 +58,7 @@ pub(crate) const REVIEW_GIT_SAFE_WORKSPACE_ENV: &str = "HARNESS_AGENT_REVIEW_GIT
 pub(crate) struct AdapterSpawnPolicyFingerprint([u8; 32]);
 
 pub(crate) fn adapter_spawn_policy_fingerprint(
-    req: &TurnRequest,
+    req: &AgentRequest,
     default_sandbox_mode: SandboxMode,
 ) -> AdapterSpawnPolicyFingerprint {
     let mut hasher = Sha256::new();
@@ -242,7 +242,7 @@ impl AgentSpawnContract for HostSpawn {
             current_dir: input.project_root.to_path_buf(),
             child_workspace: input.project_root.to_path_buf(),
             process_env,
-            clear_inherited_env: false,
+            clear_inherited_env: secretless_env_requested(input.env_vars),
             sandbox_engine: wrapped_command.engine,
             egress_proxy_lease: None,
             egress_verification: if egress_route.is_some() {

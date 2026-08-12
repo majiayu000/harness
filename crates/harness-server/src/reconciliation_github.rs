@@ -78,7 +78,9 @@ pub(super) fn classify_issue_state(state: &GitHubIssueState) -> GitHubState {
 
 /// Fetch GitHub PR state from a full URL (e.g. `https://github.com/.../pull/42`).
 pub(super) async fn fetch_pr_state_by_url(pr_url: &str, github_token: Option<&str>) -> GitHubState {
-    let Some((owner, repo, pr_number)) = harness_core::prompts::parse_github_pr_url(pr_url) else {
+    let Some((owner, repo, pr_number)) =
+        harness_agents::output_parsing::parse_github_pr_url(pr_url)
+    else {
         tracing::debug!(pr_url, "GitHub PR state check skipped for unparseable URL");
         return GitHubState::Unknown;
     };

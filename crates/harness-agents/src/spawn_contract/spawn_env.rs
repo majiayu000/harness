@@ -7,7 +7,7 @@ use crate::scoped_token::{
 };
 use harness_core::agent::{
     AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV, AGENT_ISOLATION_TIER_ENV,
-    AGENT_NETWORK_ALLOWLIST_ENV,
+    AGENT_NETWORK_ALLOWLIST_ENV, AGENT_SECRETLESS_ENV_ENV,
 };
 use harness_core::config::isolation::IsolationTier;
 use harness_core::error::HarnessError;
@@ -26,9 +26,16 @@ fn is_spawn_control_env(key: &str) -> bool {
             | AGENT_CONTAINER_IMAGE_ENV
             | LEGACY_EGRESS_PROXY_ENV
             | AGENT_EGRESS_PROXY_IMAGE_ENV
+            | AGENT_SECRETLESS_ENV_ENV
             | SCOPED_GITHUB_TOKEN_ENV
             | REVIEW_GIT_SAFE_WORKSPACE_ENV
     ) || proxy_env_keys().contains(&key)
+}
+
+pub(super) fn secretless_env_requested(env_vars: &HashMap<String, String>) -> bool {
+    env_vars
+        .get(AGENT_SECRETLESS_ENV_ENV)
+        .is_some_and(|value| value == "1")
 }
 
 pub(super) fn isolation_tier(

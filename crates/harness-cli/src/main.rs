@@ -9,8 +9,15 @@ mod gc;
 
 fn main() -> anyhow::Result<()> {
     let cli = commands::Cli::parse();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(commands::run(cli))
+    let exit_code = {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(commands::run(cli))?
+    };
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        std::process::exit(exit_code);
+    }
 }

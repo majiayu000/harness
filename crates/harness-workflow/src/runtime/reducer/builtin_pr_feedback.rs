@@ -238,16 +238,24 @@ fn pr_feedback_outcome_from_signals(result: &ActivityResult) -> Option<PrFeedbac
 }
 
 fn local_review_outcome_from_signals(result: &ActivityResult) -> Option<LocalReviewOutcome> {
-    if has_signal(result, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL) {
-        return Some(LocalReviewOutcome::ChangesRequested);
+    let mut declared_count = 0;
+    let mut declared_outcome = None;
+    for signal in &result.signals {
+        let outcome = match signal.signal_type.as_str() {
+            LOCAL_REVIEW_PASSED_SIGNAL => LocalReviewOutcome::Passed,
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL => LocalReviewOutcome::ChangesRequested,
+            LOCAL_REVIEW_BLOCKED_SIGNAL => LocalReviewOutcome::Blocked,
+            _ => continue,
+        };
+        declared_count += 1;
+        declared_outcome = Some(outcome);
     }
-    if has_signal(result, LOCAL_REVIEW_BLOCKED_SIGNAL) {
-        return Some(LocalReviewOutcome::Blocked);
+
+    if declared_count == 1 {
+        declared_outcome
+    } else {
+        None
     }
-    if has_signal(result, LOCAL_REVIEW_PASSED_SIGNAL) {
-        return Some(LocalReviewOutcome::Passed);
-    }
-    None
 }
 
 fn github_issue_pr_feedback_activity_matches(

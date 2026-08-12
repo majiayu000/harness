@@ -5,8 +5,9 @@ use harness_workflow::runtime::{
     RepoMemoryRecord, RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
     WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowRuntimeRecoveryAction,
     WorkflowRuntimeStore, WorkflowStateDefinition, WorkflowSubject, ISSUE_PLAN_ACTIVITY,
-    ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
-    SERVER_PR_SNAPSHOT_ARTIFACT,
+    ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, LOCAL_REVIEW_ACTIVITY,
+    LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
+    PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 
 fn resolved_settings_for_tests(profile: &RuntimeProfile) -> ResolvedRuntimeSettings {
@@ -168,6 +169,40 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
             ["validation_commands"]
             .as_str()
             .is_some_and(|value| value.contains("successful status"))
+    );
+}
+
+#[test]
+fn activity_result_schema_requires_exactly_one_local_review_outcome() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": LOCAL_REVIEW_ACTIVITY
+        }),
+    );
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "local_review_gate",
+        WorkflowSubject::new("issue", "issue:123"),
+    )
+    .with_id("issue-123");
+
+    let schema = activity_result_schema(&job, Some(&workflow));
+
+    assert_eq!(
+        schema["activity_contract"]["success_requires"],
+        "exactly_one_local_review_outcome_signal"
+    );
+    assert_eq!(
+        schema["activity_contract"]["accepted_signals"],
+        json!([
+            LOCAL_REVIEW_PASSED_SIGNAL,
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            LOCAL_REVIEW_BLOCKED_SIGNAL,
+        ])
     );
 }
 

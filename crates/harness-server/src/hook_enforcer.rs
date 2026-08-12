@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::circuit_breaker::CircuitBreaker;
+use crate::hook_circuit_breaker::CircuitBreaker;
 
 /// Post-tool-use hook enforcer.
 ///

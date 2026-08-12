@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 harness-core = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

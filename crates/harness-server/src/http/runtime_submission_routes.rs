@@ -1,4 +1,6 @@
-use super::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
+use super::rest_contract::{
+    ContractJson, ContractQuery, LegacyJson as Json, PrimitivePath as Path,
+};
 use super::state::AppState;
 use axum::{
     extract::State,
@@ -6,6 +8,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use harness_core::agent::ApprovalDecision;
+use harness_protocol::rest::{
+    WorkflowEvidenceArtifact as RestWorkflowEvidenceArtifact,
+    WorkflowEvidenceExportResponse as RestWorkflowEvidenceExportResponse,
+    WorkflowEvidenceQuery as RestWorkflowEvidenceQuery,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc};
@@ -31,6 +38,39 @@ pub(super) struct RuntimeSubmissionPrompt {
     phase: String,
     prompt: String,
     created_at: String,
+}
+
+pub(crate) async fn get_evidence(
+    State(state): State<Arc<AppState>>,
+    ContractQuery(query): ContractQuery<RestWorkflowEvidenceQuery>,
+) -> Response {
+    get_evidence_response(state, query, false).await
+}
+
+pub(crate) async fn get_evidence_export(
+    State(state): State<Arc<AppState>>,
+    ContractQuery(query): ContractQuery<RestWorkflowEvidenceQuery>,
+) -> Response {
+    get_evidence_response(state, query, true).await
+}
+
+async fn get_evidence_response(
+    state: Arc<AppState>,
+    query: RestWorkflowEvidenceQuery,
+    default_include_payload: bool,
+) -> Response {
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    let query = workflow_evidence_query(query, default_include_payload);
+    match store.export_workflow_run_evidence(query).await {
+        Ok(export) => ContractJson(workflow_evidence_export_response(export)).into_response(),
+        Err(error) => {
+            tracing::error!("get_runtime_evidence: runtime evidence lookup failed: {error}");
+            internal_server_error()
+        }
+    }
 }
 
 pub(crate) async fn respond_to_approval(
@@ -282,4 +322,65 @@ fn internal_server_error() -> Response {
         Json(json!({"error": "internal server error"})),
     )
         .into_response()
+}
+
+fn workflow_evidence_query(
+    query: RestWorkflowEvidenceQuery,
+    default_include_payload: bool,
+) -> harness_workflow::runtime::WorkflowRunEvidenceQuery {
+    harness_workflow::runtime::WorkflowRunEvidenceQuery {
+        project_id: query.project_id,
+        commit_sha: query.commit_sha,
+        suite: query.suite,
+        decision: query.decision,
+        created_after: query.created_after,
+        created_before: query.created_before,
+        include_payload: query.include_payload.unwrap_or(default_include_payload),
+        limit: query
+            .limit
+            .unwrap_or(harness_workflow::runtime::WORKFLOW_RUN_EVIDENCE_DEFAULT_LIMIT),
+    }
+}
+
+fn workflow_evidence_export_response(
+    export: harness_workflow::runtime::WorkflowRunEvidenceExport,
+) -> RestWorkflowEvidenceExportResponse {
+    RestWorkflowEvidenceExportResponse {
+        schema: export.schema,
+        generated_at: export.generated_at,
+        limit: export.limit,
+        count: export.records.len(),
+        records: export
+            .records
+            .into_iter()
+            .map(workflow_evidence_artifact_response)
+            .collect(),
+    }
+}
+
+fn workflow_evidence_artifact_response(
+    record: harness_workflow::runtime::WorkflowRunEvidence,
+) -> RestWorkflowEvidenceArtifact {
+    RestWorkflowEvidenceArtifact {
+        id: record.id,
+        workflow_id: record.workflow_id,
+        command_id: record.command_id,
+        runtime_job_id: record.runtime_job_id,
+        project_id: record.project_id,
+        commit_sha: record.commit_sha,
+        stack: record.stack,
+        suite: record.suite,
+        baseline: record.baseline,
+        decision: record.decision,
+        schema: record.evidence_schema,
+        digest: record.digest,
+        trust: record.trust,
+        location: record.location,
+        retention_class: record.retention_class,
+        payload: record.payload,
+        payload_expires_at: record.payload_expires_at,
+        payload_expired_at: record.payload_expired_at,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
 }

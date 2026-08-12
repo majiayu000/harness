@@ -1,4 +1,4 @@
-use crate::agent::{AgentPromptLayers, AgentRequest, TurnRequest};
+use crate::agent::{AgentPromptLayers, AgentRequest};
 use crate::prompts;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -157,8 +157,8 @@ fn concurrent_similar_prompts_keep_explicit_layer_attribution() {
 }
 
 #[test]
-fn turn_request_uses_same_claude_layer_split() {
-    let request = TurnRequest {
+fn agent_request_uses_same_claude_layer_split() {
+    let request = AgentRequest {
         prompt: "static\ncontext\ndynamic\n".to_string(),
         prompt_layers: Some(AgentPromptLayers::new("static\n", "context\n", "dynamic\n")),
         project_root: PathBuf::from("/tmp/project"),
@@ -169,13 +169,14 @@ fn turn_request_uses_same_claude_layer_split() {
         sandbox_mode: None,
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: vec![],
         timeout_secs: None,
         env_vars: HashMap::new(),
         capability_token: None,
     };
 
-    assert_eq!(request.claude_system_prompt(), Some("static\n"));
+    assert_eq!(request.claude_system_prompt().as_deref(), Some("static\n"));
     assert_eq!(request.claude_main_prompt(), "context\ndynamic\n");
 }
 

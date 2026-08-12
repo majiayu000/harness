@@ -48,6 +48,30 @@ pub(super) fn spawn_runtime_retention(state: &Arc<AppState>) {
                 let dry_run_remaining = dry_run_passes_remaining
                     .get_or_insert(workflow_cfg.storage.runtime_retention_dry_run_passes);
                 if let Some(store) = state.core.workflow_runtime_store.as_ref() {
+                    match store
+                        .expire_workflow_run_evidence_payloads(
+                            Utc::now(),
+                            workflow_cfg.storage.runtime_retention_batch_size as i64,
+                        )
+                        .await
+                    {
+                        Ok(expired_payloads) if expired_payloads > 0 => {
+                            tracing::info!(
+                                expired_payloads,
+                                "runtime retention expired workflow evidence payloads"
+                            )
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            handle.tick_failed(&error.to_string());
+                            tracing::warn!(
+                                "runtime retention evidence payload expiry failed: {error}"
+                            );
+                            drop(state);
+                            tokio::time::sleep(interval).await;
+                            continue;
+                        }
+                    }
                     let cutoff = Utc::now()
                         - chrono::Duration::days(
                             workflow_cfg.storage.runtime_retention_days as i64,

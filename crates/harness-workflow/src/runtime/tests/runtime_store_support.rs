@@ -91,6 +91,9 @@ async fn drop_runtime_graph_fk_constraints(store: &WorkflowRuntimeStore) -> anyh
         "ALTER TABLE runtime_events DROP CONSTRAINT IF EXISTS runtime_events_runtime_job_id_fkey",
         "ALTER TABLE workflow_artifacts DROP CONSTRAINT IF EXISTS workflow_artifacts_workflow_id_fkey",
         "ALTER TABLE workflow_artifacts DROP CONSTRAINT IF EXISTS workflow_artifacts_runtime_job_id_fkey",
+        "ALTER TABLE workflow_run_evidence DROP CONSTRAINT IF EXISTS workflow_run_evidence_workflow_id_fkey",
+        "ALTER TABLE workflow_run_evidence DROP CONSTRAINT IF EXISTS workflow_run_evidence_command_id_fkey",
+        "ALTER TABLE workflow_run_evidence DROP CONSTRAINT IF EXISTS workflow_run_evidence_runtime_job_id_fkey",
     ] {
         sqlx::query(statement).execute(store.pool()).await?;
     }

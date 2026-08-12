@@ -760,7 +760,7 @@ fn parse_runtime_log_identity(file_name: &str) -> Option<(DateTime<Utc>, u32)> {
     Some((DateTime::from_naive_utc_and_offset(naive, Utc), pid))
 }
 
-pub async fn run(cli: Cli) -> anyhow::Result<()> {
+pub async fn run(cli: Cli) -> anyhow::Result<i32> {
     let (mut config, config_source) = load_config(cli.config.as_deref())?;
     // Apply env var overrides for all subcommands so that HARNESS_DATA_DIR,
     // HARNESS_PROJECT_ROOT, etc. are respected by gc, rule check, and skill
@@ -1002,7 +1002,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
 
         Command::Eval { cmd } => {
-            eval::run(cmd).await?;
+            return eval::run(cmd).await;
         }
 
         Command::Plan { cmd } => match cmd {
@@ -1073,7 +1073,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(0)
 }
 
 #[cfg(test)]

@@ -39,7 +39,7 @@ async fn closed_event_receiver_kills_and_reaps_app_server_process_group() -> any
         state.thread_id = Some("thread-1".into());
         state.child_workspace = Some(PathBuf::from("/tmp/project"));
     }
-    let request = TurnRequest {
+    let request = AgentRequest {
         prompt: "ping".into(),
         prompt_layers: None,
         project_root: PathBuf::from("/tmp/project"),
@@ -50,6 +50,7 @@ async fn closed_event_receiver_kills_and_reaps_app_server_process_group() -> any
         sandbox_mode: None,
         approval_policy: None,
         allowed_tools: None,
+        max_budget_usd: None,
         context: Vec::new(),
         timeout_secs: Some(5),
         env_vars: HashMap::new(),

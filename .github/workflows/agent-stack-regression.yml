@@ -21,7 +21,6 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || vars.AGENT_STACK_REGRESSION_ENABLED == 'true' }}
     env:
       BASELINE_PATH: ${{ inputs.baseline_path || vars.AGENT_STACK_REGRESSION_BASELINE || 'evals/baselines/agent-stack/latest.json' }}
-      CANDIDATE_DECISION_PATH: ${{ runner.temp }}/agent-stack-regression/candidate-decision.json
       EVIDENCE_DIR: artifacts/agent-stack-regression
     steps:
       - name: Checkout repository
@@ -36,16 +35,39 @@ jobs:
       - name: Build Harness CLI
         run: cargo build -p harness-cli --locked
 
-      - name: Prepare fail-closed decision input
+      - name: Resolve reviewed baseline
+        id: baseline
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
-          SUBJECT: ${{ github.repository }}@${{ github.sha }}
+          DEFAULT_BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          SUBJECT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           rm -rf "$EVIDENCE_DIR"
-          mkdir -p "$EVIDENCE_DIR" "$(dirname "$CANDIDATE_DECISION_PATH")"
+          mkdir -p "$EVIDENCE_DIR"
+          BASE_REF="${PR_BASE_REF:-$DEFAULT_BASE_REF}"
+          BASE_SHA="$PR_BASE_SHA"
+          if [ -z "$BASE_REF" ]; then
+            BASE_REF="main"
+          fi
+          if [ -z "$BASE_SHA" ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_REF"
+            BASE_SHA="$(git rev-parse "origin/${BASE_REF}")"
+          fi
+          SUBJECT="${GITHUB_REPOSITORY}@${SUBJECT_SHA}"
+          export BASE_SHA BASELINE_PATH SUBJECT
           BASELINE_COPY="$EVIDENCE_DIR/base-baseline.json"
           INPUT_JSON="$EVIDENCE_DIR/promotion-input.json"
+
+          {
+            echo "base_ref=$BASE_REF"
+            echo "base_sha=$BASE_SHA"
+            echo "baseline_copy=$BASELINE_COPY"
+            echo "input_json=$INPUT_JSON"
+            echo "subject=$SUBJECT"
+          } >> "$GITHUB_OUTPUT"
+
           if ! git show "${BASE_SHA}:${BASELINE_PATH}" > "$BASELINE_COPY" 2>"$EVIDENCE_DIR/baseline.stderr"; then
             python3 - "$INPUT_JSON" <<'PY'
           import json
@@ -56,7 +78,7 @@ jobs:
               "suite": "agent-stack",
               "subject": os.environ["SUBJECT"],
               "baseline": f'{os.environ["BASELINE_PATH"]}@{os.environ["BASE_SHA"]}',
-              "candidate": os.environ["CANDIDATE_DECISION_PATH"],
+              "candidate": None,
               "decision": "NO_BASELINE",
               "no_change": True,
               "gaps": ["reviewed base-branch baseline was not found"],
@@ -69,9 +91,87 @@ jobs:
               json.dump(payload, handle, indent=2)
               handle.write("\n")
           PY
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "has_baseline=true" >> "$GITHUB_OUTPUT"
 
+      - name: Run regression engine
+        id: engine
+        if: ${{ steps.baseline.outputs.has_baseline == 'true' }}
+        env:
+          BASE_SHA: ${{ steps.baseline.outputs.base_sha }}
+          CANDIDATE_DECISION_PATH: ${{ runner.temp }}/agent-stack-regression/candidate-decision.raw.json
+          SUBJECT: ${{ steps.baseline.outputs.subject }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$CANDIDATE_DECISION_PATH")"
+          python3 - "$CANDIDATE_DECISION_PATH" <<'PY'
+          import fnmatch
+          import json
+          import os
+          import subprocess
+          import sys
+
+          stack_patterns = [
+              ".github/CODEOWNERS",
+              ".github/actions/**",
+              ".github/workflows/**",
+              ".githooks/**",
+              "AGENTS.md",
+              "CLAUDE.md",
+              "WORKFLOW.md",
+              "config/WORKFLOW.md",
+              "evals/**",
+              "skills/**",
+              "crates/harness-agents/**",
+              "crates/harness-core/src/stack/**",
+              "crates/harness-workflow/src/runtime/eval/**",
+          ]
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", f'{os.environ["BASE_SHA"]}...HEAD'],
+              text=True,
+          ).splitlines()
+          stack_changes = [
+              path
+              for path in changed
+              if any(fnmatch.fnmatch(path, pattern) for pattern in stack_patterns)
+          ]
+          decision = "REVIEW" if stack_changes else "PROMOTE"
+          payload = {
+              "suite": "agent-stack",
+              "subject": os.environ["SUBJECT"],
+              "baseline": os.environ["BASE_SHA"],
+              "candidate": "HEAD",
+              "decision": decision,
+              "no_change": not stack_changes,
+              "changes": stack_changes,
+              "regressions": [],
+              "gaps": [],
+              "rules": [
+                  "required check name is agent-stack / regression",
+                  "trusted decision output is created after untrusted build steps",
+                  "stack-affecting path changes require review",
+              ],
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2)
+              handle.write("\n")
+          PY
+          echo "candidate_decision=$CANDIDATE_DECISION_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare decision summary input
+        env:
+          BASELINE_COPY: ${{ steps.baseline.outputs.baseline_copy }}
+          BASE_SHA: ${{ steps.baseline.outputs.base_sha }}
+          CANDIDATE_DECISION_PATH: ${{ steps.engine.outputs.candidate_decision }}
+          INPUT_JSON: ${{ steps.baseline.outputs.input_json }}
+          SUBJECT: ${{ steps.baseline.outputs.subject }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.baseline.outputs.has_baseline }}" != "true" ]; then
+            exit 0
+          fi
           if [ ! -s "$CANDIDATE_DECISION_PATH" ]; then
             python3 - "$INPUT_JSON" <<'PY'
           import json
@@ -97,11 +197,89 @@ jobs:
               handle.write("\n")
           PY
           else
-            cp "$CANDIDATE_DECISION_PATH" "$INPUT_JSON"
+            python3 - "$CANDIDATE_DECISION_PATH" "$INPUT_JSON" <<'PY'
+          import json
+          import os
+          import sys
+
+          allowed = {"PROMOTE", "REVIEW", "BLOCK", "NO_BASELINE", "ENGINE_ERROR"}
+
+          def engine_error(message):
+              return {
+                  "suite": "agent-stack",
+                  "subject": os.environ["SUBJECT"],
+                  "baseline": f'{os.environ["BASELINE_PATH"]}@{os.environ["BASE_SHA"]}',
+                  "candidate": os.environ["CANDIDATE_DECISION_PATH"],
+                  "decision": "ENGINE_ERROR",
+                  "no_change": False,
+                  "engine_error": message,
+                  "rules": [
+                      "required check name is agent-stack / regression",
+                      "REVIEW, BLOCK, no-baseline, and engine errors fail this check",
+                      "malformed candidate engine output is converted to ENGINE_ERROR evidence",
+                  ],
+              }
+
+          try:
+              with open(sys.argv[1], "r", encoding="utf-8") as handle:
+                  raw = json.load(handle)
+          except Exception as exc:
+              payload = engine_error(f"agent-stack regression engine wrote malformed JSON: {exc}")
+          else:
+              if not isinstance(raw, dict):
+                  payload = engine_error("agent-stack regression engine wrote a non-object decision")
+              else:
+                  decision = str(raw.get("decision", "")).upper()
+              if isinstance(raw, dict) and decision not in allowed:
+                  payload = engine_error("agent-stack regression engine wrote an invalid decision")
+              elif isinstance(raw, dict):
+                  def string_list(value):
+                      if not isinstance(value, list):
+                          return []
+                      return [str(item) for item in value]
+
+                  payload = {
+                      "suite": str(raw.get("suite") or "agent-stack"),
+                      "subject": str(raw.get("subject") or os.environ["SUBJECT"]),
+                      "baseline": str(
+                          raw.get("baseline")
+                          or f'{os.environ["BASELINE_PATH"]}@{os.environ["BASE_SHA"]}'
+                      ),
+                      "candidate": str(
+                          raw.get("candidate") or os.environ["CANDIDATE_DECISION_PATH"]
+                      ),
+                      "decision": decision,
+                      "no_change": bool(raw.get("no_change", False)),
+                      "changes": string_list(raw.get("changes", [])),
+                      "regressions": string_list(raw.get("regressions", [])),
+                      "gaps": string_list(raw.get("gaps", [])),
+                      "rules": string_list(raw.get("rules", [])),
+                  }
+                  if raw.get("engine_error"):
+                      payload["engine_error"] = str(raw["engine_error"])
+          with open(sys.argv[2], "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2)
+              handle.write("\n")
+          PY
           fi
 
       - name: Render decision summary
         run: |
+          trusted_status="$(python3 - "$EVIDENCE_DIR/promotion-input.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], "r", encoding="utf-8") as handle:
+              decision = str(json.load(handle).get("decision", "")).upper()
+          print({
+              "PROMOTE": 0,
+              "REVIEW": 2,
+              "NO_BASELINE": 2,
+              "BLOCK": 3,
+              "ENGINE_ERROR": 1,
+          }.get(decision, 1))
+          PY
+          )"
           set +e
           target/debug/harness eval promotion-summary \
             --input "$EVIDENCE_DIR/promotion-input.json" \
@@ -109,8 +287,20 @@ jobs:
             --markdown-output "$EVIDENCE_DIR/step-summary.md"
           status=$?
           set -e
-          cat "$EVIDENCE_DIR/step-summary.md" >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
+          if [ -s "$EVIDENCE_DIR/step-summary.md" ]; then
+            cat "$EVIDENCE_DIR/step-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Agent Stack Regression" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "decision summary renderer failed before writing Markdown" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$status" -ne "$trusted_status" ]; then
+            echo "promotion summary renderer exited $status; trusted decision status is $trusted_status" >&2
+          fi
+          if [ "$trusted_status" -eq 0 ] && [ "$status" -ne 0 ]; then
+            exit 1
+          fi
+          exit "$trusted_status"
 
       - name: Upload regression evidence
         if: always()

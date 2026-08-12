@@ -249,7 +249,7 @@ fn expected_head_ref(workflow: &WorkflowInstance) -> Option<String> {
 }
 
 fn repo_slug_from_url(url: &str) -> Option<String> {
-    harness_core::prompts::parse_github_pr_url(url)
+    harness_agents::output_parsing::parse_github_pr_url(url)
         .map(|(owner, repo, _)| format!("{owner}/{repo}"))
 }
 
