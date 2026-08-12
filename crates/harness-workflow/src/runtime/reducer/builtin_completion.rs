@@ -423,10 +423,12 @@ fn workflow_decision_from_activity_result(
 }
 
 /// Evidence classes that only the server may assert.
-const SERVER_OWNED_EVIDENCE_KINDS: [&str; 3] = [
+const SERVER_OWNED_EVIDENCE_KINDS: [&str; 5] = [
     crate::runtime::completion_evidence::EVIDENCE_VERIFIED_PR_BINDING,
     crate::runtime::completion_evidence::EVIDENCE_SERVER_VALIDATION_DIGEST,
     crate::runtime::completion_evidence::EVIDENCE_GITHUB_TERMINAL,
+    crate::runtime::completion_evidence::EVIDENCE_SERVER_PR_SNAPSHOT,
+    crate::runtime::completion_evidence::EVIDENCE_PROMPT_COMPLETION,
 ];
 
 fn strip_server_owned_evidence(mut decision: WorkflowDecision) -> WorkflowDecision {
@@ -449,15 +451,19 @@ fn server_owned_evidence_for_result(
 
     let mut evidence = Vec::new();
     if let Some(verified) = verified_pr_binding_artifact(result) {
-        evidence.push(WorkflowEvidence::new(
+        evidence.push(WorkflowEvidence::runtime_observed(
             EVIDENCE_VERIFIED_PR_BINDING,
             verified.to_string(),
+            "server_verified_pr_binding_artifact",
+            None,
         ));
     }
     if server_validation_digest_passed(result) {
-        evidence.push(WorkflowEvidence::new(
+        evidence.push(WorkflowEvidence::reexecuted(
             EVIDENCE_SERVER_VALIDATION_DIGEST,
             "server validation digest recorded all commands exiting zero",
+            "server_validation_digest",
+            None,
         ));
     }
     evidence

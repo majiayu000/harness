@@ -278,9 +278,11 @@ fn candidate_promotion_success_decision_inner(
         "candidate",
         format!("candidate_id={}", plan.selected.candidate_id),
     ))
-    .with_evidence(WorkflowEvidence::new(
+    .with_evidence(WorkflowEvidence::runtime_observed(
         "runtime_completion",
         format!("event_id={} activity={}", event.id, result.activity),
+        "candidate_promotion_completion",
+        Some(event.id.clone()),
     ));
 
     if !plan.cleanup_targets.is_empty() {

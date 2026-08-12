@@ -143,9 +143,11 @@ fn server_validation_digest_evidence(result: &ActivityResult) -> WorkflowEvidenc
                 .and_then(Value::as_array)
                 .map(Vec::len)
                 .unwrap_or(0);
-            WorkflowEvidence::new(
+            WorkflowEvidence::reexecuted(
                 EVIDENCE_SERVER_VALIDATION_DIGEST,
                 format!("server executed {commands} validation command(s), all exit 0"),
+                format!("server_validation_digest:{commands}_commands"),
+                None,
             )
         }
         None => WorkflowEvidence::new(

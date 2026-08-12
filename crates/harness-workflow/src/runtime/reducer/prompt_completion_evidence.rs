@@ -29,15 +29,19 @@ pub(super) enum PromptCompletionEvidence {
 impl PromptCompletionEvidence {
     pub(super) fn evidence(&self) -> WorkflowEvidence {
         match self {
-            Self::ValidationReport { commands, failures } => WorkflowEvidence::new(
+            Self::ValidationReport { commands, failures } => WorkflowEvidence::runtime_observed(
                 EVIDENCE_PROMPT_COMPLETION,
                 format!(
                     "validation_report: {commands} command(s) reported, {failures} non-zero exit(s)"
                 ),
+                "prompt_completion_reducer",
+                None,
             ),
-            Self::NoChangeRationale => WorkflowEvidence::new(
+            Self::NoChangeRationale => WorkflowEvidence::runtime_observed(
                 EVIDENCE_PROMPT_COMPLETION,
                 "no_change_rationale: the task reported no change with a stated reason",
+                "prompt_completion_reducer",
+                None,
             ),
         }
     }

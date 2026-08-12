@@ -160,9 +160,11 @@ pub(super) fn github_issue_closed_decision(
                 "closed_issue_evidence": closed_issue.payload,
             }),
         ))
-        .with_evidence(WorkflowEvidence::new(
+        .with_evidence(WorkflowEvidence::runtime_observed(
             EVIDENCE_GITHUB_TERMINAL,
             format!("closed_issue: {}", closed_issue.summary),
+            "github_issue_closed_result",
+            Some(event.id.clone()),
         ))
         .with_evidence(WorkflowEvidence::new("closed_issue", closed_issue.summary))
         .with_evidence(runtime_completion_evidence(event, result))
@@ -248,9 +250,11 @@ pub(crate) fn verified_pr_binding_evidence(
                 "server verified pull request {verified_number:?} but the activity claimed {claimed_pr_number}"
             ));
         }
-        return Ok(WorkflowEvidence::new(
+        return Ok(WorkflowEvidence::runtime_observed(
             EVIDENCE_VERIFIED_PR_BINDING,
             verified.to_string(),
+            "server_verified_pr_binding_artifact",
+            None,
         ));
     }
     if !transition_evidence_enforced(
@@ -352,7 +356,7 @@ pub(super) fn merged_pr_from_activity_result(
                 "pull_request_evidence": merged.payload,
             }),
         ))
-        .with_evidence(WorkflowEvidence::new(
+        .with_evidence(WorkflowEvidence::runtime_observed(
             EVIDENCE_GITHUB_TERMINAL,
             format!(
                 "merged_pull_request: pr={} head={} merge_commit={}",
@@ -360,6 +364,8 @@ pub(super) fn merged_pr_from_activity_result(
                 merged.head_sha.as_deref().unwrap_or("unknown"),
                 merged.merge_commit_sha.as_deref().unwrap_or("unknown"),
             ),
+            "github_pr_merged_result",
+            Some(event.id.clone()),
         ))
         .with_evidence(WorkflowEvidence::new(
             "github_pr_merged",

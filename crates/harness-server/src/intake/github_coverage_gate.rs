@@ -395,9 +395,11 @@ async fn persist_recovered_workflow(
         state,
         "Recovered an authoritative closing pull request from GitHub.",
     )
-    .with_evidence(WorkflowEvidence::new(
+    .with_evidence(WorkflowEvidence::runtime_observed(
         "server_pr_snapshot",
         "GitHub reported an authoritative closing pull request.",
+        "github_coverage_gate",
+        Some(remote_fact.fact_hash.clone()),
     ))
     .with_command(WorkflowCommand::bind_pr(
         candidate.number,

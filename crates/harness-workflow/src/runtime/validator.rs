@@ -2,7 +2,8 @@ use super::model::{WorkflowCommand, WorkflowCommandType, WorkflowDecision, Workf
 use super::validator_binding::DecisionValidatorBinding;
 use super::validator_progress;
 use chrono::{DateTime, Utc};
-use std::collections::BTreeSet;
+use harness_core::claim_trust::ClaimTrustLevel;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 #[path = "validator_evidence.rs"]
@@ -27,6 +28,7 @@ pub struct TransitionRule {
     pub allowed_commands: BTreeSet<WorkflowCommandType>,
     pub required_command: Option<WorkflowCommandType>,
     pub required_evidence: BTreeSet<String>,
+    pub required_evidence_trust: BTreeMap<String, ClaimTrustLevel>,
     pub operator_recovery_only: bool,
 }
 
@@ -42,6 +44,7 @@ impl TransitionRule {
             allowed_commands: allowed_commands.into_iter().collect(),
             required_command: None,
             required_evidence: BTreeSet::new(),
+            required_evidence_trust: BTreeMap::new(),
             operator_recovery_only: false,
         }
     }
@@ -56,6 +59,7 @@ impl TransitionRule {
             allowed_commands: allowed_commands.into_iter().collect(),
             required_command: None,
             required_evidence: BTreeSet::new(),
+            required_evidence_trust: BTreeMap::new(),
             operator_recovery_only: false,
         }
     }
@@ -348,10 +352,13 @@ impl TransitionAllowlist {
             // A prompt task may mint Done only with server-checkable completion
             // evidence; the reducer resolves validation-report-or-no-change and
             // mints this kind (GH-1817).
-            .require_evidence(
+            .require_evidence_with_trust(
                 "implementing",
                 "done",
-                [super::model::EVIDENCE_PROMPT_COMPLETION],
+                [(
+                    super::model::EVIDENCE_PROMPT_COMPLETION,
+                    ClaimTrustLevel::RuntimeObserved,
+                )],
             )
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
@@ -393,6 +400,7 @@ pub enum WorkflowDecisionRejectionKind {
     ProgressDriverMissing,
     MissingTerminalEvidence,
     MissingRequiredEvidence,
+    InsufficientEvidenceTrust,
     OperatorRecoveryDenied,
 }
 
