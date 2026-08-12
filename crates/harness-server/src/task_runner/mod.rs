@@ -1,12 +1,9 @@
 mod artifacts;
 mod metrics;
-mod request;
-mod state;
 mod store;
-mod types;
 
-// CompletionCallback references TaskState (state.rs) which depends on types.rs.
-// Declaring it here avoids a circular import between the two leaf modules.
+// CompletionCallback references the runtime submission TaskState re-exported
+// below, so keep the alias colocated with the task_runner public facade.
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,25 +11,26 @@ pub type CompletionCallback =
     Arc<dyn Fn(TaskState) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 // Re-export everything that was previously public from the flat task_runner.rs.
-pub(crate) use artifacts::TaskArtifactSink;
-pub use metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
-pub use request::{
+pub use crate::workflow_runtime_submission::runtime_models::{
+    TaskFailureKind, TaskKind, TaskPhase, TaskStatus, TaskTerminalClassification,
+    TaskTerminalFailure, TaskTerminalInfo, TaskTerminalOutcome, ROUND_BUDGET_EXHAUSTED_REASON,
+};
+pub use crate::workflow_runtime_submission::runtime_request::{
     fill_missing_repo_from_project, CreateTaskRequest, PersistedRequestSettings, SystemTaskInput,
     MAX_TASK_PRIORITY,
 };
-pub use state::{
+pub use crate::workflow_runtime_submission::runtime_state::{
     RecentFailureTask, RoundResult, SchedulerAuthorityState, SchedulerOwner, SchedulerOwnerKind,
     TaskSchedulerState, TaskState, TaskSummary, TaskWorkflowSummary,
 };
+pub(crate) use artifacts::TaskArtifactSink;
+pub use harness_core::types::TaskId;
+pub use metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
 use store::{
     mark_terminal_once as mark_terminal_once_impl, mutate_and_persist as mutate_and_persist_impl,
     update_status as update_status_impl,
 };
 pub use store::{TaskStore, TaskSummaryFilter, TaskSummaryPageCursor, TerminalTransition};
-pub use types::{
-    TaskFailureKind, TaskId, TaskKind, TaskPhase, TaskStatus, TaskTerminalClassification,
-    TaskTerminalFailure, TaskTerminalInfo, TaskTerminalOutcome, ROUND_BUDGET_EXHAUSTED_REASON,
-};
 
 fn record_task_runner_usage() {
     harness_core::usage_probe::record_usage(
