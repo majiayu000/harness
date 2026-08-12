@@ -501,10 +501,12 @@ fn runtime_lease_renewal_interval(lease_ttl: Duration) -> StdDuration {
 }
 
 fn runtime_job_cancellation_poll() -> tokio::time::Interval {
-    tokio::time::interval_at(
+    let mut poll = tokio::time::interval_at(
         tokio::time::Instant::now() + RUNTIME_JOB_CANCELLATION_POLL_INTERVAL,
         RUNTIME_JOB_CANCELLATION_POLL_INTERVAL,
-    )
+    );
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    poll
 }
 
 fn runtime_job_activity_name(job: &RuntimeJob) -> String {

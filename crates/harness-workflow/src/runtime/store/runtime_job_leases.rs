@@ -85,21 +85,6 @@ pub fn postgres_timestamp_ceil(value: DateTime<Utc>) -> Option<DateTime<Utc>> {
         .map(postgres_timestamp_floor)
 }
 
-/// Matches PostgreSQL's text-to-`TIMESTAMPTZ` conversion at its microsecond
-/// storage boundary, including round-half-to-even for exact 500ns ties.
-pub fn postgres_timestamp_round(value: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let nanosecond = value.nanosecond();
-    let microsecond = nanosecond / 1_000;
-    let remainder = nanosecond % 1_000;
-    let rounds_up = remainder > 500 || (remainder == 500 && microsecond % 2 == 1);
-    let floored = postgres_timestamp_floor(value);
-    if rounds_up {
-        floored.checked_add_signed(TimeDelta::microseconds(1))
-    } else {
-        Some(floored)
-    }
-}
-
 impl WorkflowRuntimeStore {
     pub async fn remote_runtime_job_lease_proof(
         &self,
@@ -108,8 +93,7 @@ impl WorkflowRuntimeStore {
         lease_generation: u64,
         lease_expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<Uuid>> {
-        let lease_expires_at = postgres_timestamp_round(lease_expires_at)
-            .ok_or_else(|| anyhow::anyhow!("runtime job lease expiry exceeds PostgreSQL range"))?;
+        let lease_expires_at = postgres_timestamp_floor(lease_expires_at);
         let generation = i64::try_from(lease_generation)
             .map_err(|_| anyhow::anyhow!("runtime job lease generation exceeds BIGINT"))?;
         let row: Option<(Option<Uuid>,)> = sqlx::query_as(
@@ -146,16 +130,7 @@ impl WorkflowRuntimeStore {
             return Ok(RuntimeJobLeaseRenewalOutcome::NotFound);
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
-        let Some(request_previous_expires_at) =
-            postgres_timestamp_round(request.previous_expires_at)
-        else {
-            return reject_renewal_tx(
-                tx,
-                &request,
-                RuntimeJobLeaseRenewalRejection::InvariantViolation,
-            )
-            .await;
-        };
+        let request_previous_expires_at = postgres_timestamp_floor(request.previous_expires_at);
 
         sqlx::query(
             "DELETE FROM runtime_job_lease_renewal_receipts
@@ -283,7 +258,7 @@ impl WorkflowRuntimeStore {
         let Some(current_expires_at) = job.lease.as_ref().map(|lease| lease.expires_at) else {
             return reject_renewal_tx(tx, &request, RuntimeJobLeaseRenewalRejection::Revoked).await;
         };
-        if postgres_timestamp_round(current_expires_at) != Some(request_previous_expires_at) {
+        if postgres_timestamp_floor(current_expires_at) != request_previous_expires_at {
             return reject_renewal_tx(tx, &request, RuntimeJobLeaseRenewalRejection::StaleExpiry)
                 .await;
         }
@@ -520,8 +495,7 @@ pub(crate) async fn remote_runtime_job_lease_proof_matches_tx(
     lease_expires_at: DateTime<Utc>,
     lease_proof: Option<Uuid>,
 ) -> anyhow::Result<bool> {
-    let lease_expires_at = postgres_timestamp_round(lease_expires_at)
-        .ok_or_else(|| anyhow::anyhow!("runtime job lease expiry exceeds PostgreSQL range"))?;
+    let lease_expires_at = postgres_timestamp_floor(lease_expires_at);
     let generation = i64::try_from(lease_generation)
         .map_err(|_| anyhow::anyhow!("runtime job lease generation exceeds BIGINT"))?;
     let (matches,): (bool,) = sqlx::query_as(
@@ -554,8 +528,7 @@ async fn remote_runtime_job_lease_is_legacy_tx(
     lease_generation: u64,
     lease_expires_at: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    let lease_expires_at = postgres_timestamp_round(lease_expires_at)
-        .ok_or_else(|| anyhow::anyhow!("runtime job lease expiry exceeds PostgreSQL range"))?;
+    let lease_expires_at = postgres_timestamp_floor(lease_expires_at);
     let generation = i64::try_from(lease_generation)
         .map_err(|_| anyhow::anyhow!("runtime job lease generation exceeds BIGINT"))?;
     let (legacy,): (bool,) = sqlx::query_as(
@@ -607,23 +580,22 @@ mod timestamp_precision_tests {
     }
 
     #[test]
-    fn postgres_timestamp_round_matches_microsecond_ties_to_even() {
+    fn postgres_timestamp_floor_truncates_submicrosecond_precision() {
         for (input, expected) in [
             ("2026-08-12T00:00:00.000000499Z", "2026-08-12T00:00:00Z"),
             ("2026-08-12T00:00:00.000000500Z", "2026-08-12T00:00:00Z"),
             (
-                "2026-08-12T00:00:00.000001500Z",
-                "2026-08-12T00:00:00.000002Z",
-            ),
-            (
                 "2026-08-12T00:00:00.000002500Z",
                 "2026-08-12T00:00:00.000002Z",
             ),
-            ("2026-08-12T00:00:00.999999999Z", "2026-08-12T00:00:01Z"),
+            (
+                "2026-08-12T00:00:00.999999999Z",
+                "2026-08-12T00:00:00.999999Z",
+            ),
         ] {
             assert_eq!(
-                postgres_timestamp_round(timestamp(input)),
-                Some(timestamp(expected))
+                postgres_timestamp_floor(timestamp(input)),
+                timestamp(expected)
             );
         }
     }

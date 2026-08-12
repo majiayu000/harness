@@ -77,6 +77,10 @@ async fn enqueue_test_runtime_job(
 #[tokio::test(start_paused = true)]
 async fn cancellation_poll_waits_before_its_first_database_probe() -> anyhow::Result<()> {
     let mut poll = runtime_job_cancellation_poll();
+    assert_eq!(
+        poll.missed_tick_behavior(),
+        tokio::time::MissedTickBehavior::Delay
+    );
     let first_tick = tokio::spawn(async move { poll.tick().await });
     tokio::task::yield_now().await;
     assert!(!first_tick.is_finished());

@@ -271,6 +271,7 @@ impl WorkspaceManager {
             )
         })?;
         let project_key = crate::workspace_pool::project_limit_key(source_repo);
+        let mut delay = Duration::from_millis(250);
         loop {
             if let Some(lease) = store
                 .try_acquire_repository_write_lease(&project_key)
@@ -282,7 +283,8 @@ impl WorkspaceManager {
                 project_key = %project_key,
                 "workspace pool waiting for the PostgreSQL repository write lease"
             );
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(delay * 2, Duration::from_secs(5));
         }
     }
 

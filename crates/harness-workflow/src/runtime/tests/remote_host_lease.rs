@@ -215,7 +215,7 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
     assert!(replayed);
 
     let same_microsecond_expiry = original_expiry
-        .with_nanosecond(original_expiry.nanosecond() / 1_000 * 1_000 + 1)
+        .with_nanosecond(original_expiry.nanosecond() / 1_000 * 1_000 + 999)
         .expect("same-microsecond timestamp must be valid");
     let (precision_replay_expiry, replayed) = renewed_expiry(
         store

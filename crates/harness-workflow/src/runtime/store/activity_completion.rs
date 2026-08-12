@@ -193,7 +193,8 @@ impl WorkflowRuntimeStore {
                 .is_none_or(|generation| generation == job.lease_generation)
             && job.lease.as_ref().is_some_and(|current| {
                 current.owner == lease.owner
-                    && current.expires_at == lease.expires_at
+                    && runtime_job_leases::postgres_timestamp_floor(current.expires_at)
+                        == runtime_job_leases::postgres_timestamp_floor(lease.expires_at)
                     && current.expires_at > Utc::now()
             });
         if is_current_lease && job.runtime_kind == RuntimeKind::RemoteHost {

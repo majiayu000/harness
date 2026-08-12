@@ -47,7 +47,7 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<Option<RepositoryWriteLease>> {
         let mut connection = loop {
             match tokio::time::timeout(
-                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(10),
                 self.repository_lock_pool.acquire(),
             )
             .await
