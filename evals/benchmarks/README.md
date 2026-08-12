@@ -45,3 +45,8 @@ Historical replay cases can also record structured replay metadata:
 - `commit_resolution` is `resolved` or `pending`.
 - `verdict` is `replayable` or `pending`; pending commit pairs must not be
   marked replayable, dispatched, or counted from collected evidence.
+
+Committed baselines live under `evals/baselines/` as governed baseline records.
+Do not copy candidate run reports into that directory. Use
+`harness eval baseline record` for new baselines and
+`harness eval baseline migrate` for explicit legacy-report migrations.

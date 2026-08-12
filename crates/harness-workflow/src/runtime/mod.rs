@@ -91,13 +91,15 @@ pub use dispatcher::{CommandDispatchOutcome, RuntimeCommandDispatcher, RuntimePr
 pub use errors::RuntimeJobNotFoundError;
 pub use eval::{
     classify_eval_run_attestation, collect_eval_case_evidence,
-    collect_eval_case_evidence_from_records, diff_eval_run_reports, dispatch_eval_case_workflow,
-    enqueue_eval_case_workflow, eval_isolated_runtime_profile, eval_report_dry_run,
-    eval_report_from_evidence, eval_run_attestation_payload_digest,
-    historical_replay_command_digest, parse_benchmark_manifest_str,
-    parse_historical_replay_cohort_str, score_pr_repair_eval, validate_historical_replay_cohort,
+    collect_eval_case_evidence_from_records, compare_eval_baseline, diff_eval_run_reports,
+    dispatch_eval_case_workflow, enqueue_eval_case_workflow, eval_isolated_runtime_profile,
+    eval_report_dry_run, eval_report_from_evidence, eval_run_attestation_payload_digest,
+    historical_replay_command_digest, migrate_eval_baseline_report, parse_benchmark_manifest_str,
+    parse_eval_baseline_record_str, parse_historical_replay_cohort_str, record_eval_baseline,
+    score_pr_repair_eval, validate_eval_baseline, validate_historical_replay_cohort,
     verify_eval_run_attestation, EvalAttestationDecision, EvalAttestationSummary,
-    EvalAttestationTrust, EvalAttestationVerificationError, EvalBenchmarkCase,
+    EvalAttestationTrust, EvalAttestationVerificationError, EvalBaselineCreatorObservation,
+    EvalBaselineError, EvalBaselineProvenance, EvalBaselineRecord, EvalBenchmarkCase,
     EvalBenchmarkManifest, EvalCaseDispatchOutcome, EvalCaseEnqueueOutcome, EvalCaseEvidence,
     EvalCaseInfrastructureStatus, EvalCaseRisk, EvalCaseTransition, EvalCaseTransitionCounts,
     EvalCaseTransitionKind, EvalCaseVerdict, EvalCaseWorkflowInput, EvalCaseWorkflowPlan,
@@ -111,8 +113,9 @@ pub use eval::{
     HistoricalReplayPullRequestSnapshot, HistoricalReplayVerification, KeylessOidcProvider,
     KeylessOidcVerification, ManifestError, ScoringError, VerifiedEvalRunAttestation,
     DEFAULT_CASE_TIMEOUT_SECS, DEFAULT_EVAL_ISOLATION_BACKEND, DEFAULT_EVAL_ISOLATION_IMAGE,
-    DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE, DEFAULT_EVAL_ISOLATION_SANDBOX, EVAL_BRANCH_PREFIX,
-    EVAL_PR_DRAFT_MODE, EVAL_RUN_ATTESTATION_SCHEMA_VERSION, HISTORICAL_REPLAY_COHORT_SCHEMA,
+    DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE, DEFAULT_EVAL_ISOLATION_SANDBOX,
+    EVAL_BASELINE_RECORD_SCHEMA_VERSION, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
+    EVAL_RUN_ATTESTATION_SCHEMA_VERSION, HISTORICAL_REPLAY_COHORT_SCHEMA,
 };
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use memory_retrieval::{

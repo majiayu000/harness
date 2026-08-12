@@ -3,13 +3,16 @@ use clap::{Args, Subcommand};
 use harness_workflow::runtime::eval::model::EvalGrade;
 use harness_workflow::runtime::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
-    parse_benchmark_manifest_str, EvalAttestationDecision, EvalAttestationTrust,
+    migrate_eval_baseline_report, parse_benchmark_manifest_str, parse_eval_baseline_record_str,
+    record_eval_baseline, validate_eval_baseline, EvalAttestationDecision, EvalAttestationTrust,
+    EvalBaselineCreatorObservation, EvalBaselineProvenance, EvalBaselineRecord,
     EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseInfrastructureStatus, EvalCaseTransition,
     EvalCaseTransitionKind, EvalReportCaseStatus, EvalRunReport, EvalRunReportDiff,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const PASS_DROP_EPSILON: f64 = 1e-9;
@@ -20,6 +23,11 @@ pub enum EvalCommand {
     Run(EvalRunArgs),
     /// Compare two saved eval run reports
     Diff(EvalDiffArgs),
+    /// Create, migrate, or verify governed eval baseline records
+    Baseline {
+        #[command(subcommand)]
+        cmd: EvalBaselineCommand,
+    },
 }
 
 #[derive(Args)]
@@ -67,10 +75,64 @@ pub struct EvalDiffArgs {
     pub output: Option<PathBuf>,
 }
 
+#[derive(Subcommand)]
+pub enum EvalBaselineCommand {
+    /// Create a new governed baseline record from an eval report
+    Record(EvalBaselineWriteArgs),
+    /// Explicitly migrate a legacy eval report into a governed baseline record
+    Migrate(EvalBaselineWriteArgs),
+    /// Verify a governed baseline record and print its digest summary
+    Verify(EvalBaselineVerifyArgs),
+}
+
+#[derive(Args)]
+pub struct EvalBaselineWriteArgs {
+    /// Eval run report JSON to bind into the baseline
+    #[arg(long)]
+    pub report: PathBuf,
+    /// New baseline record path. Existing files are never overwritten.
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Digest of the benchmark suite or manifest, in sha256:<64-hex> form
+    #[arg(long)]
+    pub suite_digest: String,
+    /// Stable agent stack identifier used to produce the baseline
+    #[arg(long)]
+    pub stack_id: String,
+    /// Source commit observed when the baseline was created
+    #[arg(long)]
+    pub source_commit: String,
+    /// Evidence identifiers supporting the baseline, repeatable
+    #[arg(long = "evidence-id", required = true)]
+    pub evidence_ids: Vec<String>,
+    /// Human or service identity that observed baseline creation
+    #[arg(long)]
+    pub observer: String,
+    /// RFC3339 timestamp for the creator observation
+    #[arg(long)]
+    pub observed_at: String,
+    /// Creator observation note
+    #[arg(long)]
+    pub observation: String,
+    /// Print the created record JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct EvalBaselineVerifyArgs {
+    /// Governed baseline record JSON
+    pub baseline: PathBuf,
+    /// Print JSON instead of the compact text summary
+    #[arg(long)]
+    pub json: bool,
+}
+
 pub async fn run(cmd: EvalCommand) -> anyhow::Result<()> {
     match cmd {
         EvalCommand::Run(args) => run_eval_report(args).await,
         EvalCommand::Diff(args) => diff_eval_reports(args),
+        EvalCommand::Baseline { cmd } => run_eval_baseline_command(cmd),
     }
 }
 
@@ -78,6 +140,7 @@ async fn run_eval_report(args: EvalRunArgs) -> anyhow::Result<()> {
     if args.dry_run && args.evidence.is_some() {
         anyhow::bail!("use either --dry-run or --evidence, not both");
     }
+    ensure_report_output_not_baseline_path(args.output.as_deref())?;
 
     let manifest = read_eval_manifest(&args.manifest)?;
     let run_id = args
@@ -98,7 +161,7 @@ async fn run_eval_report(args: EvalRunArgs) -> anyhow::Result<()> {
 }
 
 fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
-    let baseline = read_run_report(&args.baseline)?;
+    let baseline = read_baseline_report(&args.baseline)?;
     let candidate = read_run_report(&args.candidate)?;
     if baseline.suite != candidate.suite {
         anyhow::bail!(
@@ -121,6 +184,43 @@ fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!("eval regression gate failed:\n{}", regressions.join("\n"))
+}
+
+fn run_eval_baseline_command(cmd: EvalBaselineCommand) -> anyhow::Result<()> {
+    match cmd {
+        EvalBaselineCommand::Record(args) => record_eval_baseline_command(args),
+        EvalBaselineCommand::Migrate(args) => migrate_eval_baseline_command(args),
+        EvalBaselineCommand::Verify(args) => verify_eval_baseline_command(args),
+    }
+}
+
+fn record_eval_baseline_command(args: EvalBaselineWriteArgs) -> anyhow::Result<()> {
+    let report = read_run_report(&args.report)?;
+    let provenance = baseline_provenance(&args);
+    let baseline = record_eval_baseline(None, report, provenance)
+        .map_err(|error| anyhow::anyhow!("invalid eval baseline record: {error}"))?;
+    write_new_json_output(&baseline, &args.output)?;
+    emit_baseline_record(&baseline, args.json);
+    Ok(())
+}
+
+fn migrate_eval_baseline_command(args: EvalBaselineWriteArgs) -> anyhow::Result<()> {
+    let report = read_run_report(&args.report)?;
+    let provenance = baseline_provenance(&args);
+    let baseline = migrate_eval_baseline_report(report, provenance)
+        .map_err(|error| anyhow::anyhow!("invalid eval baseline migration: {error}"))?;
+    write_new_json_output(&baseline, &args.output)?;
+    emit_baseline_record(&baseline, args.json);
+    Ok(())
+}
+
+fn verify_eval_baseline_command(args: EvalBaselineVerifyArgs) -> anyhow::Result<()> {
+    let baseline = read_eval_baseline_record(&args.baseline)?;
+    validate_eval_baseline(&baseline).map_err(|error| {
+        anyhow::anyhow!("invalid eval baseline {}: {error}", args.baseline.display())
+    })?;
+    emit_baseline_record(&baseline, args.json);
+    Ok(())
 }
 
 fn read_eval_manifest(path: &Path) -> anyhow::Result<EvalBenchmarkManifest> {
@@ -146,6 +246,34 @@ fn read_run_report(path: &Path) -> anyhow::Result<EvalRunReport> {
         .with_context(|| format!("failed to read eval report at {}", path.display()))?;
     serde_json::from_str(&content)
         .map_err(|error| anyhow::anyhow!("invalid eval report {}: {error}", path.display()))
+}
+
+fn read_baseline_report(path: &Path) -> anyhow::Result<EvalRunReport> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read eval baseline at {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse eval baseline at {}", path.display()))?;
+    if is_baseline_record_value(&value) {
+        let baseline = parse_eval_baseline_record_str(&content).map_err(|error| {
+            anyhow::anyhow!("invalid eval baseline {}: {error}", path.display())
+        })?;
+        return Ok(baseline.report);
+    }
+    serde_json::from_value(value)
+        .map_err(|error| anyhow::anyhow!("invalid eval report {}: {error}", path.display()))
+}
+
+fn read_eval_baseline_record(path: &Path) -> anyhow::Result<EvalBaselineRecord> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read eval baseline at {}", path.display()))?;
+    parse_eval_baseline_record_str(&content)
+        .map_err(|error| anyhow::anyhow!("invalid eval baseline {}: {error}", path.display()))
+}
+
+fn is_baseline_record_value(value: &serde_json::Value) -> bool {
+    value.get("schema_version").is_some()
+        || value.get("record_digest").is_some()
+        || value.get("provenance").is_some()
 }
 
 fn emit_report(report: &EvalRunReport, json: bool, output: Option<&Path>) -> anyhow::Result<()> {
@@ -181,6 +309,75 @@ fn write_json_output<T: serde::Serialize>(value: &T, output: Option<&Path>) -> a
         fs::write(output, serde_json::to_string_pretty(value)?)?;
     }
     Ok(())
+}
+
+fn write_new_json_output<T: serde::Serialize>(value: &T, output: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .with_context(|| format!("failed to create baseline output {}", output.display()))?;
+    file.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn ensure_report_output_not_baseline_path(output: Option<&Path>) -> anyhow::Result<()> {
+    let Some(output) = output else {
+        return Ok(());
+    };
+    if path_contains_evals_baselines(output) {
+        anyhow::bail!(
+            "candidate eval reports must not be written under evals/baselines; use `harness eval baseline record` or `harness eval baseline migrate`"
+        );
+    }
+    Ok(())
+}
+
+fn path_contains_evals_baselines(path: &Path) -> bool {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    components
+        .windows(2)
+        .any(|window| window == ["evals", "baselines"])
+}
+
+fn baseline_provenance(args: &EvalBaselineWriteArgs) -> EvalBaselineProvenance {
+    EvalBaselineProvenance {
+        suite_digest: args.suite_digest.clone(),
+        stack_id: args.stack_id.clone(),
+        source_commit: args.source_commit.clone(),
+        evidence_ids: args.evidence_ids.clone(),
+        creator_observation: EvalBaselineCreatorObservation {
+            observer: args.observer.clone(),
+            observed_at: args.observed_at.clone(),
+            note: args.observation.clone(),
+        },
+    }
+}
+
+fn emit_baseline_record(record: &EvalBaselineRecord, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(record)
+                .expect("EvalBaselineRecord serialization is infallible")
+        );
+    } else {
+        println!(
+            "Eval baseline {} ({}) report_digest={} record_digest={}",
+            record.report.run_id, record.report.suite, record.report_digest, record.record_digest
+        );
+    }
 }
 
 fn default_run_id(suite: &str) -> String {
@@ -638,6 +835,52 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
                 assert!(args.json);
             }
             _ => panic!("expected eval diff command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "harness",
+            "eval",
+            "baseline",
+            "record",
+            "--report",
+            "report.json",
+            "--output",
+            "evals/baselines/harness-core/latest.json",
+            "--suite-digest",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--stack-id",
+            "agent-stack-v1",
+            "--source-commit",
+            "1111111111111111111111111111111111111111",
+            "--evidence-id",
+            "issue:1744",
+            "--evidence-id",
+            "run:baseline-1",
+            "--observer",
+            "maintainer@example.com",
+            "--observed-at",
+            "2026-08-12T20:00:00Z",
+            "--observation",
+            "approved baseline",
+            "--json",
+        ])
+        .unwrap_or_else(|error| panic!("eval baseline record command should parse: {error}"));
+        match cli.command {
+            Command::Eval {
+                cmd:
+                    EvalCommand::Baseline {
+                        cmd: EvalBaselineCommand::Record(args),
+                    },
+            } => {
+                assert_eq!(args.report, PathBuf::from("report.json"));
+                assert_eq!(
+                    args.output,
+                    PathBuf::from("evals/baselines/harness-core/latest.json")
+                );
+                assert_eq!(args.evidence_ids, vec!["issue:1744", "run:baseline-1"]);
+                assert!(args.json);
+            }
+            _ => panic!("expected eval baseline record command"),
         }
     }
 
@@ -1125,6 +1368,107 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         assert!(output.exists());
     }
 
+    #[test]
+    fn eval_run_output_rejects_baseline_directory() {
+        let error = ensure_report_output_not_baseline_path(Some(Path::new(
+            "evals/baselines/harness-core/latest.json",
+        )))
+        .expect_err("candidate output must not target committed baselines");
+
+        assert!(error.to_string().contains("candidate eval reports"));
+    }
+
+    #[test]
+    fn eval_baseline_record_creates_record_without_overwrite() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let report_path = tempdir.path().join("report.json");
+        let output_path = tempdir.path().join("baseline.json");
+        let report = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "baseline",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Passed,
+                vec![usage_snapshot(100, 40)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("baseline report should build: {error}"));
+        write_report(&report_path, &report);
+
+        record_eval_baseline_command(baseline_write_args(
+            report_path.clone(),
+            output_path.clone(),
+        ))
+        .unwrap_or_else(|error| panic!("baseline record should write: {error}"));
+        let baseline = read_eval_baseline_record(&output_path)
+            .unwrap_or_else(|error| panic!("baseline record should read: {error}"));
+
+        assert_eq!(baseline.report.run_id, "baseline");
+        assert_eq!(baseline.provenance.stack_id, "agent-stack-v1");
+
+        let error = record_eval_baseline_command(baseline_write_args(report_path, output_path))
+            .expect_err("record command must not overwrite an existing baseline");
+        assert!(error
+            .to_string()
+            .contains("failed to create baseline output"));
+    }
+
+    #[test]
+    fn eval_diff_reads_validated_baseline_record() {
+        let tempdir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir should be creatable: {error}"));
+        let baseline_path = tempdir.path().join("baseline.json");
+        let candidate_path = tempdir.path().join("candidate.json");
+        let baseline_report = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "baseline",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Passed,
+                vec![usage_snapshot(100, 40)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("baseline report should build: {error}"));
+        let baseline = record_eval_baseline(None, baseline_report, baseline_provenance_fixture())
+            .unwrap_or_else(|error| panic!("baseline record should build: {error}"));
+        fs::write(
+            &baseline_path,
+            serde_json::to_string_pretty(&baseline)
+                .unwrap_or_else(|error| panic!("baseline should serialize: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("baseline should write: {error}"));
+        let candidate = eval_report_from_evidence(
+            &sample_eval_manifest(),
+            "candidate",
+            3,
+            vec![case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Failed,
+                vec![usage_snapshot(80, 30)],
+                Vec::new(),
+            )],
+        )
+        .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
+        write_report(&candidate_path, &candidate);
+
+        let error = diff_eval_reports(EvalDiffArgs {
+            baseline: baseline_path,
+            candidate: candidate_path,
+            max_pass_drop: Some(0.1),
+            fail_on_new_f_gate: false,
+            json: false,
+            output: None,
+        })
+        .expect_err("validated baseline diff should apply regression gates");
+
+        assert!(error.to_string().contains("pass@1 drop"));
+    }
+
     fn case_evidence(
         case_id: &str,
         status: EvalEvidenceStatus,
@@ -1184,6 +1528,35 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             cost_usd_micros: Some(cost_usd_micros),
             token_confidence: Confidence::Observed,
             cost_confidence: Confidence::Estimated,
+        }
+    }
+
+    fn baseline_write_args(report: PathBuf, output: PathBuf) -> EvalBaselineWriteArgs {
+        EvalBaselineWriteArgs {
+            report,
+            output,
+            suite_digest: format!("sha256:{}", "a".repeat(64)),
+            stack_id: "agent-stack-v1".to_string(),
+            source_commit: "1".repeat(40),
+            evidence_ids: vec!["issue:1744".to_string(), "run:baseline-1".to_string()],
+            observer: "maintainer@example.com".to_string(),
+            observed_at: "2026-08-12T20:00:00Z".to_string(),
+            observation: "approved baseline".to_string(),
+            json: false,
+        }
+    }
+
+    fn baseline_provenance_fixture() -> EvalBaselineProvenance {
+        EvalBaselineProvenance {
+            suite_digest: format!("sha256:{}", "a".repeat(64)),
+            stack_id: "agent-stack-v1".to_string(),
+            source_commit: "1".repeat(40),
+            evidence_ids: vec!["issue:1744".to_string(), "run:baseline-1".to_string()],
+            creator_observation: EvalBaselineCreatorObservation {
+                observer: "maintainer@example.com".to_string(),
+                observed_at: "2026-08-12T20:00:00Z".to_string(),
+                note: "approved baseline".to_string(),
+            },
         }
     }
 

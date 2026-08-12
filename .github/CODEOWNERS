@@ -6,5 +6,7 @@
 /AGENTS.md @majiayu000
 /CLAUDE.md @majiayu000
 /checks/ @majiayu000
+/evals/baselines/ @majiayu000
+/evals/benchmarks/ @majiayu000
 /scripts/ @majiayu000
 /tests/ @majiayu000

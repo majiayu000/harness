@@ -5,6 +5,7 @@
 //! deterministic scoring primitives, and standard-path eval dispatch helpers.
 
 pub mod attestation;
+pub mod baseline;
 mod data;
 pub mod evidence;
 pub mod historical_replay;
@@ -24,6 +25,12 @@ pub use attestation::{
     EvalAttestationTrust, EvalAttestationVerificationError, EvalRunAttestation,
     EvalRunAttestationClaims, EvalRunAttestationExpected, KeylessOidcProvider,
     KeylessOidcVerification, VerifiedEvalRunAttestation, EVAL_RUN_ATTESTATION_SCHEMA_VERSION,
+};
+pub use baseline::{
+    compare_eval_baseline, eval_baseline_report_digest, migrate_eval_baseline_report,
+    parse_eval_baseline_record_str, record_eval_baseline, validate_eval_baseline,
+    EvalBaselineCreatorObservation, EvalBaselineError, EvalBaselineProvenance, EvalBaselineRecord,
+    EVAL_BASELINE_RECORD_SCHEMA_VERSION,
 };
 pub use evidence::{
     collect_eval_case_evidence, collect_eval_case_evidence_from_records, EvalCaseEvidence,
