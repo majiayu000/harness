@@ -198,7 +198,8 @@ impl<'a> RetrievalExecutor<'a> {
         query: &RetrievalQuery<'_>,
         candidates: &[RetrievalCandidate<'_>],
     ) -> Result<RetrievalExecution, RetrievalError> {
-        let selected = self.primary.rank(query, candidates)?;
+        let mut selected = self.primary.rank(query, candidates)?;
+        selected.truncate(query.limit);
         let Some(shadow) = self.shadow else {
             return Ok(RetrievalExecution {
                 selected,
@@ -206,7 +207,10 @@ impl<'a> RetrievalExecutor<'a> {
             });
         };
         let (shadow_ranked, shadow_error) = match shadow.rank(query, candidates) {
-            Ok(ranked) => (ranked, None),
+            Ok(mut ranked) => {
+                ranked.truncate(query.limit);
+                (ranked, None)
+            }
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
         let comparison = RetrievalComparison {
@@ -441,27 +445,70 @@ fn rank_divergence(primary: &[ScoredCandidate], shadow: &[ScoredCandidate]) -> f
         .map(|candidate| candidate.id.as_str())
         .collect::<BTreeSet<_>>();
     ids.extend(shadow.iter().map(|candidate| candidate.id.as_str()));
-    let rank_delta_sum = ids
+    let primary_ranks = ids
         .iter()
         .map(|id| {
-            let primary_rank = primary
+            primary
                 .iter()
                 .position(|candidate| candidate.id.as_str() == *id)
-                .unwrap_or(max_rank);
-            let shadow_rank = shadow
-                .iter()
-                .position(|candidate| candidate.id.as_str() == *id)
-                .unwrap_or(max_rank);
-            primary_rank.abs_diff(shadow_rank)
+                .unwrap_or(max_rank)
         })
+        .collect::<Vec<_>>();
+    let shadow_ranks = ids
+        .iter()
+        .map(|id| {
+            shadow
+                .iter()
+                .position(|candidate| candidate.id.as_str() == *id)
+                .unwrap_or(max_rank)
+        })
+        .collect::<Vec<_>>();
+    let rank_delta_sum = primary_ranks
+        .iter()
+        .zip(&shadow_ranks)
+        .map(|(primary_rank, shadow_rank)| primary_rank.abs_diff(*shadow_rank))
         .sum::<usize>();
-    let denominator = (ids.len() * max_rank).max(1) as f64;
+    let mut sorted_primary_ranks = primary_ranks;
+    let mut sorted_shadow_ranks = shadow_ranks;
+    sorted_primary_ranks.sort_unstable();
+    sorted_shadow_ranks.sort_unstable();
+    // Opposite ordering is the maximum attainable footrule distance for these ranks.
+    let maximum_rank_delta = sorted_primary_ranks
+        .iter()
+        .zip(sorted_shadow_ranks.iter().rev())
+        .map(|(primary_rank, shadow_rank)| primary_rank.abs_diff(*shadow_rank))
+        .sum::<usize>();
+    let denominator = maximum_rank_delta.max(1) as f64;
     (rank_delta_sum as f64 / denominator).min(1.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReverseRetriever;
+
+    impl KnowledgeRetriever for ReverseRetriever {
+        fn name(&self) -> &'static str {
+            "reverse"
+        }
+
+        fn rank(
+            &self,
+            _query: &RetrievalQuery<'_>,
+            candidates: &[RetrievalCandidate<'_>],
+        ) -> Result<Vec<ScoredCandidate>, RetrievalError> {
+            Ok(candidates
+                .iter()
+                .rev()
+                .map(|candidate| ScoredCandidate {
+                    id: candidate.id.to_string(),
+                    score: 1.0,
+                    native_repo: candidate.native_repo,
+                })
+                .collect())
+        }
+    }
 
     #[test]
     fn lexical_relevance_matches_terms_regardless_of_order() {
@@ -549,32 +596,35 @@ mod tests {
 
     #[test]
     fn retrieval_executor_keeps_primary_selection_with_shadow_comparison() {
-        struct ReverseRetriever;
-        impl KnowledgeRetriever for ReverseRetriever {
-            fn name(&self) -> &'static str {
-                "reverse"
-            }
-
-            fn rank(
-                &self,
-                _query: &RetrievalQuery<'_>,
-                candidates: &[RetrievalCandidate<'_>],
-            ) -> Result<Vec<ScoredCandidate>, RetrievalError> {
-                Ok(candidates
-                    .iter()
-                    .rev()
-                    .map(|candidate| ScoredCandidate {
-                        id: candidate.id.to_string(),
-                        score: 1.0,
-                        native_repo: candidate.native_repo,
-                    })
-                    .collect())
-            }
-        }
-
         let primary = LexicalKnowledgeRetriever;
         let shadow = ReverseRetriever;
-        let query = RetrievalQuery::new(RetrievalSurface::Skill, "code review", 2);
+        let query = RetrievalQuery::new(RetrievalSurface::Skill, "code review", 3);
+        let result = RetrievalExecutor::new(&primary)
+            .with_shadow(&shadow)
+            .retrieve(
+                &query,
+                &[
+                    RetrievalCandidate::new("a", vec![RetrievalField::new("code review", 1.0)]),
+                    RetrievalCandidate::new("b", vec![RetrievalField::new("build error", 1.0)]),
+                    RetrievalCandidate::new("c", vec![RetrievalField::new("deploy", 1.0)]),
+                ],
+            )
+            .expect("primary retrieval succeeds");
+
+        assert_eq!(result.selected[0].id, "a");
+        let comparison = result.comparison.expect("comparison is recorded");
+        assert_eq!(comparison.primary_implementation, "lexical");
+        assert_eq!(comparison.shadow_implementation, "reverse");
+        assert_eq!(comparison.overlap_count, 3);
+        assert_eq!(comparison.rank_divergence, 1.0);
+        assert!(comparison.shadow_error.is_none());
+    }
+
+    #[test]
+    fn retrieval_executor_clamps_primary_and_shadow_results_to_query_limit() {
+        let primary = ReverseRetriever;
+        let shadow = ReverseRetriever;
+        let query = RetrievalQuery::new(RetrievalSurface::Skill, "code review", 1);
         let result = RetrievalExecutor::new(&primary)
             .with_shadow(&shadow)
             .retrieve(
@@ -584,15 +634,21 @@ mod tests {
                     RetrievalCandidate::new("b", vec![RetrievalField::new("build error", 1.0)]),
                 ],
             )
-            .expect("primary retrieval succeeds");
+            .expect("retrieval succeeds");
 
-        assert_eq!(result.selected[0].id, "a");
+        assert_eq!(
+            result
+                .selected
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
         let comparison = result.comparison.expect("comparison is recorded");
-        assert_eq!(comparison.primary_implementation, "lexical");
-        assert_eq!(comparison.shadow_implementation, "reverse");
-        assert_eq!(comparison.overlap_count, 2);
-        assert!(comparison.rank_divergence > 0.0);
-        assert!(comparison.shadow_error.is_none());
+        assert_eq!(comparison.primary_ranked, result.selected);
+        assert_eq!(comparison.shadow_ranked.len(), 1);
+        assert_eq!(comparison.shadow_ranked[0].id, "b");
+        assert_eq!(comparison.overlap_count, 1);
     }
 
     #[test]
