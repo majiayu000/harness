@@ -1,7 +1,10 @@
 use super::helpers::{
-    emit_runtime_notification, mark_turn_failed, process_stream_item, RuntimeUsageContext,
+    emit_runtime_notification, mark_turn_cancelled, mark_turn_failed, process_stream_item,
+    RuntimeUsageContext,
 };
-use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
+use harness_core::agent::{
+    AgentDiagnosticSeverity, AgentEvent, AgentRequest, StreamItem, TurnRequest,
+};
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::error::HarnessError;
@@ -44,7 +47,22 @@ pub(super) fn bridge_agent_event(
         }
         AgentEvent::TokenUsage { usage } => Some(StreamItem::TokenUsage { usage }),
         AgentEvent::Warning { message } => Some(StreamItem::Warning { message }),
+        AgentEvent::Diagnostic { severity, message } => {
+            match severity {
+                AgentDiagnosticSeverity::Warning => {
+                    tracing::warn!(agent_diagnostic = true, "{message}");
+                }
+                AgentDiagnosticSeverity::Error => {
+                    tracing::error!(
+                        agent_diagnostic = true,
+                        "non-terminal agent diagnostic: {message}"
+                    );
+                }
+            }
+            Some(StreamItem::Warning { message })
+        }
         AgentEvent::Error { message } => Some(StreamItem::Error { message }),
+        AgentEvent::TurnCancelled { message } => Some(StreamItem::TurnCancelled { message }),
         AgentEvent::TurnCompleted { output } => {
             if *emitted_agent_completion {
                 output_buf.clear();
@@ -288,6 +306,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let mut stream_closed = false;
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut stream_error: Option<String> = None;
+    let mut stream_cancelled: Option<String> = None;
     let mut last_activity = Instant::now();
     let execution_deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
     let execution_timeout = async {
@@ -316,6 +335,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         last_activity = Instant::now();
                         if let StreamItem::Error { message } = &item {
                             stream_error.get_or_insert_with(|| message.clone());
+                        }
+                        if let StreamItem::TurnCancelled { message } = &item {
+                            stream_cancelled.get_or_insert_with(|| message.clone());
                         }
                         let budget_stop = process_stream_item(
                             &server,
@@ -433,6 +455,18 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         ))
     }) {
         Ok(()) => {
+            if let Some(message) = stream_cancelled {
+                mark_turn_cancelled(
+                    &server,
+                    &notify_tx,
+                    &notification_tx,
+                    &thread_id,
+                    &turn_id,
+                    message,
+                )
+                .await;
+                return;
+            }
             if let Some(error_msg) = stream_error {
                 mark_turn_failed(
                     &server,

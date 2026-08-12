@@ -13,6 +13,9 @@ fn benchmark_case(case_id: &str) -> EvalBenchmarkCase {
         base_commit: "abcdef1".to_string(),
         verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
         timeout_secs: 120,
+        resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
+            .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
+            .expect("default resource limits should be valid"),
     }
 }
 
