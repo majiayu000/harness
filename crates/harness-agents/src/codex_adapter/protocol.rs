@@ -1,5 +1,5 @@
 use crate::codex::{parse_codex_error_item_message, parse_codex_item, parse_codex_token_usage};
-use harness_core::agent::{AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::agent::{AgentDiagnosticSeverity, AgentEvent, ApprovalDecision, TurnRequest};
 use harness_core::config::agents::SandboxMode;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -171,7 +171,10 @@ fn parse_app_server_agent_event(
             .get("item")
             .map(|item| {
                 if let Some(message) = parse_codex_error_item_message(item) {
-                    ParsedCodexMessage::Event(AgentEvent::Error { message })
+                    ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+                        severity: AgentDiagnosticSeverity::Error,
+                        message,
+                    })
                 } else {
                     parse_codex_item(item)
                         .map(|item| {
@@ -187,34 +190,15 @@ fn parse_app_server_agent_event(
             .and_then(parse_codex_token_usage)
             .map(|usage| ParsedCodexMessage::Event(AgentEvent::TokenUsage { usage }))
             .unwrap_or(ParsedCodexMessage::Ignore),
-        "warning" => ParsedCodexMessage::Event(AgentEvent::Warning {
-            message: params
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown warning")
-                .to_string(),
+        "warning" => ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+            severity: AgentDiagnosticSeverity::Warning,
+            message: app_server_message(params, "unknown warning"),
         }),
-        "error" => ParsedCodexMessage::Event(AgentEvent::Error {
-            message: params
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .or_else(|| params.get("message").and_then(Value::as_str))
-                .unwrap_or("unknown error")
-                .to_string(),
+        "error" => ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+            severity: AgentDiagnosticSeverity::Error,
+            message: app_server_message(params, "unknown error"),
         }),
-        "turn/completed" => ParsedCodexMessage::Event(AgentEvent::TurnCompleted {
-            output: params
-                .get("turn")
-                .and_then(|turn| turn.get("items"))
-                .and_then(Value::as_array)
-                .and_then(|items| items.iter().rev().find_map(parse_codex_item))
-                .and_then(|item| match item {
-                    harness_core::types::Item::AgentReasoning { content } => Some(content),
-                    _ => None,
-                })
-                .unwrap_or_default(),
-        }),
+        "turn/completed" => parse_turn_completed(params),
         "item/commandExecution/requestApproval"
         | "item/fileChange/requestApproval"
         | "item/permissions/requestApproval" => {
@@ -230,6 +214,53 @@ fn parse_app_server_agent_event(
         }
         _ => ParsedCodexMessage::Ignore,
     }
+}
+
+fn parse_turn_completed(params: &Value) -> ParsedCodexMessage {
+    let turn = params.get("turn").unwrap_or(&Value::Null);
+    match turn.get("status").and_then(Value::as_str) {
+        Some("completed") => ParsedCodexMessage::Event(AgentEvent::TurnCompleted {
+            output: turn
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|items| items.iter().rev().find_map(parse_codex_item))
+                .and_then(|item| match item {
+                    harness_core::types::Item::AgentReasoning { content } => Some(content),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+        }),
+        Some("interrupted") => ParsedCodexMessage::Event(AgentEvent::TurnCancelled {
+            message: app_server_message(params, "codex turn interrupted"),
+        }),
+        Some("failed") => ParsedCodexMessage::Event(AgentEvent::Error {
+            message: app_server_message(params, "codex turn failed"),
+        }),
+        Some(status) => ParsedCodexMessage::Event(AgentEvent::Error {
+            message: format!("codex turn completed with unsupported status `{status}`"),
+        }),
+        None => ParsedCodexMessage::Event(AgentEvent::Error {
+            message: "codex turn/completed omitted required turn.status".to_string(),
+        }),
+    }
+}
+
+fn app_server_message(params: &Value, fallback: &str) -> String {
+    params
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| params.get("message").and_then(Value::as_str))
+        .or_else(|| params.get("reason").and_then(Value::as_str))
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 pub fn parse_codex_message(line: &str) -> Option<ParsedCodexMessage> {
