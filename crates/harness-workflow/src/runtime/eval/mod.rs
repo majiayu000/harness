@@ -7,6 +7,7 @@
 pub mod attestation;
 mod data;
 pub mod evidence;
+pub mod evidence_bundle;
 pub mod historical_replay;
 pub mod manifest;
 pub mod model;
@@ -28,6 +29,13 @@ pub use attestation::{
 pub use evidence::{
     collect_eval_case_evidence, collect_eval_case_evidence_from_records, EvalCaseEvidence,
     EvalEvidenceStatus, EvalIsolationEvidence, EvalQualityGateEvidence, EvalSubmissionEvidence,
+};
+pub use evidence_bundle::{
+    evidence_bundle_manifest_json, read_evidence_bundle_artifact, verify_evidence_bundle,
+    write_evidence_bundle, EvidenceBundleArtifactInput, EvidenceBundleArtifactKind,
+    EvidenceBundleError, EvidenceBundleFileManifest, EvidenceBundleManifest,
+    EvidenceBundleRedaction, EvidenceBundleVerification, EVIDENCE_BUNDLE_ARTIFACT_SCHEMA_VERSION,
+    EVIDENCE_BUNDLE_MANIFEST_SCHEMA_VERSION, EVIDENCE_BUNDLE_SCHEMA_VERSION, REDACTED_VALUE,
 };
 pub use historical_replay::{
     historical_replay_command_digest, parse_historical_replay_cohort_str,

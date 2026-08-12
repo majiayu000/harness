@@ -3,9 +3,11 @@ use clap::{Args, Subcommand};
 use harness_workflow::runtime::eval::model::EvalGrade;
 use harness_workflow::runtime::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
-    parse_benchmark_manifest_str, EvalAttestationDecision, EvalAttestationTrust,
+    evidence_bundle_manifest_json, parse_benchmark_manifest_str, read_evidence_bundle_artifact,
+    verify_evidence_bundle, write_evidence_bundle, EvalAttestationDecision, EvalAttestationTrust,
     EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseInfrastructureStatus, EvalCaseTransition,
     EvalCaseTransitionKind, EvalReportCaseStatus, EvalRunReport, EvalRunReportDiff,
+    EvidenceBundleArtifactKind, EvidenceBundleManifest, EvidenceBundleVerification,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -20,6 +22,8 @@ pub enum EvalCommand {
     Run(EvalRunArgs),
     /// Compare two saved eval run reports
     Diff(EvalDiffArgs),
+    /// Export or verify change-control evidence bundles
+    Bundle(EvalBundleArgs),
 }
 
 #[derive(Args)]
@@ -67,10 +71,68 @@ pub struct EvalDiffArgs {
     pub output: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub struct EvalBundleArgs {
+    #[command(subcommand)]
+    pub cmd: EvalBundleCommand,
+}
+
+#[derive(Subcommand)]
+pub enum EvalBundleCommand {
+    /// Export a complete change-control evidence bundle directory
+    Export(EvalBundleExportArgs),
+    /// Verify an exported evidence bundle directory against its manifest
+    Verify(EvalBundleVerifyArgs),
+}
+
+#[derive(Args)]
+pub struct EvalBundleExportArgs {
+    /// Agent Stack artifact JSON
+    #[arg(long)]
+    pub stack: PathBuf,
+    /// Agent Stack diff artifact JSON
+    #[arg(long)]
+    pub diff: PathBuf,
+    /// Eval suite artifact JSON
+    #[arg(long)]
+    pub suite: PathBuf,
+    /// Eval results artifact JSON
+    #[arg(long)]
+    pub results: PathBuf,
+    /// Eval comparison artifact JSON
+    #[arg(long)]
+    pub comparison: PathBuf,
+    /// Promotion policy artifact JSON
+    #[arg(long)]
+    pub policy: PathBuf,
+    /// Human-readable or machine summary artifact JSON
+    #[arg(long)]
+    pub summary: PathBuf,
+    /// Output directory for the exported bundle
+    #[arg(long)]
+    pub output_dir: PathBuf,
+    /// Stable bundle identifier. Defaults to change-control-evidence-bundle.
+    #[arg(long)]
+    pub bundle_id: Option<String>,
+    /// Print the bundle manifest JSON after export
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct EvalBundleVerifyArgs {
+    /// Bundle directory containing manifest.json
+    pub bundle_dir: PathBuf,
+    /// Print JSON verification output
+    #[arg(long)]
+    pub json: bool,
+}
+
 pub async fn run(cmd: EvalCommand) -> anyhow::Result<()> {
     match cmd {
         EvalCommand::Run(args) => run_eval_report(args).await,
         EvalCommand::Diff(args) => diff_eval_reports(args),
+        EvalCommand::Bundle(args) => run_eval_bundle(args),
     }
 }
 
@@ -123,6 +185,55 @@ fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
     anyhow::bail!("eval regression gate failed:\n{}", regressions.join("\n"))
 }
 
+fn run_eval_bundle(args: EvalBundleArgs) -> anyhow::Result<()> {
+    match args.cmd {
+        EvalBundleCommand::Export(args) => export_evidence_bundle(args),
+        EvalBundleCommand::Verify(args) => verify_evidence_bundle_command(args),
+    }
+}
+
+fn export_evidence_bundle(args: EvalBundleExportArgs) -> anyhow::Result<()> {
+    let artifacts = read_bundle_artifacts(&args)?;
+    let bundle_id = args
+        .bundle_id
+        .unwrap_or_else(|| "change-control-evidence-bundle".to_string());
+    let manifest = write_evidence_bundle(&args.output_dir, bundle_id, artifacts)?;
+    emit_bundle_manifest(&manifest, args.json)
+}
+
+fn verify_evidence_bundle_command(args: EvalBundleVerifyArgs) -> anyhow::Result<()> {
+    let verification = verify_evidence_bundle(&args.bundle_dir)?;
+    emit_bundle_verification(&verification, args.json)
+}
+
+fn read_bundle_artifacts(
+    args: &EvalBundleExportArgs,
+) -> anyhow::Result<Vec<harness_workflow::runtime::EvidenceBundleArtifactInput>> {
+    [
+        (EvidenceBundleArtifactKind::Stack, args.stack.as_path()),
+        (EvidenceBundleArtifactKind::Diff, args.diff.as_path()),
+        (EvidenceBundleArtifactKind::Suite, args.suite.as_path()),
+        (EvidenceBundleArtifactKind::Results, args.results.as_path()),
+        (
+            EvidenceBundleArtifactKind::Comparison,
+            args.comparison.as_path(),
+        ),
+        (EvidenceBundleArtifactKind::Policy, args.policy.as_path()),
+        (EvidenceBundleArtifactKind::Summary, args.summary.as_path()),
+    ]
+    .into_iter()
+    .map(|(kind, path)| {
+        read_evidence_bundle_artifact(kind, path).with_context(|| {
+            format!(
+                "failed to read {} evidence artifact at {}",
+                kind.as_str(),
+                path.display()
+            )
+        })
+    })
+    .collect()
+}
+
 fn read_eval_manifest(path: &Path) -> anyhow::Result<EvalBenchmarkManifest> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read eval manifest at {}", path.display()))?;
@@ -164,6 +275,30 @@ fn emit_diff(diff: &EvalRunReportDiff, json: bool, output: Option<&Path>) -> any
         println!("{}", serde_json::to_string_pretty(diff)?);
     } else {
         print!("{}", render_diff_report(diff));
+    }
+    Ok(())
+}
+
+fn emit_bundle_manifest(manifest: &EvidenceBundleManifest, json: bool) -> anyhow::Result<()> {
+    if json {
+        print!("{}", evidence_bundle_manifest_json(manifest)?);
+    } else {
+        print!("{}", render_bundle_manifest(manifest));
+    }
+    Ok(())
+}
+
+fn emit_bundle_verification(
+    verification: &EvidenceBundleVerification,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(verification)?);
+    } else {
+        println!(
+            "Evidence bundle {} verified: files={}",
+            verification.bundle_id, verification.files_verified
+        );
     }
     Ok(())
 }
@@ -323,6 +458,41 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
             ),
             attestation_change
         ));
+    }
+    output
+}
+
+pub(crate) fn render_bundle_manifest(manifest: &EvidenceBundleManifest) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Evidence bundle {} ({})\n",
+        manifest.bundle_id, manifest.bundle_schema_version
+    ));
+    output.push_str(&format!(
+        "artifacts: total={} redactions={}\n",
+        manifest.artifact_count, manifest.redaction_count
+    ));
+    output.push_str("files:\n");
+    for file in &manifest.files {
+        output.push_str(&format!(
+            "- {} path={} schema={} bytes={} sha256={}\n",
+            file.artifact_type.as_str(),
+            file.path,
+            file.schema_version,
+            file.bytes,
+            file.sha256
+        ));
+        if let Some(schema_version) = file.content_schema_version.as_deref() {
+            output.push_str(&format!("  content_schema: {schema_version}\n"));
+        }
+        if !file.redactions.is_empty() {
+            let redactions = file
+                .redactions
+                .iter()
+                .map(|redaction| format!("{}({})", redaction.json_pointer, redaction.reason))
+                .collect::<Vec<_>>();
+            output.push_str(&format!("  redactions: {}\n", redactions.join(", ")));
+        }
     }
     output
 }
@@ -579,6 +749,16 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
         .unwrap_or_else(|error| panic!("manifest should parse: {error}"))
     }
 
+    fn write_bundle_source(dir: &Path, file_name: &str, value: serde_json::Value) -> PathBuf {
+        let path = dir.join(file_name);
+        std::fs::write(
+            &path,
+            serde_json::to_string(&value).expect("sample JSON should serialize"),
+        )
+        .expect("sample bundle source should write");
+        path
+    }
+
     #[test]
     fn eval_report_cli_parses_run_and_diff_commands() {
         let cli = Cli::try_parse_from([
@@ -639,6 +819,163 @@ verify_commands = ["cargo test -p harness-cli eval_report"]
             }
             _ => panic!("expected eval diff command"),
         }
+    }
+
+    #[test]
+    fn evidence_bundle_cli_parses_export_and_verify_commands() {
+        let cli = Cli::try_parse_from([
+            "harness",
+            "eval",
+            "bundle",
+            "export",
+            "--stack",
+            "stack.json",
+            "--diff",
+            "diff.json",
+            "--suite",
+            "suite.json",
+            "--results",
+            "results.json",
+            "--comparison",
+            "comparison.json",
+            "--policy",
+            "policy.json",
+            "--summary",
+            "summary.json",
+            "--output-dir",
+            "bundle",
+            "--bundle-id",
+            "bundle-1",
+            "--json",
+        ])
+        .unwrap_or_else(|error| panic!("eval bundle export command should parse: {error}"));
+        match cli.command {
+            Command::Eval {
+                cmd:
+                    EvalCommand::Bundle(EvalBundleArgs {
+                        cmd: EvalBundleCommand::Export(args),
+                    }),
+            } => {
+                assert_eq!(args.stack, PathBuf::from("stack.json"));
+                assert_eq!(args.diff, PathBuf::from("diff.json"));
+                assert_eq!(args.suite, PathBuf::from("suite.json"));
+                assert_eq!(args.results, PathBuf::from("results.json"));
+                assert_eq!(args.comparison, PathBuf::from("comparison.json"));
+                assert_eq!(args.policy, PathBuf::from("policy.json"));
+                assert_eq!(args.summary, PathBuf::from("summary.json"));
+                assert_eq!(args.output_dir, PathBuf::from("bundle"));
+                assert_eq!(args.bundle_id.as_deref(), Some("bundle-1"));
+                assert!(args.json);
+            }
+            _ => panic!("expected eval bundle export command"),
+        }
+
+        let cli = Cli::try_parse_from(["harness", "eval", "bundle", "verify", "bundle", "--json"])
+            .unwrap_or_else(|error| panic!("eval bundle verify command should parse: {error}"));
+        match cli.command {
+            Command::Eval {
+                cmd:
+                    EvalCommand::Bundle(EvalBundleArgs {
+                        cmd: EvalBundleCommand::Verify(args),
+                    }),
+            } => {
+                assert_eq!(args.bundle_dir, PathBuf::from("bundle"));
+                assert!(args.json);
+            }
+            _ => panic!("expected eval bundle verify command"),
+        }
+    }
+
+    #[test]
+    fn evidence_bundle_export_writes_verifiable_manifest() {
+        let source = tempfile::tempdir().expect("source tempdir should be created");
+        let bundle = tempfile::tempdir().expect("bundle tempdir should be created");
+        let stack = write_bundle_source(
+            source.path(),
+            "stack.json",
+            serde_json::json!({
+                "schema_version": "stack/v1",
+                "components": []
+            }),
+        );
+        let diff = write_bundle_source(
+            source.path(),
+            "diff.json",
+            serde_json::json!({
+                "schema_version": "diff/v1",
+                "changes": []
+            }),
+        );
+        let suite = write_bundle_source(
+            source.path(),
+            "suite.json",
+            serde_json::json!({
+                "schema_version": "suite/v1",
+                "suite": "harness-core"
+            }),
+        );
+        let results = write_bundle_source(
+            source.path(),
+            "results.json",
+            serde_json::json!({
+                "schema_version": "results/v1",
+                "cases": []
+            }),
+        );
+        let comparison = write_bundle_source(
+            source.path(),
+            "comparison.json",
+            serde_json::json!({
+                "schema_version": "comparison/v1",
+                "regression_count": 0
+            }),
+        );
+        let policy = write_bundle_source(
+            source.path(),
+            "policy.json",
+            serde_json::json!({
+                "schema_version": "policy/v1",
+                "api_key": "secret-value"
+            }),
+        );
+        let summary = write_bundle_source(
+            source.path(),
+            "summary.json",
+            serde_json::json!({
+                "schema_version": "summary/v1",
+                "decision": "review"
+            }),
+        );
+
+        export_evidence_bundle(EvalBundleExportArgs {
+            stack,
+            diff,
+            suite,
+            results,
+            comparison,
+            policy,
+            summary,
+            output_dir: bundle.path().to_path_buf(),
+            bundle_id: Some("bundle-1".to_string()),
+            json: false,
+        })
+        .expect("bundle export should succeed");
+
+        let manifest_path = bundle.path().join("manifest.json");
+        assert!(manifest_path.exists());
+        let manifest = std::fs::read_to_string(&manifest_path).expect("manifest should exist");
+        assert!(manifest.contains("\"artifact_count\":7"));
+        assert!(manifest.contains("\"redaction_count\":1"));
+        assert!(
+            !std::fs::read_to_string(bundle.path().join("artifacts/policy.json"))
+                .expect("policy artifact should exist")
+                .contains("secret-value")
+        );
+        verify_evidence_bundle_command(EvalBundleVerifyArgs {
+            bundle_dir: bundle.path().to_path_buf(),
+            json: false,
+        })
+        .expect("fresh bundle should verify");
     }
 
     #[test]
