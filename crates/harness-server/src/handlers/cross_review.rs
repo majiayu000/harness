@@ -195,7 +195,8 @@ pub(crate) async fn run_cross_review_with_context(
         None => {
             // Degraded single-model review: treat all ISSUE lines as
             // consensus, and never report a clean review as fully approved.
-            let consensus_issues = harness_core::prompts::extract_review_issues(&primary_review);
+            let consensus_issues =
+                harness_agents::output_parsing::extract_review_issues(&primary_review);
             let verdict = if consensus_issues.is_empty() {
                 CrossReviewVerdict::ApprovedDegraded
             } else {
@@ -221,7 +222,7 @@ pub(crate) async fn run_cross_review_with_context(
     let mut challenger_review = String::new();
     let mut rounds_done = 1u32;
     let mut consensus_issues: Vec<String> =
-        harness_core::prompts::extract_review_issues(&primary_review);
+        harness_agents::output_parsing::extract_review_issues(&primary_review);
     let primary_for_challenger = if max_rounds <= 1 {
         Cow::Borrowed(primary_review.as_str())
     } else {

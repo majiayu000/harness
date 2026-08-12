@@ -29,6 +29,12 @@ verdict = "replayable"
 a 7- to 40-character hexadecimal commit prefix or SHA. Every case must include
 at least one single-line verification command.
 
+Eval cases are treated as untrusted golden tasks. The manifest parser binds
+them to the `container` isolation tier, the `remote_host` runtime kind, an
+ephemeral lifecycle, and required cleanup evidence by default. The optional
+`[isolation]` table may restate those values, but it cannot downgrade cases to
+host execution.
+
 Historical replay cases can also record structured replay metadata:
 
 - `paths` are repository-relative paths touched or used as acceptance evidence.

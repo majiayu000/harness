@@ -10,7 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-harness-core = { workspace = true }
+harness-core = { workspace = true, features = ["db-postgres"] }
 harness-sandbox = { workspace = true }
 harness-observe = { workspace = true }
 harness-exec = { workspace = true }

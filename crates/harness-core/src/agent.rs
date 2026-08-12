@@ -13,6 +13,7 @@ pub const AGENT_NETWORK_ALLOWLIST_ENV: &str = "HARNESS_AGENT_NETWORK_ALLOWLIST";
 pub const AGENT_OUTPUT_SCHEMA_PATH_ENV: &str = "HARNESS_AGENT_OUTPUT_SCHEMA_PATH";
 pub const AGENT_CONTAINER_IMAGE_ENV: &str = "HARNESS_AGENT_CONTAINER_IMAGE";
 pub const AGENT_EGRESS_PROXY_IMAGE_ENV: &str = "HARNESS_AGENT_EGRESS_PROXY_IMAGE";
+pub const AGENT_SECRETLESS_ENV_ENV: &str = "HARNESS_AGENT_SECRETLESS_ENV";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,9 +35,13 @@ impl AgentEgressMode {
     }
 }
 
-/// Core trait for all code agents (Claude Code, Codex, Anthropic API, etc.)
+/// Core trait for all agent backends (Claude Code, Codex, Anthropic API, etc.).
+///
+/// Backends can be simple one-shot executors, streaming process supervisors, or
+/// stateful protocol adapters. Control operations default to `Unsupported` so
+/// one-shot executors only implement the execution surface they actually own.
 #[async_trait]
-pub trait CodeAgent: Send + Sync {
+pub trait AgentBackend: Send + Sync {
     fn name(&self) -> &str;
     /// Stable identity used to detect "primary == challenger" misconfigurations
     /// in cross-review. Defaults to the registry key (`name`); implementations
@@ -45,14 +50,63 @@ pub trait CodeAgent: Send + Sync {
     fn id(&self) -> String {
         self.name().to_string()
     }
-    fn capabilities(&self) -> Vec<Capability>;
-    async fn execute(&self, req: AgentRequest) -> crate::error::Result<AgentResponse>;
+    fn capabilities(&self) -> Vec<Capability> {
+        Vec::new()
+    }
+    async fn execute(&self, _req: AgentRequest) -> crate::error::Result<AgentResponse> {
+        Err(crate::error::Error::Unsupported(
+            "execute not supported".into(),
+        ))
+    }
+
     async fn execute_stream(
         &self,
         req: AgentRequest,
-        tx: tokio::sync::mpsc::Sender<StreamItem>,
-    ) -> crate::error::Result<()>;
+        tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> crate::error::Result<()> {
+        self.start_turn(req, tx).await
+    }
+
+    /// Start a runtime turn. Stateful protocol backends override this; plain
+    /// executors usually override `execute_stream` instead.
+    async fn start_turn(
+        &self,
+        _req: AgentRequest,
+        _tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> crate::error::Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "turn execution not supported".into(),
+        ))
+    }
+
+    /// Interrupt an in-progress turn.
+    async fn interrupt(&self) -> crate::error::Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "interrupt not supported".into(),
+        ))
+    }
+
+    /// Append instructions to an active turn (steer).
+    async fn steer(&self, _text: String) -> crate::error::Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "steer not supported".into(),
+        ))
+    }
+
+    /// Respond to an approval request from the agent.
+    async fn respond_approval(
+        &self,
+        _id: String,
+        _decision: ApprovalDecision,
+    ) -> crate::error::Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "approval not supported".into(),
+        ))
+    }
 }
+
+pub use AgentBackend as AgentAdapter;
+pub use AgentBackend as CodeAgent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
@@ -86,6 +140,10 @@ pub struct AgentRequest {
     pub approval_policy: Option<String>,
     pub max_budget_usd: Option<f64>,
     pub context: Vec<ContextItem>,
+    /// Optional wall-clock turn timeout. One-shot direct calls may ignore this;
+    /// protocol adapters use it for request/stream stall windows.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// Execution phase for per-phase model selection via ReasoningBudget.
     /// When set and the agent has a ReasoningBudget configured, the phase
     /// determines which model is used. Defaults to None (uses req.model or default_model).
@@ -223,6 +281,7 @@ impl Default for AgentRequest {
             approval_policy: None,
             max_budget_usd: None,
             context: Vec::new(),
+            timeout_secs: None,
             execution_phase: None,
             env_vars: HashMap::new(),
             capability_token: None,
@@ -321,19 +380,57 @@ pub struct AgentResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum StreamItem {
+pub enum AgentEvent {
     EgressVerifiedAtDispatch,
-    ItemStarted { item: Item },
-    MessageDelta { text: String },
-    ToolOutputDelta { item_id: String, text: String },
-    ItemCompleted { item: Item },
-    TokenUsage { usage: TokenUsage },
-    Warning { message: String },
-    TurnCancelled { message: String },
-    Error { message: String },
-    ApprovalRequest { id: String, command: String },
+    TurnStarted,
+    ItemStarted {
+        item: Item,
+    },
+    ItemStartedKind {
+        item_type: String,
+    },
+    MessageDelta {
+        text: String,
+    },
+    ToolOutputDelta {
+        item_id: String,
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        input: serde_json::Value,
+    },
+    ItemCompleted {
+        item: Item,
+    },
+    ItemCompletedKind,
+    TokenUsage {
+        usage: TokenUsage,
+    },
+    Warning {
+        message: String,
+    },
+    Diagnostic {
+        severity: AgentDiagnosticSeverity,
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+    TurnCompleted {
+        output: String,
+    },
+    TurnCancelled {
+        message: String,
+    },
+    ApprovalRequest {
+        id: String,
+        command: String,
+    },
     Done,
 }
+
+pub type StreamItem = AgentEvent;
 
 /// Task classification for agent dispatch
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,65 +450,12 @@ pub enum TaskComplexity {
     Critical,
 }
 
-// === Streaming Agent Adapter (new, coexists with CodeAgent) ===
-
-/// Events emitted by an agent adapter during a turn.
+/// Severity for non-terminal diagnostics surfaced by an agent adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentDiagnosticSeverity {
     Warning,
     Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentEvent {
-    EgressVerifiedAtDispatch,
-    TurnStarted,
-    ItemStarted {
-        item_type: String,
-    },
-    ItemStartedPayload {
-        item: Item,
-    },
-    MessageDelta {
-        text: String,
-    },
-    ToolOutputDelta {
-        item_id: String,
-        text: String,
-    },
-    ToolCall {
-        name: String,
-        input: serde_json::Value,
-    },
-    ApprovalRequest {
-        id: String,
-        command: String,
-    },
-    ItemCompleted,
-    ItemCompletedPayload {
-        item: Item,
-    },
-    TokenUsage {
-        usage: TokenUsage,
-    },
-    Warning {
-        message: String,
-    },
-    Diagnostic {
-        severity: AgentDiagnosticSeverity,
-        message: String,
-    },
-    TurnCompleted {
-        output: String,
-    },
-    TurnCancelled {
-        message: String,
-    },
-    Error {
-        message: String,
-    },
 }
 
 /// Decision for an approval request from the agent.
@@ -422,98 +466,8 @@ pub enum ApprovalDecision {
     Reject { reason: String },
 }
 
-/// Request to start a turn via an adapter.
-#[derive(Debug, Clone)]
-pub struct TurnRequest {
-    pub prompt: String,
-    pub prompt_layers: Option<AgentPromptLayers>,
-    pub project_root: PathBuf,
-    pub permission_mode: AgentPermissionMode,
-    pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub execution_phase: Option<ExecutionPhase>,
-    pub sandbox_mode: Option<SandboxMode>,
-    pub approval_policy: Option<String>,
-    /// `None` uses the Standard tool list in scoped mode. `Some(list)` is an
-    /// explicit restriction; an empty list means deny-all.
-    pub allowed_tools: Option<Vec<String>>,
-    pub context: Vec<ContextItem>,
-    pub timeout_secs: Option<u64>,
-    pub env_vars: HashMap<String, String>,
-    /// Scoped write capability; checked for expiry before spawning.
-    pub capability_token: Option<CapabilityToken>,
-}
-
-impl TurnRequest {
-    pub fn claude_main_prompt(&self) -> Cow<'_, str> {
-        self.prompt_layers
-            .as_ref()
-            .and_then(AgentPromptLayers::main_prompt_for_cache)
-            .map(Cow::Owned)
-            .unwrap_or_else(|| Cow::Borrowed(self.prompt.as_str()))
-    }
-
-    pub fn claude_system_prompt(&self) -> Option<&str> {
-        self.prompt_layers
-            .as_ref()
-            .and_then(AgentPromptLayers::static_system_prompt_for_cache)
-    }
-
-    /// True only when the request explicitly opts into Full and carries no
-    /// allowlist.
-    pub fn uses_dangerously_skip_permissions(&self) -> bool {
-        self.permission_mode == AgentPermissionMode::Full && self.allowed_tools.is_none()
-    }
-
-    pub fn scoped_allowed_tools(&self) -> Vec<String> {
-        self.allowed_tools
-            .clone()
-            .unwrap_or_else(default_scoped_tools)
-    }
-}
-
 fn default_scoped_tools() -> Vec<String> {
     CapabilityProfile::standard_tools()
-}
-
-/// Streaming agent adapter — coexists with legacy CodeAgent trait.
-///
-/// Implementations send `AgentEvent`s through the provided mpsc channel
-/// during execution. The caller consumes events to drive notifications,
-/// logging, and approval gates.
-#[async_trait]
-pub trait AgentAdapter: Send + Sync {
-    fn name(&self) -> &str;
-
-    /// Start a turn. Send events to `tx` until complete or error.
-    async fn start_turn(
-        &self,
-        req: TurnRequest,
-        tx: tokio::sync::mpsc::Sender<AgentEvent>,
-    ) -> crate::error::Result<()>;
-
-    /// Interrupt an in-progress turn.
-    async fn interrupt(&self) -> crate::error::Result<()>;
-
-    /// Append instructions to an active turn (steer).
-    /// Returns `Err` with `Unsupported` if the adapter doesn't support steering.
-    async fn steer(&self, _text: String) -> crate::error::Result<()> {
-        Err(crate::error::Error::Unsupported(
-            "steer not supported".into(),
-        ))
-    }
-
-    /// Respond to an approval request from the agent.
-    /// Returns `Err` with `Unsupported` if the adapter doesn't support approval.
-    async fn respond_approval(
-        &self,
-        _id: String,
-        _decision: ApprovalDecision,
-    ) -> crate::error::Result<()> {
-        Err(crate::error::Error::Unsupported(
-            "approval not supported".into(),
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -524,10 +478,10 @@ mod tests {
     fn agent_event_serde_round_trip() {
         let events = vec![
             AgentEvent::TurnStarted,
-            AgentEvent::ItemStarted {
+            AgentEvent::ItemStartedKind {
                 item_type: "message".into(),
             },
-            AgentEvent::ItemStartedPayload {
+            AgentEvent::ItemStarted {
                 item: Item::ShellCommand {
                     command: "pwd".into(),
                     exit_code: None,
@@ -550,8 +504,8 @@ mod tests {
                 id: "req-1".into(),
                 command: "rm -rf /tmp/test".into(),
             },
-            AgentEvent::ItemCompleted,
-            AgentEvent::ItemCompletedPayload {
+            AgentEvent::ItemCompletedKind,
+            AgentEvent::ItemCompleted {
                 item: Item::AgentReasoning {
                     content: "done".into(),
                 },

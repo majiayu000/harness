@@ -1,4 +1,7 @@
-use harness_agents::codex::{CodexAgent, CodexReviewRequest};
+use harness_agents::{
+    codex::{CodexAgent, CodexReviewRequest},
+    output_parsing,
+};
 use harness_core::{
     agent::{
         AgentRequest, CodeAgent, AGENT_CONTAINER_IMAGE_ENV, AGENT_EGRESS_PROXY_IMAGE_ENV,
@@ -76,9 +79,9 @@ pub async fn fix(
     let resp = agent.execute(req).await?;
     println!("{}", resp.output);
 
-    let pr_url = prompts::parse_pr_url(&resp.output)
+    let pr_url = output_parsing::parse_pr_url(&resp.output)
         .ok_or_else(|| anyhow::anyhow!("PR_URL=<url> not found in agent output"))?;
-    let pr_number = prompts::extract_pr_number(&pr_url)
+    let pr_number = output_parsing::extract_pr_number(&pr_url)
         .ok_or_else(|| anyhow::anyhow!("Cannot parse PR number from URL: {pr_url}"))?;
 
     println!("[harness] PR #{pr_number} created: {pr_url}");
@@ -242,7 +245,7 @@ fn codex_cli_review_instructions(pr: u64, base_ref: &str, output_format: &str) -
 /// Resolve `owner/repo` slug from a PR URL.
 async fn resolve_repo_slug(pr: u64, pr_url: Option<&str>) -> anyhow::Result<String> {
     if let Some(url) = pr_url {
-        return Ok(prompts::repo_slug_from_pr_url(Some(url)));
+        return Ok(output_parsing::repo_slug_from_pr_url(Some(url)));
     }
 
     Err(anyhow::anyhow!(
@@ -311,12 +314,12 @@ async fn run_review_loop(
         let resp = agent.execute(req).await?;
         println!("{}", resp.output);
 
-        if prompts::is_waiting(&resp.output) {
+        if output_parsing::is_waiting(&resp.output) {
             println!("[harness] Review bot hasn't re-reviewed yet, retrying...");
             continue;
         }
 
-        if prompts::is_lgtm(&resp.output) {
+        if output_parsing::is_lgtm(&resp.output) {
             println!("[harness] LGTM — {url_display}");
             return Ok(());
         }

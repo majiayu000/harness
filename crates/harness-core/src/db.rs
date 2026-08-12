@@ -1,14 +1,18 @@
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "db-postgres")]
 use sqlx::postgres::PgPool;
+#[cfg(feature = "db-postgres")]
 use std::path::Path;
 
 // Postgres pool helpers and PgMigrator live in the sibling db_pg module.
 // Re-export them here so existing callers using `harness_core::db::*` continue
 // to work without any import changes.
+#[cfg(feature = "db-postgres")]
 pub use crate::db_pg::{
     configure_pg_pool_from_server, pg_create_schema_if_not_exists, pg_open_pool,
     pg_open_pool_schematized, pg_schema_for_path, resolve_database_url, PgMigrator, PgStoreContext,
 };
+#[cfg(feature = "db-postgres")]
 pub use crate::db_pg_schema_registry::{
     apply_pg_schema_cleanup, ensure_pg_schema_registry, pg_schema_cleanup_plan,
     reap_orphaned_path_schemas, reap_orphaned_path_schemas_with_legacy_options,
@@ -17,6 +21,7 @@ pub use crate::db_pg_schema_registry::{
     PgSchemaOwnership, PgSchemaReapReport, DEFAULT_ORPHAN_REAPER_LEGACY_BATCH,
     PG_SCHEMA_REGISTRY_SCHEMA, PG_SCHEMA_REGISTRY_TABLE,
 };
+#[cfg(feature = "db-postgres")]
 pub use crate::db_test_safety::{
     apply_pg_test_schema_cleanup, drop_test_schema_if_exists, is_known_test_schema_name,
     is_test_database_url, pg_test_schema_cleanup_plan, redact_database_url,
@@ -30,6 +35,7 @@ pub use crate::db_test_safety::{
 /// Historical stores accepted SQLite file paths as their identity boundary.
 /// The Postgres backend preserves that boundary by hashing each path to a
 /// stable schema name.
+#[cfg(feature = "db-postgres")]
 pub async fn open_legacy_path_schema_pool(path: &Path) -> anyhow::Result<PgPool> {
     PgStoreContext::from_legacy_path_schema(path, None)?
         .open_pool()
@@ -61,11 +67,13 @@ pub trait DbEntity: Serialize + for<'de> Deserialize<'de> + Send + Unpin + 'stat
 /// Use this when entities do not need queryable columns beyond `id`.
 /// For entities requiring SQL-level filtering, keep a specialised store and
 /// call [`open_legacy_path_schema_pool`] only for legacy path-derived schemas.
+#[cfg(feature = "db-postgres")]
 pub struct Db<T: DbEntity> {
     pub(crate) pool: PgPool,
     _phantom: std::marker::PhantomData<T>,
 }
 
+#[cfg(feature = "db-postgres")]
 impl<T: DbEntity> Db<T> {
     pub async fn open_legacy_path_schema(path: &Path) -> anyhow::Result<Self> {
         let pool = open_legacy_path_schema_pool(path).await?;
@@ -156,8 +164,9 @@ pub struct Migration {
 }
 
 /// Backwards-compatible alias for the Postgres migrator.
+#[cfg(feature = "db-postgres")]
 pub type Migrator<'a> = PgMigrator<'a>;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "db-postgres"))]
 #[path = "db_tests.rs"]
 mod tests;

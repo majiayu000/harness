@@ -13,7 +13,7 @@ use super::transcript::PendingRuntimeTranscript;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
-use harness_core::db::PgStoreContext;
+use harness_core::db::{PgMigrator, PgStoreContext};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
@@ -169,6 +169,8 @@ impl<'a> RuntimeJobCompletionLease<'a> {
         }
     }
 }
+const WORKFLOW_RUNTIME_SHARED_POOL_MIGRATIONS_TABLE: &str = "workflow_runtime_schema_migrations";
+
 pub struct WorkflowInstancePage {
     pub instances: Vec<WorkflowInstance>,
     pub total: i64,
@@ -384,6 +386,19 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
+        Ok(Self {
+            pool,
+            budget_policy: RuntimeBudgetPolicy::default(),
+        })
+    }
+    pub async fn open_with_shared_pool(pool: PgPool) -> anyhow::Result<Self> {
+        PgMigrator::new_with_table(
+            &pool,
+            WORKFLOW_RUNTIME_MIGRATIONS,
+            WORKFLOW_RUNTIME_SHARED_POOL_MIGRATIONS_TABLE,
+        )?
+        .run()
+        .await?;
         Ok(Self {
             pool,
             budget_policy: RuntimeBudgetPolicy::default(),

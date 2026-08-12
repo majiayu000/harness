@@ -149,12 +149,12 @@ fn json_u64_field(value: &Value, field: &str) -> Option<u64> {
 }
 
 fn repo_slug_from_url(pr_url: &str) -> Option<String> {
-    harness_core::prompts::parse_github_pr_url(pr_url)
+    harness_agents::output_parsing::parse_github_pr_url(pr_url)
         .map(|(owner, repo, _)| format!("{owner}/{repo}"))
 }
 
 fn pr_number_from_url(pr_url: &str) -> Option<u64> {
-    harness_core::prompts::parse_github_pr_url(pr_url).map(|(_, _, number)| number)
+    harness_agents::output_parsing::parse_github_pr_url(pr_url).map(|(_, _, number)| number)
 }
 
 #[cfg(test)]

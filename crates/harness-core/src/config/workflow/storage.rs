@@ -107,7 +107,7 @@ fn default_orphan_reaper_interval_secs() -> u64 {
 }
 
 fn default_orphan_reaper_legacy_batch() -> usize {
-    crate::db_pg_schema_registry::DEFAULT_ORPHAN_REAPER_LEGACY_BATCH
+    200
 }
 
 fn default_workflow_watchdog_age_minutes() -> u64 {

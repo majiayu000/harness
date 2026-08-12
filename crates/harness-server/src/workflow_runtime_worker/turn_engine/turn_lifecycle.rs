@@ -1,10 +1,8 @@
 use super::helpers::{
     emit_runtime_notification, mark_turn_cancelled, mark_turn_failed, process_stream_item,
-    RuntimeUsageContext,
+    RuntimeUsageContext, StreamCompletionState,
 };
-use harness_core::agent::{
-    AgentDiagnosticSeverity, AgentEvent, AgentRequest, StreamItem, TurnRequest,
-};
+use harness_core::agent::{AgentRequest, StreamItem};
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::error::HarnessError;
@@ -18,68 +16,6 @@ use std::sync::{
 };
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
-
-pub(super) fn bridge_agent_event(
-    event: AgentEvent,
-    output_buf: &mut String,
-    emitted_agent_completion: &mut bool,
-) -> Option<StreamItem> {
-    match event {
-        AgentEvent::EgressVerifiedAtDispatch => Some(StreamItem::EgressVerifiedAtDispatch),
-        AgentEvent::ItemStartedPayload { item } => Some(StreamItem::ItemStarted { item }),
-        AgentEvent::MessageDelta { text } => {
-            output_buf.push_str(&text);
-            Some(StreamItem::MessageDelta { text })
-        }
-        AgentEvent::ToolOutputDelta { item_id, text } => {
-            Some(StreamItem::ToolOutputDelta { item_id, text })
-        }
-        AgentEvent::ApprovalRequest { id, command } => {
-            Some(StreamItem::ApprovalRequest { id, command })
-        }
-        AgentEvent::ItemCompletedPayload { item } => {
-            if let harness_core::types::Item::AgentReasoning { content } = &item {
-                output_buf.clear();
-                output_buf.push_str(content);
-                *emitted_agent_completion = true;
-            }
-            Some(StreamItem::ItemCompleted { item })
-        }
-        AgentEvent::TokenUsage { usage } => Some(StreamItem::TokenUsage { usage }),
-        AgentEvent::Warning { message } => Some(StreamItem::Warning { message }),
-        AgentEvent::Diagnostic { severity, message } => {
-            match severity {
-                AgentDiagnosticSeverity::Warning => {
-                    tracing::warn!(agent_diagnostic = true, "{message}");
-                }
-                AgentDiagnosticSeverity::Error => {
-                    tracing::error!(
-                        agent_diagnostic = true,
-                        "non-terminal agent diagnostic: {message}"
-                    );
-                }
-            }
-            Some(StreamItem::Warning { message })
-        }
-        AgentEvent::Error { message } => Some(StreamItem::Error { message }),
-        AgentEvent::TurnCancelled { message } => Some(StreamItem::TurnCancelled { message }),
-        AgentEvent::TurnCompleted { output } => {
-            if *emitted_agent_completion {
-                output_buf.clear();
-                return None;
-            }
-            let content = if output.is_empty() {
-                std::mem::take(output_buf)
-            } else {
-                output
-            };
-            Some(StreamItem::ItemCompleted {
-                item: harness_core::types::Item::AgentReasoning { content },
-            })
-        }
-        _ => None,
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TurnLifecycleOptions {
@@ -196,9 +132,10 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let adapter_opt = if options.force_code_agent {
         None
     } else {
-        execution_adapter
-            .clone()
-            .or_else(|| server.agent_registry.get_adapter(&agent_name))
+        server
+            .agent_registry
+            .get_adapter(&agent_name)
+            .or_else(|| execution_adapter.clone())
     };
 
     // Register as live adapter (RAII guard for cleanup on turn exit).
@@ -246,31 +183,12 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     );
     let (stream_tx, mut stream_rx) = mpsc::channel(128);
 
-    // Use the adapter for turn execution only when its registered strategy says
-    // it owns the full lifecycle. This is the strategy pattern boundary between
-    // Codex's App Server adapter and Claude's control-only adapter; avoid
-    // branching on agent names here.
+    // Use a turn backend only when the registry supplies one for the agent.
+    // Otherwise the default backend remains the streaming executor.
     let mut execution: std::pin::Pin<
         Box<dyn std::future::Future<Output = harness_core::error::Result<()>> + Send>,
     > = if let Some(adapter_arc) = execution_adapter {
-        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
-        // Move stream_tx into the bridge task so dropping it closes stream_rx.
-        let bridge_tx = stream_tx;
-        tokio::spawn(async move {
-            let mut output_buf = String::new();
-            let mut emitted_agent_completion = false;
-            while let Some(event) = event_rx.recv().await {
-                let maybe_item =
-                    bridge_agent_event(event, &mut output_buf, &mut emitted_agent_completion);
-                if let Some(item) = maybe_item {
-                    if bridge_tx.send(item).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            // event_rx closed → adapter done; dropping bridge_tx closes stream_rx.
-        });
-        let turn_req = TurnRequest {
+        let turn_req = AgentRequest {
             prompt,
             prompt_layers: None,
             project_root,
@@ -281,12 +199,13 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
             allowed_tools: options.allowed_tools.clone(),
+            max_budget_usd: None,
             context: vec![],
             timeout_secs,
             env_vars: options.env_vars.clone(),
             capability_token: None,
         };
-        Box::pin(async move { adapter_arc.start_turn(turn_req, event_tx).await })
+        Box::pin(async move { adapter_arc.start_turn(turn_req, stream_tx).await })
     } else {
         let req = AgentRequest {
             prompt,
@@ -298,6 +217,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
             allowed_tools: options.allowed_tools.clone(),
+            timeout_secs,
             env_vars: options.env_vars.clone(),
             ..Default::default()
         };
@@ -306,6 +226,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let mut stream_closed = false;
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut stream_error: Option<String> = None;
+    let mut completion_state = StreamCompletionState::default();
     let mut stream_cancelled: Option<String> = None;
     let mut last_activity = Instant::now();
     let execution_deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
@@ -339,6 +260,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         if let StreamItem::TurnCancelled { message } = &item {
                             stream_cancelled.get_or_insert_with(|| message.clone());
                         }
+                        let Some(item) = completion_state.normalize(item) else {
+                            continue;
+                        };
                         let budget_stop = process_stream_item(
                             &server,
                             &notify_tx,
