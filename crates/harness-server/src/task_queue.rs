@@ -8,8 +8,8 @@ use tokio::time::Instant;
 #[path = "task_queue_permits.rs"]
 mod permits;
 
+pub(crate) use permits::PriorityWaitStats;
 use permits::{empty_wait_stats, AgingParams, PriorityPermitQueue};
-pub use permits::{PriorityWaitStats, MAX_PRIORITY_LEVEL};
 
 /// Per-project and global queue statistics.
 #[derive(Debug, Clone, Serialize)]
@@ -360,7 +360,7 @@ impl TaskQueue {
     ///
     /// With aging enabled, a waiter's effective priority rises one level per
     /// configured interval of wait, capped at `base + max_boost_levels` and
-    /// never above [`MAX_PRIORITY_LEVEL`].  The project stage and the global
+    /// never above `MAX_PRIORITY_LEVEL`.  The project stage and the global
     /// stage age **independently**: the per-stage wait bound under a steady
     /// stream of maximum-priority arrivals is `max_boost_levels × interval`
     /// plus one FIFO turn at the capped level, and the documented end-to-end

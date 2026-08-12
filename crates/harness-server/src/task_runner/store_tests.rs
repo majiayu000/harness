@@ -1,4 +1,3 @@
-use super::super::state::TaskState;
 use super::*;
 
 #[test]

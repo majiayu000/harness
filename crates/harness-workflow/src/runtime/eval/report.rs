@@ -1,3 +1,4 @@
+use super::attestation::{EvalAttestationDecision, EvalAttestationTrust};
 use super::evidence::{EvalCaseEvidence, EvalEvidenceStatus};
 use super::manifest::EvalBenchmarkManifest;
 use super::model::{EvalGrade, GateStatus, HardGateName, QualitySnapshot};
@@ -43,6 +44,10 @@ pub struct EvalReportCase {
     pub verify_commands: Vec<String>,
     pub status: EvalReportCaseStatus,
     pub passed: bool,
+    #[serde(default)]
+    pub attestation_trust: EvalAttestationTrust,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_decision: Option<EvalAttestationDecision>,
     #[serde(default)]
     pub explicit_evidence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +120,14 @@ pub struct EvalCaseTransition {
     pub transition: EvalCaseTransitionKind,
     pub baseline_status: Option<EvalReportCaseStatus>,
     pub candidate_status: Option<EvalReportCaseStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_attestation_trust: Option<EvalAttestationTrust>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_attestation_trust: Option<EvalAttestationTrust>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_attestation_decision: Option<EvalAttestationDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_attestation_decision: Option<EvalAttestationDecision>,
     #[serde(default)]
     pub baseline_source_commit: Option<String>,
     #[serde(default)]
@@ -210,6 +223,8 @@ pub fn eval_report_dry_run(
             verify_commands: case.verify_commands.clone(),
             status: EvalReportCaseStatus::Pending,
             passed: false,
+            attestation_trust: EvalAttestationTrust::Unsigned,
+            attestation_decision: None,
             explicit_evidence: false,
             final_grade: None,
             failed_hard_gates: Vec::new(),
@@ -272,6 +287,8 @@ pub fn eval_report_from_evidence(
                 verify_commands: case.verify_commands.clone(),
                 status: EvalReportCaseStatus::Pending,
                 passed: false,
+                attestation_trust: EvalAttestationTrust::Unsigned,
+                attestation_decision: None,
                 explicit_evidence: false,
                 final_grade: None,
                 failed_hard_gates: Vec::new(),
@@ -291,6 +308,8 @@ pub fn eval_report_from_evidence(
                 verify_commands: case.verify_commands.clone(),
                 status: EvalReportCaseStatus::Skipped,
                 passed: false,
+                attestation_trust: EvalAttestationTrust::Unsigned,
+                attestation_decision: None,
                 explicit_evidence: false,
                 final_grade: None,
                 failed_hard_gates: Vec::new(),
@@ -334,6 +353,12 @@ pub fn diff_eval_run_reports(
                 transition: transition_kind(baseline_case, candidate_case),
                 baseline_status: baseline_case.map(|case| case.status),
                 candidate_status: candidate_case.map(|case| case.status),
+                baseline_attestation_trust: baseline_case.map(|case| case.attestation_trust),
+                candidate_attestation_trust: candidate_case.map(|case| case.attestation_trust),
+                baseline_attestation_decision: baseline_case
+                    .and_then(|case| case.attestation_decision),
+                candidate_attestation_decision: candidate_case
+                    .and_then(|case| case.attestation_decision),
                 baseline_source_commit: baseline_case.map(case_source_commit),
                 candidate_source_commit: candidate_case.map(case_source_commit),
                 baseline_verify_commands: baseline_case
@@ -395,6 +420,8 @@ fn report_case_from_evidence(
         verify_commands: case.verify_commands.clone(),
         status,
         passed,
+        attestation_trust: evidence.attestation.trust(),
+        attestation_decision: evidence.attestation.decision(),
         explicit_evidence: true,
         final_grade,
         failed_hard_gates,
@@ -681,6 +708,7 @@ fn validate_k(k: u32) -> Result<(), EvalReportError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::attestation::EvalAttestationSummary;
     use super::super::manifest::{EvalBenchmarkCase, EvalCaseVerdict, EvalCommitResolution};
     use super::super::model::RuntimeSnapshot;
     use super::super::EvalCaseEvidence;
@@ -800,6 +828,7 @@ mod tests {
             runtime: None,
             usage: Vec::new(),
             submission: None,
+            attestation: EvalAttestationSummary::unsigned(),
             quality_gate: None,
             quality: None,
             missing_evidence: Vec::new(),
@@ -949,6 +978,7 @@ mod tests {
             case_id: case_id.to_string(),
             workflow_id: Some(format!("workflow-{case_id}")),
             status,
+            attestation: EvalAttestationSummary::unsigned(),
             runtime: terminal_state.map(|terminal_state| RuntimeSnapshot {
                 task_id: Some(format!("task-{case_id}")),
                 workflow_id: Some(format!("workflow-{case_id}")),
@@ -985,6 +1015,8 @@ mod tests {
             base_commit: format!("base-{case_id}"),
             source_commit: format!("source-{case_id}"),
             verify_commands: vec![format!("cargo test {case_id}")],
+            attestation_trust: EvalAttestationTrust::Unsigned,
+            attestation_decision: None,
             status,
             passed: status == EvalReportCaseStatus::Passed,
             explicit_evidence,
