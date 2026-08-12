@@ -165,11 +165,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "Postgres integration test gate",
     ),
     allowed(
-        "crates/harness-server/src/task_runner/spawn_tests/mod.rs",
-        1,
-        "test git binary override",
-    ),
-    allowed(
         "crates/harness-server/src/task_runner/store/startup.rs",
         2,
         "Postgres integration test gate",
