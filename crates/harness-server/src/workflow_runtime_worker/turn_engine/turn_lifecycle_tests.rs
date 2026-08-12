@@ -7,7 +7,8 @@ use super::turn_lifecycle::{
 use crate::{server::HarnessServer, thread_manager::ThreadManager};
 use harness_agents::registry::{AdapterExecutionStrategy, AgentRegistry};
 use harness_core::agent::{
-    AgentAdapter, AgentEvent, AgentRequest, AgentResponse, CodeAgent, StreamItem, TurnRequest,
+    AgentAdapter, AgentDiagnosticSeverity, AgentEvent, AgentRequest, AgentResponse, CodeAgent,
+    StreamItem, TurnRequest,
 };
 use harness_core::config::HarnessConfig;
 use harness_core::error::HarnessError;
@@ -386,6 +387,8 @@ async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
 fn bridge_preserves_warning_and_token_usage_events() {
     let mut output_buf = String::new();
     let mut warning_completion = false;
+    let mut diagnostic_completion = false;
+    let mut cancelled_completion = false;
     let mut usage_completion = false;
 
     let warning = bridge_agent_event(
@@ -394,6 +397,21 @@ fn bridge_preserves_warning_and_token_usage_events() {
         },
         &mut output_buf,
         &mut warning_completion,
+    );
+    let diagnostic = bridge_agent_event(
+        AgentEvent::Diagnostic {
+            severity: AgentDiagnosticSeverity::Error,
+            message: "provider diagnostic".into(),
+        },
+        &mut output_buf,
+        &mut diagnostic_completion,
+    );
+    let cancelled = bridge_agent_event(
+        AgentEvent::TurnCancelled {
+            message: "interrupted".into(),
+        },
+        &mut output_buf,
+        &mut cancelled_completion,
     );
     let usage = bridge_agent_event(
         AgentEvent::TokenUsage {
@@ -412,6 +430,18 @@ fn bridge_preserves_warning_and_token_usage_events() {
         warning,
         Some(StreamItem::Warning {
             message: "careful".into()
+        })
+    );
+    assert_eq!(
+        diagnostic,
+        Some(StreamItem::Warning {
+            message: "provider diagnostic".into()
+        })
+    );
+    assert_eq!(
+        cancelled,
+        Some(StreamItem::TurnCancelled {
+            message: "interrupted".into()
         })
     );
     assert_eq!(
