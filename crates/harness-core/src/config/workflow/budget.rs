@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 /// for the workflow instance. The gate runs in the runtime command dispatcher
 /// before a command is enqueued as a runtime job.
 ///
-/// The default enforcement is [`RuntimeBudgetEnforcement::Shadow`]: the
-/// dispatcher records the would-block decision as a `BudgetShadowDecision`
-/// runtime event but still dispatches. `Enforce` defers the command with the
-/// `workflow_budget_exhausted` dispatch barrier reason.
+/// The default enforcement is [`RuntimeBudgetEnforcement::Enforce`]:
+/// over-budget workflow dispatch is deferred with the
+/// `workflow_budget_exhausted` dispatch barrier reason. Operators can set
+/// `Shadow` explicitly to record would-block decisions as
+/// `BudgetShadowDecision` runtime events while still dispatching.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeBudgetPolicy {
     /// Per-workflow-instance spend ceiling in USD.
@@ -90,9 +91,9 @@ impl RuntimeBudgetPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeBudgetEnforcement {
     /// Record the decision, never block.
-    #[default]
     Shadow,
     /// Defer dispatch once the workflow spend reaches the budget.
+    #[default]
     Enforce,
 }
 
@@ -124,20 +125,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_policy_is_shadow_with_builtin_budget() {
+    fn default_policy_enforces_builtin_budget() {
         let policy = RuntimeBudgetPolicy::default();
         assert_eq!(policy.default_workflow_budget_usd, 15.0);
-        assert_eq!(policy.enforcement, RuntimeBudgetEnforcement::Shadow);
+        assert_eq!(policy.enforcement, RuntimeBudgetEnforcement::Enforce);
         assert!(!policy.unlimited);
         policy.validate().expect("default policy is valid");
     }
 
     #[test]
-    fn policy_deserializes_from_partial_front_matter() {
-        let policy: RuntimeBudgetPolicy =
-            serde_yaml::from_str("enforcement: enforce").expect("partial policy parses");
-        assert_eq!(policy.default_workflow_budget_usd, 15.0);
+    fn policy_deserializes_missing_enforcement_as_enforce() {
+        let policy: RuntimeBudgetPolicy = serde_yaml::from_str("default_workflow_budget_usd: 20.0")
+            .expect("partial policy parses");
+        assert_eq!(policy.default_workflow_budget_usd, 20.0);
         assert_eq!(policy.enforcement, RuntimeBudgetEnforcement::Enforce);
+        assert!(!policy.unlimited);
+    }
+
+    #[test]
+    fn policy_deserializes_explicit_shadow_mode() {
+        let policy: RuntimeBudgetPolicy =
+            serde_yaml::from_str("enforcement: shadow").expect("partial policy parses");
+        assert_eq!(policy.default_workflow_budget_usd, 15.0);
+        assert_eq!(policy.enforcement, RuntimeBudgetEnforcement::Shadow);
         assert!(!policy.unlimited);
     }
 

@@ -132,8 +132,8 @@ pub(super) use transaction_helpers::{enum_str, insert_event_tx, to_jsonb_string}
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
     /// Hard workflow budget ceiling policy (GH-1770 spec §4.4), applied when a
-    /// completed activity commits its decision. Defaults to shadow enforcement
-    /// so a store opened without explicit wiring only records decisions.
+    /// completed activity commits its decision. Defaults to enforcement unless
+    /// callers explicitly configure shadow mode.
     pub(super) budget_policy: RuntimeBudgetPolicy,
 }
 const WORKFLOW_RUNTIME_SHARED_POOL_MIGRATIONS_TABLE: &str = "workflow_runtime_schema_migrations";

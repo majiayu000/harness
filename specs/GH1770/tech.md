@@ -101,7 +101,7 @@ runtime_budget_policy:
   soft_threshold_ratio: 0.8
   daily_profile_cap_usd: 200.0
   daily_throttle_ratio: 0.8
-  enforcement: shadow | enforce         # default shadow
+  enforcement: shadow | enforce         # default enforce after rollout
   unlimited: false                      # explicit opt-out only
 ```
 
@@ -164,8 +164,9 @@ the activity share across candidates, mirroring the existing
    raise recovers (reuses `OperatorGate` machinery; no new lifecycle
    states).
 5. **Shadow mode**: all four points compute and log
-   (`budget_shadow_decision` runtime events) but take no action unless
-   `enforcement: enforce` for the profile.
+   (`budget_shadow_decision` runtime events) but take no action when the
+   global runtime budget policy explicitly configures `enforcement:
+   shadow`.
 
 ### 5. Typed outcomes
 
@@ -194,7 +195,8 @@ the activity share across candidates, mirroring the existing
 2. Wire shadow decisions at all four enforcement points; observe for a
    week; tune `default_workflow_budget_usd` from observed p95 workflow
    spend.
-3. Enable `enforce` for one low-volume profile; then broadly.
+3. Make `enforce` the built-in default while preserving explicit
+   `shadow` for rollback and profile-specific observation.
 4. Enable daily caps last.
 
 Rollback at any phase = revert config to `shadow`; tables and events

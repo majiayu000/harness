@@ -83,7 +83,11 @@ async fn budget_gate_shadow_records_event_and_dispatches() -> anyhow::Result<()>
     let dispatcher = RuntimeCommandDispatcher::new(
         &store,
         RuntimeProfile::new("codex-high", RuntimeKind::CodexJsonrpc),
-    );
+    )
+    .with_budget_policy(RuntimeBudgetPolicy {
+        enforcement: RuntimeBudgetEnforcement::Shadow,
+        ..RuntimeBudgetPolicy::default()
+    });
     let outcome = dispatcher
         .dispatch_once()
         .await?
@@ -106,6 +110,62 @@ async fn budget_gate_shadow_records_event_and_dispatches() -> anyhow::Result<()>
     );
     assert_eq!(shadow.event["budget_usd"], 15.0);
     assert_eq!(shadow.event["spent_usd"], 20.0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn budget_gate_default_enforces_budget_barrier() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let (instance, command_id) = issue_with_pending_command(&store, 520).await?;
+    store
+        .upsert_runtime_usage(&budget_usage_upsert(&instance.id, cost_usd_to_micros(16.0)?))
+        .await?;
+
+    let dispatcher = RuntimeCommandDispatcher::new(
+        &store,
+        RuntimeProfile::new("codex-high", RuntimeKind::CodexJsonrpc),
+    );
+    let outcome = dispatcher
+        .dispatch_once()
+        .await?
+        .expect("pending command should dispatch");
+
+    let barrier = match outcome {
+        CommandDispatchOutcome::Deferred {
+            command_id: id,
+            barrier,
+        } => {
+            assert_eq!(id, command_id);
+            barrier
+        }
+        other => panic!("default budget policy must enforce over-budget commands: {other:?}"),
+    };
+    assert_eq!(
+        barrier.reason_code,
+        DispatchBarrierReasonCode::WorkflowBudgetExhausted
+    );
+    assert_eq!(
+        store.commands_for(&instance.id).await?[0].status,
+        WorkflowCommandStatus::Deferred
+    );
+    let events = store.events_for(&instance.id).await?;
+    let deferred = events
+        .iter()
+        .find(|event| event.event_type == "WorkflowRuntimeDispatchDeferred")
+        .expect("default enforcement records a dispatch-deferred audit event");
+    assert_eq!(deferred.source, "workflow_runtime_command_dispatcher");
+    assert_eq!(
+        deferred.event["dispatch_barrier"]["reason_code"],
+        "workflow_budget_exhausted"
+    );
+    assert!(events
+        .iter()
+        .all(|event| event.event_type != "BudgetShadowDecision"));
     Ok(())
 }
 

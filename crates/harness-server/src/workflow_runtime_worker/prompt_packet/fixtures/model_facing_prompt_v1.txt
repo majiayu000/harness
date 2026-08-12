@@ -389,7 +389,7 @@ Prompt packet:
       },
       "runtime_budget_policy": {
         "default_workflow_budget_usd": 15.0,
-        "enforcement": "shadow",
+        "enforcement": "enforce",
         "unlimited": false
       },
       "runtime_completion": {

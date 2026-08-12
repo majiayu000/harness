@@ -82,10 +82,10 @@ draining a quota window.
    `provider_confirmed`. An estimate is never presented as confirmed.
    Usage rows for models absent from the pricing table are priced with
    a conservative fallback and flagged.
-8. **B-008:** Budget enforcement ships with a shadow mode: ledgers are
-   computed and reason codes logged, but no dispatch is deferred and no
-   workflow blocked. Enforcement activates per profile via
-   configuration.
+8. **B-008:** Budget enforcement includes an explicit shadow mode:
+   ledgers are computed and reason codes logged, but no dispatch is
+   deferred and no workflow is blocked while shadow is configured. The
+   built-in default after rollout enforces the per-workflow ceiling.
 9. **B-009:** Budget state is observable: workflow status exposes
    budget, accumulated spend, and threshold state; profile status
    exposes daily spend, cap, and ladder position. Existing usage
@@ -153,7 +153,9 @@ draining a quota window.
 
 Phase 1 ships ledgers, pricing, and shadow mode; operators observe
 computed spend and would-have-fired reason codes. Phase 2 activates
-per-workflow enforcement for one low-volume profile, then broadly.
-Phase 3 activates daily caps. Reverting enforcement returns to
-observation-only behavior; ledgers and events remain. No database
-migration is destructive; new columns/tables are additive.
+per-workflow enforcement for one low-volume profile, then broadly, and
+makes enforcement the built-in default after the observation window.
+Phase 3 activates daily caps. Explicitly reverting enforcement to
+`shadow` returns to observation-only behavior; ledgers and events
+remain. No database migration is destructive; new columns/tables are
+additive.
