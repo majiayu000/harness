@@ -17,7 +17,7 @@ use crate::codex_adapter::CodexAdapter;
 use crate::opencode::OpenCodeAgent;
 use crate::opencode_adapter::OpenCodeAcpAdapter;
 use crate::provider_backpressure::ProviderBackpressureGate;
-use crate::registry::{AdapterExecutionStrategy, AgentRegistry};
+use crate::registry::AgentRegistry;
 use async_trait::async_trait;
 use harness_core::{
     agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem},
@@ -146,17 +146,13 @@ pub fn registry_from_config(
     );
     let codex_config = config.codex.clone();
     registry
-        .register_adapter_factory_with_strategy(
-            "codex",
-            move || {
-                Arc::new(CodexAdapter::from_config(
-                    codex_config.clone(),
-                    sandbox_mode,
-                ))
-            },
-            AdapterExecutionStrategy::ExecuteTurns,
-        )
-        .map_err(|error| anyhow::anyhow!("failed to attach the codex adapter: {error}"))?;
+        .register_turn_backend_factory("codex", move || {
+            Arc::new(CodexAdapter::from_config(
+                codex_config.clone(),
+                sandbox_mode,
+            ))
+        })
+        .map_err(|error| anyhow::anyhow!("failed to attach the codex turn backend: {error}"))?;
 
     registry.register(
         "opencode",
@@ -167,17 +163,13 @@ pub fn registry_from_config(
     );
     let opencode_config = config.opencode.clone();
     registry
-        .register_adapter_factory_with_strategy(
-            "opencode",
-            move || {
-                Arc::new(OpenCodeAcpAdapter::from_config(
-                    opencode_config.clone(),
-                    sandbox_mode,
-                ))
-            },
-            AdapterExecutionStrategy::ExecuteTurns,
-        )
-        .map_err(|error| anyhow::anyhow!("failed to attach the opencode adapter: {error}"))?;
+        .register_turn_backend_factory("opencode", move || {
+            Arc::new(OpenCodeAcpAdapter::from_config(
+                opencode_config.clone(),
+                sandbox_mode,
+            ))
+        })
+        .map_err(|error| anyhow::anyhow!("failed to attach the opencode turn backend: {error}"))?;
 
     if let Ok(api_key) = harness_core::config::process_env::var(ANTHROPIC_API_KEY_ENV) {
         registry.register(
@@ -316,10 +308,7 @@ mod tests {
             registry.get_adapter("claude").is_none(),
             "GH-1786 removed the unreachable ClaudeAdapter; claude has no adapter"
         );
-        assert_eq!(
-            registry.adapter_strategy("codex"),
-            Some(AdapterExecutionStrategy::ExecuteTurns)
-        );
+        assert!(registry.turn_execution_adapter("codex").is_some());
         assert_eq!(registry.resolved_default_agent_name(), Some("claude"));
     }
 

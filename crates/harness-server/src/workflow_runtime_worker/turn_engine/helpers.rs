@@ -1,7 +1,7 @@
 use harness_core::agent::StreamItem;
 use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 use harness_core::run_id::RunId;
-use harness_core::types::{ThreadId, TokenUsage, TurnId, TurnStatus};
+use harness_core::types::{Item, ThreadId, TokenUsage, TurnId, TurnStatus};
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 use harness_workflow::runtime::{
     cost_usd_from_micros, cost_usd_to_micros, RuntimeKind, RuntimeUsageMetrics, RuntimeUsageUpsert,
@@ -18,6 +18,67 @@ pub(crate) struct TurnBudgetStop {
     pub(crate) workflow_id: String,
     pub(crate) spent_usd: f64,
     pub(crate) budget_usd: f64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct StreamCompletionState {
+    output_buf: String,
+    emitted_agent_completion: bool,
+}
+
+impl StreamCompletionState {
+    pub(crate) fn normalize(&mut self, stream_item: StreamItem) -> Option<StreamItem> {
+        match stream_item {
+            StreamItem::MessageDelta { text } => {
+                self.output_buf.push_str(&text);
+                Some(StreamItem::MessageDelta { text })
+            }
+            StreamItem::ItemCompleted { item } => {
+                if let Item::AgentReasoning { content } = &item {
+                    self.output_buf.clear();
+                    self.output_buf.push_str(content);
+                    self.emitted_agent_completion = true;
+                }
+                Some(StreamItem::ItemCompleted { item })
+            }
+            // GH-1933: adapter diagnostics are non-terminal; log them and
+            // surface them to the turn as warnings.
+            StreamItem::Diagnostic { severity, message } => {
+                match severity {
+                    harness_core::agent::AgentDiagnosticSeverity::Warning => {
+                        tracing::warn!(agent_diagnostic = true, "{message}");
+                    }
+                    harness_core::agent::AgentDiagnosticSeverity::Error => {
+                        tracing::error!(
+                            agent_diagnostic = true,
+                            "non-terminal agent diagnostic: {message}"
+                        );
+                    }
+                }
+                Some(StreamItem::Warning { message })
+            }
+            StreamItem::TurnCompleted { output } => {
+                if self.emitted_agent_completion {
+                    self.output_buf.clear();
+                    return None;
+                }
+                let content = if output.is_empty() {
+                    std::mem::take(&mut self.output_buf)
+                } else {
+                    output
+                };
+                if content.is_empty() {
+                    None
+                } else {
+                    self.emitted_agent_completion = true;
+                    Some(StreamItem::ItemCompleted {
+                        item: Item::AgentReasoning { content },
+                    })
+                }
+            }
+            other => Some(other),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -328,6 +389,23 @@ pub(crate) async fn process_stream_item(
                 Notification::Warning {
                     turn_id: turn_id.clone(),
                     message,
+                },
+            );
+        }
+        StreamItem::TurnCompleted { output } if !output.is_empty() => {
+            let item = Item::AgentReasoning { content: output };
+            if let Err(err) = server
+                .thread_manager
+                .add_item(thread_id, turn_id, item.clone())
+            {
+                tracing::warn!("failed to append stream turn_completed to turn: {err}");
+            }
+            emit_runtime_notification(
+                notify_tx,
+                notification_tx,
+                Notification::ItemCompleted {
+                    turn_id: turn_id.clone(),
+                    item,
                 },
             );
         }
