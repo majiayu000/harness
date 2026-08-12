@@ -21,7 +21,9 @@ use crate::runtime::state_registry::{
     DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, WorkflowProgressMode,
 };
 use crate::runtime::status::WorkflowCommandStatus;
+use crate::runtime::submission::append_candidate_commands;
 use crate::runtime::validator::ValidationContext;
+use crate::runtime::{candidate_fanout_from_value, CandidateFanoutRequest};
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
 
@@ -82,7 +84,10 @@ struct RecoveryDispatchPlan { target: RecoveryDispatchTarget, command_source: Re
 #[derive(Debug, Clone, PartialEq)]
 enum RecoveryDispatchCommandSource {
     Replay(WorkflowCommand),
-    Synthetic(WorkflowCommand),
+    Synthetic {
+        command: WorkflowCommand,
+        candidate_fanout: Option<CandidateFanoutRequest>,
+    },
     LegacyFallback,
     DeclarativeProgress(WorkflowCommandType),
 }
@@ -370,7 +375,7 @@ async fn recovery_dispatch_plan_tx(
     {
         return Ok(Ok(awaiting_dependencies_recovery_dispatch_plan(
             instance, request,
-        )));
+        )?));
     }
     validate_stopped_metadata(&instance.data)?;
     let activity = stopped_activity(&instance.data)?;
@@ -405,7 +410,7 @@ async fn recovery_dispatch_plan_tx(
 fn awaiting_dependencies_recovery_dispatch_plan(
     instance: &WorkflowInstance,
     request: &WorkflowRuntimeRecoveryRequest<'_>,
-) -> RecoveryDispatchPlan {
+) -> anyhow::Result<RecoveryDispatchPlan> {
     let force_execute = instance
         .data
         .get("force_execute")
@@ -439,17 +444,25 @@ fn awaiting_dependencies_recovery_dispatch_plan(
     for field in RECOVERY_CONTEXT_FIELDS {
         copy_optional_data_field(&mut payload, &instance.data, field);
     }
-    RecoveryDispatchPlan {
+    let candidate_fanout = if force_execute {
+        candidate_fanout_from_value(&instance.data)?
+    } else {
+        None
+    };
+    Ok(RecoveryDispatchPlan {
         target: RecoveryDispatchTarget {
             state: state.to_string(),
             activity: Some(activity.to_string()),
         },
-        command_source: RecoveryDispatchCommandSource::Synthetic(WorkflowCommand::new(
-            WorkflowCommandType::EnqueueActivity,
-            "operator-dependency-override-preview",
-            payload,
-        )),
-    }
+        command_source: RecoveryDispatchCommandSource::Synthetic {
+            command: WorkflowCommand::new(
+                WorkflowCommandType::EnqueueActivity,
+                "operator-dependency-override-preview",
+                payload,
+            ),
+            candidate_fanout,
+        },
+    })
 }
 
 fn declarative_recovery_dispatch_plan(
@@ -732,7 +745,7 @@ fn recovery_dispatch_decision(
     event_id: &str,
     evidence: &[WorkflowEvidence],
 ) -> WorkflowDecision {
-    let mut decision = WorkflowDecision::new(
+    let decision = WorkflowDecision::new(
         &instance.id,
         previous_state,
         format!("operator_runtime_{}", action.as_str()),
@@ -741,10 +754,14 @@ fn recovery_dispatch_decision(
             "operator requested workflow runtime {} after resolving the stopped condition",
             action.as_str()
         ),
-    )
-    .with_command(recovery_dispatch_command(
-        instance, action, reason, plan, event_id,
-    ));
+    );
+    let command = recovery_dispatch_command(instance, action, reason, plan, event_id);
+    let mut decision = match &plan.command_source {
+        RecoveryDispatchCommandSource::Synthetic {
+            candidate_fanout, ..
+        } => append_candidate_commands(decision, command, candidate_fanout.as_ref()),
+        _ => decision.with_command(command),
+    };
     for item in evidence {
         decision = decision.with_evidence(item.clone());
     }
@@ -764,9 +781,12 @@ fn recovery_dispatch_command(
         instance.id,
         event_id
     );
-    if let RecoveryDispatchCommandSource::Replay(command)
-    | RecoveryDispatchCommandSource::Synthetic(command) = &plan.command_source
-    {
+    if let RecoveryDispatchCommandSource::Replay(command) = &plan.command_source {
+        let mut command = command.clone();
+        command.dedupe_key = dedupe_key;
+        return command;
+    }
+    if let RecoveryDispatchCommandSource::Synthetic { command, .. } = &plan.command_source {
         let mut command = command.clone();
         command.dedupe_key = dedupe_key;
         return command;

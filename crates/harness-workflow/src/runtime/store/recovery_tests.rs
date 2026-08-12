@@ -208,7 +208,8 @@ fn dependency_gate_recovery_builds_override_plan_and_evidence() {
             .expect("rejection check should parse")
             .is_none());
 
-        let plan = awaiting_dependencies_recovery_dispatch_plan(&instance, &request);
+        let plan = awaiting_dependencies_recovery_dispatch_plan(&instance, &request)
+            .expect("dependency override plan should build");
         assert_eq!(plan.target.state, expected_state);
         assert_eq!(plan.target.activity.as_deref(), Some(expected_activity));
         let command = recovery_dispatch_command(
@@ -259,4 +260,96 @@ fn dependency_gate_recovery_builds_override_plan_and_evidence() {
             "awaiting_dependencies"
         );
     }
+}
+
+#[test]
+fn dependency_gate_recovery_preserves_candidate_fanout_for_force_execute() -> anyhow::Result<()> {
+    let mut instance = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "awaiting_dependencies",
+        WorkflowSubject::new("issue", "issue:1885"),
+    )
+    .with_id("dependency-override-fanout")
+    .with_server_data(json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": 1885,
+        "task_id": "github-issue:owner/repo:issue:1885",
+        "source": "github",
+        "external_id": "1885",
+        "depends_on": ["github-issue:owner/repo:issue:1884"],
+        "dependencies_blocked": true,
+        "force_execute": true,
+        "candidate_fanout": {
+            "candidate_group_id": "dependency-override-fanout:candidate-group:issue-1885",
+            "candidate_count": 2,
+            "trigger_label": "best-of-n",
+            "max_turns_per_candidate": 4,
+        },
+        "last_remote_fact_hash": "sha256:abc",
+    }));
+    let request = WorkflowRuntimeRecoveryRequest {
+        workflow_id: "dependency-override-fanout",
+        action: WorkflowRuntimeRecoveryAction::Unblock,
+        reason: "operator approved dependency override",
+        actor: "operator",
+        target_state: None,
+        evidence: &[],
+    };
+
+    let plan = awaiting_dependencies_recovery_dispatch_plan(&instance, &request)
+        .expect("dependency override plan should build");
+    let decision = recovery_dispatch_decision(
+        &instance,
+        WorkflowRuntimeRecoveryAction::Unblock,
+        request.reason,
+        "awaiting_dependencies",
+        &plan,
+        "event-one",
+        &[],
+    );
+
+    assert_eq!(decision.next_state, "implementing");
+    assert_eq!(decision.commands.len(), 2);
+    for (candidate_index, command) in (1..=2).zip(&decision.commands) {
+        assert_eq!(command.activity_name(), Some("implement_issue"));
+        assert_eq!(command.command["submission_mode"], "deferred");
+        assert_eq!(
+            command.command["candidate"]["candidate_index"],
+            candidate_index
+        );
+        assert_eq!(command.command["candidate"]["candidate_count"], 2);
+        assert_eq!(
+            command.command["candidate"]["budget"]["max_turns_per_candidate"],
+            4
+        );
+        assert_eq!(
+            command.dedupe_key,
+            format!(
+                "operator-recovery:unblock:dependency-override-fanout:event-one:candidate:c{candidate_index}"
+            )
+        );
+    }
+
+    validator_for_instance(&instance)?
+        .expect("GitHub issue workflow should have a validator")
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("workflow_runtime_operator_action", chrono::Utc::now()),
+        )?;
+
+    persist_operator_recovery_data(
+        &mut instance,
+        WorkflowRuntimeRecoveryAction::Unblock,
+        request.reason,
+        request.actor,
+        "awaiting_dependencies",
+        "implementing",
+        "event-one",
+    )
+    .expect("operator recovery data should persist");
+    assert_eq!(instance.data["dependencies_blocked"], false);
+    Ok(())
 }
