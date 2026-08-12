@@ -42,13 +42,6 @@ impl WorkflowRuntimeRecoveryAction {
         }
     }
 
-    fn expected_state(self) -> &'static str {
-        match self {
-            Self::Unblock => "blocked",
-            Self::Retry => "failed",
-        }
-    }
-
     fn event_type(self) -> &'static str {
         match self {
             Self::Unblock => "WorkflowRuntimeUnblocked",
@@ -89,6 +82,7 @@ struct RecoveryDispatchPlan { target: RecoveryDispatchTarget, command_source: Re
 #[derive(Debug, Clone, PartialEq)]
 enum RecoveryDispatchCommandSource {
     Replay(WorkflowCommand),
+    Synthetic(WorkflowCommand),
     LegacyFallback,
     DeclarativeProgress(WorkflowCommandType),
 }
@@ -294,7 +288,7 @@ fn recovery_rejection(
         ));
     }
 
-    if instance.state != request.action.expected_state() {
+    if !recovery_action_matches_state(request.action, &instance.state) {
         return Ok(Some(WorkflowRuntimeRecoveryOutcome::WrongState {
             workflow: instance.clone(),
         }));
@@ -315,6 +309,15 @@ fn recovery_rejection(
     }
 
     Ok(None)
+}
+
+fn recovery_action_matches_state(action: WorkflowRuntimeRecoveryAction, state: &str) -> bool {
+    match action {
+        WorkflowRuntimeRecoveryAction::Unblock => {
+            matches!(state, "blocked" | "awaiting_dependencies")
+        }
+        WorkflowRuntimeRecoveryAction::Retry => state == "failed",
+    }
 }
 
 fn custom_declarative_definition(
@@ -361,6 +364,14 @@ async fn recovery_dispatch_plan_tx(
     if let Some(Ok(definition)) = custom_declarative_definition(instance) {
         return declarative_recovery_dispatch_plan(request, &definition);
     }
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "awaiting_dependencies"
+        && request.action == WorkflowRuntimeRecoveryAction::Unblock
+    {
+        return Ok(Ok(awaiting_dependencies_recovery_dispatch_plan(
+            instance, request,
+        )));
+    }
     validate_stopped_metadata(&instance.data)?;
     let activity = stopped_activity(&instance.data)?;
     let target = match recovery_dispatch_target(&instance.data, activity.as_deref())? {
@@ -389,6 +400,56 @@ async fn recovery_dispatch_plan_tx(
         target: target.clone(),
         command_source,
     }))
+}
+
+fn awaiting_dependencies_recovery_dispatch_plan(
+    instance: &WorkflowInstance,
+    request: &WorkflowRuntimeRecoveryRequest<'_>,
+) -> RecoveryDispatchPlan {
+    let force_execute = instance
+        .data
+        .get("force_execute")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (state, activity) = if force_execute {
+        ("implementing", "implement_issue")
+    } else {
+        ("planning", "plan_issue")
+    };
+    let remote_fact_hash = optional_string_field(&instance.data, "last_remote_fact_hash");
+    let dispatch_fact_hash = remote_fact_hash.clone();
+    let mut payload = json!({
+        "activity": activity,
+        "additional_prompt": format!(
+            "Operator requested workflow runtime unblock after overriding the dependency gate. Recovery reason: {}",
+            request.reason
+        ),
+        "dependency_override": {
+            "previous_state": instance.state,
+            "reason": request.reason,
+        },
+        "dispatch_gate": {
+            "reason": "operator_dependency_override",
+            "fact_hash": dispatch_fact_hash,
+        },
+        "remote_fact_hash": remote_fact_hash,
+        "submission_mode": optional_string_field(&instance.data, "submission_mode")
+            .unwrap_or_else(|| "immediate".to_string()),
+    });
+    for field in RECOVERY_CONTEXT_FIELDS {
+        copy_optional_data_field(&mut payload, &instance.data, field);
+    }
+    RecoveryDispatchPlan {
+        target: RecoveryDispatchTarget {
+            state: state.to_string(),
+            activity: Some(activity.to_string()),
+        },
+        command_source: RecoveryDispatchCommandSource::Synthetic(WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "operator-dependency-override-preview",
+            payload,
+        )),
+    }
 }
 
 fn declarative_recovery_dispatch_plan(
@@ -606,7 +667,7 @@ fn persist_operator_recovery_data(
     // A successful recovery ends the stop episode. Stop classification and
     // auto-recovery state must not leak into later terminal history or keep
     // recovered transcript dependency families pinned.
-    instance.apply_data_writes([
+    let mut writes = vec![
         crate::runtime::WorkflowDataWrite::remove(
             "auto_recovery",
             crate::runtime::DataProvenance::Server,
@@ -639,7 +700,27 @@ fn persist_operator_recovery_data(
             }),
             crate::runtime::DataProvenance::Server,
         ),
-    ])
+    ];
+    if previous_state == "awaiting_dependencies" {
+        writes.push(crate::runtime::WorkflowDataWrite::set(
+            "dependencies_blocked",
+            json!(false),
+            crate::runtime::DataProvenance::Server,
+        ));
+        writes.push(crate::runtime::WorkflowDataWrite::set(
+            "dependency_override",
+            json!({
+                "action": action.as_str(),
+                "reason": reason,
+                "actor": actor,
+                "previous_state": previous_state,
+                "state": state,
+                "event_id": event_id,
+            }),
+            crate::runtime::DataProvenance::Server,
+        ));
+    }
+    instance.apply_data_writes(writes)
 }
 
 fn recovery_dispatch_decision(
@@ -683,7 +764,9 @@ fn recovery_dispatch_command(
         instance.id,
         event_id
     );
-    if let RecoveryDispatchCommandSource::Replay(command) = &plan.command_source {
+    if let RecoveryDispatchCommandSource::Replay(command)
+    | RecoveryDispatchCommandSource::Synthetic(command) = &plan.command_source
+    {
         let mut command = command.clone();
         command.dedupe_key = dedupe_key;
         return command;

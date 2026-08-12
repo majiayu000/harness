@@ -134,6 +134,14 @@ fn stopped_action_plan(workflow: &WorkflowInstance) -> Option<StoppedActionPlan>
             legacy_fallback: true,
         });
     }
+    if workflow.state == "awaiting_dependencies" {
+        return Some(StoppedActionPlan {
+            action: StoppedRecoveryAction::Unblock,
+            target: RecoveryDispatchTarget { activity: "" },
+            runtime_job_id: None,
+            legacy_fallback: true,
+        });
+    }
     let action = match workflow.state.as_str() {
         "blocked" => StoppedRecoveryAction::Unblock,
         "failed" => StoppedRecoveryAction::Retry,

@@ -4,6 +4,7 @@ use crate::runtime::model::{WorkflowEvidence, WorkflowSubject};
 use harness_core::config::workflow::{
     DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
 };
+use serde_json::json;
 use std::collections::BTreeMap;
 
 fn definition() -> crate::runtime::declarative::DeclarativeWorkflowDefinition {
@@ -167,4 +168,95 @@ fn declarative_recovery_builds_exact_progress_driver_and_preserves_evidence() {
         WorkflowCommandType::EnqueueActivity
     );
     assert_eq!(decision.commands[0].activity_name(), Some("run"));
+}
+
+#[test]
+fn dependency_gate_recovery_builds_override_plan_and_evidence() {
+    for (force_execute, expected_state, expected_activity) in [
+        (false, "planning", "plan_issue"),
+        (true, "implementing", "implement_issue"),
+    ] {
+        let mut instance = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "awaiting_dependencies",
+            WorkflowSubject::new("issue", "issue:1885"),
+        )
+        .with_id(format!("dependency-override-{force_execute}"))
+        .with_server_data(json!({
+            "project_id": "/project-a",
+            "repo": "owner/repo",
+            "issue_number": 1885,
+            "task_id": "github-issue:owner/repo:issue:1885",
+            "source": "github",
+            "external_id": "1885",
+            "depends_on": ["github-issue:owner/repo:issue:1884"],
+            "dependencies_blocked": true,
+            "force_execute": force_execute,
+            "last_remote_fact_hash": "sha256:abc",
+        }));
+        let request = WorkflowRuntimeRecoveryRequest {
+            workflow_id: "dependency-override",
+            action: WorkflowRuntimeRecoveryAction::Unblock,
+            reason: "operator approved dependency override",
+            actor: "operator",
+            target_state: None,
+            evidence: &[],
+        };
+
+        assert!(recovery_rejection(&instance, &request)
+            .expect("rejection check should parse")
+            .is_none());
+
+        let plan = awaiting_dependencies_recovery_dispatch_plan(&instance, &request);
+        assert_eq!(plan.target.state, expected_state);
+        assert_eq!(plan.target.activity.as_deref(), Some(expected_activity));
+        let command = recovery_dispatch_command(
+            &instance,
+            WorkflowRuntimeRecoveryAction::Unblock,
+            request.reason,
+            &plan,
+            "event-one",
+        );
+        assert_eq!(command.command_type, WorkflowCommandType::EnqueueActivity);
+        assert_eq!(command.activity_name(), Some(expected_activity));
+        assert_eq!(command.command["issue_number"], 1885);
+        assert_eq!(
+            command.command["dispatch_gate"]["reason"],
+            "operator_dependency_override"
+        );
+        assert_eq!(command.command["dispatch_gate"]["fact_hash"], "sha256:abc");
+        assert!(command.command["additional_prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("overriding the dependency gate")));
+
+        persist_operator_recovery_data(
+            &mut instance,
+            WorkflowRuntimeRecoveryAction::Unblock,
+            request.reason,
+            request.actor,
+            "awaiting_dependencies",
+            expected_state,
+            "event-one",
+        )
+        .expect("operator recovery data should persist");
+        assert_eq!(instance.data["dependencies_blocked"], false);
+        assert_eq!(instance.data["dependency_override"]["action"], "unblock");
+        assert_eq!(
+            instance.data["dependency_override"]["previous_state"],
+            "awaiting_dependencies"
+        );
+        assert_eq!(
+            instance.data["dependency_override"]["state"],
+            expected_state
+        );
+        assert_eq!(
+            instance.data["dependency_override"]["event_id"],
+            "event-one"
+        );
+        assert_eq!(
+            instance.data["last_operator_recovery"]["previous_state"],
+            "awaiting_dependencies"
+        );
+    }
 }
