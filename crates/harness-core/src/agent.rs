@@ -409,11 +409,18 @@ pub enum AgentEvent {
     Warning {
         message: String,
     },
+    Diagnostic {
+        severity: AgentDiagnosticSeverity,
+        message: String,
+    },
     Error {
         message: String,
     },
     TurnCompleted {
         output: String,
+    },
+    TurnCancelled {
+        message: String,
     },
     ApprovalRequest {
         id: String,
@@ -440,6 +447,14 @@ pub enum TaskComplexity {
     Medium,
     Complex,
     Critical,
+}
+
+/// Severity for non-terminal diagnostics surfaced by an agent adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDiagnosticSeverity {
+    Warning,
+    Error,
 }
 
 /// Decision for an approval request from the agent.

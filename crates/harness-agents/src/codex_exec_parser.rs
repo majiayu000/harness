@@ -304,6 +304,8 @@ pub(crate) async fn stream_codex_exec_output(
                 StreamItem::ItemCompletedKind => "item_completed",
                 StreamItem::TokenUsage { .. } => "token_usage",
                 StreamItem::Warning { .. } => "warning",
+                StreamItem::Diagnostic { .. } => "diagnostic",
+                StreamItem::TurnCancelled { .. } => "turn_cancelled",
                 StreamItem::Error { .. } => "error",
                 StreamItem::TurnCompleted { .. } => "turn_completed",
                 StreamItem::ApprovalRequest { .. } => "approval_request",

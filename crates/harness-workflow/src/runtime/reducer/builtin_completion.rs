@@ -228,7 +228,7 @@ fn reduce_success(
         && instance.state == "local_review_gate"
         && result.activity == LOCAL_REVIEW_ACTIVITY
     {
-        let reason = "run_local_review succeeded without a LocalReviewPassed, LocalReviewChangesRequested, or LocalReviewBlocked signal";
+        let reason = "run_local_review succeeded without exactly one LocalReviewPassed, LocalReviewChangesRequested, or LocalReviewBlocked signal";
         return Some(invalid_agent_output_blocked_decision(
             instance, event, result, reason,
         ));

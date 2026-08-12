@@ -108,6 +108,9 @@ fn apply_claude_stream_event(
         AgentEvent::Warning { message } => {
             emitted_items.push(StreamItem::Warning { message });
         }
+        AgentEvent::Diagnostic { message, .. } => {
+            emitted_items.push(StreamItem::Warning { message });
+        }
         AgentEvent::Error { message } => {
             emitted_items.push(StreamItem::Error { message });
         }
@@ -125,6 +128,10 @@ fn apply_claude_stream_event(
                     content: parsed.output.clone(),
                 },
             });
+            parsed.completed = true;
+        }
+        AgentEvent::TurnCancelled { message } => {
+            emitted_items.push(StreamItem::TurnCancelled { message });
             parsed.completed = true;
         }
         AgentEvent::ToolCall { name, input } => {
@@ -172,6 +179,8 @@ fn stream_item_label(item: &StreamItem) -> &'static str {
         StreamItem::ItemCompletedKind => "item_completed",
         StreamItem::TokenUsage { .. } => "token_usage",
         StreamItem::Warning { .. } => "warning",
+        StreamItem::Diagnostic { .. } => "diagnostic",
+        StreamItem::TurnCancelled { .. } => "turn_cancelled",
         StreamItem::Error { .. } => "error",
         StreamItem::TurnCompleted { .. } => "turn_completed",
         StreamItem::ApprovalRequest { .. } => "approval_request",

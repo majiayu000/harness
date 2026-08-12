@@ -1,6 +1,6 @@
 use super::helpers::{
-    emit_runtime_notification, mark_turn_failed, process_stream_item, RuntimeUsageContext,
-    StreamCompletionState,
+    emit_runtime_notification, mark_turn_cancelled, mark_turn_failed, process_stream_item,
+    RuntimeUsageContext, StreamCompletionState,
 };
 use harness_core::agent::{AgentRequest, StreamItem};
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
@@ -227,6 +227,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut stream_error: Option<String> = None;
     let mut completion_state = StreamCompletionState::default();
+    let mut stream_cancelled: Option<String> = None;
     let mut last_activity = Instant::now();
     let execution_deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
     let execution_timeout = async {
@@ -255,6 +256,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         last_activity = Instant::now();
                         if let StreamItem::Error { message } = &item {
                             stream_error.get_or_insert_with(|| message.clone());
+                        }
+                        if let StreamItem::TurnCancelled { message } = &item {
+                            stream_cancelled.get_or_insert_with(|| message.clone());
                         }
                         let Some(item) = completion_state.normalize(item) else {
                             continue;
@@ -375,6 +379,18 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         ))
     }) {
         Ok(()) => {
+            if let Some(message) = stream_cancelled {
+                mark_turn_cancelled(
+                    &server,
+                    &notify_tx,
+                    &notification_tx,
+                    &thread_id,
+                    &turn_id,
+                    message,
+                )
+                .await;
+                return;
+            }
             if let Some(error_msg) = stream_error {
                 mark_turn_failed(
                     &server,

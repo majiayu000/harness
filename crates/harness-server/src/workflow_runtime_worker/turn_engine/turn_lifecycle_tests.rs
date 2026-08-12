@@ -1,11 +1,13 @@
 //! Tests for the runtime turn lifecycle, split out of `turn_lifecycle.rs`
 //! to keep that file under the repository file-size ceiling.
 
+use super::helpers::StreamCompletionState;
 use super::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
 use crate::{server::HarnessServer, thread_manager::ThreadManager};
 use harness_agents::registry::AgentRegistry;
 use harness_core::agent::{
-    AgentAdapter, AgentEvent, AgentRequest, AgentResponse, CodeAgent, StreamItem,
+    AgentAdapter, AgentDiagnosticSeverity, AgentEvent, AgentRequest, AgentResponse, CodeAgent,
+    StreamItem,
 };
 use harness_core::config::HarnessConfig;
 use harness_core::error::HarnessError;
@@ -501,6 +503,60 @@ async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
     assert_eq!(turn.status, TurnStatus::Failed);
     Ok(())
+}
+
+#[test]
+fn normalize_preserves_warning_diagnostic_cancelled_and_token_usage_events() {
+    let mut state = StreamCompletionState::default();
+
+    let warning = state.normalize(StreamItem::Warning {
+        message: "careful".into(),
+    });
+    let diagnostic = state.normalize(StreamItem::Diagnostic {
+        severity: AgentDiagnosticSeverity::Error,
+        message: "provider diagnostic".into(),
+    });
+    let cancelled = state.normalize(StreamItem::TurnCancelled {
+        message: "interrupted".into(),
+    });
+    let usage = state.normalize(StreamItem::TokenUsage {
+        usage: TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+            cost_usd: 0.0,
+        },
+    });
+
+    assert_eq!(
+        warning,
+        Some(StreamItem::Warning {
+            message: "careful".into()
+        })
+    );
+    assert_eq!(
+        diagnostic,
+        Some(StreamItem::Warning {
+            message: "provider diagnostic".into()
+        })
+    );
+    assert_eq!(
+        cancelled,
+        Some(StreamItem::TurnCancelled {
+            message: "interrupted".into()
+        })
+    );
+    assert_eq!(
+        usage,
+        Some(StreamItem::TokenUsage {
+            usage: TokenUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                total_tokens: 3,
+                cost_usd: 0.0,
+            }
+        })
+    );
 }
 
 #[tokio::test]

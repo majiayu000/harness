@@ -2,6 +2,7 @@ use crate::{
     ComposeRequest, ContextItem, ContextProvider, Degraded, ItemClass, ItemId, Priority,
     ProviderError, ProviderId,
 };
+use harness_core::retrieval::{score_lexical_relevance, RetrievalField};
 use harness_core::types::{DraftStatus, ExecPlanStatus, ProjectId};
 use harness_rules::engine::Rule;
 use harness_skills::store::Skill;
@@ -63,28 +64,30 @@ impl ContextProvider for SkillsProvider {
     }
 
     fn propose(&self, req: &ComposeRequest) -> Result<Vec<ContextItem>, ProviderError> {
-        let prompt = req
-            .task_profile
-            .prompt
-            .as_deref()
-            .unwrap_or_default()
-            .to_lowercase();
+        let prompt = req.task_profile.prompt.as_deref().unwrap_or_default();
         let mut skills = self
             .skills
             .iter()
-            .filter(|skill| {
-                skill.trigger_patterns.is_empty()
-                    || skill
-                        .trigger_patterns
-                        .iter()
-                        .any(|pattern| prompt.contains(&pattern.to_lowercase()))
+            .filter_map(|skill| {
+                if skill.trigger_patterns.is_empty() {
+                    Some((skill.clone(), 0.15))
+                } else if skill_trigger_relevance(prompt, skill) > 0.0 {
+                    let relevance = skill_context_relevance(prompt, skill);
+                    Some((skill.clone(), relevance))
+                } else {
+                    None
+                }
             })
-            .cloned()
             .collect::<Vec<_>>();
-        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        skills.sort_by(|(left, left_score), (right, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| right.quality_score.total_cmp(&left.quality_score))
+                .then_with(|| left.name.cmp(&right.name))
+        });
         Ok(skills
             .into_iter()
-            .map(|skill| ContextItem {
+            .map(|(skill, relevance)| ContextItem {
                 id: ItemId::new(format!("skill:{}", skill.name)),
                 class: ItemClass::Skill,
                 content: skill.content,
@@ -93,7 +96,7 @@ impl ContextProvider for SkillsProvider {
                 relevance: if skill.trigger_patterns.is_empty() {
                     0.4
                 } else {
-                    0.75
+                    (0.35 + relevance * 0.6).min(0.95) as f32
                 },
                 degrade: vec![
                     Degraded::Summary(skill.description.clone()),
@@ -104,6 +107,26 @@ impl ContextProvider for SkillsProvider {
             })
             .collect())
     }
+}
+
+fn skill_context_relevance(prompt: &str, skill: &Skill) -> f64 {
+    let mut fields = Vec::with_capacity(skill.trigger_patterns.len() + 3);
+    for pattern in &skill.trigger_patterns {
+        fields.push(RetrievalField::new(pattern, 2.0));
+    }
+    fields.push(RetrievalField::new(&skill.name, 0.8));
+    fields.push(RetrievalField::new(&skill.description, 1.2));
+    fields.push(RetrievalField::new(&skill.content, 0.25));
+    score_lexical_relevance(prompt, &fields).score
+}
+
+fn skill_trigger_relevance(prompt: &str, skill: &Skill) -> f64 {
+    let fields = skill
+        .trigger_patterns
+        .iter()
+        .map(|pattern| RetrievalField::new(pattern, 2.0))
+        .collect::<Vec<_>>();
+    score_lexical_relevance(prompt, &fields).score
 }
 
 pub struct ContractProvider;

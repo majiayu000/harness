@@ -1,0 +1,387 @@
+suite = "harness-historical-replay"
+default_timeout_secs = 7200
+
+[[cases]]
+case_id = "gh1715-legacy-lifecycle-transition-contract"
+repo = "majiayu000/harness"
+issue = 1715
+base_commit = "af5bcd26033b550cb4d0b6ddb16ff959df65a7aa"
+verify_commands = [
+    "cargo test -p harness-workflow issue_lifecycle --lib",
+    "cargo test -p harness-workflow issue_workflow_store --lib",
+]
+paths = [
+    "crates/harness-workflow/src/issue_lifecycle.rs",
+    "crates/harness-workflow/src/issue_lifecycle_tests.rs",
+    "crates/harness-workflow/src/issue_workflow_store.rs",
+    "crates/harness-workflow/src/issue_workflow_store/maintenance.rs",
+    "crates/harness-workflow/src/issue_workflow_store/merge_approval.rs",
+    "crates/harness-workflow/src/issue_workflow_store/remote_facts.rs",
+    "crates/harness-workflow/src/issue_workflow_store_tests.rs",
+    "specs/GH1715/product.md",
+    "specs/GH1715/tasks.md",
+    "specs/GH1715/tech.md",
+]
+risk = "high"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1715",
+    "https://github.com/majiayu000/harness/pull/1721",
+    "specs/GH1715/tasks.md",
+]
+resolution_prs = [1721]
+resolution_commits = ["f340f03316cab2a1930daec4b72f02a47b3007e2"]
+commit_resolution = "resolved"
+verdict = "replayable"
+
+[[cases]]
+case_id = "gh1716-startup-recovery-cas-conflicts"
+repo = "majiayu000/harness"
+issue = 1716
+base_commit = "f340f03316cab2a1930daec4b72f02a47b3007e2"
+verify_commands = [
+    "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server --lib task_db::queries_recovery_tests",
+    "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server --lib event_replay",
+    "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server --test checkpoint_recovery",
+]
+paths = [
+    "crates/harness-server/src/event_replay.rs",
+    "crates/harness-server/src/event_replay_tests.rs",
+    "crates/harness-server/src/task_db.rs",
+    "crates/harness-server/src/task_db/queries_recovery.rs",
+    "crates/harness-server/src/task_db/queries_recovery_tests.rs",
+    "crates/harness-server/src/task_runner/store/startup.rs",
+    "crates/harness-server/tests/checkpoint_recovery.rs",
+    "specs/GH1716/tasks.md",
+]
+risk = "high"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1716",
+    "https://github.com/majiayu000/harness/pull/1722",
+    "specs/GH1716/tasks.md",
+]
+resolution_prs = [1722]
+resolution_commits = ["3bdfbb85e1548eec18fff3b8ccf6b22347bba7ba"]
+commit_resolution = "resolved"
+verdict = "replayable"
+
+[[cases]]
+case_id = "gh1717-context-preview-wire-decoupling"
+repo = "majiayu000/harness"
+issue = 1717
+base_commit = "e68fdeb6ed25292cd91ff55f60d6c51ef3986263"
+verify_commands = [
+    "cargo check -p harness-protocol --all-targets",
+    "python3 -c \"import re, subprocess, sys; tree = subprocess.check_output('cargo tree -p harness-protocol --edges normal --prefix none', shell=True, text=True); sys.exit(1 if re.search(r'harness-(context|rules|skills|gc|exec) ', tree) else 0)\"",
+    "cargo test -p harness-protocol context_preview_wire_json_matches_legacy_golden_fixtures --lib",
+    "cargo test -p harness-protocol context_preview_defaults_and_empty_collections_are_equivalent --lib",
+    "cargo test -p harness-protocol context_preview_rejects_malformed_payloads --lib",
+    "cargo test -p harness-protocol context_rpc_preview_slash_method_deserializes --lib",
+    "cargo test -p harness-server context_preview_conversion_preserves_every_field --lib",
+    "cargo test -p harness-server context_preview_conversion_is_deterministic_and_order_preserving --lib",
+    "cargo check -p harness-server --all-targets",
+    "cargo test -p harness-server context_rpc_preview_with_supplied_items_returns_manifest --lib",
+    "cargo test -p harness-server context_preview_uses_current_run_id_when_request_omits_run_id --lib",
+    "cargo test -p harness-server context_preview_preserves_composer_error_mapping --lib",
+    "python3 checks/check_workflow.py --repo . --spec-dir specs/GH1717",
+]
+paths = [
+    "Cargo.lock",
+    "crates/harness-protocol/Cargo.toml",
+    "crates/harness-protocol/src/context.rs",
+    "crates/harness-protocol/src/lib.rs",
+    "crates/harness-protocol/src/methods.rs",
+    "crates/harness-server/src/handlers/context.rs",
+    "crates/harness-server/src/router/tests/observability.rs",
+    "specs/GH1717/tasks.md",
+]
+risk = "medium"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1717",
+    "https://github.com/majiayu000/harness/pull/1723",
+    "https://github.com/majiayu000/harness/pull/1724",
+    "specs/GH1717/tasks.md",
+]
+resolution_prs = [1723, 1724]
+resolution_commits = [
+    "05b95428de95b54b168064d2611a724978d5cd78",
+    "30f726cd10535780cf476e76ed6efd772e252646",
+]
+commit_resolution = "resolved"
+verdict = "replayable"
+
+[[cases]]
+case_id = "gh1434-phase1-archive-restoration"
+repo = "majiayu000/harness"
+issue = 1434
+base_commit = "e0b3507e703d70d484a22a51512ecfee86e9f1a7"
+verify_commands = [
+    "bash scripts/archive-phase1-data.sh && test -s archives/phase1-*/RESTORE.md",
+    "python3 checks/check_workflow.py --repo . --spec-dir specs/GH1434",
+]
+paths = [
+    "scripts/archive-phase1-data.sh",
+    "specs/GH1434/tasks.md",
+    "specs/GH1434/tech.md",
+]
+risk = "high"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1434",
+    "https://github.com/majiayu000/harness/pull/1714",
+    "specs/GH1434/tasks.md",
+]
+resolution_prs = [1714]
+resolution_commits = ["26ea9aa47eda9124950a3f6c965ebcbb2bee9a14"]
+commit_resolution = "resolved"
+verdict = "replayable"
+
+[[cases]]
+case_id = "gh1707-github-closing-pr-coverage-recovery"
+repo = "majiayu000/harness"
+issue = 1707
+base_commit = "505961e3c38bd575650e876baec29c820ec00a7e"
+verify_commands = [
+    "cargo test -p harness-server multiple_closing_pr_candidates_are_selected_deterministically",
+    "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart",
+]
+paths = [
+    "crates/harness-server/src/github_pr_snapshot.rs",
+    "crates/harness-server/src/github_pr_snapshot_tests.rs",
+    "crates/harness-server/src/http/tests/runtime_worker_non_issue_replay_tests.rs",
+    "crates/harness-server/src/intake/github_coverage_gate.rs",
+    "crates/harness-server/src/intake/github_coverage_recovery.rs",
+    "crates/harness-server/src/intake/github_coverage_recovery_tests.rs",
+    "crates/harness-server/src/intake/github_coverage_recovery_tests/atomic.rs",
+    "crates/harness-server/src/intake/github_coverage_recovery_tests/support.rs",
+    "crates/harness-server/src/intake/github_issue_links.rs",
+    "crates/harness-server/src/intake/mod.rs",
+    "crates/harness-server/src/task_executor/pr_detection.rs",
+    "crates/harness-server/src/task_executor/pr_detection_tests.rs",
+    "crates/harness-server/src/workflow_runtime_pr_feedback/pr_detection.rs",
+    "crates/harness-server/src/workflow_runtime_worker/child_workflow.rs",
+    "crates/harness-server/src/workflow_runtime_worker/child_workflow_non_issue.rs",
+    "crates/harness-workflow/src/runtime/mod.rs",
+    "crates/harness-workflow/src/runtime/remote_facts.rs",
+    "crates/harness-workflow/src/runtime/store.rs",
+    "crates/harness-workflow/src/runtime/store/commands.rs",
+    "crates/harness-workflow/src/runtime/store/coverage_recovery.rs",
+    "crates/harness-workflow/src/runtime/store/runtime_job_state.rs",
+    "specs/GH1707/product.md",
+    "specs/GH1707/tasks.md",
+    "specs/GH1707/tech.md",
+]
+risk = "high"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1707",
+    "https://github.com/majiayu000/harness/pull/1709",
+    "specs/GH1707/tasks.md",
+]
+resolution_prs = [1709]
+resolution_commits = ["e0b3507e703d70d484a22a51512ecfee86e9f1a7"]
+commit_resolution = "resolved"
+verdict = "replayable"
+
+[[cases]]
+case_id = "gh1704-durable-runtime-replay-transcripts"
+repo = "majiayu000/harness"
+issue = 1704
+base_commit = "40ab28c9abff26d78901c3c3d614c49fca0cfee7"
+verify_commands = [
+    "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server 'http::tests::runtime_transcript_route_tests::exact_replay_preflight_fails_terminal_on_missing_or_corrupt_transcript' -- --exact",
+    "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server 'http::tests::runtime_transcript_route_tests::exact_replay_hydrates_verified_transcript_before_dispatch' -- --exact",
+]
+paths = [
+    "crates/harness-server/src/handlers/mod.rs",
+    "crates/harness-server/src/handlers/runtime_hosts.rs",
+    "crates/harness-server/src/handlers/runtime_hosts_workflow_api_tests.rs",
+    "crates/harness-server/src/http/background/auto_recovery_recovery_tests.rs",
+    "crates/harness-server/src/http/background/auto_recovery_tests.rs",
+    "crates/harness-server/src/http/http_router.rs",
+    "crates/harness-server/src/http/task_mutation_routes.rs",
+    "crates/harness-server/src/http/tests/mod.rs",
+    "crates/harness-server/src/http/tests/runtime_transcript_route_tests.rs",
+    "crates/harness-server/src/workflow_runtime_worker.rs",
+    "crates/harness-server/src/workflow_runtime_worker/executor.rs",
+    "crates/harness-server/src/workflow_runtime_worker/executor_contract.rs",
+    "crates/harness-server/src/workflow_runtime_worker/transcript_durability.rs",
+    "crates/harness-workflow/src/runtime/mod.rs",
+    "crates/harness-workflow/src/runtime/reason_class.rs",
+    "crates/harness-workflow/src/runtime/reducer/prompt_task_completion.rs",
+    "crates/harness-workflow/src/runtime/reducer/runtime_failure.rs",
+    "crates/harness-workflow/src/runtime/store.rs",
+    "crates/harness-workflow/src/runtime/store/activity_completion.rs",
+    "crates/harness-workflow/src/runtime/store/artifacts.rs",
+    "crates/harness-workflow/src/runtime/store/commands.rs",
+    "crates/harness-workflow/src/runtime/store/instances.rs",
+    "crates/harness-workflow/src/runtime/store/recovery.rs",
+    "crates/harness-workflow/src/runtime/store/runtime_jobs.rs",
+    "crates/harness-workflow/src/runtime/store_migrations.rs",
+    "crates/harness-workflow/src/runtime/tests.rs",
+    "crates/harness-workflow/src/runtime/tests/command_store.rs",
+    "crates/harness-workflow/src/runtime/tests/runtime_failure_classification.rs",
+    "crates/harness-workflow/src/runtime/tests/transcript_durability.rs",
+    "crates/harness-workflow/src/runtime/transcript.rs",
+    "crates/harness-workflow/src/runtime/worker.rs",
+    "docs/api-contract.md",
+]
+risk = "high"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1704",
+    "https://github.com/majiayu000/harness/pull/1710",
+    "specs/GH1704/tasks.md",
+]
+resolution_prs = [1710]
+resolution_commits = ["505961e3c38bd575650e876baec29c820ec00a7e"]
+commit_resolution = "resolved"
+verdict = "replayable"
+
+[[cases]]
+case_id = "gh1686-pinned-bun-toolchain"
+repo = "majiayu000/harness"
+issue = 1686
+base_commit = "856bb080e72e064ccc88360a3b1921bf0e8583b1"
+verify_commands = [
+    "python3 -c \"from pathlib import Path; files=['.github/workflows/ci.yml','.github/workflows/web-ci.yml','.github/workflows/ci-disabled-modules.yml']; assert Path('.bun-version').read_text() == '1.3.14\\n'; text='\\n'.join(Path(p).read_text() for p in files); assert 'bun-version: latest' not in text; assert text.count('bun-version-file: .bun-version') == 3; assert '.bun-version' in Path('.github/workflows/ci.yml').read_text(); assert '.bun-version' in Path('.github/workflows/web-ci.yml').read_text()\"",
+    "cd web && bun install --frozen-lockfile && bun run typecheck && bun run test && bun run build",
+]
+paths = [
+    ".bun-version",
+    ".github/workflows/ci-disabled-modules.yml",
+    ".github/workflows/ci.yml",
+    ".github/workflows/web-ci.yml",
+]
+risk = "medium"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1686",
+    "https://github.com/majiayu000/harness/pull/1689",
+    "specs/GH1686/tasks.md",
+]
+resolution_prs = [1689]
+resolution_commits = ["49272ee2bf4ccfef5e711f65c87db34e362581f2"]
+commit_resolution = "resolved"
+verdict = "replayable"
+
+[[cases]]
+case_id = "gh1652-registry-driven-definition-enumeration"
+repo = "majiayu000/harness"
+issue = 1652
+base_commit = "4888b404f205927925064c6852d165e6f41c2794"
+verify_commands = [
+    "cargo test -p harness-server definition_ids",
+    "cargo test -p harness-server declarative_visibility",
+]
+paths = [
+    "crates/harness-server/src/handlers/dashboard_active_counts.rs",
+    "crates/harness-server/src/handlers/definition_ids.rs",
+    "crates/harness-server/src/handlers/mod.rs",
+    "crates/harness-server/src/handlers/operator_monitor.rs",
+    "crates/harness-server/src/handlers/operator_monitor/activity.rs",
+    "crates/harness-server/src/handlers/operator_monitor/sampling.rs",
+    "crates/harness-server/src/handlers/operator_monitor/tests.rs",
+    "crates/harness-server/src/handlers/overview.rs",
+    "crates/harness-server/src/http/builders/registry.rs",
+    "crates/harness-server/src/http/mod.rs",
+    "crates/harness-server/src/http/task_query_routes_tests.rs",
+    "crates/harness-server/src/runtime_projection.rs",
+    "crates/harness-server/src/server.rs",
+    "crates/harness-workflow/src/runtime/declarative_pinning.rs",
+    "crates/harness-workflow/src/runtime/mod.rs",
+    "crates/harness-workflow/src/runtime/state_registry.rs",
+    "crates/harness-workflow/src/runtime/state_registry/versioning.rs",
+    "crates/harness-workflow/src/runtime/state_registry/versioning_tests.rs",
+    "crates/harness-workflow/src/runtime/store.rs",
+    "crates/harness-workflow/src/runtime/store/definitions.rs",
+    "crates/harness-workflow/src/runtime/store/instances.rs",
+    "crates/harness-workflow/src/runtime/store/terminal_instance_queries.rs",
+    "crates/harness-workflow/src/runtime/tests/declarative_pinning.rs",
+]
+risk = "medium"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1652",
+    "https://github.com/majiayu000/harness/pull/1666",
+    "specs/GH1652/tasks.md",
+]
+resolution_prs = [1666]
+resolution_commits = ["643f101d7edff62e4128e1b4ec8ae3821d4d21ee"]
+commit_resolution = "resolved"
+verdict = "replayable"
+
+[[cases]]
+case_id = "gh1574-nap-lite-phase1-replay-gate"
+repo = "majiayu000/harness"
+issue = 1574
+base_commit = "6a6a7b5c23af4f2311ce25f8e7f29981bfaf3cbf"
+verify_commands = [
+    "cargo check -p harness-core",
+    "cargo test -p harness-context nap",
+    "python3 -c \"import json; p='specs/GH1574/phase1-replay-report.json'; data=json.load(open(p)); assert data['gate'] == 'gh1574_phase1'; assert data['expected_sessions'] == 40 and data['observed_sessions'] == 40; assert data['overall_pass'] is False; assert data['metrics']['effective_token_saving'] < data['thresholds']['effective_token_saving_min_inclusive']; assert data['metrics']['nap_mismatch_rate'] > data['thresholds']['nap_mismatch_max_exclusive']; assert data['metrics']['paired_success_regressions'] > data['thresholds']['paired_success_regressions_max_inclusive']\"",
+]
+paths = [
+    "specs/GH1574/phase1-replay-report.json",
+    "specs/GH1574/tasks.md",
+]
+risk = "medium"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1574",
+    "https://github.com/majiayu000/harness/pull/1700",
+    "specs/GH1574/tasks.md",
+]
+resolution_prs = [1700]
+resolution_commits = ["f4cd0e6a4da2e97a64899c4a45f64d0210ffc054"]
+commit_resolution = "resolved"
+verdict = "replayable"
+
+[[cases]]
+case_id = "gh1656-declarative-intake-bindings"
+repo = "majiayu000/harness"
+issue = 1656
+base_commit = "50116e93ce5bdbdc2cea28967b614b4f43d21eac"
+verify_commands = [
+    "cargo test -p harness-core config",
+    "cargo test -p harness-server intake",
+    "cargo test -p harness-workflow --test docs_examples",
+]
+paths = [
+    "crates/harness-core/src/config/workflow.rs",
+    "crates/harness-core/src/config/workflow/defaults.rs",
+    "crates/harness-core/src/config/workflow/intake_binding.rs",
+    "crates/harness-core/src/config/workflow_intake_binding_tests.rs",
+    "crates/harness-server/src/http/init.rs",
+    "crates/harness-server/src/http/state.rs",
+    "crates/harness-server/src/http/test_fixtures.rs",
+    "crates/harness-server/src/http/tests/state_support.rs",
+    "crates/harness-server/src/intake/binding.rs",
+    "crates/harness-server/src/intake/declarative_routing.rs",
+    "crates/harness-server/src/intake/mod.rs",
+    "crates/harness-server/src/router/tests.rs",
+    "crates/harness-server/src/runtime_projection/stopped_actions.rs",
+    "crates/harness-server/src/server.rs",
+    "crates/harness-server/src/services/execution.rs",
+    "crates/harness-server/src/stdio.rs",
+    "crates/harness-server/src/test_helpers.rs",
+    "crates/harness-server/src/websocket.rs",
+    "crates/harness-server/src/workflow_runtime_submission/declarative.rs",
+    "crates/harness-server/src/workflow_runtime_submission/declarative_cancel_tests.rs",
+    "crates/harness-server/src/workflow_runtime_submission/declarative_project_tests.rs",
+    "crates/harness-server/src/workflow_runtime_submission/declarative_tests.rs",
+    "crates/harness-server/src/workflow_runtime_worker.rs",
+    "crates/harness-server/src/workflow_runtime_worker/prompt_packet_tests.rs",
+    "crates/harness-workflow/src/runtime/declarative_interpreter.rs",
+    "crates/harness-workflow/src/runtime/reducer/declarative_tests.rs",
+    "crates/harness-workflow/src/runtime/state_registry/versioning_tests.rs",
+    "crates/harness-workflow/src/runtime/store/recovery_tests.rs",
+    "crates/harness-workflow/src/runtime/tests/declarative_interpreter.rs",
+    "crates/harness-workflow/src/runtime/tests/declarative_pinning.rs",
+    "crates/harness-workflow/src/runtime/tests/declarative_recovery_integration.rs",
+    "crates/harness-workflow/src/runtime/tests/declarative_validation.rs",
+    "docs/workflow-declarative-definitions.md",
+]
+risk = "high"
+evidence = [
+    "https://github.com/majiayu000/harness/issues/1656",
+    "https://github.com/majiayu000/harness/pull/1688",
+    "specs/GH1656/tasks.md",
+]
+resolution_prs = [1688]
+resolution_commits = ["6a6a7b5c23af4f2311ce25f8e7f29981bfaf3cbf"]
+commit_resolution = "resolved"
+verdict = "replayable"
