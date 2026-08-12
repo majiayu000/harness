@@ -1,5 +1,6 @@
 use super::evidence::{EvalCaseEvidence, EvalEvidenceStatus};
 use super::manifest::EvalBenchmarkManifest;
+use super::model::{EvalGrade, GateStatus, HardGateName, QualitySnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, fmt};
@@ -38,10 +39,20 @@ pub struct EvalReportCase {
     pub verify_commands: Vec<String>,
     pub status: EvalReportCaseStatus,
     pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_grade: Option<EvalGrade>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_hard_gates: Vec<EvalReportFailedGate>,
     pub workflow_id: Option<String>,
     pub total_tokens: u64,
     pub cost_usd_micros: u64,
     pub missing_evidence: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalReportFailedGate {
+    pub name: HardGateName,
+    pub grade_cap: Option<EvalGrade>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +140,8 @@ pub fn eval_report_dry_run(
             verify_commands: case.verify_commands.clone(),
             status: EvalReportCaseStatus::Pending,
             passed: false,
+            final_grade: None,
+            failed_hard_gates: Vec::new(),
             workflow_id: None,
             total_tokens: 0,
             cost_usd_micros: 0,
@@ -179,6 +192,8 @@ pub fn eval_report_from_evidence(
                 verify_commands: case.verify_commands.clone(),
                 status: EvalReportCaseStatus::Failed,
                 passed: false,
+                final_grade: None,
+                failed_hard_gates: Vec::new(),
                 workflow_id: None,
                 total_tokens: 0,
                 cost_usd_micros: 0,
@@ -245,6 +260,7 @@ fn report_case_from_evidence(
     let (total_tokens, cost_usd_micros) = evidence_usage_totals(&evidence);
     let passed = evidence.status == EvalEvidenceStatus::Passed;
     let status = evidence_case_status(&evidence, passed);
+    let (final_grade, failed_hard_gates) = quality_summary(evidence.quality.as_ref());
     EvalReportCase {
         case_id: case.case_id.clone(),
         repo: case.repo.clone(),
@@ -253,11 +269,31 @@ fn report_case_from_evidence(
         verify_commands: case.verify_commands.clone(),
         status,
         passed,
+        final_grade,
+        failed_hard_gates,
         workflow_id: evidence.workflow_id,
         total_tokens,
         cost_usd_micros,
         missing_evidence: evidence.missing_evidence,
     }
+}
+
+fn quality_summary(
+    quality: Option<&QualitySnapshot>,
+) -> (Option<EvalGrade>, Vec<EvalReportFailedGate>) {
+    let Some(quality) = quality else {
+        return (None, Vec::new());
+    };
+    let failed_hard_gates = quality
+        .hard_gates
+        .iter()
+        .filter(|gate| gate.status == GateStatus::Fail)
+        .map(|gate| EvalReportFailedGate {
+            name: gate.name,
+            grade_cap: gate.grade_cap,
+        })
+        .collect();
+    (Some(quality.final_grade), failed_hard_gates)
 }
 
 fn evidence_case_status(evidence: &EvalCaseEvidence, passed: bool) -> EvalReportCaseStatus {

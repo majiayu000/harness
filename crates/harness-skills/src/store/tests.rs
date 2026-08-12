@@ -295,6 +295,58 @@ fn match_prompt_is_case_insensitive() {
 }
 
 #[test]
+fn match_prompt_uses_lexical_relevance_when_phrase_order_differs() {
+    let mut store = SkillStore::new();
+    store.skills.push(make_skill_with_patterns(
+        "review",
+        SkillLocation::System,
+        "review code",
+        &["code review"],
+        "system",
+    ));
+    let matches = store.match_prompt("please review code changes in this PR");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].name, "review");
+}
+
+#[test]
+fn match_prompt_ranks_more_relevant_skill_first() {
+    let mut store = SkillStore::new();
+    store.skills.push(make_skill_with_patterns(
+        "build-fix",
+        SkillLocation::System,
+        "fix builds",
+        &["build error"],
+        "system",
+    ));
+    store.skills.push(make_skill_with_patterns(
+        "review",
+        SkillLocation::System,
+        "review code",
+        &["code review"],
+        "system",
+    ));
+    let matches = store.match_prompt("review code changes before merging");
+    assert_eq!(matches[0].name, "review");
+}
+
+#[test]
+fn match_prompt_requires_trigger_overlap_before_auxiliary_fields() {
+    let mut store = SkillStore::new();
+    store.skills.push(make_skill_with_patterns(
+        "review",
+        SkillLocation::System,
+        "implement feature",
+        &["code review"],
+        "system",
+    ));
+
+    let matches = store.match_prompt("implement feature support");
+
+    assert!(matches.is_empty());
+}
+
+#[test]
 fn match_prompt_skips_skills_without_patterns() {
     let mut store = SkillStore::new();
     store
