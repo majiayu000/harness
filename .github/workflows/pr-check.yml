@@ -2,7 +2,7 @@ name: PR Check
 
 on:
   pull_request:
-    types: [opened, edited, synchronize]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
 
 permissions:
   pull-requests: write
@@ -21,3 +21,19 @@ jobs:
             exit 1
           fi
           echo "PR description looks good (${#PR_BODY} chars)."
+
+  gemini-review:
+    name: Gemini Review Request
+    runs-on: ubuntu-latest
+    if: vars.GEMINI_REVIEW_ENABLED == 'true' && contains(fromJSON('["opened", "synchronize", "reopened", "ready_for_review"]'), github.event.action)
+    steps:
+      - name: Request Gemini review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '/gemini review'
+            });
