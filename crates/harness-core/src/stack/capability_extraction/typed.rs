@@ -15,30 +15,40 @@ pub(super) const MAX_COMPONENT_FINDINGS: usize = 256;
 pub(super) const LIMIT_RULE_ID: &str = "extraction.finding_limit";
 
 #[rustfmt::skip]
-pub(super) fn extract_typed(component: &AgentStackComponent, locator: &str, text: &str, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
+pub(super) fn extract_typed(component: &AgentStackComponent, locator: &str, text: &str, is_requirements: bool, is_starlark: bool, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
     if component.kind() == AgentStackComponentKind::Hook {
         extract_hook_metadata(component, locator, text, raw, failures);
         return;
     }
 
-    if Path::new(locator).extension().and_then(OsStr::to_str) == Some("star") {
+    if is_starlark {
         collect_starlark_prefix_rules(component, locator, text, raw, failures);
         return;
     }
-    let Some(format) = file_format(locator) else {
+    let Some(format) = is_requirements.then_some(FileFormat::Toml).or_else(|| file_format(locator)) else {
         return;
     };
-    let Some(source) = format.source(text) else {
-        return;
+    let source = match format.source(text) {
+        Ok(Some(source)) => source,
+        Ok(None) => return,
+        Err(()) => {
+            let (_, parse_rule_id, label) = format.metadata();
+            push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::ParseFailed, Some(parse_rule_id), format!("{locator} is not valid {label}"));
+            return;
+        }
     };
     let (root_name, parse_rule_id, label) = format.metadata();
     match format.parse(source) {
         Ok(value) => {
+            if is_requirements && !value.get("rules").is_some_and(Value::is_object) {
+                push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("policy.prefix_rule"), "requirements policy must contain a rules table".to_owned());
+                return;
+            }
             collect_explicit_capabilities(component, &value, root_name, rule_id_for_explicit(component.kind()), true, raw, failures);
             if component.kind() == AgentStackComponentKind::McpServer {
                 collect_mcp_capabilities(component, &value, raw, failures);
             }
-            collect_policy_prefix_rules(component, &value, raw, failures);
+            collect_policy_prefix_rules(component, &value, is_requirements, raw, failures);
         }
         Err(()) => {
             push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::ParseFailed, Some(parse_rule_id), format!("{locator} is not valid {label}"));
@@ -51,7 +61,6 @@ pub(super) fn extract_typed(component: &AgentStackComponent, locator: &str, text
 enum FileFormat { Json, Json5, Toml, Yaml, Markdown }
 
 const MAX_JSON5_DEPTH: usize = 128;
-
 #[derive(Clone, Copy)]
 #[rustfmt::skip]
 enum Json5State { Code, String(u8), LineComment, BlockComment }
@@ -90,7 +99,13 @@ fn validate_json5_structure(text: &str) -> Result<(), ()> {
                     state = Json5State::Code;
                 }
             }
-            Json5State::LineComment if matches!(byte, b'\n' | b'\r') => state = Json5State::Code,
+            Json5State::LineComment
+                if matches!(byte, b'\n' | b'\r')
+                    || bytes[index..].starts_with(&[0xe2, 0x80, 0xa8])
+                    || bytes[index..].starts_with(&[0xe2, 0x80, 0xa9]) =>
+            {
+                state = Json5State::Code
+            }
             Json5State::BlockComment if byte == b'*' && bytes.get(index + 1) == Some(&b'/') => {
                 state = Json5State::Code;
                 index += 1;
@@ -104,12 +119,11 @@ fn validate_json5_structure(text: &str) -> Result<(), ()> {
         Json5State::String(_) | Json5State::BlockComment => Err(()),
     }
 }
-
 impl FileFormat {
-    fn source(self, text: &str) -> Option<&str> {
+    fn source(self, text: &str) -> Result<Option<&str>, ()> {
         match self {
             Self::Markdown => yaml_front_matter(text),
-            _ => Some(text),
+            _ => Ok(Some(text)),
         }
     }
 
@@ -137,7 +151,6 @@ impl FileFormat {
         }
     }
 }
-
 fn file_format(locator: &str) -> Option<FileFormat> {
     let path = Path::new(locator);
     match path.extension().and_then(OsStr::to_str) {
@@ -149,7 +162,6 @@ fn file_format(locator: &str) -> Option<FileFormat> {
         _ => None,
     }
 }
-
 fn rule_id_for_explicit(kind: AgentStackComponentKind) -> &'static str {
     match kind {
         AgentStackComponentKind::McpServer => "mcp.explicit_capabilities",
@@ -158,13 +170,17 @@ fn rule_id_for_explicit(kind: AgentStackComponentKind) -> &'static str {
         _ => "config.explicit_capabilities",
     }
 }
-
 #[rustfmt::skip]
 fn collect_explicit_capabilities(component: &AgentStackComponent, value: &Value, path: &str, rule_id: &'static str, allow_generic: bool, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
     if finding_limit_reached(failures) { return; }
     match value {
         Value::Object(map) => {
             for (key, child) in map {
+                if component.kind() == AgentStackComponentKind::McpServer
+                    && is_documentation_key(key)
+                {
+                    continue;
+                }
                 let child_path = format!("{path}.{key}");
                 if is_capability_key(key, allow_generic) {
                     push_declared_capability_values(component, child, &child_path, rule_id, raw, failures);
@@ -220,7 +236,6 @@ fn push_declared_capability_values(component: &AgentStackComponent, value: &Valu
         push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some(rule_id), format!("{path} must contain at least one capability"));
     }
 }
-
 fn split_capability_names(value: &str) -> impl Iterator<Item = &str> {
     value
         .split([',', ' ', '\n', '\t'])
@@ -274,8 +289,10 @@ fn visit_mcp(component: &AgentStackComponent, value: &Value, raw: &mut Vec<RawCa
                     }
                 }
             }
-            for child in map.values() {
-                visit_mcp(component, child, raw, failures, schema_seen, server_seen);
+            for (key, child) in map {
+                if !is_documentation_key(key) {
+                    visit_mcp(component, child, raw, failures, schema_seen, server_seen);
+                }
             }
         }
         Value::Array(items) => {
@@ -299,8 +316,10 @@ fn infer_schema_capabilities(component: &AgentStackComponent, schema: &Value, ra
     }
     match schema {
         Value::Object(map) => {
-            for child in map.values() {
-                infer_schema_capabilities(component, child, raw, failures, seen);
+            for (key, child) in map {
+                if !is_documentation_key(key) {
+                    infer_schema_capabilities(component, child, raw, failures, seen);
+                }
             }
         }
         Value::Array(items) => {
@@ -327,7 +346,9 @@ fn capabilities_for_schema_field(name: &str, property: &Value) -> Vec<AgentStack
     ];
     let mut capabilities = Vec::new();
     for &(needles, capability) in patterns {
-        if schema_name_matches(name, needles) {
+        if schema_name_matches(name, needles)
+            && !(capability == SecretRead && schema_name_matches(name, &["endpoint"]))
+        {
             push_unique(&mut capabilities, capability);
         }
     }
@@ -343,15 +364,27 @@ fn schema_name_matches(name: &str, needles: &[&str]) -> bool {
         let needle = needle.as_bytes();
         name.windows(needle.len()).enumerate().any(|(start, part)| {
             let end = start + part.len();
-            let boundary = |left: u8, right: u8| {
-                !left.is_ascii_alphanumeric()
-                    || right.is_ascii_uppercase() && left.is_ascii_lowercase()
-            };
             part.eq_ignore_ascii_case(needle)
-                && (start == 0 || boundary(name[start - 1], name[start]))
-                && (end == name.len() || boundary(name[end - 1], name[end]))
+                && (start == 0
+                    || !name[start - 1].is_ascii_alphanumeric()
+                    || name[start].is_ascii_uppercase()
+                        && (name[start - 1].is_ascii_lowercase()
+                            || name[start - 1].is_ascii_uppercase()
+                                && name.get(start + 1).is_some_and(u8::is_ascii_lowercase)))
+                && (end == name.len()
+                    || !name[end].is_ascii_alphanumeric()
+                    || name[end].is_ascii_uppercase()
+                        && (name[end - 1].is_ascii_lowercase()
+                            || name.get(end + 1).is_some_and(u8::is_ascii_lowercase)))
         })
     })
+}
+
+fn is_documentation_key(key: &str) -> bool {
+    matches!(
+        key,
+        "description" | "example" | "examples" | "title" | "default"
+    )
 }
 
 fn has_nonempty_value(value: &Value) -> bool {
@@ -371,23 +404,34 @@ fn has_sensitive_binding(value: &Value) -> bool {
 }
 
 #[rustfmt::skip]
-fn collect_policy_prefix_rules(component: &AgentStackComponent, value: &Value, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
-    let Some(rules) = value
-        .get("rules")
-        .and_then(|rules| rules.get("prefix_rules"))
-        .and_then(Value::as_array)
-    else {
+fn collect_policy_prefix_rules(component: &AgentStackComponent, value: &Value, is_requirements: bool, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
+    let Some(prefix_rules) = value.get("rules").and_then(|rules| rules.get("prefix_rules")) else {
+        return;
+    };
+    let Some(rules) = prefix_rules.as_array() else {
+        push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("policy.prefix_rule"), "rules.prefix_rules must be an array".to_owned());
         return;
     };
     let mut seen = BTreeSet::new();
     for (index, rule) in rules.iter().enumerate() {
-        let Some(pattern) = rule.get("pattern").and_then(pattern_tokens) else {
+        if is_requirements && rule.get("justification").is_some_and(|value| value.as_str().is_none_or(|value| value.trim().is_empty())) {
+            if !push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("policy.prefix_rule"), format!("policy prefix rule {index} has invalid justification")) { return; }
+            continue;
+        }
+        let pattern_value = rule.get("pattern");
+        let requirements_pattern = pattern_value.is_some_and(|value| matches!(value, Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_object)));
+        let Some(pattern) = pattern_value.and_then(pattern_tokens).filter(|_| !is_requirements || requirements_pattern) else {
+            if !push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("policy.prefix_rule"), format!("policy prefix rule {index} has no valid pattern")) { return; }
             continue;
         };
-        let decision = rule
+        let Some(decision) = rule
             .get("decision")
             .and_then(Value::as_str)
-            .unwrap_or("unspecified");
+            .filter(|value| matches!(*value, "allow" | "prompt" | "forbidden") && (!is_requirements || *value != "allow"))
+        else {
+            if !push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("policy.prefix_rule"), format!("policy prefix rule {index} has no valid decision")) { return; }
+            continue;
+        };
         for capability in classify_command_pattern(&pattern) {
             push_inferred_once(component, raw, failures, &mut seen, capability, "policy.prefix_rule", format!("policy prefix rule {index} with decision `{decision}` controls a command associated with {}", capability.as_str()));
         }
@@ -443,13 +487,8 @@ fn classify_command_pattern(pattern: &CommandPattern) -> Vec<AgentStackCapabilit
     capabilities
 }
 
-fn collect_starlark_prefix_rules(
-    component: &AgentStackComponent,
-    locator: &str,
-    text: &str,
-    raw: &mut Vec<RawCapability>,
-    failures: &mut Vec<AgentStackCapabilityExtractionFailure>,
-) {
+#[rustfmt::skip]
+fn collect_starlark_prefix_rules(component: &AgentStackComponent, locator: &str, text: &str, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
     let dialect = Dialect {
         enable_def: false,
         enable_lambda: false,
@@ -472,7 +511,7 @@ fn collect_starlark_prefix_rules(
     };
     let mut index = 0;
     let mut seen = BTreeSet::new();
-    ast.statement().visit_expr(|expr| {
+    ast.statement().visit_expr(|expr| visit_starlark_expr(expr, &mut |expr| {
         let Expr::Call(function, arguments) = &expr.node else {
             return;
         };
@@ -489,9 +528,17 @@ fn collect_starlark_prefix_rules(
                 Argument::Positional(value) => Some(value), _ => None,
             }).nth(position))
         };
-        let decision = argument("decision", 1)
-            .and_then(starlark_string)
-            .unwrap_or("unspecified");
+        let decision = match argument("decision", 1) {
+            None => "allow",
+            Some(value) => match starlark_string(value).filter(|value| matches!(*value, "allow" | "prompt" | "forbidden")) {
+                Some(decision) => decision,
+                None => {
+                    push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("policy.prefix_rule"), format!("Starlark policy prefix rule {index} has no valid decision"));
+                    index += 1;
+                    return;
+                }
+            },
+        };
         let Some(pattern) = argument("pattern", 0).and_then(starlark_pattern_tokens) else {
             push_failure(
                 component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration,
@@ -512,8 +559,11 @@ fn collect_starlark_prefix_rules(
             );
         }
         index += 1;
-    });
+    }));
 }
+
+#[rustfmt::skip]
+fn visit_starlark_expr(expr: &AstExpr, visit: &mut impl FnMut(&AstExpr)) { visit(expr); expr.node.visit_expr(|child| visit_starlark_expr(child, visit)); }
 
 fn starlark_string(expr: &AstExpr) -> Option<&str> {
     match &expr.node {
@@ -610,10 +660,21 @@ pub(super) fn record_limit(component: &AgentStackComponent, raw: &[RawCapability
     }
 }
 
-fn yaml_front_matter(text: &str) -> Option<&str> {
-    let rest = text
+fn yaml_front_matter(text: &str) -> Result<Option<&str>, ()> {
+    let rest = match text
         .strip_prefix("---\n")
-        .or_else(|| text.strip_prefix("---\r\n"))?;
-    let end = rest.find("\n---")?;
-    Some(&rest[..end])
+        .or_else(|| text.strip_prefix("---\r\n"))
+    {
+        Some(rest) => rest,
+        None if text.starts_with("---") => return Err(()),
+        None => return Ok(None),
+    };
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if matches!(line.trim_end_matches(['\r', '\n']), "---" | "...") {
+            return Ok(Some(&rest[..offset]));
+        }
+        offset += line.len();
+    }
+    Err(())
 }
