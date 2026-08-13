@@ -11,13 +11,11 @@ use starlark_syntax::syntax::module::AstModuleFields;
 use starlark_syntax::syntax::{AstModule, Dialect};
 use std::{collections::BTreeSet, ffi::OsStr, path::Path};
 
-pub(super) fn extract_typed(
-    component: &AgentStackComponent,
-    locator: &str,
-    text: &str,
-    raw: &mut Vec<RawCapability>,
-    failures: &mut Vec<AgentStackCapabilityExtractionFailure>,
-) {
+pub(super) const MAX_COMPONENT_FINDINGS: usize = 256;
+pub(super) const LIMIT_RULE_ID: &str = "extraction.finding_limit";
+
+#[rustfmt::skip]
+pub(super) fn extract_typed(component: &AgentStackComponent, locator: &str, text: &str, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
     if component.kind() == AgentStackComponentKind::Hook {
         extract_hook_metadata(component, locator, text, raw, failures);
         return;
@@ -36,25 +34,15 @@ pub(super) fn extract_typed(
     let (root_name, parse_rule_id, label) = format.metadata();
     match format.parse(source) {
         Ok(value) => {
-            collect_explicit_capabilities(
-                component,
-                &value,
-                root_name,
-                rule_id_for_explicit(component.kind()),
-                raw,
-                failures,
-            );
+            collect_explicit_capabilities(component, &value, root_name, rule_id_for_explicit(component.kind()), true, raw, failures);
             if component.kind() == AgentStackComponentKind::McpServer {
-                collect_mcp_capabilities(&value, raw);
+                collect_mcp_capabilities(component, &value, raw, failures);
             }
-            collect_policy_prefix_rules(&value, raw);
+            collect_policy_prefix_rules(component, &value, raw, failures);
         }
-        Err(()) => failures.push(AgentStackCapabilityExtractionFailure::new(
-            component,
-            AgentStackCapabilityExtractionFailureKind::ParseFailed,
-            Some(parse_rule_id),
-            format!("{locator} is not valid {label}"),
-        )),
+        Err(()) => {
+            push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::ParseFailed, Some(parse_rule_id), format!("{locator} is not valid {label}"));
+        }
     }
 }
 
@@ -171,154 +159,105 @@ fn rule_id_for_explicit(kind: AgentStackComponentKind) -> &'static str {
     }
 }
 
-fn collect_explicit_capabilities(
-    component: &AgentStackComponent,
-    value: &Value,
-    path: &str,
-    rule_id: &'static str,
-    raw: &mut Vec<RawCapability>,
-    failures: &mut Vec<AgentStackCapabilityExtractionFailure>,
-) {
+#[rustfmt::skip]
+fn collect_explicit_capabilities(component: &AgentStackComponent, value: &Value, path: &str, rule_id: &'static str, allow_generic: bool, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
+    if finding_limit_reached(failures) { return; }
     match value {
         Value::Object(map) => {
             for (key, child) in map {
                 let child_path = format!("{path}.{key}");
-                if is_capability_key(key) {
-                    push_declared_capability_values(
-                        component,
-                        child,
-                        &child_path,
-                        rule_id,
-                        raw,
-                        failures,
-                    );
+                if is_capability_key(key, allow_generic) {
+                    push_declared_capability_values(component, child, &child_path, rule_id, raw, failures);
                 } else {
-                    collect_explicit_capabilities(
-                        component,
-                        child,
-                        &child_path,
-                        rule_id,
-                        raw,
-                        failures,
-                    );
+                    collect_explicit_capabilities(component, child, &child_path, rule_id, matches!(key.as_str(), "agent_stack" | "harness"), raw, failures);
                 }
             }
         }
         Value::Array(items) => {
             for (index, child) in items.iter().enumerate() {
-                collect_explicit_capabilities(
-                    component,
-                    child,
-                    &format!("{path}[{index}]"),
-                    rule_id,
-                    raw,
-                    failures,
-                );
+                collect_explicit_capabilities(component, child, &format!("{path}[{index}]"), rule_id, false, raw, failures);
             }
         }
         _ => {}
     }
 }
 
-fn push_declared_capability_values(
-    component: &AgentStackComponent,
-    value: &Value,
-    path: &str,
-    rule_id: &'static str,
-    raw: &mut Vec<RawCapability>,
-    failures: &mut Vec<AgentStackCapabilityExtractionFailure>,
-) {
-    let Some(names) = capability_names(value) else {
+#[rustfmt::skip]
+fn push_declared_capability_values(component: &AgentStackComponent, value: &Value, path: &str, rule_id: &'static str, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
+    let valid_shape = matches!(value, Value::String(_))
+        || matches!(value, Value::Array(values) if !values.is_empty() && values.iter().all(Value::is_string));
+    if !valid_shape {
+        push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some(rule_id), format!("{path} must contain a non-empty string or string array"));
         return;
-    };
-    for name in names {
-        match parse_capability(&name) {
-            Some(capability) => raw.push(declared_raw(
-                capability,
-                rule_id,
-                format!(
-                    "{} explicitly declares {name}",
-                    component.source().locator().as_str()
-                ),
-            )),
-            None => failures.push(AgentStackCapabilityExtractionFailure::new(
-                component,
-                AgentStackCapabilityExtractionFailureKind::InvalidDeclaration,
-                Some(rule_id),
-                format!("{path} contains unsupported capability `{name}`"),
-            )),
+    }
+    let mut found = false;
+    let mut extract = |value: &str| {
+        for name in split_capability_names(value) {
+            found = true;
+            let keep_going = match parse_capability(name) {
+                Some(capability) => push_raw(component, raw, failures, declared_raw(capability, rule_id, format!("{} explicitly declares {name}", component.source().locator().as_str()))),
+                None => push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some(rule_id), format!("{path} contains unsupported capability `{name}`")),
+            };
+            if !keep_going {
+                return false;
+            }
         }
-    }
-}
-
-fn capability_names(value: &Value) -> Option<Vec<String>> {
+        true
+    };
     match value {
-        Value::String(value) => Some(split_capability_names(value)),
-        Value::Array(values) => Some(
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .flat_map(split_capability_names)
-                .collect(),
-        ),
-        _ => None,
+        Value::String(value) => {
+            extract(value);
+        }
+        Value::Array(values) => {
+            for value in values {
+                let Some(value) = value.as_str() else { return };
+                if !extract(value) { return; }
+            }
+        }
+        _ => unreachable!(),
+    }
+    if !found {
+        push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some(rule_id), format!("{path} must contain at least one capability"));
     }
 }
 
-fn split_capability_names(value: &str) -> Vec<String> {
+fn split_capability_names(value: &str) -> impl Iterator<Item = &str> {
     value
         .split([',', ' ', '\n', '\t'])
         .map(str::trim)
         .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
-fn is_capability_key(key: &str) -> bool {
-    matches!(
-        key,
-        "capabilities" | "harness_capabilities" | "x-harness-capabilities"
-    )
-}
-
-fn push_inferred_once(
-    raw: &mut Vec<RawCapability>,
-    seen: &mut BTreeSet<&'static str>,
-    capability: AgentStackCapability,
-    rule_id: &'static str,
-    reason: String,
-) {
-    if seen.insert(capability.as_str()) {
-        raw.push(inferred_raw(
-            capability,
-            rule_id,
-            reason,
-            AgentStackCapabilityExtractionConfidence::Medium,
-        ));
-    }
-}
-
-fn collect_mcp_capabilities(value: &Value, raw: &mut Vec<RawCapability>) {
-    visit_mcp(value, raw, &mut BTreeSet::new(), &mut BTreeSet::new());
+fn is_capability_key(key: &str, allow_generic: bool) -> bool {
+    matches!(key, "harness_capabilities" | "x-harness-capabilities")
+        || allow_generic && key == "capabilities"
 }
 
 #[rustfmt::skip]
-const MCP_SERVER_FIELDS: [(&str, AgentStackCapability); 5] = [
+fn push_inferred_once(component: &AgentStackComponent, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>, seen: &mut BTreeSet<&'static str>, capability: AgentStackCapability, rule_id: &'static str, reason: String) {
+    if seen.insert(capability.as_str()) {
+        push_raw(component, raw, failures, inferred_raw(capability, rule_id, reason, AgentStackCapabilityExtractionConfidence::Medium));
+    }
+}
+
+#[rustfmt::skip]
+fn collect_mcp_capabilities(component: &AgentStackComponent, value: &Value, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
+    visit_mcp(component, value, raw, failures, &mut BTreeSet::new(), &mut BTreeSet::new());
+}
+
+#[rustfmt::skip]
+const MCP_SERVER_FIELDS: [(&str, AgentStackCapability); 3] = [
     ("command", AgentStackCapability::Shell), ("args", AgentStackCapability::Shell), ("url", AgentStackCapability::Network),
-    ("headers", AgentStackCapability::SecretRead), ("env", AgentStackCapability::SecretRead),
 ];
 
-fn visit_mcp(
-    value: &Value,
-    raw: &mut Vec<RawCapability>,
-    schema_seen: &mut BTreeSet<&'static str>,
-    server_seen: &mut BTreeSet<&'static str>,
-) {
+#[rustfmt::skip]
+fn visit_mcp(component: &AgentStackComponent, value: &Value, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>, schema_seen: &mut BTreeSet<&'static str>, server_seen: &mut BTreeSet<&'static str>) {
+    if finding_limit_reached(failures) { return; }
     match value {
         Value::Object(map) => {
             for key in ["inputSchema", "input_schema"] {
                 if let Some(schema) = map.get(key) {
-                    infer_schema_capabilities(schema, raw, schema_seen);
+                    infer_schema_capabilities(component, schema, raw, failures, schema_seen);
                 }
             }
             for key in ["mcpServers", "mcp_servers"] {
@@ -326,66 +265,50 @@ fn visit_mcp(
                     for (name, server) in servers {
                         for (field, capability) in MCP_SERVER_FIELDS {
                             if server.get(field).is_some_and(has_nonempty_value) {
-                                push_inferred_once(
-                                    raw,
-                                    server_seen,
-                                    capability,
-                                    "mcp.server_declaration",
-                                    format!(
-                                        "MCP server `{name}` field `{field}` indicates {}",
-                                        capability.as_str()
-                                    ),
-                                );
+                                push_inferred_once(component, raw, failures, server_seen, capability, "mcp.server_declaration", format!("MCP server `{name}` field `{field}` indicates {}", capability.as_str()));
                             }
+                        }
+                        if ["headers", "env"].iter().any(|field| server.get(field).is_some_and(has_sensitive_binding)) {
+                            push_inferred_once(component, raw, failures, server_seen, AgentStackCapability::SecretRead, "mcp.server_declaration", format!("MCP server `{name}` contains a secret-bearing binding"));
                         }
                     }
                 }
             }
             for child in map.values() {
-                visit_mcp(child, raw, schema_seen, server_seen);
+                visit_mcp(component, child, raw, failures, schema_seen, server_seen);
             }
         }
         Value::Array(items) => {
             for child in items {
-                visit_mcp(child, raw, schema_seen, server_seen);
+                visit_mcp(component, child, raw, failures, schema_seen, server_seen);
             }
         }
         _ => {}
     }
 }
 
-fn infer_schema_capabilities(
-    schema: &Value,
-    raw: &mut Vec<RawCapability>,
-    seen: &mut BTreeSet<&'static str>,
-) {
+#[rustfmt::skip]
+fn infer_schema_capabilities(component: &AgentStackComponent, schema: &Value, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>, seen: &mut BTreeSet<&'static str>) {
+    if finding_limit_reached(failures) { return; }
     if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
         for (name, property) in properties {
             for capability in capabilities_for_schema_field(name, property) {
-                push_inferred_once(
-                    raw,
-                    seen,
-                    capability,
-                    "mcp.input_schema",
-                    format!(
-                        "MCP input schema field `{name}` indicates {}",
-                        capability.as_str()
-                    ),
-                );
+                push_inferred_once(component, raw, failures, seen, capability, "mcp.input_schema", format!("MCP input schema field `{name}` indicates {}", capability.as_str()));
             }
-            infer_schema_capabilities(property, raw, seen);
         }
     }
-    for key in ["items", "prefixItems", "allOf", "anyOf", "oneOf"] {
-        match schema.get(key) {
-            Some(Value::Array(items)) => {
-                for item in items {
-                    infer_schema_capabilities(item, raw, seen);
-                }
+    match schema {
+        Value::Object(map) => {
+            for child in map.values() {
+                infer_schema_capabilities(component, child, raw, failures, seen);
             }
-            Some(item) => infer_schema_capabilities(item, raw, seen),
-            None => {}
         }
+        Value::Array(items) => {
+            for child in items {
+                infer_schema_capabilities(component, child, raw, failures, seen);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -441,7 +364,14 @@ fn has_nonempty_value(value: &Value) -> bool {
     }
 }
 
-fn collect_policy_prefix_rules(value: &Value, raw: &mut Vec<RawCapability>) {
+#[rustfmt::skip]
+fn has_sensitive_binding(value: &Value) -> bool {
+    const NAMES: &[&str] = &["authorization", "token", "secret", "api_key", "api-key", "apikey", "password", "credential", "cookie", "access_key"];
+    value.as_object().is_some_and(|values| values.iter().any(|(name, value)| has_nonempty_value(value) && schema_name_matches(name, NAMES)))
+}
+
+#[rustfmt::skip]
+fn collect_policy_prefix_rules(component: &AgentStackComponent, value: &Value, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
     let Some(rules) = value
         .get("rules")
         .and_then(|rules| rules.get("prefix_rules"))
@@ -459,13 +389,7 @@ fn collect_policy_prefix_rules(value: &Value, raw: &mut Vec<RawCapability>) {
             .and_then(Value::as_str)
             .unwrap_or("unspecified");
         for capability in classify_command_pattern(&pattern) {
-            push_inferred_once(
-                raw,
-                &mut seen,
-                capability,
-                "policy.prefix_rule",
-                format!("policy prefix rule {index} with decision `{decision}` controls a command associated with {}", capability.as_str()),
-            );
+            push_inferred_once(component, raw, failures, &mut seen, capability, "policy.prefix_rule", format!("policy prefix rule {index} with decision `{decision}` controls a command associated with {}", capability.as_str()));
         }
     }
 }
@@ -558,28 +482,29 @@ fn collect_starlark_prefix_rules(
         if name.ident != "prefix_rule" {
             return;
         }
-        let argument = |wanted: &str| {
+        let argument = |wanted: &str, position: usize| {
             arguments.args.iter().find_map(|argument| match &argument.node {
-                Argument::Named(name, value) if name.node == wanted => Some(value),
-                _ => None,
-            })
+                Argument::Named(name, value) if name.node == wanted => Some(value), _ => None,
+            }).or_else(|| arguments.args.iter().filter_map(|argument| match &argument.node {
+                Argument::Positional(value) => Some(value), _ => None,
+            }).nth(position))
         };
-        let decision = argument("decision")
+        let decision = argument("decision", 1)
             .and_then(starlark_string)
             .unwrap_or("unspecified");
-        let Some(pattern) = argument("pattern").and_then(starlark_pattern_tokens) else {
-            failures.push(AgentStackCapabilityExtractionFailure::new(
-                component,
-                AgentStackCapabilityExtractionFailureKind::InvalidDeclaration,
-                Some("policy.prefix_rule"),
-                format!("Starlark policy prefix rule {index} has no literal pattern"),
-            ));
+        let Some(pattern) = argument("pattern", 0).and_then(starlark_pattern_tokens) else {
+            push_failure(
+                component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration,
+                Some("policy.prefix_rule"), format!("Starlark policy prefix rule {index} has no literal pattern"),
+            );
             index += 1;
             return;
         };
         for capability in classify_command_pattern(&pattern) {
             push_inferred_once(
+                component,
                 raw,
+                failures,
                 &mut seen,
                 capability,
                 "policy.prefix_rule",
@@ -616,13 +541,8 @@ fn starlark_pattern_tokens(expr: &AstExpr) -> Option<CommandPattern> {
     (!tokens.is_empty()).then_some(tokens)
 }
 
-fn extract_hook_metadata(
-    component: &AgentStackComponent,
-    locator: &str,
-    text: &str,
-    raw: &mut Vec<RawCapability>,
-    failures: &mut Vec<AgentStackCapabilityExtractionFailure>,
-) {
+#[rustfmt::skip]
+fn extract_hook_metadata(component: &AgentStackComponent, locator: &str, text: &str, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
     let mut reason = None;
     for line in text.lines().take(64) {
         let trimmed = line.trim_start();
@@ -637,29 +557,56 @@ fn extract_hook_metadata(
             reason = (!value.trim().is_empty()).then(|| value.trim().to_owned());
             continue;
         }
-        let Some(value) = comment
-            .strip_prefix("harness-capabilities:")
-            .or_else(|| comment.strip_prefix("harness-capability:"))
-        else {
-            continue;
-        };
+        let Some(value) = comment.strip_prefix("harness-capabilities:").or_else(|| comment.strip_prefix("harness-capability:")) else { continue; };
+        let mut found = false;
         for name in split_capability_names(value) {
-            match parse_capability(&name) {
-                Some(capability) => raw.push(declared_raw(
-                    capability,
-                    "hook.metadata_capabilities",
-                    reason
-                        .clone()
-                        .unwrap_or_else(|| format!("{locator} declares {name} in hook metadata")),
-                )),
-                None => failures.push(AgentStackCapabilityExtractionFailure::new(
-                    component,
-                    AgentStackCapabilityExtractionFailureKind::InvalidDeclaration,
-                    Some("hook.metadata_capabilities"),
-                    format!("{locator} hook metadata contains unsupported capability `{name}`"),
-                )),
+            found = true;
+            match parse_capability(name) {
+                Some(capability) => if !push_raw(component, raw, failures, declared_raw(capability, "hook.metadata_capabilities", reason.clone().unwrap_or_else(|| format!("{locator} declares {name} in hook metadata")))) { return; },
+                None => if !push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("hook.metadata_capabilities"), format!("{locator} hook metadata contains unsupported capability `{name}`")) { return; },
             }
         }
+        if !found {
+            push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("hook.metadata_capabilities"), format!("{locator} hook metadata must contain at least one capability"));
+        }
+    }
+}
+
+#[rustfmt::skip]
+fn finding_limit_reached(failures: &[AgentStackCapabilityExtractionFailure]) -> bool {
+    failures.iter().any(|failure| failure.rule_id() == Some(LIMIT_RULE_ID))
+}
+
+#[rustfmt::skip]
+fn push_raw(component: &AgentStackComponent, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>, item: RawCapability) -> bool {
+    if raw.len() + failures.len() < MAX_COMPONENT_FINDINGS - 1 {
+        raw.push(item);
+        true
+    } else {
+        record_limit(component, raw, failures);
+        false
+    }
+}
+
+#[rustfmt::skip]
+fn push_failure(component: &AgentStackComponent, raw: &[RawCapability], failures: &mut Vec<AgentStackCapabilityExtractionFailure>, kind: AgentStackCapabilityExtractionFailureKind, rule_id: Option<&str>, reason: String) -> bool {
+    if raw.len() + failures.len() < MAX_COMPONENT_FINDINGS - 1 {
+        failures.push(AgentStackCapabilityExtractionFailure::new(component, kind, rule_id, reason));
+        true
+    } else {
+        record_limit(component, raw, failures);
+        false
+    }
+}
+
+#[rustfmt::skip]
+pub(super) fn record_limit(component: &AgentStackComponent, raw: &[RawCapability], failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
+    if !finding_limit_reached(failures) {
+        failures.push(AgentStackCapabilityExtractionFailure::new(
+            component, AgentStackCapabilityExtractionFailureKind::LimitExceeded, Some(LIMIT_RULE_ID),
+            format!("{} exceeds the capability extraction finding limit", component.source().locator().as_str()),
+        ));
+        debug_assert!(raw.len() + failures.len() <= MAX_COMPONENT_FINDINGS);
     }
 }
 

@@ -133,11 +133,16 @@ fn push_command(commands: &mut Vec<Vec<String>>, tokens: &mut Vec<String>) {
     let command = std::mem::take(tokens);
     let start = command
         .iter()
-        .position(|token| !is_assignment(token))
+        .position(|token| !is_assignment(token) && !is_shell_control(token))
         .unwrap_or(command.len());
     if start < command.len() {
         commands.push(command.into_iter().skip(start).collect());
     }
+}
+
+#[rustfmt::skip]
+fn is_shell_control(token: &str) -> bool {
+    matches!(token, "!" | "{" | "}" | "do" | "done" | "elif" | "else" | "fi" | "if" | "then" | "time" | "until" | "while")
 }
 
 fn is_assignment(token: &str) -> bool {

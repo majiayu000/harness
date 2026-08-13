@@ -219,17 +219,29 @@ pub fn extract_repository_capability_evidence(
             }
         };
         let mut typed = Vec::new();
-        extract_typed(component, locator, &text, &mut typed, &mut failures);
+        let mut component_failures = Vec::new();
+        extract_typed(
+            component,
+            locator,
+            &text,
+            &mut typed,
+            &mut component_failures,
+        );
         let typed_capabilities = typed
             .iter()
             .map(|raw| raw.capability.as_str())
             .collect::<BTreeSet<_>>();
         let mut raw = typed;
         for static_capability in extract_static(component, locator, &text) {
+            if raw.len() + component_failures.len() >= typed::MAX_COMPONENT_FINDINGS - 1 {
+                typed::record_limit(component, &raw, &mut component_failures);
+                break;
+            }
             if !typed_capabilities.contains(static_capability.capability.as_str()) {
                 raw.push(static_capability);
             }
         }
+        failures.extend(component_failures);
         append_validated(component, raw, &mut evidence, &mut failures);
     }
 

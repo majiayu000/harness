@@ -112,17 +112,18 @@ fn capability_extraction_reads_supported_declarations_and_static_commands() {
         dir.path(),
         "harness.toml" => b"[rules]\nexec_policy_paths = [\"policy.star\"]\n",
         ".vibeguard/policy.json5" => b"{ capabilities: ['network',], /* metadata */ }",
-        "policy.star" => b"prefix_rule(pattern = [[\"curl\", \"rm\"]], decision = \"prompt\")\nprefix_rule(pattern = [\" python3 \"], decision = \"prompt\")\n",
+        "policy.star" => b"prefix_rule(pattern = [[\"curl\", \"rm\"]], decision = \"prompt\")\nprefix_rule(pattern = [\" python3 \"], decision = \"prompt\")\nprefix_rule([\"kubectl\", \"apply\"], \"prompt\")\n",
         "rules/windows.md" => b"---\r\ncapabilities: [secret_read]\r\n---\r\n# Policy\r\n",
         PING => br#"{"tools":[{"inputSchema":{"properties":{
           "command":{},"output_path":{},"config":{"properties":{"api_key":{}}},
-          "request":{"items":{"properties":{"url":{}}}}
+          "request":{"items":{"properties":{"url":{}}}},"definitions":{"job":{"properties":{"deploy":{}}}}
         }}}],"mcpServers":{"local":{"command":"node","env":{"TOKEN":"secret"}},
         "remote":{"url":"https://mcp.invalid","headers":{"Authorization":"token"}}}}"#,
-        "mcp.json" => br#"{"tools":[{"inputSchema":{"properties":{"profile":{},"tokenizer":{}}}}],"mcpServers":{"empty":{"command":"","args":[],"url":" ","headers":{"Authorization":""},"env":{}}}}"#,
+        "mcp.json" => br#"{"examples":[{"capabilities":["destructive"]}],"tools":[{"inputSchema":{"properties":{"profile":{},"tokenizer":{}}}}],"mcpServers":{"benign":{"headers":{"User-Agent":"harness"},"env":{"NODE_ENV":"test"}},"secret":{"headers":{"X-Api-Key":"${API_KEY}"}},"empty":{"command":"","args":[],"url":" ","headers":{"Authorization":""},"env":{}}}}"#,
         "requirements.toml" => b"[rules]\n[[rules.prefix_rules]]\npattern = [{ any_of = [\"curl\", \"rm\"] }]\ndecision = \"prompt\"\n",
-        ".harness/guards/preflight.sh" => b"#!/bin/sh\n# harness-reason:\n# harness-capabilities: shell\necho ready; curl https://example.invalid && rm -f output\n",
+        ".harness/guards/preflight.sh" => b"#!/bin/sh\n# harness-reason:\n# harness-capabilities: shell\necho ready; curl https://example.invalid && rm -f output\nif kubectl apply; then touch output; fi\n{ wget https://example.invalid; }\n",
         ".harness/guards/pre-push.sh" => b"#!/bin/sh\n# harness-capabilities: network\ncurl https://example.invalid\n",
+        ".harness/guards/group.sh" => b"#!/bin/sh\n{ wget https://example.invalid; }\n",
     );
     let extraction = run(dir.path());
     assert!(
@@ -133,22 +134,27 @@ fn capability_extraction_reads_supported_declarations_and_static_commands() {
     assert_rows(
         &extraction,
         &[
+            (".harness/guards/group.sh", Capability::Network, STATIC, Low),
             (PRE_PUSH, Capability::Network, META, High),
             (PREFLIGHT, Capability::Destructive, STATIC, Low),
             (PREFLIGHT, Capability::FileWrite, STATIC, Low),
             (PREFLIGHT, Capability::Network, STATIC, Low),
+            (PREFLIGHT, Capability::ProductionWrite, STATIC, Low),
             (PREFLIGHT, Capability::Shell, META, High),
             (PING, Capability::FileWrite, SCHEMA, Medium),
             (PING, Capability::Network, SCHEMA, Medium),
             (PING, Capability::Network, SERVER, Medium),
+            (PING, Capability::ProductionWrite, SCHEMA, Medium),
             (PING, Capability::SecretRead, SCHEMA, Medium),
             (PING, Capability::SecretRead, SERVER, Medium),
             (PING, Capability::Shell, SCHEMA, Medium),
             (PING, Capability::Shell, SERVER, Medium),
             (".vibeguard/policy.json5", Capability::Network, POLICY, High),
+            ("mcp.json", Capability::SecretRead, SERVER, Medium),
             ("policy.star", Capability::Destructive, PREFIX, Medium),
             ("policy.star", Capability::FileWrite, PREFIX, Medium),
             ("policy.star", Capability::Network, PREFIX, Medium),
+            ("policy.star", Capability::ProductionWrite, PREFIX, Medium),
             ("policy.star", Capability::Shell, PREFIX, Medium),
             ("requirements.toml", Capability::Destructive, PREFIX, Medium),
             ("requirements.toml", Capability::FileWrite, PREFIX, Medium),
@@ -187,6 +193,10 @@ fn unsupported_and_documentation_sources_do_not_emit_evidence() {
 #[test]
 fn extractor_reports_parse_and_invalid_declaration_failures() {
     let dir = tmp();
+    let names = (0..typed::MAX_COMPONENT_FINDINGS)
+        .map(|index| format!("invalid{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let deeply_nested = format!(
         "{}{{capabilities:['network']}}{}",
         "[".repeat(129),
@@ -197,7 +207,10 @@ fn extractor_reports_parse_and_invalid_declaration_failures() {
         PING => b"{ not valid json",
         ".vibeguard/deep.json5" => deeply_nested,
         ".vibeguard/comment.json5" => b"{capabilities:['network']} /*",
-        ".harness/guards/preflight.sh" => b"#!/bin/sh\n# harness-capabilities: rocket\n",
+        ".vibeguard/invalid.json5" => b"{capabilities:['network', 7]}",
+        ".harness/guards/preflight.sh" => format!("#!/bin/sh\n# harness-capabilities: {names}\ncurl https://example.invalid\n"),
+        ".harness/guards/pre-push.sh" => format!("#!/bin/sh\n# harness-capabilities: {}\ncurl example.invalid; rm output\n", names.split(' ').take(typed::MAX_COMPONENT_FINDINGS - 2).collect::<Vec<_>>().join(" ")),
+        ".harness/guards/empty.sh" => b"#!/bin/sh\n# harness-capabilities:\n",
     );
     let extraction = run(dir.path());
     let has = |locator, kind, rule_id| {
@@ -212,8 +225,29 @@ fn extractor_reports_parse_and_invalid_declaration_failures() {
         (PING, ParseFailed, "typed.json_parse"),
         (".vibeguard/deep.json5", ParseFailed, "typed.json5_parse"),
         (".vibeguard/comment.json5", ParseFailed, "typed.json5_parse"),
+        (".vibeguard/invalid.json5", InvalidDeclaration, POLICY),
         (PREFLIGHT, InvalidDeclaration, "hook.metadata_capabilities"),
+        (PREFLIGHT, FailureKind::LimitExceeded, typed::LIMIT_RULE_ID),
+        (PRE_PUSH, FailureKind::LimitExceeded, typed::LIMIT_RULE_ID),
+        (
+            ".harness/guards/empty.sh",
+            InvalidDeclaration,
+            "hook.metadata_capabilities",
+        ),
     ] {
         assert!(has(locator, kind, rule));
+    }
+    for locator in [PREFLIGHT, PRE_PUSH] {
+        let failures = extraction
+            .failures()
+            .iter()
+            .filter(|failure| failure.component().source().locator().as_str() == locator)
+            .count();
+        let evidence = extraction
+            .evidence()
+            .iter()
+            .filter(|item| item.component().source().locator().as_str() == locator)
+            .count();
+        assert_eq!(failures + evidence, typed::MAX_COMPONENT_FINDINGS);
     }
 }
