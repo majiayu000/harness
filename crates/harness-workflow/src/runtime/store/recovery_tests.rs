@@ -209,7 +209,7 @@ fn dependency_gate_recovery_builds_override_plan_and_evidence() {
             .expect("rejection check should parse")
             .is_none());
 
-        let plan = awaiting_dependencies_recovery_dispatch_plan(&instance, &request)
+        let plan = dependency_override_recovery::dispatch_plan(&instance, &request)
             .expect("dependency override plan should build");
         assert_eq!(plan.target.state, expected_state);
         assert_eq!(plan.target.activity.as_deref(), Some(expected_activity));
@@ -267,6 +267,120 @@ fn dependency_gate_recovery_builds_override_plan_and_evidence() {
 }
 
 #[test]
+fn dependency_cycle_retry_builds_override_plan_and_cleans_failure_marker() {
+    for (force_execute, expected_state, expected_activity) in [
+        (false, "planning", "plan_issue"),
+        (true, "implementing", "implement_issue"),
+    ] {
+        let mut instance = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "failed",
+            WorkflowSubject::new("issue", "issue:1885"),
+        )
+        .with_id(format!("dependency-cycle-retry-{force_execute}"))
+        .with_server_data(json!({
+            "project_id": "/project-a",
+            "issue_number": 1885,
+            "dependencies_blocked": true,
+            "dependency_failure_status": "dependency_cycle",
+            "force_execute": force_execute,
+        }));
+        let request = WorkflowRuntimeRecoveryRequest {
+            workflow_id: "dependency-cycle-retry",
+            action: WorkflowRuntimeRecoveryAction::Retry,
+            reason: "operator approved dependency override",
+            actor: "operator",
+            target_state: None,
+            evidence: &[],
+        };
+
+        assert!(recovery_rejection(&instance, &request)
+            .expect("rejection check should parse")
+            .is_none());
+        assert!(dependency_override_recovery::matches(
+            &instance,
+            request.action
+        ));
+        let plan = dependency_override_recovery::dispatch_plan(&instance, &request)
+            .expect("cycle retry plan should build");
+        assert_eq!(plan.target.state, expected_state);
+        assert_eq!(plan.target.activity.as_deref(), Some(expected_activity));
+        let decision = recovery_dispatch_decision(
+            &instance,
+            request.action,
+            request.reason,
+            "failed",
+            &plan,
+            "event-one",
+            &[],
+        );
+        assert_eq!(decision.decision, "operator_runtime_retry");
+        assert!(decision.commands[0]
+            .dedupe_key
+            .starts_with("operator-recovery:retry:"));
+        validator_for_instance(&instance)
+            .expect("validator lookup should succeed")
+            .expect("GitHub issue workflow should have a validator")
+            .validate(
+                &instance,
+                &decision,
+                &ValidationContext::new("workflow_runtime_operator_action", chrono::Utc::now())
+                    .allow_terminal_reopen(),
+            )
+            .expect("cycle retry should be a valid terminal reopen");
+
+        persist_operator_recovery_data(
+            &mut instance,
+            request.action,
+            request.reason,
+            request.actor,
+            "failed",
+            expected_state,
+            "event-one",
+        )
+        .expect("operator recovery data should persist");
+        assert_eq!(instance.data["dependencies_blocked"], false);
+        assert_eq!(instance.data["dependency_override"]["action"], "retry");
+        assert_eq!(
+            instance.data["dependency_override"]["previous_state"],
+            "failed"
+        );
+        assert_eq!(instance.data["last_operator_recovery"]["action"], "retry");
+        assert_eq!(
+            instance.data["last_operator_recovery"]["previous_state"],
+            "failed"
+        );
+        assert!(instance.data.get("dependency_failure_status").is_none());
+    }
+
+    let malformed = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "failed",
+        WorkflowSubject::new("issue", "issue:1886"),
+    )
+    .with_server_data(json!({
+        "dependency_failure_status": "dependency_cycle",
+        "candidate_fanout": {
+            "candidate_group_id": "dependency-cycle-malformed",
+            "candidate_count": "two",
+        },
+    }));
+    let request = WorkflowRuntimeRecoveryRequest {
+        workflow_id: "dependency-cycle-malformed",
+        action: WorkflowRuntimeRecoveryAction::Retry,
+        reason: "operator approved dependency override",
+        actor: "operator",
+        target_state: None,
+        evidence: &[],
+    };
+    let error = dependency_override_recovery::dispatch_plan(&malformed, &request)
+        .expect_err("malformed cycle fan-out must fail before recovery mutation");
+    assert!(error.to_string().contains("candidate_fanout"));
+}
+
+#[test]
 fn dependency_gate_recovery_preserves_candidate_fanout_for_force_execute() -> anyhow::Result<()> {
     let mut instance = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
@@ -302,7 +416,7 @@ fn dependency_gate_recovery_preserves_candidate_fanout_for_force_execute() -> an
         evidence: &[],
     };
 
-    let plan = awaiting_dependencies_recovery_dispatch_plan(&instance, &request)
+    let plan = dependency_override_recovery::dispatch_plan(&instance, &request)
         .expect("dependency override plan should build");
     let decision = recovery_dispatch_decision(
         &instance,
@@ -386,7 +500,7 @@ fn dependency_gate_recovery_validates_candidate_fanout_before_planning() {
         evidence: &[],
     };
 
-    let error = awaiting_dependencies_recovery_dispatch_plan(&instance, &request)
+    let error = dependency_override_recovery::dispatch_plan(&instance, &request)
         .expect_err("malformed candidate fan-out must fail before planning");
 
     assert!(error.to_string().contains("candidate_fanout"));
@@ -420,7 +534,7 @@ fn dependency_gate_recovery_validates_but_defers_fanout_until_after_planning() {
         evidence: &[],
     };
 
-    let plan = awaiting_dependencies_recovery_dispatch_plan(&instance, &request)
+    let plan = dependency_override_recovery::dispatch_plan(&instance, &request)
         .expect("valid fan-out metadata should allow recovery planning");
     let decision = recovery_dispatch_decision(
         &instance,

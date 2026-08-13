@@ -146,6 +146,23 @@ fn stopped_action_plan(workflow: &WorkflowInstance) -> Option<StoppedActionPlan>
             legacy_fallback: true,
         });
     }
+    if workflow.state == "failed"
+        && workflow
+            .data
+            .get("dependency_failure_status")
+            .and_then(Value::as_str)
+            == Some("dependency_cycle")
+    {
+        if candidate_fanout_from_value(&workflow.data).is_err() {
+            return None;
+        }
+        return Some(StoppedActionPlan {
+            action: StoppedRecoveryAction::Retry,
+            target: RecoveryDispatchTarget { activity: "" },
+            runtime_job_id: None,
+            legacy_fallback: true,
+        });
+    }
     let action = match workflow.state.as_str() {
         "blocked" => StoppedRecoveryAction::Unblock,
         "failed" => StoppedRecoveryAction::Retry,
@@ -359,6 +376,25 @@ mod tests {
             },
         }));
         assert!(stopped_action_plan(&malformed).is_none());
+
+        let cycle = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "failed",
+            WorkflowSubject::new("issue", "issue:1886"),
+        )
+        .with_server_data(json!({
+            "dependency_failure_status": "dependency_cycle",
+        }));
+        assert!(stopped_action_plan(&cycle).is_some());
+        let malformed_cycle = cycle.with_server_data(json!({
+            "dependency_failure_status": "dependency_cycle",
+            "candidate_fanout": {
+                "candidate_group_id": "dependency-projection:candidate-group:issue-1886",
+                "candidate_count": "two",
+            },
+        }));
+        assert!(stopped_action_plan(&malformed_cycle).is_none());
     }
 
     #[test]

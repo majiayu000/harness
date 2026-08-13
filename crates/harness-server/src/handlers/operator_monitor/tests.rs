@@ -105,6 +105,28 @@ fn workflow_sample_truncation_preserves_operator_action_and_failed_states() {
 }
 
 #[test]
+fn workflow_sample_truncation_preserves_github_dependency_waits() {
+    let base = Utc::now();
+    let mut workflows = (0..500)
+        .map(|index| {
+            let mut workflow = workflow("checking", json!({})).with_id(format!("checking-{index}"));
+            workflow.updated_at = base + chrono::Duration::seconds(index);
+            workflow
+        })
+        .collect::<Vec<_>>();
+    let mut dependency_wait =
+        workflow("awaiting_dependencies", json!({})).with_id("older-dependency-wait".to_string());
+    dependency_wait.updated_at = base - chrono::Duration::hours(1);
+    workflows.push(dependency_wait);
+
+    truncate_workflow_sample(&mut workflows, 500);
+
+    assert!(workflows
+        .iter()
+        .any(|workflow| workflow.id == "older-dependency-wait"));
+}
+
+#[test]
 fn workflow_sample_truncation_preserves_failed_reserve_before_operator_actions() {
     let base = Utc::now();
     let mut workflows = (0..500)
@@ -516,6 +538,47 @@ fn operator_monitor_stuck_workflows_expose_structured_stop_metadata() {
     assert_eq!(row["last_stop"]["runtime_job_id"], "job-blocked");
     assert_eq!(row["can_unblock"], true);
     assert_eq!(row["can_retry"], false);
+}
+
+#[test]
+fn operator_actions_include_only_eligible_github_dependency_waits() {
+    let eligible = workflow(
+        "awaiting_dependencies",
+        json!({"repo": "owner/repo", "issue_number": 1885}),
+    )
+    .with_id("eligible-dependency-wait".to_string());
+    let ineligible = workflow(
+        "awaiting_dependencies",
+        json!({"repo": "owner/repo", "issue_number": 1886}),
+    )
+    .with_id("ineligible-dependency-wait".to_string());
+    let unrelated = WorkflowInstance::new(
+        QUALITY_GATE_DEFINITION_ID,
+        1,
+        "awaiting_dependencies",
+        WorkflowSubject::new("issue", "issue:1887"),
+    )
+    .with_id("unrelated-external-wait".to_string());
+    let mut eligibility = std::collections::HashMap::new();
+    for workflow_id in ["eligible-dependency-wait", "unrelated-external-wait"] {
+        eligibility.insert(
+            workflow_id.to_string(),
+            RuntimeStoppedActionEligibility {
+                can_unblock: true,
+                can_retry: false,
+            },
+        );
+    }
+
+    let actions = operator_actions(&[eligible, ineligible, unrelated], Utc::now(), &eligibility);
+
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].workflow_id, "eligible-dependency-wait");
+    assert_eq!(actions[0].kind, "blocked");
+    assert_eq!(actions[0].state, "awaiting_dependencies");
+    assert_eq!(actions[0].next_action, "Resolve blocker");
+    assert!(actions[0].stopped_state.can_unblock);
+    assert!(!actions[0].stopped_state.can_retry);
 }
 
 #[test]

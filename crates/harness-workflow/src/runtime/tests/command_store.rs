@@ -225,16 +225,18 @@ async fn dependency_recovery_rejects_invalid_candidate_fanout_without_mutation(
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    for (issue_number, force_execute) in [(1885, false), (1886, true)] {
-        let original = project_issue_instance(
-            "/project-a",
-            issue_number,
-            "awaiting_dependencies",
-        )
-        .with_server_data(json!({
+    use super::WorkflowRuntimeRecoveryAction::{Retry, Unblock};
+    for (issue_number, state, action, force_execute) in [
+        (1885, "awaiting_dependencies", Unblock, false),
+        (1886, "awaiting_dependencies", Unblock, true),
+        (1887, "failed", Retry, false),
+        (1888, "failed", Retry, true),
+    ] {
+        let original = project_issue_instance("/project-a", issue_number, state).with_server_data(json!({
             "project_id": "/project-a",
             "issue_number": issue_number,
             "dependencies_blocked": true,
+            "dependency_failure_status": (state == "failed").then_some("dependency_cycle"),
             "force_execute": force_execute,
             "candidate_fanout": {
                 "candidate_group_id": "invalid-candidate-fanout",
@@ -283,7 +285,7 @@ async fn dependency_recovery_rejects_invalid_candidate_fanout_without_mutation(
         let error = recover(
             &store,
             &original.id,
-            super::WorkflowRuntimeRecoveryAction::Unblock,
+            action,
         )
         .await
         .expect_err("malformed candidate fan-out must reject recovery");
@@ -299,6 +301,73 @@ async fn dependency_recovery_rejects_invalid_candidate_fanout_without_mutation(
         assert_eq!(store.runtime_jobs_for_commands(&command_ids).await?, jobs_before);
         assert!(store.events_for(&original.id).await?.is_empty());
         assert!(store.decisions_for(&original.id).await?.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dependency_cycle_retry_persists_override_and_routes_by_force_execute(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    for (issue_number, force_execute, expected_state, expected_activity, command_count) in [
+        (1890, false, "planning", "plan_issue", 1),
+        (1891, true, "implementing", "implement_issue", 2),
+    ] {
+        let original = project_issue_instance("/project-a", issue_number, "failed")
+            .with_server_data(json!({
+                "project_id": "/project-a",
+                "issue_number": issue_number,
+                "dependencies_blocked": true,
+                "dependency_failure_status": "dependency_cycle",
+                "force_execute": force_execute,
+                "candidate_fanout": {
+                    "candidate_group_id": format!("dependency-cycle-{issue_number}"),
+                    "candidate_count": 2,
+                    "trigger_label": "best-of-n",
+                },
+            }));
+        store
+            .force_upsert_lifecycle_state_for_test(&original)
+            .await?;
+
+        let workflow = recovered_workflow(
+            recover(
+                &store,
+                &original.id,
+                super::WorkflowRuntimeRecoveryAction::Retry,
+            )
+            .await?,
+            "dependency cycle retry",
+        )?;
+
+        assert_eq!(workflow.state, expected_state);
+        assert_eq!(workflow.data["dependencies_blocked"], false);
+        assert_eq!(workflow.data["dependency_override"]["action"], "retry");
+        assert_eq!(
+            workflow.data["dependency_override"]["previous_state"],
+            "failed"
+        );
+        assert!(workflow.data.get("dependency_failure_status").is_none());
+        let commands = store.commands_for(&original.id).await?;
+        assert_eq!(commands.len(), command_count);
+        assert!(commands.iter().all(|command| {
+            command.status == WorkflowCommandStatus::Pending
+                && command.command.activity_name() == Some(expected_activity)
+        }));
+        assert_operator_recovery_audit(
+            &store,
+            &original.id,
+            "WorkflowRuntimeRetried",
+            "retry",
+            "failed",
+            expected_state,
+        )
+        .await?;
     }
     Ok(())
 }

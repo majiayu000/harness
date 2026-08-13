@@ -23,10 +23,12 @@ use crate::runtime::state_registry::{
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::submission::append_candidate_commands;
 use crate::runtime::validator::ValidationContext;
-use crate::runtime::{candidate_fanout_from_value, CandidateFanoutRequest};
+use crate::runtime::CandidateFanoutRequest;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
 
+#[path = "dependency_override_recovery.rs"]
+mod dependency_override_recovery;
 #[path = "recovery_prompt.rs"]
 mod recovery_prompt;
 #[path = "recovery_validation.rs"]
@@ -371,11 +373,8 @@ async fn recovery_dispatch_plan_tx(
     if let Some(Ok(definition)) = custom_declarative_definition(instance) {
         return declarative_recovery_dispatch_plan(request, &definition);
     }
-    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
-        && instance.state == "awaiting_dependencies"
-        && request.action == WorkflowRuntimeRecoveryAction::Unblock
-    {
-        return Ok(Ok(awaiting_dependencies_recovery_dispatch_plan(
+    if dependency_override_recovery::matches(instance, request.action) {
+        return Ok(Ok(dependency_override_recovery::dispatch_plan(
             instance, request,
         )?));
     }
@@ -407,59 +406,6 @@ async fn recovery_dispatch_plan_tx(
         target: target.clone(),
         command_source,
     }))
-}
-
-fn awaiting_dependencies_recovery_dispatch_plan(
-    instance: &WorkflowInstance,
-    request: &WorkflowRuntimeRecoveryRequest<'_>,
-) -> anyhow::Result<RecoveryDispatchPlan> {
-    let force_execute = instance
-        .data
-        .get("force_execute")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let (state, activity) = if force_execute {
-        ("implementing", "implement_issue")
-    } else {
-        ("planning", "plan_issue")
-    };
-    let remote_fact_hash = optional_string_field(&instance.data, "last_remote_fact_hash");
-    let dispatch_fact_hash = remote_fact_hash.clone();
-    let mut payload = json!({
-        "activity": activity,
-        "additional_prompt": recovery_prompt::dependency_override(&instance.data, request.reason),
-        "dependency_override": {
-            "previous_state": instance.state,
-            "reason": request.reason,
-        },
-        "dispatch_gate": {
-            "reason": "operator_dependency_override",
-            "fact_hash": dispatch_fact_hash,
-        },
-        "remote_fact_hash": remote_fact_hash,
-        "submission_mode": optional_string_field(&instance.data, "submission_mode")
-            .unwrap_or_else(|| "immediate".to_string()),
-    });
-    for field in RECOVERY_CONTEXT_FIELDS {
-        copy_optional_data_field(&mut payload, &instance.data, field);
-    }
-    let candidate_fanout = candidate_fanout_from_value(&instance.data)
-        .context("invalid candidate_fanout recovery metadata")?;
-    let candidate_fanout = force_execute.then_some(candidate_fanout).flatten();
-    Ok(RecoveryDispatchPlan {
-        target: RecoveryDispatchTarget {
-            state: state.to_string(),
-            activity: Some(activity.to_string()),
-        },
-        command_source: RecoveryDispatchCommandSource::Synthetic {
-            command: WorkflowCommand::new(
-                WorkflowCommandType::EnqueueActivity,
-                "operator-dependency-override-preview",
-                payload,
-            ),
-            candidate_fanout,
-        },
-    })
 }
 
 fn declarative_recovery_dispatch_plan(
@@ -711,10 +657,15 @@ fn persist_operator_recovery_data(
             crate::runtime::DataProvenance::Server,
         ),
     ];
-    if previous_state == "awaiting_dependencies" {
+    if dependency_override_recovery::matches_persisted_state(&instance.data, action, previous_state)
+    {
         writes.push(crate::runtime::WorkflowDataWrite::set(
             "dependencies_blocked",
             json!(false),
+            crate::runtime::DataProvenance::Server,
+        ));
+        writes.push(crate::runtime::WorkflowDataWrite::remove(
+            "dependency_failure_status",
             crate::runtime::DataProvenance::Server,
         ));
         writes.push(crate::runtime::WorkflowDataWrite::set(
