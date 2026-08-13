@@ -210,8 +210,9 @@ remain (harmless).
   before its removal in PR #1725).
 - `cargo test -p harness-server` — shadow vs enforce behavior, monitor
   payload fields, daily rollover.
-- `cargo test -p harness-agents` — flag derivation (both adapter files
-  per the CLI arg-order rule), absence for non-supporting adapters.
+- `cargo test -p harness-agents` — flag derivation in `claude.rs` (the
+  only Claude spawn path after GH-1786), absence for non-supporting
+  backends.
 - Full gate before PR: `cargo clippy --workspace --all-targets -- -D
   warnings` + `cargo fmt --all`.
 

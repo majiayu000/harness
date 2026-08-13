@@ -111,11 +111,12 @@ pub trait AgentBackend: Send + Sync {
 /// code. The alias exists because call sites and docs still say "adapter" for
 /// stateful protocol backends such as `CodexAdapter`.
 pub use AgentBackend as AgentAdapter;
-/// Historical name for the oneshot CLI executor surface.
+/// Historical name for the oneshot execute surface.
 ///
 /// This is the same trait as [`AgentBackend`]. Keep using `AgentBackend` in new
-/// code. The alias exists because oneshot CLI wrappers (`claude.rs`, `codex.rs`)
-/// were originally named `CodeAgent`.
+/// code. The alias exists because oneshot backends (`claude.rs`, `codex.rs`,
+/// `anthropic_api.rs`) were originally named `CodeAgent`. It is not CLI-only:
+/// HTTP backends such as `AnthropicApiAgent` also implement this alias.
 pub use AgentBackend as CodeAgent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

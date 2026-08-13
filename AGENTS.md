@@ -48,7 +48,7 @@ These names overlap in everyday speech but mean different things in code. Use th
 | **task** | Legacy execution unit; submissions are being migrated to flow through the workflow runtime instead. | `crates/harness-server/src/task_runner/` |
 | **runtime host** | Process instance that executes runtime jobs; can register remotely via `/api/runtime-hosts`. | `crates/harness-server/src/runtime_hosts.rs` |
 
-There is no type literally named `AgentRuntime` in the codebase. The phrase is used informally to mean the agent runtime layer (implementations of `AgentBackend`). Prefer `AgentBackend` in new code. `CodeAgent` means a oneshot CLI wrapper; `AgentAdapter` means a per-turn protocol backend. Both names alias the same trait.
+There is no type literally named `AgentRuntime` in the codebase. The phrase is used informally to mean the agent runtime layer (implementations of `AgentBackend`). Prefer `AgentBackend` in new code. `CodeAgent` means the oneshot execute surface (CLI wrappers and HTTP backends such as `AnthropicApiAgent`); `AgentAdapter` means a per-turn protocol backend. Both names alias the same trait.
 
 ## Worktree Usage
 
@@ -73,12 +73,12 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 
 | Surface | Trait name (alias) | Codex | Claude | OpenCode |
 |---|---|---|---|---|
-| Oneshot CLI | `CodeAgent` | `codex.rs` via `codex exec`; prompt is the final positional argument | `claude.rs` via `claude -p <PROMPT> ...` | `opencode.rs` |
+| Oneshot execute | `CodeAgent` | `codex.rs` via `codex exec`; prompt is the final positional argument | `claude.rs` via `claude -p <PROMPT> ...` | `opencode.rs` |
 | Per-turn protocol | `AgentAdapter` | `codex_adapter.rs` via `codex app-server` JSON-RPC, registered with `register_turn_backend_factory("codex", ...)` | none — `ClaudeAdapter` / `claude_adapter.rs` was removed (GH-1786); stream-json parsers live in `claude_stream_json.rs` | `opencode_adapter.rs` via `register_turn_backend_factory("opencode", ...)` |
 
-- The two surfaces do not share a CLI argument contract. Keep changes scoped to the affected implementation.
+- The two surfaces do not share a CLI argument contract. Keep changes scoped to the affected implementation. `anthropic-api` is a oneshot HTTP `CodeAgent`, not a CLI wrapper.
 - After modifying a spawn path, run `cargo test --package harness-agents`.
-- Do not register a process-backed adapter as a singleton in `AdapterRegistry` for concurrent turns; the factory creates a fresh adapter per turn.
+- Do not register a process-backed adapter as a singleton on `AgentRegistry` for concurrent turns. Attach a `register_turn_backend_factory` so each turn gets a fresh adapter.
 
 ## Server Operation
 

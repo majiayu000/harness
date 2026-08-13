@@ -192,7 +192,7 @@ dangerously_skip_permissions = true   # explicit opt-up only
 | B-002 v3 fencing, server byte-identical, historical packets untouched | `harness-server` `workflow_runtime_worker::prompt_packet` snapshot tests: v2 vs v3 fixture diff; v1/v2 fixture readback |
 | B-003 continuation always fenced | prompt_packet test with continuation present/absent |
 | B-004 grandfather vs writer-defect split | prompt_packet tests: pre-`migrated_at` field → fenced + degradation artifact; post-`migrated_at` unclassified → `UnclassifiedField` error |
-| B-005 / B-006 scoped default, explicit opt-up, flag exclusivity | `cargo test --package harness-agents` spawn-arg tests for both adapters; config resolution tests for `SpawnPermissionMode` |
+| B-005 / B-006 scoped default, explicit opt-up, flag exclusivity | `cargo test --package harness-agents` spawn-arg tests for `claude.rs`; config resolution tests for `SpawnPermissionMode` |
 | B-007 host egress deny-by-default + typed platform error | `harness-sandbox` policy-generation tests (Seatbelt/Landlock rule sets per `EgressPolicy`); dispatch error test |
 | B-008 container canary + preserved `none` fallback | `spawn_contract` tests: canary pass/fail gating; `container_network_mode` regression |
 | B-009 evidence completeness | runtime evidence tests asserting profile, egress mode, fencing counts per job |
