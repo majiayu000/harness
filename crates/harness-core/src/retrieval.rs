@@ -461,50 +461,40 @@ fn overlap_count(primary: &[ScoredCandidate], shadow: &[ScoredCandidate]) -> usi
 }
 
 fn rank_divergence(primary: &[ScoredCandidate], shadow: &[ScoredCandidate]) -> f64 {
-    if primary.is_empty() && shadow.is_empty() {
-        return 0.0;
-    }
-    let max_rank = primary.len().max(shadow.len()).max(1);
     let mut ids = primary
         .iter()
         .map(|candidate| candidate.id.as_str())
         .collect::<BTreeSet<_>>();
     ids.extend(shadow.iter().map(|candidate| candidate.id.as_str()));
-    let primary_ranks = ids
-        .iter()
-        .map(|id| {
-            primary
-                .iter()
-                .position(|candidate| candidate.id.as_str() == *id)
-                .unwrap_or(max_rank)
+    if ids.len() < 2 {
+        return 0.0;
+    }
+    let max_rank = primary.len().max(shadow.len()).max(1);
+    let rank = |items: &[ScoredCandidate], id: &str| {
+        items
+            .iter()
+            .position(|candidate| candidate.id == id)
+            .unwrap_or(max_rank)
+    };
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    let divergence = (0..ids.len())
+        .flat_map(|left| (left + 1..ids.len()).map(move |right| (left, right)))
+        .map(|(left, right)| {
+            let primary_order = rank(primary, ids[left]).cmp(&rank(primary, ids[right]));
+            let shadow_order = rank(shadow, ids[left]).cmp(&rank(shadow, ids[right]));
+            if primary_order == shadow_order {
+                0.0
+            } else if primary_order == std::cmp::Ordering::Equal
+                || shadow_order == std::cmp::Ordering::Equal
+            {
+                0.5
+            } else {
+                1.0
+            }
         })
-        .collect::<Vec<_>>();
-    let shadow_ranks = ids
-        .iter()
-        .map(|id| {
-            shadow
-                .iter()
-                .position(|candidate| candidate.id.as_str() == *id)
-                .unwrap_or(max_rank)
-        })
-        .collect::<Vec<_>>();
-    let rank_delta_sum = primary_ranks
-        .iter()
-        .zip(&shadow_ranks)
-        .map(|(primary_rank, shadow_rank)| primary_rank.abs_diff(*shadow_rank))
-        .sum::<usize>();
-    let mut sorted_primary_ranks = primary_ranks;
-    let mut sorted_shadow_ranks = shadow_ranks;
-    sorted_primary_ranks.sort_unstable();
-    sorted_shadow_ranks.sort_unstable();
-    // Opposite ordering is the maximum attainable footrule distance for these ranks.
-    let maximum_rank_delta = sorted_primary_ranks
-        .iter()
-        .zip(sorted_shadow_ranks.iter().rev())
-        .map(|(primary_rank, shadow_rank)| primary_rank.abs_diff(*shadow_rank))
-        .sum::<usize>();
-    let denominator = maximum_rank_delta.max(1) as f64;
-    (rank_delta_sum as f64 / denominator).min(1.0)
+        .sum::<f64>();
+    let pair_count = ids.len() * (ids.len() - 1) / 2;
+    divergence / pair_count as f64
 }
 
 #[cfg(test)]

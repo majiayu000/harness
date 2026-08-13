@@ -222,6 +222,32 @@ fn retrieval_executor_keeps_primary_selection_with_shadow_comparison() {
 }
 
 #[test]
+fn rank_divergence_uses_kendall_pair_inversions() {
+    let ranked = |ids: &[&str]| {
+        ids.iter()
+            .map(|id| ScoredCandidate {
+                id: (*id).to_owned(),
+                score: 1.0,
+                native_repo: true,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rank_divergence(&ranked(&["a", "b", "c"]), &ranked(&["b", "a", "c"])),
+        1.0 / 3.0
+    );
+    assert_eq!(rank_divergence(&ranked(&[]), &ranked(&["a", "b"])), 0.5);
+    assert_eq!(
+        rank_divergence(&ranked(&["a", "b"]), &ranked(&["b", "c"])),
+        2.0 / 3.0
+    );
+    assert_eq!(
+        rank_divergence(&ranked(&["a", "b"]), &ranked(&["c", "d"])),
+        5.0 / 6.0
+    );
+}
+
+#[test]
 fn retrieval_executor_clamps_primary_and_shadow_results_to_query_limit() {
     let primary = ReverseRetriever;
     let shadow = ReverseRetriever;
