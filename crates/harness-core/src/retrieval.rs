@@ -100,6 +100,9 @@ impl std::error::Error for RetrievalError {}
 pub trait KnowledgeRetriever: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Returns candidates in descending rank order. Implementations must remove
+    /// duplicate IDs before applying `query.limit` so lower-ranked unique
+    /// candidates are not discarded at the cutoff.
     fn rank(
         &self,
         query: &RetrievalQuery<'_>,
@@ -138,8 +141,7 @@ impl KnowledgeRetriever for LexicalKnowledgeRetriever {
                 .then_with(|| right.native_repo.cmp(&left.native_repo))
                 .then_with(|| left.id.cmp(&right.id))
         });
-        scored.truncate(query.limit);
-        Ok(scored)
+        Ok(canonicalize_ranked(scored, query.limit))
     }
 }
 
@@ -169,8 +171,8 @@ pub struct RetrievalComparison {
     pub shadow_implementation: &'static str,
     pub primary_ranked: Vec<ScoredCandidate>,
     pub shadow_ranked: Vec<ScoredCandidate>,
-    pub overlap_count: usize,
-    pub rank_divergence: f64,
+    pub overlap_count: Option<usize>,
+    pub rank_divergence: Option<f64>,
     pub shadow_error: Option<String>,
 }
 
@@ -197,8 +199,7 @@ impl<'a> RetrievalExecutor<'a> {
         query: &RetrievalQuery<'_>,
         candidates: &[RetrievalCandidate<'_>],
     ) -> Result<RetrievalExecution, RetrievalError> {
-        let mut selected = self.primary.rank(query, candidates)?;
-        selected.truncate(query.limit);
+        let selected = canonicalize_ranked(self.primary.rank(query, candidates)?, query.limit);
         let Some(shadow) = self.shadow else {
             return Ok(RetrievalExecution {
                 selected,
@@ -206,18 +207,23 @@ impl<'a> RetrievalExecutor<'a> {
             });
         };
         let (shadow_ranked, shadow_error) = match shadow.rank(query, candidates) {
-            Ok(mut ranked) => {
-                ranked.truncate(query.limit);
-                (ranked, None)
-            }
+            Ok(ranked) => (canonicalize_ranked(ranked, query.limit), None),
             Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        let (overlap_count, rank_divergence) = if shadow_error.is_none() {
+            (
+                Some(overlap_count(&selected, &shadow_ranked)),
+                Some(rank_divergence(&selected, &shadow_ranked)),
+            )
+        } else {
+            (None, None)
         };
         let comparison = RetrievalComparison {
             surface: query.surface,
             primary_implementation: self.primary.name(),
             shadow_implementation: shadow.name(),
-            overlap_count: overlap_count(&selected, &shadow_ranked),
-            rank_divergence: rank_divergence(&selected, &shadow_ranked),
+            overlap_count,
+            rank_divergence,
             primary_ranked: selected.clone(),
             shadow_ranked,
             shadow_error,
@@ -227,6 +233,26 @@ impl<'a> RetrievalExecutor<'a> {
             comparison: Some(comparison),
         })
     }
+}
+
+fn canonicalize_ranked(ranked: Vec<ScoredCandidate>, limit: usize) -> Vec<ScoredCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut canonical = Vec::with_capacity(limit.min(ranked.len()));
+    for candidate in ranked {
+        if canonical
+            .iter()
+            .any(|existing: &ScoredCandidate| existing.id == candidate.id)
+        {
+            continue;
+        }
+        canonical.push(candidate);
+        if canonical.len() == limit {
+            break;
+        }
+    }
+    canonical
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -482,211 +508,5 @@ fn rank_divergence(primary: &[ScoredCandidate], shadow: &[ScoredCandidate]) -> f
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct ReverseRetriever;
-
-    impl KnowledgeRetriever for ReverseRetriever {
-        fn name(&self) -> &'static str {
-            "reverse"
-        }
-
-        fn rank(
-            &self,
-            _query: &RetrievalQuery<'_>,
-            candidates: &[RetrievalCandidate<'_>],
-        ) -> Result<Vec<ScoredCandidate>, RetrievalError> {
-            Ok(candidates
-                .iter()
-                .rev()
-                .map(|candidate| ScoredCandidate {
-                    id: candidate.id.to_string(),
-                    score: 1.0,
-                    native_repo: candidate.native_repo,
-                })
-                .collect())
-        }
-    }
-
-    #[test]
-    fn lexical_relevance_matches_terms_regardless_of_order() {
-        let score = score_lexical_relevance(
-            "please review the code changes",
-            &[RetrievalField::new("code review", 2.0)],
-        );
-
-        assert!(score.score > 0.7, "score was {}", score.score);
-        assert_eq!(score.matched_terms, 2);
-    }
-
-    #[test]
-    fn lexical_relevance_returns_zero_without_content_overlap() {
-        let score = score_lexical_relevance(
-            "fix a postgres migration",
-            &[RetrievalField::new("frontend visual polish", 1.0)],
-        );
-
-        assert_eq!(score, LexicalRelevanceScore::none(3));
-    }
-
-    #[test]
-    fn lexical_relevance_does_not_phrase_match_inside_tokens() {
-        let score = score_lexical_relevance(
-            "cargo build failed",
-            &[RetrievalField::new("go build", 2.0)],
-        );
-
-        assert!(
-            score.score < 0.7,
-            "score should not receive a phrase bonus from 'cargo', was {}",
-            score.score
-        );
-        assert_eq!(score.matched_terms, 1);
-    }
-
-    #[test]
-    fn lexical_retriever_ranks_candidates_by_weighted_score() {
-        let retriever = LexicalKnowledgeRetriever;
-        let query = RetrievalQuery::new(RetrievalSurface::Skill, "review code changes", 10);
-        let ranked = retriever
-            .rank(
-                &query,
-                &[
-                    RetrievalCandidate::new(
-                        "skill:build-fix",
-                        vec![RetrievalField::new("build error", 2.0)],
-                    ),
-                    RetrievalCandidate::new(
-                        "skill:review",
-                        vec![RetrievalField::new("code review", 2.0)],
-                    ),
-                ],
-            )
-            .expect("lexical ranking succeeds");
-
-        assert_eq!(ranked[0].id, "skill:review");
-        assert!(ranked[0].score > ranked[1].score);
-    }
-
-    #[test]
-    fn lexical_retriever_prefers_native_repo_on_score_ties() {
-        let retriever = LexicalKnowledgeRetriever;
-        let query = RetrievalQuery::new(RetrievalSurface::RepoMemory, "postgres timeout", 10);
-        let ranked = retriever
-            .rank(
-                &query,
-                &[
-                    RetrievalCandidate::new(
-                        "foreign",
-                        vec![RetrievalField::new("postgres timeout", 1.0)],
-                    )
-                    .with_native_repo(false),
-                    RetrievalCandidate::new(
-                        "native",
-                        vec![RetrievalField::new("postgres timeout", 1.0)],
-                    ),
-                ],
-            )
-            .expect("lexical ranking succeeds");
-
-        assert_eq!(ranked[0].id, "native");
-    }
-
-    #[test]
-    fn retrieval_executor_keeps_primary_selection_with_shadow_comparison() {
-        let primary = LexicalKnowledgeRetriever;
-        let shadow = ReverseRetriever;
-        let query = RetrievalQuery::new(RetrievalSurface::Skill, "code review", 3);
-        let result = RetrievalExecutor::new(&primary)
-            .with_shadow(&shadow)
-            .retrieve(
-                &query,
-                &[
-                    RetrievalCandidate::new("a", vec![RetrievalField::new("code review", 1.0)]),
-                    RetrievalCandidate::new("b", vec![RetrievalField::new("build error", 1.0)]),
-                    RetrievalCandidate::new("c", vec![RetrievalField::new("deploy", 1.0)]),
-                ],
-            )
-            .expect("primary retrieval succeeds");
-
-        assert_eq!(result.selected[0].id, "a");
-        let comparison = result.comparison.expect("comparison is recorded");
-        assert_eq!(comparison.primary_implementation, "lexical");
-        assert_eq!(comparison.shadow_implementation, "reverse");
-        assert_eq!(comparison.overlap_count, 3);
-        assert_eq!(comparison.rank_divergence, 1.0);
-        assert!(comparison.shadow_error.is_none());
-    }
-
-    #[test]
-    fn retrieval_executor_clamps_primary_and_shadow_results_to_query_limit() {
-        let primary = ReverseRetriever;
-        let shadow = ReverseRetriever;
-        let query = RetrievalQuery::new(RetrievalSurface::Skill, "code review", 1);
-        let result = RetrievalExecutor::new(&primary)
-            .with_shadow(&shadow)
-            .retrieve(
-                &query,
-                &[
-                    RetrievalCandidate::new("a", vec![RetrievalField::new("code review", 1.0)]),
-                    RetrievalCandidate::new("b", vec![RetrievalField::new("build error", 1.0)]),
-                ],
-            )
-            .expect("retrieval succeeds");
-
-        assert_eq!(
-            result
-                .selected
-                .iter()
-                .map(|candidate| candidate.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["b"]
-        );
-        let comparison = result.comparison.expect("comparison is recorded");
-        assert_eq!(comparison.primary_ranked, result.selected);
-        assert_eq!(comparison.shadow_ranked.len(), 1);
-        assert_eq!(comparison.shadow_ranked[0].id, "b");
-        assert_eq!(comparison.overlap_count, 1);
-    }
-
-    #[test]
-    fn retrieval_executor_isolates_shadow_failure() {
-        struct FailingRetriever;
-        impl KnowledgeRetriever for FailingRetriever {
-            fn name(&self) -> &'static str {
-                "failing"
-            }
-
-            fn rank(
-                &self,
-                _query: &RetrievalQuery<'_>,
-                _candidates: &[RetrievalCandidate<'_>],
-            ) -> Result<Vec<ScoredCandidate>, RetrievalError> {
-                Err(RetrievalError::new("embedding backend unavailable"))
-            }
-        }
-
-        let primary = LexicalKnowledgeRetriever;
-        let shadow = FailingRetriever;
-        let query = RetrievalQuery::new(RetrievalSurface::Skill, "code review", 1);
-        let result = RetrievalExecutor::new(&primary)
-            .with_shadow(&shadow)
-            .retrieve(
-                &query,
-                &[RetrievalCandidate::new(
-                    "skill:review",
-                    vec![RetrievalField::new("code review", 1.0)],
-                )],
-            )
-            .expect("primary retrieval succeeds");
-
-        assert_eq!(result.selected.len(), 1);
-        let comparison = result.comparison.expect("comparison is recorded");
-        assert_eq!(
-            comparison.shadow_error.as_deref(),
-            Some("embedding backend unavailable")
-        );
-        assert!(comparison.shadow_ranked.is_empty());
-    }
-}
+#[path = "retrieval_tests.rs"]
+mod tests;
