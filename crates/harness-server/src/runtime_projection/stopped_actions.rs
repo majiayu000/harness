@@ -1,8 +1,9 @@
 use super::{RuntimeRecoveryTargetProjection, RuntimeStoppedActionEligibility};
 use harness_workflow::runtime::{
-    workflow_declarative_definition, ActivityErrorKind, WorkflowCommand, WorkflowCommandType,
-    WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    candidate_fanout_from_value, workflow_declarative_definition, ActivityErrorKind,
+    WorkflowCommand, WorkflowCommandType, WorkflowInstance, WorkflowRuntimeStore,
+    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
+    PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -135,6 +136,9 @@ fn stopped_action_plan(workflow: &WorkflowInstance) -> Option<StoppedActionPlan>
         });
     }
     if workflow.state == "awaiting_dependencies" {
+        if candidate_fanout_from_value(&workflow.data).is_err() {
+            return None;
+        }
         return Some(StoppedActionPlan {
             action: StoppedRecoveryAction::Unblock,
             target: RecoveryDispatchTarget { activity: "" },
@@ -327,6 +331,34 @@ mod tests {
         for payload in [Value::Null, Value::String("implement_issue".to_string())] {
             assert!(!enqueue_payload_matches_target(&payload));
         }
+    }
+
+    #[test]
+    fn dependency_projection_requires_valid_candidate_fanout() {
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "awaiting_dependencies",
+            WorkflowSubject::new("issue", "issue:1885"),
+        );
+        assert!(stopped_action_plan(&workflow).is_some());
+
+        let valid = workflow.clone().with_server_data(json!({
+            "candidate_fanout": {
+                "candidate_group_id": "dependency-projection:candidate-group:issue-1885",
+                "candidate_count": 2,
+                "trigger_label": "best-of-n",
+            },
+        }));
+        assert!(stopped_action_plan(&valid).is_some());
+
+        let malformed = workflow.with_server_data(json!({
+            "candidate_fanout": {
+                "candidate_group_id": "dependency-projection:candidate-group:issue-1885",
+                "candidate_count": "two",
+            },
+        }));
+        assert!(stopped_action_plan(&malformed).is_none());
     }
 
     #[test]
