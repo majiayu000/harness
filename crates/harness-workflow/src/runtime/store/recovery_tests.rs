@@ -357,3 +357,132 @@ fn dependency_gate_recovery_preserves_candidate_fanout_for_force_execute() -> an
     assert_eq!(instance.data["dependencies_blocked"], false);
     Ok(())
 }
+
+#[test]
+fn dependency_gate_recovery_validates_candidate_fanout_before_planning() {
+    let instance = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "awaiting_dependencies",
+        WorkflowSubject::new("issue", "issue:1885"),
+    )
+    .with_id("dependency-override-invalid-fanout")
+    .with_server_data(json!({
+        "project_id": "/project-a",
+        "issue_number": 1885,
+        "dependencies_blocked": true,
+        "force_execute": false,
+        "candidate_fanout": {
+            "candidate_group_id": "dependency-override-invalid-fanout:candidate-group:issue-1885",
+            "candidate_count": "two",
+        },
+    }));
+    let request = WorkflowRuntimeRecoveryRequest {
+        workflow_id: "dependency-override-invalid-fanout",
+        action: WorkflowRuntimeRecoveryAction::Unblock,
+        reason: "operator approved dependency override",
+        actor: "operator",
+        target_state: None,
+        evidence: &[],
+    };
+
+    let error = awaiting_dependencies_recovery_dispatch_plan(&instance, &request)
+        .expect_err("malformed candidate fan-out must fail before planning");
+
+    assert!(error.to_string().contains("candidate_fanout"));
+}
+
+#[test]
+fn dependency_gate_recovery_validates_but_defers_fanout_until_after_planning() {
+    let mut instance = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "awaiting_dependencies",
+        WorkflowSubject::new("issue", "issue:1885"),
+    )
+    .with_id("dependency-override-deferred-fanout")
+    .with_server_data(json!({
+        "project_id": "/project-a",
+        "issue_number": 1885,
+        "force_execute": false,
+        "candidate_fanout": {
+            "candidate_group_id": "dependency-override-deferred-fanout:candidate-group:issue-1885",
+            "candidate_count": 2,
+            "trigger_label": "best-of-n",
+        },
+    }));
+    let request = WorkflowRuntimeRecoveryRequest {
+        workflow_id: "dependency-override-deferred-fanout",
+        action: WorkflowRuntimeRecoveryAction::Unblock,
+        reason: "operator approved dependency override",
+        actor: "operator",
+        target_state: None,
+        evidence: &[],
+    };
+
+    let plan = awaiting_dependencies_recovery_dispatch_plan(&instance, &request)
+        .expect("valid fan-out metadata should allow recovery planning");
+    let decision = recovery_dispatch_decision(
+        &instance,
+        request.action,
+        request.reason,
+        "awaiting_dependencies",
+        &plan,
+        "event-one",
+        &[],
+    );
+
+    assert_eq!(decision.next_state, "planning");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(decision.commands[0].activity_name(), Some("plan_issue"));
+    assert!(decision.commands[0].command.get("candidate").is_none());
+    instance.state = "planning".to_string();
+    persist_operator_recovery_data(
+        &mut instance,
+        request.action,
+        request.reason,
+        request.actor,
+        "awaiting_dependencies",
+        "planning",
+        "event-one",
+    )
+    .expect("recovery metadata should persist");
+    assert!(instance.data.get("candidate_fanout").is_some());
+
+    let result =
+        crate::runtime::model::ActivityResult::succeeded("plan_issue", "Issue plan ready.")
+            .with_artifact(crate::runtime::model::ActivityArtifact::new(
+                "issue_plan",
+                json!({
+                    "summary": "Implement the dependency-gated issue.",
+                    "task_class": "runtime_or_data",
+                    "target_files": ["crates/harness-workflow/src/runtime/store/recovery.rs"],
+                    "validation_plan": ["cargo test -p harness-workflow dependency_gate_recovery"],
+                    "blockers": [],
+                }),
+            ));
+    let event = crate::runtime::model::WorkflowEvent::new(
+        &instance.id,
+        1,
+        crate::runtime::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-one",
+    )
+    .with_payload(json!({
+        "command_id": "plan-command",
+        "command": decision.commands[0],
+        "runtime_job_id": "runtime-one",
+        "activity_result": result,
+    }));
+    let implementation = crate::runtime::reduce_runtime_job_completed(&instance, &event)
+        .expect("plan completion event should parse")
+        .expect("plan completion should start implementation");
+    assert_eq!(implementation.commands.len(), 2);
+    for (candidate_index, command) in (1..=2).zip(&implementation.commands) {
+        assert_eq!(command.activity_name(), Some("implement_issue"));
+        assert_eq!(command.command["submission_mode"], "deferred");
+        assert_eq!(
+            command.command["candidate"]["candidate_index"],
+            candidate_index
+        );
+    }
+}

@@ -216,6 +216,93 @@ async fn runtime_recovery_skips_superseded_active_commands() -> anyhow::Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn dependency_recovery_rejects_invalid_candidate_fanout_without_mutation(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    for (issue_number, force_execute) in [(1885, false), (1886, true)] {
+        let original = project_issue_instance(
+            "/project-a",
+            issue_number,
+            "awaiting_dependencies",
+        )
+        .with_server_data(json!({
+            "project_id": "/project-a",
+            "issue_number": issue_number,
+            "dependencies_blocked": true,
+            "force_execute": force_execute,
+            "candidate_fanout": {
+                "candidate_group_id": "invalid-candidate-fanout",
+                "candidate_count": "two",
+            },
+        }));
+        store
+            .force_upsert_lifecycle_state_for_test(&original)
+            .await?;
+        let pending_id = store
+            .enqueue_command(
+                &original.id,
+                None,
+                &WorkflowCommand::enqueue_activity(
+                    "plan_issue",
+                    format!("preexisting-pending-{issue_number}"),
+                ),
+            )
+            .await?;
+        let dispatching_id = store
+            .enqueue_command(
+                &original.id,
+                None,
+                &WorkflowCommand::enqueue_activity(
+                    "plan_issue",
+                    format!("preexisting-dispatching-{issue_number}"),
+                ),
+            )
+            .await?;
+        store
+            .mark_command_status(&dispatching_id, WorkflowCommandStatus::Dispatching)
+            .await?;
+        let (dispatched_id, _) = enqueue_original_runtime_job(
+            &store,
+            &original.id,
+            &WorkflowCommand::enqueue_activity(
+                "plan_issue",
+                format!("preexisting-dispatched-{issue_number}"),
+            ),
+        )
+        .await?;
+        let command_ids = vec![pending_id, dispatching_id, dispatched_id];
+        let commands_before = store.commands_for(&original.id).await?;
+        let jobs_before = store.runtime_jobs_for_commands(&command_ids).await?;
+
+        let error = recover(
+            &store,
+            &original.id,
+            super::WorkflowRuntimeRecoveryAction::Unblock,
+        )
+        .await
+        .expect_err("malformed candidate fan-out must reject recovery");
+
+        assert!(error.to_string().contains("candidate_fanout"));
+        let stored = store
+            .get_instance(&original.id)
+            .await?
+            .expect("workflow should still exist");
+        assert_eq!(stored.state, original.state);
+        assert_eq!(stored.data, original.data);
+        assert_eq!(store.commands_for(&original.id).await?, commands_before);
+        assert_eq!(store.runtime_jobs_for_commands(&command_ids).await?, jobs_before);
+        assert!(store.events_for(&original.id).await?.is_empty());
+        assert!(store.decisions_for(&original.id).await?.is_empty());
+    }
+    Ok(())
+}
+
 #[rustfmt::skip]
 #[tokio::test]
 async fn runtime_recovery_unblocks_legacy_blocked_without_stop_metadata() -> anyhow::Result<()> {

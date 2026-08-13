@@ -443,11 +443,9 @@ fn awaiting_dependencies_recovery_dispatch_plan(
     for field in RECOVERY_CONTEXT_FIELDS {
         copy_optional_data_field(&mut payload, &instance.data, field);
     }
-    let candidate_fanout = if force_execute {
-        candidate_fanout_from_value(&instance.data)?
-    } else {
-        None
-    };
+    let candidate_fanout = candidate_fanout_from_value(&instance.data)
+        .context("invalid candidate_fanout recovery metadata")?;
+    let candidate_fanout = force_execute.then_some(candidate_fanout).flatten();
     Ok(RecoveryDispatchPlan {
         target: RecoveryDispatchTarget {
             state: state.to_string(),
