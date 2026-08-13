@@ -37,19 +37,14 @@ use super::runtime_usage::runtime_usage_context;
 use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
 use super::turn_engine::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
 use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
-#[path = "executor/runtime_timeout.rs"]
 mod runtime_timeout;
 use runtime_timeout::runtime_profile_with_timeout_fallback;
-#[path = "executor/egress_evidence.rs"]
 mod egress_evidence;
 use egress_evidence::AgentEgressEvidence;
-#[path = "executor/permission_profile.rs"]
 mod permission_profile;
 use permission_profile::RuntimePermissionProfile;
-#[path = "executor/spawn_env.rs"]
 mod spawn_env;
 use spawn_env::{correction_spawn_env_vars, isolation_spawn_env_vars};
-#[path = "executor/structured_output.rs"]
 mod structured_output;
 use structured_output::{
     codex_output_schema_file, reserve_structured_output_correction_turn,

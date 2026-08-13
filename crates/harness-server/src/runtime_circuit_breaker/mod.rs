@@ -5,7 +5,6 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-#[path = "runtime_circuit_breaker/failure_class.rs"]
 mod failure_class;
 pub(crate) use failure_class::{classify_agent_failure, FailureClass};
 

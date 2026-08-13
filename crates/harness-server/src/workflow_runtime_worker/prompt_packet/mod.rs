@@ -18,22 +18,18 @@ use super::activity_contract::activity_contract;
 use super::data_helpers::activity_name;
 use super::runtime_profile::ResolvedRuntimeSettings;
 
-#[path = "prompt_packet/activity_policy.rs"]
 mod activity_policy;
 use activity_policy::{append_activity_policy_prompt, apply_activity_policy};
 
-#[path = "prompt_packet/context_provenance.rs"]
 mod context_provenance;
 use context_provenance::{
     apply_context_provenance, repo_memory_prompt_section, repo_memory_prompt_value,
     strip_model_facing_audit_sections,
 };
 
-#[path = "prompt_packet/command_input_taint.rs"]
 mod command_input_taint;
 use command_input_taint::render_command_input;
 
-#[path = "prompt_packet/workflow_data_taint.rs"]
 mod workflow_data_taint;
 use workflow_data_taint::{
     append_continuation_context_prompt, prompt_continuation_context, workflow_prompt_value,
@@ -785,17 +781,17 @@ where
 }
 
 #[cfg(test)]
-#[path = "prompt_packet_tests.rs"]
+#[path = "../prompt_packet_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "prompt_packet_taint_tests.rs"]
+#[path = "../prompt_packet_taint_tests.rs"]
 mod taint_tests;
 
 #[cfg(test)]
-#[path = "prompt_packet_pinning_tests.rs"]
+#[path = "../prompt_packet_pinning_tests.rs"]
 mod pinning_tests;
 
 #[cfg(test)]
-#[path = "prompt_packet_activity_policy_tests.rs"]
+#[path = "../prompt_packet_activity_policy_tests.rs"]
 mod activity_policy_tests;

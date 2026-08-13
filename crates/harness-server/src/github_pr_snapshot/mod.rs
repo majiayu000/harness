@@ -570,5 +570,5 @@ pub(crate) fn github_pr_snapshot_failure_result(
 }
 
 #[cfg(test)]
-#[path = "github_pr_snapshot_tests.rs"]
+#[path = "../github_pr_snapshot_tests.rs"]
 mod tests;
