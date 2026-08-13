@@ -27,6 +27,8 @@ use crate::runtime::{candidate_fanout_from_value, CandidateFanoutRequest};
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
 
+#[path = "recovery_prompt.rs"]
+mod recovery_prompt;
 #[path = "recovery_validation.rs"]
 mod recovery_validation;
 
@@ -425,10 +427,7 @@ fn awaiting_dependencies_recovery_dispatch_plan(
     let dispatch_fact_hash = remote_fact_hash.clone();
     let mut payload = json!({
         "activity": activity,
-        "additional_prompt": format!(
-            "Operator requested workflow runtime unblock after overriding the dependency gate. Recovery reason: {}",
-            request.reason
-        ),
+        "additional_prompt": recovery_prompt::dependency_override(&instance.data, request.reason),
         "dependency_override": {
             "previous_state": instance.state,
             "reason": request.reason,

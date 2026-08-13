@@ -193,6 +193,7 @@ fn dependency_gate_recovery_builds_override_plan_and_evidence() {
             "depends_on": ["github-issue:owner/repo:issue:1884"],
             "dependencies_blocked": true,
             "force_execute": force_execute,
+            "additional_prompt": "Preserve the operator's issue-specific instruction.",
             "last_remote_fact_hash": "sha256:abc",
         }));
         let request = WorkflowRuntimeRecoveryRequest {
@@ -230,6 +231,9 @@ fn dependency_gate_recovery_builds_override_plan_and_evidence() {
         assert!(command.command["additional_prompt"]
             .as_str()
             .is_some_and(|prompt| prompt.contains("overriding the dependency gate")));
+        assert!(command.command["additional_prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("issue-specific instruction")));
 
         persist_operator_recovery_data(
             &mut instance,
