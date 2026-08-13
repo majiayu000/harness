@@ -11,10 +11,9 @@ GH-1770
 - `crates/harness-core/src/agent.rs:52,126` — `AgentRequest::max_budget_usd:
   Option<f64>`, default `None` (unlimited).
 - `crates/harness-agents/src/claude.rs:148-150` — when set, appended as
-  `--max-budget-usd`; enforcement delegated to the Claude CLI. The
-  streaming path `crates/harness-agents/src/claude_adapter.rs` never
-  passes the flag at all today, and the Codex and direct Anthropic API
-  adapters receive no equivalent cap.
+  `--max-budget-usd`; enforcement delegated to the Claude CLI. Claude has
+  no streaming adapter (`claude_adapter.rs` was removed in GH-1786). The
+  Codex and direct Anthropic API backends receive no equivalent CLI cap.
 - `crates/harness-server/src/workflow_runtime_submission/runtime_request.rs:53,159,202,245,278`
   — the field survives submission, storage, redispatch, and recovery,
   defaulting to `None`.
@@ -139,13 +138,12 @@ the activity share across candidates, mirroring the existing
    (dispatch only when no under-threshold work is claimable). Reasons
    extend the existing `dispatch_barrier.rs` enum and surface through
    the same status paths.
-2. **Adapter flag** (`claude.rs` AND `claude_adapter.rs`): populate
-   `max_budget_usd` from the activity share when unset. Today only the
-   batch path (`claude.rs:148-150`) forwards the flag; the streaming
-   adapter must gain the same argument, and per the project CLI-arg
-   rule any arg-construction change applies to both files, verified by
-   `cargo test --package harness-agents`. Codex/direct-API adapters
-   skip the flag; server-side enforcement covers them.
+2. **Adapter flag** (`claude.rs`): populate
+   `max_budget_usd` from the activity share when unset. Today the
+   CodeAgent path (`claude.rs:148-150`) forwards the flag. There is no
+   Claude turn adapter to update. Codex/direct-API adapters skip the
+   flag; server-side enforcement covers them. Verify Claude CLI arg
+   construction with `cargo test --package harness-agents`.
 3. **Turn-stream watchdog** (`workflow_runtime_worker`): accumulate
    `CostSample`s from streamed usage events; when the activity share is
    crossed mid-turn, request turn interruption via the adapter's

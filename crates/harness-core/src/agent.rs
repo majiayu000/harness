@@ -105,7 +105,17 @@ pub trait AgentBackend: Send + Sync {
     }
 }
 
+/// Historical name for the per-turn / JSON-RPC adapter surface.
+///
+/// This is the same trait as [`AgentBackend`]. Keep using `AgentBackend` in new
+/// code. The alias exists because call sites and docs still say "adapter" for
+/// stateful protocol backends such as `CodexAdapter`.
 pub use AgentBackend as AgentAdapter;
+/// Historical name for the oneshot CLI executor surface.
+///
+/// This is the same trait as [`AgentBackend`]. Keep using `AgentBackend` in new
+/// code. The alias exists because oneshot CLI wrappers (`claude.rs`, `codex.rs`)
+/// were originally named `CodeAgent`.
 pub use AgentBackend as CodeAgent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

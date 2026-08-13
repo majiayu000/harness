@@ -38,13 +38,12 @@ So the plumbing for per-request budgets is done and durable.
 Enforcement, however, is delegated entirely to the agent CLI:
 `crates/harness-agents/src/claude.rs:148-150` appends
 `--max-budget-usd <value>` to the Claude CLI invocation when the field
-is set — and only on the batch path. The streaming adapter
-(`crates/harness-agents/src/claude_adapter.rs`), which is the runtime's
-live spawn path, never passes the flag at all, and neither the Codex
-nor the direct Anthropic API adapter receives an equivalent cap.
-Harness itself never compares accumulated spend against the budget. So
-even for the one field that exists, coverage is one adapter out of
-four, and honesty depends on that CLI: the budget is advisory fiction.
+is set. Claude has no streaming adapter (`claude_adapter.rs` was
+removed in GH-1786), and neither the Codex nor the direct Anthropic API
+backend receives an equivalent cap. Harness itself never compares
+accumulated spend against the budget. So even for the one field that
+exists, coverage is the Claude CodeAgent path only, and honesty depends
+on that CLI: the budget is advisory fiction.
 
 ### 2. The only subsystem that sets a budget: GC
 
