@@ -1,8 +1,13 @@
+#[cfg(feature = "server")]
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{ArgAction, Args, Parser, Subcommand};
+#[cfg(feature = "server")]
 use harness_server::server::RuntimeLogMetadata;
+#[cfg(feature = "server")]
 use std::cmp::Ordering;
-use std::fs::{self, File, OpenOptions};
+#[cfg(feature = "server")]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,14 +15,19 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 
 mod eval;
 mod exec;
+#[cfg(feature = "server")]
 mod reconcile;
 mod runtime;
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod runtime_log_tests;
+#[cfg(feature = "server")]
 mod serve;
+mod server_cmds;
 mod status;
 
+#[cfg(feature = "server")]
 const RUNTIME_LOG_PREFIX: &str = "harness-serve-";
+#[cfg(feature = "server")]
 const RUNTIME_LOG_SUFFIX: &str = ".log";
 
 #[derive(Parser)]
@@ -437,9 +447,12 @@ impl Write for TeeWriter {
 }
 
 struct LoggingBootstrap {
+    #[cfg(feature = "server")]
     runtime_logs: RuntimeLogMetadata,
     runtime_log_file: Option<Arc<Mutex<File>>>,
+    #[cfg(feature = "server")]
     setup_warning: Option<String>,
+    #[cfg(feature = "server")]
     retention_warnings: Vec<String>,
 }
 
@@ -516,59 +529,33 @@ fn log_config_source(source: &ConfigSource) {
     }
 }
 
-fn log_runtime_log_status(bootstrap: &LoggingBootstrap) {
-    match bootstrap.runtime_logs.state {
-        harness_server::server::RuntimeLogState::Enabled => {
-            if let Some(path) = bootstrap.runtime_logs.active_path.as_ref() {
-                tracing::info!(
-                    path = %path.display(),
-                    retention_days = bootstrap.runtime_logs.retention_days,
-                    retention_max_files = bootstrap.runtime_logs.retention_max_files,
-                    "runtime logs persisted to file"
-                );
-            }
-            for warning in &bootstrap.retention_warnings {
-                tracing::warn!(warning = %warning, "runtime log retention cleanup skipped an entry");
-            }
-        }
-        harness_server::server::RuntimeLogState::Degraded => {
-            tracing::warn!(
-                path_hint = bootstrap
-                    .runtime_logs
-                    .path_hint
-                    .as_deref()
-                    .unwrap_or("logs"),
-                retention_days = bootstrap.runtime_logs.retention_days,
-                retention_max_files = bootstrap.runtime_logs.retention_max_files,
-                error = bootstrap
-                    .setup_warning
-                    .as_deref()
-                    .unwrap_or("unknown setup error"),
-                "runtime log persistence unavailable; continuing with console logging only"
-            );
-        }
-        harness_server::server::RuntimeLogState::Disabled => {}
-    }
-}
-
 fn prepare_logging(
     command: &Command,
     config: &harness_core::config::HarnessConfig,
 ) -> LoggingBootstrap {
-    match command {
-        Command::Serve { .. } => prepare_runtime_logs(config, Utc::now()),
-        _ => LoggingBootstrap {
-            runtime_logs: RuntimeLogMetadata::disabled(
-                config.observe.log_retention_days,
-                config.observe.log_retention_max_files,
-            ),
-            runtime_log_file: None,
-            setup_warning: None,
-            retention_warnings: Vec::new(),
-        },
+    #[cfg(feature = "server")]
+    if matches!(command, Command::Serve { .. }) {
+        return prepare_runtime_logs(config, Utc::now());
+    }
+    #[cfg(not(feature = "server"))]
+    let _ = (command, config);
+    #[cfg(feature = "server")]
+    let _ = command;
+    LoggingBootstrap {
+        #[cfg(feature = "server")]
+        runtime_logs: RuntimeLogMetadata::disabled(
+            config.observe.log_retention_days,
+            config.observe.log_retention_max_files,
+        ),
+        runtime_log_file: None,
+        #[cfg(feature = "server")]
+        setup_warning: None,
+        #[cfg(feature = "server")]
+        retention_warnings: Vec::new(),
     }
 }
 
+#[cfg(feature = "server")]
 fn prepare_runtime_logs(
     config: &harness_core::config::HarnessConfig,
     started_at: DateTime<Utc>,
@@ -602,6 +589,7 @@ fn prepare_runtime_logs(
     }
 }
 
+#[cfg(feature = "server")]
 fn runtime_log_path(data_dir: &Path, started_at: DateTime<Utc>, pid: u32) -> PathBuf {
     data_dir.join("logs").join(format!(
         "{RUNTIME_LOG_PREFIX}{}-pid{pid}{RUNTIME_LOG_SUFFIX}",
@@ -609,6 +597,7 @@ fn runtime_log_path(data_dir: &Path, started_at: DateTime<Utc>, pid: u32) -> Pat
     ))
 }
 
+#[cfg(feature = "server")]
 fn open_runtime_log_file(
     log_path: &Path,
     retention_days: u32,
@@ -633,6 +622,7 @@ fn open_runtime_log_file(
     Ok((file, retention_warnings))
 }
 
+#[cfg(feature = "server")]
 fn purge_stale_runtime_logs(
     logs_dir: &Path,
     retention_days: u32,
@@ -650,6 +640,7 @@ fn purge_stale_runtime_logs(
     )
 }
 
+#[cfg(feature = "server")]
 fn purge_stale_runtime_logs_with(
     logs_dir: &Path,
     retention_days: u32,
@@ -730,12 +721,14 @@ fn purge_stale_runtime_logs_with(
 }
 
 #[derive(Debug)]
+#[cfg(feature = "server")]
 struct RuntimeLogEntry {
     started_at: DateTime<Utc>,
     pid: u32,
     path: PathBuf,
 }
 
+#[cfg(feature = "server")]
 fn compare_runtime_logs(
     left: &RuntimeLogEntry,
     right: &RuntimeLogEntry,
@@ -750,6 +743,7 @@ fn compare_runtime_logs(
         .then_with(|| left.path.cmp(&right.path))
 }
 
+#[cfg(feature = "server")]
 fn parse_runtime_log_identity(file_name: &str) -> Option<(DateTime<Utc>, u32)> {
     let trimmed = file_name
         .strip_prefix(RUNTIME_LOG_PREFIX)?
@@ -783,7 +777,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     {
         tracing::warn!(network_policy = "deny", "scoped CLI agents have no network access, including model-provider connectivity; configure exact provider hosts in isolation.network_allowlist and use container isolation for allowlisted Linux workloads");
     }
-    log_runtime_log_status(&logging);
+    server_cmds::log_runtime_log_status(&logging);
 
     // Register the central base WORKFLOW.md (sibling of the loaded config file,
     // e.g. config/WORKFLOW.md) as the single source of default workflow policy.
@@ -812,14 +806,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             projects,
             default_project,
         } => {
-            serve::run(
+            server_cmds::run_serve(
                 config,
                 transport,
                 port,
                 project_root,
                 projects,
                 default_project,
-                logging.runtime_logs.clone(),
+                &logging,
             )
             .await?;
         }
@@ -1069,7 +1063,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
 
         Command::Reconcile { dry_run, project } => {
-            reconcile::run(dry_run, project, &config).await?;
+            server_cmds::run_reconcile(dry_run, project, &config).await?;
         }
     }
 
