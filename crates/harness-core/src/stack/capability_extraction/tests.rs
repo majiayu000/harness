@@ -18,15 +18,13 @@ const STATIC: &str = "hook.static_command";
 const PREFLIGHT: &str = ".harness/guards/preflight.sh";
 const PRE_PUSH: &str = ".harness/guards/pre-push.sh";
 
-fn tmp() -> TempDir {
-    tempfile::tempdir().expect("tempdir")
-}
+#[rustfmt::skip]
+fn tmp() -> TempDir { tempfile::tempdir().expect("tempdir") }
 
+#[rustfmt::skip]
 fn write_control(root: &Path, rel: &str, contents: impl AsRef<[u8]>) {
     let path = root.join(rel);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).expect("mkdir");
-    }
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent).expect("mkdir"); }
     fs::write(path, contents).expect("write");
 }
 
@@ -36,12 +34,8 @@ macro_rules! write_files {
     };
 }
 
-fn run(root: &Path) -> AgentStackCapabilityExtraction {
-    extract_repository_capability_evidence(&AgentStackCapabilityExtractionOptions::new(
-        root.to_path_buf(),
-    ))
-    .expect("extraction succeeds")
-}
+#[rustfmt::skip]
+fn run(root: &Path) -> AgentStackCapabilityExtraction { extract_repository_capability_evidence(&AgentStackCapabilityExtractionOptions::new(root.to_path_buf())).expect("extraction succeeds") }
 
 #[rustfmt::skip]
 fn rows(extraction: &AgentStackCapabilityExtraction) -> Vec<Row<'_>> {
@@ -49,35 +43,28 @@ fn rows(extraction: &AgentStackCapabilityExtraction) -> Vec<Row<'_>> {
         item.component().source().locator().as_str(), item.capability(), item.rule_id(), item.confidence()
     )).collect()
 }
-fn assert_rows(extraction: &AgentStackCapabilityExtraction, expected: &[ExpectedRow]) {
-    assert_eq!(rows(extraction).as_slice(), expected);
-}
+#[rustfmt::skip]
+fn assert_rows(extraction: &AgentStackCapabilityExtraction, expected: &[ExpectedRow]) { assert_eq!(rows(extraction).as_slice(), expected); }
 
 #[test]
+#[rustfmt::skip]
 fn raised_file_limit_is_applied_to_inventory_and_extraction() {
     let dir = tmp();
     let padding = "x".repeat(64 * 1024 * 1024);
-    write_control(
-        dir.path(),
-        ".mcp.json",
-        format!(r#"{{"capabilities":["network"],"padding":"{padding}"}}"#),
-    );
+    write_control(dir.path(), ".mcp.json", format!(r#"{{"capabilities":["network"],"padding":"{padding}"}}"#));
     let requested_limit = 65 * 1024 * 1024;
     let options = AgentStackCapabilityExtractionOptions::new(dir.path().to_path_buf())
         .with_max_file_bytes(requested_limit)
         .expect("valid raised limit");
     assert_eq!(options.max_total_bytes, requested_limit);
-    let extraction = extract_repository_capability_evidence(&options)
-        .expect("raised limit reaches inventory and extraction");
-    assert_rows(
-        &extraction,
-        &[(PING, Capability::Network, "mcp.explicit_capabilities", High)],
-    );
+    let extraction = extract_repository_capability_evidence(&options).expect("raised limit reaches inventory and extraction");
+    assert_rows(&extraction, &[(PING, Capability::Network, "mcp.explicit_capabilities", High)]);
 }
 
 const PING: &str = ".mcp.json";
 
 #[test]
+#[rustfmt::skip]
 fn changed_content_is_rejected_after_inventory() {
     let dir = tmp();
     let original = br#"{"capabilities":["network"]}"#;
@@ -85,12 +72,7 @@ fn changed_content_is_rejected_after_inventory() {
     let options = AgentStackCapabilityExtractionOptions::new(dir.path().to_path_buf());
     let root = Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).expect("open root");
     let inventory = inventory_with_root(&root, &options.inventory_options).expect("inventory");
-    let component = inventory
-        .entries()
-        .iter()
-        .find(|entry| entry.component().source().locator().as_str() == PING)
-        .expect("MCP component")
-        .component();
+    let component = inventory.entries().iter().find(|entry| entry.component().source().locator().as_str() == PING).expect("MCP component").component();
     let mut remaining_bytes = original.len() as u64;
     #[rustfmt::skip]
     macro_rules! read { () => { read_text(&root, component, PING, options.max_file_bytes, &mut remaining_bytes) }; }
@@ -134,64 +116,85 @@ fn capability_extraction_reads_supported_declarations_and_static_commands() {
         &[
             (".harness/guards/group.sh", Capability::Network, STATIC, Low),
             (PRE_PUSH, Capability::Network, META, High),
-            (PREFLIGHT, Capability::Destructive, STATIC, Low),
-            (PREFLIGHT, Capability::FileWrite, STATIC, Low),
-            (PREFLIGHT, Capability::Network, STATIC, Low),
-            (PREFLIGHT, Capability::ProductionWrite, STATIC, Low),
-            (PREFLIGHT, Capability::Shell, META, High),
-            (PING, Capability::Destructive, SCHEMA, Medium),
-            (PING, Capability::FileWrite, SCHEMA, Medium),
-            (PING, Capability::Network, SCHEMA, Medium),
-            (PING, Capability::Network, SERVER, Medium),
-            (PING, Capability::ProductionWrite, SCHEMA, Medium),
-            (PING, Capability::SecretRead, SCHEMA, Medium),
-            (PING, Capability::SecretRead, SERVER, Medium),
-            (PING, Capability::Shell, SCHEMA, Medium),
-            (PING, Capability::Shell, SERVER, Medium),
+            (PREFLIGHT, Capability::Destructive, STATIC, Low), (PREFLIGHT, Capability::FileWrite, STATIC, Low), (PREFLIGHT, Capability::Network, STATIC, Low), (PREFLIGHT, Capability::ProductionWrite, STATIC, Low), (PREFLIGHT, Capability::Shell, META, High),
+            (PING, Capability::Destructive, SCHEMA, Medium), (PING, Capability::FileWrite, SCHEMA, Medium), (PING, Capability::Network, SCHEMA, Medium),
+            (PING, Capability::Network, SERVER, Medium), (PING, Capability::ProductionWrite, SCHEMA, Medium), (PING, Capability::SecretRead, SCHEMA, Medium),
+            (PING, Capability::SecretRead, SERVER, Medium), (PING, Capability::Shell, SCHEMA, Medium), (PING, Capability::Shell, SERVER, Medium),
             (".vibeguard/policy.json5", Capability::Network, POLICY, High),
-            ("mcp.json", Capability::FileWrite, SCHEMA, Medium),
-            ("mcp.json", Capability::Network, SCHEMA, Medium),
-            ("mcp.json", Capability::SecretRead, SCHEMA, Medium),
-            ("mcp.json", Capability::SecretRead, SERVER, Medium),
-            ("mcp.json", Capability::Shell, SCHEMA, Medium),
-            ("policy.rules", Capability::Destructive, PREFIX, Medium),
-            ("policy.rules", Capability::FileWrite, PREFIX, Medium),
-            ("policy.rules", Capability::Network, PREFIX, Medium),
-            ("policy.rules", Capability::ProductionWrite, PREFIX, Medium),
-            ("policy.rules", Capability::Shell, PREFIX, Medium),
-            ("requirements.toml", Capability::Destructive, PREFIX, Medium),
-            ("requirements.toml", Capability::FileWrite, PREFIX, Medium),
-            ("requirements.toml", Capability::Network, PREFIX, Medium),
+            ("mcp.json", Capability::FileWrite, SCHEMA, Medium), ("mcp.json", Capability::Network, SCHEMA, Medium), ("mcp.json", Capability::SecretRead, SCHEMA, Medium),
+            ("mcp.json", Capability::SecretRead, SERVER, Medium), ("mcp.json", Capability::Shell, SCHEMA, Medium),
+            ("policy.rules", Capability::Destructive, PREFIX, Medium), ("policy.rules", Capability::FileWrite, PREFIX, Medium), ("policy.rules", Capability::Network, PREFIX, Medium),
+            ("policy.rules", Capability::ProductionWrite, PREFIX, Medium), ("policy.rules", Capability::Shell, PREFIX, Medium),
+            ("requirements.toml", Capability::Destructive, PREFIX, Medium), ("requirements.toml", Capability::FileWrite, PREFIX, Medium), ("requirements.toml", Capability::Network, PREFIX, Medium),
             ("rules/windows.md", Capability::SecretRead, POLICY, High),
         ],
     );
     assert!(extraction.evidence().iter().all(|item| !item.reason().trim().is_empty()));
     let schema_reasons = extraction.evidence().iter().filter(|item| item.component().source().locator().as_str() == "mcp.json" && item.rule_id() == SCHEMA).map(|item| item.reason()).collect::<Vec<_>>();
-    assert!(schema_reasons
-        .iter()
-        .any(|reason| reason.contains("APIToken")));
-    assert!(schema_reasons
-        .iter()
-        .any(|reason| reason.contains("HTTPCommand")));
-    assert!(schema_reasons.iter().any(|reason| reason.contains("URLValue")));
-    assert!(schema_reasons.iter().all(|reason| !reason.contains("tokenEndpoint")));
+    assert!(schema_reasons.iter().any(|reason| reason.contains("APIToken"))); assert!(schema_reasons.iter().any(|reason| reason.contains("HTTPCommand")));
+    assert!(schema_reasons.iter().any(|reason| reason.contains("URLValue"))); assert!(schema_reasons.iter().all(|reason| !reason.contains("tokenEndpoint")));
 }
 
 #[test]
+#[rustfmt::skip]
+fn shell_syntax_boundaries_preserve_real_commands_and_mutations() {
+    let dir = tmp();
+    write_files!(
+        dir.path(),
+        ".harness/guards/git-mutate.sh" => b"git -C . add file; git restore file\n",
+        ".harness/guards/git-read.sh" => b"git -C . show push\n",
+        ".harness/guards/hash.sh" => b"printf '%s' foo#bar; curl https://example.invalid\n",
+        ".harness/guards/heredoc-hash.sh" => b"cat <<EOF#suffix\ncurl https://ignored.invalid\nEOF#suffix\ncat <<ESC\\ #suffix\ncurl https://also-ignored.invalid\nESC #suffix\n",
+        ".harness/guards/fd.sh" => b"printf x >&2; printf x 2>&1; printf x 2>&-\n",
+        ".harness/guards/redirect.sh" => b"printf '%s' value 2>>generated.conf\n",
+        ".harness/guards/sudo.sh" => b"doas -a persist rm -rf output\nsudo -nEu root rm -rf output\n",
+    );
+    assert_rows(&run(dir.path()), &[
+        (".harness/guards/git-mutate.sh", Capability::Destructive, STATIC, Low), (".harness/guards/git-mutate.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/hash.sh", Capability::Network, STATIC, Low),
+        (".harness/guards/redirect.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/sudo.sh", Capability::Destructive, STATIC, Low), (".harness/guards/sudo.sh", Capability::FileWrite, STATIC, Low), (".harness/guards/sudo.sh", Capability::Privileged, STATIC, Low),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn typed_sources_honor_path_semantics_bom_docs_and_secret_references() {
+    let dir = tmp();
+    write_files!(
+        dir.path(),
+        "harness.toml" => b"[rules]\ndiscovery_paths = [\"custom.policy\", \"policies\"]\nbuiltin_path = \"builtins\"\nrequirements_path = \"policy.star\"\n",
+        PING => br#"{"mcpServers":{"remote":{"env":{"CUSTOM_AUTH":"${GITHUB_TOKEN}"}}}}"#,
+        ".vibeguard/example.json" => br#"{"examples":[{"harness_capabilities":["destructive"]}]}"#,
+        "builtins/child.toml" => b"---\ncapabilities: [shell]\n---\n# Builtin\n",
+        "custom.policy" => "\u{feff}---\ncapabilities: [secret_read]\n---\n# Custom\n",
+        "policies/nested/policy.toml" => b"---\ncapabilities: [network]\n---\n# Nested\n",
+        "policy.star" => b"[rules]\n[[rules.prefix_rules]]\npattern = [{ token = \"curl\" }]\ndecision = \"prompt\"\n",
+        "rules/bom.md" => "\u{feff}---\ncapabilities: [destructive]\n---\n# Policy\n",
+    );
+    assert_rows(&run(dir.path()), &[
+        (PING, Capability::SecretRead, SERVER, Medium), ("builtins/child.toml", Capability::Shell, POLICY, High),
+        ("custom.policy", Capability::SecretRead, POLICY, High), ("policies/nested/policy.toml", Capability::Network, POLICY, High),
+        ("policy.star", Capability::Network, PREFIX, Medium), ("rules/bom.md", Capability::Destructive, POLICY, High),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
 fn unsupported_and_documentation_sources_do_not_emit_evidence() {
     let dir = tmp();
     let outside = tmp();
-    write_control(
-        outside.path(),
-        "outside.toml",
-        b"capabilities = [\"destructive\"]\n",
-    );
+    write_control(outside.path(), "outside.toml", b"capabilities = [\"destructive\"]\n");
     write_files!(
         dir.path(),
         "harness.toml" => format!("[rules]\ndiscovery_paths = [\"{}\"]\n", outside.path().join("outside.toml").display()),
+        ".gitignore" => b".mcp.json\nrules/\n",
+        PING => br#"{"capabilities":["network"]}"#,
         ".harness/guards/binary.sh" => b"#!/bin/sh\n# harness-capabilities: shell\n\xff\xfe",
-        ".harness/generated/policy.toml" => b"capabilities = [\"network\"]\n",
+        ".vibeguard/generated/policy.toml" => b"capabilities = [\"network\"]\n",
         "README.md" => b"capabilities = [\"destructive\"]\n",
+        "rules/.gitignore" => b"!reinclude.md\n",
+        "rules/reinclude.md" => b"---\ncapabilities: [network]\n---\n",
         ".harness/guards/preflight.sh" => b"#!/bin/sh\necho \"rm -rf /tmp/example\"\nprintf 'curl https://example.invalid'\necho foo\\; rm -rf output\necho \"start\n\\c\\u\\r\\l\" <<EOF\nrm -rf /tmp/example\n EOF\ncurl https://example.invalid\nEOF\n",
         "rules/security.md" => b"# Never run `rm -rf /`, `curl`, or `kubectl delete` from docs.\n",
     );
@@ -207,11 +210,7 @@ fn extractor_reports_parse_and_invalid_declaration_failures() {
     let dir = tmp();
     let names = (0..typed::MAX_COMPONENT_FINDINGS).map(|index| format!("invalid{index}")).collect::<Vec<_>>().join(" ");
     let deeply_nested = format!("{}{{capabilities:['network']}}{}", "[".repeat(129), "]".repeat(129));
-    let unicode_nested = format!(
-        "{{// comment\u{2028}{}0{} }}",
-        "[".repeat(129),
-        "]".repeat(129)
-    );
+    let unicode_nested = format!("{{// comment\u{2028}{}0{} }}", "[".repeat(129), "]".repeat(129));
     write_files!(
         dir.path(),
         PING => b"{ not valid json",

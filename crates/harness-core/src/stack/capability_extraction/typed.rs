@@ -15,27 +15,20 @@ pub(super) const MAX_COMPONENT_FINDINGS: usize = 256;
 pub(super) const LIMIT_RULE_ID: &str = "extraction.finding_limit";
 
 #[rustfmt::skip]
-pub(super) fn extract_typed(component: &AgentStackComponent, locator: &str, text: &str, is_requirements: bool, is_starlark: bool, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
-    if component.kind() == AgentStackComponentKind::Hook {
-        extract_hook_metadata(component, locator, text, raw, failures);
-        return;
-    }
+#[derive(Debug, Clone, Copy)]
+pub(super) enum TypedSource { Auto, Requirements, Starlark, MarkdownPolicy }
 
-    if is_starlark {
-        collect_starlark_prefix_rules(component, locator, text, raw, failures);
-        return;
-    }
-    let Some(format) = is_requirements.then_some(FileFormat::Toml).or_else(|| file_format(locator)) else {
-        return;
-    };
+#[rustfmt::skip]
+pub(super) fn extract_typed(component: &AgentStackComponent, locator: &str, text: &str, source_kind: TypedSource, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if component.kind() == AgentStackComponentKind::Hook { extract_hook_metadata(component, locator, text, raw, failures); return; }
+    if matches!(source_kind, TypedSource::Starlark) { collect_starlark_prefix_rules(component, locator, text, raw, failures); return; }
+    let Some(format) = (match source_kind { TypedSource::Requirements => Some(FileFormat::Toml), TypedSource::MarkdownPolicy => Some(FileFormat::Markdown), TypedSource::Auto => file_format(locator), TypedSource::Starlark => unreachable!() }) else { return; };
+    let is_requirements = matches!(source_kind, TypedSource::Requirements);
     let source = match format.source(text) {
         Ok(Some(source)) => source,
         Ok(None) => return,
-        Err(()) => {
-            let (_, parse_rule_id, label) = format.metadata();
-            push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::ParseFailed, Some(parse_rule_id), format!("{locator} is not valid {label}"));
-            return;
-        }
+        Err(()) => { let (_, rule, label) = format.metadata(); push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::ParseFailed, Some(rule), format!("{locator} is not valid {label}")); return; }
     };
     let (root_name, parse_rule_id, label) = format.metadata();
     match format.parse(source) {
@@ -45,14 +38,10 @@ pub(super) fn extract_typed(component: &AgentStackComponent, locator: &str, text
                 return;
             }
             collect_explicit_capabilities(component, &value, root_name, rule_id_for_explicit(component.kind()), true, raw, failures);
-            if component.kind() == AgentStackComponentKind::McpServer {
-                collect_mcp_capabilities(component, &value, raw, failures);
-            }
+            if component.kind() == AgentStackComponentKind::McpServer { collect_mcp_capabilities(component, &value, raw, failures); }
             collect_policy_prefix_rules(component, &value, is_requirements, raw, failures);
         }
-        Err(()) => {
-            push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::ParseFailed, Some(parse_rule_id), format!("{locator} is not valid {label}"));
-        }
+        Err(()) => { push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::ParseFailed, Some(parse_rule_id), format!("{locator} is not valid {label}")); }
     }
 }
 
@@ -65,77 +54,43 @@ const MAX_JSON5_DEPTH: usize = 128;
 #[rustfmt::skip]
 enum Json5State { Code, String(u8), LineComment, BlockComment }
 
+#[rustfmt::skip]
 fn validate_json5_structure(text: &str) -> Result<(), ()> {
-    let bytes = text.as_bytes();
-    let mut state = Json5State::Code;
-    let mut depth = 0;
-    let mut index = 0;
+    let bytes = text.as_bytes(); let mut state = Json5State::Code;
+    let mut depth = 0; let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
         match state {
             Json5State::Code => match (byte, bytes.get(index + 1).copied()) {
-                (b'/', Some(b'/')) => {
-                    state = Json5State::LineComment;
-                    index += 1;
-                }
-                (b'/', Some(b'*')) => {
-                    state = Json5State::BlockComment;
-                    index += 1;
-                }
+                (b'/', Some(b'/')) => { state = Json5State::LineComment; index += 1; }
+                (b'/', Some(b'*')) => { state = Json5State::BlockComment; index += 1; }
                 (b'\'' | b'"', _) => state = Json5State::String(byte),
-                (b'{' | b'[', _) => {
-                    depth += 1;
-                    if depth > MAX_JSON5_DEPTH {
-                        return Err(());
-                    }
-                }
+                (b'{' | b'[', _) => { depth += 1; if depth > MAX_JSON5_DEPTH { return Err(()); } }
                 (b'}' | b']', _) => depth = depth.saturating_sub(1),
                 _ => {}
             },
-            Json5State::String(quote) => {
-                if byte == b'\\' {
-                    index += 1;
-                } else if byte == quote {
-                    state = Json5State::Code;
-                }
-            }
+            Json5State::String(quote) => { if byte == b'\\' { index += 1; } else if byte == quote { state = Json5State::Code; } }
             Json5State::LineComment
                 if matches!(byte, b'\n' | b'\r')
                     || bytes[index..].starts_with(&[0xe2, 0x80, 0xa8])
                     || bytes[index..].starts_with(&[0xe2, 0x80, 0xa9]) =>
-            {
-                state = Json5State::Code
-            }
-            Json5State::BlockComment if byte == b'*' && bytes.get(index + 1) == Some(&b'/') => {
-                state = Json5State::Code;
-                index += 1;
-            }
+            { state = Json5State::Code }
+            Json5State::BlockComment if byte == b'*' && bytes.get(index + 1) == Some(&b'/') => { state = Json5State::Code; index += 1; }
             Json5State::LineComment | Json5State::BlockComment => {}
         }
         index += 1;
     }
-    match state {
-        Json5State::Code | Json5State::LineComment => Ok(()),
-        Json5State::String(_) | Json5State::BlockComment => Err(()),
-    }
+    match state { Json5State::Code | Json5State::LineComment => Ok(()), Json5State::String(_) | Json5State::BlockComment => Err(()) }
 }
+#[rustfmt::skip]
 impl FileFormat {
-    fn source(self, text: &str) -> Result<Option<&str>, ()> {
-        match self {
-            Self::Markdown => yaml_front_matter(text),
-            _ => Ok(Some(text)),
-        }
-    }
+    fn source(self, text: &str) -> Result<Option<&str>, ()> { match self { Self::Markdown => yaml_front_matter(text), _ => Ok(Some(text)) } }
 
     fn parse(self, text: &str) -> Result<Value, ()> {
         match self {
             Self::Json => serde_json::from_str(text).map_err(|_| ()),
-            Self::Json5 => {
-                validate_json5_structure(text).and_then(|()| json5::from_str(text).map_err(|_| ()))
-            }
-            Self::Toml => toml::from_str::<toml::Value>(text)
-                .map_err(|_| ())
-                .and_then(|value| serde_json::to_value(value).map_err(|_| ())),
+            Self::Json5 => validate_json5_structure(text).and_then(|()| json5::from_str(text).map_err(|_| ())),
+            Self::Toml => toml::from_str::<toml::Value>(text).map_err(|_| ()).and_then(|value| serde_json::to_value(value).map_err(|_| ())),
             Self::Yaml | Self::Markdown => serde_yaml::from_str(text).map_err(|_| ()),
         }
     }
@@ -151,9 +106,9 @@ impl FileFormat {
         }
     }
 }
+#[rustfmt::skip]
 fn file_format(locator: &str) -> Option<FileFormat> {
-    let path = Path::new(locator);
-    match path.extension().and_then(OsStr::to_str) {
+    match Path::new(locator).extension().and_then(OsStr::to_str) {
         Some("json") => Some(FileFormat::Json),
         Some("json5") => Some(FileFormat::Json5),
         Some("toml") => Some(FileFormat::Toml),
@@ -162,6 +117,7 @@ fn file_format(locator: &str) -> Option<FileFormat> {
         _ => None,
     }
 }
+#[rustfmt::skip]
 fn rule_id_for_explicit(kind: AgentStackComponentKind) -> &'static str {
     match kind {
         AgentStackComponentKind::McpServer => "mcp.explicit_capabilities",
@@ -176,9 +132,7 @@ fn collect_explicit_capabilities(component: &AgentStackComponent, value: &Value,
     match value {
         Value::Object(map) => {
             for (key, child) in map {
-                if component.kind() == AgentStackComponentKind::McpServer
-                    && is_documentation_key(key)
-                {
+                if is_documentation_key(key) {
                     continue;
                 }
                 let child_path = format!("{path}.{key}");
@@ -380,19 +334,15 @@ fn schema_name_matches(name: &str, needles: &[&str]) -> bool {
     })
 }
 
-fn is_documentation_key(key: &str) -> bool {
-    matches!(
-        key,
-        "description" | "example" | "examples" | "title" | "default"
-    )
-}
+#[rustfmt::skip]
+fn is_documentation_key(key: &str) -> bool { matches!(key, "description" | "example" | "examples" | "title" | "default") }
 
+#[rustfmt::skip]
 fn has_nonempty_value(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::String(value) => !value.trim().is_empty(),
-        Value::Array(values) => values.iter().any(has_nonempty_value),
-        Value::Object(values) => values.values().any(has_nonempty_value),
+        Value::Array(values) => values.iter().any(has_nonempty_value), Value::Object(values) => values.values().any(has_nonempty_value),
         Value::Bool(_) | Value::Number(_) => true,
     }
 }
@@ -400,7 +350,24 @@ fn has_nonempty_value(value: &Value) -> bool {
 #[rustfmt::skip]
 fn has_sensitive_binding(value: &Value) -> bool {
     const NAMES: &[&str] = &["authorization", "token", "secret", "api_key", "api-key", "apikey", "password", "credential", "cookie", "access_key"];
-    value.as_object().is_some_and(|values| values.iter().any(|(name, value)| has_nonempty_value(value) && schema_name_matches(name, NAMES)))
+    match value {
+        Value::Object(values) => values.iter().any(|(name, value)| (has_nonempty_value(value) && schema_name_matches(name, NAMES)) || has_sensitive_binding(value)),
+        Value::Array(values) => values.iter().any(has_sensitive_binding),
+        Value::String(value) => sensitive_reference(value, NAMES),
+        _ => false,
+    }
+}
+
+#[rustfmt::skip]
+fn sensitive_reference(value: &str, names: &[&str]) -> bool {
+    let bytes = value.as_bytes(); let mut index = 0;
+    while let Some(offset) = bytes[index..].iter().position(|byte| *byte == b'$') {
+        index += offset + 1;
+        let braced = bytes.get(index) == Some(&b'{'); if braced { index += 1; } let start = index;
+        while bytes.get(index).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') { index += 1; }
+        if start < index && (!braced || bytes.get(index) == Some(&b'}')) && schema_name_matches(&value[start..index], names) { return true; }
+    }
+    false
 }
 
 #[rustfmt::skip]

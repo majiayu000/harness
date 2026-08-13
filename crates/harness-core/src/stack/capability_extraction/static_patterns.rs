@@ -3,9 +3,7 @@ use crate::stack::{AgentStackCapability, AgentStackComponent, AgentStackComponen
 use std::collections::VecDeque;
 #[rustfmt::skip]
 pub(super) fn extract_static(component: &AgentStackComponent, locator: &str, text: &str) -> Vec<RawCapability> {
-    if component.kind() != AgentStackComponentKind::Hook {
-        return Vec::new();
-    }
+    if component.kind() != AgentStackComponentKind::Hook { return Vec::new(); }
     let mut by_capability = std::collections::BTreeMap::<&'static str, RawCapability>::new();
     let mut quote = None;
     let mut heredocs = VecDeque::<(String, bool)>::new();
@@ -21,7 +19,7 @@ pub(super) fn extract_static(component: &AgentStackComponent, locator: &str, tex
         if logical_line.as_bytes().iter().rev().take_while(|byte| **byte == b'\\').count() % 2 == 1 { logical_line.pop(); continue; }
         let line = logical_line.as_str();
         let next_heredocs = heredoc_delimiters(line, quote);
-        let commands = shell_commands_outside_quotes(line, &mut quote);
+        let (commands, writes_file) = shell_commands_outside_quotes(line, &mut quote);
         pending_heredocs.extend(next_heredocs);
         if quote.is_none() { heredocs.append(&mut pending_heredocs); }
         for tokens in commands {
@@ -31,18 +29,23 @@ pub(super) fn extract_static(component: &AgentStackComponent, locator: &str, tex
                 ));
             }
         }
+        if writes_file { by_capability.entry(AgentStackCapability::FileWrite.as_str()).or_insert_with(|| inferred_raw(AgentStackCapability::FileWrite, "hook.static_command", format!("{locator} uses an output redirection associated with file_write"), AgentStackCapabilityExtractionConfidence::Low)); }
         logical_line.clear();
     }
     by_capability.into_values().collect()
 }
 #[rustfmt::skip]
 pub(super) fn classify_command_tokens(tokens: &[String]) -> Vec<AgentStackCapability> {
-    use AgentStackCapability::{Destructive, FileWrite, Network, ProductionWrite, Shell};
+    use AgentStackCapability::{Destructive, FileWrite, Network, Privileged, ProductionWrite, Shell};
     let mut capabilities = Vec::new();
     let Some(program) = tokens.first().map(|token| command_basename(token)) else {
         return capabilities;
     };
     match program {
+        "sudo" | "doas" => {
+            capabilities.push(Privileged);
+            if let Some(start) = wrapped_command_start(tokens) { for capability in classify_command_tokens(&tokens[start..]) { push_unique(&mut capabilities, capability); } }
+        }
         "bash" | "sh" | "zsh" | "fish" | "python" | "python3" | "node" | "ruby" | "perl" => capabilities.push(Shell),
         "curl" | "wget" | "ssh" | "scp" | "rsync" => capabilities.push(Network),
         "rm" | "rmdir" | "unlink" => capabilities.extend([Destructive, FileWrite]),
@@ -50,73 +53,70 @@ pub(super) fn classify_command_tokens(tokens: &[String]) -> Vec<AgentStackCapabi
         "git" => classify_git(tokens, &mut capabilities),
         "gh" => {
             capabilities.push(Network);
-            if contains_any(tokens, &["delete", "edit", "merge", "close", "release"]) {
-                capabilities.push(ProductionWrite);
-            }
+            if contains_any(tokens, &["delete", "edit", "merge", "close", "release"]) { capabilities.push(ProductionWrite); }
         }
         "kubectl" | "helm" | "terraform" | "aws" | "gcloud" | "az" | "docker" => {
             capabilities.push(Network);
-            if contains_any(tokens, &["apply", "delete", "destroy", "deploy", "push", "release", "update"]) {
-                capabilities.push(ProductionWrite);
-            }
+            if contains_any(tokens, &["apply", "delete", "destroy", "deploy", "push", "release", "update"]) { capabilities.push(ProductionWrite); }
         }
         _ => {}
     }
     capabilities
 }
-fn shell_commands_outside_quotes(line: &str, quote: &mut Option<char>) -> Vec<Vec<String>> {
-    let mut commands = Vec::new();
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut escaped = false;
-    let mut suppress_carried_content = quote.is_some();
-    for ch in line.chars() {
+#[rustfmt::skip]
+fn shell_commands_outside_quotes(line: &str, quote: &mut Option<char>) -> (Vec<Vec<String>>, bool) {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut commands = Vec::new(); let mut tokens = Vec::new(); let mut current = String::new();
+    let mut escaped = false; let mut suppress_carried_content = quote.is_some(); let mut word_started = quote.is_some(); let mut writes_file = false;
+    for (index, &ch) in chars.iter().enumerate() {
         if escaped {
-            if !suppress_carried_content {
-                current.push(ch);
-            }
-            escaped = false;
-            continue;
+            if !suppress_carried_content { current.push(ch); word_started = true; }
+            escaped = false; continue;
         }
         if let Some(active) = *quote {
-            if ch == active {
-                *quote = None;
-                suppress_carried_content = false;
-            } else if active == '"' && ch == '\\' {
-                escaped = true;
-            } else if !suppress_carried_content {
-                current.push(ch);
-            }
+            if ch == active { *quote = None; suppress_carried_content = false; }
+            else if active == '"' && ch == '\\' { escaped = true; }
+            else if !suppress_carried_content { current.push(ch); }
             continue;
         }
         match ch {
-            '\'' | '"' => *quote = Some(ch),
+            '\'' | '"' => { *quote = Some(ch); word_started = true; }
             '\\' => escaped = true,
-            '#' => break,
-            ';' | '|' | '&' | '(' | ')' => {
-                push_token(&mut tokens, &mut current);
-                push_command(&mut commands, &mut tokens);
-            }
-            ch if ch.is_whitespace() || matches!(ch, '<' | '>') => {
-                push_token(&mut tokens, &mut current)
-            }
-            _ => current.push(ch),
+            '#' if !word_started => break,
+            '#' => current.push(ch),
+            ';' | '|' | '&' | '(' | ')' => { push_token(&mut tokens, &mut current, &mut word_started); push_command(&mut commands, &mut tokens); }
+            '>' => { writes_file |= output_redirection_writes_path(&chars, index); push_token(&mut tokens, &mut current, &mut word_started) }
+            ch if ch.is_whitespace() || ch == '<' => push_token(&mut tokens, &mut current, &mut word_started),
+            _ => { current.push(ch); word_started = true; }
         }
     }
-    push_token(&mut tokens, &mut current);
-    push_command(&mut commands, &mut tokens);
-    commands
+    push_token(&mut tokens, &mut current, &mut word_started); push_command(&mut commands, &mut tokens);
+    (commands, writes_file)
+}
+
+#[rustfmt::skip]
+fn output_redirection_writes_path(chars: &[char], index: usize) -> bool {
+    let mut next = index + 1;
+    if chars.get(next).is_some_and(|ch| matches!(ch, '>' | '|')) { next += 1; }
+    while chars.get(next).is_some_and(|ch| ch.is_whitespace()) { next += 1; }
+    if chars.get(next) != Some(&'&') { return next < chars.len(); }
+    next += 1; while chars.get(next).is_some_and(|ch| ch.is_whitespace()) { next += 1; }
+    let boundary = |at: usize| chars.get(at).is_none_or(|ch| ch.is_whitespace() || ";|&()<>".contains(*ch));
+    if chars.get(next) == Some(&'-') && boundary(next + 1) { return false; }
+    let start = next; while chars.get(next).is_some_and(|ch| ch.is_ascii_digit()) { next += 1; }
+    !(start < next && boundary(next)) && start < chars.len()
 }
 #[rustfmt::skip]
 fn heredoc_delimiters(line: &str, mut quote: Option<char>) -> Vec<(String, bool)> {
     let bytes = line.as_bytes();
     let mut delimiters = Vec::new();
     let mut escaped = false;
+    let mut word_started = false;
     let mut index = 0;
     while index + 1 < bytes.len() {
         let byte = bytes[index];
         if escaped {
-            escaped = false;
+            escaped = false; word_started = true;
         } else if let Some(active) = quote {
             if byte == active as u8 {
                 quote = None;
@@ -125,9 +125,9 @@ fn heredoc_delimiters(line: &str, mut quote: Option<char>) -> Vec<(String, bool)
             }
         } else {
             match byte {
-                b'\\' => escaped = true,
-                b'\'' | b'"' => quote = Some(byte as char),
-                b'#' => break,
+                b'\\' => { escaped = true; word_started = true; }
+                b'\'' | b'"' => { quote = Some(byte as char); word_started = true; }
+                b'#' if !word_started => break,
                 b'<' if bytes[index + 1] == b'<' && bytes.get(index + 2) == Some(&b'<') => { index += 2; continue; }
                 b'<' if bytes[index + 1] == b'<' && bytes.get(index + 2) != Some(&b'<') => {
                     index += 2;
@@ -152,7 +152,8 @@ fn heredoc_delimiters(line: &str, mut quote: Option<char>) -> Vec<(String, bool)
                     if let Ok(value) = String::from_utf8(value) { delimiters.push((value, allows_tabs)); }
                     continue;
                 }
-                _ => {}
+                byte if byte.is_ascii_whitespace() || b";|&()<>".contains(&byte) => word_started = false,
+                _ => word_started = true,
             }
         }
         index += 1;
@@ -160,7 +161,7 @@ fn heredoc_delimiters(line: &str, mut quote: Option<char>) -> Vec<(String, bool)
     delimiters
 }
 #[rustfmt::skip]
-fn push_token(tokens: &mut Vec<String>, current: &mut String) { if !current.is_empty() { tokens.push(std::mem::take(current)); } }
+fn push_token(tokens: &mut Vec<String>, current: &mut String, word_started: &mut bool) { if *word_started { tokens.push(std::mem::take(current)); *word_started = false; } }
 
 #[rustfmt::skip]
 fn push_command(commands: &mut Vec<Vec<String>>, tokens: &mut Vec<String>) {
@@ -188,10 +189,42 @@ fn is_assignment(token: &str) -> bool {
 fn command_basename(token: &str) -> &str { token.rsplit('/').next().unwrap_or(token) }
 
 #[rustfmt::skip]
+fn wrapped_command_start(tokens: &[String]) -> Option<usize> {
+    let program = tokens.first().map(|token| command_basename(token))?;
+    let mut index = 1;
+    while let Some(token) = tokens.get(index) {
+        if token == "--" { index += 1; break; } else if !token.starts_with('-') { break; }
+        index += 1 + usize::from(wrapper_option_takes_next(program, token));
+    }
+    while tokens.get(index).is_some_and(|token| is_assignment(token)) { index += 1; }
+    (index < tokens.len()).then_some(index)
+}
+
+#[rustfmt::skip]
+fn wrapper_option_takes_next(program: &str, option: &str) -> bool {
+    const LONG: &[&str] = &["--user", "--group", "--host", "--prompt", "--close-from", "--command-timeout", "--chroot", "--chdir", "--role", "--type"];
+    if option.starts_with("--") { return program == "sudo" && LONG.contains(&option) && !option.contains('='); }
+    let value_options = if program == "doas" { "aCu" } else { "CDghpRrtTu" };
+    option.strip_prefix('-').and_then(|cluster| cluster.char_indices().find(|(_, ch)| value_options.contains(*ch)).map(|(at, ch)| at + ch.len_utf8() == cluster.len())).unwrap_or(false)
+}
+
+#[rustfmt::skip]
 fn classify_git(tokens: &[String], capabilities: &mut Vec<AgentStackCapability>) {
-    if contains_any(tokens, &["push", "pull", "fetch", "clone", "ls-remote"]) { push_unique(capabilities, AgentStackCapability::Network); }
-    if contains_any(tokens, &["push", "reset", "clean", "checkout", "rebase"]) { push_unique(capabilities, AgentStackCapability::FileWrite); }
-    if contains_any(tokens, &["push", "reset", "clean"]) { push_unique(capabilities, AgentStackCapability::Destructive); }
+    let Some(command) = git_subcommand(tokens) else { return; };
+    if ["push", "pull", "fetch", "clone", "ls-remote"].contains(&command) { push_unique(capabilities, AgentStackCapability::Network); }
+    if ["add", "am", "apply", "branch", "checkout", "cherry-pick", "clean", "clone", "commit", "fetch", "init", "merge", "mv", "pull", "push", "rebase", "reset", "restore", "revert", "rm", "stash", "submodule", "switch", "tag", "worktree"].contains(&command) { push_unique(capabilities, AgentStackCapability::FileWrite); }
+    if ["checkout", "clean", "push", "rebase", "reset", "restore", "rm"].contains(&command) { push_unique(capabilities, AgentStackCapability::Destructive); }
+}
+
+#[rustfmt::skip]
+fn git_subcommand(tokens: &[String]) -> Option<&str> {
+    const TAKES_VALUE: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--exec-path"];
+    let mut index = 1;
+    while let Some(token) = tokens.get(index) {
+        if token == "--" { return tokens.get(index + 1).map(String::as_str); } else if !token.starts_with('-') { return Some(token.as_str()); }
+        index += 1 + usize::from(TAKES_VALUE.contains(&token.as_str()) && !token.contains('='));
+    }
+    None
 }
 
 #[rustfmt::skip]
