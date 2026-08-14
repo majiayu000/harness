@@ -170,7 +170,7 @@ impl StackPolicyFacts {
                     "stack policy fact_id cannot be empty",
                 ));
             }
-            if !ids.insert(fact_id.to_owned()) {
+            if !ids.insert(fact_id) {
                 return Err(StackPolicyError::evaluation(format!(
                     "duplicate stack policy fact_id `{fact_id}`"
                 )));
@@ -248,9 +248,17 @@ impl StackChangeFact {
         match self {
             Self::ComponentAdded { component_id, .. }
             | Self::ComponentRemoved { component_id, .. }
-            | Self::ComponentModified { component_id, .. }
-            | Self::CapabilityEvidence { component_id, .. } => {
+            | Self::ComponentModified { component_id, .. } => {
                 ensure_non_empty("component_id", component_id)?;
+            }
+            Self::CapabilityEvidence {
+                component_id,
+                evidence_class,
+                trust_level,
+                ..
+            } => {
+                ensure_non_empty("component_id", component_id)?;
+                validate_capability_evidence_trust(*evidence_class, *trust_level)?;
             }
             Self::ProtectiveControlDiff { roles, .. } => {
                 if roles.is_empty() {
@@ -325,7 +333,7 @@ impl StackPolicyDocument {
                 self.schema_version
             )));
         }
-        ensure_unique_evidence("required evidence", &self.required_evidence)?;
+        ensure_unique_policy_evidence("required evidence", &self.required_evidence)?;
         if self.rules.is_empty() {
             return Err(StackPolicyError::parse(
                 "stack policy must declare at least one rule",
@@ -334,9 +342,14 @@ impl StackPolicyDocument {
 
         let mut ids = HashSet::new();
         for rule in &self.rules {
-            ensure_non_empty("rule id", &rule.id)?;
-            ensure_non_empty("rule reason", &rule.reason)?;
-            if !ids.insert(rule.id.clone()) {
+            ensure_policy_non_empty("rule id", &rule.id)?;
+            ensure_policy_non_empty("rule reason", &rule.reason)?;
+            if rule.id == MISSING_EVIDENCE_RULE_ID {
+                return Err(StackPolicyError::parse(format!(
+                    "stack policy rule id `{MISSING_EVIDENCE_RULE_ID}` is reserved"
+                )));
+            }
+            if !ids.insert(rule.id.as_str()) {
                 return Err(StackPolicyError::parse(format!(
                     "duplicate stack policy rule id `{}`",
                     rule.id
@@ -502,12 +515,14 @@ impl StackPolicyMatcher {
                 .then(Vec::new),
             Self::Any { conditions } => {
                 let mut matched = BTreeSet::new();
+                let mut any_matched = false;
                 for condition in conditions {
                     if let Some(fact_ids) = condition.matches(facts) {
+                        any_matched = true;
                         matched.extend(fact_ids);
                     }
                 }
-                (!matched.is_empty()).then(|| matched.into_iter().collect())
+                any_matched.then(|| matched.into_iter().collect())
             }
             Self::All { conditions } => {
                 let mut matched = BTreeSet::new();
@@ -582,7 +597,6 @@ impl StackPolicyEngine {
         &self,
         facts: &StackPolicyFacts,
     ) -> Result<StackPolicyEvaluation, StackPolicyError> {
-        self.policy.validate()?;
         facts.validate()?;
 
         let mut matched_rules = self.missing_required_evidence_matches(facts);
@@ -617,17 +631,18 @@ impl StackPolicyEngine {
             .filter(|rule_match| rule_match.precedence == winning_precedence)
             .map(|rule_match| rule_match.rule_id.clone())
             .collect();
-        let non_promote_decisions = matched_rules
+        let has_review = matched_rules
             .iter()
-            .map(|rule_match| rule_match.decision)
-            .filter(|decision| *decision != StackPolicyDecision::Promote)
-            .collect::<BTreeSet<_>>();
+            .any(|rule_match| rule_match.decision == StackPolicyDecision::Review);
+        let has_block = matched_rules
+            .iter()
+            .any(|rule_match| rule_match.decision == StackPolicyDecision::Block);
 
         Ok(StackPolicyEvaluation {
             decision,
             winning_precedence,
             winning_rule_ids,
-            conflicted: non_promote_decisions.len() > 1,
+            conflicted: has_review && has_block,
             precedence: precedence_entries(),
             matched_rules,
         })
@@ -689,6 +704,16 @@ fn ensure_non_empty(field: &str, value: &str) -> Result<(), StackPolicyError> {
     }
 }
 
+fn ensure_policy_non_empty(field: &str, value: &str) -> Result<(), StackPolicyError> {
+    if value.trim().is_empty() {
+        Err(StackPolicyError::parse(format!(
+            "stack policy {field} cannot be empty"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn ensure_non_empty_list<T>(field: &str, value: &[T]) -> Result<(), StackPolicyError> {
     if value.is_empty() {
         Err(StackPolicyError::parse(format!(
@@ -713,6 +738,46 @@ fn ensure_unique_evidence(
         }
     }
     Ok(())
+}
+
+fn ensure_unique_policy_evidence(
+    label: &str,
+    evidence: &[StackEvidenceKind],
+) -> Result<(), StackPolicyError> {
+    let mut seen = BTreeSet::new();
+    for kind in evidence {
+        if !seen.insert(*kind) {
+            return Err(StackPolicyError::parse(format!(
+                "duplicate {label} kind `{}`",
+                kind.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_capability_evidence_trust(
+    evidence_class: AgentStackCapabilityEvidenceClass,
+    trust_level: AgentStackTrustLevel,
+) -> Result<(), StackPolicyError> {
+    let valid = match evidence_class {
+        AgentStackCapabilityEvidenceClass::Declared => matches!(
+            trust_level,
+            AgentStackTrustLevel::SelfDeclared | AgentStackTrustLevel::RepositoryObserved
+        ),
+        AgentStackCapabilityEvidenceClass::Granted
+        | AgentStackCapabilityEvidenceClass::Observed => matches!(
+            trust_level,
+            AgentStackTrustLevel::RuntimeObserved | AgentStackTrustLevel::RunnerObserved
+        ),
+    };
+    valid.then_some(()).ok_or_else(|| {
+        StackPolicyError::evaluation(format!(
+            "capability evidence class `{}` is incompatible with trust level `{}`",
+            evidence_class.as_str(),
+            trust_level.as_str()
+        ))
+    })
 }
 
 fn ensure_unique_fields(fields: &[StackChangedField]) -> Result<(), StackPolicyError> {

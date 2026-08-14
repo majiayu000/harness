@@ -1,7 +1,7 @@
 use crate::stack_policy::{
     StackChangeFact, StackEvidenceCompleteness, StackEvidenceKind, StackPolicyDecision,
-    StackPolicyDocument, StackPolicyEngine, StackPolicyError, StackPolicyFacts,
-    STACK_POLICY_FACTS_SCHEMA_VERSION,
+    StackPolicyDocument, StackPolicyEngine, StackPolicyError, StackPolicyFacts, StackPolicyMatcher,
+    StackPolicyRule, STACK_POLICY_FACTS_SCHEMA_VERSION,
 };
 use harness_core::stack::capability_evidence::AgentStackCapabilityEvidenceClass;
 use harness_core::stack::{
@@ -243,4 +243,143 @@ fn stack_policy_evaluation_errors_are_engine_errors() {
         .expect_err("no matching rule should be an evaluation error");
 
     assert!(matches!(error, StackPolicyError::EngineEvaluation { .. }));
+}
+
+#[test]
+fn stack_policy_rejects_capability_evidence_with_incompatible_trust() {
+    let error = StackPolicyFacts::new(
+        complete_evidence(),
+        [StackChangeFact::CapabilityEvidence {
+            fact_id: "forged-declaration".to_string(),
+            component_id: "runtime:agent_runtime:codex-default".to_string(),
+            evidence_class: AgentStackCapabilityEvidenceClass::Declared,
+            capability: AgentStackCapability::Destructive,
+            trust_level: AgentStackTrustLevel::RunnerObserved,
+        }],
+    )
+    .expect_err("declared evidence cannot carry runner-observed trust");
+
+    assert!(matches!(error, StackPolicyError::EngineEvaluation { .. }));
+}
+
+#[test]
+fn stack_policy_rejects_reserved_synthetic_rule_id() {
+    let policy = StackPolicyDocument {
+        schema_version: crate::stack_policy::STACK_POLICY_SCHEMA_VERSION.to_string(),
+        required_evidence: vec![StackEvidenceKind::StructuralDiff],
+        rules: vec![StackPolicyRule {
+            id: "ASC-012-BLOCK-MISSING-REQUIRED-EVIDENCE".to_string(),
+            decision: StackPolicyDecision::Promote,
+            reason: "attempt to shadow synthetic evidence rule".to_string(),
+            matches: StackPolicyMatcher::Always,
+        }],
+    };
+
+    let error = StackPolicyEngine::from_policy(policy)
+        .expect_err("reserved synthetic rule ID should be rejected");
+
+    assert!(matches!(error, StackPolicyError::EngineParse { .. }));
+}
+
+#[test]
+fn stack_policy_document_invariant_errors_are_parse_errors() {
+    let invalid_policies = [
+        StackPolicyDocument {
+            schema_version: crate::stack_policy::STACK_POLICY_SCHEMA_VERSION.to_string(),
+            required_evidence: vec![
+                StackEvidenceKind::StructuralDiff,
+                StackEvidenceKind::StructuralDiff,
+            ],
+            rules: vec![default_promote_rule()],
+        },
+        StackPolicyDocument {
+            schema_version: crate::stack_policy::STACK_POLICY_SCHEMA_VERSION.to_string(),
+            required_evidence: Vec::new(),
+            rules: vec![StackPolicyRule {
+                id: " ".to_string(),
+                ..default_promote_rule()
+            }],
+        },
+        StackPolicyDocument {
+            schema_version: crate::stack_policy::STACK_POLICY_SCHEMA_VERSION.to_string(),
+            required_evidence: Vec::new(),
+            rules: vec![StackPolicyRule {
+                reason: " ".to_string(),
+                ..default_promote_rule()
+            }],
+        },
+    ];
+
+    for policy in invalid_policies {
+        let error = StackPolicyEngine::from_policy(policy)
+            .expect_err("invalid policy document should fail during parsing");
+        assert!(matches!(error, StackPolicyError::EngineParse { .. }));
+    }
+}
+
+#[test]
+fn stack_policy_any_preserves_missing_evidence_match_without_fact_ids() {
+    let engine = engine_with_any_block(StackPolicyMatcher::MissingEvidence {
+        evidence: vec![StackEvidenceKind::ObservedCapabilityUse],
+    });
+    let evidence = StackEvidenceCompleteness {
+        available: Vec::new(),
+        missing: vec![StackEvidenceKind::ObservedCapabilityUse],
+    };
+
+    let evaluation = engine
+        .evaluate(&StackPolicyFacts::new(evidence, []).expect("facts should validate"))
+        .expect("policy should evaluate");
+
+    assert_eq!(evaluation.decision, StackPolicyDecision::Block);
+    assert_eq!(evaluation.winning_rule_ids, vec!["CUSTOM-BLOCK"]);
+    assert!(evaluation
+        .matched_rules
+        .iter()
+        .any(|matched| matched.rule_id == "CUSTOM-BLOCK" && matched.matched_facts.is_empty()));
+}
+
+#[test]
+fn stack_policy_any_preserves_always_match_without_fact_ids() {
+    let engine = engine_with_any_block(StackPolicyMatcher::Always);
+
+    let evaluation = engine
+        .evaluate(&StackPolicyFacts::new(complete_evidence(), []).expect("facts should validate"))
+        .expect("policy should evaluate");
+
+    assert_eq!(evaluation.decision, StackPolicyDecision::Block);
+    assert_eq!(evaluation.winning_rule_ids, vec!["CUSTOM-BLOCK"]);
+}
+
+fn engine_with_any_block(condition: StackPolicyMatcher) -> StackPolicyEngine {
+    StackPolicyEngine::from_policy(StackPolicyDocument {
+        schema_version: crate::stack_policy::STACK_POLICY_SCHEMA_VERSION.to_string(),
+        required_evidence: Vec::new(),
+        rules: vec![
+            StackPolicyRule {
+                id: "CUSTOM-BLOCK".to_string(),
+                decision: StackPolicyDecision::Block,
+                reason: "custom condition blocks promotion".to_string(),
+                matches: StackPolicyMatcher::Any {
+                    conditions: vec![condition],
+                },
+            },
+            StackPolicyRule {
+                id: "DEFAULT-PROMOTE".to_string(),
+                decision: StackPolicyDecision::Promote,
+                reason: "promote by default".to_string(),
+                matches: StackPolicyMatcher::Always,
+            },
+        ],
+    })
+    .expect("policy should validate")
+}
+
+fn default_promote_rule() -> StackPolicyRule {
+    StackPolicyRule {
+        id: "DEFAULT-PROMOTE".to_string(),
+        decision: StackPolicyDecision::Promote,
+        reason: "promote by default".to_string(),
+        matches: StackPolicyMatcher::Always,
+    }
 }
