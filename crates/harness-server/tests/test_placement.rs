@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use syn::{punctuated::Punctuated, Attribute, Expr, Item, Lit, Meta, Token};
 
 const LEGACY_PLACEMENT: &str = include_str!("fixtures/src_test_placement.txt");
 
@@ -64,83 +65,113 @@ fn collect_declared_test_modules(
     source: &Path,
 ) -> anyhow::Result<()> {
     let contents = fs::read_to_string(source)?;
-    let mut cfg_test = false;
-    let mut path_override = None;
+    let syntax = syn::parse_file(&contents)?;
+    let source_dir = source.parent().unwrap_or(src);
+    collect_test_module_items(
+        entries,
+        src,
+        source_dir,
+        &module_root(source),
+        &syntax.items,
+        false,
+    )
+}
 
-    for raw_line in contents.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with("//") {
+fn collect_test_module_items(
+    entries: &mut BTreeSet<String>,
+    src: &Path,
+    path_dir: &Path,
+    module_dir: &Path,
+    items: &[Item],
+    inherited_test: bool,
+) -> anyhow::Result<()> {
+    for item in items {
+        let Item::Mod(module) = item else {
+            continue;
+        };
+        let test_only = inherited_test || module.attrs.iter().any(is_test_cfg);
+        if let Some((_, nested_items)) = &module.content {
+            let nested_module_dir = module_dir.join(module.ident.to_string());
+            collect_test_module_items(
+                entries,
+                src,
+                &nested_module_dir,
+                &nested_module_dir,
+                nested_items,
+                test_only,
+            )?;
             continue;
         }
-        if line.starts_with("#[") {
-            cfg_test |= is_test_cfg(line);
-            if let Some(path) = path_attribute(line) {
-                path_override = Some(path.to_owned());
-            }
-            continue;
-        }
 
-        if cfg_test {
-            if let Some(module) = module_declaration(line) {
-                let target = match path_override.as_deref() {
-                    Some(path) => source.parent().unwrap_or(src).join(path.replace('\\', "/")),
-                    None => resolve_module_path(source, module),
-                };
-                if target.is_file() {
-                    record(entries, "file", src, &target)?;
-                } else if target.is_dir() {
-                    record(entries, "dir", src, &target)?;
-                    collect_rust_files(entries, src, &target)?;
-                }
-            }
+        let test_path = cfg_attr_test_path(&module.attrs).map(|path| path_dir.join(path));
+        let target = test_path.or_else(|| {
+            test_only.then(|| {
+                path_attribute(&module.attrs).map_or_else(
+                    || resolve_module_path(module_dir, &module.ident.to_string()),
+                    |path| path_dir.join(path),
+                )
+            })
+        });
+        if let Some(target) = target {
+            record_module_target(entries, src, &target)?;
         }
-
-        cfg_test = false;
-        path_override = None;
     }
     Ok(())
 }
 
-fn is_test_cfg(attribute: &str) -> bool {
-    attribute
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .eq("#[cfg(test)]".chars())
+fn is_test_cfg(attribute: &Attribute) -> bool {
+    attribute.path().is_ident("cfg")
+        && matches!(attribute.parse_args::<Meta>(), Ok(Meta::Path(path)) if path.is_ident("test"))
 }
 
-fn path_attribute(attribute: &str) -> Option<&str> {
-    let compact = attribute.trim();
-    if !compact.starts_with("#[path") {
+fn path_attribute(attributes: &[Attribute]) -> Option<PathBuf> {
+    attributes
+        .iter()
+        .find(|attribute| attribute.path().is_ident("path"))
+        .and_then(attribute_path_value)
+}
+
+fn cfg_attr_test_path(attributes: &[Attribute]) -> Option<PathBuf> {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("cfg_attr"))
+        .find_map(|attribute| {
+            let arguments = attribute
+                .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                .ok()?;
+            let mut arguments = arguments.iter();
+            let condition = arguments.next()?;
+            if !matches!(condition, Meta::Path(path) if path.is_ident("test")) {
+                return None;
+            }
+            arguments.find_map(meta_path_value)
+        })
+}
+
+fn attribute_path_value(attribute: &Attribute) -> Option<PathBuf> {
+    meta_path_value(&attribute.meta)
+}
+
+fn meta_path_value(meta: &Meta) -> Option<PathBuf> {
+    let Meta::NameValue(value) = meta else {
+        return None;
+    };
+    if !value.path.is_ident("path") {
         return None;
     }
-    let start = compact.find('"')? + 1;
-    let end = compact[start..].find('"')? + start;
-    Some(&compact[start..end])
-}
-
-fn module_declaration(line: &str) -> Option<&str> {
-    let item = line.strip_suffix(';')?.trim();
-    let marker = item.rfind("mod ")?;
-    let visibility = &item[..marker];
-    if !(visibility.is_empty()
-        || visibility == "pub "
-        || visibility.starts_with("pub(") && visibility.ends_with(") "))
-    {
+    let Expr::Lit(value) = &value.value else {
         return None;
-    }
-    let module = &item[marker + "mod ".len()..];
-    let module = module.trim();
-    (!module.is_empty()
-        && module
-            .chars()
-            .all(|character| character == '_' || character.is_ascii_alphanumeric()))
-    .then_some(module)
+    };
+    let Lit::Str(value) = &value.lit else {
+        return None;
+    };
+    Some(PathBuf::from(value.value()))
 }
 
-fn resolve_module_path(source: &Path, module: &str) -> PathBuf {
+fn module_root(source: &Path) -> PathBuf {
     let parent = source.parent().unwrap_or_else(|| Path::new(""));
     let filename = source.file_name().and_then(|value| value.to_str());
-    let module_root = match filename {
+    match filename {
         Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
         _ => parent.join(
             source
@@ -148,13 +179,30 @@ fn resolve_module_path(source: &Path, module: &str) -> PathBuf {
                 .and_then(|value| value.to_str())
                 .unwrap_or_default(),
         ),
-    };
+    }
+}
+
+fn resolve_module_path(module_root: &Path, module: &str) -> PathBuf {
     let file = module_root.join(format!("{module}.rs"));
     if file.is_file() {
         file
     } else {
         module_root.join(module)
     }
+}
+
+fn record_module_target(
+    entries: &mut BTreeSet<String>,
+    src: &Path,
+    target: &Path,
+) -> anyhow::Result<()> {
+    if target.is_file() {
+        record(entries, "file", src, target)?;
+    } else if target.is_dir() {
+        record(entries, "dir", src, target)?;
+        collect_rust_files(entries, src, target)?;
+    }
+    Ok(())
 }
 
 fn collect_rust_files(
@@ -189,5 +237,75 @@ fn record(
         .to_string_lossy()
         .replace('\\', "/");
     entries.insert(format!("{kind} src/{relative}"));
+    Ok(())
+}
+
+#[test]
+fn declared_test_modules_are_found_from_rust_syntax_and_scope() -> anyhow::Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "harness-test-placement-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let src = root.join("src");
+    fs::create_dir_all(src.join("suite"))?;
+    fs::create_dir_all(src.join("outer"))?;
+    fs::create_dir_all(src.join("nested_path"))?;
+    fs::write(
+        src.join("lib.rs"),
+        r#"
+            # [ cfg ( test ) ]
+            #[path = "arbitrary.rs"]
+            pub(crate)    mod hidden;
+
+            #[cfg_attr(test, path = "override.rs")]
+            mod variant;
+
+            #[cfg(test)]
+            mod suite {
+                mod cases;
+            }
+
+            mod outer {
+                #[cfg(test)]
+                pub(super) mod inner;
+            }
+
+            #[cfg(test)]
+            mod nested_path {
+                #[path = "renamed.rs"]
+                mod leaf;
+            }
+        "#,
+    )?;
+    for path in [
+        src.join("arbitrary.rs"),
+        src.join("override.rs"),
+        src.join("suite/cases.rs"),
+        src.join("outer/inner.rs"),
+        src.join("nested_path/renamed.rs"),
+    ] {
+        fs::write(path, "")?;
+    }
+
+    let result = scan_legacy_homes(&src);
+    let cleanup = fs::remove_dir_all(&root);
+    let entries = result?;
+    cleanup?;
+    assert_eq!(
+        entries,
+        [
+            "file src/arbitrary.rs",
+            "file src/nested_path/renamed.rs",
+            "file src/outer/inner.rs",
+            "file src/override.rs",
+            "file src/suite/cases.rs",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
+    );
     Ok(())
 }
