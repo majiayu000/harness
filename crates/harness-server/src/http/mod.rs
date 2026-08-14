@@ -51,6 +51,8 @@ mod shutdown_test;
 mod startup_tests;
 #[cfg(test)]
 mod test_fixtures;
+// Nested route-contract tests. New tests must not grow this tree; see
+// CONTRIBUTING.md and crates/harness-server/tests/test_placement.rs (#1956).
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
