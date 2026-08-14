@@ -39,10 +39,8 @@ GH-1771
 - `crates/harness-agents/src/claude.rs:115-131` — `base_args`: full profile
   (`allowed_tools = None`) → `--dangerously-skip-permissions` (pushed at
   `:131`); scoped profile → `--allowedTools`. The flags are mutually
-  exclusive.
-- `crates/harness-agents/src/claude_adapter.rs:87-93` — same contract for
-  the streaming adapter; `claude_adapter.rs:316-320` documents
-  auto-approval. Repo rule: both files must change together.
+  exclusive. There is no Claude streaming adapter; `claude_adapter.rs`
+  was removed in GH-1786.
 - `workflow_runtime_worker/runtime_profile.rs:27-38` — runtime profiles can
   already declare `sandbox: "read-only-with-network"`. The resolved mode
   flows agent-agnostically: `workflow_runtime_worker/executor.rs:99-101`
@@ -51,13 +49,12 @@ GH-1771
   `TurnLifecycleOptions` (`executor.rs:197`;
   `turn_engine/turn_lifecycle.rs:227`, `:243`) into the `AgentRequest` for
   any agent. Claude spawns honor it as a real OS filesystem sandbox —
-  `claude_adapter.rs:104-109` and `claude.rs:85`, `:184-189`, `:313-318`
-  build `SandboxSpec`s enforced by harness-sandbox Seatbelt/Landlock; codex
-  paths translate it to CLI sandbox config (`codex.rs:667-676`,
-  `codex_adapter.rs:566-580`). What is missing is narrower: the Claude
-  *tool-permission flag surface* is sandbox-unaware
-  (`--dangerously-skip-permissions` under the full profile), and no
-  per-activity tool profile exists.
+  `claude.rs:85`, `:184-189`, `:313-318` build `SandboxSpec`s enforced
+  by harness-sandbox Seatbelt/Landlock; codex paths translate it to CLI
+  sandbox config (`codex.rs:667-676`, `codex_adapter.rs:566-580`). What
+  is missing is narrower: the Claude *tool-permission flag surface* is
+  sandbox-unaware (`--dangerously-skip-permissions` under the full
+  profile), and no per-activity tool profile exists.
 
 ### Egress
 
@@ -150,8 +147,7 @@ dangerously_skip_permissions = true   # explicit opt-up only
 - `workflow_runtime_worker` activity policy maps activity → profile name;
   runtime call sites pass a new `SpawnPermissionMode` enum instead of the
   `Option<Vec<String>>` sentinel, so full permissions can never be
-  inferred from absence. `claude.rs` and `claude_adapter.rs` change
-  together.
+  inferred from absence. `claude.rs` is the only Claude CLI spawn path.
 - Effective profile recorded into packet evidence and OTel span
   attributes.
 
@@ -196,7 +192,7 @@ dangerously_skip_permissions = true   # explicit opt-up only
 | B-002 v3 fencing, server byte-identical, historical packets untouched | `harness-server` `workflow_runtime_worker::prompt_packet` snapshot tests: v2 vs v3 fixture diff; v1/v2 fixture readback |
 | B-003 continuation always fenced | prompt_packet test with continuation present/absent |
 | B-004 grandfather vs writer-defect split | prompt_packet tests: pre-`migrated_at` field → fenced + degradation artifact; post-`migrated_at` unclassified → `UnclassifiedField` error |
-| B-005 / B-006 scoped default, explicit opt-up, flag exclusivity | `cargo test --package harness-agents` spawn-arg tests for both adapters; config resolution tests for `SpawnPermissionMode` |
+| B-005 / B-006 scoped default, explicit opt-up, flag exclusivity | `cargo test --package harness-agents` spawn-arg tests for `claude.rs`; config resolution tests for `SpawnPermissionMode` |
 | B-007 host egress deny-by-default + typed platform error | `harness-sandbox` policy-generation tests (Seatbelt/Landlock rule sets per `EgressPolicy`); dispatch error test |
 | B-008 container canary + preserved `none` fallback | `spawn_contract` tests: canary pass/fail gating; `container_network_mode` regression |
 | B-009 evidence completeness | runtime evidence tests asserting profile, egress mode, fencing counts per job |
