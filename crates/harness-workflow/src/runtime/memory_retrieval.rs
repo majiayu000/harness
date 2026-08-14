@@ -2,7 +2,10 @@ use super::repo_memory::{
     record_from_row, RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, RepoMemoryRecordRow,
 };
 use super::store::WorkflowRuntimeStore;
-use harness_core::retrieval::{score_lexical_relevance, RetrievalField};
+use harness_core::retrieval::{
+    score_retrieval_candidate, KnowledgeRetriever, LexicalKnowledgeRetriever, RetrievalCandidate,
+    RetrievalField, RetrievalQuery, RetrievalSurface,
+};
 use serde_json::Value;
 
 pub const DEFAULT_REPO_MEMORY_RETRIEVAL_LIMIT: usize = 5;
@@ -97,18 +100,21 @@ fn select_repo_memory_records(
 }
 
 fn rank_repo_memory_candidates(
-    candidates: &mut [RepoMemoryRecord],
+    candidates: &mut Vec<RepoMemoryRecord>,
     activity_class: &str,
     task_text: Option<&str>,
 ) {
     let activity_class = activity_class.trim();
-    let query = repo_memory_relevance_query(activity_class, task_text);
-    let mut ranked = candidates
-        .iter()
-        .cloned()
+    let query_text = repo_memory_relevance_query(activity_class, task_text);
+    let retrieval_query =
+        RetrievalQuery::new(RetrievalSurface::RepoMemory, &query_text, candidates.len())
+            .with_activity_class(activity_class);
+    let retriever = LexicalKnowledgeRetriever;
+    let mut ranked = std::mem::take(candidates)
+        .into_iter()
         .map(|record| RankedRepoMemoryCandidate {
             activity_mismatch: record.activity_class != activity_class,
-            relevance: repo_memory_relevance(&record, &query),
+            relevance: repo_memory_relevance(&retriever, &record, &retrieval_query),
             record,
         })
         .collect::<Vec<_>>();
@@ -120,9 +126,7 @@ fn rank_repo_memory_candidates(
             .then_with(|| right.record.created_at.cmp(&left.record.created_at))
             .then_with(|| left.record.id.cmp(&right.record.id))
     });
-    for (target, ranked) in candidates.iter_mut().zip(ranked) {
-        *target = ranked.record;
-    }
+    *candidates = ranked.into_iter().map(|ranked| ranked.record).collect();
 }
 
 #[derive(Debug, Clone)]
@@ -139,20 +143,29 @@ fn repo_memory_relevance_query(activity_class: &str, task_text: Option<&str>) ->
     }
 }
 
-fn repo_memory_relevance(record: &RepoMemoryRecord, query: &str) -> f64 {
+fn repo_memory_relevance(
+    retriever: &dyn KnowledgeRetriever,
+    record: &RepoMemoryRecord,
+    query: &RetrievalQuery<'_>,
+) -> f64 {
     let payload = compact_payload(&record.payload_json);
     let evidence = record.evidence_ref.as_deref().unwrap_or_default();
-    score_lexical_relevance(
+    let id = record.id.to_string();
+    score_retrieval_candidate(
+        retriever,
         query,
-        &[
-            RetrievalField::new(&record.activity_class, 1.5),
-            RetrievalField::new(record.kind.db_value(), 0.7),
-            RetrievalField::new(record.outcome.db_value(), 0.3),
-            RetrievalField::new(&payload, 1.0),
-            RetrievalField::new(evidence, 0.2),
-        ],
+        RetrievalCandidate::new(
+            &id,
+            vec![
+                RetrievalField::new(&record.activity_class, 1.5),
+                RetrievalField::new(record.kind.db_value(), 0.7),
+                RetrievalField::new(record.outcome.db_value(), 0.3),
+                RetrievalField::new(&payload, 1.0),
+                RetrievalField::new(evidence, 0.2),
+            ],
+        ),
     )
-    .score
+    .unwrap_or(0.0)
 }
 
 fn select_with_budget<'a>(

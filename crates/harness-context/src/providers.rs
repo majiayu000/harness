@@ -2,7 +2,10 @@ use crate::{
     ComposeRequest, ContextItem, ContextProvider, Degraded, ItemClass, ItemId, Priority,
     ProviderError, ProviderId,
 };
-use harness_core::retrieval::{score_lexical_relevance, RetrievalField};
+use harness_core::retrieval::{
+    score_retrieval_candidate, KnowledgeRetriever, LexicalKnowledgeRetriever, RetrievalCandidate,
+    RetrievalField, RetrievalQuery, RetrievalSurface,
+};
 use harness_core::types::{DraftStatus, ExecPlanStatus, ProjectId};
 use harness_rules::engine::Rule;
 use harness_skills::store::Skill;
@@ -65,20 +68,16 @@ impl ContextProvider for SkillsProvider {
 
     fn propose(&self, req: &ComposeRequest) -> Result<Vec<ContextItem>, ProviderError> {
         let prompt = req.task_profile.prompt.as_deref().unwrap_or_default();
-        let mut skills = self
-            .skills
-            .iter()
-            .filter_map(|skill| {
-                if skill.trigger_patterns.is_empty() {
-                    Some((skill.clone(), 0.15))
-                } else if skill_trigger_relevance(prompt, skill) > 0.0 {
-                    let relevance = skill_context_relevance(prompt, skill);
-                    Some((skill.clone(), relevance))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let retriever = LexicalKnowledgeRetriever;
+        let mut skills = Vec::new();
+        for skill in &self.skills {
+            if skill.trigger_patterns.is_empty() {
+                skills.push((skill.clone(), 0.15));
+            } else if skill_trigger_relevance(&retriever, prompt, skill)? > 0.0 {
+                let relevance = skill_context_relevance(&retriever, prompt, skill)?;
+                skills.push((skill.clone(), relevance));
+            }
+        }
         skills.sort_by(|(left, left_score), (right, right_score)| {
             right_score
                 .total_cmp(left_score)
@@ -109,7 +108,11 @@ impl ContextProvider for SkillsProvider {
     }
 }
 
-fn skill_context_relevance(prompt: &str, skill: &Skill) -> f64 {
+fn skill_context_relevance(
+    retriever: &dyn KnowledgeRetriever,
+    prompt: &str,
+    skill: &Skill,
+) -> Result<f64, ProviderError> {
     let mut fields = Vec::with_capacity(skill.trigger_patterns.len() + 3);
     for pattern in &skill.trigger_patterns {
         fields.push(RetrievalField::new(pattern, 2.0));
@@ -117,16 +120,32 @@ fn skill_context_relevance(prompt: &str, skill: &Skill) -> f64 {
     fields.push(RetrievalField::new(&skill.name, 0.8));
     fields.push(RetrievalField::new(&skill.description, 1.2));
     fields.push(RetrievalField::new(&skill.content, 0.25));
-    score_lexical_relevance(prompt, &fields).score
+    score_skill_candidate(retriever, prompt, skill, fields)
 }
 
-fn skill_trigger_relevance(prompt: &str, skill: &Skill) -> f64 {
+fn skill_trigger_relevance(
+    retriever: &dyn KnowledgeRetriever,
+    prompt: &str,
+    skill: &Skill,
+) -> Result<f64, ProviderError> {
     let fields = skill
         .trigger_patterns
         .iter()
         .map(|pattern| RetrievalField::new(pattern, 2.0))
         .collect::<Vec<_>>();
-    score_lexical_relevance(prompt, &fields).score
+    score_skill_candidate(retriever, prompt, skill, fields)
+}
+
+fn score_skill_candidate(
+    retriever: &dyn KnowledgeRetriever,
+    prompt: &str,
+    skill: &Skill,
+    fields: Vec<RetrievalField<'_>>,
+) -> Result<f64, ProviderError> {
+    let query = RetrievalQuery::new(RetrievalSurface::Skill, prompt, 1);
+    let candidate = RetrievalCandidate::new(&skill.name, fields);
+    score_retrieval_candidate(retriever, &query, candidate)
+        .map_err(|error| ProviderError::new("skills", error.to_string()))
 }
 
 pub struct ContractProvider;
