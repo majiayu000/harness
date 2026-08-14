@@ -217,7 +217,10 @@ fn runtime_completion_reducer_blocks_failed_pr_binding_verification() {
 
 #[test]
 fn runtime_completion_reducer_finishes_merge_pr_with_merged_pull_request_artifact() {
-    let instance = issue_instance("merging");
+    let instance = issue_instance("merging").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+    }));
     let result = ActivityResult::succeeded("merge_pr", "PR was merged.").with_artifact(
         ActivityArtifact::new(
             "pull_request",
@@ -230,7 +233,17 @@ fn runtime_completion_reducer_finishes_merge_pr_with_merged_pull_request_artifac
                 "head_sha": "head123"
             }),
         ),
-    );
+    )
+    .with_artifact(ActivityArtifact::new(
+        crate::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+        json!({
+            "schema": crate::runtime::completion_evidence::MERGE_COMPLETION_VERIFICATION_SCHEMA,
+            "verified": true,
+            "observed_merged": true,
+            "repo": "owner/repo",
+            "pr_number": 77
+        }),
+    ));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -262,6 +275,133 @@ fn runtime_completion_reducer_finishes_merge_pr_with_merged_pull_request_artifac
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("merged PR decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_rejects_unverified_merge_completion() {
+    let instance = issue_instance("merging").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+    }));
+    let result = ActivityResult::succeeded("merge_pr", "PR was merged.").with_artifact(
+        ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+                "state": "merged",
+                "merged": true,
+                "merge_commit_sha": "abc123",
+                "head_sha": "head123"
+            }),
+        ),
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("agent-reported merge should produce an auditable decision");
+
+    assert_eq!(decision.decision, "record_pr_merged");
+    let terminal_evidence = decision
+        .evidence
+        .iter()
+        .find(|evidence| evidence.kind == "github_terminal_evidence")
+        .expect("terminal evidence should be retained for audit");
+    assert_eq!(
+        terminal_evidence.provenance,
+        harness_core::claim_trust::ClaimProvenance::self_declared()
+    );
+    let rejection = DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect_err("an agent-reported merge must not satisfy terminal trust");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
+    );
+}
+
+#[test]
+fn runtime_completion_reducer_rejects_merge_verification_without_matching_repo() {
+    let instances = [
+        issue_instance("merging"),
+        issue_instance("merging").with_server_data(json!({
+            "repo": "owner/repo",
+            "pr_number": 77,
+        })),
+    ];
+
+    for instance in instances {
+        let result = ActivityResult::succeeded("merge_pr", "PR was merged.")
+            .with_artifact(ActivityArtifact::new(
+                "pull_request",
+                json!({
+                    "pr_number": 77,
+                    "pr_url": "https://github.com/owner/repo/pull/77",
+                    "state": "merged",
+                    "merged": true
+                }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                crate::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+                json!({
+                    "schema": crate::runtime::completion_evidence::MERGE_COMPLETION_VERIFICATION_SCHEMA,
+                    "verified": true,
+                    "observed_merged": true,
+                    "repo": "other/repo",
+                    "pr_number": 77
+                }),
+            ));
+        let event = WorkflowEvent::new(
+            &instance.id,
+            1,
+            crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+            "runtime-1",
+        )
+        .with_payload(json!({
+            "command_id": "command-1",
+            "runtime_job_id": "job-1",
+            "activity_result": result,
+        }));
+
+        let decision = reduce_runtime_job_completed(&instance, &event)
+            .expect("event should parse")
+            .expect("unbound verification should produce an auditable decision");
+        let terminal_evidence = decision
+            .evidence
+            .iter()
+            .find(|evidence| evidence.kind == "github_terminal_evidence")
+            .expect("terminal evidence should be retained for audit");
+        assert_eq!(
+            terminal_evidence.provenance,
+            harness_core::claim_trust::ClaimProvenance::self_declared()
+        );
+        assert_eq!(
+            DecisionValidator::github_issue_pr()
+                .validate(
+                    &instance,
+                    &decision,
+                    &ValidationContext::new("runtime-1", Utc::now()),
+                )
+                .expect_err("repository identity must match server verification")
+                .kind,
+            WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
+        );
+    }
 }
 
 #[test]

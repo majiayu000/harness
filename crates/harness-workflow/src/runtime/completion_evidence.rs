@@ -32,6 +32,10 @@ pub const ARTIFACT_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verificati
 pub const ARTIFACT_SERVER_VALIDATION_DIGEST: &str = "server_validation_digest";
 /// Server-attached artifact carrying an independently observed closed issue.
 pub const ARTIFACT_VERIFIED_ISSUE_STATE: &str = "verified_issue_state";
+/// Server-attached artifact carrying an independently verified merged PR.
+pub const ARTIFACT_MERGE_COMPLETION_VERIFICATION: &str = "merge_completion_verification";
+pub const MERGE_COMPLETION_VERIFICATION_SCHEMA: &str =
+    "harness.github.merge_completion_verification.v1";
 
 /// Blocked-decision reason when a prompt task completes without validation
 /// evidence or an explicit no-change rationale.
@@ -43,11 +47,12 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 4] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 5] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
     ARTIFACT_VERIFIED_ISSUE_STATE,
+    ARTIFACT_MERGE_COMPLETION_VERIFICATION,
 ];
 
 /// Downgrade every evidence claim deserialized from an agent-authored
@@ -248,6 +253,10 @@ mod tests {
             .with_artifact(ActivityArtifact::new(
                 ARTIFACT_VERIFIED_ISSUE_STATE,
                 json!({ "issue_number": 1, "state": "closed" }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+                json!({ "verified": true, "observed_merged": true }),
             ))
             .with_artifact(ActivityArtifact::new(
                 "pull_request",

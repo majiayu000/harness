@@ -7,7 +7,8 @@ use super::{
 };
 use crate::runtime::completion_evidence::{
     pr_binding_verification_failure, transition_evidence_enforced, verified_issue_state_artifact,
-    verified_pr_binding_artifact, EVIDENCE_GITHUB_TERMINAL, EVIDENCE_VERIFIED_PR_BINDING,
+    verified_pr_binding_artifact, ARTIFACT_MERGE_COMPLETION_VERIFICATION, EVIDENCE_GITHUB_TERMINAL,
+    EVIDENCE_VERIFIED_PR_BINDING, MERGE_COMPLETION_VERIFICATION_SCHEMA,
     REASON_PR_BINDING_VERIFICATION_FAILED,
 };
 use crate::runtime::model::{
@@ -371,6 +372,27 @@ pub(super) fn merged_pr_from_activity_result(
     }
     let merged = merged_pull_request_artifact(result)?;
     let reason = "merge_pr returned structured evidence that the pull request was merged";
+    let terminal_evidence = if merge_completion_verified(instance, result, merged.pr_number) {
+        WorkflowEvidence::runtime_observed(
+            EVIDENCE_GITHUB_TERMINAL,
+            format!(
+                "merged_pull_request: pr={} head={} merge_commit={}",
+                merged.pr_number,
+                merged.head_sha.as_deref().unwrap_or("unknown"),
+                merged.merge_commit_sha.as_deref().unwrap_or("unknown"),
+            ),
+            "github_pr_merged_result",
+            Some(event.id.clone()),
+        )
+    } else {
+        WorkflowEvidence::new(
+            EVIDENCE_GITHUB_TERMINAL,
+            format!(
+                "agent_reported_merged_pull_request: pr={}",
+                merged.pr_number
+            ),
+        )
+    };
     Some(
         WorkflowDecision::new(
             &instance.id,
@@ -396,17 +418,7 @@ pub(super) fn merged_pr_from_activity_result(
                 "pull_request_evidence": merged.payload,
             }),
         ))
-        .with_evidence(WorkflowEvidence::runtime_observed(
-            EVIDENCE_GITHUB_TERMINAL,
-            format!(
-                "merged_pull_request: pr={} head={} merge_commit={}",
-                merged.pr_number,
-                merged.head_sha.as_deref().unwrap_or("unknown"),
-                merged.merge_commit_sha.as_deref().unwrap_or("unknown"),
-            ),
-            "github_pr_merged_result",
-            Some(event.id.clone()),
-        ))
+        .with_evidence(terminal_evidence)
         .with_evidence(WorkflowEvidence::new(
             "github_pr_merged",
             format!("pr={} url={}", merged.pr_number, merged.pr_url),
@@ -414,6 +426,39 @@ pub(super) fn merged_pr_from_activity_result(
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
     )
+}
+
+fn merge_completion_verified(
+    instance: &WorkflowInstance,
+    result: &ActivityResult,
+    pr_number: u64,
+) -> bool {
+    let Some(expected_repo) = instance
+        .data
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+    else {
+        return false;
+    };
+    result.artifacts.iter().any(|artifact| {
+        artifact.artifact_type == ARTIFACT_MERGE_COMPLETION_VERIFICATION
+            && artifact.artifact.get("schema").and_then(Value::as_str)
+                == Some(MERGE_COMPLETION_VERIFICATION_SCHEMA)
+            && artifact.artifact.get("verified").and_then(Value::as_bool) == Some(true)
+            && artifact
+                .artifact
+                .get("observed_merged")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && artifact.artifact.get("pr_number").and_then(Value::as_u64) == Some(pr_number)
+            && artifact
+                .artifact
+                .get("repo")
+                .and_then(Value::as_str)
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(expected_repo))
+    })
 }
 
 #[derive(Debug, Clone)]

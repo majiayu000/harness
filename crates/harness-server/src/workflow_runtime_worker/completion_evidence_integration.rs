@@ -77,7 +77,18 @@ pub(super) async fn apply_completion_evidence(
     }
     if result_claims_issue_closure(workflow, &result) {
         if let Some(workflow) = workflow {
-            result = attach_issue_state_verification(state, workflow, result).await;
+            result = attach_issue_state_verification(
+                state,
+                workflow,
+                result,
+                state
+                    .core
+                    .server
+                    .config
+                    .workflow
+                    .completion_evidence_enforced,
+            )
+            .await;
         }
     }
     result
@@ -97,6 +108,7 @@ async fn attach_issue_state_verification(
     state: &Arc<AppState>,
     workflow: &WorkflowInstance,
     result: ActivityResult,
+    evidence_enforced: bool,
 ) -> ActivityResult {
     let Some((repo, issue_number)) = workflow_issue_target(workflow) else {
         return result;
@@ -127,6 +139,18 @@ async fn attach_issue_state_verification(
         }
     }
 
+    issue_verification_unavailable(result, &repo, issue_number, evidence_enforced)
+}
+
+fn issue_verification_unavailable(
+    result: ActivityResult,
+    repo: &str,
+    issue_number: u64,
+    evidence_enforced: bool,
+) -> ActivityResult {
+    if !evidence_enforced {
+        return result;
+    }
     let mut failed = result;
     failed.summary = format!(
         "Server could not verify the reported closed issue {repo}#{issue_number} after \
@@ -249,5 +273,18 @@ mod tests {
             WorkflowSubject::new("issue", "123"),
         );
         assert_eq!(workflow_issue_target(&missing_target), None);
+    }
+
+    #[test]
+    fn issue_verification_outage_honors_evidence_kill_switch() {
+        let result = ActivityResult::succeeded("implement_issue", "closed");
+        let waived = issue_verification_unavailable(result.clone(), "owner/repo", 123, false);
+        assert_eq!(waived.status, ActivityStatus::Succeeded);
+        let enforced = issue_verification_unavailable(result, "owner/repo", 123, true);
+        assert_eq!(enforced.status, ActivityStatus::Failed);
+        assert_eq!(
+            enforced.error_kind,
+            Some(ActivityErrorKind::ExternalDependency)
+        );
     }
 }
