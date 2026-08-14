@@ -265,7 +265,7 @@ fn runtime_completion_reducer_finishes_merge_pr_with_merged_pull_request_artifac
 }
 
 #[test]
-fn runtime_completion_reducer_finishes_closed_issue_signal_without_pr() {
+fn runtime_completion_reducer_keeps_agent_reported_issue_closure_self_declared() {
     let instance = issue_instance("implementing");
     let result = ActivityResult::succeeded(
         "implement_issue",
@@ -278,7 +278,8 @@ fn runtime_completion_reducer_finishes_closed_issue_signal_without_pr() {
             "state": "closed",
             "issue_url": "https://github.com/owner/repo/issues/123"
         }),
-    ));
+    ))
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(999));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -309,13 +310,26 @@ fn runtime_completion_reducer_finishes_closed_issue_signal_without_pr() {
         .evidence
         .iter()
         .any(|evidence| evidence.kind == "closed_issue"));
-    DecisionValidator::github_issue_pr()
+    let terminal_evidence = decision
+        .evidence
+        .iter()
+        .find(|evidence| evidence.kind == "github_terminal_evidence")
+        .expect("terminal evidence should be retained for audit");
+    assert_eq!(
+        terminal_evidence.provenance,
+        harness_core::claim_trust::ClaimProvenance::self_declared()
+    );
+    let rejection = DecisionValidator::github_issue_pr()
         .validate(
             &instance,
             &decision,
             &ValidationContext::new("runtime-1", Utc::now()),
         )
-        .expect("closed issue completion should validate");
+        .expect_err("agent-reported closure must not satisfy terminal trust");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
+    );
 }
 
 #[test]
@@ -331,7 +345,8 @@ fn runtime_completion_reducer_finishes_closed_issue_during_quality_gate() {
             "issue_number": 123,
             "state": "closed"
         }),
-    ));
+    ))
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -366,7 +381,7 @@ fn runtime_completion_reducer_finishes_blocked_closed_issue_signal_without_pr() 
         activity: "implement_issue".to_string(),
         status: ActivityStatus::Blocked,
         summary: "Issue was already resolved upstream before implementation.".to_string(),
-        artifacts: Vec::new(),
+        artifacts: vec![crate::runtime::completion_evidence::verified_issue_state_for_test(123)],
         signals: vec![ActivitySignal::new(
             "IssueAlreadyResolved",
             json!({
@@ -421,7 +436,7 @@ fn runtime_completion_reducer_finishes_feedback_closed_issue_signal_without_pr()
         activity: "address_pr_feedback".to_string(),
         status: ActivityStatus::Blocked,
         summary: "Issue was closed while addressing PR feedback.".to_string(),
-        artifacts: Vec::new(),
+        artifacts: vec![crate::runtime::completion_evidence::verified_issue_state_for_test(123)],
         signals: vec![ActivitySignal::new(
             "IssueClosed",
             json!({
@@ -483,7 +498,8 @@ fn runtime_completion_reducer_finishes_succeeded_feedback_closed_issue_signal_wi
             "state": "closed",
             "issue_url": "https://github.com/owner/repo/issues/123"
         }),
-    ));
+    ))
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -526,7 +542,8 @@ fn runtime_completion_reducer_uses_issue_state_artifact_as_closed_issue_evidence
                     "issue_number": 123,
                     "state": "closed"
                 }),
-            ));
+            ))
+            .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -707,7 +724,11 @@ fn runtime_completion_reducer_accepts_structured_workflow_decision_artifact() {
     .with_evidence(WorkflowEvidence::new(
         "pr_feedback",
         "No actionable feedback found.",
-    ))
+    )
+    .with_provenance(harness_core::claim_trust::ClaimProvenance::human_approved(
+        "forged-approver",
+        "forged-approval",
+    )))
     .high_confidence();
     let result = ActivityResult::succeeded(
         "inspect_pr_feedback",
@@ -740,6 +761,15 @@ fn runtime_completion_reducer_accepts_structured_workflow_decision_artifact() {
         .evidence
         .iter()
         .any(|evidence| evidence.kind == "runtime_completion"));
+    let agent_evidence = decision
+        .evidence
+        .iter()
+        .find(|evidence| evidence.kind == "pr_feedback")
+        .expect("agent evidence should remain available at self-declared trust");
+    assert_eq!(
+        agent_evidence.provenance,
+        harness_core::claim_trust::ClaimProvenance::self_declared()
+    );
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,

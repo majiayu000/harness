@@ -410,11 +410,10 @@ fn workflow_decision_from_activity_result(
             serde_json::from_value::<WorkflowDecision>(artifact.artifact.clone()).ok()
         })
         .map(|decision| {
-            // GH-1766: the decision body is agent-authored, so it may not
-            // assert server-owned evidence classes. Drop any it claims and
-            // re-mint only the classes the server itself proved from its own
-            // reserved artifacts.
-            let mut decision = strip_server_owned_evidence(decision);
+            // GH-1766: the decision body is agent-authored. Drop reserved
+            // server evidence and downgrade every retained claim before the
+            // runtime re-mints evidence it proved from reserved artifacts.
+            let mut decision = normalize_agent_authored_evidence(decision);
             for evidence in server_owned_evidence_for_result(result) {
                 decision = decision.with_evidence(evidence);
             }
@@ -431,7 +430,8 @@ const SERVER_OWNED_EVIDENCE_KINDS: [&str; 5] = [
     crate::runtime::completion_evidence::EVIDENCE_PROMPT_COMPLETION,
 ];
 
-fn strip_server_owned_evidence(mut decision: WorkflowDecision) -> WorkflowDecision {
+fn normalize_agent_authored_evidence(mut decision: WorkflowDecision) -> WorkflowDecision {
+    decision = crate::runtime::completion_evidence::downgrade_agent_authored_decision(decision);
     decision
         .evidence
         .retain(|evidence| !SERVER_OWNED_EVIDENCE_KINDS.contains(&evidence.kind.as_str()));

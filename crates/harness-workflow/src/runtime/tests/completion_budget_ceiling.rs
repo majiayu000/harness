@@ -228,7 +228,8 @@ async fn budget_ceiling_does_not_preempt_terminal_completion() -> anyhow::Result
             "state": "closed",
             "issue_url": "https://github.com/owner/repo/issues/123"
         }),
-    ));
+    ))
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123));
 
     let record = store
         .commit_parent_runtime_completion(

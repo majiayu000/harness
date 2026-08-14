@@ -6,8 +6,9 @@ use super::{
     ISSUE_STATE_ARTIFACT, SCOPE_TOO_LARGE_SIGNAL,
 };
 use crate::runtime::completion_evidence::{
-    pr_binding_verification_failure, transition_evidence_enforced, verified_pr_binding_artifact,
-    EVIDENCE_GITHUB_TERMINAL, EVIDENCE_VERIFIED_PR_BINDING, REASON_PR_BINDING_VERIFICATION_FAILED,
+    pr_binding_verification_failure, transition_evidence_enforced, verified_issue_state_artifact,
+    verified_pr_binding_artifact, EVIDENCE_GITHUB_TERMINAL, EVIDENCE_VERIFIED_PR_BINDING,
+    REASON_PR_BINDING_VERIFICATION_FAILED,
 };
 use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
@@ -142,6 +143,23 @@ pub(super) fn github_issue_closed_decision(
         "{} reported structured evidence that the GitHub issue is already closed",
         result.activity
     );
+    let verified_issue = verified_issue_state_for_instance(instance, result);
+    let terminal_evidence = if let Some(verified_issue) = verified_issue {
+        WorkflowEvidence::runtime_observed(
+            EVIDENCE_GITHUB_TERMINAL,
+            format!("verified_closed_issue: {verified_issue}"),
+            "server_verified_issue_state",
+            Some(event.id.clone()),
+        )
+    } else {
+        WorkflowEvidence::new(
+            EVIDENCE_GITHUB_TERMINAL,
+            format!("closed_issue: {}", closed_issue.summary),
+        )
+    };
+    let terminal_payload = verified_issue
+        .cloned()
+        .unwrap_or_else(|| closed_issue.payload.clone());
     Some(
         WorkflowDecision::new(
             &instance.id,
@@ -157,19 +175,41 @@ pub(super) fn github_issue_closed_decision(
                 "reason": reason,
                 "activity": result.activity,
                 "runtime_job_id": event_field_string(event, "runtime_job_id"),
-                "closed_issue_evidence": closed_issue.payload,
+                "closed_issue_evidence": terminal_payload,
             }),
         ))
-        .with_evidence(WorkflowEvidence::runtime_observed(
-            EVIDENCE_GITHUB_TERMINAL,
-            format!("closed_issue: {}", closed_issue.summary),
-            "github_issue_closed_result",
-            Some(event.id.clone()),
-        ))
+        .with_evidence(terminal_evidence)
         .with_evidence(WorkflowEvidence::new("closed_issue", closed_issue.summary))
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
     )
+}
+
+fn verified_issue_state_for_instance<'a>(
+    instance: &WorkflowInstance,
+    result: &'a ActivityResult,
+) -> Option<&'a Value> {
+    let verified = verified_issue_state_artifact(result)?;
+    let expected_issue_number = instance
+        .data
+        .get("issue_number")
+        .and_then(Value::as_u64)
+        .or_else(|| instance.subject.subject_key.parse().ok())?;
+    if verified.get("issue_number").and_then(Value::as_u64) != Some(expected_issue_number)
+        || verified.get("state").and_then(Value::as_str) != Some("closed")
+    {
+        return None;
+    }
+    if let Some(expected_repo) = instance.data.get("repo").and_then(Value::as_str) {
+        if !verified
+            .get("repo")
+            .and_then(Value::as_str)
+            .is_some_and(|repo| repo.eq_ignore_ascii_case(expected_repo))
+        {
+            return None;
+        }
+    }
+    Some(verified)
 }
 
 fn github_issue_state_can_finish_closed(state: &str) -> bool {

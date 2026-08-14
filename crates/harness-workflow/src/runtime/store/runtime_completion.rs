@@ -196,12 +196,12 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         }
     }
 
-    if declarative_decision_missing_required_evidence(&instance, source, event, &decision) {
+    if declarative_decision_requires_blocked_fallback(&instance, source, event, &decision) {
         let rejected =
             persist_runtime_completion_decision_tx(tx, instance.clone(), source, event, decision)
                 .await?;
         if rejected.accepted {
-            anyhow::bail!("missing-evidence declarative decision unexpectedly passed validation");
+            anyhow::bail!("insufficient-evidence decision unexpectedly passed validation");
         }
         let result: ActivityResult =
             serde_json::from_value(event.event.get("activity_result").cloned().ok_or_else(
@@ -216,7 +216,7 @@ async fn apply_runtime_completion_decision_for_instance_tx(
             event,
             &result,
             &format!(
-                "declarative transition was rejected for missing evidence: {rejection_reason}"
+                "transition was rejected for insufficient trusted evidence: {rejection_reason}"
             ),
         )
         .with_evidence(WorkflowEvidence::new(
@@ -231,7 +231,7 @@ async fn apply_runtime_completion_decision_for_instance_tx(
                 .await?;
         if !policy.accepted {
             anyhow::bail!(
-                "blocked policy decision was rejected after missing declarative evidence: {}",
+                "blocked policy decision was rejected after insufficient trusted evidence: {}",
                 policy
                     .rejection_reason
                     .as_deref()
@@ -246,7 +246,7 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         .map(Some)
 }
 
-fn declarative_decision_missing_required_evidence(
+fn declarative_decision_requires_blocked_fallback(
     instance: &WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
@@ -267,7 +267,12 @@ fn declarative_decision_missing_required_evidence(
             decision,
             &ValidationContext::new(source, event.created_at),
         ),
-        Err(error) if error.kind == WorkflowDecisionRejectionKind::MissingRequiredEvidence
+        Err(error)
+            if matches!(
+                error.kind,
+                WorkflowDecisionRejectionKind::MissingRequiredEvidence
+                    | WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
+            )
     )
 }
 
@@ -297,6 +302,7 @@ fn driverless_structured_completion_decision(
         .find_map(|artifact| {
             serde_json::from_value::<WorkflowDecision>(artifact.artifact.clone()).ok()
         })
+        .map(crate::runtime::completion_evidence::downgrade_agent_authored_decision)
     else {
         return Ok(None);
     };
