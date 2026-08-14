@@ -40,6 +40,11 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "operator identity and sudo process checks",
     ),
     allowed(
+        "crates/harness-core/build.rs",
+        1,
+        "Cargo manifest path supplied to the build script",
+    ),
+    allowed(
         "crates/harness-core/src/agents_md.rs",
         2,
         "operator home instruction discovery",
