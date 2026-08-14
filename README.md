@@ -684,7 +684,7 @@ the scheduling and lifecycle authority.
 | `harness-skills` | Skill discovery, deduplication, search, and persistence |
 | `harness-exec` | ExecPlan model plus Markdown serialization/deserialization |
 | `harness-observe` | Event storage, quality grading, health/stat aggregation, OTLP export |
-| `harness-cli` | `harness` binary with serve/exec/gc/rule/skill/plan commands |
+| `harness-cli` | `harness` binary with exec/gc/rule/skill/plan commands; `serve`/`reconcile` are behind the default `server` feature |
 
 ## JSON-RPC API
 

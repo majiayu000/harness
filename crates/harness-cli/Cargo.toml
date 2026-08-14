@@ -9,6 +9,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["server"]
+# Links harness-server so `harness serve` / `harness reconcile` can run in-process.
+# Omit it with `--no-default-features` to keep gc/rule/skill/plan/exec off the
+# HTTP/workflow/Postgres/OTel server stack.
+server = ["dep:harness-server"]
+
 [[bin]]
 name = "harness"
 path = "src/main.rs"
@@ -16,7 +23,7 @@ path = "src/main.rs"
 [dependencies]
 harness-core = { workspace = true, features = ["db-postgres"] }
 harness-protocol = { workspace = true }
-harness-server = { workspace = true }
+harness-server = { workspace = true, optional = true }
 harness-workflow = { workspace = true }
 harness-agents = { workspace = true }
 harness-gc = { workspace = true }
