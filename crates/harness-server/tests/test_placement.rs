@@ -13,14 +13,17 @@ fn src_test_placement_can_only_shrink() -> anyhow::Result<()> {
     let current = scan_legacy_homes(&src)?;
     let expected = LEGACY_PLACEMENT
         .lines()
+        .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToOwned::to_owned)
         .collect::<BTreeSet<_>>();
     let additions = current.difference(&expected).cloned().collect::<Vec<_>>();
+    let retired = expected.difference(&current).cloned().collect::<Vec<_>>();
     assert!(
-        additions.is_empty(),
-        "harness-server src/ test homes may only shrink. Put new unit tests in the same file as `#[cfg(test)] mod tests`, and new API/route-contract tests in crates/harness-server/tests/. New entries:\n{}",
-        additions.join("\n")
+        additions.is_empty() && retired.is_empty(),
+        "harness-server src/ test homes must match the shrinking inventory. Put new unit tests in the same file as `#[cfg(test)] mod tests`, and new API/route-contract tests in crates/harness-server/tests/. Remove migrated paths from the inventory so they cannot be recreated.\nNew entries:\n{}\nRetired entries still in the inventory:\n{}",
+        additions.join("\n"),
+        retired.join("\n")
     );
     Ok(())
 }
@@ -36,7 +39,7 @@ fn scan_legacy_homes(src: &Path) -> anyhow::Result<BTreeSet<String>> {
                 .and_then(|value| value.to_str())
                 .unwrap_or_default();
             if path.is_dir() {
-                if name == "tests" {
+                if name == "tests" || name.ends_with("_tests") {
                     record(&mut entries, "dir", src, &path)?;
                     collect_rust_files(&mut entries, src, &path)?;
                     continue;

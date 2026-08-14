@@ -25,6 +25,10 @@ file src/http/tests/state_support.rs
 file src/http/tests/task_detail_sse_tests.rs
 file src/http/tests/webhook_runtime_tests.rs
 file src/http/tests/webhook_task_tests.rs
+dir src/intake/github_coverage_recovery_tests
+file src/intake/github_coverage_recovery_tests/atomic.rs
+file src/intake/github_coverage_recovery_tests/mod.rs
+file src/intake/github_coverage_recovery_tests/support.rs
 dir src/router/tests
 file src/router/tests/exec_plan.rs
 file src/router/tests/mod.rs
