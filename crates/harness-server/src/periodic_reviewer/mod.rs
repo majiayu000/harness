@@ -708,13 +708,9 @@ async fn last_review_timestamp(state: &Arc<AppState>, hook_key: &str) -> Option<
     events.iter().map(|e| e.ts).max()
 }
 
-#[path = "periodic_reviewer/commit_gate.rs"]
 mod commit_gate;
-#[path = "periodic_reviewer/tick.rs"]
 mod tick;
-#[path = "periodic_reviewer/tick_helpers.rs"]
 mod tick_helpers;
 
 #[cfg(test)]
-#[path = "periodic_reviewer/tests.rs"]
 mod tests;

@@ -80,5 +80,5 @@ pub enum TerminalTransition {
 }
 
 #[cfg(test)]
-#[path = "store_tests.rs"]
+#[path = "../store_tests.rs"]
 mod store_tests;

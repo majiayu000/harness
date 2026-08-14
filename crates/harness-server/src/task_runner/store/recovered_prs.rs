@@ -20,7 +20,7 @@ struct RecoveredPrStatusUpdate {
 impl TaskStore {
     /// Validate recovered pending tasks by checking their GitHub PR state via `gh`.
     ///
-    /// Spawned as a background task from `http.rs` after the completion callback is
+    /// Spawned as a background task from `http/mod.rs` after the completion callback is
     /// built, so it does not block server startup. For each pending task that has a
     /// `pr_url`, fetches the current PR state with a per-call timeout:
     /// - MERGED → mark Done  (completion_callback invoked)

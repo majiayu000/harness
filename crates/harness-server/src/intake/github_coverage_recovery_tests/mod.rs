@@ -1,11 +1,9 @@
 use super::*;
 use serde_json::json;
 
-#[path = "github_coverage_recovery_tests/support.rs"]
 mod support;
 use support::*;
 
-#[path = "github_coverage_recovery_tests/atomic.rs"]
 mod atomic;
 
 #[tokio::test]
