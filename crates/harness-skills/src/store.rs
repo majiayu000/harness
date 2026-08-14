@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
 use harness_core::{
-    retrieval::{score_lexical_relevance, LexicalRelevanceScore, RetrievalField},
+    retrieval::{
+        score_retrieval_candidate, KnowledgeRetriever, LexicalKnowledgeRetriever,
+        RetrievalCandidate, RetrievalField, RetrievalQuery, RetrievalSurface,
+    },
     types::SkillId,
     types::SkillLocation,
 };
@@ -276,6 +279,7 @@ impl SkillStore {
     }
 
     pub fn match_prompt(&self, prompt: &str) -> Vec<&Skill> {
+        let retriever = LexicalKnowledgeRetriever;
         let mut matches = self
             .skills
             .iter()
@@ -283,11 +287,10 @@ impl SkillStore {
                 if skill.trigger_patterns.is_empty() || !allows_auto_injection(skill, prompt) {
                     return None;
                 }
-                if skill_trigger_relevance(prompt, skill).score <= 0.0 {
+                if skill_trigger_relevance(&retriever, prompt, skill) <= 0.0 {
                     return None;
                 }
-                let relevance = skill_prompt_relevance(prompt, skill);
-                Some((skill, relevance.score))
+                Some((skill, skill_prompt_relevance(&retriever, prompt, skill)))
             })
             .collect::<Vec<_>>();
         matches.sort_by(|(left, left_score), (right, right_score)| {
@@ -688,7 +691,7 @@ fn allows_auto_injection(skill: &Skill, prompt: &str) -> bool {
     }
 }
 
-fn skill_prompt_relevance(prompt: &str, skill: &Skill) -> LexicalRelevanceScore {
+fn skill_prompt_relevance(retriever: &dyn KnowledgeRetriever, prompt: &str, skill: &Skill) -> f64 {
     let mut fields = Vec::with_capacity(skill.trigger_patterns.len() + 3);
     for pattern in &skill.trigger_patterns {
         fields.push(RetrievalField::new(pattern, 2.0));
@@ -696,16 +699,27 @@ fn skill_prompt_relevance(prompt: &str, skill: &Skill) -> LexicalRelevanceScore 
     fields.push(RetrievalField::new(&skill.name, 0.8));
     fields.push(RetrievalField::new(&skill.description, 1.2));
     fields.push(RetrievalField::new(&skill.content, 0.25));
-    score_lexical_relevance(prompt, &fields)
+    score_skill_candidate(retriever, prompt, skill, fields)
 }
 
-fn skill_trigger_relevance(prompt: &str, skill: &Skill) -> LexicalRelevanceScore {
+fn skill_trigger_relevance(retriever: &dyn KnowledgeRetriever, prompt: &str, skill: &Skill) -> f64 {
     let fields = skill
         .trigger_patterns
         .iter()
         .map(|pattern| RetrievalField::new(pattern, 2.0))
         .collect::<Vec<_>>();
-    score_lexical_relevance(prompt, &fields)
+    score_skill_candidate(retriever, prompt, skill, fields)
+}
+
+fn score_skill_candidate(
+    retriever: &dyn KnowledgeRetriever,
+    prompt: &str,
+    skill: &Skill,
+    fields: Vec<RetrievalField<'_>>,
+) -> f64 {
+    let query = RetrievalQuery::new(RetrievalSurface::Skill, prompt, 1);
+    let candidate = RetrievalCandidate::new(&skill.name, fields);
+    score_retrieval_candidate(retriever, &query, candidate).unwrap_or(0.0)
 }
 
 fn in_canary_bucket(skill_id: &SkillId, prompt: &str, ratio: f64) -> bool {
