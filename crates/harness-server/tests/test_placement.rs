@@ -47,12 +47,114 @@ fn scan_legacy_homes(src: &Path) -> anyhow::Result<BTreeSet<String>> {
                 pending.push(path);
                 continue;
             }
+            if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+                collect_declared_test_modules(&mut entries, src, &path)?;
+            }
             if name == "tests.rs" || name.ends_with("_tests.rs") {
                 record(&mut entries, "file", src, &path)?;
             }
         }
     }
     Ok(entries)
+}
+
+fn collect_declared_test_modules(
+    entries: &mut BTreeSet<String>,
+    src: &Path,
+    source: &Path,
+) -> anyhow::Result<()> {
+    let contents = fs::read_to_string(source)?;
+    let mut cfg_test = false;
+    let mut path_override = None;
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if line.starts_with("#[") {
+            cfg_test |= is_test_cfg(line);
+            if let Some(path) = path_attribute(line) {
+                path_override = Some(path.to_owned());
+            }
+            continue;
+        }
+
+        if cfg_test {
+            if let Some(module) = module_declaration(line) {
+                let target = match path_override.as_deref() {
+                    Some(path) => source.parent().unwrap_or(src).join(path.replace('\\', "/")),
+                    None => resolve_module_path(source, module),
+                };
+                if target.is_file() {
+                    record(entries, "file", src, &target)?;
+                } else if target.is_dir() {
+                    record(entries, "dir", src, &target)?;
+                    collect_rust_files(entries, src, &target)?;
+                }
+            }
+        }
+
+        cfg_test = false;
+        path_override = None;
+    }
+    Ok(())
+}
+
+fn is_test_cfg(attribute: &str) -> bool {
+    attribute
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .eq("#[cfg(test)]".chars())
+}
+
+fn path_attribute(attribute: &str) -> Option<&str> {
+    let compact = attribute.trim();
+    if !compact.starts_with("#[path") {
+        return None;
+    }
+    let start = compact.find('"')? + 1;
+    let end = compact[start..].find('"')? + start;
+    Some(&compact[start..end])
+}
+
+fn module_declaration(line: &str) -> Option<&str> {
+    let item = line.strip_suffix(';')?.trim();
+    let marker = item.rfind("mod ")?;
+    let visibility = &item[..marker];
+    if !(visibility.is_empty()
+        || visibility == "pub "
+        || visibility.starts_with("pub(") && visibility.ends_with(") "))
+    {
+        return None;
+    }
+    let module = &item[marker + "mod ".len()..];
+    let module = module.trim();
+    (!module.is_empty()
+        && module
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric()))
+    .then_some(module)
+}
+
+fn resolve_module_path(source: &Path, module: &str) -> PathBuf {
+    let parent = source.parent().unwrap_or_else(|| Path::new(""));
+    let filename = source.file_name().and_then(|value| value.to_str());
+    let module_root = match filename {
+        Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
+        _ => parent.join(
+            source
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        ),
+    };
+    let file = module_root.join(format!("{module}.rs"));
+    if file.is_file() {
+        file
+    } else {
+        module_root.join(module)
+    }
 }
 
 fn collect_rust_files(
@@ -80,7 +182,12 @@ fn record(
     src: &Path,
     path: &Path,
 ) -> anyhow::Result<()> {
-    let relative = path.strip_prefix(src)?.to_string_lossy().replace('\\', "/");
+    let canonical_src = fs::canonicalize(src)?;
+    let canonical_path = fs::canonicalize(path)?;
+    let relative = canonical_path
+        .strip_prefix(canonical_src)?
+        .to_string_lossy()
+        .replace('\\', "/");
     entries.insert(format!("{kind} src/{relative}"));
     Ok(())
 }
