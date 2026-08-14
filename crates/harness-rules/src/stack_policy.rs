@@ -9,7 +9,9 @@ use std::collections::{BTreeSet, HashSet};
 use thiserror::Error;
 
 mod reference;
+mod validation;
 pub use reference::conservative_reference_policy;
+use validation::*;
 
 pub const STACK_POLICY_SCHEMA_VERSION: &str = "harness-stack-policy/v0.1";
 pub const STACK_POLICY_FACTS_SCHEMA_VERSION: &str = "harness-stack-policy-facts/v0.1";
@@ -246,10 +248,22 @@ impl StackChangeFact {
 
     fn validate(&self) -> Result<(), StackPolicyError> {
         match self {
-            Self::ComponentAdded { component_id, .. }
-            | Self::ComponentRemoved { component_id, .. }
-            | Self::ComponentModified { component_id, .. } => {
-                ensure_non_empty("component_id", component_id)?;
+            Self::ComponentAdded {
+                component_id,
+                component_kind,
+                source_scope,
+                ..
+            }
+            | Self::ComponentRemoved {
+                component_id,
+                component_kind,
+                source_scope,
+                ..
+            } => {
+                validate_component_identity(component_id, Some((*source_scope, *component_kind)))?;
+            }
+            Self::ComponentModified { component_id, .. } => {
+                validate_component_identity(component_id, None)?;
             }
             Self::CapabilityEvidence {
                 component_id,
@@ -257,7 +271,7 @@ impl StackChangeFact {
                 trust_level,
                 ..
             } => {
-                ensure_non_empty("component_id", component_id)?;
+                validate_component_identity(component_id, None)?;
                 validate_capability_evidence_trust(*evidence_class, *trust_level)?;
             }
             Self::ProtectiveControlDiff { roles, .. } => {
@@ -692,104 +706,6 @@ fn precedence_entries() -> Vec<StackPolicyPrecedenceEntry> {
             reason: "promote applies only when no block or review rule matched",
         },
     ]
-}
-
-fn ensure_non_empty(field: &str, value: &str) -> Result<(), StackPolicyError> {
-    if value.trim().is_empty() {
-        Err(StackPolicyError::evaluation(format!(
-            "stack policy {field} cannot be empty"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-fn ensure_policy_non_empty(field: &str, value: &str) -> Result<(), StackPolicyError> {
-    if value.trim().is_empty() {
-        Err(StackPolicyError::parse(format!(
-            "stack policy {field} cannot be empty"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-fn ensure_non_empty_list<T>(field: &str, value: &[T]) -> Result<(), StackPolicyError> {
-    if value.is_empty() {
-        Err(StackPolicyError::parse(format!(
-            "stack policy matcher `{field}` cannot be empty"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-fn ensure_unique_evidence(
-    label: &str,
-    evidence: &[StackEvidenceKind],
-) -> Result<(), StackPolicyError> {
-    let mut seen = BTreeSet::new();
-    for kind in evidence {
-        if !seen.insert(*kind) {
-            return Err(StackPolicyError::evaluation(format!(
-                "duplicate {label} kind `{}`",
-                kind.as_str()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn ensure_unique_policy_evidence(
-    label: &str,
-    evidence: &[StackEvidenceKind],
-) -> Result<(), StackPolicyError> {
-    let mut seen = BTreeSet::new();
-    for kind in evidence {
-        if !seen.insert(*kind) {
-            return Err(StackPolicyError::parse(format!(
-                "duplicate {label} kind `{}`",
-                kind.as_str()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_capability_evidence_trust(
-    evidence_class: AgentStackCapabilityEvidenceClass,
-    trust_level: AgentStackTrustLevel,
-) -> Result<(), StackPolicyError> {
-    let valid = match evidence_class {
-        AgentStackCapabilityEvidenceClass::Declared => matches!(
-            trust_level,
-            AgentStackTrustLevel::SelfDeclared | AgentStackTrustLevel::RepositoryObserved
-        ),
-        AgentStackCapabilityEvidenceClass::Granted
-        | AgentStackCapabilityEvidenceClass::Observed => matches!(
-            trust_level,
-            AgentStackTrustLevel::RuntimeObserved | AgentStackTrustLevel::RunnerObserved
-        ),
-    };
-    valid.then_some(()).ok_or_else(|| {
-        StackPolicyError::evaluation(format!(
-            "capability evidence class `{}` is incompatible with trust level `{}`",
-            evidence_class.as_str(),
-            trust_level.as_str()
-        ))
-    })
-}
-
-fn ensure_unique_fields(fields: &[StackChangedField]) -> Result<(), StackPolicyError> {
-    let mut seen = BTreeSet::new();
-    for field in fields {
-        if !seen.insert(*field) {
-            return Err(StackPolicyError::evaluation(
-                "component modification facts cannot repeat changed_fields",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn non_empty_match(matched: Vec<String>) -> Option<Vec<String>> {

@@ -5,8 +5,9 @@ use crate::stack_policy::{
 };
 use harness_core::stack::capability_evidence::AgentStackCapabilityEvidenceClass;
 use harness_core::stack::{
-    AgentStackCapability, AgentStackProtectionConfidence, AgentStackProtectionDiffKind,
-    AgentStackProtectionRole, AgentStackTrustLevel,
+    AgentStackCapability, AgentStackComponentKind, AgentStackProtectionConfidence,
+    AgentStackProtectionDiffKind, AgentStackProtectionRole, AgentStackSourceScope,
+    AgentStackTrustLevel,
 };
 
 fn complete_evidence() -> StackEvidenceCompleteness {
@@ -260,6 +261,29 @@ fn stack_policy_rejects_capability_evidence_with_incompatible_trust() {
     .expect_err("declared evidence cannot carry runner-observed trust");
 
     assert!(matches!(error, StackPolicyError::EngineEvaluation { .. }));
+}
+
+#[test]
+fn stack_policy_rejects_noncanonical_or_mismatched_component_identities() {
+    let invalid_facts = [
+        StackChangeFact::ComponentModified {
+            fact_id: "malformed".to_string(),
+            component_id: "not-a-component-id".to_string(),
+            changed_fields: vec![crate::stack_policy::StackChangedField::Capability],
+        },
+        StackChangeFact::ComponentAdded {
+            fact_id: "mismatched".to_string(),
+            component_id: "repository:skill:.harness/skills/review.md".to_string(),
+            component_kind: AgentStackComponentKind::Policy,
+            source_scope: AgentStackSourceScope::Repository,
+        },
+    ];
+
+    for fact in invalid_facts {
+        let error = StackPolicyFacts::new(complete_evidence(), [fact])
+            .expect_err("noncanonical component identity should be rejected");
+        assert!(matches!(error, StackPolicyError::EngineEvaluation { .. }));
+    }
 }
 
 #[test]
