@@ -1,8 +1,13 @@
+#[cfg(feature = "server")]
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::{ArgAction, Args, Parser, Subcommand};
+#[cfg(feature = "server")]
 use harness_server::server::RuntimeLogMetadata;
+#[cfg(feature = "server")]
 use std::cmp::Ordering;
-use std::fs::{self, File, OpenOptions};
+#[cfg(feature = "server")]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,14 +15,27 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 
 mod eval;
 mod exec;
+mod execpolicy;
+mod gc;
+mod mcp_server;
+mod plan;
+mod pr;
+#[cfg(feature = "server")]
 mod reconcile;
+mod rule;
 mod runtime;
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod runtime_log_tests;
+#[cfg(feature = "server")]
 mod serve;
+mod server_cmds;
+mod skill;
 mod status;
+mod version;
 
+#[cfg(feature = "server")]
 const RUNTIME_LOG_PREFIX: &str = "harness-serve-";
+#[cfg(feature = "server")]
 const RUNTIME_LOG_SUFFIX: &str = ".log";
 
 #[derive(Parser)]
@@ -341,7 +359,7 @@ pub enum RuntimeBreakerCommand {
     },
 }
 
-fn configured_rule_engine(
+pub(crate) fn configured_rule_engine(
     config: &harness_core::config::HarnessConfig,
 ) -> harness_rules::engine::RuleEngine {
     let mut engine = harness_rules::engine::RuleEngine::new();
@@ -351,18 +369,6 @@ fn configured_rule_engine(
         config.rules.requirements_path.clone(),
     );
     engine
-}
-
-fn configured_skill_store(
-    config: &harness_core::config::HarnessConfig,
-) -> anyhow::Result<harness_skills::store::SkillStore> {
-    let project_root = std::env::current_dir()?;
-    let mut store = harness_skills::store::SkillStore::new()
-        .with_persist_dir(config.server.data_dir.join("skills"))
-        .with_discovery(&project_root);
-    store.load_builtin();
-    store.discover()?;
-    Ok(store)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,9 +443,12 @@ impl Write for TeeWriter {
 }
 
 struct LoggingBootstrap {
+    #[cfg(feature = "server")]
     runtime_logs: RuntimeLogMetadata,
     runtime_log_file: Option<Arc<Mutex<File>>>,
+    #[cfg(feature = "server")]
     setup_warning: Option<String>,
+    #[cfg(feature = "server")]
     retention_warnings: Vec<String>,
 }
 
@@ -516,59 +525,33 @@ fn log_config_source(source: &ConfigSource) {
     }
 }
 
-fn log_runtime_log_status(bootstrap: &LoggingBootstrap) {
-    match bootstrap.runtime_logs.state {
-        harness_server::server::RuntimeLogState::Enabled => {
-            if let Some(path) = bootstrap.runtime_logs.active_path.as_ref() {
-                tracing::info!(
-                    path = %path.display(),
-                    retention_days = bootstrap.runtime_logs.retention_days,
-                    retention_max_files = bootstrap.runtime_logs.retention_max_files,
-                    "runtime logs persisted to file"
-                );
-            }
-            for warning in &bootstrap.retention_warnings {
-                tracing::warn!(warning = %warning, "runtime log retention cleanup skipped an entry");
-            }
-        }
-        harness_server::server::RuntimeLogState::Degraded => {
-            tracing::warn!(
-                path_hint = bootstrap
-                    .runtime_logs
-                    .path_hint
-                    .as_deref()
-                    .unwrap_or("logs"),
-                retention_days = bootstrap.runtime_logs.retention_days,
-                retention_max_files = bootstrap.runtime_logs.retention_max_files,
-                error = bootstrap
-                    .setup_warning
-                    .as_deref()
-                    .unwrap_or("unknown setup error"),
-                "runtime log persistence unavailable; continuing with console logging only"
-            );
-        }
-        harness_server::server::RuntimeLogState::Disabled => {}
-    }
-}
-
 fn prepare_logging(
     command: &Command,
     config: &harness_core::config::HarnessConfig,
 ) -> LoggingBootstrap {
-    match command {
-        Command::Serve { .. } => prepare_runtime_logs(config, Utc::now()),
-        _ => LoggingBootstrap {
-            runtime_logs: RuntimeLogMetadata::disabled(
-                config.observe.log_retention_days,
-                config.observe.log_retention_max_files,
-            ),
-            runtime_log_file: None,
-            setup_warning: None,
-            retention_warnings: Vec::new(),
-        },
+    #[cfg(feature = "server")]
+    if matches!(command, Command::Serve { .. }) {
+        return prepare_runtime_logs(config, Utc::now());
+    }
+    #[cfg(not(feature = "server"))]
+    let _ = (command, config);
+    #[cfg(feature = "server")]
+    let _ = command;
+    LoggingBootstrap {
+        #[cfg(feature = "server")]
+        runtime_logs: RuntimeLogMetadata::disabled(
+            config.observe.log_retention_days,
+            config.observe.log_retention_max_files,
+        ),
+        runtime_log_file: None,
+        #[cfg(feature = "server")]
+        setup_warning: None,
+        #[cfg(feature = "server")]
+        retention_warnings: Vec::new(),
     }
 }
 
+#[cfg(feature = "server")]
 fn prepare_runtime_logs(
     config: &harness_core::config::HarnessConfig,
     started_at: DateTime<Utc>,
@@ -602,6 +585,7 @@ fn prepare_runtime_logs(
     }
 }
 
+#[cfg(feature = "server")]
 fn runtime_log_path(data_dir: &Path, started_at: DateTime<Utc>, pid: u32) -> PathBuf {
     data_dir.join("logs").join(format!(
         "{RUNTIME_LOG_PREFIX}{}-pid{pid}{RUNTIME_LOG_SUFFIX}",
@@ -609,6 +593,7 @@ fn runtime_log_path(data_dir: &Path, started_at: DateTime<Utc>, pid: u32) -> Pat
     ))
 }
 
+#[cfg(feature = "server")]
 fn open_runtime_log_file(
     log_path: &Path,
     retention_days: u32,
@@ -633,6 +618,7 @@ fn open_runtime_log_file(
     Ok((file, retention_warnings))
 }
 
+#[cfg(feature = "server")]
 fn purge_stale_runtime_logs(
     logs_dir: &Path,
     retention_days: u32,
@@ -650,6 +636,7 @@ fn purge_stale_runtime_logs(
     )
 }
 
+#[cfg(feature = "server")]
 fn purge_stale_runtime_logs_with(
     logs_dir: &Path,
     retention_days: u32,
@@ -730,12 +717,14 @@ fn purge_stale_runtime_logs_with(
 }
 
 #[derive(Debug)]
+#[cfg(feature = "server")]
 struct RuntimeLogEntry {
     started_at: DateTime<Utc>,
     pid: u32,
     path: PathBuf,
 }
 
+#[cfg(feature = "server")]
 fn compare_runtime_logs(
     left: &RuntimeLogEntry,
     right: &RuntimeLogEntry,
@@ -750,6 +739,7 @@ fn compare_runtime_logs(
         .then_with(|| left.path.cmp(&right.path))
 }
 
+#[cfg(feature = "server")]
 fn parse_runtime_log_identity(file_name: &str) -> Option<(DateTime<Utc>, u32)> {
     let trimmed = file_name
         .strip_prefix(RUNTIME_LOG_PREFIX)?
@@ -783,7 +773,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     {
         tracing::warn!(network_policy = "deny", "scoped CLI agents have no network access, including model-provider connectivity; configure exact provider hosts in isolation.network_allowlist and use container isolation for allowlisted Linux workloads");
     }
-    log_runtime_log_status(&logging);
+    server_cmds::log_runtime_log_status(&logging);
 
     // Register the central base WORKFLOW.md (sibling of the loaded config file,
     // e.g. config/WORKFLOW.md) as the single source of default workflow policy.
@@ -812,20 +802,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             projects,
             default_project,
         } => {
-            serve::run(
+            server_cmds::run_serve(
                 config,
                 transport,
                 port,
                 project_root,
                 projects,
                 default_project,
-                logging.runtime_logs.clone(),
+                &logging,
             )
             .await?;
         }
 
         Command::McpServer => {
-            crate::cmd::mcp_server::run(config.clone()).await?;
+            mcp_server::run(config.clone()).await?;
         }
 
         Command::Exec {
@@ -859,145 +849,30 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
 
         Command::Gc { cmd } => {
-            crate::gc::run_gc(cmd, &config).await?;
+            gc::run_gc(cmd, &config).await?;
         }
 
         Command::Rule { cmd } => {
-            match cmd {
-                RuleCommand::Load { project } => {
-                    let mut engine = configured_rule_engine(&config);
-                    engine.load(&project)?;
-                    println!("Loaded {} rules", engine.rules().len());
-                }
-                RuleCommand::Check { project, auto_fix } => {
-                    let mut engine = configured_rule_engine(&config);
-                    engine.load(&project)?;
-                    let violations = engine.scan(&project).await?;
-                    // Persist rule scan results for observability/GC even when running via CLI.
-                    match harness_observe::event_store::EventStore::with_policies_and_otel_with_database_url(
-                        &config.server.data_dir,
-                        config.server.database_url.as_deref(),
-                        config.observe.session_renewal_secs,
-                        config.observe.log_retention_days,
-                        &config.otel,
-                    )
-                    .await
-                    {
-                        Ok(store) => {
-                            store.persist_rule_scan(&project, &violations).await;
-                            store.shutdown().await;
-                        }
-                        Err(e) => tracing::warn!(
-                            "Failed to initialize event store, rule scan not persisted: {e}"
-                        ),
-                    }
-                    if violations.is_empty() {
-                        println!("No violations found");
-                    } else {
-                        for v in &violations {
-                            println!(
-                                "{:?} {}:{} [{}] {}",
-                                v.severity,
-                                v.file.display(),
-                                v.line.unwrap_or(0),
-                                v.rule_id,
-                                v.message
-                            );
-                        }
-                        if auto_fix {
-                            let fixed = engine.apply_fixes(&violations, &project)?;
-                            println!("Auto-fixed {fixed} file(s)");
-                        }
-                    }
-                }
-            }
+            rule::run(cmd, &config).await?;
         }
 
-        Command::ExecPolicy { cmd } => match cmd {
-            ExecPolicyCommand::Check {
-                rules,
-                requirements,
-                resolve_host_executables,
-                pretty,
-                command,
-            } => {
-                let mut engine = configured_rule_engine(&config);
-                let policy_paths = if rules.is_empty() {
-                    config.rules.exec_policy_paths.clone()
-                } else {
-                    rules
-                };
-                if policy_paths.is_empty() {
-                    anyhow::bail!(
-                        "no execpolicy rules supplied; pass --rules or set rules.exec_policy_paths"
-                    );
-                }
+        Command::ExecPolicy { cmd } => {
+            execpolicy::run(cmd, &config)?;
+        }
 
-                engine.load_exec_policy_files(&policy_paths)?;
-                if let Some(path) = requirements {
-                    engine.load_requirements_toml(&path)?;
-                } else {
-                    engine.load_configured_requirements()?;
-                }
-
-                let result = engine.check_command_policy(
-                    &command,
-                    &harness_rules::exec_policy::MatchOptions {
-                        resolve_host_executables,
-                    },
-                );
-                let rendered = if pretty {
-                    serde_json::to_string_pretty(&result)?
-                } else {
-                    serde_json::to_string(&result)?
-                };
-                println!("{rendered}");
-            }
-        },
-
-        Command::Skill { cmd } => match cmd {
-            SkillCommand::List { query } => {
-                let store = configured_skill_store(&config)?;
-                let skills = if let Some(q) = query {
-                    store.search(&q).into_iter().cloned().collect::<Vec<_>>()
-                } else {
-                    store.list().to_vec()
-                };
-                for s in &skills {
-                    println!("{} [{}]: {}", s.name, s.id, s.description);
-                }
-                if skills.is_empty() {
-                    println!("No skills found");
-                }
-            }
-            SkillCommand::Create { name, file } => {
-                let content = std::fs::read_to_string(&file)?;
-                let mut store = configured_skill_store(&config)?;
-                store.create(name.clone(), content);
-                println!("Created skill: {name}");
-            }
-            SkillCommand::Delete { skill_id } => {
-                let mut store = configured_skill_store(&config)?;
-                let deleted = if let Some(skill) = store.get_by_name(&skill_id).cloned() {
-                    store.delete(&skill.id)
-                } else {
-                    store.delete(&harness_core::types::SkillId::from_str(&skill_id))
-                };
-                println!("Deleted skill: {deleted}");
-            }
-        },
+        Command::Skill { cmd } => {
+            skill::run(cmd, &config)?;
+        }
 
         Command::Pr { cmd } => match cmd {
             PrCommand::Fix { issue, args } => {
-                crate::cmd::pr::fix(&config, issue, args.wait, args.max_rounds, args.project)
-                    .await?;
+                pr::fix(&config, issue, args.wait, args.max_rounds, args.project).await?;
             }
             PrCommand::Loop { pr, args } => {
-                crate::cmd::pr::loop_pr(&config, pr, args.wait, args.max_rounds, args.project)
-                    .await?;
+                pr::loop_pr(&config, pr, args.wait, args.max_rounds, args.project).await?;
             }
             PrCommand::Review { pr, args } => {
-                crate::cmd::pr::review(&config, pr, args.provider, args.base, args.project).await?;
+                pr::review(&config, pr, args.provider, args.base, args.project).await?;
             }
         },
 
@@ -1005,54 +880,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             eval::run(cmd).await?;
         }
 
-        Command::Plan { cmd } => match cmd {
-            PlanCommand::Init { spec } => {
-                let content = std::fs::read_to_string(&spec)?;
-                let project_root = std::env::current_dir()?;
-                let plan = harness_exec::plan::ExecPlan::from_spec(&content, &project_root)?;
-                let md = plan.to_markdown();
-                let out_path = format!("exec-plan-{}.md", plan.id);
-                std::fs::write(&out_path, &md)?;
-                println!("Created ExecPlan: {out_path}");
-            }
-            PlanCommand::Status { plan } => {
-                if std::path::Path::new(&plan).exists() {
-                    let content = std::fs::read_to_string(&plan)?;
-                    let p = harness_exec::plan::ExecPlan::from_markdown(&content)?;
-                    println!("Plan: {}", p.purpose);
-                    println!("Status: {:?}", p.status);
-                    let done = p.progress.iter().filter(|m| m.completed).count();
-                    println!("Progress: {}/{}", done, p.progress.len());
-                } else {
-                    println!("Plan file not found: {plan}");
-                }
-            }
-        },
+        Command::Plan { cmd } => {
+            plan::run(cmd)?;
+        }
 
         Command::Version => {
-            let cargo_toml_path = std::env::current_dir()?.join("Cargo.toml");
-            if !cargo_toml_path.exists() {
-                anyhow::bail!("Cargo.toml not found in current directory");
-            }
-            let content = std::fs::read_to_string(&cargo_toml_path)?;
-            let parsed: toml::Value = toml::from_str(&content)?;
-
-            if let Some(version) = parsed
-                .get("workspace")
-                .and_then(|w| w.get("package"))
-                .and_then(|p| p.get("version"))
-                .and_then(|v| v.as_str())
-            {
-                println!("Current version: {}", version);
-            } else if let Some(version) = parsed
-                .get("package")
-                .and_then(|p| p.get("version"))
-                .and_then(|v| v.as_str())
-            {
-                println!("Current version: {}", version);
-            } else {
-                anyhow::bail!("Version field not found in Cargo.toml");
-            }
+            version::run()?;
         }
 
         Command::Status {
@@ -1069,7 +902,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
 
         Command::Reconcile { dry_run, project } => {
-            reconcile::run(dry_run, project, &config).await?;
+            server_cmds::run_reconcile(dry_run, project, &config).await?;
         }
     }
 

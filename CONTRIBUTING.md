@@ -42,7 +42,7 @@ to broader gates:
 | Change type | Start with | Add before handoff |
 | --- | --- | --- |
 | Docs-only | `cargo test --help >/dev/null` | Add the command documented by the changed page if it names one. No Postgres is required for text-only edits. |
-| CLI (`crates/harness-cli`) | `cargo test -p harness-cli --all-targets` | Add the touched library crate test when the command delegates into shared logic. |
+| CLI (`crates/harness-cli`) | `cargo test -p harness-cli --all-targets` | Add `cargo test -p harness-cli --no-default-features --all-targets` when changing the `server` feature gate. Add the touched library crate test when the command delegates into shared logic. |
 | Server, API, or workflow runtime | `HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-fast.sh` | Postgres is required. Use `scripts/test-server-db.sh` for startup, recovery, persistence, full `AppState`, route, or workflow-runtime changes. |
 | SDK (TypeScript) (`sdk/typescript`) | `cd sdk/typescript && bun install && bun run test && bun run build` | Run the package-local build before publishing or release work. |
 | SDK (Python) (`sdk/python`) | `python3 -m unittest discover sdk/python/tests` | Run `cd sdk/python && python3 -m build` before publishing or release work. |
