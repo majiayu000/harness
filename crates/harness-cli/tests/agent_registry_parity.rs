@@ -44,19 +44,19 @@ const ENTRY_CONTRACTS: [EntryContract; 5] = [
         expected_use: ExpectedUse::LetBinding("agent_registry"),
     },
     EntryContract {
-        relative_path: "src/gc.rs",
+        relative_path: "src/commands/gc.rs",
         function: "build_agent_registry",
         builder: REGISTRY_BUILDER,
         expected_use: ExpectedUse::TailExpression,
     },
     EntryContract {
-        relative_path: "src/cmd/mcp_server.rs",
+        relative_path: "src/commands/mcp_server.rs",
         function: "run",
         builder: REGISTRY_BUILDER,
         expected_use: ExpectedUse::LetBinding("agent_registry"),
     },
     EntryContract {
-        relative_path: "src/cmd/pr.rs",
+        relative_path: "src/commands/pr.rs",
         function: "create_agent",
         builder: CLAUDE_BUILDER,
         expected_use: ExpectedUse::TailExpression,
@@ -97,27 +97,27 @@ fn codex_constructor_is_only_the_exact_read_only_review_exception() {
             relative_path.display().to_string(),
             suppression_counter.count,
         ));
-        if relative_path == Path::new("src/cmd/pr.rs") {
+        if relative_path == Path::new("src/commands/pr.rs") {
             pr_source = Some(source);
         }
     }
 
     assert_eq!(
         occurrences,
-        ["src/cmd/pr.rs"],
+        ["src/commands/pr.rs"],
         "all production `CodexAgent::new` references must be the single review-only exception"
     );
     assert_eq!(
         suppressions,
-        ["src/cmd/pr.rs"],
+        ["src/commands/pr.rs"],
         "`clippy::disallowed_methods` may only be suppressed for the reviewed Codex exception"
     );
     verify_codex_review_exception(
         pr_source
             .as_deref()
-            .expect("src/cmd/pr.rs should be included in the production scan"),
+            .expect("src/commands/pr.rs should be included in the production scan"),
     )
-    .unwrap_or_else(|error| panic!("cmd/pr.rs::review exception changed: {error}"));
+    .unwrap_or_else(|error| panic!("commands/pr.rs::review exception changed: {error}"));
 }
 
 fn verify_entry_contract(source: &str, contract: EntryContract) -> Result<(), String> {

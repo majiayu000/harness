@@ -525,13 +525,13 @@ impl ExecutionService for DefaultExecutionService {
 }
 
 #[cfg(test)]
-#[path = "execution_continuation_tests.rs"]
+#[path = "../execution_continuation_tests.rs"]
 mod continuation_tests;
 
 #[cfg(test)]
-#[path = "execution_declarative_tests.rs"]
+#[path = "../execution_declarative_tests.rs"]
 mod declarative_tests;
 
 #[cfg(test)]
-#[path = "execution_runtime_policy_tests.rs"]
+#[path = "../execution_runtime_policy_tests.rs"]
 mod runtime_policy_tests;

@@ -1,4 +1,259 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RetrievalSurface {
+    Skill,
+    RepoMemory,
+}
+
+impl RetrievalSurface {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::RepoMemory => "repo_memory",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RetrievalQuery<'a> {
+    pub surface: RetrievalSurface,
+    pub text: &'a str,
+    pub activity_class: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    pub limit: usize,
+}
+
+impl<'a> RetrievalQuery<'a> {
+    pub const fn new(surface: RetrievalSurface, text: &'a str, limit: usize) -> Self {
+        Self {
+            surface,
+            text,
+            activity_class: None,
+            repo: None,
+            limit,
+        }
+    }
+
+    pub const fn with_activity_class(mut self, activity_class: &'a str) -> Self {
+        self.activity_class = Some(activity_class);
+        self
+    }
+
+    pub const fn with_repo(mut self, repo: &'a str) -> Self {
+        self.repo = Some(repo);
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RetrievalCandidate<'a> {
+    pub id: &'a str,
+    pub fields: Vec<RetrievalField<'a>>,
+    pub native_repo: bool,
+}
+
+impl<'a> RetrievalCandidate<'a> {
+    pub fn new(id: &'a str, fields: Vec<RetrievalField<'a>>) -> Self {
+        Self {
+            id,
+            fields,
+            native_repo: true,
+        }
+    }
+
+    pub const fn with_native_repo(mut self, native_repo: bool) -> Self {
+        self.native_repo = native_repo;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredCandidate {
+    pub id: String,
+    pub score: f64,
+    pub native_repo: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalError {
+    message: String,
+}
+
+impl RetrievalError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for RetrievalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RetrievalError {}
+
+pub trait KnowledgeRetriever: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    /// Returns candidates in descending rank order. Implementations must remove
+    /// duplicate IDs before applying `query.limit` so lower-ranked unique
+    /// candidates are not discarded at the cutoff.
+    fn rank(
+        &self,
+        query: &RetrievalQuery<'_>,
+        candidates: &[RetrievalCandidate<'_>],
+    ) -> Result<Vec<ScoredCandidate>, RetrievalError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LexicalKnowledgeRetriever;
+
+impl KnowledgeRetriever for LexicalKnowledgeRetriever {
+    fn name(&self) -> &'static str {
+        "lexical"
+    }
+
+    fn rank(
+        &self,
+        query: &RetrievalQuery<'_>,
+        candidates: &[RetrievalCandidate<'_>],
+    ) -> Result<Vec<ScoredCandidate>, RetrievalError> {
+        if query.limit == 0 || candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut scored = candidates
+            .iter()
+            .map(|candidate| ScoredCandidate {
+                id: candidate.id.to_string(),
+                score: score_lexical_relevance(query.text, &candidate.fields).score,
+                native_repo: candidate.native_repo,
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| right.native_repo.cmp(&left.native_repo))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(canonicalize_ranked(scored, query.limit))
+    }
+}
+
+pub fn score_retrieval_candidate(
+    retriever: &dyn KnowledgeRetriever,
+    query: &RetrievalQuery<'_>,
+    candidate: RetrievalCandidate<'_>,
+) -> Result<f64, RetrievalError> {
+    Ok(retriever
+        .rank(query, std::slice::from_ref(&candidate))?
+        .into_iter()
+        .find(|scored| scored.id == candidate.id)
+        .map(|scored| scored.score)
+        .unwrap_or(0.0))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalExecution {
+    pub selected: Vec<ScoredCandidate>,
+    pub comparison: Option<RetrievalComparison>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalComparison {
+    pub surface: RetrievalSurface,
+    pub primary_implementation: &'static str,
+    pub shadow_implementation: &'static str,
+    pub primary_ranked: Vec<ScoredCandidate>,
+    pub shadow_ranked: Vec<ScoredCandidate>,
+    pub overlap_count: Option<usize>,
+    pub rank_divergence: Option<f64>,
+    pub shadow_error: Option<String>,
+}
+
+pub struct RetrievalExecutor<'a> {
+    primary: &'a dyn KnowledgeRetriever,
+    shadow: Option<&'a dyn KnowledgeRetriever>,
+}
+
+impl<'a> RetrievalExecutor<'a> {
+    pub fn new(primary: &'a dyn KnowledgeRetriever) -> Self {
+        Self {
+            primary,
+            shadow: None,
+        }
+    }
+
+    pub fn with_shadow(mut self, shadow: &'a dyn KnowledgeRetriever) -> Self {
+        self.shadow = Some(shadow);
+        self
+    }
+
+    pub fn retrieve(
+        &self,
+        query: &RetrievalQuery<'_>,
+        candidates: &[RetrievalCandidate<'_>],
+    ) -> Result<RetrievalExecution, RetrievalError> {
+        let selected = canonicalize_ranked(self.primary.rank(query, candidates)?, query.limit);
+        let Some(shadow) = self.shadow else {
+            return Ok(RetrievalExecution {
+                selected,
+                comparison: None,
+            });
+        };
+        let (shadow_ranked, shadow_error) = match shadow.rank(query, candidates) {
+            Ok(ranked) => (canonicalize_ranked(ranked, query.limit), None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        let (overlap_count, rank_divergence) = if shadow_error.is_none() {
+            (
+                Some(overlap_count(&selected, &shadow_ranked)),
+                Some(rank_divergence(&selected, &shadow_ranked)),
+            )
+        } else {
+            (None, None)
+        };
+        let comparison = RetrievalComparison {
+            surface: query.surface,
+            primary_implementation: self.primary.name(),
+            shadow_implementation: shadow.name(),
+            overlap_count,
+            rank_divergence,
+            primary_ranked: selected.clone(),
+            shadow_ranked,
+            shadow_error,
+        };
+        Ok(RetrievalExecution {
+            selected,
+            comparison: Some(comparison),
+        })
+    }
+}
+
+fn canonicalize_ranked(ranked: Vec<ScoredCandidate>, limit: usize) -> Vec<ScoredCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut canonical = Vec::with_capacity(limit.min(ranked.len()));
+    for candidate in ranked {
+        if canonical
+            .iter()
+            .any(|existing: &ScoredCandidate| existing.id == candidate.id)
+        {
+            continue;
+        }
+        canonical.push(candidate);
+        if canonical.len() == limit {
+            break;
+        }
+    }
+    canonical
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RetrievalField<'a> {
@@ -194,43 +449,54 @@ fn is_stopword(term: &str) -> bool {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lexical_relevance_matches_terms_regardless_of_order() {
-        let score = score_lexical_relevance(
-            "please review the code changes",
-            &[RetrievalField::new("code review", 2.0)],
-        );
-
-        assert!(score.score > 0.7, "score was {}", score.score);
-        assert_eq!(score.matched_terms, 2);
-    }
-
-    #[test]
-    fn lexical_relevance_returns_zero_without_content_overlap() {
-        let score = score_lexical_relevance(
-            "fix a postgres migration",
-            &[RetrievalField::new("frontend visual polish", 1.0)],
-        );
-
-        assert_eq!(score, LexicalRelevanceScore::none(3));
-    }
-
-    #[test]
-    fn lexical_relevance_does_not_phrase_match_inside_tokens() {
-        let score = score_lexical_relevance(
-            "cargo build failed",
-            &[RetrievalField::new("go build", 2.0)],
-        );
-
-        assert!(
-            score.score < 0.7,
-            "score should not receive a phrase bonus from 'cargo', was {}",
-            score.score
-        );
-        assert_eq!(score.matched_terms, 1);
-    }
+fn overlap_count(primary: &[ScoredCandidate], shadow: &[ScoredCandidate]) -> usize {
+    let primary_ids = primary
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<BTreeSet<_>>();
+    shadow
+        .iter()
+        .filter(|candidate| primary_ids.contains(candidate.id.as_str()))
+        .count()
 }
+
+fn rank_divergence(primary: &[ScoredCandidate], shadow: &[ScoredCandidate]) -> f64 {
+    let mut ids = primary
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<BTreeSet<_>>();
+    ids.extend(shadow.iter().map(|candidate| candidate.id.as_str()));
+    if ids.len() < 2 {
+        return 0.0;
+    }
+    let max_rank = primary.len().max(shadow.len()).max(1);
+    let rank = |items: &[ScoredCandidate], id: &str| {
+        items
+            .iter()
+            .position(|candidate| candidate.id == id)
+            .unwrap_or(max_rank)
+    };
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    let divergence = (0..ids.len())
+        .flat_map(|left| (left + 1..ids.len()).map(move |right| (left, right)))
+        .map(|(left, right)| {
+            let primary_order = rank(primary, ids[left]).cmp(&rank(primary, ids[right]));
+            let shadow_order = rank(shadow, ids[left]).cmp(&rank(shadow, ids[right]));
+            if primary_order == shadow_order {
+                0.0
+            } else if primary_order == std::cmp::Ordering::Equal
+                || shadow_order == std::cmp::Ordering::Equal
+            {
+                0.5
+            } else {
+                1.0
+            }
+        })
+        .sum::<f64>();
+    let pair_count = ids.len() * (ids.len() - 1) / 2;
+    divergence / pair_count as f64
+}
+
+#[cfg(test)]
+#[path = "retrieval_tests.rs"]
+mod tests;

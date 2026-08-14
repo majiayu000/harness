@@ -491,7 +491,7 @@ async fn persist_recovered_workflow(
 }
 
 #[cfg(test)]
-#[path = "github_coverage_recovery_tests.rs"]
+#[path = "github_coverage_recovery_tests/mod.rs"]
 mod recovery_tests;
 
 #[cfg(test)]

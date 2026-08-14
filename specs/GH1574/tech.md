@@ -8,9 +8,10 @@ GitHub issue: `#1574`
 - `harness-context` composes pre-run context via `ContextComposer` with
   quotas (`ContextQuotas`), a `Degraded` state, and a `ComposeManifest`
   that already records per-item decisions.
-- `harness-agents` adapters (`claude_adapter`, `codex_adapter`,
+- `harness-agents` stream parsers (`claude_stream_json`, `codex_adapter`,
   `codex_exec_parser`) parse agent event streams and deliver subagent
-  results to the orchestrator.
+  results to the orchestrator. There is no `claude_adapter` module
+  (removed in GH-1786).
 - The inner tool loop of Claude Code / Codex is not interceptable; the only
   seams Harness owns are (A) subagent result ingestion and (B) the
   over-budget degradation path in the composer.

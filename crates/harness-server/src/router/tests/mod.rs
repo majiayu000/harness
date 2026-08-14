@@ -4,10 +4,8 @@ use harness_agents::registry::AgentRegistry;
 use harness_protocol::{methods::Method, methods::RpcRequest, methods::VALIDATION_ERROR};
 use std::sync::Arc;
 
-#[path = "tests/exec_plan.rs"]
 mod exec_plan;
 
-#[path = "tests/observability.rs"]
 mod observability;
 
 #[tokio::test]
