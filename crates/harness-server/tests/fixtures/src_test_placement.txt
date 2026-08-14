@@ -20,14 +20,12 @@ file src/http/tests/runtime_worker_non_issue_replay_tests.rs
 file src/http/tests/runtime_worker_replay_tests.rs
 file src/http/tests/runtime_worker_tests/child_workflows.rs
 file src/http/tests/runtime_worker_tests/mod.rs
+dir src/http/tests/runtime_worker_tests
 file src/http/tests/runtime_worker_workspace_tests.rs
 file src/http/tests/state_support.rs
 file src/http/tests/task_detail_sse_tests.rs
 file src/http/tests/webhook_runtime_tests.rs
 file src/http/tests/webhook_task_tests.rs
-file src/http/shutdown_test.rs
-file src/http/test_fixtures.rs
-file src/http/tests_password_reset.rs
 dir src/intake/github_coverage_recovery_tests
 file src/intake/github_coverage_recovery_tests/atomic.rs
 file src/intake/github_coverage_recovery_tests/mod.rs
@@ -80,11 +78,8 @@ file src/task_db/queries_recovery_tests.rs
 file src/task_queue_aging_tests.rs
 file src/task_queue_tests.rs
 file src/task_runner/store_tests.rs
-file src/test_helpers.rs
 file src/thread_manager_tests.rs
 file src/webhook/tests.rs
-file src/workflow_runtime_plan_issue.rs
-file src/workflow_runtime_pr_feedback/pr_lifecycle_persist.rs
 file src/workflow_runtime_pr_feedback/pr_detection_tests.rs
 file src/workflow_runtime_submission/atomicity_tests.rs
 file src/workflow_runtime_submission/continuation_tests.rs
@@ -112,5 +107,4 @@ file src/workspace_lease_store_tests.rs
 file src/workspace_pool_tests.rs
 file src/workspace_reclaim_tests.rs
 file src/workspace_startup_reconcile_tests.rs
-file src/workspace_test_support.rs
 file src/workspace_tests.rs
