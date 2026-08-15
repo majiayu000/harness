@@ -6,9 +6,6 @@ use super::{
 };
 use crate::stack::{AgentStackCapability, AgentStackComponent, AgentStackComponentKind};
 use serde_json::Value;
-use starlark_syntax::syntax::ast::{Argument, AstExpr, AstLiteral, Expr};
-use starlark_syntax::syntax::module::AstModuleFields;
-use starlark_syntax::syntax::{AstModule, Dialect};
 use std::{collections::BTreeSet, ffi::OsStr, path::Path};
 
 pub(super) const MAX_COMPONENT_FINDINGS: usize = 256;
@@ -20,7 +17,9 @@ pub(super) enum TypedSource { Auto, Requirements, Starlark, MarkdownPolicy }
 
 #[rustfmt::skip]
 pub(super) fn extract_typed(component: &AgentStackComponent, locator: &str, text: &str, source_kind: TypedSource, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let is_markdown = matches!(source_kind, TypedSource::MarkdownPolicy)
+        || matches!(source_kind, TypedSource::Auto) && matches!(file_format(locator), Some(FileFormat::Markdown));
+    let text = if is_markdown { text } else { text.strip_prefix('\u{feff}').unwrap_or(text) };
     if component.kind() == AgentStackComponentKind::Hook { extract_hook_metadata(component, locator, text, raw, failures); return; }
     if matches!(source_kind, TypedSource::Starlark) { collect_starlark_prefix_rules(component, locator, text, raw, failures); return; }
     let Some(format) = (match source_kind { TypedSource::Requirements => Some(FileFormat::Toml), TypedSource::MarkdownPolicy => Some(FileFormat::Markdown), TypedSource::Auto => file_format(locator), TypedSource::Starlark => unreachable!() }) else { return; };
@@ -84,7 +83,7 @@ fn validate_json5_structure(text: &str) -> Result<(), ()> {
 }
 #[rustfmt::skip]
 impl FileFormat {
-    fn source(self, text: &str) -> Result<Option<&str>, ()> { match self { Self::Markdown => yaml_front_matter(text), _ => Ok(Some(text)) } }
+    fn source(self, text: &str) -> Result<Option<&str>, ()> { match self { Self::Markdown => super::frontmatter::yaml_front_matter(text), _ => Ok(Some(text)) } }
 
     fn parse(self, text: &str) -> Result<Value, ()> {
         match self {
@@ -518,70 +517,25 @@ fn classify_command_pattern(
 
 #[rustfmt::skip]
 fn collect_starlark_prefix_rules(component: &AgentStackComponent, locator: &str, text: &str, raw: &mut Vec<RawCapability>, failures: &mut Vec<AgentStackCapabilityExtractionFailure>) {
-    let dialect = Dialect {
-        enable_def: false,
-        enable_lambda: false,
-        enable_load: false,
-        enable_load_reexport: false,
-        enable_top_level_stmt: false,
-        ..Dialect::Standard
-    };
-    let ast = match AstModule::parse(locator, text.to_owned(), &dialect) {
-        Ok(ast) => ast,
-        Err(_) => {
-            failures.push(AgentStackCapabilityExtractionFailure::new(
-                component,
-                AgentStackCapabilityExtractionFailureKind::ParseFailed,
-                Some("typed.starlark_parse"),
-                format!("{locator} is not valid Starlark"),
-            ));
+    let validated = match super::starlark_validation::validate(locator, text) {
+        Ok(rules) => rules,
+        Err(super::starlark_validation::ValidationError::Parse) => {
+            push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::ParseFailed, Some("typed.starlark_parse"), format!("{locator} is not valid Starlark"));
+            return;
+        }
+        Err(super::starlark_validation::ValidationError::Invalid) => {
+            push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("policy.prefix_rule"), "Starlark policy failed runtime-compatible validation".to_owned());
             return;
         }
     };
-    let mut index = 0;
     let mut seen = BTreeSet::new();
-    ast.statement().visit_expr(|expr| visit_starlark_expr(expr, &mut |expr| {
-        let Expr::Call(function, arguments) = &expr.node else {
-            return;
-        };
-        let Expr::Identifier(name) = &function.node else {
-            return;
-        };
-        if name.ident != "prefix_rule" {
-            return;
-        }
-        let argument = |wanted: &str, position: usize| {
-            arguments.args.iter().find_map(|argument| match &argument.node {
-                Argument::Named(name, value) if name.node == wanted => Some(value), _ => None,
-            }).or_else(|| arguments.args.iter().filter_map(|argument| match &argument.node {
-                Argument::Positional(value) => Some(value), _ => None,
-            }).nth(position))
-        };
-        let decision = match argument("decision", 1) {
-            None => "allow",
-            Some(value) => match starlark_string(value).filter(|value| matches!(*value, "allow" | "prompt" | "forbidden")) {
-                Some(decision) => decision,
-                None => {
-                    push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("policy.prefix_rule"), format!("Starlark policy prefix rule {index} has no valid decision"));
-                    index += 1;
-                    return;
-                }
-            },
-        };
-        let Some(pattern) = argument("pattern", 0).and_then(starlark_pattern_tokens) else {
-            push_failure(
-                component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration,
-                Some("policy.prefix_rule"), format!("Starlark policy prefix rule {index} has no literal pattern"),
-            );
-            index += 1;
-            return;
-        };
-        let capabilities = match classify_command_pattern(&pattern) {
+    for (index, rule) in validated.iter().enumerate() {
+        let decision = rule.decision.as_str();
+        let capabilities = match classify_command_pattern(&rule.pattern) {
             Ok(capabilities) => capabilities,
             Err(limit) => {
                 push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::LimitExceeded, Some("policy.prefix_rule"), format!("Starlark policy prefix rule {index} {}", limit.reason()));
-                index += 1;
-                return;
+                continue;
             }
         };
         for capability in capabilities {
@@ -595,37 +549,7 @@ fn collect_starlark_prefix_rules(component: &AgentStackComponent, locator: &str,
                 format!("Starlark prefix rule {index} with decision `{decision}` controls a command associated with {}", capability.as_str()),
             );
         }
-        index += 1;
-    }));
-}
-
-#[rustfmt::skip]
-fn visit_starlark_expr(expr: &AstExpr, visit: &mut impl FnMut(&AstExpr)) { visit(expr); expr.node.visit_expr(|child| visit_starlark_expr(child, visit)); }
-
-fn starlark_string(expr: &AstExpr) -> Option<&str> {
-    match &expr.node {
-        Expr::Literal(AstLiteral::String(value)) => Some(&value.node),
-        _ => None,
     }
-}
-
-fn starlark_pattern_tokens(expr: &AstExpr) -> Option<CommandPattern> {
-    let Expr::List(items) = &expr.node else {
-        return None;
-    };
-    let mut tokens = Vec::new();
-    for item in items {
-        let position = match &item.node {
-            Expr::Literal(AstLiteral::String(value)) => vec![trimmed_token(&value.node)?],
-            Expr::List(alternatives) if !alternatives.is_empty() => alternatives
-                .iter()
-                .map(|value| trimmed_token(starlark_string(value)?))
-                .collect::<Option<_>>()?,
-            _ => return None,
-        };
-        tokens.push(position);
-    }
-    (!tokens.is_empty()).then_some(tokens)
 }
 
 #[rustfmt::skip]
@@ -695,23 +619,4 @@ pub(super) fn record_limit(component: &AgentStackComponent, raw: &[RawCapability
         ));
         debug_assert!(raw.len() + failures.len() <= MAX_COMPONENT_FINDINGS);
     }
-}
-
-fn yaml_front_matter(text: &str) -> Result<Option<&str>, ()> {
-    let rest = match text
-        .strip_prefix("---\n")
-        .or_else(|| text.strip_prefix("---\r\n"))
-    {
-        Some(rest) => rest,
-        None if text.starts_with("---") => return Err(()),
-        None => return Ok(None),
-    };
-    let mut offset = 0;
-    for line in rest.split_inclusive('\n') {
-        if matches!(line.trim_end_matches(['\r', '\n']), "---" | "...") {
-            return Ok(Some(&rest[..offset]));
-        }
-        offset += line.len();
-    }
-    Err(())
 }

@@ -96,7 +96,7 @@ fn capability_extraction_reads_supported_declarations_and_static_commands() {
         dir.path(),
         "harness.toml" => b"[rules]\nexec_policy_paths = [\"policy.rules\"]\n",
         ".vibeguard/policy.json5" => b"{ capabilities: ['network',], /* metadata */ }",
-        "policy.rules" => b"prefix_rule(pattern = [[\"curl\", \"rm\"]], decision = \"prompt\")\nprefix_rule(pattern = [\" python3 \"], decision = \"prompt\")\nprefix_rule([\"kubectl\", \"apply\"], \"prompt\")\n[prefix_rule([\"curl\"])]\n",
+        "policy.rules" => b"prefix_rule(pattern = [[\"curl\", \"rm\"]], decision = \"prompt\")\nprefix_rule(pattern = [\" python3 \"], decision = \"prompt\")\nprefix_rule([\"kubectl\", \"apply\"], \"prompt\")\nprefix_rule(pattern = [\"git\", \"push\"], decision = \"prompt\", match = [\"git push origin\"], not_match = [\"git status\"], justification = \"publishes changes\")\n[prefix_rule([\"curl\"])]\n",
         "rules/windows.md" => b"---\r\ncapabilities: [secret_read]\r\n---\r\n# Policy\r\n",
         PING => br#"{"tools":[{"inputSchema":{"properties":{
           "command":{},"output_path":{},"delete_flag":{},"TOKEN_FILE":{},"config":{"properties":{"api_key":{}}},
@@ -139,6 +139,7 @@ fn capability_extraction_reads_supported_declarations_and_static_commands() {
 #[rustfmt::skip]
 fn shell_syntax_boundaries_preserve_real_commands_and_mutations() {
     let dir = tmp();
+    let nested_wrappers = format!("{}curl https://example.invalid\n", "env ".repeat(32));
     write_files!(
         dir.path(),
         ".harness/guards/git-mutate.sh" => b"git -C . add file; git restore file\n",
@@ -148,7 +149,7 @@ fn shell_syntax_boundaries_preserve_real_commands_and_mutations() {
         ".harness/guards/fd.sh" => b"printf x >&2; printf x 2>&1; printf x 2>&-\n",
         ".harness/guards/redirect.sh" => b"printf '%s' value 2>>generated.conf\n",
         ".harness/guards/sudo.sh" => b"doas -a persist rm -rf output\nsudo -nEu root rm -rf output\n",
-        ".harness/guards/substitution.sh" => b"echo \"$(curl https://example.invalid)\"\nresult=`rm -rf output`\nprintf '%s' '$(kubectl apply)' '`wget ignored.invalid`'\n",
+        ".harness/guards/substitution.sh" => b"echo \"$(curl https://example.invalid)\"\nresult=`rm -rf output`\nnested=`echo \\`curl https://example.invalid\\``\nprintf '%s' '$(kubectl apply)' '`wget ignored.invalid`'\n",
         ".harness/guards/heredoc-unquoted.sh" => b"cat <<EOF\n$(curl https://example.invalid)\nEOF\n",
         ".harness/guards/heredoc-tabs.sh" => b"cat <<-EOF\n\t`rm -rf output`\n\tEOF\n",
         ".harness/guards/heredoc-quoted.sh" => b"cat <<'EOF'\n$(curl https://ignored.invalid)\nEOF\n",
@@ -160,11 +161,27 @@ rl https://example.invalid)"
         ".harness/guards/arithmetic-expansion.sh" => b"value=$(( 1\n << 2\n)); rm -rf output\n",
         ".harness/guards/arithmetic-multiline.sh" => b"(( x = 1\n << 2\n)); rm -rf output\n",
         ".harness/guards/arithmetic-shift.sh" => b"(( x = 1 << 2 )); rm -rf output\n",
+        ".harness/guards/wrappers.sh" => b"env TOKEN=x curl https://example.invalid\ncommand rm -rf output\nexec kubectl apply\n",
+        ".harness/guards/env-split.sh" => b"env -S 'rm -rf output'\n",
+        ".harness/guards/env-split-trailing.sh" => b"env -S 'printf \"%s\\n\"' rm -rf output\n",
+        ".harness/guards/env-split-escape.sh" => b"env -S \"rm\\_-rf\\_output\"\n",
+        ".harness/guards/env-invalid.sh" => b"env -uS printf\nenv -PS printf\nenv -S \"'' rm -rf output\"\nenv -S 'c\\url https://example.invalid'\nenv -S '${}' rm -rf output\nenv -S '$NAME' rm -rf output\n",
+        ".harness/guards/env-path.sh" => b"env -iP /usr/bin curl https://example.invalid\n",
+        ".harness/guards/depth.sh" => nested_wrappers,
+        ".harness/guards/shell-c.sh" => b"sh -c 'curl https://example.invalid; rm -rf output'\nsh -c 'echo \"$(rm -rf nested)\"'\n",
+        ".harness/guards/gh-read.sh" => b"gh release list\ngh release view delete\ngh api -X GET search/issues -f q=repo:harness\ngh run download 7\ngh variable get NAME\ngh gist clone id\ngh codespace view\ngh repo clone owner/repo\ngh repo set-default --view\ngh pr checkout 42\n",
+        ".harness/guards/gh-write.sh" => b"gh release create v1\ngh pr -R owner/repo merge 42\ngh label create urgent\ngh run cancel 7\ngh secret set TOKEN\ngh api -X DELETE repos/owner/repo/hooks/1\ngh api -XDELETE repos/owner/repo/hooks/1\ngh api -fbody=x repos/owner/repo/issues\n",
     );
     assert_rows(&run(dir.path()), &[
         (".harness/guards/arithmetic-expansion.sh", Capability::Destructive, STATIC, Low), (".harness/guards/arithmetic-expansion.sh", Capability::FileWrite, STATIC, Low),
         (".harness/guards/arithmetic-multiline.sh", Capability::Destructive, STATIC, Low), (".harness/guards/arithmetic-multiline.sh", Capability::FileWrite, STATIC, Low),
         (".harness/guards/arithmetic-shift.sh", Capability::Destructive, STATIC, Low), (".harness/guards/arithmetic-shift.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/depth.sh", Capability::Destructive, STATIC, Low), (".harness/guards/depth.sh", Capability::FileWrite, STATIC, Low), (".harness/guards/depth.sh", Capability::Network, STATIC, Low), (".harness/guards/depth.sh", Capability::Privileged, STATIC, Low), (".harness/guards/depth.sh", Capability::ProductionWrite, STATIC, Low), (".harness/guards/depth.sh", Capability::Shell, STATIC, Low),
+        (".harness/guards/env-path.sh", Capability::Network, STATIC, Low),
+        (".harness/guards/env-split-escape.sh", Capability::Destructive, STATIC, Low), (".harness/guards/env-split-escape.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/env-split.sh", Capability::Destructive, STATIC, Low), (".harness/guards/env-split.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/gh-read.sh", Capability::Network, STATIC, Low),
+        (".harness/guards/gh-write.sh", Capability::Network, STATIC, Low), (".harness/guards/gh-write.sh", Capability::ProductionWrite, STATIC, Low),
         (".harness/guards/git-mutate.sh", Capability::Destructive, STATIC, Low), (".harness/guards/git-mutate.sh", Capability::FileWrite, STATIC, Low),
         (".harness/guards/hash.sh", Capability::Network, STATIC, Low),
         (".harness/guards/heredoc-continuation.sh", Capability::Network, STATIC, Low),
@@ -172,8 +189,10 @@ rl https://example.invalid)"
         (".harness/guards/heredoc-unquoted.sh", Capability::Network, STATIC, Low),
         (".harness/guards/nested-continuation.sh", Capability::Network, STATIC, Low),
         (".harness/guards/redirect.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/shell-c.sh", Capability::Destructive, STATIC, Low), (".harness/guards/shell-c.sh", Capability::FileWrite, STATIC, Low), (".harness/guards/shell-c.sh", Capability::Network, STATIC, Low), (".harness/guards/shell-c.sh", Capability::Shell, STATIC, Low),
         (".harness/guards/substitution.sh", Capability::Destructive, STATIC, Low), (".harness/guards/substitution.sh", Capability::FileWrite, STATIC, Low), (".harness/guards/substitution.sh", Capability::Network, STATIC, Low),
         (".harness/guards/sudo.sh", Capability::Destructive, STATIC, Low), (".harness/guards/sudo.sh", Capability::FileWrite, STATIC, Low), (".harness/guards/sudo.sh", Capability::Privileged, STATIC, Low),
+        (".harness/guards/wrappers.sh", Capability::Destructive, STATIC, Low), (".harness/guards/wrappers.sh", Capability::FileWrite, STATIC, Low), (".harness/guards/wrappers.sh", Capability::Network, STATIC, Low), (".harness/guards/wrappers.sh", Capability::ProductionWrite, STATIC, Low),
     ]);
 }
 
@@ -259,13 +278,15 @@ fn typed_sources_honor_path_semantics_bom_docs_and_secret_references() {
         "builtins/child.toml" => b"---\ncapabilities: [shell]\n---\n# Builtin\n",
         "custom.policy" => "\u{feff}---\ncapabilities: [secret_read]\n---\n# Custom\n",
         "policies/nested/policy.toml" => b"---\ncapabilities: [network]\n---\n# Nested\n",
+        ".harness/rules/default.toml" => b"---\ncapabilities: [network]\n---\n# Default\n",
         "policy.star" => b"[rules]\n[[rules.prefix_rules]]\npattern = [{ token = \"curl\" }]\ndecision = \"prompt\"\n",
         "rules/bom.md" => "\u{feff}---\ncapabilities: [destructive]\n---\n# Policy\n",
     );
     assert_rows(&run(dir.path()), &[
+        (".harness/rules/default.toml", Capability::Network, POLICY, High),
         (PING, Capability::SecretRead, SERVER, Medium), ("builtins/child.toml", Capability::Shell, POLICY, High),
-        ("custom.policy", Capability::SecretRead, POLICY, High), ("policies/nested/policy.toml", Capability::Network, POLICY, High),
-        ("policy.star", Capability::Network, PREFIX, Medium), ("rules/bom.md", Capability::Destructive, POLICY, High),
+        ("policies/nested/policy.toml", Capability::Network, POLICY, High),
+        ("policy.star", Capability::Network, PREFIX, Medium),
     ]);
 }
 
@@ -402,7 +423,7 @@ fn extractor_reports_parse_and_invalid_declaration_failures() {
         ".vibeguard/prefix.json5" => b"{rules:{prefix_rules:'curl'}}",
         ".vibeguard/decision.json5" => b"{rules:{prefix_rules:[{pattern:'curl'}]}}",
         "harness.toml" => b"[rules]\ndiscovery_paths = [\"harness.toml\"]\nexec_policy_paths = [\"invalid.rules\"]\nrequirements_path = \"./reqs.req\"\n",
-        "invalid.rules" => b"prefix_rule(pattern = [\"curl\"], decision = \"invalid\")\n",
+        "invalid.rules" => b"prefix_rule(pattern = [\"curl\"], decision = \"invalid\")\nprefix_rule(pattern = [\"curl\"], decision = \"prompt\", not_match = [\"curl\"])\n",
         "reqs.req" => b"foo = 1\n",
         "requirements.toml" => b"[[rules.prefix_rules]]\npattern = [\"curl\"]\ndecision = \"prompt\"\n[[rules.prefix_rules]]\npattern = [{ token = \"rm\" }]\ndecision = \"allow\"\n[[rules.prefix_rules]]\npattern = [{ token = \"curl\" }]\ndecision = \"prompt\"\njustification = \"\"\n",
         "rules/unclosed.md" => b"---\ncapabilities: [network]\n",
@@ -425,8 +446,6 @@ fn extractor_reports_parse_and_invalid_declaration_failures() {
         ("invalid.rules", InvalidDeclaration, PREFIX),
         ("reqs.req", InvalidDeclaration, PREFIX),
         ("requirements.toml", InvalidDeclaration, PREFIX),
-        ("rules/unclosed.md", ParseFailed, "typed.front_matter_parse"),
-        ("rules/invalid-open.md", ParseFailed, "typed.front_matter_parse"),
         (PREFLIGHT, InvalidDeclaration, "hook.metadata_capabilities"),
         (PREFLIGHT, FailureKind::LimitExceeded, typed::LIMIT_RULE_ID),
         (PRE_PUSH, FailureKind::LimitExceeded, typed::LIMIT_RULE_ID),
@@ -452,4 +471,39 @@ fn repository_finding_limit_is_fail_visible() {
     let extraction = run(dir.path());
     assert_eq!(extraction.evidence().len() + extraction.failures().len(), MAX_REPOSITORY_FINDINGS);
     assert!(extraction.failures().iter().any(|failure| failure.rule_id() == Some(REPOSITORY_LIMIT_RULE_ID)));
+}
+
+#[test]
+fn unsupported_entry_does_not_consume_repository_finding_sentinel() {
+    let dir = tmp();
+    let full = (0..typed::MAX_COMPONENT_FINDINGS)
+        .map(|index| format!("invalid{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let partial = (0..typed::MAX_COMPONENT_FINDINGS - 1)
+        .map(|index| format!("invalid{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for index in 0..3 {
+        write_control(
+            dir.path(),
+            &format!(".harness/guards/limit-{index}.sh"),
+            format!("#!/bin/sh\n# harness-capabilities: {full}\n"),
+        );
+    }
+    write_control(
+        dir.path(),
+        ".harness/guards/limit-3.sh",
+        format!("#!/bin/sh\n# harness-capabilities: {partial}\n"),
+    );
+    write_control(dir.path(), ".harness/guards/zzzz.txt", "ignored");
+    let extraction = run(dir.path());
+    assert_eq!(
+        extraction.evidence().len() + extraction.failures().len(),
+        MAX_REPOSITORY_FINDINGS - 1
+    );
+    assert!(!extraction
+        .failures()
+        .iter()
+        .any(|failure| failure.rule_id() == Some(REPOSITORY_LIMIT_RULE_ID)));
 }

@@ -2,6 +2,8 @@ use super::{inferred_raw, push_unique, AgentStackCapabilityExtractionConfidence,
 use crate::stack::{AgentStackCapability, AgentStackComponent, AgentStackComponentKind};
 use std::collections::VecDeque;
 
+const MAX_COMMAND_CLASSIFICATION_DEPTH: usize = 16;
+
 struct Heredoc {
     delimiter: String,
     allows_tabs: bool,
@@ -65,7 +67,15 @@ pub(super) fn extract_static(component: &AgentStackComponent, locator: &str, tex
 }
 #[rustfmt::skip]
 pub(super) fn classify_command_tokens(tokens: &[String]) -> Vec<AgentStackCapability> {
+    classify_command_tokens_at_depth(tokens, 0)
+}
+
+#[rustfmt::skip]
+fn classify_command_tokens_at_depth(tokens: &[String], depth: usize) -> Vec<AgentStackCapability> {
     use AgentStackCapability::{Destructive, FileWrite, Network, Privileged, ProductionWrite, Shell};
+    if depth >= MAX_COMMAND_CLASSIFICATION_DEPTH {
+        return vec![Destructive, FileWrite, Network, Privileged, ProductionWrite, Shell];
+    }
     let mut capabilities = Vec::new();
     let Some(program) = tokens.first().map(|token| command_basename(token)) else {
         return capabilities;
@@ -73,16 +83,30 @@ pub(super) fn classify_command_tokens(tokens: &[String]) -> Vec<AgentStackCapabi
     match program {
         "sudo" | "doas" => {
             capabilities.push(Privileged);
-            if let Some(start) = wrapped_command_start(tokens) { for capability in classify_command_tokens(&tokens[start..]) { push_unique(&mut capabilities, capability); } }
+            if let Some(start) = wrapped_command_start(tokens) { for capability in classify_command_tokens_at_depth(&tokens[start..], depth + 1) { push_unique(&mut capabilities, capability); } }
         }
-        "bash" | "sh" | "zsh" | "fish" | "python" | "python3" | "node" | "ruby" | "perl" => capabilities.push(Shell),
+        "bash" | "sh" | "zsh" | "fish" => {
+            capabilities.push(Shell);
+            if let Some(payload) = shell_command_payload(tokens) {
+                classify_embedded_commands(payload, depth + 1, &mut capabilities);
+            }
+        }
+        "python" | "python3" | "node" | "ruby" | "perl" => capabilities.push(Shell),
+        "env" => {
+            match super::env_command::resolve(tokens) {
+                super::env_command::Resolution::Command(command) => for capability in classify_command_tokens_at_depth(&command, depth + 1) { push_unique(&mut capabilities, capability); },
+                super::env_command::Resolution::Ambiguous => for capability in [Destructive, FileWrite, Network, Privileged, ProductionWrite, Shell] { push_unique(&mut capabilities, capability); },
+                super::env_command::Resolution::None => {},
+            }
+        }
+        "command" | "exec" => if let Some(start) = ordinary_wrapper_start(tokens) { for capability in classify_command_tokens_at_depth(&tokens[start..], depth + 1) { push_unique(&mut capabilities, capability); } },
         "curl" | "wget" | "ssh" | "scp" | "rsync" => capabilities.push(Network),
         "rm" | "rmdir" | "unlink" => capabilities.extend([Destructive, FileWrite]),
         "mv" | "cp" | "touch" | "mkdir" | "tee" | "chmod" | "chown" => capabilities.push(FileWrite),
         "git" => classify_git(tokens, &mut capabilities),
         "gh" => {
             capabilities.push(Network);
-            if contains_any(tokens, &["delete", "edit", "merge", "close", "release"]) { capabilities.push(ProductionWrite); }
+            if gh_is_production_write(tokens) { capabilities.push(ProductionWrite); }
         }
         "kubectl" | "helm" | "terraform" | "aws" | "gcloud" | "az" | "docker" => {
             capabilities.push(Network);
@@ -91,6 +115,49 @@ pub(super) fn classify_command_tokens(tokens: &[String]) -> Vec<AgentStackCapabi
         _ => {}
     }
     capabilities
+}
+
+fn classify_embedded_commands(
+    payload: &str,
+    depth: usize,
+    capabilities: &mut Vec<AgentStackCapability>,
+) {
+    let mut quote = None;
+    for line in payload.lines() {
+        let (commands, writes) = shell_commands_outside_quotes(line, &mut quote);
+        if writes {
+            push_unique(capabilities, AgentStackCapability::FileWrite);
+        }
+        for command in commands {
+            for capability in classify_command_tokens_at_depth(&command, depth) {
+                push_unique(capabilities, capability);
+            }
+        }
+    }
+    let (commands, writes, incomplete) = shell_substitution_commands(payload);
+    if writes {
+        push_unique(capabilities, AgentStackCapability::FileWrite);
+    }
+    for command in commands {
+        for capability in classify_command_tokens_at_depth(&command, depth) {
+            push_unique(capabilities, capability);
+        }
+    }
+    if incomplete {
+        use AgentStackCapability::{
+            Destructive, FileWrite, Network, Privileged, ProductionWrite, Shell,
+        };
+        for capability in [
+            Destructive,
+            FileWrite,
+            Network,
+            Privileged,
+            ProductionWrite,
+            Shell,
+        ] {
+            push_unique(capabilities, capability);
+        }
+    }
 }
 #[rustfmt::skip]
 fn shell_commands_outside_quotes(line: &str, quote: &mut Option<char>) -> (Vec<Vec<String>>, bool) {
@@ -104,7 +171,10 @@ fn shell_commands_outside_quotes(line: &str, quote: &mut Option<char>) -> (Vec<V
         }
         if let Some(active) = *quote {
             if ch == active { *quote = None; suppress_carried_content = false; }
-            else if active == '"' && ch == '\\' { escaped = true; }
+            else if active == '"' && ch == '\\' {
+                if chars.get(index + 1).is_some_and(|next| matches!(next, '$' | '`' | '"' | '\\')) { escaped = true; }
+                else if !suppress_carried_content { current.push('\\'); }
+            }
             else if !suppress_carried_content { current.push(ch); }
             continue;
         }
@@ -226,7 +296,33 @@ fn shell_substitution_commands(source: &str) -> (Vec<Vec<String>>, bool, bool) {
         None
     }
 
-    fn collect<'a>(source: &'a str, depth: usize, fragments: &mut Vec<&'a str>) -> bool {
+    fn unescape_nested_backticks(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let mut output = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'\\' {
+                output.push(bytes[index]);
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while bytes.get(index) == Some(&b'\\') {
+                index += 1;
+            }
+            let count = index - start;
+            if bytes.get(index) == Some(&b'`') && count % 2 == 1 {
+                output.extend(std::iter::repeat_n(b'\\', count / 2));
+                output.push(b'`');
+                index += 1;
+            } else {
+                output.extend_from_slice(&bytes[start..index]);
+            }
+        }
+        String::from_utf8(output).unwrap_or_else(|_| source.to_owned())
+    }
+
+    fn collect(source: &str, depth: usize, fragments: &mut Vec<String>) -> bool {
         if depth > MAX_SUBSTITUTION_DEPTH {
             return false;
         }
@@ -288,9 +384,9 @@ fn shell_substitution_commands(source: &str) -> (Vec<Vec<String>>, bool, bool) {
                 if fragments.len() == MAX_SUBSTITUTIONS {
                     return false;
                 }
-                let fragment = &source[index + 2..end];
-                fragments.push(fragment);
-                if !collect(fragment, depth + 1, fragments) {
+                let fragment = source[index + 2..end].to_owned();
+                fragments.push(fragment.clone());
+                if !collect(&fragment, depth + 1, fragments) {
                     return false;
                 }
                 index = end + 1;
@@ -304,9 +400,9 @@ fn shell_substitution_commands(source: &str) -> (Vec<Vec<String>>, bool, bool) {
                 if fragments.len() == MAX_SUBSTITUTIONS {
                     return false;
                 }
-                let fragment = &source[index + 1..end];
-                fragments.push(fragment);
-                if !collect(fragment, depth + 1, fragments) {
+                let fragment = unescape_nested_backticks(&source[index + 1..end]);
+                fragments.push(fragment.clone());
+                if !collect(&fragment, depth + 1, fragments) {
                     return false;
                 }
                 index = end + 1;
@@ -421,7 +517,7 @@ fn is_shell_control(token: &str) -> bool {
 }
 
 #[rustfmt::skip]
-fn is_assignment(token: &str) -> bool {
+pub(super) fn is_assignment(token: &str) -> bool {
     let Some((name, _)) = token.split_once('=') else {
         return false;
     };
@@ -443,6 +539,136 @@ fn wrapped_command_start(tokens: &[String]) -> Option<usize> {
     }
     while tokens.get(index).is_some_and(|token| is_assignment(token)) { index += 1; }
     (index < tokens.len()).then_some(index)
+}
+
+#[rustfmt::skip]
+fn ordinary_wrapper_start(tokens: &[String]) -> Option<usize> {
+    let program = tokens.first().map(|token| command_basename(token))?;
+    let mut index = 1;
+    while let Some(token) = tokens.get(index) {
+        if token == "--" { index += 1; break; }
+        if !token.starts_with('-') { break; }
+        if program == "command" && token.chars().skip(1).any(|flag| matches!(flag, 'v' | 'V')) { return None; }
+        let takes_value = program == "exec" && token == "-a";
+        index += 1 + usize::from(takes_value);
+    }
+    (index < tokens.len()).then_some(index)
+}
+
+#[rustfmt::skip]
+fn shell_command_payload(tokens: &[String]) -> Option<&str> {
+    let index = tokens
+        .iter()
+        .skip(1)
+        .position(|token| {
+            token == "-c"
+                || token.starts_with('-')
+                    && !token.starts_with("--")
+                    && token[1..].contains('c')
+        })?
+        + 1;
+    tokens.get(index + 1).map(String::as_str)
+}
+
+fn gh_is_production_write(tokens: &[String]) -> bool {
+    const GROUPS: &[&str] = &[
+        "alias",
+        "api",
+        "auth",
+        "browse",
+        "cache",
+        "codespace",
+        "completion",
+        "config",
+        "extension",
+        "gist",
+        "gpg-key",
+        "issue",
+        "label",
+        "org",
+        "pr",
+        "project",
+        "release",
+        "repo",
+        "run",
+        "search",
+        "secret",
+        "ssh-key",
+        "status",
+        "variable",
+        "workflow",
+    ];
+    let Some(group_index) =
+        gh_next_positional(tokens, 1).filter(|index| GROUPS.contains(&tokens[*index].as_str()))
+    else {
+        return false;
+    };
+    let group = tokens[group_index].as_str();
+    if group == "api" {
+        let mut explicit_method = None;
+        for (index, token) in tokens.iter().enumerate() {
+            if matches!(token.as_str(), "-X" | "--method") {
+                explicit_method = tokens.get(index + 1).map(String::as_str);
+            } else if let Some(method) = token.strip_prefix("-X").filter(|value| !value.is_empty())
+            {
+                explicit_method = Some(method.trim_start_matches('='));
+            } else if let Some(method) = token.strip_prefix("--method=") {
+                explicit_method = Some(method);
+            }
+        }
+        if let Some(method) = explicit_method {
+            return !matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD");
+        }
+        return tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "-f" | "-F" | "--field" | "--raw-field" | "--input"
+            ) || token.starts_with("--field=")
+                || token.starts_with("-f") && token.len() > 2
+                || token.starts_with("-F") && token.len() > 2
+                || token.starts_with("--raw-field=")
+                || token.starts_with("--input=")
+        });
+    }
+    let Some(action_index) = gh_next_positional(tokens, group_index + 1) else {
+        return false;
+    };
+    let action = tokens[action_index].as_str();
+    match group {
+        "issue" => !matches!(action, "list" | "status" | "view"),
+        "pr" => !matches!(
+            action,
+            "checks" | "checkout" | "diff" | "list" | "status" | "view"
+        ),
+        "repo" => !matches!(action, "clone" | "list" | "set-default" | "view"),
+        "release" => !matches!(
+            action,
+            "download" | "list" | "view" | "verify" | "verify-asset"
+        ),
+        "cache" | "label" | "secret" | "workflow" => !matches!(action, "list" | "view"),
+        "run" => !matches!(action, "download" | "list" | "view" | "watch"),
+        "variable" => !matches!(action, "get" | "list"),
+        "gist" => !matches!(action, "clone" | "list" | "view"),
+        "gpg-key" | "ssh-key" => !matches!(action, "list" | "view"),
+        "project" => !matches!(action, "field-list" | "item-list" | "list" | "view"),
+        "codespace" => !matches!(action, "list" | "logs" | "ports" | "ssh" | "view"),
+        _ => false,
+    }
+}
+
+fn gh_next_positional(tokens: &[String], mut index: usize) -> Option<usize> {
+    while let Some(token) = tokens.get(index) {
+        if token == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if !token.starts_with('-') {
+            return Some(index);
+        }
+        let takes_value =
+            matches!(token.as_str(), "-R" | "--repo" | "--hostname") && !token.contains('=');
+        index += 1 + usize::from(takes_value);
+    }
+    None
 }
 
 #[rustfmt::skip]

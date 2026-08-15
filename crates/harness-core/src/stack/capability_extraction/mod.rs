@@ -17,6 +17,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+mod env_command;
+mod frontmatter;
+mod starlark_validation;
 mod static_patterns;
 #[cfg(test)]
 mod tests;
@@ -142,8 +145,8 @@ pub fn extract_repository_capability_evidence(options: &AgentStackCapabilityExtr
     for entry in inventory.entries() {
         let component = entry.component();
         let locator = component.source().locator().as_str();
-        if evidence.len() + failures.len() >= MAX_REPOSITORY_FINDINGS - 1 { failures.push(repository_limit_failure(component)); break; }
         if !is_supported_control(component.kind(), locator) { continue; }
+        if evidence.len() + failures.len() >= MAX_REPOSITORY_FINDINGS - 1 { failures.push(repository_limit_failure(component)); break; }
         match exclusions.excludes(&root, locator, options.max_file_bytes, &mut remaining_bytes) {
             Ok(true) => continue,
             Ok(false) => {}
@@ -160,7 +163,7 @@ pub fn extract_repository_capability_evidence(options: &AgentStackCapabilityExtr
         let mut component_failures = Vec::new();
         let source_kind = if locator == "requirements.toml" || requirements_path.as_deref() == Some(locator) { TypedSource::Requirements }
             else if locator.ends_with(".star") || exec_policy_paths.contains(locator) { TypedSource::Starlark }
-            else if markdown_policy_paths.iter().any(|path| locator == path || locator.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/'))) { TypedSource::MarkdownPolicy }
+            else if locator.starts_with(".harness/rules/") || markdown_policy_paths.iter().any(|path| locator == path || locator.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/'))) { TypedSource::MarkdownPolicy }
             else { TypedSource::Auto };
         extract_typed(component, locator, &text, source_kind, &mut typed, &mut component_failures);
         let typed_capabilities = typed.iter().map(|raw| raw.capability.as_str()).collect::<BTreeSet<_>>();
