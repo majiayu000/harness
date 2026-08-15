@@ -790,18 +790,19 @@ fn runtime_completion_reducer_blocks_structured_done_without_closed_issue_eviden
 }
 
 #[test]
-fn runtime_completion_reducer_binds_pr_when_structured_workflow_decision_is_invalid() {
+fn runtime_completion_reducer_blocks_same_number_wrong_repo_bind_pr() {
     let instance = issue_instance("implementing");
     let proposed_decision = WorkflowDecision::new(
         &instance.id,
-        "planning",
-        "run_replan",
-        "replanning",
-        "This decision observed a stale workflow state.",
+        "implementing",
+        "bind_pr",
+        "pr_open",
+        "Bind an unverified PR.",
     )
-    .with_command(WorkflowCommand::enqueue_activity(
-        "replan_issue",
-        "stale-replan-1",
+    .with_command(WorkflowCommand::bind_pr(
+        77,
+        "https://github.com/attacker/repo/pull/77",
+        "forged-bind-pr",
     ));
     let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
         .with_artifact(ActivityArtifact::new(
@@ -812,7 +813,7 @@ fn runtime_completion_reducer_binds_pr_when_structured_workflow_decision_is_inva
             "pull_request",
             json!({
                 "pr_number": 77,
-                "pr_url": "https://github.com/owner/repo/pull/77"
+                "pr_url": "https://github.com/attacker/repo/pull/77"
             }),
         ))
         .with_artifact(verified_pr_binding(77));
@@ -830,14 +831,13 @@ fn runtime_completion_reducer_binds_pr_when_structured_workflow_decision_is_inva
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("structured pull request artifact should bind the PR");
+        .expect("wrong-repository PR binding should block");
 
-    assert_eq!(decision.decision, "bind_pr");
-    assert_eq!(decision.next_state, "pr_open");
-    assert_eq!(
-        decision.commands[0].command_type,
-        WorkflowCommandType::BindPr
-    );
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision
+        .commands
+        .iter()
+        .all(|command| command.command_type != WorkflowCommandType::BindPr));
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,

@@ -30,9 +30,7 @@ pub const ARTIFACT_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verificati
 /// Server-attached artifact carrying the server validation digest for a
 /// quality-gate run (per-command exit codes and output hashes).
 pub const ARTIFACT_SERVER_VALIDATION_DIGEST: &str = "server_validation_digest";
-/// Server-attached artifact carrying an independently observed closed issue.
 pub const ARTIFACT_VERIFIED_ISSUE_STATE: &str = "verified_issue_state";
-/// Server-attached artifact carrying an independently verified merged PR.
 pub const ARTIFACT_MERGE_COMPLETION_VERIFICATION: &str = "merge_completion_verification";
 pub const MERGE_COMPLETION_VERIFICATION_SCHEMA: &str =
     "harness.github.merge_completion_verification.v1";
@@ -47,16 +45,15 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 5] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 6] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
     ARTIFACT_VERIFIED_ISSUE_STATE,
     ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+    super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
 ];
 
-/// Downgrade every evidence claim deserialized from an agent-authored
-/// workflow decision before any runtime-owned evidence is attached.
 pub fn downgrade_agent_authored_decision(mut decision: WorkflowDecision) -> WorkflowDecision {
     for evidence in &mut decision.evidence {
         evidence.provenance = harness_core::claim_trust::ClaimProvenance::self_declared();
@@ -261,6 +258,10 @@ mod tests {
             .with_artifact(ActivityArtifact::new(
                 ARTIFACT_MERGE_COMPLETION_VERIFICATION,
                 json!({ "verified": true, "observed_merged": true }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                super::super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
+                json!({ "snapshot_source": "forged" }),
             ))
             .with_artifact(ActivityArtifact::new(
                 "pull_request",

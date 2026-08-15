@@ -410,11 +410,8 @@ fn workflow_decision_from_activity_result(
             serde_json::from_value::<WorkflowDecision>(artifact.artifact.clone()).ok()
         })
         .map(|decision| {
-            // GH-1766: the decision body is agent-authored. Drop reserved
-            // server evidence and downgrade every retained claim before the
-            // runtime re-mints evidence it proved from reserved artifacts.
             let mut decision = normalize_agent_authored_evidence(decision);
-            for evidence in server_owned_evidence_for_result(result) {
+            for evidence in server_owned_evidence_for_result(result, &decision) {
                 decision = decision.with_evidence(evidence);
             }
             decision.with_evidence(runtime_completion_evidence(event, result))
@@ -442,6 +439,7 @@ fn normalize_agent_authored_evidence(mut decision: WorkflowDecision) -> Workflow
 /// server-authored artifacts on this result.
 fn server_owned_evidence_for_result(
     result: &ActivityResult,
+    decision: &WorkflowDecision,
 ) -> Vec<crate::runtime::model::WorkflowEvidence> {
     use crate::runtime::completion_evidence::{
         server_validation_digest_passed, verified_pr_binding_artifact,
@@ -450,7 +448,9 @@ fn server_owned_evidence_for_result(
     use crate::runtime::model::WorkflowEvidence;
 
     let mut evidence = Vec::new();
-    if let Some(verified) = verified_pr_binding_artifact(result) {
+    if let Some(verified) = verified_pr_binding_artifact(result)
+        .filter(|verified| verified_pr_binding_matches_commands(verified, decision))
+    {
         evidence.push(WorkflowEvidence::runtime_observed(
             EVIDENCE_VERIFIED_PR_BINDING,
             verified.to_string(),
@@ -467,6 +467,29 @@ fn server_owned_evidence_for_result(
         ));
     }
     evidence
+}
+
+fn verified_pr_binding_matches_commands(
+    verified: &serde_json::Value,
+    decision: &WorkflowDecision,
+) -> bool {
+    let Some(pr_number) = verified["pr_number"].as_u64() else {
+        return false;
+    };
+    let Some(repo) = verified["repo"].as_str() else {
+        return false;
+    };
+    let expected_url = format!("https://github.com/{repo}/pull/{pr_number}");
+    decision
+        .commands
+        .iter()
+        .filter(|command| command.command_type == WorkflowCommandType::BindPr)
+        .all(|command| {
+            (
+                command.command["pr_number"].as_u64(),
+                command.command["pr_url"].as_str(),
+            ) == (Some(pr_number), Some(expected_url.as_str()))
+        })
 }
 
 fn structured_decision_validates(

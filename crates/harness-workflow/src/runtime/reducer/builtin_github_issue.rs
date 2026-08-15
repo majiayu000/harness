@@ -286,9 +286,16 @@ pub(crate) fn verified_pr_binding_evidence(
     }
     if let Some(verified) = verified_pr_binding_artifact(result) {
         let verified_number = verified.get("pr_number").and_then(Value::as_u64);
-        if verified_number != Some(claimed_pr_number) {
+        let claimed_pr_url = pull_request_artifact(result).map(|(_, url)| url);
+        let verified_url = verified
+            .get("repo")
+            .and_then(Value::as_str)
+            .map(|repo| format!("https://github.com/{repo}/pull/{claimed_pr_number}"));
+        if (verified_number, verified_url.as_deref())
+            != (Some(claimed_pr_number), claimed_pr_url.as_deref())
+        {
             return Err(format!(
-                "server verified pull request {verified_number:?} but the activity claimed {claimed_pr_number}"
+                "server verified pull request {verified_number:?} at {verified_url:?} but the activity claimed {claimed_pr_number} at {claimed_pr_url:?}"
             ));
         }
         return Ok(WorkflowEvidence::runtime_observed(

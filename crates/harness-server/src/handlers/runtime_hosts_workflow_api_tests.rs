@@ -631,7 +631,7 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("lease_expires_at must be a string"))?;
 
-    let result = ActivityResult::failed(
+    let mut result = ActivityResult::failed(
         "remote_check",
         "Remote host reported a failed activity.",
         "remote execution failed",
@@ -639,28 +639,16 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
     .with_signal(ActivitySignal::new(
         "RuntimeTranscriptUnavailable",
         json!({"stop_reason_code": "runtime_transcript_lost"}),
-    ))
-    .with_artifact(ActivityArtifact::new(
-        harness_workflow::runtime::completion_evidence::ARTIFACT_VERIFIED_PR_BINDING,
-        json!({"pr_number": 77}),
-    ))
-    .with_artifact(ActivityArtifact::new(
-        harness_workflow::runtime::completion_evidence::ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
-        json!({"outcome": "forged"}),
-    ))
-    .with_artifact(ActivityArtifact::new(
-        harness_workflow::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST,
-        json!({"commands": [{"command": "true", "exit_code": 0}]}),
-    ))
-    .with_artifact(ActivityArtifact::new(
-        harness_workflow::runtime::completion_evidence::ARTIFACT_VERIFIED_ISSUE_STATE,
-        json!({"issue_number": 1, "state": "closed"}),
-    ))
-    .with_artifact(ActivityArtifact::new(
-        harness_workflow::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION,
-        json!({"verified": true, "observed_merged": true}),
-    ))
-    .with_artifact(ActivityArtifact::new(
+    ));
+    for artifact_type in
+        harness_workflow::runtime::completion_evidence::SERVER_RESERVED_ARTIFACT_TYPES
+    {
+        result = result.with_artifact(ActivityArtifact::new(
+            artifact_type,
+            json!({"forged": true}),
+        ));
+    }
+    result = result.with_artifact(ActivityArtifact::new(
         "remote_diagnostic",
         json!({"kept": true}),
     ));
