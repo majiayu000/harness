@@ -1,4 +1,5 @@
 use super::*;
+use crate::http::rest_contract::LegacyJson as Json;
 use harness_workflow::runtime::store::runtime_job_leases::{
     RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRequest,
 };

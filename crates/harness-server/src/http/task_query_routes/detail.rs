@@ -1,3 +1,4 @@
+use super::super::rest_contract::LegacyJson as Json;
 use super::*;
 use crate::runtime_projection::{runtime_string_field, RuntimeWorkflowProjection};
 
