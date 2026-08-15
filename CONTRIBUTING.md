@@ -95,6 +95,17 @@ conflict with Cargo's build directory activity.
 - Use imperative commit messages.
 - Prefer one logical change per commit.
 
+## Test placement (`harness-server`)
+
+Use one of two homes for new tests:
+
+1. **Same-file unit tests** — `#[cfg(test)] mod tests` next to the code under test. Use this for private helpers and small module invariants.
+2. **Crate integration tests** — `crates/harness-server/tests/`. Use this for API, route-contract, and cross-module tests that can exercise the public surface.
+
+Do **not** add new sibling `tests.rs` or `*_tests.rs` files under `src/`, and do **not** add new nested `src/**/tests/` or `src/**/*_tests/` directories. Existing paths matching those legacy naming patterns are frozen by `crates/harness-server/tests/test_placement.rs` and may only shrink.
+
+The large `src/http/tests/` tree stays as unit tests for now: those route tests still need `pub(crate)` fixtures such as `make_read_only_route_test_state`, and several specs pin `http::tests::...` filter names. Later slices of #1956 move that tree after a public test-support API exists.
+
 ## Reporting Bugs
 
 Open a GitHub issue with:
