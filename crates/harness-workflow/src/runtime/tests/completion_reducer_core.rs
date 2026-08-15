@@ -365,7 +365,7 @@ fn runtime_completion_reducer_rejects_unverified_merge_completion() {
 }
 
 #[test]
-fn runtime_completion_reducer_accepts_server_merge_verification_waiver() {
+fn runtime_completion_reducer_rejects_server_merge_verification_waiver() {
     let instance = issue_instance("merging").with_server_data(json!({
         "repo": "owner/repo",
         "pr_number": 77,
@@ -405,25 +405,29 @@ fn runtime_completion_reducer_accepts_server_merge_verification_waiver() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("configured verification waiver should preserve legacy completion");
+        .expect("unverified merge should produce an auditable decision");
 
-    assert_eq!(decision.next_state, "done");
+    assert_eq!(decision.decision, "record_pr_merged");
     let terminal_evidence = decision
         .evidence
         .iter()
         .find(|evidence| evidence.kind == "github_terminal_evidence")
         .expect("terminal evidence");
     assert_eq!(
-        terminal_evidence.provenance.trust,
-        harness_core::claim_trust::ClaimTrustLevel::RuntimeObserved
+        terminal_evidence.provenance,
+        harness_core::claim_trust::ClaimProvenance::self_declared()
     );
-    DecisionValidator::github_issue_pr()
+    let rejection = DecisionValidator::github_issue_pr()
         .validate(
             &instance,
             &decision,
             &ValidationContext::new("runtime-1", Utc::now()),
         )
-        .expect("server configuration waiver should validate");
+        .expect_err("a configuration waiver must not satisfy terminal trust");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
+    );
 }
 
 #[test]

@@ -26,7 +26,13 @@ pub(super) async fn verify_merge_completion_if_needed(
     }
     let config = auto_merge_config(state);
     if !config.verify_merge_completion {
-        return merge_completion_verification_waived(job, workflow, result);
+        return merge_completion_failed(
+            result,
+            ActivityErrorKind::Configuration,
+            "Server-side merge completion verification is disabled.",
+            "Harness refuses to accept an unverified merge_pr completion; enable verify_merge_completion",
+            None,
+        );
     }
     let target = match merge_completion_target(job, workflow, &result) {
         Ok(target) => target,
@@ -46,10 +52,29 @@ pub(super) async fn verify_merge_completion_if_needed(
     )
     .await
     {
-        Ok(snapshot) if snapshot_observes_merged(&snapshot.normalized_snapshot) => {
-            merge_completion_verified(result, &target, snapshot)
-        }
-        Ok(snapshot) => merge_completion_failed(
+        Ok(snapshot) => verify_merge_completion_snapshot(job, workflow, result, &target, snapshot),
+        Err(error) => merge_completion_fetch_failed(result, &target, &error),
+    }
+}
+
+fn verify_merge_completion_snapshot(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+    result: ActivityResult,
+    target: &GitHubPrSnapshotTarget,
+    snapshot: GitHubPrSnapshotArtifacts,
+) -> ActivityResult {
+    let Some(expected_head_sha) = expected_head_sha_for_merge(job, workflow) else {
+        return merge_completion_failed(
+            result,
+            ActivityErrorKind::Configuration,
+            "Server-side merge completion verification requires a pinned pull request head.",
+            "merge_pr completion is missing a non-empty expected_head_sha",
+            Some(snapshot),
+        );
+    };
+    if !snapshot_observes_merged(&snapshot.normalized_snapshot) {
+        return merge_completion_failed(
             result,
             ActivityErrorKind::Fatal,
             "Server-side merge completion verification rejected agent output.",
@@ -61,32 +86,23 @@ pub(super) async fn verify_merge_completion_if_needed(
                     .unwrap_or_else(|| "<missing>".to_string())
             ),
             Some(snapshot),
-        ),
-        Err(error) => merge_completion_fetch_failed(result, &target, &error),
+        );
     }
-}
-
-fn merge_completion_verification_waived(
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-    mut result: ActivityResult,
-) -> ActivityResult {
-    let Ok(target) = merge_completion_target(job, workflow, &result) else {
-        return result;
-    };
-    result.artifacts.push(ActivityArtifact::new(
-        MERGE_COMPLETION_VERIFICATION_ARTIFACT,
-        json!({
-            "schema": MERGE_COMPLETION_VERIFICATION_SCHEMA,
-            "verified": false,
-            "observed_merged": false,
-            "outcome": "verification_waived",
-            "verification_source": "server_configuration",
-            "repo": target.repo_slug,
-            "pr_number": target.pr_number,
-        }),
-    ));
-    result
+    if !snapshot_head_matches_expected(&snapshot.normalized_snapshot, &expected_head_sha) {
+        let observed_head_sha = value_string(snapshot.normalized_snapshot.get("head_oid"))
+            .unwrap_or_else(|| "<missing>".to_string());
+        return merge_completion_failed(
+            result,
+            ActivityErrorKind::Fatal,
+            "Server-side merge completion verification rejected a stale pull request head.",
+            &format!(
+                "agent reported merged=true for PR #{} in {}, but GitHub head {} did not match expected_head_sha {}",
+                target.pr_number, target.repo_slug, observed_head_sha, expected_head_sha
+            ),
+            Some(snapshot),
+        );
+    }
+    merge_completion_verified(result, target, snapshot)
 }
 
 pub(super) fn auto_merge_config(state: &AppState) -> GitHubAutoMergeConfig {
@@ -201,6 +217,31 @@ pub(super) fn snapshot_observes_merged(snapshot: &Value) -> bool {
             .get("state")
             .and_then(|value| value_string(Some(value)))
             .is_some_and(|state| state.eq_ignore_ascii_case("MERGED"))
+}
+
+fn expected_head_sha_for_merge(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> Option<String> {
+    activity_string(job, workflow, "expected_head_sha")
+        .or_else(|| activity_string(job, workflow, "merge_attempted_head_sha"))
+        .or_else(|| activity_string(job, workflow, "pr_head_sha"))
+        .or_else(|| activity_string(job, workflow, "head_sha"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn activity_string(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+    field: &str,
+) -> Option<String> {
+    value_string(job.input.get(field))
+        .or_else(|| workflow.and_then(|workflow| value_string(workflow.data.get(field))))
+}
+
+fn snapshot_head_matches_expected(snapshot: &Value, expected_head_sha: &str) -> bool {
+    value_string(snapshot.get("head_oid")).is_some_and(|head_oid| head_oid == expected_head_sha)
 }
 
 pub(super) fn merge_completion_verified(
@@ -470,6 +511,74 @@ mod tests {
         }));
     }
 
+    fn job_with_expected_head(expected_head_sha: Option<&str>) -> RuntimeJob {
+        let mut input = json!({"activity": "merge_pr"});
+        if let Some(expected_head_sha) = expected_head_sha {
+            input["expected_head_sha"] = json!(expected_head_sha);
+        }
+        RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexExec,
+            "codex-default",
+            input,
+        )
+    }
+
+    #[test]
+    fn merged_snapshot_requires_a_pinned_dispatched_head() {
+        let result = verify_merge_completion_snapshot(
+            &job_with_expected_head(None),
+            None,
+            activity_result(),
+            &target(),
+            snapshot("MERGED", true),
+        );
+
+        assert_eq!(result.status, ActivityStatus::Failed);
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing a non-empty expected_head_sha"));
+    }
+
+    #[test]
+    fn merged_snapshot_rejects_a_head_other_than_the_dispatched_head() {
+        let result = verify_merge_completion_snapshot(
+            &job_with_expected_head(Some("reviewed-head")),
+            None,
+            activity_result(),
+            &target(),
+            snapshot("MERGED", true),
+        );
+
+        assert_eq!(result.status, ActivityStatus::Failed);
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Fatal));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("did not match expected_head_sha reviewed-head"));
+    }
+
+    #[test]
+    fn merged_snapshot_accepts_the_pinned_dispatched_head() {
+        let result = verify_merge_completion_snapshot(
+            &job_with_expected_head(Some("server-head")),
+            None,
+            activity_result(),
+            &target(),
+            snapshot("MERGED", true),
+        );
+
+        assert_eq!(result.status, ActivityStatus::Succeeded);
+        assert!(result.artifacts.iter().any(|artifact| {
+            artifact.artifact_type == MERGE_COMPLETION_VERIFICATION_ARTIFACT
+                && artifact.artifact["verified"] == true
+        }));
+    }
+
     #[test]
     fn mismatched_reported_pr_is_configuration_failure() {
         let job = RuntimeJob::pending(
@@ -493,35 +602,5 @@ mod tests {
             .expect_err("mismatched PR should fail before GitHub verification");
 
         assert!(error.contains("workflow is bound to PR #78"));
-    }
-
-    #[test]
-    fn disabled_verification_records_a_server_configuration_waiver() {
-        let job = RuntimeJob::pending(
-            "command-1",
-            harness_workflow::runtime::RuntimeKind::CodexExec,
-            "codex-default",
-            json!({"activity": "merge_pr"}),
-        );
-        let workflow = WorkflowInstance::new(
-            GITHUB_ISSUE_PR_DEFINITION_ID,
-            1,
-            "merging",
-            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
-        )
-        .with_server_data(json!({
-            "repo": "owner/repo",
-            "pr_number": 77,
-        }));
-
-        let result = merge_completion_verification_waived(&job, Some(&workflow), activity_result());
-
-        assert!(result.artifacts.iter().any(|artifact| {
-            artifact.artifact_type == MERGE_COMPLETION_VERIFICATION_ARTIFACT
-                && artifact.artifact["outcome"] == "verification_waived"
-                && artifact.artifact["verification_source"] == "server_configuration"
-                && artifact.artifact["repo"] == "owner/repo"
-                && artifact.artifact["pr_number"] == 77
-        }));
     }
 }

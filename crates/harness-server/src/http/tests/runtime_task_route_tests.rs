@@ -339,7 +339,7 @@ async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Re
         .workflow_runtime_store
         .as_ref()
         .expect("workflow runtime store should be configured");
-    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+    let mut workflow = harness_workflow::runtime::WorkflowInstance::new(
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
         "ready_to_merge",
@@ -352,8 +352,14 @@ async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Re
         "issue_number": 54,
         "pr_number": 126,
         "pr_url": "https://github.com/owner/repo/pull/126",
+        "pr_head_sha": "reviewed-head-126",
         "task_id": "runtime-ready-task-54",
     }));
+    workflow.set_data_field(
+        "pr_head_sha",
+        serde_json::json!("reviewed-head-126"),
+        harness_workflow::runtime::DataProvenance::External,
+    )?;
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let app = Router::new()
         .route(
@@ -385,6 +391,130 @@ async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Re
     let commands = store.commands_for("runtime-ready-54").await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].command.activity_name(), Some("merge_pr"));
+    assert_eq!(
+        commands[0].command.command["expected_head_sha"],
+        "reviewed-head-126"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_merge_endpoint_rejects_missing_server_observed_head() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:missing-head"),
+    )
+    .with_id("runtime-ready-missing-head")
+    .with_server_data(serde_json::json!({
+        "repo": "owner/repo",
+        "issue_number": 55,
+        "pr_number": 127,
+        "pr_url": "https://github.com/owner/repo/pull/127",
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/merge",
+            post(task_mutation_routes::merge_workflow_runtime),
+        )
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/workflows/runtime/merge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "workflow_id": "runtime-ready-missing-head" }).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response_json(response).await?;
+    assert!(body["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("missing a server-observed PR head SHA"));
+    assert!(store
+        .commands_for("runtime-ready-missing-head")
+        .await?
+        .is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_runtime_merge_rejects_agent_and_legacy_head_provenance() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let merge_data = serde_json::json!({
+        "repo": "owner/repo",
+        "pr_number": 128,
+        "pr_head_sha": "untrusted-head",
+    });
+    let agent_head = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:agent-head"),
+    )
+    .with_id("runtime-agent-head")
+    .with_classified_data(
+        merge_data.clone(),
+        harness_workflow::runtime::DataProvenance::Agent,
+    );
+    let agent_outcome =
+        crate::workflow_runtime_pr_feedback::approve_runtime_merge_with_instance(store, agent_head)
+            .await?;
+    assert!(matches!(
+        agent_outcome,
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::Rejected { reason, .. }
+            if reason.contains("missing a server-observed PR head SHA")
+    ));
+
+    let mut legacy_head = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:legacy-head"),
+    )
+    .with_id("runtime-legacy-head");
+    legacy_head.data = merge_data;
+    legacy_head.data_provenance = None;
+    let legacy_outcome = crate::workflow_runtime_pr_feedback::approve_runtime_merge_with_instance(
+        store,
+        legacy_head,
+    )
+    .await?;
+    assert!(matches!(
+        legacy_outcome,
+        crate::workflow_runtime_pr_feedback::RuntimeMergeApprovalOutcome::Rejected { reason, .. }
+            if reason.contains("missing a server-observed PR head SHA")
+    ));
     Ok(())
 }
 

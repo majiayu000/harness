@@ -1,4 +1,6 @@
 use super::*;
+use harness_workflow::runtime::store::runtime_job_leases::RuntimeJobLeaseRenewalOutcome;
+use uuid::Uuid;
 
 #[test]
 fn eval_resource_limits_derive_from_timeout_when_missing() {
@@ -180,6 +182,96 @@ fn completion_reservation_id_is_stable_for_ambiguous_retries() {
 
     assert_eq!(first, retry);
     assert_ne!(first, different_owner);
+}
+
+#[tokio::test]
+async fn completion_reservation_reconciles_old_fence_and_deregister_revokes_final_commit(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) =
+        crate::handlers::runtime_hosts_workflow_api_tests::make_test_state_with_runtime_store(
+            dir.path(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let app = crate::handlers::runtime_hosts_workflow_api_tests::runtime_hosts_workflow_app(state);
+    crate::handlers::runtime_hosts_workflow_api_tests::register_host(&app, "host-a").await?;
+    let job = crate::handlers::runtime_hosts_workflow_api_tests::enqueue_runtime_host_test_job(
+        store.as_ref(),
+        "completion-reservation-reconcile",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({"activity": "remote_check"}),
+    )
+    .await?;
+    let claimed = crate::handlers::runtime_hosts_workflow_api_tests::post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({"lease_secs": 60}),
+    )
+    .await?;
+    let original_expires_at: DateTime<Utc> =
+        serde_json::from_value(claimed["lease_expires_at"].clone())?;
+    let lease_generation = claimed["lease_generation"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("claimed lease generation must be an integer"))?;
+
+    let reserved = completion::replay_completion_reservation(
+        store.as_ref(),
+        &job.id,
+        "host-a",
+        lease_generation,
+        original_expires_at,
+    )
+    .await?;
+    let RuntimeJobLeaseRenewalOutcome::Renewed {
+        lease_expires_at: reserved_expires_at,
+        ..
+    } = reserved
+    else {
+        anyhow::bail!("completion reservation should renew the lease");
+    };
+
+    let reconciled = crate::handlers::runtime_hosts_workflow_api_tests::post_json(
+        &app,
+        format!(
+            "/api/runtime-hosts/host-a/runtime-jobs/{}/lease/renew",
+            job.id
+        ),
+        json!({
+            "lease_generation": lease_generation,
+            "lease_expires_at": original_expires_at,
+            "renewal_id": Uuid::new_v4(),
+            "lease_secs": 120,
+        }),
+    )
+    .await?;
+    assert_eq!(reconciled["renewed"], true);
+    assert_eq!(reconciled["replayed"], true);
+    assert_eq!(reconciled["lease_expires_at"], json!(reserved_expires_at));
+
+    crate::handlers::runtime_hosts_workflow_api_tests::post_json(
+        &app,
+        "/api/runtime-hosts/host-a/deregister".to_string(),
+        json!({}),
+    )
+    .await?;
+    let stale_completion = store
+        .commit_runtime_activity_completion_if_owned_with_generation(
+            &job.id,
+            "host-a",
+            reserved_expires_at,
+            Some(lease_generation),
+            &ActivityResult::succeeded("remote_check", "done"),
+        )
+        .await?;
+    assert!(
+        stale_completion.is_none(),
+        "deregistration must revoke the reserved lease before final completion"
+    );
+    Ok(())
 }
 
 #[tokio::test]

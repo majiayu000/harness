@@ -141,7 +141,13 @@ pub(super) async fn post_json_with_status(
     let bytes = http_body_util::BodyExt::collect(response.into_body())
         .await?
         .to_bytes();
-    Ok((status, serde_json::from_slice(&bytes)?))
+    let json = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to decode HTTP {status} response as JSON (body: {:?}): {error}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })?;
+    Ok((status, json))
 }
 
 #[tokio::test]
@@ -767,7 +773,7 @@ async fn runtime_job_completion_preflight_error_preserves_the_client_lease_fence
         return Ok(());
     };
     let app = runtime_hosts_workflow_app(state);
-    register_host(&app, "host-a").await?;
+    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
     let job = enqueue_runtime_host_test_job(
         &store,
         "completion-preflight-fence",

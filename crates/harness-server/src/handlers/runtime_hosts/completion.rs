@@ -13,7 +13,11 @@ pub async fn complete_runtime_job_for_runtime_host(
     Path((host_id, runtime_job_id)): Path<(String, String)>,
     Json(req): Json<CompleteRuntimeJobRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
+    let _runtime_job_operation = state
+        .runtime_hosts
+        .lock_runtime_job_operation(&runtime_job_id)
+        .await;
+    let host_operation = state.runtime_hosts.lock_operation(&host_id).await;
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         return (
             StatusCode::NOT_FOUND,
@@ -78,6 +82,12 @@ pub async fn complete_runtime_job_for_runtime_host(
         Ok(lease) => lease,
         Err(response) => return response,
     };
+    // The database lease fence, not the host-wide lifecycle lock, owns the
+    // completion from this point forward. GitHub verification may block for
+    // minutes; keeping this lock would also block heartbeats and unrelated job
+    // renewals for the same host. Deregistration can safely revoke the reserved
+    // lease, and the fenced completion commit below will then fail closed.
+    drop(host_operation);
     let result = match tokio::time::timeout(
         Duration::from_secs(COMPLETION_EVIDENCE_TIMEOUT_SECS),
         crate::workflow_runtime_worker::remote_completion::apply_remote_completion_evidence(
@@ -414,4 +424,31 @@ pub(super) fn completion_reservation_id(
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     Uuid::from_bytes(bytes)
+}
+
+pub(super) async fn replay_completion_reservation(
+    store: &WorkflowRuntimeStore,
+    runtime_job_id: &str,
+    owner: &str,
+    lease_generation: u64,
+    previous_expires_at: DateTime<Utc>,
+) -> anyhow::Result<RuntimeJobLeaseRenewalOutcome> {
+    store
+        .renew_remote_host_runtime_job_lease(RuntimeJobLeaseRenewalRequest {
+            runtime_job_id,
+            owner,
+            lease_generation,
+            previous_expires_at,
+            renewal_id: completion_reservation_id(
+                runtime_job_id,
+                owner,
+                lease_generation,
+                previous_expires_at,
+            ),
+            lease_secs: crate::runtime_hosts::MAX_LEASE_SECS,
+            now: Utc::now(),
+            max_lease_secs: crate::runtime_hosts::MAX_LEASE_SECS,
+            owner_active: true,
+        })
+        .await
 }

@@ -445,14 +445,7 @@ fn merge_completion_trust_source<'a>(
         if verified {
             return Some("github_pr_merged_result");
         }
-        let waived = artifact.artifact.get("outcome").and_then(Value::as_str)
-            == Some("verification_waived")
-            && artifact
-                .artifact
-                .get("verification_source")
-                .and_then(Value::as_str)
-                == Some("server_configuration");
-        waived.then_some("merge_verification_waived_by_server_configuration")
+        None
     })
 }
 
