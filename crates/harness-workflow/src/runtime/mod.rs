@@ -169,7 +169,7 @@ pub use reducer::{
     activity_result_has_closed_issue_evidence, activity_result_value_has_closed_issue_evidence,
     reduce_runtime_job_completed, value_has_closed_issue_evidence, GITHUB_ISSUE_PR_DEFINITION_ID,
     ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT,
-    RUNTIME_JOB_COMPLETED_EVENT, SCOPE_TOO_LARGE_SIGNAL,
+    RUNTIME_JOB_COMPLETED_EVENT,
 };
 pub use remote_facts::{
     remote_fact_command_dedupe_key, stable_pr_snapshot_fact_hash_input, stable_remote_fact_hash,

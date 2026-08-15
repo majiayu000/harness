@@ -16,23 +16,14 @@ const EXECUTION_PATH_WORKFLOW_RUNTIME: &str = "workflow_runtime";
 const PROMPT_TASK_DESCRIPTION: &str = "prompt task";
 const GITHUB_TRACKER_SOURCE: &str = "github";
 
-#[path = "workflow_runtime_submission/cancel.rs"]
 mod cancel;
-#[path = "workflow_runtime_submission/commit.rs"]
 mod commit;
-#[path = "workflow_runtime_submission/declarative.rs"]
 mod declarative;
-#[path = "workflow_runtime_submission/dependencies.rs"]
 mod dependencies;
-#[path = "workflow_runtime_submission/prompt_memory.rs"]
 mod prompt_memory;
-#[path = "workflow_runtime_submission/replay.rs"]
 mod replay;
-#[path = "workflow_runtime_submission/runtime_models.rs"]
 pub(crate) mod runtime_models;
-#[path = "workflow_runtime_submission/runtime_request.rs"]
 pub(crate) mod runtime_request;
-#[path = "workflow_runtime_submission/runtime_state.rs"]
 pub(crate) mod runtime_state;
 
 pub use runtime_models::TaskId;
@@ -787,40 +778,31 @@ fn string_array_field(data: &serde_json::Value, field: &str) -> anyhow::Result<V
 }
 
 #[cfg(test)]
-#[path = "workflow_runtime_submission/atomicity_tests.rs"]
 mod atomicity_tests;
 
 #[cfg(test)]
-#[path = "workflow_runtime_submission/identity_tests.rs"]
 mod identity_tests;
 
 #[cfg(test)]
-#[path = "workflow_runtime_submission/dependency_tests.rs"]
 mod dependency_tests;
 
 #[cfg(test)]
-#[path = "workflow_runtime_submission/declarative_cancel_tests.rs"]
 mod declarative_cancel_tests;
 #[cfg(test)]
-#[path = "workflow_runtime_submission/declarative_tests.rs"]
 mod declarative_tests;
 
 #[cfg(test)]
-#[path = "workflow_runtime_submission/declarative_project_tests.rs"]
 mod declarative_project_tests;
 
 #[cfg(test)]
-#[path = "workflow_runtime_submission/continuation_tests.rs"]
 mod continuation_tests;
 
 #[cfg(test)]
-#[path = "workflow_runtime_submission/replay_tests.rs"]
 mod replay_tests;
 
 #[cfg(test)]
-#[path = "workflow_runtime_submission/trust_tests.rs"]
 mod trust_tests;
 
 #[cfg(test)]
-#[path = "workflow_runtime_submission_tests.rs"]
+#[path = "../workflow_runtime_submission_tests.rs"]
 mod tests;

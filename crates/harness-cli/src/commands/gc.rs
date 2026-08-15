@@ -7,7 +7,7 @@ use harness_gc::gc_agent::GcAgent;
 use harness_gc::signal_detector::SignalDetector;
 use harness_observe::event_store::EventStore;
 
-use crate::commands::GcCommand;
+use super::GcCommand;
 
 pub async fn run_gc(
     cmd: GcCommand,

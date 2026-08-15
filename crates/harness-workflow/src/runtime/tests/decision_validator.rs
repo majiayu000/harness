@@ -637,9 +637,11 @@ fn allows_declared_non_command_progress_modes() {
         "quality checks passed",
     )
     // GH-1766: the gate transition requires the server validation digest.
-    .with_evidence(crate::runtime::model::WorkflowEvidence::new(
+    .with_evidence(crate::runtime::model::WorkflowEvidence::reexecuted(
         crate::runtime::completion_evidence::EVIDENCE_SERVER_VALIDATION_DIGEST,
         "server executed 1 validation command(s), all exit 0",
+        "server_validation_digest:1_commands",
+        None,
     ));
     DecisionValidator::quality_gate()
         .validate(&terminal, &terminal_decision, &validation_context())

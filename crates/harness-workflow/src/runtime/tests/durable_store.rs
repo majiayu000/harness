@@ -151,9 +151,11 @@ async fn durable_store_apply_decision_transition_can_create_initial_instance() -
     ))
     // `implementing -> pr_open` requires server-verified PR evidence
     // (GH-1766); a decision reaching the store without it is rejected.
-    .with_evidence(WorkflowEvidence::new(
+    .with_evidence(WorkflowEvidence::runtime_observed(
         ARTIFACT_VERIFIED_PR_BINDING,
         json!({ "pr_number": 77, "repo": "owner/repo", "state": "OPEN" }).to_string(),
+        "workflow-runtime-test",
+        None,
     ));
     let mut final_instance = initial.clone();
     final_instance.state = "pr_open".to_string();
@@ -725,6 +727,7 @@ async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyh
             "issue_url": "https://github.com/owner/repo/issues/123"
         }),
     ))
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123))
     .with_artifact(ActivityArtifact::new(
         "workflow_decision",
         serde_json::to_value(&driverless)?,
@@ -763,5 +766,70 @@ async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyh
         WorkflowCommandType::MarkDone
     );
     assert_eq!(commands[0].decision_id.as_deref(), Some(record.id.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unverified_closed_issue_uses_blocked_fallback() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = issue_instance("implementing")
+        .with_id("unverified-closed-issue")
+        .with_server_data(json!({
+            "repo": "owner/repo",
+            "issue_number": 123,
+        }));
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+    let result = ActivityResult::succeeded("implement_issue", "Issue is closed.").with_signal(
+        ActivitySignal::new(
+            "IssueClosed",
+            json!({
+                "issue_number": 123,
+                "state": "closed",
+                "issue_url": "https://github.com/owner/repo/issues/123",
+            }),
+        ),
+    );
+
+    let record = store
+        .commit_parent_runtime_completion(
+            &instance.id,
+            "runtime-1",
+            json!({
+                "command_id": "unverified-closed-command",
+                "runtime_job_id": "unverified-closed-job",
+                "activity_result": result,
+            }),
+        )
+        .await?
+        .expect("insufficient terminal trust should produce a blocked fallback");
+
+    assert!(record.accepted);
+    assert_eq!(record.decision.decision, "block_invalid_agent_output");
+    assert_eq!(record.decision.next_state, "blocked");
+    let decisions = store.decisions_for(&instance.id).await?;
+    assert_eq!(decisions.len(), 2);
+    assert!(decisions.iter().any(|candidate| {
+        !candidate.accepted
+            && candidate.decision.decision == "finish_closed_issue"
+            && candidate
+                .rejection_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("insufficient evidence trust"))
+    }));
+    assert_eq!(
+        store
+            .get_instance(&instance.id)
+            .await?
+            .expect("workflow should remain visible")
+            .state,
+        "blocked"
+    );
     Ok(())
 }

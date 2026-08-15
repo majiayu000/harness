@@ -48,13 +48,14 @@ pub(crate) struct RuntimeHostRecord {
 pub struct RuntimeHostManager {
     pub(crate) hosts: DashMap<String, RuntimeHostRecord>,
     operation_locks: Arc<DashMap<String, Weak<Mutex<()>>>>,
+    runtime_job_operation_locks: Arc<DashMap<String, Weak<Mutex<()>>>>,
     pub(crate) heartbeat_timeout_secs: i64,
 }
 
 pub struct RuntimeHostOperationGuard {
     guard: Option<OwnedMutexGuard<()>>,
     operation_locks: Arc<DashMap<String, Weak<Mutex<()>>>>,
-    host_id: String,
+    operation_id: String,
     operation_lock: Weak<Mutex<()>>,
 }
 
@@ -65,7 +66,7 @@ impl Drop for RuntimeHostOperationGuard {
             return;
         }
         if let dashmap::mapref::entry::Entry::Occupied(entry) =
-            self.operation_locks.entry(self.host_id.clone())
+            self.operation_locks.entry(self.operation_id.clone())
         {
             if Weak::ptr_eq(entry.get(), &self.operation_lock) && entry.get().strong_count() == 0 {
                 entry.remove();
@@ -83,6 +84,7 @@ impl RuntimeHostManager {
         Self {
             hosts: DashMap::new(),
             operation_locks: Arc::new(DashMap::new()),
+            runtime_job_operation_locks: Arc::new(DashMap::new()),
             heartbeat_timeout_secs,
         }
     }
@@ -93,19 +95,38 @@ impl RuntimeHostManager {
     /// must retain the same ordering boundary as requests that were queued
     /// before the previous registration was removed.
     pub async fn lock_operation(&self, host_id: &str) -> RuntimeHostOperationGuard {
-        let operation_lock = self.operation_lock(host_id);
+        Self::lock_named_operation(&self.operation_locks, host_id).await
+    }
+
+    /// Serializes completion and renewal for one runtime job without blocking
+    /// heartbeats, deregistration, or unrelated jobs owned by the same host.
+    pub async fn lock_runtime_job_operation(
+        &self,
+        runtime_job_id: &str,
+    ) -> RuntimeHostOperationGuard {
+        Self::lock_named_operation(&self.runtime_job_operation_locks, runtime_job_id).await
+    }
+
+    async fn lock_named_operation(
+        operation_locks: &Arc<DashMap<String, Weak<Mutex<()>>>>,
+        operation_id: &str,
+    ) -> RuntimeHostOperationGuard {
+        let operation_lock = Self::named_operation_lock(operation_locks, operation_id);
         let operation_lock_weak = Arc::downgrade(&operation_lock);
         let guard = operation_lock.lock_owned().await;
         RuntimeHostOperationGuard {
             guard: Some(guard),
-            operation_locks: self.operation_locks.clone(),
-            host_id: host_id.to_string(),
+            operation_locks: operation_locks.clone(),
+            operation_id: operation_id.to_string(),
             operation_lock: operation_lock_weak,
         }
     }
 
-    fn operation_lock(&self, host_id: &str) -> Arc<Mutex<()>> {
-        let mut entry = self.operation_locks.entry(host_id.to_string()).or_default();
+    fn named_operation_lock(
+        operation_locks: &DashMap<String, Weak<Mutex<()>>>,
+        operation_id: &str,
+    ) -> Arc<Mutex<()>> {
+        let mut entry = operation_locks.entry(operation_id.to_string()).or_default();
         if let Some(operation_lock) = entry.upgrade() {
             return operation_lock;
         }
@@ -117,6 +138,11 @@ impl RuntimeHostManager {
     #[cfg(test)]
     pub(crate) fn operation_lock_count(&self) -> usize {
         self.operation_locks.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_job_operation_lock_count(&self) -> usize {
+        self.runtime_job_operation_locks.len()
     }
 
     pub fn register(

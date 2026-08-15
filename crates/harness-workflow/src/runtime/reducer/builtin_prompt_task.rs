@@ -40,19 +40,6 @@ pub(super) fn prompt_task_success_decision(
             ));
         }
     };
-    if let Some(scope_signal) = result
-        .signals
-        .iter()
-        .find(|signal| signal.signal_type == super::SCOPE_TOO_LARGE_SIGNAL)
-    {
-        return Some(scope_too_large_decision(
-            instance,
-            event,
-            result,
-            &continuation,
-            &scope_signal.signal,
-        ));
-    }
     let signal = match parse_external_state_signal(result) {
         Ok(signal) => signal,
         Err(reason) => {
@@ -116,52 +103,6 @@ pub(super) fn prompt_task_success_decision(
     Some(continue_decision(
         instance, event, result, &signal, observed, prompt_ref,
     ))
-}
-
-fn scope_too_large_decision(
-    instance: &WorkflowInstance,
-    event: &WorkflowEvent,
-    result: &ActivityResult,
-    continuation: &PromptContinuationState,
-    scope: &Value,
-) -> WorkflowDecision {
-    let reason = format!(
-        "prompt continuation reported SCOPE_TOO_LARGE before the external state settled: {scope}"
-    );
-    let mut block = runtime_blocked_command(
-        &reason,
-        None,
-        format!(
-            "runtime-completion:{}:prompt-scope-too-large:block",
-            event.id
-        ),
-        event,
-        result,
-    );
-    block.command["continuation"] = json!(continuation);
-    WorkflowDecision::new(
-        &instance.id,
-        &instance.state,
-        "prompt_continuation_scope_too_large",
-        "blocked",
-        &reason,
-    )
-    .with_command(block)
-    .with_command(WorkflowCommand::new(
-        WorkflowCommandType::RequestOperatorAttention,
-        format!(
-            "runtime-completion:{}:prompt-scope-too-large:operator",
-            event.id
-        ),
-        json!({
-            "reason": reason,
-            "activity": result.activity,
-            "scope_guard": scope,
-        }),
-    ))
-    .with_evidence(runtime_completion_evidence(event, result))
-    .with_evidence(WorkflowEvidence::new("scope_too_large", scope.to_string()))
-    .high_confidence()
 }
 
 /// Attach the completion evidence when the contract is enforced. With the kill
@@ -674,6 +615,10 @@ mod tests {
             .find(|evidence| evidence.kind == EVIDENCE_PROMPT_COMPLETION)
             .expect("completion evidence is minted");
         assert!(evidence.summary.contains("no_change_rationale"));
+        assert_eq!(
+            evidence.provenance.trust,
+            harness_core::claim_trust::ClaimTrustLevel::SelfDeclared
+        );
     }
 
     #[test]
@@ -695,6 +640,10 @@ mod tests {
             .expect("completion evidence is minted");
         assert!(evidence.summary.contains("2 command(s)"));
         assert!(evidence.summary.contains("1 non-zero"));
+        assert_eq!(
+            evidence.provenance.trust,
+            harness_core::claim_trust::ClaimTrustLevel::SelfDeclared
+        );
     }
 
     #[test]

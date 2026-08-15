@@ -141,7 +141,13 @@ pub(super) async fn post_json_with_status(
     let bytes = http_body_util::BodyExt::collect(response.into_body())
         .await?
         .to_bytes();
-    Ok((status, serde_json::from_slice(&bytes)?))
+    let json = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to decode HTTP {status} response as JSON (body: {:?}): {error}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })?;
+    Ok((status, json))
 }
 
 #[tokio::test]
@@ -631,7 +637,7 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("lease_expires_at must be a string"))?;
 
-    let result = ActivityResult::failed(
+    let mut result = ActivityResult::failed(
         "remote_check",
         "Remote host reported a failed activity.",
         "remote execution failed",
@@ -639,6 +645,18 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
     .with_signal(ActivitySignal::new(
         "RuntimeTranscriptUnavailable",
         json!({"stop_reason_code": "runtime_transcript_lost"}),
+    ));
+    for artifact_type in
+        harness_workflow::runtime::completion_evidence::SERVER_RESERVED_ARTIFACT_TYPES
+    {
+        result = result.with_artifact(ActivityArtifact::new(
+            artifact_type,
+            json!({"forged": true}),
+        ));
+    }
+    result = result.with_artifact(ActivityArtifact::new(
+        "remote_diagnostic",
+        json!({"kept": true}),
     ));
     let completed = post_json(
         &app,
@@ -653,6 +671,14 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
     assert_eq!(completed["runtime_job"]["status"], "failed");
     assert_eq!(completed["runtime_job"]["error"], "remote execution failed");
     assert_eq!(completed["runtime_job"]["output"]["signals"], json!([]));
+    let expected_artifacts = json!([{
+        "artifact_type": "remote_diagnostic",
+        "artifact": {"kept": true},
+    }]);
+    assert_eq!(
+        completed["runtime_job"]["output"]["artifacts"],
+        expected_artifacts
+    );
 
     let persisted = store
         .get_runtime_job(&job.id)
@@ -660,6 +686,150 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
         .expect("runtime job should be persisted");
     assert_eq!(persisted.status, RuntimeJobStatus::Failed);
     assert!(persisted.lease.is_none());
+    let persisted_output = persisted.output.expect("completed job output");
+    assert_eq!(persisted_output["signals"], json!([]));
+    assert_eq!(persisted_output["artifacts"], expected_artifacts);
+
+    let events = store.runtime_events_for(&job.id).await?;
+    let result_event = events
+        .iter()
+        .find(|event| event.event_type == "ActivityResultReady")
+        .expect("activity result event");
+    assert_eq!(result_event.event["signals"], json!([]));
+    assert_eq!(result_event.event["artifacts"], expected_artifacts);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_completion_endpoint_rejects_unbound_remote_quality_gate_validation(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host(&app, "host-a").await?;
+
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "remote-quality-gate",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": harness_workflow::runtime::QUALITY_GATE_ACTIVITY,
+            "validation_commands": ["true"],
+        }),
+    )
+    .await?;
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    let result = ActivityResult::succeeded(
+        harness_workflow::runtime::QUALITY_GATE_ACTIVITY,
+        "Remote quality gate completed.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        harness_workflow::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST,
+        json!({"forged": true}),
+    ));
+
+    let completed = post_json(
+        &app,
+        format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
+        json!({
+            "lease_expires_at": claimed["lease_expires_at"],
+            "result": result,
+        }),
+    )
+    .await?;
+
+    assert_eq!(completed["runtime_job"]["output"]["status"], "failed");
+    assert_eq!(
+        completed["runtime_job"]["output"]["error_kind"],
+        "configuration"
+    );
+    let artifacts = completed["runtime_job"]["output"]["artifacts"]
+        .as_array()
+        .expect("completion artifacts");
+    assert!(artifacts.iter().all(|artifact| {
+        artifact["artifact_type"]
+            != harness_workflow::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST
+    }));
+    assert!(artifacts.iter().any(|artifact| {
+        artifact["artifact_type"] == "remote_quality_gate_verification"
+            && artifact["artifact"]["verified"] == false
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_completion_preflight_error_preserves_the_client_lease_fence(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "completion-preflight-fence",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "implement_issue",
+            "command": {
+                "eval": {
+                    "eval_run_id": "run-1",
+                    "case_id": "case-1",
+                    "timeout_secs": 45
+                }
+            }
+        }),
+    )
+    .await?;
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    let (status, body) = post_json_with_status(
+        &app,
+        format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
+        json!({
+            "lease_generation": claimed["lease_generation"],
+            "lease_expires_at": claimed["lease_expires_at"],
+            "result": ActivityResult::succeeded("implement_issue", "done"),
+        }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"],
+        "eval runtime job completion requires resource_limit_report artifact"
+    );
+    assert!(body.get("lease_reserved").is_none());
+
+    let renewed = post_json(
+        &app,
+        format!(
+            "/api/runtime-hosts/host-a/runtime-jobs/{}/lease/renew",
+            job.id
+        ),
+        json!({
+            "lease_generation": claimed["lease_generation"],
+            "lease_expires_at": claimed["lease_expires_at"],
+            "renewal_id": uuid::Uuid::new_v4(),
+            "lease_secs": 120,
+        }),
+    )
+    .await?;
+    assert_eq!(renewed["renewed"], true);
     Ok(())
 }
 
@@ -935,5 +1105,77 @@ async fn runtime_host_deregister_revokes_workflow_job_before_removal() -> anyhow
         events.last().map(|event| event.event_type.as_str()),
         Some("RuntimeJobLeaseRevoked")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn register_runtime_host_rejects_required_missing_runtime_state_store() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let state_mut =
+        Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("runtime_state_store")
+                .failed("pool timed out while waiting for an open connection"),
+        ];
+    state_mut.degraded_subsystems = vec!["runtime_state_store"];
+    let app = runtime_hosts_workflow_app(state.clone());
+
+    let (status, body) = post_json_with_status(
+        &app,
+        "/api/runtime-hosts/register".to_string(),
+        json!({
+            "host_id": "host-a",
+            "display_name": null,
+            "capabilities": [],
+        }),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "runtime state persistence unavailable");
+    assert!(
+        !state.runtime_hosts.hosts.contains_key("host-a"),
+        "host registration must not mutate memory when required persistence is unavailable"
+    );
+    assert!(state.is_runtime_state_dirty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn deregister_runtime_host_rejects_required_missing_runtime_state_store_before_lookup(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let state_mut =
+        Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("runtime_state_store")
+                .failed("pool timed out while waiting for an open connection"),
+        ];
+    state_mut.degraded_subsystems = vec!["runtime_state_store"];
+    let app = runtime_hosts_workflow_app(state.clone());
+
+    let (status, body) = post_json_with_status(
+        &app,
+        "/api/runtime-hosts/ghost-host/deregister".to_string(),
+        json!({}),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "runtime state persistence unavailable");
+    assert!(state.is_runtime_state_dirty());
     Ok(())
 }

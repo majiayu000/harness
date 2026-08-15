@@ -423,9 +423,11 @@ fn prompt_task_done_requires_completion_evidence_even_if_the_reducer_is_bypassed
         WorkflowDecisionRejectionKind::MissingRequiredEvidence
     );
 
-    let evidenced = decision.with_evidence(WorkflowEvidence::new(
+    let evidenced = decision.with_evidence(WorkflowEvidence::runtime_observed(
         "prompt_completion_evidence",
         "validation_report: 1 command(s) reported, 0 non-zero exit(s)",
+        "prompt_completion_reducer",
+        None,
     ));
     DecisionValidator::prompt_task()
         .validate(

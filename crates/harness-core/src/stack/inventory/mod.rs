@@ -166,6 +166,9 @@ mod review_tests;
 mod rules;
 use rules::*;
 
+#[rustfmt::skip]
+pub(super) fn normalize_extraction_source(raw: &str) -> Result<Option<String>, AgentStackInventoryErrorKind> { rules::normalize_configured_source(raw) }
+
 #[cfg(test)]
 thread_local! {
     /// §3 seam: force the initial recursive `open_dir` for one prefix to fail

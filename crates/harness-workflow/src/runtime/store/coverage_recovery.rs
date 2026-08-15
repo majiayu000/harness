@@ -348,9 +348,11 @@ mod tests {
             "quality_gate_pending",
             "recover",
         )
-        .with_evidence(crate::runtime::WorkflowEvidence::new(
+        .with_evidence(crate::runtime::WorkflowEvidence::runtime_observed(
             "server_pr_snapshot",
             "GitHub reported an authoritative closing pull request.",
+            "coverage_recovery_test",
+            Some(fact.fact_hash.clone()),
         ))
         .with_command(WorkflowCommand::start_child_workflow(
             "quality_gate",
@@ -412,9 +414,11 @@ mod tests {
                 "quality_gate_pending",
                 "recover",
             )
-            .with_evidence(crate::runtime::WorkflowEvidence::new(
+            .with_evidence(crate::runtime::WorkflowEvidence::runtime_observed(
                 "server_pr_snapshot",
                 "GitHub reported an authoritative closing pull request.",
+                "coverage_recovery_test",
+                Some(fact.fact_hash.clone()),
             ))
             .with_command(WorkflowCommand::start_child_workflow(
                 "quality_gate",
@@ -580,9 +584,11 @@ mod tests {
             "merging",
             "invalid direct coverage transition",
         )
-        .with_evidence(crate::runtime::WorkflowEvidence::new(
+        .with_evidence(crate::runtime::WorkflowEvidence::runtime_observed(
             "server_pr_snapshot",
             "GitHub reported an authoritative closing pull request.",
+            "coverage_recovery_test",
+            Some(fact.fact_hash.clone()),
         ));
 
         let outcome = store

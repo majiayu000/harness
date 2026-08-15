@@ -38,7 +38,6 @@ pub const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
 pub const ISSUE_CLOSED_SIGNAL: &str = "IssueClosed";
 pub const ISSUE_ALREADY_RESOLVED_SIGNAL: &str = "IssueAlreadyResolved";
 pub const ISSUE_STATE_ARTIFACT: &str = "issue_state";
-pub const SCOPE_TOO_LARGE_SIGNAL: &str = "SCOPE_TOO_LARGE";
 
 pub fn prompt_validation_report_has_nonzero_exit(result: &ActivityResult) -> bool {
     first_valid_prompt_validation_report(result)
