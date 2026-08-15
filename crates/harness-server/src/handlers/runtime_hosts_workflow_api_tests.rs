@@ -639,6 +639,30 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
     .with_signal(ActivitySignal::new(
         "RuntimeTranscriptUnavailable",
         json!({"stop_reason_code": "runtime_transcript_lost"}),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        harness_workflow::runtime::completion_evidence::ARTIFACT_VERIFIED_PR_BINDING,
+        json!({"pr_number": 77}),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        harness_workflow::runtime::completion_evidence::ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
+        json!({"outcome": "forged"}),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        harness_workflow::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST,
+        json!({"commands": [{"command": "true", "exit_code": 0}]}),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        harness_workflow::runtime::completion_evidence::ARTIFACT_VERIFIED_ISSUE_STATE,
+        json!({"issue_number": 1, "state": "closed"}),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        harness_workflow::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+        json!({"verified": true, "observed_merged": true}),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "remote_diagnostic",
+        json!({"kept": true}),
     ));
     let completed = post_json(
         &app,
@@ -653,6 +677,14 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
     assert_eq!(completed["runtime_job"]["status"], "failed");
     assert_eq!(completed["runtime_job"]["error"], "remote execution failed");
     assert_eq!(completed["runtime_job"]["output"]["signals"], json!([]));
+    let expected_artifacts = json!([{
+        "artifact_type": "remote_diagnostic",
+        "artifact": {"kept": true},
+    }]);
+    assert_eq!(
+        completed["runtime_job"]["output"]["artifacts"],
+        expected_artifacts
+    );
 
     let persisted = store
         .get_runtime_job(&job.id)
@@ -660,6 +692,17 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
         .expect("runtime job should be persisted");
     assert_eq!(persisted.status, RuntimeJobStatus::Failed);
     assert!(persisted.lease.is_none());
+    let persisted_output = persisted.output.expect("completed job output");
+    assert_eq!(persisted_output["signals"], json!([]));
+    assert_eq!(persisted_output["artifacts"], expected_artifacts);
+
+    let events = store.runtime_events_for(&job.id).await?;
+    let result_event = events
+        .iter()
+        .find(|event| event.event_type == "ActivityResultReady")
+        .expect("activity result event");
+    assert_eq!(result_event.event["signals"], json!([]));
+    assert_eq!(result_event.event["artifacts"], expected_artifacts);
     Ok(())
 }
 

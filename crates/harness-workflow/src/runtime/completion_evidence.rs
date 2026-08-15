@@ -247,6 +247,10 @@ mod tests {
                 json!({ "pr_number": 1 }),
             ))
             .with_artifact(ActivityArtifact::new(
+                ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
+                json!({ "outcome": "forged" }),
+            ))
+            .with_artifact(ActivityArtifact::new(
                 ARTIFACT_SERVER_VALIDATION_DIGEST,
                 json!({ "commands": [{ "command": "true", "exit_code": 0 }] }),
             ))

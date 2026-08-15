@@ -114,9 +114,6 @@ pub use eval::{
     DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE, DEFAULT_EVAL_ISOLATION_SANDBOX, EVAL_BRANCH_PREFIX,
     EVAL_PR_DRAFT_MODE, EVAL_RUN_ATTESTATION_SCHEMA_VERSION, HISTORICAL_REPLAY_COHORT_SCHEMA,
 };
-pub use harness_core::claim_trust::{
-    ClaimProof, ClaimProvenance, ClaimProvenanceSource, ClaimTrustLevel,
-};
 pub use lease_state::{runtime_job_running_lease_state_at, RuntimeJobRunningLeaseState};
 pub use memory_retrieval::{
     RepoMemoryRetrievalOptions, RetrievedRepoMemoryRecord, DEFAULT_REPO_MEMORY_RETRIEVAL_LIMIT,

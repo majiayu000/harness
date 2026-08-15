@@ -309,13 +309,11 @@ pub(super) fn runtime_completion_evidence(
         .get("runtime_job_id")
         .and_then(|value| value.as_str())
         .unwrap_or("<unknown>");
-    WorkflowEvidence::runtime_observed(
+    WorkflowEvidence::new(
         "runtime_completion",
         format!(
             "activity={} status={:?} command_id={} runtime_job_id={} summary={}",
             result.activity, result.status, command_id, runtime_job_id, result.summary
         ),
-        "workflow_runtime_completion_event",
-        Some(event.id.clone()),
     )
 }
