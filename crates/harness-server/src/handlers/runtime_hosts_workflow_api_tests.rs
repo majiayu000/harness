@@ -1107,3 +1107,75 @@ async fn runtime_host_deregister_revokes_workflow_job_before_removal() -> anyhow
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn register_runtime_host_rejects_required_missing_runtime_state_store() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let state_mut =
+        Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("runtime_state_store")
+                .failed("pool timed out while waiting for an open connection"),
+        ];
+    state_mut.degraded_subsystems = vec!["runtime_state_store"];
+    let app = runtime_hosts_workflow_app(state.clone());
+
+    let (status, body) = post_json_with_status(
+        &app,
+        "/api/runtime-hosts/register".to_string(),
+        json!({
+            "host_id": "host-a",
+            "display_name": null,
+            "capabilities": [],
+        }),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "runtime state persistence unavailable");
+    assert!(
+        !state.runtime_hosts.hosts.contains_key("host-a"),
+        "host registration must not mutate memory when required persistence is unavailable"
+    );
+    assert!(state.is_runtime_state_dirty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn deregister_runtime_host_rejects_required_missing_runtime_state_store_before_lookup(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut state = Arc::new(crate::test_helpers::make_test_state(dir.path()).await?);
+    let state_mut =
+        Arc::get_mut(&mut state).ok_or_else(|| anyhow::anyhow!("expected unique state"))?;
+    state_mut.startup_statuses =
+        vec![
+            crate::http::state::StoreStartupResult::optional("runtime_state_store")
+                .failed("pool timed out while waiting for an open connection"),
+        ];
+    state_mut.degraded_subsystems = vec!["runtime_state_store"];
+    let app = runtime_hosts_workflow_app(state.clone());
+
+    let (status, body) = post_json_with_status(
+        &app,
+        "/api/runtime-hosts/ghost-host/deregister".to_string(),
+        json!({}),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "runtime state persistence unavailable");
+    assert!(state.is_runtime_state_dirty());
+    Ok(())
+}

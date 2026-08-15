@@ -770,6 +770,3 @@ fn runtime_state_persistence_error_response(
         })),
     )
 }
-
-#[cfg(test)]
-mod tests;
