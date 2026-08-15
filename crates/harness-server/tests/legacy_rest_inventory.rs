@@ -145,17 +145,80 @@ impl Visit<'_> for InventoryVisitor<'_> {
 
 fn legacy_json_aliases(file: &syn::File, relative: &str) -> anyhow::Result<BTreeSet<String>> {
     let mut aliases = BTreeSet::new();
+    let mut has_glob_import = false;
+    let mut explicitly_imports_json = false;
     for item in &file.items {
         let syn::Item::Use(item) = item else {
             continue;
         };
+        if is_test_only(&item.attrs) {
+            continue;
+        }
         let tokens = item.to_token_stream().to_string();
         if tokens.contains("rest_contract") && tokens.contains('*') {
             anyhow::bail!("{relative}: glob imports from rest_contract are forbidden");
         }
+        has_glob_import |= use_tree_contains_glob(&item.tree);
+        explicitly_imports_json |= use_tree_imports_identifier(&item.tree, "Json");
         collect_legacy_aliases(&item.tree, &mut aliases);
     }
+    if aliases.is_empty()
+        && has_glob_import
+        && !explicitly_imports_json
+        && production_functions_use_identifier(file, "Json")
+    {
+        anyhow::bail!(
+            "{relative}: production functions use Json through an unresolved glob import; import Json explicitly"
+        );
+    }
     Ok(aliases)
+}
+
+fn use_tree_contains_glob(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Glob(_) => true,
+        syn::UseTree::Path(path) => use_tree_contains_glob(&path.tree),
+        syn::UseTree::Group(group) => group.items.iter().any(use_tree_contains_glob),
+        _ => false,
+    }
+}
+
+fn use_tree_imports_identifier(tree: &syn::UseTree, identifier: &str) -> bool {
+    match tree {
+        syn::UseTree::Name(name) => name.ident == identifier,
+        syn::UseTree::Rename(rename) => rename.rename == identifier,
+        syn::UseTree::Path(path) => use_tree_imports_identifier(&path.tree, identifier),
+        syn::UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|item| use_tree_imports_identifier(item, identifier)),
+        syn::UseTree::Glob(_) => false,
+    }
+}
+
+fn production_functions_use_identifier(file: &syn::File, identifier: &str) -> bool {
+    file.items.iter().any(|item| match item {
+        syn::Item::Fn(function) => {
+            !is_test_only(&function.attrs) && tokens_use_identifier(function, identifier)
+        }
+        syn::Item::Impl(item_impl) if !is_test_only(&item_impl.attrs) => item_impl
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::ImplItem::Fn(function) if !is_test_only(&function.attrs) => Some(function),
+                _ => None,
+            })
+            .any(|function| tokens_use_identifier(function, identifier)),
+        _ => false,
+    })
+}
+
+fn tokens_use_identifier(value: &impl ToTokens, identifier: &str) -> bool {
+    value
+        .to_token_stream()
+        .to_string()
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|token| token == identifier)
 }
 
 fn collect_legacy_aliases(tree: &syn::UseTree, aliases: &mut BTreeSet<String>) {
@@ -226,6 +289,33 @@ fn legacy_json_type_aliases_fail_closed() {
         entries: &mut entries,
     }
     .visit_file(&file);
+}
+
+#[test]
+fn inherited_json_aliases_fail_closed() {
+    for source in [
+        "use super::*; fn handler(Json(value): Json<serde_json::Value>) { drop(value); }",
+        "use super::*; #[cfg(test)] use axum::Json; fn handler(Json(value): Json<serde_json::Value>) { drop(value); }",
+        "use super::*; struct Handler; impl Handler { fn handle(Json(value): Json<serde_json::Value>) { drop(value); } }",
+    ] {
+        let file = syn::parse_file(source).expect("fixture should parse");
+        let error = legacy_json_aliases(&file, "fixture.rs")
+            .expect_err("an inherited Json alias must not bypass inventory");
+        assert!(error.to_string().contains("unresolved glob import"));
+    }
+}
+
+#[test]
+fn explicit_non_legacy_json_import_is_not_inventoried() {
+    let file = syn::parse_file(
+        "use super::*; use axum::Json; fn handler(Json(value): Json<serde_json::Value>) { drop(value); }",
+    )
+    .expect("fixture should parse");
+
+    let aliases = legacy_json_aliases(&file, "fixture.rs")
+        .expect("an explicit non-legacy Json import is resolved");
+
+    assert!(aliases.is_empty());
 }
 
 fn fingerprint(value: &impl ToTokens) -> String {

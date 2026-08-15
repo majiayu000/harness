@@ -3,6 +3,7 @@ use super::{
     TransitionRule, ValidationContext, WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
 };
 use crate::runtime::model::{WorkflowCommandType, WorkflowDecision, WorkflowInstance};
+use harness_core::claim_trust::ClaimTrustLevel;
 
 impl DecisionValidator {
     pub(super) fn validate_hidden_workflow_transition(
@@ -47,16 +48,19 @@ impl DecisionValidator {
                 "GitHub coverage recovery transitions require reconciliation context",
             ));
         }
-        if !decision
-            .evidence
-            .iter()
-            .any(|evidence| evidence.kind == "server_pr_snapshot")
-        {
-            return Err(WorkflowDecisionRejection::new(
-                WorkflowDecisionRejectionKind::MissingRequiredEvidence,
-                "GitHub coverage recovery requires server_pr_snapshot evidence",
-            ));
-        }
+        let mut evidence_rule = TransitionRule::new(
+            decision.observed_state.as_str(),
+            decision.next_state.as_str(),
+            std::iter::empty::<WorkflowCommandType>(),
+        );
+        evidence_rule
+            .required_evidence
+            .insert("server_pr_snapshot".to_string());
+        evidence_rule.required_evidence_trust.insert(
+            "server_pr_snapshot".to_string(),
+            ClaimTrustLevel::RuntimeObserved,
+        );
+        validator_progress::validate_required_evidence(&evidence_rule, decision)?;
 
         let required_command = coverage_recovery_required_command(decision)?;
         if !decision

@@ -43,12 +43,12 @@ These names overlap in everyday speech but mean different things in code. Use th
 | Term | Meaning | Location |
 |---|---|---|
 | **workflow runtime** | Orchestration layer that decides what should happen next; event-sourced state machine with a command outbox. | `crates/harness-workflow/src/runtime/` |
-| **agent runtime** (a.k.a. `CodeAgent` / `AgentAdapter`) | Agent abstraction; receives an `AgentRequest` and returns a stream or response. | `crates/harness-core/src/agent.rs`, `crates/harness-agents/src/` |
+| **agent runtime** (a.k.a. `AgentBackend`) | Agent abstraction; receives an `AgentRequest` and returns a stream or response. `CodeAgent` and `AgentAdapter` are type aliases of `AgentBackend`, not separate traits. | `crates/harness-core/src/agent.rs`, `crates/harness-agents/src/` |
 | **`RuntimeKind`** | Label the workflow layer attaches to an agent implementation. Treat the enum definition as the source of truth; do not duplicate its variants in documentation. | `crates/harness-workflow/src/runtime/model.rs` |
 | **task** | Legacy execution unit; submissions are being migrated to flow through the workflow runtime instead. | `crates/harness-server/src/task_runner/` |
 | **runtime host** | Process instance that executes runtime jobs; can register remotely via `/api/runtime-hosts`. | `crates/harness-server/src/runtime_hosts.rs` |
 
-There is no type literally named `AgentRuntime` in the codebase. The phrase is used informally to mean "the agent runtime layer" (i.e. `CodeAgent` and `AgentAdapter` impls). Prefer the precise names above when writing code.
+There is no type literally named `AgentRuntime` in the codebase. The phrase is used informally to mean the agent runtime layer (implementations of `AgentBackend`). Prefer `AgentBackend` in new code. `CodeAgent` means the oneshot execute surface (CLI wrappers and HTTP backends such as `AnthropicApiAgent`); `AgentAdapter` means a per-turn protocol backend. Both names alias the same trait.
 
 ## Worktree Usage
 
@@ -60,22 +60,23 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 
 - Before merging, every PR must receive a fresh-context review from an agent process that did not author the changes. Review output must be machine-parseable: direct reviews must put `APPROVED` on the last non-empty line when no blockers remain or prefix each blocking finding with `ISSUE:`; packaged review workflows may instead use their declared verdict field, such as `Assessment: APPROVE` or `Consensus: APPROVE`. Missing or unparseable output is not approval.
 - External review bots are optional advisors. Address valid feedback when it arrives, but bot silence, quota exhaustion, or service failure does not block a merge.
-- Address valid reviewer findings before merge. Record the reason for rejecting false positives in the handoff; posting that reason to the PR requires operator approval.
-- Merging requires explicit operator approval, a passing `CI Result` check, and squash merge.
+- Address valid reviewer findings before merge. Record the reason for rejecting false positives in the handoff or on the PR when useful.
+- Merging requires a passing `CI Result` check and squash merge.
 - Do not change `Cargo.toml` versions in feature or fix PRs; version bumps happen during releases.
-- Keep implementation PRs within the scope guard in `WORKFLOW.md` (currently 30 changed files and 1,500 added lines). If the work cannot fit, split it or obtain operator approval for the larger scope.
-- Resolving a review thread does not require separate user approval once its feedback has been verified as addressed.
-- Posting a new comment or reply remains an externally visible action and requires explicit user approval.
+- Resolve review threads once their feedback has been verified as addressed.
 
-## Codex Integration
+## Agent Integration (dual surface)
 
-| Surface | Implementation | Invocation |
-|---|---|---|
-| `CodeAgent` | `crates/harness-agents/src/codex.rs` | `codex exec`; the prompt is the final positional argument |
-| `AgentAdapter` | `crates/harness-agents/src/codex_adapter.rs` | `codex app-server` over stdio JSON-RPC |
+`crates/harness-agents/src/builder.rs` wires both surfaces into `AgentRegistry`. Do not treat either Codex path as dead code.
 
-- Keep changes scoped to the affected integration surface; they do not share the same CLI argument contract.
-- After modifying either surface, run `cargo test --package harness-agents`.
+| Surface | Trait name (alias) | Codex | Claude | OpenCode |
+|---|---|---|---|---|
+| Oneshot execute | `CodeAgent` | `codex.rs` via `codex exec`; prompt is the final positional argument | `claude.rs` via `claude -p <PROMPT> ...` | `opencode.rs` |
+| Per-turn protocol | `AgentAdapter` | `codex_adapter.rs` via `codex app-server` JSON-RPC, registered with `register_turn_backend_factory("codex", ...)` | none — `ClaudeAdapter` / `claude_adapter.rs` was removed (GH-1786); stream-json parsers live in `claude_stream_json.rs` | `opencode_adapter.rs` via `register_turn_backend_factory("opencode", ...)` |
+
+- The two surfaces do not share a CLI argument contract. Keep changes scoped to the affected implementation. `anthropic-api` is a oneshot HTTP `CodeAgent`, not a CLI wrapper.
+- After modifying a spawn path, run `cargo test --package harness-agents`.
+- Do not register a process-backed adapter as a singleton on `AgentRegistry` for concurrent turns. Attach a `register_turn_backend_factory` so each turn gets a fresh adapter.
 
 ## Server Operation
 

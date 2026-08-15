@@ -653,10 +653,4 @@ mod tests {
         .unwrap();
         assert_eq!(wf.state, IssueLifecycleState::Done);
     }
-
-    #[test]
-    fn config_human_gate_flag_defaults_false() {
-        let policy = harness_core::config::workflow::IssueWorkflowPolicy::default();
-        assert!(!policy.require_human_gate_before_merge);
-    }
 }

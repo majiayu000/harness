@@ -24,3 +24,12 @@ jobs:
           bun install --frozen-lockfile
           bun run build
       - run: cargo check --workspace --all-features
+
+  check-cli-without-server:
+    name: Compile-check harness-cli without server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p harness-cli --no-default-features --all-targets

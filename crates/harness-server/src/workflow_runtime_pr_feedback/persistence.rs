@@ -490,9 +490,11 @@ pub(super) async fn persist_pr_merged(
     ))
     // A server-observed merge is the terminal proof the `-> done` contract
     // requires (GH-1766); the agent never asserts this.
-    .with_evidence(WorkflowEvidence::new(
+    .with_evidence(WorkflowEvidence::runtime_observed(
         harness_workflow::runtime::completion_evidence::EVIDENCE_GITHUB_TERMINAL,
         ctx.pr_url.unwrap_or("merged externally"),
+        "workflow_runtime_pr_feedback",
+        None,
     ))
     .high_confidence();
     commit_runtime_decision(
@@ -540,8 +542,13 @@ pub(super) async fn approve_runtime_merge(
         .get("pr_number")
         .and_then(|value| value.as_u64());
     let pr_url = optional_string_field(&instance.data, "pr_url");
-    let expected_head_sha = optional_string_field(&instance.data, "pr_head_sha")
-        .or_else(|| optional_string_field(&instance.data, "head_sha"));
+    let expected_head_sha = trusted_merge_head_sha(&instance);
+    let Some(expected_head_sha) = expected_head_sha else {
+        return Ok(RuntimeMergeApprovalOutcome::Rejected {
+            workflow_id: instance.id,
+            reason: "ready-to-merge workflow is missing a server-observed PR head SHA".to_string(),
+        });
+    };
     let merge_method = optional_string_field(&instance.data, "merge_method")
         .unwrap_or_else(|| "squash".to_string());
     let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(true);
@@ -640,6 +647,24 @@ pub(super) async fn approve_runtime_merge(
             Ok(RuntimeMergeApprovalOutcome::NotReady { workflow_id, state })
         }
     }
+}
+
+fn trusted_merge_head_sha(instance: &WorkflowInstance) -> Option<String> {
+    ["pr_head_sha", "head_sha"].into_iter().find_map(|field| {
+        let provenance = instance
+            .data_provenance
+            .as_ref()?
+            .provenance_for(&format!("/{field}"));
+        if !matches!(
+            provenance,
+            Some(DataProvenance::Server | DataProvenance::External)
+        ) {
+            return None;
+        }
+        optional_string_field(&instance.data, field)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 pub(super) async fn commit_runtime_decision(

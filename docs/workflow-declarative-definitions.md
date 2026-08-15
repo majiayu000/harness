@@ -40,7 +40,7 @@ definition:
       activity: implement_issue
       on_success: reviewing
       on_signal:
-        SCOPE_TOO_LARGE: blocked
+        ImplementationBlocked: blocked
     reviewing:
       activity: run_local_review
       on_success: done

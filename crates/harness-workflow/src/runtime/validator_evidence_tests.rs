@@ -4,6 +4,7 @@ use crate::runtime::model::{
     ActivityArtifact, WorkflowCommand, WorkflowCommandType, WorkflowEvidence,
 };
 use crate::runtime::validator::{DecisionValidator, TransitionAllowlist, TransitionRule};
+use harness_core::claim_trust::{ClaimProvenance, ClaimTrustLevel};
 use serde_json::json;
 
 fn rule(operator_recovery_only: bool) -> TransitionRule {
@@ -96,6 +97,83 @@ fn only_nonempty_nondecision_artifact_types_become_evidence() {
         workflow_evidence_from_activity_artifacts(&[ActivityArtifact::new(" ", json!({}))])
             .is_err()
     );
+}
+
+#[test]
+fn claim_trust_vocabulary_is_closed_and_ordered() {
+    let actual = ClaimTrustLevel::ALL
+        .iter()
+        .map(|trust| {
+            serde_json::to_value(trust)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            "self_declared",
+            "repository_observed",
+            "runtime_observed",
+            "runner_observed",
+            "reexecuted",
+            "cryptographically_attested",
+            "human_approved"
+        ]
+    );
+    assert!(serde_json::from_str::<ClaimTrustLevel>("\"unsigned_attestation\"").is_err());
+    assert!(ClaimTrustLevel::Reexecuted.satisfies(ClaimTrustLevel::RuntimeObserved));
+    assert!(!ClaimTrustLevel::SelfDeclared.satisfies(ClaimTrustLevel::RuntimeObserved));
+}
+
+#[test]
+fn stronger_claim_trust_requires_matching_proof_metadata() {
+    let context = ValidationContext::new("workflow_runtime_operator_action", chrono::Utc::now());
+    let no_proof = decision("advance")
+        .with_evidence(WorkflowEvidence::new("ReviewReport", "ok").with_provenance(
+            ClaimProvenance::with_trust(ClaimTrustLevel::CryptographicallyAttested, None),
+        ))
+        .with_evidence(WorkflowEvidence::new("tests", "ok"));
+    let rejection = validate_declarative_transition_metadata(&rule(false), &no_proof, &context)
+        .expect_err("attested trust without proof must fail");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InvalidDecisionContract
+    );
+    assert!(rejection
+        .message
+        .contains("cryptographically_attested requires proof metadata"));
+
+    let unsigned_attestation = decision("advance")
+        .with_evidence(WorkflowEvidence::new("ReviewReport", "ok").with_provenance(
+            ClaimProvenance::cryptographically_attested("sha256:payload", "  ", None),
+        ))
+        .with_evidence(WorkflowEvidence::new("tests", "ok"));
+    let rejection =
+        validate_declarative_transition_metadata(&rule(false), &unsigned_attestation, &context)
+            .expect_err("empty signature must not count as attested proof");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InvalidDecisionContract
+    );
+    assert!(rejection.message.contains("signature must not be empty"));
+
+    let inferred_human = decision("advance")
+        .with_evidence(
+            WorkflowEvidence::new("ReviewReport", "ok")
+                .with_provenance(ClaimProvenance::human_approved("approver", " ")),
+        )
+        .with_evidence(WorkflowEvidence::new("tests", "ok"));
+    let rejection =
+        validate_declarative_transition_metadata(&rule(false), &inferred_human, &context)
+            .expect_err("human approval requires an explicit approval reference");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InvalidDecisionContract
+    );
+    assert!(rejection.message.contains("approval_ref must not be empty"));
 }
 
 #[test]
@@ -192,6 +270,19 @@ fn builtin_evidence_contract_matches_spec_table() {
                     rule.required_evidence.contains(*kind),
                     "{definition}: {from} -> {to} must require `{kind}`"
                 );
+                let expected_trust = match *kind {
+                    EVIDENCE_SERVER_VALIDATION_DIGEST => ClaimTrustLevel::Reexecuted,
+                    EVIDENCE_VERIFIED_PR_BINDING
+                    | EVIDENCE_GITHUB_TERMINAL
+                    | EVIDENCE_SERVER_PR_SNAPSHOT => ClaimTrustLevel::RuntimeObserved,
+                    EVIDENCE_PROMPT_COMPLETION => ClaimTrustLevel::SelfDeclared,
+                    _ => ClaimTrustLevel::SelfDeclared,
+                };
+                assert_eq!(
+                    rule.required_evidence_trust.get(*kind).copied(),
+                    Some(expected_trust),
+                    "{definition}: {from} -> {to} `{kind}` trust requirement diverges from the contract table",
+                );
             }
         }
         for rule in allowlist.rules() {
@@ -237,9 +328,23 @@ fn contracted_transition_rejects_without_evidence_and_accepts_with_it() {
         .message
         .contains(EVIDENCE_SERVER_VALIDATION_DIGEST));
 
-    let evidenced = bare.with_evidence(WorkflowEvidence::new(
+    let weak = bare.clone().with_evidence(WorkflowEvidence::new(
+        EVIDENCE_SERVER_VALIDATION_DIGEST,
+        "agent claimed the validation digest passed",
+    ));
+    let rejection = validate_declarative_transition_metadata(rule, &weak, &context)
+        .expect_err("self-declared evidence must not satisfy reexecuted evidence policy");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
+    );
+    assert!(rejection.message.contains("requires reexecuted"));
+
+    let evidenced = bare.with_evidence(WorkflowEvidence::reexecuted(
         EVIDENCE_SERVER_VALIDATION_DIGEST,
         "server executed 2 validation command(s), all exit 0",
+        "server_validation_digest:2_commands",
+        None,
     ));
     if let Err(rejection) = validate_declarative_transition_metadata(rule, &evidenced, &context) {
         panic!("digest evidence should satisfy the contract: {rejection}");

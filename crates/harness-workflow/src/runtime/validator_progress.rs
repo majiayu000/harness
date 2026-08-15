@@ -3,7 +3,8 @@ use super::state_registry::{self, WorkflowProgressMode};
 use super::validator::{
     TransitionRule, ValidationContext, WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
 };
-use std::collections::BTreeSet;
+use harness_core::claim_trust::ClaimTrustLevel;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Rule metadata plus required evidence, in one call. `DecisionValidator`
 /// runs the two halves separately so command-structure errors surface before
@@ -58,6 +59,7 @@ pub(super) fn validate_required_evidence(
     rule: &TransitionRule,
     decision: &WorkflowDecision,
 ) -> Result<(), WorkflowDecisionRejection> {
+    let evidence_trust = validated_evidence_trust(decision)?;
     let is_activity_retry = decision.decision == "retry_failed_runtime_activity"
         && decision.observed_state == decision.next_state
         && decision.commands.len() == 1
@@ -65,11 +67,7 @@ pub(super) fn validate_required_evidence(
     if is_activity_retry {
         return Ok(());
     }
-    let evidence_kinds = decision
-        .evidence
-        .iter()
-        .map(|evidence| evidence.kind.as_str())
-        .collect::<BTreeSet<_>>();
+    let evidence_kinds = evidence_trust.keys().copied().collect::<BTreeSet<_>>();
     let missing = rule
         .required_evidence
         .iter()
@@ -87,7 +85,66 @@ pub(super) fn validate_required_evidence(
             ),
         ));
     }
+    let insufficient = rule
+        .required_evidence
+        .iter()
+        .filter_map(|required| {
+            let actual = evidence_trust.get(required.as_str())?;
+            let minimum = rule
+                .required_evidence_trust
+                .get(required)
+                .copied()
+                .unwrap_or(ClaimTrustLevel::SelfDeclared);
+            (!actual.satisfies(minimum)).then_some((required.as_str(), *actual, minimum))
+        })
+        .collect::<Vec<_>>();
+    if !insufficient.is_empty() {
+        let detail = insufficient
+            .into_iter()
+            .map(|(kind, actual, minimum)| {
+                format!(
+                    "{kind} has trust {}, requires {}",
+                    actual.as_str(),
+                    minimum.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(WorkflowDecisionRejection::new(
+            WorkflowDecisionRejectionKind::InsufficientEvidenceTrust,
+            format!(
+                "transition '{}' -> '{}' has insufficient evidence trust: {detail}",
+                decision.observed_state, decision.next_state
+            ),
+        ));
+    }
     Ok(())
+}
+
+fn validated_evidence_trust(
+    decision: &WorkflowDecision,
+) -> Result<BTreeMap<&str, ClaimTrustLevel>, WorkflowDecisionRejection> {
+    let mut evidence_trust = BTreeMap::new();
+    for evidence in &decision.evidence {
+        evidence.validate_claim_trust().map_err(|error| {
+            WorkflowDecisionRejection::new(
+                WorkflowDecisionRejectionKind::InvalidDecisionContract,
+                format!(
+                    "workflow evidence `{}` has invalid claim trust: {error}",
+                    evidence.kind
+                ),
+            )
+        })?;
+        evidence_trust
+            .entry(evidence.kind.as_str())
+            .and_modify(|trust| {
+                if evidence.provenance.trust > *trust {
+                    *trust = evidence.provenance.trust;
+                }
+            })
+            .or_insert(evidence.provenance.trust);
+    }
+    Ok(evidence_trust)
 }
 
 pub(super) fn validate_target_progress_contract(

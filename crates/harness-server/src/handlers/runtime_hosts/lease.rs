@@ -7,7 +7,8 @@ use axum::{
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use harness_workflow::runtime::store::runtime_job_leases::{
-    postgres_timestamp_ceil, RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRequest,
+    postgres_timestamp_ceil, RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRejection,
+    RuntimeJobLeaseRenewalRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -62,6 +63,10 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
             )
         }
     };
+    let _runtime_job_operation = state
+        .runtime_hosts
+        .lock_runtime_job_operation(&runtime_job_id)
+        .await;
     let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
     let owner_active = match state.runtime_hosts.lifecycle(&host_id) {
         Some(RuntimeHostLifecycle::Active) => true,
@@ -94,6 +99,21 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
             owner_active,
         })
         .await;
+    let outcome = match outcome {
+        Ok(RuntimeJobLeaseRenewalOutcome::LeaseLost {
+            reason: RuntimeJobLeaseRenewalRejection::StaleExpiry,
+        }) => {
+            super::completion::replay_completion_reservation(
+                store.as_ref(),
+                &runtime_job_id,
+                &host_id,
+                req.lease_generation,
+                req.lease_expires_at,
+            )
+            .await
+        }
+        outcome => outcome,
+    };
     match outcome {
         Ok(RuntimeJobLeaseRenewalOutcome::Renewed {
             lease_generation,
@@ -170,7 +190,7 @@ pub(super) fn lease_lost_response() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-fn workflow_store_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
+pub(super) fn workflow_store_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
     crate::http::api_error::ApiError::store_unavailable("workflow runtime store").into_status_json()
 }
 

@@ -3,7 +3,7 @@ use super::executor::{is_internal_non_agent_activity, ServerRuntimeJobExecutor};
 use super::prompt_packet::PromptPacketConfigurationError;
 use super::transcript_durability::{
     exact_replay_preflight_result, hydrate_exact_replay_transcript,
-    strip_caller_transcript_unavailable_signal,
+    strip_transcript_unavailable_signal,
 };
 use async_trait::async_trait;
 use harness_workflow::runtime::{
@@ -35,7 +35,7 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
         }
         let activity = activity_name(&job);
         match self.execute_inner(job).await {
-            Ok(result) => strip_caller_transcript_unavailable_signal(result),
+            Ok(result) => postprocess_local_execution_result(result),
             Err(error) => execution_error_result(activity, error),
         }
     }
@@ -46,6 +46,10 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
         // run before execute returns (GH-1877).
         self.cancel_lease_lost();
     }
+}
+
+fn postprocess_local_execution_result(result: ActivityResult) -> ActivityResult {
+    strip_transcript_unavailable_signal(result)
 }
 
 fn execution_error_result(activity: String, error: anyhow::Error) -> ActivityResult {
@@ -81,5 +85,22 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("unclassified workflow.data")));
+    }
+
+    #[test]
+    fn local_executor_retains_server_attached_completion_evidence() {
+        let result = ActivityResult::succeeded("merge_pr", "verified merge")
+            .with_artifact(harness_workflow::runtime::ActivityArtifact::new(
+            harness_workflow::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+            serde_json::json!({"verified": true, "observed_merged": true}),
+        ));
+
+        let result = postprocess_local_execution_result(result);
+
+        assert_eq!(result.artifacts.len(), 1);
+        assert_eq!(
+            result.artifacts[0].artifact_type,
+            harness_workflow::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION
+        );
     }
 }

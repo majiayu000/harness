@@ -1,5 +1,6 @@
 use super::terminal_state::{workflow_terminal_state_for_instance, WorkflowTerminalState};
 use chrono::{DateTime, Utc};
+use harness_core::claim_trust::ClaimProvenance;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -353,6 +354,8 @@ pub const EVIDENCE_PROMPT_COMPLETION: &str = "prompt_completion_evidence";
 pub struct WorkflowEvidence {
     pub kind: String,
     pub summary: String,
+    #[serde(default)]
+    pub provenance: ClaimProvenance,
 }
 
 impl WorkflowEvidence {
@@ -360,7 +363,40 @@ impl WorkflowEvidence {
         Self {
             kind: kind.into(),
             summary: summary.into(),
+            provenance: ClaimProvenance::default(),
         }
+    }
+
+    pub fn with_provenance(mut self, provenance: ClaimProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    pub fn runtime_observed(
+        kind: impl Into<String>,
+        summary: impl Into<String>,
+        source: impl Into<String>,
+        event_ref: Option<String>,
+    ) -> Self {
+        Self::new(kind, summary)
+            .with_provenance(ClaimProvenance::runtime_observed(source, event_ref))
+    }
+
+    pub fn reexecuted(
+        kind: impl Into<String>,
+        summary: impl Into<String>,
+        command: impl Into<String>,
+        output_sha256: Option<String>,
+    ) -> Self {
+        Self::new(kind, summary)
+            .with_provenance(ClaimProvenance::reexecuted(command, output_sha256))
+    }
+
+    pub fn validate_claim_trust(&self) -> Result<(), String> {
+        if self.kind.trim().is_empty() {
+            return Err("workflow evidence kind must not be empty".to_string());
+        }
+        self.provenance.validate()
     }
 }
 

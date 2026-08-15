@@ -365,8 +365,7 @@ Prompt packet:
       },
       "issue_workflow": {
         "auto_replan_on_plan_issue": true,
-        "force_execute_label": "force-execute",
-        "require_human_gate_before_merge": false
+        "force_execute_label": "force-execute"
       },
       "memory": {
         "enabled": false
@@ -381,11 +380,6 @@ Prompt packet:
         "hygiene_interval_secs": 1800,
         "rebase_needed_label": "rebase-needed",
         "sweep_interval_secs": 60
-      },
-      "pr_scope_guard": {
-        "enabled": true,
-        "max_files_changed": 30,
-        "max_lines_added": 1500
       },
       "runtime_budget_policy": {
         "default_workflow_budget_usd": 15.0,

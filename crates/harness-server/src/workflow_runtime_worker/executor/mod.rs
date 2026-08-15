@@ -37,19 +37,14 @@ use super::runtime_usage::runtime_usage_context;
 use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
 use super::turn_engine::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
 use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
-#[path = "executor/runtime_timeout.rs"]
 mod runtime_timeout;
 use runtime_timeout::runtime_profile_with_timeout_fallback;
-#[path = "executor/egress_evidence.rs"]
 mod egress_evidence;
 use egress_evidence::AgentEgressEvidence;
-#[path = "executor/permission_profile.rs"]
 mod permission_profile;
 use permission_profile::RuntimePermissionProfile;
-#[path = "executor/spawn_env.rs"]
 mod spawn_env;
 use spawn_env::{correction_spawn_env_vars, isolation_spawn_env_vars};
-#[path = "executor/structured_output.rs"]
 mod structured_output;
 use structured_output::{
     codex_output_schema_file, reserve_structured_output_correction_turn,
@@ -76,7 +71,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
     }
 
     pub(super) async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
-        let workflow = self.workflow_for_job(&job).await?;
+        let workflow = super::job_context::workflow_for_job(self.state, &job).await?;
         if let Some(workflow) = workflow.as_ref() {
             if workflow.is_terminal() {
                 return Ok(ActivityResult::cancelled(
@@ -99,7 +94,8 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         {
             return Ok(result);
         }
-        let source_project_root = self.project_root_for_job(&job, workflow.as_ref())?;
+        let source_project_root =
+            super::job_context::project_root_for_job(self.state, &job, workflow.as_ref())?;
         let workflow_document =
             harness_core::config::workflow::load_workflow_document(&source_project_root)?;
         let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
@@ -415,15 +411,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         }
         combine_activity_result_with_runtime_workspace_finalization(activity_result, finish_result)
     }
-    async fn workflow_for_job(&self, job: &RuntimeJob) -> anyhow::Result<Option<WorkflowInstance>> {
-        let Some(workflow_id) = job.input.get("workflow_id").and_then(Value::as_str) else {
-            return Ok(None);
-        };
-        let Some(store) = self.state.core.workflow_runtime_store.as_ref() else {
-            return Ok(None);
-        };
-        store.get_instance(workflow_id).await
-    }
     async fn execute_server_owned_activity(
         &self,
         job: &RuntimeJob,
@@ -463,27 +450,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             .await?;
         Ok(())
     }
-    fn project_root_for_job(
-        &self,
-        job: &RuntimeJob,
-        workflow: Option<&WorkflowInstance>,
-    ) -> anyhow::Result<std::path::PathBuf> {
-        if let Some(project_id) = workflow
-            .and_then(|workflow| workflow.data.get("project_id"))
-            .and_then(Value::as_str)
-            .or_else(|| job.input.get("project_id").and_then(Value::as_str))
-        {
-            let project_root = std::path::PathBuf::from(project_id);
-            if project_root.exists() {
-                return Ok(project_root);
-            }
-            anyhow::bail!(
-                "workflow project_id path is not resolvable: {}",
-                project_root.display()
-            );
-        }
-        Ok(self.state.core.project_root.clone())
-    }
     pub(super) async fn runtime_worker_disabled_result(
         &self,
         job: &RuntimeJob,
@@ -494,8 +460,11 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         // permanently failing the job here. That path classifies transient vs
         // fatal errors and applies the retry policy; a hard failure in preflight
         // would bypass it.
-        let workflow = self.workflow_for_job(job).await.ok()?;
-        let source_project_root = self.project_root_for_job(job, workflow.as_ref()).ok()?;
+        let workflow = super::job_context::workflow_for_job(self.state, job)
+            .await
+            .ok()?;
+        let source_project_root =
+            super::job_context::project_root_for_job(self.state, job, workflow.as_ref()).ok()?;
         let workflow_document =
             harness_core::config::workflow::load_workflow_document(&source_project_root).ok()?;
         runtime_worker_disabled_result_for_config(

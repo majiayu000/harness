@@ -42,7 +42,7 @@ to broader gates:
 | Change type | Start with | Add before handoff |
 | --- | --- | --- |
 | Docs-only | `cargo test --help >/dev/null` | Add the command documented by the changed page if it names one. No Postgres is required for text-only edits. |
-| CLI (`crates/harness-cli`) | `cargo test -p harness-cli --all-targets` | Add the touched library crate test when the command delegates into shared logic. |
+| CLI (`crates/harness-cli`) | `cargo test -p harness-cli --all-targets` | Add `cargo test -p harness-cli --no-default-features --all-targets` when changing the `server` feature gate. Add the touched library crate test when the command delegates into shared logic. |
 | Server, API, or workflow runtime | `HARNESS_DATABASE_URL=postgres://harness:harness@localhost:5432/harness_test scripts/test-server-fast.sh` | Postgres is required. Use `scripts/test-server-db.sh` for startup, recovery, persistence, full `AppState`, route, or workflow-runtime changes. |
 | SDK (TypeScript) (`sdk/typescript`) | `cd sdk/typescript && bun install && bun run test && bun run build` | Run the package-local build before publishing or release work. |
 | SDK (Python) (`sdk/python`) | `python3 -m unittest discover sdk/python/tests` | Run `cd sdk/python && python3 -m build` before publishing or release work. |
@@ -94,6 +94,17 @@ conflict with Cargo's build directory activity.
 
 - Use imperative commit messages.
 - Prefer one logical change per commit.
+
+## Test placement (`harness-server`)
+
+Use one of two homes for new tests:
+
+1. **Same-file unit tests** — `#[cfg(test)] mod tests` next to the code under test. Use this for private helpers and small module invariants.
+2. **Crate integration tests** — `crates/harness-server/tests/`. Use this for API, route-contract, and cross-module tests that can exercise the public surface.
+
+Do **not** add new sibling `tests.rs` or `*_tests.rs` files under `src/`, and do **not** add new nested `src/**/tests/` or `src/**/*_tests/` directories. Existing paths matching those legacy naming patterns are frozen by `crates/harness-server/tests/test_placement.rs` and may only shrink.
+
+The large `src/http/tests/` tree stays as unit tests for now: those route tests still need `pub(crate)` fixtures such as `make_read_only_route_test_state`, and several specs pin `http::tests::...` filter names. Later slices of #1956 move that tree after a public test-support API exists.
 
 ## Reporting Bugs
 

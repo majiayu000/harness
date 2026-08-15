@@ -4,6 +4,7 @@ mod agent_tests;
 pub mod agents_md;
 pub mod alert;
 pub mod capability;
+pub mod claim_trust;
 pub mod compress;
 pub mod config;
 pub mod db;

@@ -25,7 +25,7 @@ use super::{
     LOCAL_REVIEW_ACTIVITY, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
     QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL, RUNTIME_JOB_COMPLETED_EVENT, SCOPE_TOO_LARGE_SIGNAL,
+    QUALITY_PASSED_SIGNAL, RUNTIME_JOB_COMPLETED_EVENT,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Timelike, Utc};
@@ -39,7 +39,6 @@ use std::sync::{
 include!("tests/common.rs");
 include!("tests/decision_builders.rs");
 include!("tests/completion_reducer_core.rs");
-include!("tests/completion_reducer_scope.rs");
 include!("tests/prompt_continuation_reducer.rs");
 include!("tests/completion_reducer_quality.rs");
 include!("tests/completion_reducer_quality_gate.rs");

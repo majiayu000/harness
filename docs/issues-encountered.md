@@ -114,7 +114,7 @@ Prompt-only fixes are fragile for async workflows involving external services. T
 |------|--------|
 | `crates/harness-core/src/prompts.rs` | Added `prev_fixed` param, freshness check block, `is_waiting()`, extracted `last_non_empty_line()` |
 | `crates/harness-server/src/task_runner.rs` | `for` loop → `while` loop with `prev_fixed` tracking and WAITING retry |
-| `crates/harness-cli/src/cmd/pr.rs` | Same `prev_fixed` + WAITING handling for CLI review command |
+| `crates/harness-cli/src/commands/pr.rs` | Same `prev_fixed` + WAITING handling for CLI review command |
 
 ---
 
