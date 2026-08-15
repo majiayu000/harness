@@ -1,24 +1,36 @@
 use super::{inferred_raw, push_unique, AgentStackCapabilityExtractionConfidence, RawCapability};
 use crate::stack::{AgentStackCapability, AgentStackComponent, AgentStackComponentKind};
 use std::collections::VecDeque;
+
+struct Heredoc {
+    delimiter: String,
+    allows_tabs: bool,
+    expands: bool,
+}
+
 #[rustfmt::skip]
 pub(super) fn extract_static(component: &AgentStackComponent, locator: &str, text: &str) -> Vec<RawCapability> {
     if component.kind() != AgentStackComponentKind::Hook { return Vec::new(); }
     let mut by_capability = std::collections::BTreeMap::<&'static str, RawCapability>::new();
     let mut quote = None;
-    let mut heredocs = VecDeque::<(String, bool)>::new();
+    let mut heredocs = VecDeque::<Heredoc>::new();
     let mut pending_heredocs = VecDeque::new();
     let mut logical_line = String::new();
+    let mut executable_source = String::new();
+    let mut arithmetic_depth = 0usize;
     for physical_line in text.lines() {
-        if let Some((delimiter, allows_tabs)) = heredocs.front() {
-            let candidate = if *allows_tabs { physical_line.trim_start_matches('\t') } else { physical_line };
-            if candidate == delimiter { heredocs.pop_front(); }
+        if let Some(heredoc) = heredocs.front() {
+            let candidate = if heredoc.allows_tabs { physical_line.trim_start_matches('\t') } else { physical_line };
+            if candidate == heredoc.delimiter { heredocs.pop_front(); }
+            else if heredoc.expands { executable_source.push_str(physical_line); executable_source.push('\n'); }
             continue;
         }
+        executable_source.push_str(physical_line);
+        executable_source.push('\n');
         logical_line.push_str(physical_line);
         if logical_line.as_bytes().iter().rev().take_while(|byte| **byte == b'\\').count() % 2 == 1 { logical_line.pop(); continue; }
         let line = logical_line.as_str();
-        let next_heredocs = heredoc_delimiters(line, quote);
+        let next_heredocs = heredoc_delimiters(line, quote, &mut arithmetic_depth);
         let (commands, writes_file) = shell_commands_outside_quotes(line, &mut quote);
         pending_heredocs.extend(next_heredocs);
         if quote.is_none() { heredocs.append(&mut pending_heredocs); }
@@ -31,6 +43,23 @@ pub(super) fn extract_static(component: &AgentStackComponent, locator: &str, tex
         }
         if writes_file { by_capability.entry(AgentStackCapability::FileWrite.as_str()).or_insert_with(|| inferred_raw(AgentStackCapability::FileWrite, "hook.static_command", format!("{locator} uses an output redirection associated with file_write"), AgentStackCapabilityExtractionConfidence::Low)); }
         logical_line.clear();
+    }
+    let (substitution_commands, substitution_writes, substitution_incomplete) = shell_substitution_commands(&executable_source);
+    for tokens in substitution_commands {
+        for capability in classify_command_tokens(&tokens) {
+            by_capability.entry(capability.as_str()).or_insert_with(|| inferred_raw(
+                capability, "hook.static_command", format!("{locator} invokes a command associated with {} inside shell command substitution", capability.as_str()), AgentStackCapabilityExtractionConfidence::Low,
+            ));
+        }
+    }
+    if substitution_writes { by_capability.entry(AgentStackCapability::FileWrite.as_str()).or_insert_with(|| inferred_raw(AgentStackCapability::FileWrite, "hook.static_command", format!("{locator} uses an output redirection inside shell command substitution associated with file_write"), AgentStackCapabilityExtractionConfidence::Low)); }
+    if substitution_incomplete {
+        use AgentStackCapability::{Destructive, FileWrite, Network, Privileged, ProductionWrite, Shell};
+        for capability in [Destructive, FileWrite, Network, Privileged, ProductionWrite, Shell] {
+            by_capability.entry(capability.as_str()).or_insert_with(|| inferred_raw(
+                capability, "hook.static_command", format!("{locator} could not complete bounded shell command substitution analysis; {} is retained conservatively", capability.as_str()), AgentStackCapabilityExtractionConfidence::Low,
+            ));
+        }
     }
     by_capability.into_values().collect()
 }
@@ -94,6 +123,219 @@ fn shell_commands_outside_quotes(line: &str, quote: &mut Option<char>) -> (Vec<V
     (commands, writes_file)
 }
 
+fn shell_substitution_commands(source: &str) -> (Vec<Vec<String>>, bool, bool) {
+    const MAX_SUBSTITUTION_DEPTH: usize = 16;
+    const MAX_SUBSTITUTIONS: usize = 256;
+
+    fn without_line_continuations(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let mut output = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'\\' {
+                output.push(bytes[index]);
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while bytes.get(index) == Some(&b'\\') {
+                index += 1;
+            }
+            let count = index - start;
+            let newline_len = if bytes.get(index) == Some(&b'\n') {
+                1
+            } else if bytes.get(index) == Some(&b'\r') && bytes.get(index + 1) == Some(&b'\n') {
+                2
+            } else {
+                0
+            };
+            let preserved = count - usize::from(newline_len > 0 && count % 2 == 1);
+            output.extend_from_slice(&bytes[start..start + preserved]);
+            if preserved != count {
+                index += newline_len;
+            }
+        }
+        String::from_utf8(output).unwrap_or_else(|_| source.to_owned())
+    }
+
+    fn find_parenthesis_close(source: &str, start: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        let mut depth = 1usize;
+        let mut quote = None;
+        let mut escaped = false;
+        let mut word_started = false;
+        let mut index = start;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if escaped {
+                escaped = false;
+            } else if let Some(active) = quote {
+                if byte == active {
+                    quote = None;
+                } else if active != b'\'' && byte == b'\\' {
+                    escaped = true;
+                }
+            } else {
+                match byte {
+                    b'\\' => escaped = true,
+                    b'\'' | b'"' | b'`' => quote = Some(byte),
+                    b'#' if !word_started => return None,
+                    b'<' if bytes.get(index + 1) == Some(&b'<')
+                        && bytes.get(index + 2) != Some(&b'<') =>
+                    {
+                        return None
+                    }
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(index);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            word_started = !(byte == b'\n'
+                || quote.is_none() && (byte.is_ascii_whitespace() || b";|&()<>".contains(&byte)));
+            index += 1;
+        }
+        None
+    }
+
+    fn find_backtick_close(source: &str, start: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        let mut escaped = false;
+        let mut word_started = false;
+        for (offset, &byte) in bytes[start..].iter().enumerate() {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'#' && !word_started
+                || byte == b'<'
+                    && bytes.get(start + offset + 1) == Some(&b'<')
+                    && bytes.get(start + offset + 2) != Some(&b'<')
+            {
+                return None;
+            } else if byte == b'`' {
+                return Some(start + offset);
+            }
+            word_started =
+                !(byte == b'\n' || byte.is_ascii_whitespace() || b";|&()<>".contains(&byte));
+        }
+        None
+    }
+
+    fn collect<'a>(source: &'a str, depth: usize, fragments: &mut Vec<&'a str>) -> bool {
+        if depth > MAX_SUBSTITUTION_DEPTH {
+            return false;
+        }
+        let bytes = source.as_bytes();
+        let mut quote = None;
+        let mut escaped = false;
+        let mut word_started = false;
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if escaped {
+                escaped = false;
+                word_started = true;
+                index += 1;
+                continue;
+            }
+            if quote == Some(b'\'') {
+                if byte == b'\'' {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            if byte == b'\\' {
+                escaped = true;
+                index += 1;
+                continue;
+            }
+            if quote.is_none() && byte == b'\'' {
+                quote = Some(b'\'');
+                word_started = true;
+                index += 1;
+                continue;
+            }
+            if byte == b'"' {
+                quote = if quote == Some(b'"') {
+                    None
+                } else {
+                    Some(b'"')
+                };
+                word_started = true;
+                index += 1;
+                continue;
+            }
+            if quote.is_none() && byte == b'#' && !word_started {
+                index = source[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |offset| index + offset + 1);
+                word_started = false;
+                continue;
+            }
+            if byte == b'$'
+                && bytes.get(index + 1) == Some(&b'(')
+                && bytes.get(index + 2) != Some(&b'(')
+            {
+                let Some(end) = find_parenthesis_close(source, index + 2) else {
+                    return false;
+                };
+                if fragments.len() == MAX_SUBSTITUTIONS {
+                    return false;
+                }
+                let fragment = &source[index + 2..end];
+                fragments.push(fragment);
+                if !collect(fragment, depth + 1, fragments) {
+                    return false;
+                }
+                index = end + 1;
+                word_started = true;
+                continue;
+            }
+            if byte == b'`' {
+                let Some(end) = find_backtick_close(source, index + 1) else {
+                    return false;
+                };
+                if fragments.len() == MAX_SUBSTITUTIONS {
+                    return false;
+                }
+                let fragment = &source[index + 1..end];
+                fragments.push(fragment);
+                if !collect(fragment, depth + 1, fragments) {
+                    return false;
+                }
+                index = end + 1;
+                word_started = true;
+                continue;
+            }
+            word_started = !(byte == b'\n'
+                || quote.is_none() && (byte.is_ascii_whitespace() || b";|&()<>".contains(&byte)));
+            index += 1;
+        }
+        true
+    }
+
+    let normalized = without_line_continuations(source);
+    let mut fragments = Vec::new();
+    let complete = collect(&normalized, 0, &mut fragments);
+    let mut commands = Vec::new();
+    let mut writes_file = false;
+    for fragment in fragments {
+        let mut quote = None;
+        for line in fragment.lines() {
+            let (mut found, writes) = shell_commands_outside_quotes(line, &mut quote);
+            commands.append(&mut found);
+            writes_file |= writes;
+        }
+    }
+    (commands, writes_file, !complete)
+}
+
 #[rustfmt::skip]
 fn output_redirection_writes_path(chars: &[char], index: usize) -> bool {
     let mut next = index + 1;
@@ -107,7 +349,7 @@ fn output_redirection_writes_path(chars: &[char], index: usize) -> bool {
     !(start < next && boundary(next)) && start < chars.len()
 }
 #[rustfmt::skip]
-fn heredoc_delimiters(line: &str, mut quote: Option<char>) -> Vec<(String, bool)> {
+fn heredoc_delimiters(line: &str, mut quote: Option<char>, arithmetic_depth: &mut usize) -> Vec<Heredoc> {
     let bytes = line.as_bytes();
     let mut delimiters = Vec::new();
     let mut escaped = false;
@@ -128,28 +370,31 @@ fn heredoc_delimiters(line: &str, mut quote: Option<char>) -> Vec<(String, bool)
                 b'\\' => { escaped = true; word_started = true; }
                 b'\'' | b'"' => { quote = Some(byte as char); word_started = true; }
                 b'#' if !word_started => break,
+                b'(' if bytes[index + 1] == b'(' => { *arithmetic_depth += 1; word_started = true; index += 2; continue; }
+                b')' if *arithmetic_depth > 0 && bytes[index + 1] == b')' => { *arithmetic_depth -= 1; word_started = true; index += 2; continue; }
                 b'<' if bytes[index + 1] == b'<' && bytes.get(index + 2) == Some(&b'<') => { index += 2; continue; }
-                b'<' if bytes[index + 1] == b'<' && bytes.get(index + 2) != Some(&b'<') => {
+                b'<' if *arithmetic_depth == 0 && bytes[index + 1] == b'<' && bytes.get(index + 2) != Some(&b'<') => {
                     index += 2;
                     let allows_tabs = bytes.get(index) == Some(&b'-');
                     if allows_tabs { index += 1; }
                     while bytes.get(index).is_some_and(u8::is_ascii_whitespace) { index += 1; }
                     let mut value = Vec::new();
                     let mut delimiter_quote = None;
+                    let mut quoted = false;
                     while let Some(&byte) = bytes.get(index) {
                         if delimiter_quote.is_none() && (byte.is_ascii_whitespace() || b";|&()<>".contains(&byte)) { break; }
                         match (delimiter_quote, byte) {
                             (Some(active), byte) if byte == active => delimiter_quote = None,
-                            (None, b'\'' | b'"') => delimiter_quote = Some(byte),
+                            (None, b'\'' | b'"') => { delimiter_quote = Some(byte); quoted = true; },
                             (Some(b'\''), _) => value.push(byte),
                             (Some(b'"'), b'\\') if bytes.get(index + 1).is_some_and(|byte| b"$`\"\\\n".contains(byte)) => { value.push(bytes[index + 1]); index += 1; },
                             (Some(b'"'), b'\\') => value.push(b'\\'),
-                            (None, b'\\') => if let Some(&escaped) = bytes.get(index + 1) { value.push(escaped); index += 1; },
+                            (None, b'\\') => if let Some(&escaped) = bytes.get(index + 1) { quoted = true; value.push(escaped); index += 1; },
                             _ => value.push(byte),
                         }
                         index += 1;
                     }
-                    if let Ok(value) = String::from_utf8(value) { delimiters.push((value, allows_tabs)); }
+                    if let Ok(delimiter) = String::from_utf8(value) { delimiters.push(Heredoc { delimiter, allows_tabs, expands: !quoted }); }
                     continue;
                 }
                 byte if byte.is_ascii_whitespace() || b";|&()<>".contains(&byte) => word_started = false,

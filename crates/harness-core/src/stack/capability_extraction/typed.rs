@@ -399,7 +399,14 @@ fn collect_policy_prefix_rules(component: &AgentStackComponent, value: &Value, i
             if !push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::InvalidDeclaration, Some("policy.prefix_rule"), format!("policy prefix rule {index} has no valid decision")) { return; }
             continue;
         };
-        for capability in classify_command_pattern(&pattern) {
+        let capabilities = match classify_command_pattern(&pattern) {
+            Ok(capabilities) => capabilities,
+            Err(limit) => {
+                if !push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::LimitExceeded, Some("policy.prefix_rule"), format!("policy prefix rule {index} {}", limit.reason())) { return; }
+                continue;
+            }
+        };
+        for capability in capabilities {
             push_inferred_once(component, raw, failures, &mut seen, capability, "policy.prefix_rule", format!("policy prefix rule {index} with decision `{decision}` controls a command associated with {}", capability.as_str()));
         }
     }
@@ -435,23 +442,78 @@ fn trimmed_token(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-fn classify_command_pattern(pattern: &CommandPattern) -> Vec<AgentStackCapability> {
-    let mut capabilities = Vec::new();
-    let tail = pattern
+#[derive(Debug, Clone, Copy)]
+enum CommandPatternLimit {
+    PositionCount,
+    TokenBytes,
+}
+
+impl CommandPatternLimit {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::PositionCount => "exceeds the command pattern position limit",
+            Self::TokenBytes => "exceeds the command pattern token byte limit",
+        }
+    }
+}
+
+fn classify_command_pattern(
+    pattern: &CommandPattern,
+) -> Result<Vec<AgentStackCapability>, CommandPatternLimit> {
+    const MAX_COMMAND_PATTERN_EXPANSIONS: usize = 512;
+    const MAX_COMMAND_PATTERN_POSITIONS: usize = 256;
+    const MAX_COMMAND_PATTERN_TOKEN_BYTES: usize = 64 * 1024;
+
+    if pattern.len() > MAX_COMMAND_PATTERN_POSITIONS {
+        return Err(CommandPatternLimit::PositionCount);
+    }
+    let token_bytes = pattern
         .iter()
-        .skip(1)
         .flatten()
-        .cloned()
-        .collect::<Vec<_>>();
-    for head in &pattern[0] {
-        let tokens = std::iter::once(head.clone())
-            .chain(tail.iter().cloned())
+        .try_fold(0usize, |total, token| total.checked_add(token.len()))
+        .ok_or(CommandPatternLimit::TokenBytes)?;
+    if token_bytes > MAX_COMMAND_PATTERN_TOKEN_BYTES {
+        return Err(CommandPatternLimit::TokenBytes);
+    }
+    if pattern.is_empty() || pattern.iter().any(Vec::is_empty) {
+        return Ok(Vec::new());
+    }
+
+    let mut capabilities = Vec::new();
+    let mut indices = vec![0usize; pattern.len()];
+    for _ in 0..MAX_COMMAND_PATTERN_EXPANSIONS {
+        let tokens = pattern
+            .iter()
+            .zip(&indices)
+            .map(|(position, index)| position[*index].clone())
             .collect::<Vec<_>>();
         for capability in classify_command_tokens(&tokens) {
             push_unique(&mut capabilities, capability);
         }
+        let mut cursor = indices.len();
+        loop {
+            if cursor == 0 {
+                return Ok(capabilities);
+            }
+            cursor -= 1;
+            indices[cursor] += 1;
+            if indices[cursor] < pattern[cursor].len() {
+                break;
+            }
+            indices[cursor] = 0;
+        }
     }
-    capabilities
+    use AgentStackCapability::{
+        Destructive, FileWrite, Network, Privileged, ProductionWrite, Shell,
+    };
+    Ok(vec![
+        Destructive,
+        FileWrite,
+        Network,
+        Privileged,
+        ProductionWrite,
+        Shell,
+    ])
 }
 
 #[rustfmt::skip]
@@ -514,7 +576,15 @@ fn collect_starlark_prefix_rules(component: &AgentStackComponent, locator: &str,
             index += 1;
             return;
         };
-        for capability in classify_command_pattern(&pattern) {
+        let capabilities = match classify_command_pattern(&pattern) {
+            Ok(capabilities) => capabilities,
+            Err(limit) => {
+                push_failure(component, raw, failures, AgentStackCapabilityExtractionFailureKind::LimitExceeded, Some("policy.prefix_rule"), format!("Starlark policy prefix rule {index} {}", limit.reason()));
+                index += 1;
+                return;
+            }
+        };
+        for capability in capabilities {
             push_inferred_once(
                 component,
                 raw,

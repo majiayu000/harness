@@ -9,6 +9,8 @@ use super::{
     Sha256Digest,
 };
 use cap_std::fs::{Dir, OpenOptions};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::Match;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -24,7 +26,10 @@ use typed::{extract_typed, TypedSource};
 const DEFAULT_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REPOSITORY_FINDINGS: usize = 1024;
+const MAX_IGNORE_RULES: usize = 16_384;
+const MAX_IGNORE_PATTERN_BYTES: usize = 4096;
 const REPOSITORY_LIMIT_RULE_ID: &str = "extraction.repository_finding_limit";
+const IGNORE_RULE_ID: &str = "extraction.gitignore";
 
 #[rustfmt::skip]
 #[derive(Debug, Clone)]
@@ -138,7 +143,15 @@ pub fn extract_repository_capability_evidence(options: &AgentStackCapabilityExtr
         let component = entry.component();
         let locator = component.source().locator().as_str();
         if evidence.len() + failures.len() >= MAX_REPOSITORY_FINDINGS - 1 { failures.push(repository_limit_failure(component)); break; }
-        if !is_supported_control(component.kind(), locator) || exclusions.excludes(&root, locator) { continue; }
+        if !is_supported_control(component.kind(), locator) { continue; }
+        match exclusions.excludes(&root, locator, options.max_file_bytes, &mut remaining_bytes) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err((kind, reason)) => {
+                failures.push(AgentStackCapabilityExtractionFailure::new(component, kind, Some(IGNORE_RULE_ID), reason));
+                break;
+            }
+        }
         let text = match if locator == "harness.toml" && component.kind() == AgentStackComponentKind::Validation { config_text.take().ok_or((AgentStackCapabilityExtractionFailureKind::ReadFailed, String::new())) } else { read_text(&root, component, locator, options.max_file_bytes, &mut remaining_bytes) } {
             Ok(text) => text,
             Err((kind, reason)) => { if !reason.is_empty() { failures.push(AgentStackCapabilityExtractionFailure::new(component, kind, None, reason)); } continue; }
@@ -171,76 +184,94 @@ pub fn extract_repository_capability_evidence(options: &AgentStackCapabilityExtr
 
 #[rustfmt::skip]
 #[derive(Default)]
-struct RepositoryExclusions { loaded: BTreeSet<String>, rules: Vec<IgnoreRule> }
-#[rustfmt::skip]
-struct IgnoreRule { base: String, pattern: String, negated: bool, directory_only: bool, anchored: bool }
+struct RepositoryExclusions { loaded: BTreeSet<String>, matchers: Vec<(String, Gitignore)>, rule_count: usize, failed: Option<(AgentStackCapabilityExtractionFailureKind, String)> }
 
 #[rustfmt::skip]
 impl RepositoryExclusions {
-    fn excludes(&mut self, root: &Dir, locator: &str) -> bool {
-        if locator.split('/').any(|segment| segment == "generated") { return true; }
-        self.load(root, "");
+    fn excludes(&mut self, root: &Dir, locator: &str, max_file_bytes: u64, remaining_bytes: &mut u64) -> Result<bool, (AgentStackCapabilityExtractionFailureKind, String)> {
+        if let Some(failure) = &self.failed { return Err(failure.clone()); }
+        if locator.split('/').any(|segment| segment == "generated") { return Ok(true); }
+        self.load(root, "", max_file_bytes, remaining_bytes)?;
         let mut base = String::new();
         for segment in locator.split('/').take(locator.matches('/').count()) {
             if !base.is_empty() { base.push('/'); } base.push_str(segment);
-            if self.ignored(&base, true) { return true; } self.load(root, &base);
+            if self.ignored(&base, true) { return Ok(true); }
+            self.load(root, &base, max_file_bytes, remaining_bytes)?;
         }
-        self.ignored(locator, false)
+        Ok(self.ignored(locator, false))
     }
-    fn ignored(&self, locator: &str, is_directory: bool) -> bool { self.rules.iter().filter(|rule| rule.matches(locator, is_directory)).fold(false, |_, rule| !rule.negated) }
-    fn load(&mut self, root: &Dir, base: &str) {
-        if !self.loaded.insert(base.to_owned()) { return; }
+    fn ignored(&self, locator: &str, is_directory: bool) -> bool {
+        self.matchers.iter().fold(false, |ignored, (base, matcher)| {
+            if !base.is_empty() && !locator.strip_prefix(base).is_some_and(|suffix| suffix.starts_with('/')) { return ignored; }
+            match matcher.matched_path_or_any_parents(locator, is_directory) {
+            Match::Ignore(_) => true,
+            Match::Whitelist(_) => false,
+            Match::None => ignored,
+        }})
+    }
+    fn load(&mut self, root: &Dir, base: &str, max_file_bytes: u64, remaining_bytes: &mut u64) -> Result<(), (AgentStackCapabilityExtractionFailureKind, String)> {
+        if !self.loaded.insert(base.to_owned()) { return Ok(()); }
         let path = if base.is_empty() { ".gitignore".to_owned() } else { format!("{base}/.gitignore") };
-        let Some(text) = read_optional_control(root, &path) else { return; };
+        let Some(text) = read_optional_control(root, &path, max_file_bytes.min(DEFAULT_MAX_FILE_BYTES), remaining_bytes).map_err(|failure| self.remember_failure(failure))? else { return Ok(()); };
+        let potential_rules = text.lines().filter(|line| {
+            let line = line.trim_end_matches('\r');
+            !line.is_empty() && !line.starts_with('#')
+        }).count();
+        if self.rule_count.saturating_add(potential_rules) > MAX_IGNORE_RULES {
+            return Err(self.remember_failure((AgentStackCapabilityExtractionFailureKind::LimitExceeded, format!("{path} exceeds the capability extraction ignore rule limit"))));
+        }
+        let mut builder = GitignoreBuilder::new(if base.is_empty() { Path::new(".") } else { Path::new(base) });
         for raw in text.lines() {
-            let mut line = raw.trim_end_matches(['\r', ' ']);
-            if line.is_empty() || line.starts_with('#') { continue; }
-            let escaped_marker = line.starts_with("\\#") || line.starts_with("\\!");
-            if escaped_marker { line = &line[1..]; } let negated = !escaped_marker && line.starts_with('!'); if negated { line = &line[1..]; }
-            let directory_only = line.ends_with('/');
-            line = line.trim_end_matches('/'); let anchored = line.starts_with('/'); line = line.trim_start_matches('/');
-            if !line.is_empty() { self.rules.push(IgnoreRule { base: base.to_owned(), pattern: line.to_owned(), negated, directory_only, anchored }); }
+            let line = raw.trim_end_matches('\r');
+            if line.len() > MAX_IGNORE_PATTERN_BYTES {
+                return Err(self.remember_failure((AgentStackCapabilityExtractionFailureKind::LimitExceeded, format!("{path} contains an ignore pattern longer than the capability extraction limit"))));
+            }
+            builder.add_line(Some(PathBuf::from(&path)), line).map_err(|error| self.remember_failure((
+                AgentStackCapabilityExtractionFailureKind::ParseFailed,
+                format!("{path} contains an invalid gitignore pattern: {error}"),
+            )))?;
         }
+        let matcher = builder.build().map_err(|error| self.remember_failure((
+            AgentStackCapabilityExtractionFailureKind::ParseFailed,
+            format!("{path} contains an invalid gitignore pattern: {error}"),
+        )))?;
+        self.rule_count += matcher.len();
+        self.matchers.push((base.to_owned(), matcher));
+        Ok(())
+    }
+    fn remember_failure(&mut self, failure: (AgentStackCapabilityExtractionFailureKind, String)) -> (AgentStackCapabilityExtractionFailureKind, String) {
+        self.failed = Some(failure.clone());
+        failure
     }
 }
 
 #[rustfmt::skip]
-impl IgnoreRule {
-    fn matches(&self, locator: &str, is_directory: bool) -> bool {
-        let Some(relative) = self.base.is_empty().then_some(locator).or_else(|| locator.strip_prefix(&format!("{}/", self.base))) else { return false; };
-        if self.anchored || self.pattern.contains('/') { return path_or_parent_matches(&self.pattern, relative, self.directory_only, is_directory); }
-        let segment_count = relative.matches('/').count() + 1;
-        relative.split('/').enumerate().any(|(index, segment)| glob_matches(&self.pattern, segment) && (!self.directory_only || index + 1 < segment_count || is_directory))
-    }
-}
-
-#[rustfmt::skip]
-fn path_or_parent_matches(pattern: &str, path: &str, directory_only: bool, is_directory: bool) -> bool { path.match_indices('/').map(|(index, _)| index).chain(std::iter::once(path.len())).any(|end| glob_matches(pattern, &path[..end]) && (!directory_only || end < path.len() || is_directory)) }
-
-#[rustfmt::skip]
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    fn visit(pattern: &[u8], text: &[u8], pi: usize, ti: usize, failed: &mut BTreeSet<(usize, usize)>) -> bool {
-        if !failed.insert((pi, ti)) { return false; } else if pi == pattern.len() { return ti == text.len(); }
-        if pattern[pi] == b'*' {
-            let double = pattern.get(pi + 1) == Some(&b'*');
-            let next = pi + 1 + usize::from(double);
-            if double && pattern.get(next) == Some(&b'/') && visit(pattern, text, next + 1, ti, failed) { return true; }
-            return visit(pattern, text, next, ti, failed) || ti < text.len() && (double || text[ti] != b'/') && visit(pattern, text, pi, ti + 1, failed);
-        }
-        let (expected, next) = if pattern[pi] == b'\\' && pi + 1 < pattern.len() { (pattern[pi + 1], pi + 2) } else { (pattern[pi], pi + 1) };
-        ti < text.len() && (expected == b'?' && text[ti] != b'/' || expected == text[ti]) && visit(pattern, text, next, ti + 1, failed)
-    }
-    visit(pattern.as_bytes(), text.as_bytes(), 0, 0, &mut BTreeSet::new())
-}
-
-#[rustfmt::skip]
-fn read_optional_control(root: &Dir, locator: &str) -> Option<String> {
+fn read_optional_control(root: &Dir, locator: &str, max_file_bytes: u64, remaining_bytes: &mut u64) -> Result<Option<String>, (AgentStackCapabilityExtractionFailureKind, String)> {
+    let metadata = match root.symlink_metadata(locator) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err((AgentStackCapabilityExtractionFailureKind::ReadFailed, format!("failed to inspect {locator} for capability extraction ignore matching"))),
+    };
+    if metadata.is_symlink() || !metadata.is_file() { return Ok(None); }
     let mut options = OpenOptions::new(); options.read(true);
-    #[cfg(unix)] { use cap_std::fs::OpenOptionsExt; options.custom_flags(libc::O_NONBLOCK); }
-    let file = root.open_with(locator, &options).ok()?;
-    if !file.metadata().ok()?.is_file() { return None; }
-    let mut bytes = Vec::new(); file.take(DEFAULT_MAX_FILE_BYTES + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 <= DEFAULT_MAX_FILE_BYTES).then(|| String::from_utf8(bytes).ok()).flatten()
+    #[cfg(unix)] { use cap_std::fs::OpenOptionsExt; options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW); }
+    let file = match root.open_with(locator, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err((AgentStackCapabilityExtractionFailureKind::ReadFailed, format!("failed to open {locator} for capability extraction ignore matching"))),
+    };
+    if !file.metadata().map_err(|_| (AgentStackCapabilityExtractionFailureKind::ReadFailed, format!("failed to inspect {locator} for capability extraction ignore matching")))?.is_file() { return Ok(None); }
+    if *remaining_bytes == 0 { return Err((AgentStackCapabilityExtractionFailureKind::LimitExceeded, format!("{locator} exceeds the capability extraction total byte limit"))); }
+    let read_limit = max_file_bytes.min(*remaining_bytes) + 1;
+    let mut bytes = Vec::new();
+    let read_result = file.take(read_limit).read_to_end(&mut bytes);
+    let bytes_read = bytes.len() as u64;
+    let total_exceeded = bytes_read > *remaining_bytes;
+    *remaining_bytes = remaining_bytes.saturating_sub(bytes_read);
+    if total_exceeded { return Err((AgentStackCapabilityExtractionFailureKind::LimitExceeded, format!("{locator} exceeds the capability extraction total byte limit"))); }
+    read_result.map_err(|_| (AgentStackCapabilityExtractionFailureKind::ReadFailed, format!("failed to read {locator} for capability extraction ignore matching")))?;
+    if bytes.len() as u64 > max_file_bytes { return Err((AgentStackCapabilityExtractionFailureKind::LimitExceeded, format!("{locator} exceeds the capability extraction ignore file byte limit"))); }
+    String::from_utf8(bytes).map(Some).map_err(|_| (AgentStackCapabilityExtractionFailureKind::ReadFailed, format!("{locator} is not valid UTF-8; capability extraction ignore matching stopped")))
 }
 
 #[rustfmt::skip]

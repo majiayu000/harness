@@ -148,13 +148,103 @@ fn shell_syntax_boundaries_preserve_real_commands_and_mutations() {
         ".harness/guards/fd.sh" => b"printf x >&2; printf x 2>&1; printf x 2>&-\n",
         ".harness/guards/redirect.sh" => b"printf '%s' value 2>>generated.conf\n",
         ".harness/guards/sudo.sh" => b"doas -a persist rm -rf output\nsudo -nEu root rm -rf output\n",
+        ".harness/guards/substitution.sh" => b"echo \"$(curl https://example.invalid)\"\nresult=`rm -rf output`\nprintf '%s' '$(kubectl apply)' '`wget ignored.invalid`'\n",
+        ".harness/guards/heredoc-unquoted.sh" => b"cat <<EOF\n$(curl https://example.invalid)\nEOF\n",
+        ".harness/guards/heredoc-tabs.sh" => b"cat <<-EOF\n\t`rm -rf output`\n\tEOF\n",
+        ".harness/guards/heredoc-quoted.sh" => b"cat <<'EOF'\n$(curl https://ignored.invalid)\nEOF\n",
+        ".harness/guards/heredoc-escaped.sh" => b"cat <<E\\OF\n`rm -rf ignored`\nEOF\n",
+        ".harness/guards/heredoc-continuation.sh" => b"cat <<EOF\n$\\\n(curl https://example.invalid)\nEOF\n",
+        ".harness/guards/nested-continuation.sh" => br#"echo "$(printf '%s' '"' ; cu\
+rl https://example.invalid)"
+"#,
+        ".harness/guards/arithmetic-expansion.sh" => b"value=$(( 1\n << 2\n)); rm -rf output\n",
+        ".harness/guards/arithmetic-multiline.sh" => b"(( x = 1\n << 2\n)); rm -rf output\n",
+        ".harness/guards/arithmetic-shift.sh" => b"(( x = 1 << 2 )); rm -rf output\n",
     );
     assert_rows(&run(dir.path()), &[
+        (".harness/guards/arithmetic-expansion.sh", Capability::Destructive, STATIC, Low), (".harness/guards/arithmetic-expansion.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/arithmetic-multiline.sh", Capability::Destructive, STATIC, Low), (".harness/guards/arithmetic-multiline.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/arithmetic-shift.sh", Capability::Destructive, STATIC, Low), (".harness/guards/arithmetic-shift.sh", Capability::FileWrite, STATIC, Low),
         (".harness/guards/git-mutate.sh", Capability::Destructive, STATIC, Low), (".harness/guards/git-mutate.sh", Capability::FileWrite, STATIC, Low),
         (".harness/guards/hash.sh", Capability::Network, STATIC, Low),
+        (".harness/guards/heredoc-continuation.sh", Capability::Network, STATIC, Low),
+        (".harness/guards/heredoc-tabs.sh", Capability::Destructive, STATIC, Low), (".harness/guards/heredoc-tabs.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/heredoc-unquoted.sh", Capability::Network, STATIC, Low),
+        (".harness/guards/nested-continuation.sh", Capability::Network, STATIC, Low),
         (".harness/guards/redirect.sh", Capability::FileWrite, STATIC, Low),
+        (".harness/guards/substitution.sh", Capability::Destructive, STATIC, Low), (".harness/guards/substitution.sh", Capability::FileWrite, STATIC, Low), (".harness/guards/substitution.sh", Capability::Network, STATIC, Low),
         (".harness/guards/sudo.sh", Capability::Destructive, STATIC, Low), (".harness/guards/sudo.sh", Capability::FileWrite, STATIC, Low), (".harness/guards/sudo.sh", Capability::Privileged, STATIC, Low),
     ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn ambiguous_multiline_substitutions_retain_capabilities_conservatively() {
+    let dir = tmp();
+    write_files!(
+        dir.path(),
+        ".harness/guards/comment-substitution.sh" => b"value=\"$( # ) is inside a comment\ncurl https://example.invalid\n)\"\n",
+        ".harness/guards/heredoc-substitution.sh" => b"value=\"$(cat <<EOF\n)\nEOF\nrm -rf output\n)\"\n",
+        ".harness/guards/backtick-comment.sh" => b"value=` # ` is inside a comment\ncurl https://example.invalid\n`\n",
+    );
+    let extraction = run(dir.path());
+    for locator in [
+        ".harness/guards/backtick-comment.sh",
+        ".harness/guards/comment-substitution.sh",
+        ".harness/guards/heredoc-substitution.sh",
+    ] {
+        for capability in [Capability::Destructive, Capability::FileWrite, Capability::Network, Capability::Privileged, Capability::ProductionWrite, Capability::Shell] {
+            assert!(extraction.evidence().iter().any(|item| item.component().source().locator().as_str() == locator && item.capability() == capability));
+        }
+    }
+}
+
+#[test]
+#[rustfmt::skip]
+fn prefix_rule_trailing_alternatives_are_classified_without_unbounded_expansion() {
+    let dir = tmp();
+    write_files!(
+        dir.path(),
+        "harness.toml" => b"[rules]\nexec_policy_paths = [\"policy.rules\"]\nrequirements_path = \"requirements.toml\"\n",
+        "policy.rules" => b"prefix_rule(pattern = [\"git\", [\"status\", \"reset\"]], decision = \"prompt\")\n",
+        "requirements.toml" => b"[[rules.prefix_rules]]\npattern = [{ token = \"git\" }, { any_of = [\"status\", \"reset\"] }]\ndecision = \"prompt\"\njustification = \"repository inspection\"\n",
+    );
+    assert_rows(&run(dir.path()), &[
+        ("policy.rules", Capability::Destructive, PREFIX, Medium), ("policy.rules", Capability::FileWrite, PREFIX, Medium),
+        ("requirements.toml", Capability::Destructive, PREFIX, Medium), ("requirements.toml", Capability::FileWrite, PREFIX, Medium),
+    ]);
+
+    let overflow = tmp();
+    let alternatives = std::iter::repeat_n("\"status\"", 512).chain(std::iter::once("\"reset\"")).collect::<Vec<_>>().join(", ");
+    write_files!(
+        overflow.path(),
+        "harness.toml" => b"[rules]\nexec_policy_paths = [\"overflow.rules\"]\n",
+        "overflow.rules" => format!("prefix_rule(pattern = [\"git\", [{alternatives}]], decision = \"prompt\")\n"),
+    );
+    let extraction = run(overflow.path());
+    assert!(extraction.evidence().iter().any(|item| item.capability() == Capability::Destructive));
+
+    let flat = tmp();
+    let positions = std::iter::once("\"git\"").chain(std::iter::repeat_n("\"status\"", 256)).collect::<Vec<_>>().join(", ");
+    write_files!(
+        flat.path(),
+        "harness.toml" => b"[rules]\nexec_policy_paths = [\"flat.rules\"]\n",
+        "flat.rules" => format!("prefix_rule(pattern = [{positions}], decision = \"prompt\")\n"),
+    );
+    let extraction = run(flat.path());
+    assert!(extraction.evidence().is_empty());
+    assert!(extraction.failures().iter().any(|failure| failure.kind() == FailureKind::LimitExceeded && failure.rule_id() == Some(PREFIX) && failure.reason().contains("position limit")));
+
+    let bytes = tmp();
+    let token = "x".repeat(64 * 1024 + 1);
+    write_files!(
+        bytes.path(),
+        "harness.toml" => b"[rules]\nexec_policy_paths = [\"bytes.rules\"]\n",
+        "bytes.rules" => format!("prefix_rule(pattern = [\"{token}\"], decision = \"prompt\")\n"),
+    );
+    let extraction = run(bytes.path());
+    assert!(extraction.evidence().is_empty());
+    assert!(extraction.failures().iter().any(|failure| failure.kind() == FailureKind::LimitExceeded && failure.rule_id() == Some(PREFIX) && failure.reason().contains("token byte limit")));
 }
 
 #[test]
@@ -195,13 +285,104 @@ fn unsupported_and_documentation_sources_do_not_emit_evidence() {
         "README.md" => b"capabilities = [\"destructive\"]\n",
         "rules/.gitignore" => b"!reinclude.md\n",
         "rules/reinclude.md" => b"---\ncapabilities: [network]\n---\n",
-        ".harness/guards/preflight.sh" => b"#!/bin/sh\necho \"rm -rf /tmp/example\"\nprintf 'curl https://example.invalid'\necho foo\\; rm -rf output\necho \"start\n\\c\\u\\r\\l\" <<EOF\nrm -rf /tmp/example\n EOF\ncurl https://example.invalid\nEOF\n",
+        ".harness/guards/preflight.sh" => b"#!/bin/sh\necho \"rm -rf /tmp/example\"\nprintf 'curl https://example.invalid'\necho \"$((rm + 1))\"\necho foo\\; rm -rf output\necho \"start\n\\c\\u\\r\\l\" <<EOF\nrm -rf /tmp/example\n EOF\ncurl https://example.invalid\nEOF\n",
         "rules/security.md" => b"# Never run `rm -rf /`, `curl`, or `kubectl delete` from docs.\n",
     );
     let extraction = run(dir.path());
     assert!(extraction.evidence().is_empty());
     assert_eq!(extraction.failures().len(), 1);
     assert_eq!(extraction.failures()[0].kind(), FailureKind::ReadFailed);
+}
+
+#[test]
+#[rustfmt::skip]
+fn gitignore_semantics_cover_classes_spacing_negation_anchoring_and_double_star() {
+    let dir = tmp();
+    let policy = b"---\ncapabilities: [network]\n---\n";
+    write_files!(
+        dir.path(),
+        ".gitignore" => b"rules/[0-9]*.md\nrules/**/generated-?.md\nrules/space\\ name.md\nrules/trailing.md   \n/rules/anchored.md\nrules/reinclude.md\n!rules/reinclude.md\n",
+        "rules/1-number.md" => policy,
+        "rules/a/b/generated-x.md" => policy,
+        "rules/space name.md" => policy,
+        "rules/trailing.md" => policy,
+        "rules/anchored.md" => policy,
+        "rules/nested/anchored.md" => policy,
+        "rules/reinclude.md" => policy,
+    );
+    let extraction = run(dir.path());
+    assert!(extraction.failures().is_empty(), "{:#?}", extraction.failures());
+    assert_rows(&extraction, &[
+        ("rules/nested/anchored.md", Capability::Network, POLICY, High),
+        ("rules/reinclude.md", Capability::Network, POLICY, High),
+    ]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn nested_gitignore_matchers_stay_scoped_to_their_directory() {
+    let dir = tmp();
+    let policy = b"---\ncapabilities: [network]\n---\n";
+    write_files!(
+        dir.path(),
+        "rules/a/.gitignore" => b"*.md\n",
+        "rules/a/hidden.md" => policy,
+        "rules/b/visible.md" => policy,
+    );
+    assert_rows(&run(dir.path()), &[("rules/b/visible.md", Capability::Network, POLICY, High)]);
+}
+
+#[cfg(unix)]
+#[test]
+#[rustfmt::skip]
+fn symlinked_gitignore_files_are_not_followed() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tmp();
+    write_files!(
+        dir.path(),
+        ".ignore-source" => b"rules/*.md\n",
+        "rules/visible.md" => b"---\ncapabilities: [network]\n---\n",
+    );
+    symlink(".ignore-source", dir.path().join(".gitignore")).expect("create gitignore symlink");
+    assert_rows(&run(dir.path()), &[("rules/visible.md", Capability::Network, POLICY, High)]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn hierarchical_gitignore_reads_share_byte_rule_and_pattern_budgets() {
+    let dir = tmp();
+    let mut locator = String::new();
+    for index in 0..20 {
+        if !locator.is_empty() { locator.push('/'); }
+        locator.push_str(&format!("d{index}"));
+        write_control(dir.path(), &format!("{locator}/.gitignore"), b"x\n");
+    }
+    locator.push_str("/rules/policy.md");
+    let root = Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).expect("open root");
+    let mut exclusions = RepositoryExclusions::default();
+    let mut remaining_bytes = 10;
+    let (kind, reason) = exclusions.excludes(&root, &locator, 1024, &mut remaining_bytes).expect_err("nested ignore files share the aggregate budget");
+    assert_eq!(kind, FailureKind::LimitExceeded);
+    assert!(reason.contains("total byte limit"));
+
+    let rules = tmp();
+    write_control(rules.path(), ".gitignore", "x\n".repeat(MAX_IGNORE_RULES + 1));
+    let root = Dir::open_ambient_dir(rules.path(), cap_std::ambient_authority()).expect("open root");
+    let mut exclusions = RepositoryExclusions::default();
+    let mut remaining_bytes = DEFAULT_MAX_TOTAL_BYTES;
+    let (kind, reason) = exclusions.excludes(&root, "rules/policy.md", DEFAULT_MAX_FILE_BYTES, &mut remaining_bytes).expect_err("ignore rule count is bounded");
+    assert_eq!(kind, FailureKind::LimitExceeded);
+    assert!(reason.contains("ignore rule limit"));
+
+    let pattern = tmp();
+    write_control(pattern.path(), ".gitignore", format!("{}\n", "x".repeat(MAX_IGNORE_PATTERN_BYTES + 1)));
+    let root = Dir::open_ambient_dir(pattern.path(), cap_std::ambient_authority()).expect("open root");
+    let mut exclusions = RepositoryExclusions::default();
+    let mut remaining_bytes = DEFAULT_MAX_TOTAL_BYTES;
+    let (kind, reason) = exclusions.excludes(&root, "rules/policy.md", DEFAULT_MAX_FILE_BYTES, &mut remaining_bytes).expect_err("ignore pattern length is bounded");
+    assert_eq!(kind, FailureKind::LimitExceeded);
+    assert!(reason.contains("ignore pattern"));
 }
 
 #[test]
