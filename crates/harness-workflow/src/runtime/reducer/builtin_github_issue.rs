@@ -3,21 +3,19 @@ use super::support::{
 };
 use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
-    ISSUE_STATE_ARTIFACT, SCOPE_TOO_LARGE_SIGNAL,
+    ISSUE_STATE_ARTIFACT,
 };
 use crate::runtime::completion_evidence::{
-    pr_binding_verification_failure, transition_evidence_enforced, verified_issue_state_artifact,
-    verified_pr_binding_artifact, ARTIFACT_MERGE_COMPLETION_VERIFICATION, EVIDENCE_GITHUB_TERMINAL,
-    EVIDENCE_VERIFIED_PR_BINDING, MERGE_COMPLETION_VERIFICATION_SCHEMA,
-    REASON_PR_BINDING_VERIFICATION_FAILED,
+    github_pr_identity, pr_binding_verification_failure, transition_evidence_enforced,
+    verified_issue_state_artifact, verified_pr_binding_artifact,
+    ARTIFACT_MERGE_COMPLETION_VERIFICATION, EVIDENCE_GITHUB_TERMINAL, EVIDENCE_VERIFIED_PR_BINDING,
+    MERGE_COMPLETION_VERIFICATION_SCHEMA, REASON_PR_BINDING_VERIFICATION_FAILED,
 };
 use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
     WorkflowEvidence, WorkflowInstance,
 };
-use crate::runtime::reason_class::{
-    STOP_REASON_INVALID_AGENT_OUTPUT, STOP_REASON_MAINTAINER_INPUT_REQUIRED,
-};
+use crate::runtime::reason_class::STOP_REASON_INVALID_AGENT_OUTPUT;
 use serde_json::{json, Value};
 
 pub(super) fn issue_implementation_missing_result_decision(
@@ -68,61 +66,6 @@ pub(super) fn issue_implementation_missing_result_decision(
                 "runtime_job_id": event_field_string(event, "runtime_job_id"),
             }),
         ))
-        .with_evidence(runtime_completion_evidence(event, result))
-        .high_confidence(),
-    )
-}
-
-pub(super) fn scope_too_large_decision(
-    instance: &WorkflowInstance,
-    event: &WorkflowEvent,
-    result: &ActivityResult,
-) -> Option<WorkflowDecision> {
-    if (
-        instance.definition_id.as_str(),
-        instance.state.as_str(),
-        result.activity.as_str(),
-    ) != (
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        "implementing",
-        "implement_issue",
-    ) {
-        return None;
-    }
-
-    let scope = scope_too_large_evidence_from_activity_result(result)?;
-    let scope_summary = scope.summary;
-    let scope_payload = scope.payload;
-    let reason = format!(
-        "implement_issue reported SCOPE_TOO_LARGE before PR creation: {}",
-        scope_summary
-    );
-    Some(
-        WorkflowDecision::new(
-            &instance.id,
-            &instance.state,
-            "block_scope_too_large",
-            "blocked",
-            &reason,
-        )
-        .with_command(runtime_blocked_command(
-            &reason,
-            Some(STOP_REASON_MAINTAINER_INPUT_REQUIRED),
-            format!("runtime-completion:{}:scope-too-large:block", event.id),
-            event,
-            result,
-        ))
-        .with_command(WorkflowCommand::new(
-            WorkflowCommandType::RequestOperatorAttention,
-            format!("runtime-completion:{}:scope-too-large:operator", event.id),
-            json!({
-                "reason": reason,
-                "activity": result.activity,
-                "runtime_job_id": event_field_string(event, "runtime_job_id"),
-                "scope_guard": scope_payload,
-            }),
-        ))
-        .with_evidence(WorkflowEvidence::new("scope_too_large", scope_summary))
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
     )
@@ -242,14 +185,15 @@ pub(super) fn bind_pr_from_activity_result(
         return None;
     }
     let (pr_number, pr_url) = pull_request_artifact(result)?;
-    let binding_evidence = match verified_pr_binding_evidence(result, pr_number) {
-        Ok(evidence) => evidence,
+    let binding = match verified_pr_binding_evidence(result, pr_number, &pr_url) {
+        Ok(binding) => binding,
         Err(reason) => {
             return Some(pr_binding_verification_blocked_decision(
                 instance, event, result, &reason,
             ));
         }
     };
+    let pr_url = binding.canonical_pr_url;
     Some(
         WorkflowDecision::new(
             &instance.id,
@@ -264,7 +208,7 @@ pub(super) fn bind_pr_from_activity_result(
             format!("runtime-completion:{}:bind-pr:{pr_number}", event.id),
         ))
         .with_evidence(WorkflowEvidence::new("pull_request", pr_url))
-        .with_evidence(binding_evidence)
+        .with_evidence(binding.evidence)
         .with_evidence(runtime_completion_evidence(event, result))
         .high_confidence(),
     )
@@ -275,35 +219,61 @@ pub(super) fn bind_pr_from_activity_result(
 /// recorded waiver when enforcement is disabled. A server-recorded
 /// verification failure, a PR-number mismatch, or a missing verification
 /// while enforcement is active all fail closed.
+pub(crate) struct VerifiedPrBindingEvidence {
+    pub(crate) evidence: WorkflowEvidence,
+    pub(crate) canonical_pr_url: String,
+}
+
 pub(crate) fn verified_pr_binding_evidence(
     result: &ActivityResult,
     claimed_pr_number: u64,
-) -> Result<WorkflowEvidence, String> {
+    claimed_pr_url: &str,
+) -> Result<VerifiedPrBindingEvidence, String> {
     if let Some(failure) = pr_binding_verification_failure(result) {
         return Err(format!(
             "server verification of the claimed pull request failed: {failure}"
         ));
     }
+    let Some((claimed_repo, url_pr_number)) = github_pr_identity(claimed_pr_url) else {
+        return Err(format!(
+            "the activity claimed an invalid GitHub pull request URL: {claimed_pr_url}"
+        ));
+    };
+    if url_pr_number != claimed_pr_number {
+        return Err(format!(
+            "the activity claimed pull request number {claimed_pr_number} but its URL identifies #{url_pr_number}"
+        ));
+    }
     if let Some(verified) = verified_pr_binding_artifact(result) {
         let verified_number = verified.get("pr_number").and_then(Value::as_u64);
-        let claimed_pr_url = pull_request_artifact(result).map(|(_, url)| url);
-        let verified_url = verified
+        let verified_repo = verified
             .get("repo")
             .and_then(Value::as_str)
-            .map(|repo| format!("https://github.com/{repo}/pull/{claimed_pr_number}"));
-        if (verified_number, verified_url.as_deref())
-            != (Some(claimed_pr_number), claimed_pr_url.as_deref())
+            .map(str::trim)
+            .filter(|repo| !repo.is_empty());
+        let Some(verified_repo) = verified_repo else {
+            return Err(format!(
+                "server verified pull request {verified_number:?} without a repository identity"
+            ));
+        };
+        if verified_number != Some(claimed_pr_number)
+            || !verified_repo.eq_ignore_ascii_case(&claimed_repo)
         {
             return Err(format!(
-                "server verified pull request {verified_number:?} at {verified_url:?} but the activity claimed {claimed_pr_number} at {claimed_pr_url:?}"
+                "server verified pull request {verified_number:?} in {verified_repo} but the activity claimed {claimed_pr_number} in {claimed_repo}"
             ));
         }
-        return Ok(WorkflowEvidence::runtime_observed(
-            EVIDENCE_VERIFIED_PR_BINDING,
-            verified.to_string(),
-            "server_verified_pr_binding_artifact",
-            None,
-        ));
+        return Ok(VerifiedPrBindingEvidence {
+            evidence: WorkflowEvidence::runtime_observed(
+                EVIDENCE_VERIFIED_PR_BINDING,
+                verified.to_string(),
+                "server_verified_pr_binding_artifact",
+                None,
+            ),
+            canonical_pr_url: format!(
+                "https://github.com/{verified_repo}/pull/{claimed_pr_number}"
+            ),
+        });
     }
     if !transition_evidence_enforced(
         GITHUB_ISSUE_PR_DEFINITION_ID,
@@ -313,10 +283,13 @@ pub(crate) fn verified_pr_binding_evidence(
     ) {
         // The transition table no longer demands it, so neither does this
         // reducer: one authority, no drift.
-        return Ok(WorkflowEvidence::new(
-            EVIDENCE_VERIFIED_PR_BINDING,
-            "enforcement_lifted_by_deployment_config",
-        ));
+        return Ok(VerifiedPrBindingEvidence {
+            evidence: WorkflowEvidence::new(
+                EVIDENCE_VERIFIED_PR_BINDING,
+                "enforcement_lifted_by_deployment_config",
+            ),
+            canonical_pr_url: format!("https://github.com/{claimed_repo}/pull/{claimed_pr_number}"),
+        });
     }
     Err(
         "the activity claimed a pull request but the server recorded no binding verification"
@@ -379,27 +352,28 @@ pub(super) fn merged_pr_from_activity_result(
     }
     let merged = merged_pull_request_artifact(result)?;
     let reason = "merge_pr returned structured evidence that the pull request was merged";
-    let terminal_evidence = if merge_completion_verified(instance, result, merged.pr_number) {
-        WorkflowEvidence::runtime_observed(
-            EVIDENCE_GITHUB_TERMINAL,
-            format!(
-                "merged_pull_request: pr={} head={} merge_commit={}",
-                merged.pr_number,
-                merged.head_sha.as_deref().unwrap_or("unknown"),
-                merged.merge_commit_sha.as_deref().unwrap_or("unknown"),
-            ),
-            "github_pr_merged_result",
-            Some(event.id.clone()),
-        )
-    } else {
-        WorkflowEvidence::new(
-            EVIDENCE_GITHUB_TERMINAL,
-            format!(
-                "agent_reported_merged_pull_request: pr={}",
-                merged.pr_number
-            ),
-        )
-    };
+    let terminal_evidence =
+        if let Some(source) = merge_completion_trust_source(instance, result, merged.pr_number) {
+            WorkflowEvidence::runtime_observed(
+                EVIDENCE_GITHUB_TERMINAL,
+                format!(
+                    "merged_pull_request: pr={} head={} merge_commit={}",
+                    merged.pr_number,
+                    merged.head_sha.as_deref().unwrap_or("unknown"),
+                    merged.merge_commit_sha.as_deref().unwrap_or("unknown"),
+                ),
+                source,
+                Some(event.id.clone()),
+            )
+        } else {
+            WorkflowEvidence::new(
+                EVIDENCE_GITHUB_TERMINAL,
+                format!(
+                    "agent_reported_merged_pull_request: pr={}",
+                    merged.pr_number
+                ),
+            )
+        };
     Some(
         WorkflowDecision::new(
             &instance.id,
@@ -435,36 +409,50 @@ pub(super) fn merged_pr_from_activity_result(
     )
 }
 
-fn merge_completion_verified(
+fn merge_completion_trust_source<'a>(
     instance: &WorkflowInstance,
-    result: &ActivityResult,
+    result: &'a ActivityResult,
     pr_number: u64,
-) -> bool {
-    let Some(expected_repo) = instance
+) -> Option<&'a str> {
+    let expected_repo = instance
         .data
         .get("repo")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|repo| !repo.is_empty())
-    else {
-        return false;
-    };
-    result.artifacts.iter().any(|artifact| {
-        artifact.artifact_type == ARTIFACT_MERGE_COMPLETION_VERIFICATION
-            && artifact.artifact.get("schema").and_then(Value::as_str)
-                == Some(MERGE_COMPLETION_VERIFICATION_SCHEMA)
-            && artifact.artifact.get("verified").and_then(Value::as_bool) == Some(true)
-            && artifact
-                .artifact
-                .get("observed_merged")
-                .and_then(Value::as_bool)
-                == Some(true)
-            && artifact.artifact.get("pr_number").and_then(Value::as_u64) == Some(pr_number)
-            && artifact
+        .filter(|repo| !repo.is_empty())?;
+    result.artifacts.iter().find_map(|artifact| {
+        if artifact.artifact_type != ARTIFACT_MERGE_COMPLETION_VERIFICATION
+            || artifact.artifact.get("schema").and_then(Value::as_str)
+                != Some(MERGE_COMPLETION_VERIFICATION_SCHEMA)
+        {
+            return None;
+        }
+        if artifact.artifact.get("pr_number").and_then(Value::as_u64) != Some(pr_number)
+            || !artifact
                 .artifact
                 .get("repo")
                 .and_then(Value::as_str)
                 .is_some_and(|repo| repo.eq_ignore_ascii_case(expected_repo))
+        {
+            return None;
+        }
+        let verified = artifact.artifact.get("verified").and_then(Value::as_bool) == Some(true)
+            && artifact
+                .artifact
+                .get("observed_merged")
+                .and_then(Value::as_bool)
+                == Some(true);
+        if verified {
+            return Some("github_pr_merged_result");
+        }
+        let waived = artifact.artifact.get("outcome").and_then(Value::as_str)
+            == Some("verification_waived")
+            && artifact
+                .artifact
+                .get("verification_source")
+                .and_then(Value::as_str)
+                == Some("server_configuration");
+        waived.then_some("merge_verification_waived_by_server_configuration")
     })
 }
 
@@ -520,56 +508,6 @@ fn pull_request_artifact_is_merged(value: &Value) -> bool {
             .get("state")
             .and_then(non_empty_json_string)
             .is_some_and(|state| state.eq_ignore_ascii_case("merged"))
-}
-
-#[derive(Debug, Clone)]
-struct ScopeTooLargeEvidence {
-    summary: String,
-    payload: Value,
-}
-
-fn scope_too_large_evidence_from_activity_result(
-    result: &ActivityResult,
-) -> Option<ScopeTooLargeEvidence> {
-    result
-        .signals
-        .iter()
-        .filter(|signal| signal.signal_type == SCOPE_TOO_LARGE_SIGNAL)
-        .find_map(|signal| scope_too_large_evidence_from_value(&signal.signal))
-}
-
-fn scope_too_large_evidence_from_value(value: &Value) -> Option<ScopeTooLargeEvidence> {
-    let files_changed = value.get("files_changed").and_then(Value::as_u64)?;
-    let lines_added = value.get("lines_added").and_then(Value::as_u64)?;
-    let max_files_changed = value.get("max_files_changed").and_then(Value::as_u64)?;
-    let max_lines_added = value.get("max_lines_added").and_then(Value::as_u64)?;
-    let base_ref = value
-        .get("base_ref")
-        .and_then(non_empty_json_string)
-        .unwrap_or_else(|| "configured base".to_string());
-    value
-        .get("decomposition_skeleton")
-        .filter(|skeleton| decomposition_skeleton_is_non_empty(skeleton))?;
-
-    if files_changed <= max_files_changed && lines_added <= max_lines_added {
-        return None;
-    }
-
-    Some(ScopeTooLargeEvidence {
-        summary: format!(
-            "base_ref={base_ref}; files_changed={files_changed}/{max_files_changed}; lines_added={lines_added}/{max_lines_added}"
-        ),
-        payload: value.clone(),
-    })
-}
-
-fn decomposition_skeleton_is_non_empty(value: &Value) -> bool {
-    match value {
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(fields) => !fields.is_empty(),
-        Value::String(text) => !text.trim().is_empty(),
-        _ => false,
-    }
 }
 
 fn pull_request_artifact(result: &ActivityResult) -> Option<(u64, String)> {

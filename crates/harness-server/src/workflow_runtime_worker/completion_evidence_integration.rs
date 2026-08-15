@@ -70,6 +70,15 @@ pub(super) async fn apply_completion_evidence(
         result = apply_server_validation(result, run);
     }
 
+    apply_external_completion_evidence(state, job, workflow, result).await
+}
+
+pub(super) async fn apply_external_completion_evidence(
+    state: &Arc<AppState>,
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+    mut result: ActivityResult,
+) -> ActivityResult {
     if result_claims_pr_binding(job, workflow, &result) {
         if let Some(workflow) = workflow {
             result = attach_pr_binding_verification(state, workflow, result).await;

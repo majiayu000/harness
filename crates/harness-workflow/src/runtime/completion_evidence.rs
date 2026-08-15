@@ -92,6 +92,29 @@ pub fn verified_pr_binding_artifact(result: &ActivityResult) -> Option<&Value> {
         .map(|artifact| &artifact.artifact)
 }
 
+/// Parse a GitHub pull-request URL into its repository slug and PR number.
+/// Extra path segments, query strings, and fragments do not change identity.
+pub(crate) fn github_pr_identity(url: &str) -> Option<(String, u64)> {
+    let path = url
+        .trim()
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.trim().strip_prefix("http://github.com/"))?;
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    let pull = parts.next()?;
+    let number = parts
+        .next()?
+        .split(['#', '?'])
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    if owner.is_empty() || repo.is_empty() || pull != "pull" {
+        return None;
+    }
+    Some((format!("{owner}/{repo}"), number))
+}
+
 /// The server-attached closed-issue observation, if present.
 pub fn verified_issue_state_artifact(result: &ActivityResult) -> Option<&Value> {
     result

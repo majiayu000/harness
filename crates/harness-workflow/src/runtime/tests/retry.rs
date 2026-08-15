@@ -267,44 +267,6 @@ fn runtime_succeeded_with_blockers_routes_like_blocked() {
 }
 
 #[test]
-fn runtime_failure_scope_guard_block_carries_structured_stop_metadata() {
-    let instance = issue_instance("implementing");
-    let result = ActivityResult {
-        activity: "implement_issue".to_string(),
-        status: ActivityStatus::Blocked,
-        summary: "Scope guard rejected the implementation.".to_string(),
-        artifacts: Vec::new(),
-        signals: Vec::new(),
-        validation: Vec::new(),
-        error: None,
-        error_kind: None,
-    }
-    .with_signal(ActivitySignal::new(
-        SCOPE_TOO_LARGE_SIGNAL,
-        json!({
-            "base_ref": "origin/main",
-            "files_changed": 42,
-            "lines_added": 1600,
-            "max_files_changed": 30,
-            "max_lines_added": 1500,
-            "decomposition_skeleton": [{"title": "Split reducer behavior"}]
-        }),
-    ));
-    let event = runtime_completion_event(&instance, "implement_issue", result);
-
-    let decision = reduce_runtime_job_completed(&instance, &event)
-        .expect("event should parse")
-        .expect("scope guard should block the workflow");
-
-    assert_eq!(decision.decision, "block_scope_too_large");
-    let command = &decision.commands[0];
-    assert_eq!(command.command["blocked_reason"], decision.reason);
-    assert_eq!(command.command["last_stop"]["state"], "blocked");
-    assert_eq!(command.command["last_stop"]["activity"], "implement_issue");
-    assert_eq!(command.command["last_stop"]["runtime_job_id"], "job-1");
-}
-
-#[test]
 fn runtime_failure_does_not_retry_fatal_activity_failure() {
     let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {

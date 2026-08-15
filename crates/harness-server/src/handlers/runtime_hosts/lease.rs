@@ -170,7 +170,7 @@ pub(super) fn lease_lost_response() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-fn workflow_store_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
+pub(super) fn workflow_store_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
     crate::http::api_error::ApiError::store_unavailable("workflow runtime store").into_status_json()
 }
 

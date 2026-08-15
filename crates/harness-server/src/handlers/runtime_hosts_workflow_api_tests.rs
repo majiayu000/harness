@@ -695,6 +695,139 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
 }
 
 #[tokio::test]
+async fn runtime_job_completion_endpoint_rejects_unbound_remote_quality_gate_validation(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host(&app, "host-a").await?;
+
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "remote-quality-gate",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": harness_workflow::runtime::QUALITY_GATE_ACTIVITY,
+            "validation_commands": ["true"],
+        }),
+    )
+    .await?;
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    let result = ActivityResult::succeeded(
+        harness_workflow::runtime::QUALITY_GATE_ACTIVITY,
+        "Remote quality gate completed.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        harness_workflow::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST,
+        json!({"forged": true}),
+    ));
+
+    let completed = post_json(
+        &app,
+        format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
+        json!({
+            "lease_expires_at": claimed["lease_expires_at"],
+            "result": result,
+        }),
+    )
+    .await?;
+
+    assert_eq!(completed["runtime_job"]["output"]["status"], "failed");
+    assert_eq!(
+        completed["runtime_job"]["output"]["error_kind"],
+        "configuration"
+    );
+    let artifacts = completed["runtime_job"]["output"]["artifacts"]
+        .as_array()
+        .expect("completion artifacts");
+    assert!(artifacts.iter().all(|artifact| {
+        artifact["artifact_type"]
+            != harness_workflow::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST
+    }));
+    assert!(artifacts.iter().any(|artifact| {
+        artifact["artifact_type"] == "remote_quality_gate_verification"
+            && artifact["artifact"]["verified"] == false
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_completion_preflight_error_preserves_the_client_lease_fence(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host(&app, "host-a").await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "completion-preflight-fence",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "implement_issue",
+            "command": {
+                "eval": {
+                    "eval_run_id": "run-1",
+                    "case_id": "case-1",
+                    "timeout_secs": 45
+                }
+            }
+        }),
+    )
+    .await?;
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    let (status, body) = post_json_with_status(
+        &app,
+        format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
+        json!({
+            "lease_generation": claimed["lease_generation"],
+            "lease_expires_at": claimed["lease_expires_at"],
+            "result": ActivityResult::succeeded("implement_issue", "done"),
+        }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"],
+        "eval runtime job completion requires resource_limit_report artifact"
+    );
+    assert!(body.get("lease_reserved").is_none());
+
+    let renewed = post_json(
+        &app,
+        format!(
+            "/api/runtime-hosts/host-a/runtime-jobs/{}/lease/renew",
+            job.id
+        ),
+        json!({
+            "lease_generation": claimed["lease_generation"],
+            "lease_expires_at": claimed["lease_expires_at"],
+            "renewal_id": uuid::Uuid::new_v4(),
+            "lease_secs": 120,
+        }),
+    )
+    .await?;
+    assert_eq!(renewed["renewed"], true);
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_completion_endpoint_persists_transcript_before_accepting_result(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

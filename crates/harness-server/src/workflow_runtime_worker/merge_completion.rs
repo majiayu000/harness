@@ -26,7 +26,7 @@ pub(super) async fn verify_merge_completion_if_needed(
     }
     let config = auto_merge_config(state);
     if !config.verify_merge_completion {
-        return result;
+        return merge_completion_verification_waived(job, workflow, result);
     }
     let target = match merge_completion_target(job, workflow, &result) {
         Ok(target) => target,
@@ -64,6 +64,29 @@ pub(super) async fn verify_merge_completion_if_needed(
         ),
         Err(error) => merge_completion_fetch_failed(result, &target, &error),
     }
+}
+
+fn merge_completion_verification_waived(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+    mut result: ActivityResult,
+) -> ActivityResult {
+    let Ok(target) = merge_completion_target(job, workflow, &result) else {
+        return result;
+    };
+    result.artifacts.push(ActivityArtifact::new(
+        MERGE_COMPLETION_VERIFICATION_ARTIFACT,
+        json!({
+            "schema": MERGE_COMPLETION_VERIFICATION_SCHEMA,
+            "verified": false,
+            "observed_merged": false,
+            "outcome": "verification_waived",
+            "verification_source": "server_configuration",
+            "repo": target.repo_slug,
+            "pr_number": target.pr_number,
+        }),
+    ));
+    result
 }
 
 pub(super) fn auto_merge_config(state: &AppState) -> GitHubAutoMergeConfig {
@@ -470,5 +493,35 @@ mod tests {
             .expect_err("mismatched PR should fail before GitHub verification");
 
         assert!(error.contains("workflow is bound to PR #78"));
+    }
+
+    #[test]
+    fn disabled_verification_records_a_server_configuration_waiver() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexExec,
+            "codex-default",
+            json!({"activity": "merge_pr"}),
+        );
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "merging",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
+        )
+        .with_server_data(json!({
+            "repo": "owner/repo",
+            "pr_number": 77,
+        }));
+
+        let result = merge_completion_verification_waived(&job, Some(&workflow), activity_result());
+
+        assert!(result.artifacts.iter().any(|artifact| {
+            artifact.artifact_type == MERGE_COMPLETION_VERIFICATION_ARTIFACT
+                && artifact.artifact["outcome"] == "verification_waived"
+                && artifact.artifact["verification_source"] == "server_configuration"
+                && artifact.artifact["repo"] == "owner/repo"
+                && artifact.artifact["pr_number"] == 77
+        }));
     }
 }

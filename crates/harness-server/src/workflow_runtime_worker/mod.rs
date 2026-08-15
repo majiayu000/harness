@@ -4,16 +4,19 @@ mod activity_status_contract;
 mod child_workflow;
 mod child_workflow_non_issue;
 mod child_workflow_replay;
+mod circuit_breaker_events;
 mod completion_evidence_integration;
 mod data_helpers;
 mod executor;
 mod executor_contract;
+mod job_context;
 mod merge_completion;
 mod otel_trajectory;
 mod pr_binding_verification;
 mod pr_feedback_inspection;
 mod prompt_input_telemetry;
 mod prompt_packet;
+pub(crate) mod remote_completion;
 mod repo_memory_prompt;
 mod runtime_execution_queue;
 mod runtime_profile;
@@ -25,14 +28,13 @@ mod transcript_durability;
 pub(crate) mod turn_engine;
 mod workspace;
 
+pub(crate) use circuit_breaker_events::emit_circuit_breaker_events;
 pub(crate) use transcript_durability::{
     hydrate_exact_replay_transcript, strip_caller_transcript_unavailable_signal,
 };
 
 use crate::http::AppState;
-use crate::runtime_circuit_breaker::{
-    classify_agent_failure, CircuitBreakerEvent, CircuitBreakerEventKind, FailureClass,
-};
+use crate::runtime_circuit_breaker::{classify_agent_failure, FailureClass};
 use crate::runtime_projection::RuntimeWorkflowProjection;
 use crate::workflow_runtime_submission::{
     runtime_models::{TaskFailureKind, TaskKind, TaskStatus},
@@ -41,14 +43,13 @@ use crate::workflow_runtime_submission::{
 use chrono::Duration;
 use data_helpers::{optional_data_string, optional_data_u64};
 use executor::ServerRuntimeJobExecutor;
-use harness_core::types::{Decision, Event, SessionId};
 use harness_workflow::runtime::{
     ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeWorker,
     WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
     STOP_REASON_RUNTIME_TRANSCRIPT_LOST, STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE,
 };
 use otel_trajectory::emit_runtime_job_trajectory_completion;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -214,88 +215,8 @@ pub(crate) async fn record_runtime_circuit_breaker_completion(
             Vec::new()
         }
     };
-    emit_circuit_breaker_events(state, events).await;
+    circuit_breaker_events::emit_circuit_breaker_events(state, events).await;
     Ok(())
-}
-
-pub(crate) async fn emit_circuit_breaker_events(
-    state: &AppState,
-    events: Vec<CircuitBreakerEvent>,
-) {
-    for event in events {
-        emit_circuit_breaker_event(state, event).await;
-    }
-}
-
-async fn emit_circuit_breaker_event(state: &AppState, event: CircuitBreakerEvent) {
-    let class = event.class.map(FailureClass::as_str);
-    let (level, breaker_state, decision, reason) = match event.kind {
-        CircuitBreakerEventKind::Opened => (
-            "error",
-            "open",
-            Decision::Block,
-            "runtime circuit breaker opened",
-        ),
-        CircuitBreakerEventKind::Closed => (
-            "info",
-            "closed",
-            Decision::Complete,
-            "runtime circuit breaker closed",
-        ),
-        CircuitBreakerEventKind::Reset => (
-            "info",
-            "closed",
-            Decision::Complete,
-            "runtime circuit breaker reset",
-        ),
-    };
-    let detail = json!({
-        "level": level,
-        "profile": event.profile,
-        "state": breaker_state,
-        "failure_class": class,
-        "consecutive": event.consecutive,
-        "cooldown_until": event.cooldown_until,
-    });
-    match event.kind {
-        CircuitBreakerEventKind::Opened => {
-            tracing::error!(
-                runtime_profile = %detail["profile"],
-                failure_class = ?detail["failure_class"],
-                consecutive = ?event.consecutive,
-                cooldown_until = ?event.cooldown_until,
-                "runtime circuit breaker opened"
-            );
-            // External alert (GH1582 B-020): dedup key is the profile scope,
-            // so a flapping breaker is suppressed within the dedup window.
-            state
-                .observability
-                .alerts
-                .raise(crate::alerting::producers::circuit_breaker_open(
-                    &event.profile,
-                    &format!(
-                        "failure_class={:?} consecutive={:?} cooldown_until={:?}",
-                        class, event.consecutive, event.cooldown_until
-                    ),
-                ));
-        }
-        CircuitBreakerEventKind::Closed | CircuitBreakerEventKind::Reset => tracing::info!(
-            runtime_profile = %detail["profile"],
-            failure_class = ?detail["failure_class"],
-            "runtime circuit breaker recovered"
-        ),
-    }
-    let mut observe_event = Event::new(
-        SessionId::new(),
-        "runtime_circuit_breaker",
-        detail["profile"].as_str().unwrap_or("runtime"),
-        decision,
-    );
-    observe_event.reason = Some(reason.to_string());
-    observe_event.detail = Some(detail.to_string());
-    if let Err(error) = state.observability.events.log(&observe_event).await {
-        tracing::warn!("failed to record runtime circuit breaker event: {error}");
-    }
 }
 
 pub(crate) async fn notify_runtime_submission_terminal(

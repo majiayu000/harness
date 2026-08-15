@@ -132,6 +132,35 @@ fn runtime_completion_reducer_binds_pr_from_structured_pull_request_artifact() {
         .expect("structured PR binding should validate");
 }
 
+#[test]
+fn runtime_completion_reducer_compares_pr_identity_and_persists_canonical_url() {
+    let instance = issue_instance("implementing");
+    let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
+        .with_artifact(ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/OWNER/REPO/pull/77/files#diff-1"
+            }),
+        ))
+        .with_artifact(verified_pr_binding(77));
+    let event = runtime_completion_event(&instance, "implement_issue", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("equivalent pull request identity should bind");
+
+    assert_eq!(decision.decision, "bind_pr");
+    assert_eq!(
+        decision.commands[0].command["pr_url"],
+        "https://github.com/owner/repo/pull/77"
+    );
+    assert!(decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "verified_pr_binding"));
+}
+
 /// GH-1766 B-006: a PR claim the server never verified is blocked, does not
 /// enter `pr_open`, and mints no BindPr command.
 #[test]
@@ -333,6 +362,68 @@ fn runtime_completion_reducer_rejects_unverified_merge_completion() {
         rejection.kind,
         WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
     );
+}
+
+#[test]
+fn runtime_completion_reducer_accepts_server_merge_verification_waiver() {
+    let instance = issue_instance("merging").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+    }));
+    let result = ActivityResult::succeeded("merge_pr", "PR was merged.")
+        .with_artifact(ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+                "merged": true
+            }),
+        ))
+        .with_artifact(ActivityArtifact::new(
+            crate::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+            json!({
+                "schema": crate::runtime::completion_evidence::MERGE_COMPLETION_VERIFICATION_SCHEMA,
+                "verified": false,
+                "observed_merged": false,
+                "outcome": "verification_waived",
+                "verification_source": "server_configuration",
+                "repo": "owner/repo",
+                "pr_number": 77
+            }),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("configured verification waiver should preserve legacy completion");
+
+    assert_eq!(decision.next_state, "done");
+    let terminal_evidence = decision
+        .evidence
+        .iter()
+        .find(|evidence| evidence.kind == "github_terminal_evidence")
+        .expect("terminal evidence");
+    assert_eq!(
+        terminal_evidence.provenance.trust,
+        harness_core::claim_trust::ClaimTrustLevel::RuntimeObserved
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("server configuration waiver should validate");
 }
 
 #[test]
@@ -845,6 +936,55 @@ fn runtime_completion_reducer_blocks_same_number_wrong_repo_bind_pr() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("fallback PR binding should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_canonicalizes_verified_structured_bind_pr_url() {
+    let instance = issue_instance("implementing");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "implementing",
+        "bind_pr",
+        "pr_open",
+        "Bind the verified PR.",
+    )
+    .with_command(WorkflowCommand::bind_pr(
+        77,
+        "https://github.com/OWNER/REPO/pull/77/files?diff=split#discussion",
+        "verified-bind-pr",
+    ));
+    let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
+        .with_artifact(ActivityArtifact::new(
+            "workflow_decision",
+            serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+        ))
+        .with_artifact(verified_pr_binding(77));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("verified structured binding should be accepted");
+
+    assert_eq!(decision.next_state, "pr_open");
+    let bind_pr = decision
+        .commands
+        .iter()
+        .find(|command| command.command_type == WorkflowCommandType::BindPr)
+        .expect("bind PR command");
+    assert_eq!(
+        bind_pr.command["pr_url"],
+        "https://github.com/owner/repo/pull/77"
+    );
 }
 
 #[test]

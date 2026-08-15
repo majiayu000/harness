@@ -1,7 +1,7 @@
 use super::builtin_github_issue::{
     bind_pr_from_activity_result, closed_issue_evidence_from_activity_result,
     github_issue_closed_decision, issue_implementation_missing_result_decision,
-    merged_pr_from_activity_result, scope_too_large_decision,
+    merged_pr_from_activity_result,
 };
 use super::builtin_plan_issue::issue_plan_decision_from_activity_result;
 use super::builtin_pr_feedback::{
@@ -61,7 +61,6 @@ pub(super) fn reduce_builtin_completion(
         ActivityStatus::Succeeded => reduce_success(instance, event, result),
         ActivityStatus::Blocked | ActivityStatus::SucceededWithBlockers => {
             github_issue_closed_decision(instance, event, result)
-                .or_else(|| scope_too_large_decision(instance, event, result))
                 .or_else(|| Some(runtime_blocked_decision(instance, event, result)))
         }
         ActivityStatus::Failed => {
@@ -106,9 +105,6 @@ fn reduce_success(
         return Some(decision);
     }
     if let Some(decision) = issue_plan_decision_from_activity_result(instance, event, result) {
-        return Some(decision);
-    }
-    if let Some(decision) = scope_too_large_decision(instance, event, result) {
         return Some(decision);
     }
     if let Some(selection) = candidate_selection_record_from_activity_result(result) {
@@ -411,6 +407,7 @@ fn workflow_decision_from_activity_result(
         })
         .map(|decision| {
             let mut decision = normalize_agent_authored_evidence(decision);
+            canonicalize_verified_pr_binding_commands(result, &mut decision);
             for evidence in server_owned_evidence_for_result(result, &decision) {
                 decision = decision.with_evidence(evidence);
             }
@@ -479,17 +476,63 @@ fn verified_pr_binding_matches_commands(
     let Some(repo) = verified["repo"].as_str() else {
         return false;
     };
-    let expected_url = format!("https://github.com/{repo}/pull/{pr_number}");
     decision
         .commands
         .iter()
         .filter(|command| command.command_type == WorkflowCommandType::BindPr)
         .all(|command| {
-            (
-                command.command["pr_number"].as_u64(),
-                command.command["pr_url"].as_str(),
-            ) == (Some(pr_number), Some(expected_url.as_str()))
+            let Some(command_url) = command.command["pr_url"].as_str() else {
+                return false;
+            };
+            let Some((command_repo, command_url_number)) =
+                crate::runtime::completion_evidence::github_pr_identity(command_url)
+            else {
+                return false;
+            };
+            command.command["pr_number"].as_u64() == Some(pr_number)
+                && command_url_number == pr_number
+                && command_repo.eq_ignore_ascii_case(repo)
         })
+}
+
+fn canonicalize_verified_pr_binding_commands(
+    result: &ActivityResult,
+    decision: &mut WorkflowDecision,
+) {
+    let Some(verified) = crate::runtime::completion_evidence::verified_pr_binding_artifact(result)
+    else {
+        return;
+    };
+    let Some(pr_number) = verified["pr_number"].as_u64() else {
+        return;
+    };
+    let Some(repo) = verified["repo"]
+        .as_str()
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+    else {
+        return;
+    };
+    for command in &mut decision.commands {
+        if command.command_type != WorkflowCommandType::BindPr {
+            continue;
+        }
+        let Some(command_url) = command.command["pr_url"].as_str() else {
+            continue;
+        };
+        let Some((command_repo, command_url_number)) =
+            crate::runtime::completion_evidence::github_pr_identity(command_url)
+        else {
+            continue;
+        };
+        if command.command["pr_number"].as_u64() == Some(pr_number)
+            && command_url_number == pr_number
+            && command_repo.eq_ignore_ascii_case(repo)
+        {
+            command.command["pr_url"] =
+                json!(format!("https://github.com/{repo}/pull/{pr_number}"));
+        }
+    }
 }
 
 fn structured_decision_validates(
