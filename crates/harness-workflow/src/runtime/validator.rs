@@ -349,7 +349,7 @@ impl TransitionAllowlist {
             .allow("blocked", "awaiting_dependencies", [Wait])
             .allow("blocked", "implementing", [EnqueueActivity, Wait])
             .allow("implementing", "done", [MarkDone])
-            // A prompt task may mint Done only with server-checkable completion
+            // A prompt task may mint Done only with structured self-declared
             // evidence; the reducer resolves validation-report-or-no-change and
             // mints this kind (GH-1817).
             .require_evidence_with_trust(
@@ -357,7 +357,7 @@ impl TransitionAllowlist {
                 "done",
                 [(
                     super::model::EVIDENCE_PROMPT_COMPLETION,
-                    ClaimTrustLevel::RuntimeObserved,
+                    ClaimTrustLevel::SelfDeclared,
                 )],
             )
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])

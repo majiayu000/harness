@@ -26,6 +26,15 @@ pub(super) async fn verify_merge_completion_if_needed(
     }
     let config = auto_merge_config(state);
     if !config.verify_merge_completion {
+        if !state
+            .core
+            .server
+            .config
+            .workflow
+            .completion_evidence_enforced
+        {
+            return result;
+        }
         return merge_completion_failed(
             result,
             ActivityErrorKind::Configuration,
@@ -284,6 +293,7 @@ fn enrich_pull_request_artifact(
             json!("server_github_graphql"),
         );
         copy_snapshot_field(object, snapshot, "observed_at");
+        copy_snapshot_field(object, snapshot, "pr_url");
         copy_snapshot_field_as(object, snapshot, "head_oid", "head_sha");
         copy_snapshot_field_as(object, snapshot, "merge_commit_sha", "merge_commit_sha");
         object.insert(
@@ -461,8 +471,9 @@ mod tests {
 
     #[test]
     fn verified_merge_enriches_pull_request_with_server_evidence() {
-        let result =
-            merge_completion_verified(activity_result(), &target(), snapshot("MERGED", true));
+        let mut result = activity_result();
+        result.artifacts[0].artifact["pr_url"] = json!("https://github.com/attacker/repo/pull/77");
+        let result = merge_completion_verified(result, &target(), snapshot("MERGED", true));
 
         assert_eq!(result.status, ActivityStatus::Succeeded);
         let pull_request = result
@@ -471,6 +482,10 @@ mod tests {
             .find(|artifact| artifact.artifact_type == "pull_request")
             .expect("pull request artifact");
         assert_eq!(pull_request.artifact["server_verified"], true);
+        assert_eq!(
+            pull_request.artifact["pr_url"],
+            "https://github.com/owner/repo/pull/77"
+        );
         assert_eq!(pull_request.artifact["head_sha"], "server-head");
         assert_eq!(pull_request.artifact["merge_commit_sha"], "merge-sha");
         assert_eq!(

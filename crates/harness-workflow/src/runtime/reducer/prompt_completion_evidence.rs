@@ -1,9 +1,8 @@
 //! The prompt-task completion contract.
 //!
-//! A prompt task may claim Done only if it presented something a reader can
-//! check: the commands it ran with their exit codes, or an explicit statement
-//! that no change was needed. Agent-authored prose in a `ValidationRecord`
-//! names a command but proves nothing about whether it ran.
+//! A prompt task may claim Done only if it presented structured completion
+//! information. These artifacts remain agent-authored claims: parsing them in
+//! the reducer does not upgrade their trust provenance.
 
 use crate::runtime::model::{ActivityResult, WorkflowEvidence, EVIDENCE_PROMPT_COMPLETION};
 use crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID;
@@ -29,19 +28,15 @@ pub(super) enum PromptCompletionEvidence {
 impl PromptCompletionEvidence {
     pub(super) fn evidence(&self) -> WorkflowEvidence {
         match self {
-            Self::ValidationReport { commands, failures } => WorkflowEvidence::runtime_observed(
+            Self::ValidationReport { commands, failures } => WorkflowEvidence::new(
                 EVIDENCE_PROMPT_COMPLETION,
                 format!(
                     "validation_report: {commands} command(s) reported, {failures} non-zero exit(s)"
                 ),
-                "prompt_completion_reducer",
-                None,
             ),
-            Self::NoChangeRationale => WorkflowEvidence::runtime_observed(
+            Self::NoChangeRationale => WorkflowEvidence::new(
                 EVIDENCE_PROMPT_COMPLETION,
                 "no_change_rationale: the task reported no change with a stated reason",
-                "prompt_completion_reducer",
-                None,
             ),
         }
     }

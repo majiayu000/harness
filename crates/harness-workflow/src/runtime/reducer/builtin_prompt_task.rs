@@ -615,6 +615,10 @@ mod tests {
             .find(|evidence| evidence.kind == EVIDENCE_PROMPT_COMPLETION)
             .expect("completion evidence is minted");
         assert!(evidence.summary.contains("no_change_rationale"));
+        assert_eq!(
+            evidence.provenance.trust,
+            harness_core::claim_trust::ClaimTrustLevel::SelfDeclared
+        );
     }
 
     #[test]
@@ -636,6 +640,10 @@ mod tests {
             .expect("completion evidence is minted");
         assert!(evidence.summary.contains("2 command(s)"));
         assert!(evidence.summary.contains("1 non-zero"));
+        assert_eq!(
+            evidence.provenance.trust,
+            harness_core::claim_trust::ClaimTrustLevel::SelfDeclared
+        );
     }
 
     #[test]

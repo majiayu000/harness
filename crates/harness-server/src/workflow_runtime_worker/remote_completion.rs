@@ -44,6 +44,16 @@ pub(crate) async fn apply_remote_completion_evidence(
         );
     }
 
+    if !state
+        .core
+        .server
+        .config
+        .workflow
+        .completion_evidence_enforced
+    {
+        return Ok(result);
+    }
+
     Ok(remote_quality_gate_requires_revision_bound_verification(
         result,
     ))

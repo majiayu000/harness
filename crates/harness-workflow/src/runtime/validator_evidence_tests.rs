@@ -274,8 +274,8 @@ fn builtin_evidence_contract_matches_spec_table() {
                     EVIDENCE_SERVER_VALIDATION_DIGEST => ClaimTrustLevel::Reexecuted,
                     EVIDENCE_VERIFIED_PR_BINDING
                     | EVIDENCE_GITHUB_TERMINAL
-                    | EVIDENCE_SERVER_PR_SNAPSHOT
-                    | EVIDENCE_PROMPT_COMPLETION => ClaimTrustLevel::RuntimeObserved,
+                    | EVIDENCE_SERVER_PR_SNAPSHOT => ClaimTrustLevel::RuntimeObserved,
+                    EVIDENCE_PROMPT_COMPLETION => ClaimTrustLevel::SelfDeclared,
                     _ => ClaimTrustLevel::SelfDeclared,
                 };
                 assert_eq!(

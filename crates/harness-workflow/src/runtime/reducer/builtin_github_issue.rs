@@ -352,28 +352,29 @@ pub(super) fn merged_pr_from_activity_result(
     }
     let merged = merged_pull_request_artifact(result)?;
     let reason = "merge_pr returned structured evidence that the pull request was merged";
-    let terminal_evidence =
-        if let Some(source) = merge_completion_trust_source(instance, result, merged.pr_number) {
-            WorkflowEvidence::runtime_observed(
-                EVIDENCE_GITHUB_TERMINAL,
-                format!(
-                    "merged_pull_request: pr={} head={} merge_commit={}",
-                    merged.pr_number,
-                    merged.head_sha.as_deref().unwrap_or("unknown"),
-                    merged.merge_commit_sha.as_deref().unwrap_or("unknown"),
-                ),
-                source,
-                Some(event.id.clone()),
-            )
-        } else {
-            WorkflowEvidence::new(
-                EVIDENCE_GITHUB_TERMINAL,
-                format!(
-                    "agent_reported_merged_pull_request: pr={}",
-                    merged.pr_number
-                ),
-            )
-        };
+    let terminal_evidence = if let Some(source) =
+        merge_completion_trust_source(instance, result, merged.pr_number, &merged.pr_url)
+    {
+        WorkflowEvidence::runtime_observed(
+            EVIDENCE_GITHUB_TERMINAL,
+            format!(
+                "merged_pull_request: pr={} head={} merge_commit={}",
+                merged.pr_number,
+                merged.head_sha.as_deref().unwrap_or("unknown"),
+                merged.merge_commit_sha.as_deref().unwrap_or("unknown"),
+            ),
+            source,
+            Some(event.id.clone()),
+        )
+    } else {
+        WorkflowEvidence::new(
+            EVIDENCE_GITHUB_TERMINAL,
+            format!(
+                "agent_reported_merged_pull_request: pr={}",
+                merged.pr_number
+            ),
+        )
+    };
     Some(
         WorkflowDecision::new(
             &instance.id,
@@ -413,6 +414,7 @@ fn merge_completion_trust_source<'a>(
     instance: &WorkflowInstance,
     result: &'a ActivityResult,
     pr_number: u64,
+    pr_url: &str,
 ) -> Option<&'a str> {
     let expected_repo = instance
         .data
@@ -420,6 +422,10 @@ fn merge_completion_trust_source<'a>(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|repo| !repo.is_empty())?;
+    let (url_repo, url_pr_number) = github_pr_identity(pr_url)?;
+    if url_pr_number != pr_number || !url_repo.eq_ignore_ascii_case(expected_repo) {
+        return None;
+    }
     result.artifacts.iter().find_map(|artifact| {
         if artifact.artifact_type != ARTIFACT_MERGE_COMPLETION_VERIFICATION
             || artifact.artifact.get("schema").and_then(Value::as_str)

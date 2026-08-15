@@ -307,6 +307,50 @@ fn runtime_completion_reducer_finishes_merge_pr_with_merged_pull_request_artifac
 }
 
 #[test]
+fn runtime_completion_reducer_rejects_verified_merge_with_mismatched_pr_url() {
+    let instance = issue_instance("merging").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+    }));
+    let result = ActivityResult::succeeded("merge_pr", "PR was merged.")
+        .with_artifact(ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/attacker/repo/pull/77",
+                "merged": true
+            }),
+        ))
+        .with_artifact(ActivityArtifact::new(
+            crate::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+            json!({
+                "schema": crate::runtime::completion_evidence::MERGE_COMPLETION_VERIFICATION_SCHEMA,
+                "verified": true,
+                "observed_merged": true,
+                "repo": "owner/repo",
+                "pr_number": 77
+            }),
+        ));
+    let event = runtime_completion_event(&instance, "merge_pr", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("mismatched URL should remain auditable");
+    let rejection = DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect_err("a verification for another URL must not satisfy terminal trust");
+
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
+    );
+}
+
+#[test]
 fn runtime_completion_reducer_rejects_unverified_merge_completion() {
     let instance = issue_instance("merging").with_server_data(json!({
         "repo": "owner/repo",
