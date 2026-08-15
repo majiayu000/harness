@@ -1,9 +1,8 @@
 //! The prompt-task completion contract.
 //!
-//! A prompt task may claim Done only if it presented something a reader can
-//! check: the commands it ran with their exit codes, or an explicit statement
-//! that no change was needed. Agent-authored prose in a `ValidationRecord`
-//! names a command but proves nothing about whether it ran.
+//! A prompt task may claim Done only if it presented structured completion
+//! information. These artifacts remain agent-authored claims: parsing them in
+//! the reducer does not upgrade their trust provenance.
 
 use crate::runtime::model::{ActivityResult, WorkflowEvidence, EVIDENCE_PROMPT_COMPLETION};
 use crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID;

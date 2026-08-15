@@ -238,14 +238,15 @@ fn candidate_promotion_success_decision_inner(
 ) -> anyhow::Result<WorkflowDecision> {
     let (pr_number, pr_url) = pull_request_artifact(result)
         .ok_or_else(|| anyhow::anyhow!("promote_candidate_pr succeeded without pull_request"))?;
-    let binding_evidence = match super::reducer::verified_pr_binding_evidence(result, pr_number) {
-        Ok(evidence) => evidence,
+    let binding = match super::reducer::verified_pr_binding_evidence(result, pr_number, &pr_url) {
+        Ok(binding) => binding,
         Err(reason) => {
             return Ok(super::reducer::pr_binding_verification_blocked_decision(
                 instance, event, result, &reason,
             ));
         }
     };
+    let pr_url = binding.canonical_pr_url;
     let context = promotion_command_context(command)?;
     let plan = candidate_promotion_plan(&context.selection, context.failed_promotions)?;
     if plan.selected.candidate_id != context.candidate_id {
@@ -273,7 +274,7 @@ fn candidate_promotion_success_decision_inner(
         format!("candidate-promotion:{}:bind-pr:{pr_number}", event.id),
     ))
     .with_evidence(WorkflowEvidence::new("pull_request", pr_url))
-    .with_evidence(binding_evidence)
+    .with_evidence(binding.evidence)
     .with_evidence(WorkflowEvidence::new(
         "candidate",
         format!("candidate_id={}", plan.selected.candidate_id),

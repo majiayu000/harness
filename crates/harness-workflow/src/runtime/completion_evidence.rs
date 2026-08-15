@@ -7,7 +7,7 @@
 //! artifacts may inform these kinds but can never impersonate them: reserved
 //! artifact types are stripped from agent output before server attachment.
 
-use super::model::ActivityResult;
+use super::model::{ActivityResult, WorkflowDecision};
 use serde_json::Value;
 
 /// Evidence kind required on `github_issue_pr` `implementing -> pr_open`.
@@ -30,6 +30,10 @@ pub const ARTIFACT_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verificati
 /// Server-attached artifact carrying the server validation digest for a
 /// quality-gate run (per-command exit codes and output hashes).
 pub const ARTIFACT_SERVER_VALIDATION_DIGEST: &str = "server_validation_digest";
+pub const ARTIFACT_VERIFIED_ISSUE_STATE: &str = "verified_issue_state";
+pub const ARTIFACT_MERGE_COMPLETION_VERIFICATION: &str = "merge_completion_verification";
+pub const MERGE_COMPLETION_VERIFICATION_SCHEMA: &str =
+    "harness.github.merge_completion_verification.v1";
 
 /// Blocked-decision reason when a prompt task completes without validation
 /// evidence or an explicit no-change rationale.
@@ -41,11 +45,21 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 3] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 6] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
+    ARTIFACT_VERIFIED_ISSUE_STATE,
+    ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+    super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
 ];
+
+pub fn downgrade_agent_authored_decision(mut decision: WorkflowDecision) -> WorkflowDecision {
+    for evidence in &mut decision.evidence {
+        evidence.provenance = harness_core::claim_trust::ClaimProvenance::self_declared();
+    }
+    decision
+}
 
 /// Whether the transition table still demands `evidence_kind` for this
 /// transition.
@@ -76,6 +90,52 @@ pub fn verified_pr_binding_artifact(result: &ActivityResult) -> Option<&Value> {
         .iter()
         .find(|artifact| artifact.artifact_type == ARTIFACT_VERIFIED_PR_BINDING)
         .map(|artifact| &artifact.artifact)
+}
+
+/// Parse a GitHub pull-request URL into its repository slug and PR number.
+/// Extra path segments, query strings, and fragments do not change identity.
+pub(crate) fn github_pr_identity(url: &str) -> Option<(String, u64)> {
+    let path = url
+        .trim()
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.trim().strip_prefix("http://github.com/"))?;
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    let pull = parts.next()?;
+    let number = parts
+        .next()?
+        .split(['#', '?'])
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    if owner.is_empty() || repo.is_empty() || pull != "pull" {
+        return None;
+    }
+    Some((format!("{owner}/{repo}"), number))
+}
+
+/// The server-attached closed-issue observation, if present.
+pub fn verified_issue_state_artifact(result: &ActivityResult) -> Option<&Value> {
+    result
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == ARTIFACT_VERIFIED_ISSUE_STATE)
+        .map(|artifact| &artifact.artifact)
+}
+
+#[cfg(test)]
+pub(crate) fn verified_issue_state_for_test(issue_number: u64) -> super::model::ActivityArtifact {
+    super::model::ActivityArtifact::new(
+        ARTIFACT_VERIFIED_ISSUE_STATE,
+        serde_json::json!({
+            "issue_number": issue_number,
+            "repo": "owner/repo",
+            "state": "closed",
+            "issue_url": format!("https://github.com/owner/repo/issues/{issue_number}"),
+            "snapshot_source": "server_github_rest",
+        }),
+    )
 }
 
 /// The server-attached PR-binding verification failure payload, if present.
@@ -207,8 +267,24 @@ mod tests {
                 json!({ "pr_number": 1 }),
             ))
             .with_artifact(ActivityArtifact::new(
+                ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
+                json!({ "outcome": "forged" }),
+            ))
+            .with_artifact(ActivityArtifact::new(
                 ARTIFACT_SERVER_VALIDATION_DIGEST,
                 json!({ "commands": [{ "command": "true", "exit_code": 0 }] }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                ARTIFACT_VERIFIED_ISSUE_STATE,
+                json!({ "issue_number": 1, "state": "closed" }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+                json!({ "verified": true, "observed_merged": true }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                super::super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
+                json!({ "snapshot_source": "forged" }),
             ))
             .with_artifact(ActivityArtifact::new(
                 "pull_request",

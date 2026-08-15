@@ -192,22 +192,6 @@ pub struct IssueWorkflowPolicy {
     pub force_execute_label: String,
     #[serde(default = "default_true")]
     pub auto_replan_on_plan_issue: bool,
-    /// When true, the review loop pauses at `ready_to_merge` and requires a
-    /// human to call `POST /api/workflows/runtime/merge` with the workflow ID
-    /// before the workflow advances to `done`. Defaults to `false` to
-    /// preserve the automatic merge flow.
-    #[serde(default)]
-    pub require_human_gate_before_merge: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrScopeGuardPolicy {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_pr_scope_guard_max_files_changed")]
-    pub max_files_changed: u32,
-    #[serde(default = "default_pr_scope_guard_max_lines_added")]
-    pub max_lines_added: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,8 +340,6 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub issue_workflow: IssueWorkflowPolicy,
     #[serde(default)]
-    pub pr_scope_guard: PrScopeGuardPolicy,
-    #[serde(default)]
     pub pr_feedback: PrFeedbackPolicy,
     #[serde(default)]
     pub runtime_dispatch: RuntimeDispatchPolicy,
@@ -384,17 +366,6 @@ impl Default for IssueWorkflowPolicy {
         Self {
             force_execute_label: default_force_execute_label(),
             auto_replan_on_plan_issue: default_true(),
-            require_human_gate_before_merge: false,
-        }
-    }
-}
-
-impl Default for PrScopeGuardPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_files_changed: default_pr_scope_guard_max_files_changed(),
-            max_lines_added: default_pr_scope_guard_max_lines_added(),
         }
     }
 }

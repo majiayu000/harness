@@ -259,7 +259,8 @@ async fn runtime_worker_finishes_closed_issue_success_without_pr() -> anyhow::Re
                 "state": "closed",
                 "issue_url": "https://github.com/owner/repo/issues/125",
             }),
-        )),
+        ))
+        .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(125)),
     };
 
     let completed = worker

@@ -60,12 +60,10 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 
 - Before merging, every PR must receive a fresh-context review from an agent process that did not author the changes. Review output must be machine-parseable: direct reviews must put `APPROVED` on the last non-empty line when no blockers remain or prefix each blocking finding with `ISSUE:`; packaged review workflows may instead use their declared verdict field, such as `Assessment: APPROVE` or `Consensus: APPROVE`. Missing or unparseable output is not approval.
 - External review bots are optional advisors. Address valid feedback when it arrives, but bot silence, quota exhaustion, or service failure does not block a merge.
-- Address valid reviewer findings before merge. Record the reason for rejecting false positives in the handoff; posting that reason to the PR requires operator approval.
-- Merging requires explicit operator approval, a passing `CI Result` check, and squash merge.
+- Address valid reviewer findings before merge. Record the reason for rejecting false positives in the handoff or on the PR when useful.
+- Merging requires a passing `CI Result` check and squash merge.
 - Do not change `Cargo.toml` versions in feature or fix PRs; version bumps happen during releases.
-- Keep implementation PRs within the scope guard in `WORKFLOW.md` (currently 30 changed files and 1,500 added lines). If the work cannot fit, split it or obtain operator approval for the larger scope.
-- Resolving a review thread does not require separate user approval once its feedback has been verified as addressed.
-- Posting a new comment or reply remains an externally visible action and requires explicit user approval.
+- Resolve review threads once their feedback has been verified as addressed.
 
 ## Agent Integration (dual surface)
 

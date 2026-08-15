@@ -43,6 +43,57 @@ fn pin_safety_decision(instance: &WorkflowInstance) -> WorkflowDecision {
 }
 
 #[test]
+fn parent_pr_inspection_persists_server_observed_head_for_manual_merge() -> anyhow::Result<()> {
+    let mut instance = WorkflowInstance::new(
+        crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "awaiting_feedback",
+        WorkflowSubject::new("issue", "77"),
+    )
+    .with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        "awaiting_feedback",
+        "start_quality_gate",
+        "quality_gate_pending",
+        "PR inspection found the PR ready for validation.",
+    );
+    let event = WorkflowEvent::new(&instance.id, 1, "RuntimeJobCompleted", "runtime-1")
+        .with_payload(json!({
+            "activity_result": {
+                "activity": crate::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+                "artifacts": [{
+                    "artifact_type": crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+                    "artifact": {
+                        "snapshot_source": "server_github_graphql",
+                        "repo": "owner/repo",
+                        "pr_number": 77,
+                        "pr_url": "https://github.com/owner/repo/pull/77",
+                        "head_oid": "server-head-77",
+                        "observed_at": "2026-08-15T00:00:00Z"
+                    }
+                }]
+            }
+        }));
+
+    apply_runtime_completion_data_side_effect(&mut instance, &decision, &event)?;
+
+    assert_eq!(instance.data["pr_head_sha"], "server-head-77");
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|sidecar| sidecar.provenance_for("/pr_head_sha")),
+        Some(DataProvenance::External)
+    );
+    Ok(())
+}
+
+#[test]
 fn completion_continuation_is_persisted_as_agent_data() -> anyhow::Result<()> {
     let policy = PromptContinuationPolicy {
         max_attempts: 3,

@@ -87,9 +87,11 @@ pub(super) async fn apply_loaded_runtime_workflow_transition(
     // observation is exactly the server-recognized terminal proof the
     // transition contract requires (GH-1766).
     let decision = if target_state == "done" {
-        decision.with_evidence(WorkflowEvidence::new(
+        decision.with_evidence(WorkflowEvidence::runtime_observed(
             harness_workflow::runtime::completion_evidence::EVIDENCE_GITHUB_TERMINAL,
             runtime_remote_evidence_summary(candidate),
+            "runtime_reconciliation_remote_fact",
+            Some(runtime_remote_key(candidate)),
         ))
     } else {
         decision

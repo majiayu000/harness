@@ -9,7 +9,6 @@ use crate::runtime::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEME
 use crate::runtime::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
 use crate::runtime::reducer::{
     GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
-    SCOPE_TOO_LARGE_SIGNAL,
 };
 use crate::runtime::validator::TransitionAllowlist;
 use crate::runtime::RegisteredWorkflowDefinition;
@@ -85,7 +84,6 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
                     [
                         (ISSUE_CLOSED_SIGNAL, "done"),
                         (ISSUE_ALREADY_RESOLVED_SIGNAL, "done"),
-                        (SCOPE_TOO_LARGE_SIGNAL, "blocked"),
                         ("PlanIssue", "replanning"),
                     ],
                 ),
@@ -201,10 +199,7 @@ fn prompt_task_definition() -> DeclarativeWorkflowDefinition {
                 activity(
                     PROMPT_TASK_IMPLEMENT_ACTIVITY,
                     Some("done"),
-                    [
-                        ("PromptContinuationActive", "implementing"),
-                        (SCOPE_TOO_LARGE_SIGNAL, "blocked"),
-                    ],
+                    [("PromptContinuationActive", "implementing")],
                 ),
             ),
             (

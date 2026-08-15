@@ -202,9 +202,11 @@ pub(super) fn pr_feedback_child_decision_from_activity_result(
         // evidence. The readiness contract above already proved the snapshot;
         // record the evidence class the transition rule demands.
         if ready_snapshot_proves_pr_ready(instance, result) {
-            decision = decision.with_evidence(WorkflowEvidence::new(
+            decision = decision.with_evidence(WorkflowEvidence::runtime_observed(
                 crate::runtime::completion_evidence::EVIDENCE_SERVER_PR_SNAPSHOT,
                 "server_github_graphql snapshot proves the PR is ready to merge",
+                "server_pr_snapshot",
+                Some(event.id.clone()),
             ));
         } else if !crate::runtime::completion_evidence::transition_evidence_enforced(
             PR_FEEDBACK_DEFINITION_ID,

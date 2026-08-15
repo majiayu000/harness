@@ -86,11 +86,36 @@ pub(super) async fn execute_server_merge(
             );
         }
     };
+    let expected_head_sha = match required_expected_head_sha_for_merge(job, workflow) {
+        Ok(expected_head_sha) => expected_head_sha,
+        Err(error) => {
+            return server_merge_failed(
+                activity,
+                Some(&target),
+                ActivityErrorKind::Configuration,
+                "Server-side merge requires a pinned pull request head.",
+                error,
+                Some(before_snapshot),
+                None,
+                "head_missing",
+            );
+        }
+    };
+    if !snapshot_head_matches_expected(&before_snapshot.normalized_snapshot, &expected_head_sha) {
+        return server_merge_head_mismatch(
+            activity,
+            &target,
+            before_snapshot,
+            &expected_head_sha,
+            None,
+        );
+    }
     if snapshot_observes_merged(&before_snapshot.normalized_snapshot) {
         return server_merge_succeeded(
             activity,
             &target,
             before_snapshot,
+            &expected_head_sha,
             "already_merged_before_merge",
             None,
         );
@@ -133,31 +158,12 @@ pub(super) async fn execute_server_merge(
             "gate_rejected",
         );
     }
-    let expected_head_sha = expected_head_sha_for_merge(job, workflow);
-    if !snapshot_head_matches_expected(
-        &before_snapshot.normalized_snapshot,
-        expected_head_sha.as_deref(),
-    ) {
-        return server_merge_failed(
-            activity,
-            Some(&target),
-            ActivityErrorKind::Fatal,
-            "Server-side merge gate rejected a stale pull request head.",
-            format!(
-                "PR #{} in {} head did not match expected_head_sha {:?}",
-                target.pr_number, target.repo_slug, expected_head_sha
-            ),
-            Some(before_snapshot),
-            None,
-            "head_mismatch",
-        );
-    }
     let merge_call = match merge_pull_request(
         &target,
         Some(github_token),
         &GitHubPrMergeOptions {
             method: policy.method,
-            expected_head_sha,
+            expected_head_sha: Some(expected_head_sha.clone()),
         },
     )
     .await
@@ -177,12 +183,26 @@ pub(super) async fn execute_server_merge(
                     "server-executed GitHub merge failed due to configuration: {error}"
                 );
             }
-            return merge_error_result(activity, &target, Some(github_token), error).await;
+            return merge_error_result(
+                activity,
+                &target,
+                Some(github_token),
+                &expected_head_sha,
+                error,
+            )
+            .await;
         }
     };
     match fetch_github_pr_snapshot(&target, Some(github_token)).await {
         Ok(snapshot) if snapshot_observes_merged(&snapshot.normalized_snapshot) => {
-            server_merge_succeeded(activity, &target, snapshot, "merged", Some(merge_call))
+            server_merge_succeeded(
+                activity,
+                &target,
+                snapshot,
+                &expected_head_sha,
+                "merged",
+                Some(merge_call),
+            )
         }
         Ok(snapshot) => server_merge_failed(
             activity,
@@ -211,6 +231,7 @@ async fn merge_error_result(
     activity: String,
     target: &GitHubPrSnapshotTarget,
     github_token: Option<&str>,
+    expected_head_sha: &str,
     error: GitHubPrMergeError,
 ) -> ActivityResult {
     match fetch_github_pr_snapshot(target, github_token).await {
@@ -219,6 +240,7 @@ async fn merge_error_result(
                 activity,
                 target,
                 snapshot,
+                expected_head_sha,
                 "already_merged_after_merge_error",
                 Some(server_merge_error_payload(&error)),
             )
@@ -244,6 +266,30 @@ async fn merge_error_result(
             "merge_call_and_confirmation_failed",
         ),
     }
+}
+
+fn server_merge_head_mismatch(
+    activity: String,
+    target: &GitHubPrSnapshotTarget,
+    snapshot: GitHubPrSnapshotArtifacts,
+    expected_head_sha: &str,
+    merge_call: Option<Value>,
+) -> ActivityResult {
+    let observed_head_sha = value_string(snapshot.normalized_snapshot.get("head_oid"))
+        .unwrap_or_else(|| "<missing>".to_string());
+    server_merge_failed(
+        activity,
+        Some(target),
+        ActivityErrorKind::Fatal,
+        "Server-side merge gate rejected a stale pull request head.",
+        format!(
+            "PR #{} in {} head {} did not match expected_head_sha {}",
+            target.pr_number, target.repo_slug, observed_head_sha, expected_head_sha
+        ),
+        Some(snapshot),
+        merge_call,
+        "head_mismatch",
+    )
 }
 
 fn server_merge_policy(
@@ -302,6 +348,16 @@ fn expected_head_sha_for_merge(
         .or_else(|| activity_string(job, workflow, "head_sha"))
 }
 
+fn required_expected_head_sha_for_merge(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> Result<String, &'static str> {
+    expected_head_sha_for_merge(job, workflow)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or("merge_pr dispatch is missing a non-empty expected_head_sha")
+}
+
 fn activity_string(
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
@@ -322,13 +378,7 @@ fn activity_bool(
         .or_else(|| workflow.and_then(|workflow| workflow.data.get(field).and_then(Value::as_bool)))
 }
 
-fn snapshot_head_matches_expected(snapshot: &Value, expected_head_sha: Option<&str>) -> bool {
-    let Some(expected_head_sha) = expected_head_sha
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return true;
-    };
+fn snapshot_head_matches_expected(snapshot: &Value, expected_head_sha: &str) -> bool {
     value_string(snapshot.get("head_oid")).is_some_and(|head_oid| head_oid == expected_head_sha)
 }
 
@@ -336,9 +386,19 @@ fn server_merge_succeeded(
     activity: String,
     target: &GitHubPrSnapshotTarget,
     snapshot: GitHubPrSnapshotArtifacts,
+    expected_head_sha: &str,
     outcome: &str,
     merge_call: Option<Value>,
 ) -> ActivityResult {
+    if !snapshot_head_matches_expected(&snapshot.normalized_snapshot, expected_head_sha) {
+        return server_merge_head_mismatch(
+            activity,
+            target,
+            snapshot,
+            expected_head_sha,
+            merge_call,
+        );
+    }
     let result = ActivityResult::succeeded(activity, server_merge_success_summary(outcome))
         .with_artifact(server_merge_pull_request_artifact(
             target,
@@ -563,6 +623,7 @@ mod tests {
             "merge_pr".to_string(),
             &target,
             server_merge_test_snapshot("MERGED", true, "head-sha"),
+            "head-sha",
             "merged",
             Some(json!({ "status": "ok" })),
         );
@@ -583,11 +644,45 @@ mod tests {
     fn stale_head_is_not_mergeable() {
         assert!(snapshot_head_matches_expected(
             &server_merge_test_snapshot("OPEN", false, "fresh-head").normalized_snapshot,
-            Some("fresh-head")
+            "fresh-head"
         ));
         assert!(!snapshot_head_matches_expected(
             &server_merge_test_snapshot("OPEN", false, "fresh-head").normalized_snapshot,
-            Some("stale-head")
+            "stale-head"
         ));
+        let target = GitHubPrSnapshotTarget::new("owner/repo", 77).expect("target");
+        let result = server_merge_succeeded(
+            "merge_pr".to_string(),
+            &target,
+            server_merge_test_snapshot("MERGED", true, "fresh-head"),
+            "stale-head",
+            "already_merged_before_merge",
+            None,
+        );
+        assert_eq!(result.status, ActivityStatus::Failed);
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Fatal));
+    }
+
+    #[test]
+    fn server_merge_requires_a_nonempty_expected_head() {
+        let missing = RuntimeJob::pending(
+            "command-missing",
+            RuntimeKind::CodexExec,
+            "codex-default",
+            json!({"activity": "merge_pr"}),
+        );
+        let blank = RuntimeJob::pending(
+            "command-blank",
+            RuntimeKind::CodexExec,
+            "codex-default",
+            json!({"activity": "merge_pr", "expected_head_sha": "  "}),
+        );
+
+        assert!(required_expected_head_sha_for_merge(&missing, None).is_err());
+        assert!(required_expected_head_sha_for_merge(&blank, None).is_err());
+        assert_eq!(
+            required_expected_head_sha_for_merge(&job(), None).as_deref(),
+            Ok("head-sha")
+        );
     }
 }

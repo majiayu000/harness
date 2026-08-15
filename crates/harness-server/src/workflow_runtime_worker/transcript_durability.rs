@@ -12,9 +12,12 @@ const EXACT_REPLAY_INPUT_POINTER: &str = "/command/exact_replay";
 const TRANSCRIPT_ARTIFACT_REF_FIELD: &str = "transcript_artifact_ref";
 const RUNTIME_TRANSCRIPT_UNAVAILABLE_SIGNAL: &str = "RuntimeTranscriptUnavailable";
 
-pub(crate) fn strip_caller_transcript_unavailable_signal(
-    mut result: ActivityResult,
-) -> ActivityResult {
+pub(crate) fn strip_caller_transcript_unavailable_signal(result: ActivityResult) -> ActivityResult {
+    let result = strip_transcript_unavailable_signal(result);
+    harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(result)
+}
+
+pub(super) fn strip_transcript_unavailable_signal(mut result: ActivityResult) -> ActivityResult {
     result
         .signals
         .retain(|signal| signal.signal_type != RUNTIME_TRANSCRIPT_UNAVAILABLE_SIGNAL);
@@ -249,17 +252,27 @@ mod tests {
     }
 
     #[test]
-    fn local_exact_replay_result_cannot_forge_transcript_unavailable_signal() {
+    fn caller_result_cannot_forge_transcript_or_server_evidence() {
         let result = ActivityResult::failed("exact_replay", "failed", "agent failed")
             .with_signal(ActivitySignal::new(
                 RUNTIME_TRANSCRIPT_UNAVAILABLE_SIGNAL,
                 json!({"stop_reason_code": STOP_REASON_RUNTIME_TRANSCRIPT_LOST}),
             ))
-            .with_signal(ActivitySignal::new("AgentEvidence", json!({"kept": true})));
+            .with_signal(ActivitySignal::new("AgentEvidence", json!({"kept": true})))
+            .with_artifact(ActivityArtifact::new(
+                harness_workflow::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+                json!({"verified": true, "observed_merged": true}),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                "pull_request",
+                json!({"pr_number": 77, "merged": true}),
+            ));
 
         let result = strip_caller_transcript_unavailable_signal(result);
 
         assert_eq!(result.signals.len(), 1);
         assert_eq!(result.signals[0].signal_type, "AgentEvidence");
+        assert_eq!(result.artifacts.len(), 1);
+        assert_eq!(result.artifacts[0].artifact_type, "pull_request");
     }
 }

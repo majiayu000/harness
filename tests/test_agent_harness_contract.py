@@ -10,7 +10,7 @@ def test_shared_agent_rules_have_one_canonical_source() -> None:
     assert "Read and follow `AGENTS.md`" in claude
     assert "canonical source for shared project rules" in claude
     for rule in (
-        "Merging requires explicit operator approval",
+        "Merging requires a passing `CI Result` check and squash merge",
         "Do not change `Cargo.toml` versions",
         "External review bots are optional advisors",
     ):
