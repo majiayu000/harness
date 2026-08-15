@@ -12,8 +12,24 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
-        self.claim_next_runtime_job_matching(Some(runtime_kind), None, owner, expires_at)
+        self.claim_next_runtime_job_matching(Some(runtime_kind), None, owner, expires_at, true)
             .await
+    }
+
+    pub async fn claim_next_remote_host_runtime_job(
+        &self,
+        owner: &str,
+        expires_at: DateTime<Utc>,
+        supports_eval_resource_limits: bool,
+    ) -> anyhow::Result<Option<RuntimeJob>> {
+        self.claim_next_runtime_job_matching(
+            Some(RuntimeKind::RemoteHost),
+            None,
+            owner,
+            expires_at,
+            supports_eval_resource_limits,
+        )
+        .await
     }
 
     pub async fn claim_next_runtime_job_excluding_runtime_kind(
@@ -22,7 +38,7 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
-        self.claim_next_runtime_job_matching(None, Some(runtime_kind), owner, expires_at)
+        self.claim_next_runtime_job_matching(None, Some(runtime_kind), owner, expires_at, true)
             .await
     }
 
@@ -32,6 +48,7 @@ impl WorkflowRuntimeStore {
         excluded_runtime_kind: Option<RuntimeKind>,
         owner: &str,
         expires_at: DateTime<Utc>,
+        supports_eval_resource_limits: bool,
     ) -> anyhow::Result<Option<RuntimeJob>> {
         let records_remote_host_audit = only_runtime_kind == Some(RuntimeKind::RemoteHost);
         let only_runtime_kind = only_runtime_kind
@@ -57,8 +74,16 @@ impl WorkflowRuntimeStore {
                      AND (job.data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
                  )
              )
+             AND job.data #> '{input,cancellation_requested}' IS NULL
              AND ($1::text IS NULL OR job.runtime_kind = $1)
              AND ($2::text IS NULL OR job.runtime_kind <> $2)
+             AND (
+                 $3::boolean
+                 OR (
+                     job.data #> '{input,eval}' IS NULL
+                     AND job.data #> '{input,command,eval}' IS NULL
+                 )
+             )
              ORDER BY
                  CASE
                      WHEN COALESCE(job.data #>> '{input,activity}', '') IN (
@@ -75,6 +100,7 @@ impl WorkflowRuntimeStore {
         )
         .bind(only_runtime_kind.as_deref())
         .bind(excluded_runtime_kind.as_deref())
+        .bind(supports_eval_resource_limits)
         .fetch_optional(&mut *tx)
         .await?;
 

@@ -30,6 +30,15 @@ pub const ARTIFACT_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verificati
 /// Server-attached artifact carrying the server validation digest for a
 /// quality-gate run (per-command exit codes and output hashes).
 pub const ARTIFACT_SERVER_VALIDATION_DIGEST: &str = "server_validation_digest";
+/// Server-attached artifact proving the remote runtime host observed the
+/// requested eval base commit before execution.
+pub const ARTIFACT_EVAL_BASE_CHECKOUT: &str = "server_eval_base_checkout";
+/// Host-observed resource-limit report, attached only after server validation.
+pub const ARTIFACT_RESOURCE_LIMIT_REPORT: &str = "resource_limit_report";
+/// Host-observed usage attached by the server for remote eval execution.
+pub const ARTIFACT_RUNTIME_HOST_USAGE: &str = "server_runtime_host_usage";
+/// Host-observed cleanup proof for an ephemeral eval workspace.
+pub const ARTIFACT_EVAL_ISOLATION_CLEANUP: &str = "server_eval_isolation_cleanup";
 pub const ARTIFACT_VERIFIED_ISSUE_STATE: &str = "verified_issue_state";
 pub const ARTIFACT_MERGE_COMPLETION_VERIFICATION: &str = "merge_completion_verification";
 pub const MERGE_COMPLETION_VERIFICATION_SCHEMA: &str =
@@ -45,10 +54,14 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 6] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 10] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
+    ARTIFACT_EVAL_BASE_CHECKOUT,
+    ARTIFACT_RESOURCE_LIMIT_REPORT,
+    ARTIFACT_RUNTIME_HOST_USAGE,
+    ARTIFACT_EVAL_ISOLATION_CLEANUP,
     ARTIFACT_VERIFIED_ISSUE_STATE,
     ARTIFACT_MERGE_COMPLETION_VERIFICATION,
     super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,

@@ -220,11 +220,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "Postgres integration test gate",
     ),
     allowed(
-        "crates/harness-workflow/src/runtime/eval/run.rs",
-        2,
-        "Postgres integration test gate",
-    ),
-    allowed(
         "crates/harness-workflow/src/runtime/tests/remote_host_lease.rs",
         1,
         "Postgres integration test gate",

@@ -501,7 +501,7 @@ async fn runtime_job_claim_endpoint_defers_open_circuit_profile() -> anyhow::Res
 }
 
 #[tokio::test]
-async fn runtime_job_claim_endpoint_defers_eval_job_without_resource_limit_capability(
+async fn runtime_job_claim_endpoint_skips_eval_job_without_resource_limit_capability(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
@@ -528,8 +528,6 @@ async fn runtime_job_claim_endpoint_defers_eval_job_without_resource_limit_capab
         }),
     )
     .await?;
-    let before_claim = Utc::now();
-
     let json = post_json(
         &app,
         "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
@@ -538,25 +536,15 @@ async fn runtime_job_claim_endpoint_defers_eval_job_without_resource_limit_capab
     .await?;
 
     assert_eq!(json["claimed"], false);
-    assert_eq!(json["deferred"], true);
-    assert_eq!(json["runtime_job_id"], job.id);
-    assert_eq!(json["required_capability"], "eval_resource_limits");
-    let deferred = store
+    let pending = store
         .get_runtime_job(&job.id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("eval job should still exist"))?;
-    assert_eq!(deferred.status, RuntimeJobStatus::Pending);
-    assert!(deferred.lease.is_none());
-    assert!(deferred
-        .not_before
-        .is_some_and(|not_before| not_before > before_claim));
+    assert_eq!(pending.status, RuntimeJobStatus::Pending);
+    assert!(pending.lease.is_none());
+    assert!(pending.not_before.is_none());
     let events = store.runtime_events_for(&job.id).await?;
-    assert_eq!(events[0].event_type, "RuntimeJobClaimed");
-    assert_eq!(events[1].event_type, "RuntimeJobClaimDeferred");
-    assert_eq!(
-        events[1].event["required_capability"],
-        "eval_resource_limits"
-    );
+    assert!(events.is_empty());
     Ok(())
 }
 

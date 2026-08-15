@@ -59,7 +59,7 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
    A failed or interrupted cleanup leaves the host visibly draining and
    retryable.
 4. A non-expired lease blocks claims by other hosts.
-5. Expired leases are reclaimable by any host.
+5. Expired leases are reclaimable by any host unless eval cancellation is awaiting the original owner's cleanup acknowledgement.
 6. Workflow runtime-job claims select only `runtime_kind = remote_host` jobs.
 7. In-process runtime workers do not claim `remote_host` jobs.
 8. Runtime-job completion requires the host id and exact lease expiration
@@ -92,8 +92,9 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 - unknown host or job returns `404`, invalid input returns `400`, and unavailable durable storage returns `503`.
 
 `POST /api/runtime-hosts/{id}/runtime-jobs/{runtime_job_id}/complete`
-- request: `{ lease_expires_at, lease_generation?, result }`
+- request: `{ lease_expires_at, lease_generation?, result, execution_evidence? }`
 - `result` is the workflow `ActivityResult` payload and may report `succeeded`, `failed`, `blocked`, or `cancelled`.
+- Eval implementation and quality-gate jobs require host-level `execution_evidence` containing the full observed checkout SHA, the enforced `resource_limit_report`, token usage, and `isolation_cleanup_status: "cleaned"`. Quality-gate evidence also carries the exact validation argv, exit code, output SHA-256, and duration. Implementation must match the manifest base commit; quality-gate execution must exactly match the server-observed draft head. Every non-null effective resource limit must have its matching usage observation. The server validates these fields and attaches reserved evidence; agent-authored artifacts cannot substitute for them.
 - success: `{ completed: true, runtime_job, workflow_event, decision }`
 - stale or wrong lease: HTTP `409` with `{ completed: false, error }`
 
@@ -102,7 +103,7 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 1. Schedule renewal at approximately one third of the confirmed TTL and keep at most one renewal request in flight per runtime job.
 2. Treat heartbeat and per-job renewal as independent protocols. Heartbeat proves host liveness only; renewal of one job does not renew any other job.
 3. On an ambiguous transport failure, retry only with the same `renewal_id`, generation, prior expiry, and duration.
-4. On `404`, `409`, `must_stop: true`, or inability to confirm renewal before the last confirmed expiry, cancel local execution and suppress completion.
+4. On `404`, `409`, `must_stop: true`, or inability to confirm renewal before the last confirmed expiry, cancel local execution. When the response includes `cleanup_ack_required: true`, clean the ephemeral isolation and promptly submit a cancelled completion with `isolation_cleanup_status: "cleaned"`; the server reserves this cleanup acknowledgement against the same owner and lease generation even if the prior expiry elapsed. Otherwise suppress completion.
 5. Deregistration is draining cleanup: do not claim or renew after draining begins, and retry deregistration until it succeeds or returns an operational failure.
 
 ## Rollback

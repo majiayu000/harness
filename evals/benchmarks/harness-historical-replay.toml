@@ -38,6 +38,7 @@ case_id = "gh1716-startup-recovery-cas-conflicts"
 repo = "majiayu000/harness"
 issue = 1716
 base_commit = "f340f03316cab2a1930daec4b72f02a47b3007e2"
+verify_command_mode = "shell"
 verify_commands = [
     "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server --lib task_db::queries_recovery_tests",
     "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server --lib event_replay",
@@ -114,6 +115,7 @@ case_id = "gh1434-phase1-archive-restoration"
 repo = "majiayu000/harness"
 issue = 1434
 base_commit = "e0b3507e703d70d484a22a51512ecfee86e9f1a7"
+verify_command_mode = "shell"
 verify_commands = [
     "bash scripts/archive-phase1-data.sh && test -s archives/phase1-*/RESTORE.md",
     "python3 checks/check_workflow.py --repo . --spec-dir specs/GH1434",
@@ -139,6 +141,7 @@ case_id = "gh1707-github-closing-pr-coverage-recovery"
 repo = "majiayu000/harness"
 issue = 1707
 base_commit = "505961e3c38bd575650e876baec29c820ec00a7e"
+verify_command_mode = "shell"
 verify_commands = [
     "cargo test -p harness-server multiple_closing_pr_candidates_are_selected_deterministically",
     "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server empty_store_recovers_ready_pr_and_stays_idempotent_after_restart",
@@ -185,6 +188,7 @@ case_id = "gh1704-durable-runtime-replay-transcripts"
 repo = "majiayu000/harness"
 issue = 1704
 base_commit = "40ab28c9abff26d78901c3c3d614c49fca0cfee7"
+verify_command_mode = "shell"
 verify_commands = [
     "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server 'http::tests::runtime_transcript_route_tests::exact_replay_preflight_fails_terminal_on_missing_or_corrupt_transcript' -- --exact",
     "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server 'http::tests::runtime_transcript_route_tests::exact_replay_hydrates_verified_transcript_before_dispatch' -- --exact",
@@ -239,6 +243,7 @@ case_id = "gh1686-pinned-bun-toolchain"
 repo = "majiayu000/harness"
 issue = 1686
 base_commit = "856bb080e72e064ccc88360a3b1921bf0e8583b1"
+verify_command_mode = "shell"
 verify_commands = [
     "python3 -c \"from pathlib import Path; files=['.github/workflows/ci.yml','.github/workflows/web-ci.yml','.github/workflows/ci-disabled-modules.yml']; assert Path('.bun-version').read_text() == '1.3.14\\n'; text='\\n'.join(Path(p).read_text() for p in files); assert 'bun-version: latest' not in text; assert text.count('bun-version-file: .bun-version') == 3; assert '.bun-version' in Path('.github/workflows/ci.yml').read_text(); assert '.bun-version' in Path('.github/workflows/web-ci.yml').read_text()\"",
     "cd web && bun install --frozen-lockfile && bun run typecheck && bun run test && bun run build",

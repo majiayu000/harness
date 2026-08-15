@@ -331,14 +331,17 @@ impl WorkflowRuntimeStore {
              JOIN workflow_commands AS command ON command.id = job.command_id
              JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
              WHERE (
-                 job.status = 'pending'
-                 AND (job.not_before IS NULL OR job.not_before <= CURRENT_TIMESTAMP)
-             ) OR (
-                 job.status = 'running'
-                 AND job.data ? 'lease'
-                 AND (job.data->'lease' ? 'expires_at')
-                 AND (job.data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
+                 (
+                     job.status = 'pending'
+                     AND (job.not_before IS NULL OR job.not_before <= CURRENT_TIMESTAMP)
+                 ) OR (
+                     job.status = 'running'
+                     AND job.data ? 'lease'
+                     AND (job.data->'lease' ? 'expires_at')
+                     AND (job.data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
+                 )
              )
+             AND job.data #> '{input,cancellation_requested}' IS NULL
              ORDER BY
                  CASE
                      WHEN COALESCE(job.data #>> '{input,activity}', '') IN (

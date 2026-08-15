@@ -64,6 +64,65 @@ pub(super) fn string_vec(value: &Value, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub(super) fn optional_string_vec_strict(
+    value: &Value,
+    field: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(raw_values) = value.get(field) else {
+        return Ok(None);
+    };
+    let values = raw_values
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("`{field}` must be an array of strings"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("`{field}[{index}]` must be a string"))?;
+            if value.trim().is_empty() {
+                anyhow::bail!("`{field}[{index}]` must not be empty");
+            }
+            Ok(value.to_string())
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
+}
+
+pub(super) fn optional_string_matrix_strict(
+    value: &Value,
+    field: &str,
+) -> anyhow::Result<Option<Vec<Vec<String>>>> {
+    let Some(raw_commands) = value.get(field) else {
+        return Ok(None);
+    };
+    let commands = raw_commands
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("`{field}` must be an array of argv arrays"))?;
+    let parsed = commands
+        .iter()
+        .enumerate()
+        .map(|(command_index, command)| {
+            let arguments = command.as_array().ok_or_else(|| {
+                anyhow::anyhow!("`{field}[{command_index}]` must be an argv array")
+            })?;
+            arguments
+                .iter()
+                .enumerate()
+                .map(|(argument_index, argument)| {
+                    argument.as_str().map(str::to_string).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`{field}[{command_index}][{argument_index}]` must be a string"
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Some(parsed))
+}
+
 pub(super) fn dependency_task_ids_from_command(
     command: &Value,
     repo: Option<&str>,
@@ -245,6 +304,7 @@ pub(super) struct PrFeedbackChildData<'a> {
     pub command_id: &'a str,
     pub remote_fact_hash: Option<&'a str>,
     pub remote_fact_activity_at: Option<&'a str>,
+    pub eval: Option<&'a Value>,
 }
 
 pub(super) fn merge_pr_feedback_child_data(
@@ -300,6 +360,13 @@ pub(super) fn merge_pr_feedback_child_data(
             DataProvenance::Server,
         ),
     ];
+    if let Some(eval) = input.eval {
+        writes.push(WorkflowDataWrite::set(
+            "eval",
+            eval.clone(),
+            DataProvenance::Server,
+        ));
+    }
     let merged = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         Path::new(input.project_id),
         child.data.clone(),
@@ -460,10 +527,10 @@ mod tests {
                 command_id: "command",
                 remote_fact_hash: Some("sha256:fact"),
                 remote_fact_activity_at: Some("2026-06-10T00:00:00Z"),
+                eval: None,
             },
         )
         .expect("classified child data write");
-
         assert_eq!(child.data["remote_fact_hash"], "sha256:fact");
         assert_eq!(
             child.data["remote_fact_activity_at"],

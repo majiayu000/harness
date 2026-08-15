@@ -1,19 +1,21 @@
 use super::*;
-use crate::http::rest_contract::LegacyJson as Json;
-use harness_workflow::runtime::store::runtime_job_leases::{
-    RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRequest,
-};
-use sha2::{Digest, Sha256};
+use crate::http::rest_contract::ContractJson;
+use harness_protocol::rest::RuntimeHostCompletionResponse;
 use std::time::Duration;
-use uuid::Uuid;
 
 const COMPLETION_EVIDENCE_TIMEOUT_SECS: u64 = crate::runtime_hosts::MAX_LEASE_SECS as u64 - 30;
+
+type CompletionJson = ContractJson<RuntimeHostCompletionResponse>;
+
+fn completion_json(value: serde_json::Value) -> CompletionJson {
+    ContractJson(RuntimeHostCompletionResponse(value))
+}
 
 pub async fn complete_runtime_job_for_runtime_host(
     State(state): State<Arc<AppState>>,
     Path((host_id, runtime_job_id)): Path<(String, String)>,
-    Json(req): Json<CompleteRuntimeJobRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+    ContractJson(req): ContractJson<CompleteRuntimeJobRequest>,
+) -> (StatusCode, CompletionJson) {
     let _runtime_job_operation = state
         .runtime_hosts
         .lock_runtime_job_operation(&runtime_job_id)
@@ -22,22 +24,23 @@ pub async fn complete_runtime_job_for_runtime_host(
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("runtime host '{host_id}' is not registered") })),
+            completion_json(
+                json!({ "error": format!("runtime host '{host_id}' is not registered") }),
+            ),
         );
-    }
-    if !state.runtime_hosts.is_active(&host_id) {
-        return lease::lease_lost_response();
     }
     let store = match workflow_runtime_store(&state) {
         Ok(store) => store,
-        Err(response) => return response,
+        Err((status, body)) => return (status, completion_json(body.0)),
     };
     let job = match store.get_runtime_job(&runtime_job_id).await {
         Ok(Some(job)) => job,
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({ "error": format!("runtime job not found: {runtime_job_id}") })),
+                completion_json(
+                    json!({ "error": format!("runtime job not found: {runtime_job_id}") }),
+                ),
             );
         }
         Err(error) => {
@@ -49,25 +52,52 @@ pub async fn complete_runtime_job_for_runtime_host(
             );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "failed to load runtime job" })),
+                completion_json(json!({ "error": "failed to load runtime job" })),
             );
         }
     };
     let CompleteRuntimeJobRequest {
         lease_expires_at,
         lease_generation,
-        result,
+        result: result_value,
+        execution_evidence,
     } = req;
+    let result: ActivityResult = match serde_json::from_value(result_value) {
+        Ok(result) => result,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                completion_json(json!({ "error": format!("invalid activity result: {error}") })),
+            );
+        }
+    };
     let result = crate::workflow_runtime_worker::strip_caller_transcript_unavailable_signal(result);
-    if let Err((status, response)) = validate_eval_resource_limit_report(&job, &result) {
-        return (status, Json(response));
+    let cancellation_ack = is_eval_cancellation_ack(&job, &result);
+    if !state.runtime_hosts.is_active(&host_id) && !cancellation_ack {
+        let (status, body) = lease::lease_lost_response();
+        return (status, completion_json(body.0));
+    }
+    let result = match if cancellation_ack {
+        attach_eval_cancellation_cleanup_evidence(result, execution_evidence)
+    } else {
+        attach_eval_checkout_evidence(&job, result, execution_evidence)
+    } {
+        Ok(result) => result,
+        Err(response) => return (StatusCode::BAD_REQUEST, completion_json(response)),
+    };
+    if !cancellation_ack {
+        if let Err((status, response)) = validate_eval_resource_limit_report(&job, &result) {
+            return (status, completion_json(response));
+        }
     }
     let (result, transcript) = match prepare_runtime_transcript(&job, result) {
         Ok(prepared) => prepared,
         Err(error) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("invalid runtime transcript source: {error}") })),
+                completion_json(
+                    json!({ "error": format!("invalid runtime transcript source: {error}") }),
+                ),
             );
         }
     };
@@ -77,6 +107,7 @@ pub async fn complete_runtime_job_for_runtime_host(
         &host_id,
         lease_expires_at,
         lease_generation,
+        cancellation_ack,
     )
     .await
     {
@@ -159,7 +190,7 @@ pub async fn complete_runtime_job_for_runtime_host(
         Ok(None) => {
             return (
                 StatusCode::CONFLICT,
-                Json(json!({
+                completion_json(json!({
                     "completed": false,
                     "error": "runtime job lease is not owned by this host"
                 })),
@@ -168,7 +199,7 @@ pub async fn complete_runtime_job_for_runtime_host(
         Err(e) if e.downcast_ref::<RuntimeJobNotFoundError>().is_some() => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({ "error": e.to_string() })),
+                completion_json(json!({ "error": e.to_string() })),
             );
         }
         Err(e) => {
@@ -217,7 +248,7 @@ pub async fn complete_runtime_job_for_runtime_host(
 
     (
         StatusCode::OK,
-        Json(json!({
+        completion_json(json!({
             "completed": true,
             "runtime_job": runtime_job,
             "workflow_event": completion.workflow_event,
@@ -226,512 +257,16 @@ pub async fn complete_runtime_job_for_runtime_host(
     )
 }
 
-pub(super) fn reserved_lease_error_response(
-    error: impl Into<String>,
-    lease_expires_at: DateTime<Utc>,
-    lease_generation: u64,
-) -> Json<serde_json::Value> {
-    Json(json!({
-        "error": error.into(),
-        "lease_expires_at": lease_expires_at,
-        "lease_generation": lease_generation,
-        "lease_reserved": true,
-    }))
-}
-
-pub(super) fn eval_resource_limit_preflight_failure(
-    job: &RuntimeJob,
-    error: &str,
-    resource_limits: Option<CappedResourceLimits>,
-) -> ActivityResult {
-    let mut artifact = json!({
-        "enforced": false,
-        "reason": error,
-    });
-    if let Some(resource_limits) = resource_limits {
-        artifact["resource_limits"] = json!(resource_limits);
-    }
-    ActivityResult::failed(
-        runtime_job_activity(job),
-        "Evaluation resource limits could not be enforced.",
-        error,
-    )
-    .with_error_kind(ActivityErrorKind::Configuration)
-    .with_artifact(ActivityArtifact::new(
-        "resource_limit_enforcement",
-        artifact,
-    ))
-}
-
-fn runtime_job_activity(job: &RuntimeJob) -> String {
-    job.input
-        .get("activity")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            job.input
-                .pointer("/command/activity")
-                .and_then(Value::as_str)
-        })
-        .unwrap_or("remote_host")
-        .to_string()
-}
-
-pub(super) fn validate_eval_resource_limit_report(
-    job: &RuntimeJob,
-    result: &ActivityResult,
-) -> Result<(), (StatusCode, serde_json::Value)> {
-    let Some(expected_limits) = eval_resource_limit_enforcement_for_job(job).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            json!({ "error": format!("invalid eval resource limits: {error}") }),
-        )
-    })?
-    else {
-        return Ok(());
-    };
-
-    let Some(report_value) = result
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.artifact_type == "resource_limit_report")
-        .map(|artifact| artifact.artifact.clone())
-    else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "eval runtime job completion requires resource_limit_report artifact"
-            }),
-        ));
-    };
-    let report: ResourceLimitReport = serde_json::from_value(report_value).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            json!({ "error": format!("invalid resource_limit_report artifact: {error}") }),
-        )
-    })?;
-    if report.limits.effective != expected_limits.effective {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "resource_limit_report limits do not match claimed eval resource limits"
-            }),
-        ));
-    }
-    if !resource_usage_has_evidence(&report.usage) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "resource_limit_report requires usage evidence"
-            }),
-        ));
-    }
-    if report.reason.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "resource_limit_report requires a non-empty reason"
-            }),
-        ));
-    }
-    Ok(())
-}
-
-fn resource_usage_has_evidence(usage: &harness_sandbox::ResourceUsage) -> bool {
-    usage.cpu_time_millis.is_some()
-        || usage.peak_memory_bytes.is_some()
-        || usage.peak_pids.is_some()
-        || usage.disk_bytes.is_some()
-        || usage.output_bytes.is_some()
-        || usage.wall_time_millis.is_some()
-}
-
-async fn reserve_completion_lease(
-    store: &WorkflowRuntimeStore,
-    job: &RuntimeJob,
-    owner: &str,
-    previous_expires_at: DateTime<Utc>,
-    lease_generation: Option<u64>,
-) -> Result<(DateTime<Utc>, u64), (StatusCode, Json<serde_json::Value>)> {
-    let lease_generation = lease_generation.unwrap_or(job.lease_generation);
-    let renewal_id =
-        completion_reservation_id(&job.id, owner, lease_generation, previous_expires_at);
-    let now = Utc::now();
-    let renew = || {
-        store.renew_remote_host_runtime_job_lease(RuntimeJobLeaseRenewalRequest {
-            runtime_job_id: &job.id,
-            owner,
-            lease_generation,
-            previous_expires_at,
-            renewal_id,
-            lease_secs: crate::runtime_hosts::MAX_LEASE_SECS,
-            now,
-            max_lease_secs: crate::runtime_hosts::MAX_LEASE_SECS,
-            owner_active: true,
-        })
-    };
-    let outcome = match renew().await {
-        Ok(outcome) => Ok(outcome),
-        Err(error) => {
-            tracing::warn!(
-                runtime_job_id = %job.id,
-                owner,
-                %renewal_id,
-                %error,
-                "runtime host completion lease reservation returned an ambiguous store error; reconciling"
-            );
-            renew().await
-        }
-    };
-    match outcome {
-        Ok(RuntimeJobLeaseRenewalOutcome::Renewed {
-            lease_generation,
-            lease_expires_at,
-            ..
-        }) => Ok((lease_expires_at, lease_generation)),
-        Ok(RuntimeJobLeaseRenewalOutcome::LeaseLost { .. }) => Err(lease::lease_lost_response()),
-        Ok(RuntimeJobLeaseRenewalOutcome::NotFound) => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "runtime job not found" })),
-        )),
-        Err(error) => {
-            tracing::error!(
-                runtime_job_id = %job.id,
-                owner,
-                %error,
-                "runtime host failed to reserve completion lease"
-            );
-            Err(lease::workflow_store_unavailable_response())
-        }
-    }
-}
-
-pub(super) fn completion_reservation_id(
-    runtime_job_id: &str,
-    owner: &str,
-    lease_generation: u64,
-    previous_expires_at: DateTime<Utc>,
-) -> Uuid {
-    let mut digest = Sha256::new();
-    for component in [
-        runtime_job_id.as_bytes(),
-        owner.as_bytes(),
-        &lease_generation.to_be_bytes(),
-        previous_expires_at.to_rfc3339().as_bytes(),
-    ] {
-        digest.update((component.len() as u64).to_be_bytes());
-        digest.update(component);
-    }
-    let digest = digest.finalize();
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    Uuid::from_bytes(bytes)
-}
-
-pub(super) async fn replay_completion_reservation(
-    store: &WorkflowRuntimeStore,
-    runtime_job_id: &str,
-    owner: &str,
-    lease_generation: u64,
-    previous_expires_at: DateTime<Utc>,
-) -> anyhow::Result<RuntimeJobLeaseRenewalOutcome> {
-    store
-        .renew_remote_host_runtime_job_lease(RuntimeJobLeaseRenewalRequest {
-            runtime_job_id,
-            owner,
-            lease_generation,
-            previous_expires_at,
-            renewal_id: completion_reservation_id(
-                runtime_job_id,
-                owner,
-                lease_generation,
-                previous_expires_at,
-            ),
-            lease_secs: crate::runtime_hosts::MAX_LEASE_SECS,
-            now: Utc::now(),
-            max_lease_secs: crate::runtime_hosts::MAX_LEASE_SECS,
-            owner_active: true,
-        })
-        .await
-}
-
+mod evidence;
+mod reservation;
+use evidence::{
+    attach_eval_cancellation_cleanup_evidence, attach_eval_checkout_evidence,
+    is_eval_cancellation_ack,
+};
+pub(super) use evidence::{
+    eval_resource_limit_preflight_failure, validate_eval_resource_limit_report,
+};
 #[cfg(test)]
-mod tests {
-    use super::super::*;
-    use super::*;
-    use harness_workflow::runtime::store::runtime_job_leases::RuntimeJobLeaseRenewalOutcome;
-    use uuid::Uuid;
-
-    #[test]
-    fn eval_resource_limits_derive_from_timeout_when_missing() {
-        let job = RuntimeJob::pending(
-            "cmd-1",
-            RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({
-                "activity": "implement_issue",
-                "command": {
-                    "eval": {
-                        "eval_run_id": "run-1",
-                        "case_id": "case-1",
-                        "timeout_secs": 45
-                    }
-                }
-            }),
-        );
-
-        let limits = eval_resource_limit_enforcement_for_job(&job)
-            .expect("limits should parse")
-            .expect("eval job should require limits");
-
-        assert_eq!(limits.effective.wall_time_secs, Some(45));
-        assert_eq!(limits.effective.cpu_time_secs, Some(45));
-        assert_eq!(limits.effective.output_bytes, Some(64 * 1024 * 1024));
-    }
-
-    #[test]
-    fn eval_resource_limit_report_is_required_for_eval_completion() {
-        let job = RuntimeJob::pending(
-            "cmd-1",
-            RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({
-                "activity": "implement_issue",
-                "command": {
-                    "eval": {
-                        "eval_run_id": "run-1",
-                        "case_id": "case-1",
-                        "timeout_secs": 45
-                    }
-                }
-            }),
-        );
-        let result = ActivityResult::succeeded("implement_issue", "done");
-
-        let err = validate_eval_resource_limit_report(&job, &result)
-            .expect_err("missing resource report should fail closed");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1["error"],
-            "eval runtime job completion requires resource_limit_report artifact"
-        );
-    }
-
-    #[test]
-    fn eval_resource_limit_report_accepts_matching_usage_evidence() {
-        let limits = ResourceLimits::evaluation_defaults(45)
-            .cap_by(ResourceLimits::operator_default_maxima())
-            .expect("limits should cap");
-        let job = RuntimeJob::pending(
-            "cmd-1",
-            RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({
-                "activity": "implement_issue",
-                "command": {
-                    "eval": {
-                        "eval_run_id": "run-1",
-                        "case_id": "case-1",
-                        "timeout_secs": 45,
-                        "resource_limits": limits.clone()
-                    }
-                }
-            }),
-        );
-        let result = ActivityResult::succeeded("implement_issue", "done").with_artifact(
-            ActivityArtifact::new(
-                "resource_limit_report",
-                json!(ResourceLimitReport {
-                    limits,
-                    usage: harness_sandbox::ResourceUsage {
-                        output_bytes: Some(128),
-                        wall_time_millis: Some(1000),
-                        ..Default::default()
-                    },
-                    termination: None,
-                    reason: "completed within resource limits".to_string(),
-                }),
-            ),
-        );
-
-        validate_eval_resource_limit_report(&job, &result)
-            .expect("matching resource report should be accepted");
-    }
-
-    #[test]
-    fn eval_resource_limit_report_requires_usage_evidence_and_reason() {
-        let limits = ResourceLimits::evaluation_defaults(45)
-            .cap_by(ResourceLimits::operator_default_maxima())
-            .expect("limits should cap");
-        let job = RuntimeJob::pending(
-            "cmd-1",
-            RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({
-                "activity": "implement_issue",
-                "command": {
-                    "eval": {
-                        "eval_run_id": "run-1",
-                        "case_id": "case-1",
-                        "timeout_secs": 45,
-                        "resource_limits": limits.clone()
-                    }
-                }
-            }),
-        );
-        let empty_usage = ActivityResult::succeeded("implement_issue", "done").with_artifact(
-            ActivityArtifact::new(
-                "resource_limit_report",
-                json!(ResourceLimitReport {
-                    limits: limits.clone(),
-                    usage: harness_sandbox::ResourceUsage::default(),
-                    termination: None,
-                    reason: "completed within resource limits".to_string(),
-                }),
-            ),
-        );
-
-        let err = validate_eval_resource_limit_report(&job, &empty_usage)
-            .expect_err("empty usage should fail closed");
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1["error"],
-            "resource_limit_report requires usage evidence"
-        );
-
-        let empty_reason = ActivityResult::succeeded("implement_issue", "done").with_artifact(
-            ActivityArtifact::new(
-                "resource_limit_report",
-                json!(ResourceLimitReport {
-                    limits,
-                    usage: harness_sandbox::ResourceUsage {
-                        wall_time_millis: Some(1000),
-                        ..Default::default()
-                    },
-                    termination: None,
-                    reason: " ".to_string(),
-                }),
-            ),
-        );
-        let err = validate_eval_resource_limit_report(&job, &empty_reason)
-            .expect_err("empty reason should fail closed");
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1["error"],
-            "resource_limit_report requires a non-empty reason"
-        );
-    }
-
-    #[test]
-    fn post_reservation_errors_return_the_updated_lease_fence() {
-        let lease_expires_at = Utc::now() + chrono::TimeDelta::minutes(5);
-        let response = reserved_lease_error_response("verification failed", lease_expires_at, 7);
-
-        assert_eq!(response.0["error"], "verification failed");
-        assert_eq!(response.0["lease_expires_at"], json!(lease_expires_at));
-        assert_eq!(response.0["lease_generation"], 7);
-        assert_eq!(response.0["lease_reserved"], true);
-    }
-
-    #[test]
-    fn completion_reservation_id_is_stable_for_ambiguous_retries() {
-        let lease_expires_at = Utc::now() + chrono::TimeDelta::minutes(5);
-        let first = completion_reservation_id("job-1", "host-a", 3, lease_expires_at);
-        let retry = completion_reservation_id("job-1", "host-a", 3, lease_expires_at);
-        let different_owner = completion_reservation_id("job-1", "host-b", 3, lease_expires_at);
-
-        assert_eq!(first, retry);
-        assert_ne!(first, different_owner);
-    }
-
-    #[tokio::test]
-    async fn completion_reservation_reconciles_old_fence_and_deregister_revokes_final_commit(
-    ) -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let Some((state, store)) =
-            crate::handlers::runtime_hosts_workflow_api_tests::make_test_state_with_runtime_store(
-                dir.path(),
-            )
-            .await?
-        else {
-            return Ok(());
-        };
-        let app =
-            crate::handlers::runtime_hosts_workflow_api_tests::runtime_hosts_workflow_app(state);
-        crate::handlers::runtime_hosts_workflow_api_tests::register_host(&app, "host-a").await?;
-        let job = crate::handlers::runtime_hosts_workflow_api_tests::enqueue_runtime_host_test_job(
-            store.as_ref(),
-            "completion-reservation-reconcile",
-            RuntimeKind::RemoteHost,
-            "remote-host-default",
-            json!({"activity": "remote_check"}),
-        )
-        .await?;
-        let claimed = crate::handlers::runtime_hosts_workflow_api_tests::post_json(
-            &app,
-            "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
-            json!({"lease_secs": 60}),
-        )
-        .await?;
-        let original_expires_at: DateTime<Utc> =
-            serde_json::from_value(claimed["lease_expires_at"].clone())?;
-        let lease_generation = claimed["lease_generation"]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("claimed lease generation must be an integer"))?;
-
-        let reserved = replay_completion_reservation(
-            store.as_ref(),
-            &job.id,
-            "host-a",
-            lease_generation,
-            original_expires_at,
-        )
-        .await?;
-        let RuntimeJobLeaseRenewalOutcome::Renewed {
-            lease_expires_at: reserved_expires_at,
-            ..
-        } = reserved
-        else {
-            anyhow::bail!("completion reservation should renew the lease");
-        };
-
-        let reconciled = crate::handlers::runtime_hosts_workflow_api_tests::post_json(
-            &app,
-            format!(
-                "/api/runtime-hosts/host-a/runtime-jobs/{}/lease/renew",
-                job.id
-            ),
-            json!({
-                "lease_generation": lease_generation,
-                "lease_expires_at": original_expires_at,
-                "renewal_id": Uuid::new_v4(),
-                "lease_secs": 120,
-            }),
-        )
-        .await?;
-        assert_eq!(reconciled["renewed"], true);
-        assert_eq!(reconciled["replayed"], true);
-        assert_eq!(reconciled["lease_expires_at"], json!(reserved_expires_at));
-
-        crate::handlers::runtime_hosts_workflow_api_tests::post_json(
-            &app,
-            "/api/runtime-hosts/host-a/deregister".to_string(),
-            json!({}),
-        )
-        .await?;
-        let stale_completion = store
-            .commit_runtime_activity_completion_if_owned_with_generation(
-                &job.id,
-                "host-a",
-                reserved_expires_at,
-                Some(lease_generation),
-                &ActivityResult::succeeded("remote_check", "done"),
-            )
-            .await?;
-        assert!(
-            stale_completion.is_none(),
-            "deregistration must revoke the reserved lease before final completion"
-        );
-        Ok(())
-    }
-}
+use reservation::completion_reservation_id;
+pub(super) use reservation::replay_completion_reservation;
+use reservation::{reserve_completion_lease, reserved_lease_error_response};

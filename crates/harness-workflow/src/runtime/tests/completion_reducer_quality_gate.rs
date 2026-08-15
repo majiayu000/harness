@@ -3,11 +3,17 @@
 fn quality_gate_run_decision_starts_runtime_activity() {
     let instance = quality_gate_instance("pending");
     let commands = vec!["cargo check".to_string(), "cargo test".to_string()];
+    let command_argv = vec![vec!["cargo".to_string(), "check".to_string()]];
+    let eval = json!({"eval_run_id": "run-1", "case_id": "case-1"});
+    let expected_head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let output = build_quality_gate_run_decision(
         &instance,
         QualityGateDecisionInput {
             reason: "Run validation before merge.",
             validation_commands: &commands,
+            validation_commands_argv: &command_argv,
+            eval: Some(&eval),
+            expected_head_sha: Some(expected_head_sha),
         },
     );
 
@@ -21,6 +27,15 @@ fn quality_gate_run_decision_starts_runtime_activity() {
     assert_eq!(
         output.decision.commands[0].command["validation_commands"][1],
         "cargo test"
+    );
+    assert_eq!(
+        output.decision.commands[0].command["validation_commands_argv"][0],
+        serde_json::json!(["cargo", "check"])
+    );
+    assert_eq!(output.decision.commands[0].command["eval"], eval);
+    assert_eq!(
+        output.decision.commands[0].command["expected_head_sha"],
+        expected_head_sha
     );
     DecisionValidator::quality_gate()
         .validate(

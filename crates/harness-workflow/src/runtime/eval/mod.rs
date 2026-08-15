@@ -5,8 +5,11 @@
 //! deterministic scoring primitives, and standard-path eval dispatch helpers.
 
 pub mod attestation;
+mod cleanup;
 mod data;
 pub mod evidence;
+mod evidence_collection;
+mod evidence_usage;
 pub mod execute;
 pub mod historical_replay;
 pub mod manifest;
@@ -26,11 +29,17 @@ pub use attestation::{
     EvalRunAttestationClaims, EvalRunAttestationExpected, KeylessOidcProvider,
     KeylessOidcVerification, VerifiedEvalRunAttestation, EVAL_RUN_ATTESTATION_SCHEMA_VERSION,
 };
+pub use cleanup::{cancel_eval_workflow_family, finalize_eval_case_cleanup};
+pub use data::server_owned_eval_metadata;
 pub use evidence::{
-    collect_eval_case_evidence, collect_eval_case_evidence_from_records, EvalCaseEvidence,
-    EvalEvidenceStatus, EvalIsolationEvidence, EvalQualityGateEvidence, EvalSubmissionEvidence,
+    collect_eval_case_evidence_from_records, EvalCaseEvidence, EvalEvidenceStatus,
+    EvalIsolationEvidence, EvalQualityGateEvidence, EvalSubmissionEvidence,
 };
-pub use execute::{execute_manifest, EvalExecuteConfig, DEFAULT_EVAL_POLL_INTERVAL};
+pub use evidence_collection::collect_eval_case_evidence;
+pub use execute::{
+    execute_manifest, execute_manifest_with_cancellation, EvalExecuteConfig,
+    DEFAULT_EVAL_DISPATCH_TIMEOUT, DEFAULT_EVAL_POLL_INTERVAL,
+};
 pub use historical_replay::{
     historical_replay_command_digest, parse_historical_replay_cohort_str,
     validate_historical_replay_cohort, HistoricalReplayCase, HistoricalReplayCohort,
@@ -42,9 +51,9 @@ pub use historical_replay::{
 pub use manifest::{
     parse_benchmark_manifest_str, EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseRisk,
     EvalCaseVerdict, EvalCommitResolution, EvalIsolationLifecycle, EvalIsolationProfile,
-    ManifestError, DEFAULT_CASE_TIMEOUT_SECS, DEFAULT_EVAL_ISOLATION_BACKEND,
-    DEFAULT_EVAL_ISOLATION_IMAGE, DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE,
-    DEFAULT_EVAL_ISOLATION_SANDBOX,
+    EvalVerifyCommandMode, ManifestError, DEFAULT_CASE_TIMEOUT_SECS,
+    DEFAULT_EVAL_ISOLATION_BACKEND, DEFAULT_EVAL_ISOLATION_IMAGE,
+    DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE, DEFAULT_EVAL_ISOLATION_SANDBOX,
 };
 pub use report::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
@@ -54,9 +63,8 @@ pub use report::{
     EvalRunReportDiff,
 };
 pub use run::{
-    cleanup_cancelled_eval_run, dispatch_eval_case_workflow, enqueue_eval_case_workflow,
-    eval_isolated_runtime_profile, EvalCaseDispatchOutcome, EvalCaseEnqueueOutcome,
-    EvalCaseWorkflowInput, EvalCaseWorkflowPlan, EvalRunCleanupInput, EvalRunCleanupSummary,
-    EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
+    cleanup_cancelled_eval_run, enqueue_eval_case_workflow, eval_isolated_runtime_profile,
+    EvalCaseEnqueueOutcome, EvalCaseWorkflowInput, EvalCaseWorkflowPlan, EvalRunCleanupInput,
+    EvalRunCleanupSummary, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
 };
 pub use scoring::{score_pr_repair_eval, ScoringError};

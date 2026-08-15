@@ -77,6 +77,16 @@ impl GitHubPrSnapshotArtifacts {
             .with_signal(signal)
     }
 
+    pub(crate) fn eval_draft_validation_activity_result(&self, activity: &str) -> ActivityResult {
+        let mut result = self.activity_result(activity);
+        let mut signal = pr_feedback_signal_for_snapshot(&self.normalized_snapshot);
+        signal.signal_type = "PrReadyToMerge".to_string();
+        result.summary =
+            "Server-owned eval draft snapshot is ready for evaluator validation.".to_string();
+        result.signals = vec![signal];
+        result
+    }
+
     pub(crate) fn remote_fact_snapshot(&self) -> anyhow::Result<RemoteFactSnapshot> {
         let repo = value_string(self.normalized_snapshot.get("repo"))
             .context("server PR snapshot missing repo")?;
@@ -106,6 +116,20 @@ impl GitHubPrSnapshotArtifacts {
         }
         Ok(snapshot)
     }
+}
+
+pub(crate) fn eval_draft_snapshot_allows_validation(snapshot: &Value) -> bool {
+    string_eq(snapshot, "snapshot_source", "server_github_graphql")
+        && string_eq(snapshot, "state", "OPEN")
+        && snapshot.get("is_draft").and_then(Value::as_bool) == Some(true)
+        && value_string(snapshot.get("head_oid"))
+            .as_deref()
+            .is_some_and(valid_git_oid)
+        && snapshot_base_ref_matches_expected(snapshot)
+}
+
+fn valid_git_oid(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

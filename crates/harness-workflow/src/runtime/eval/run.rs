@@ -4,14 +4,13 @@ use super::{
     transition_outcome::accepted_transition_record,
 };
 use crate::runtime::{
-    build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeCommandDispatcher,
-    RuntimeJobStatus, RuntimeKind, RuntimeProfile, SubmissionMode, ValidationContext,
-    WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision,
-    WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
-    WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeJobStatus,
+    RuntimeProfile, SubmissionMode, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
+    WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition,
+    WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use chrono::Utc;
-use harness_core::config::isolation::{IsolationConfig, IsolationRule, IsolationTrustClass};
 use serde_json::{json, Value};
 
 pub const EVAL_BRANCH_PREFIX: &str = "harness-eval/";
@@ -33,12 +32,6 @@ pub struct EvalCaseEnqueueOutcome {
     pub command_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct EvalCaseDispatchOutcome {
-    pub enqueue: EvalCaseEnqueueOutcome,
-    pub dispatched_jobs: usize,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct EvalCaseWorkflowInput<'a> {
     pub eval_run_id: &'a str,
@@ -46,6 +39,8 @@ pub struct EvalCaseWorkflowInput<'a> {
     pub project_id: &'a str,
     pub task_id: &'a str,
     pub additional_prompt: Option<&'a str>,
+    pub timeout_secs: u64,
+    pub resource_limits: &'a harness_sandbox::CappedResourceLimits,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +124,7 @@ pub async fn enqueue_eval_case_workflow(
     input: EvalCaseWorkflowInput<'_>,
 ) -> anyhow::Result<EvalCaseEnqueueOutcome> {
     validate_eval_case_replayable(input.case)?;
+    let verification_argv = input.case.verification_command_argv()?;
 
     store
         .upsert_definition(
@@ -137,7 +133,7 @@ pub async fn enqueue_eval_case_workflow(
         )
         .await?;
 
-    let initial_instance = eval_case_initial_instance(input);
+    let initial_instance = eval_case_initial_instance(input, &verification_argv);
     let additional_prompt = eval_case_additional_prompt(input.additional_prompt);
     let output = build_issue_submission_decision(
         &initial_instance,
@@ -155,7 +151,7 @@ pub async fn enqueue_eval_case_workflow(
             candidate_fanout: None,
         },
     );
-    let decision = with_eval_command_metadata(output.decision, input);
+    let decision = with_eval_command_metadata(output.decision, input, &verification_argv);
     let validator = crate::runtime::DecisionValidator::github_issue_pr();
     validator.validate(
         &initial_instance,
@@ -167,7 +163,7 @@ pub async fn enqueue_eval_case_workflow(
     submitted_instance.state = decision.next_state.clone();
     submitted_instance.version = submitted_instance.version.saturating_add(1);
     submitted_instance.replace_classified_data(
-        eval_case_submitted_data(input, &decision.decision),
+        eval_case_submitted_data(input, &decision.decision, &verification_argv),
         crate::runtime::DataProvenance::Server,
     );
     let record = accepted_transition_record(
@@ -224,104 +220,21 @@ fn validate_eval_case_replayable(case: &EvalBenchmarkCase) -> anyhow::Result<()>
     if let Some(blocker) = case.replay_blocker() {
         anyhow::bail!("eval case {} is not replayable: {blocker}", case.case_id);
     }
+    case.verification_command_argv()?;
     Ok(())
 }
 
-pub async fn dispatch_eval_case_workflow(
-    store: &WorkflowRuntimeStore,
-    runtime_profile: RuntimeProfile,
-    input: EvalCaseWorkflowInput<'_>,
-) -> anyhow::Result<EvalCaseDispatchOutcome> {
-    validate_eval_runtime_profile(&runtime_profile, input.case)?;
-    ensure_eval_runtime_profile_supports_resource_limits(&runtime_profile, input)?;
-    let enqueue = enqueue_eval_case_workflow(store, input).await?;
-    let outcomes = RuntimeCommandDispatcher::new(store, runtime_profile)
-        .with_isolation_config(eval_case_isolation_config(input.case))
-        .dispatch_pending()
-        .await?;
-    let dispatched_jobs = outcomes
-        .into_iter()
-        .filter(|outcome| {
-            matches!(
-                outcome,
-                crate::runtime::CommandDispatchOutcome::Enqueued { .. }
-                    | crate::runtime::CommandDispatchOutcome::AlreadyDispatched { .. }
-            )
-        })
-        .count();
-    Ok(EvalCaseDispatchOutcome {
-        enqueue,
-        dispatched_jobs,
-    })
-}
-
-pub fn eval_isolated_runtime_profile(case: &EvalBenchmarkCase) -> RuntimeProfile {
+pub fn eval_isolated_runtime_profile(
+    case: &EvalBenchmarkCase,
+    timeout_secs: u64,
+) -> RuntimeProfile {
     let mut profile = RuntimeProfile::new(
         case.isolation.runtime_profile.clone(),
         case.isolation.runtime_kind,
     );
     profile.sandbox = Some(case.isolation.sandbox.clone());
-    profile.timeout_secs = Some(case.timeout_secs);
+    profile.timeout_secs = Some(timeout_secs);
     profile
-}
-
-fn validate_eval_runtime_profile(
-    profile: &RuntimeProfile,
-    case: &EvalBenchmarkCase,
-) -> anyhow::Result<()> {
-    if profile.kind != case.isolation.runtime_kind {
-        anyhow::bail!(
-            "eval case {} requires runtime kind `{}`, got `{}`",
-            case.case_id,
-            case.isolation.runtime_kind.as_str(),
-            profile.kind.as_str()
-        );
-    }
-    if profile.name != case.isolation.runtime_profile {
-        anyhow::bail!(
-            "eval case {} requires runtime profile `{}`, got `{}`",
-            case.case_id,
-            case.isolation.runtime_profile,
-            profile.name
-        );
-    }
-    if profile.sandbox.as_deref() != Some(case.isolation.sandbox.as_str()) {
-        anyhow::bail!(
-            "eval case {} requires sandbox `{}`, got `{}`",
-            case.case_id,
-            case.isolation.sandbox,
-            profile.sandbox.as_deref().unwrap_or("<unset>")
-        );
-    }
-    Ok(())
-}
-
-fn eval_case_isolation_config(case: &EvalBenchmarkCase) -> IsolationConfig {
-    IsolationConfig {
-        default_tier: case.isolation.tier,
-        rules: vec![IsolationRule {
-            trust: IsolationTrustClass::NonCollaborator,
-            tier: case.isolation.tier,
-        }],
-        network_allowlist: Vec::new(),
-    }
-}
-
-fn ensure_eval_runtime_profile_supports_resource_limits(
-    runtime_profile: &RuntimeProfile,
-    input: EvalCaseWorkflowInput<'_>,
-) -> anyhow::Result<()> {
-    if runtime_profile.kind == RuntimeKind::RemoteHost
-        || input.case.resource_limits.effective.is_empty()
-    {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "resource-limited eval case {} requires a remote_host runtime profile; profile `{}` is `{}`",
-        input.case.case_id,
-        runtime_profile.name,
-        runtime_profile.kind.as_str()
-    );
 }
 
 pub async fn cleanup_cancelled_eval_run(
@@ -554,7 +467,10 @@ fn active_runtime_job_status(status: RuntimeJobStatus) -> bool {
     )
 }
 
-pub(super) fn eval_case_initial_instance(input: EvalCaseWorkflowInput<'_>) -> WorkflowInstance {
+pub(super) fn eval_case_initial_instance(
+    input: EvalCaseWorkflowInput<'_>,
+    verification_argv: &[Vec<String>],
+) -> WorkflowInstance {
     WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
@@ -566,12 +482,16 @@ pub(super) fn eval_case_initial_instance(input: EvalCaseWorkflowInput<'_>) -> Wo
         &input.case.case_id,
     ))
     .with_classified_data(
-        eval_case_submitted_data(input, "created"),
+        eval_case_submitted_data(input, "created", verification_argv),
         crate::runtime::DataProvenance::Server,
     )
 }
 
-fn eval_case_submitted_data(input: EvalCaseWorkflowInput<'_>, last_decision: &str) -> Value {
+fn eval_case_submitted_data(
+    input: EvalCaseWorkflowInput<'_>,
+    last_decision: &str,
+    verification_argv: &[Vec<String>],
+) -> Value {
     json!({
         "project_id": input.project_id,
         "repo": input.case.repo,
@@ -588,8 +508,9 @@ fn eval_case_submitted_data(input: EvalCaseWorkflowInput<'_>, last_decision: &st
             "case_id": input.case.case_id,
             "base_commit": input.case.base_commit,
             "verify_commands": input.case.verify_commands,
-            "timeout_secs": input.case.timeout_secs,
-            "resource_limits": input.case.resource_limits,
+            "verify_commands_argv": verification_argv,
+            "timeout_secs": input.timeout_secs,
+            "resource_limits": input.resource_limits,
             "branch_prefix": EVAL_BRANCH_PREFIX,
             "pull_request_mode": EVAL_PR_DRAFT_MODE,
             "isolation": eval_isolation_metadata(&input.case.isolation),
@@ -602,6 +523,7 @@ fn eval_case_submitted_data(input: EvalCaseWorkflowInput<'_>, last_decision: &st
 fn with_eval_command_metadata(
     mut decision: crate::runtime::WorkflowDecision,
     input: EvalCaseWorkflowInput<'_>,
+    verification_argv: &[Vec<String>],
 ) -> crate::runtime::WorkflowDecision {
     for command in &mut decision.commands {
         let Some(object) = command.command.as_object_mut() else {
@@ -614,8 +536,9 @@ fn with_eval_command_metadata(
                 "case_id": input.case.case_id,
                 "base_commit": input.case.base_commit,
                 "verify_commands": input.case.verify_commands,
-                "timeout_secs": input.case.timeout_secs,
-                "resource_limits": input.case.resource_limits,
+                "verify_commands_argv": verification_argv,
+                "timeout_secs": input.timeout_secs,
+                "resource_limits": input.resource_limits,
                 "branch_prefix": EVAL_BRANCH_PREFIX,
                 "pull_request_mode": EVAL_PR_DRAFT_MODE,
                 "isolation": eval_isolation_metadata(&input.case.isolation),
@@ -627,6 +550,10 @@ fn with_eval_command_metadata(
         object.insert(
             "validation_commands".to_string(),
             json!(input.case.verify_commands),
+        );
+        object.insert(
+            "validation_commands_argv".to_string(),
+            json!(verification_argv),
         );
     }
     decision
@@ -654,7 +581,9 @@ This is a Harness eval run. Execute through the normal workflow runtime path, \
 open only a draft pull request, use the harness-eval/ branch prefix, use the \
 recorded eval isolation profile, keep untrusted case execution out of the \
 caller/server environment, retain backend/image/lifecycle/cleanup evidence, \
-and do not merge or close the eval-produced PR.";
+and do not merge or close the eval-produced PR. Before making changes, check out \
+the exact requested base commit. The runtime host independently reports the \
+observed checkout commit to the server.";
 
 fn eval_case_additional_prompt(additional_prompt: Option<&str>) -> String {
     match additional_prompt
@@ -667,361 +596,5 @@ fn eval_case_additional_prompt(additional_prompt: Option<&str>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::runtime::{RuntimeKind, RuntimeProfile, WorkflowRuntimeStore};
-
-    #[test]
-    fn eval_run_plan_marks_issue_submission_for_draft_prs() -> anyhow::Result<()> {
-        let case = EvalBenchmarkCase {
-            case_id: "owner/repo#42".to_string(),
-            repo: "owner/repo".to_string(),
-            issue: 42,
-            base_commit: "abcdef1".to_string(),
-            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
-            paths: Vec::new(),
-            risk: None,
-            evidence: Vec::new(),
-            resolution_prs: Vec::new(),
-            resolution_commits: Vec::new(),
-            commit_resolution: None,
-            verdict: None,
-            timeout_secs: 120,
-            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
-                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
-            isolation: EvalIsolationProfile::default(),
-        };
-        let input = EvalCaseWorkflowInput {
-            eval_run_id: "run-1",
-            case: &case,
-            project_id: "/repo",
-            task_id: "eval-task-1",
-            additional_prompt: None,
-        };
-
-        let initial = eval_case_initial_instance(input);
-        assert_eq!(initial.id, "eval:run-1:owner/repo#42");
-        assert_eq!(initial.definition_id, GITHUB_ISSUE_PR_DEFINITION_ID);
-        assert_eq!(initial.data["author_trust_class"], "non_collaborator");
-        assert_eq!(initial.data["eval"]["eval_run_id"], "run-1");
-        assert_eq!(initial.data["eval"]["branch_prefix"], EVAL_BRANCH_PREFIX);
-        assert_eq!(
-            initial.data["eval"]["pull_request_mode"],
-            EVAL_PR_DRAFT_MODE
-        );
-        assert_eq!(initial.data["eval"]["isolation"]["tier"], "container");
-        assert_eq!(
-            initial.data["eval"]["isolation"]["runtime_kind"],
-            "remote_host"
-        );
-        assert_eq!(
-            initial.data["eval"]["isolation"]["runtime_profile"],
-            "eval-isolated-runtime-host"
-        );
-        assert_eq!(initial.data["eval"]["isolation"]["lifecycle"], "ephemeral");
-        assert_eq!(initial.data["eval"]["isolation"]["cleanup_required"], true);
-
-        let output = build_issue_submission_decision(
-            &initial,
-            IssueSubmissionDecisionInput {
-                task_id: "eval-task-1",
-                repo: Some("owner/repo"),
-                issue_number: 42,
-                labels: &[],
-                force_execute: true,
-                additional_prompt: Some(EVAL_CASE_DEFAULT_ADDITIONAL_PROMPT),
-                depends_on: &[],
-                dependencies_blocked: false,
-                remote_fact_hash: None,
-                submission_mode: SubmissionMode::Immediate,
-                candidate_fanout: None,
-            },
-        );
-        let decision = with_eval_command_metadata(output.decision, input);
-        let command = &decision.commands[0].command;
-        assert_eq!(command["activity"], "implement_issue");
-        assert_eq!(command["eval"]["eval_run_id"], "run-1");
-        assert_eq!(
-            command["eval"]["resource_limits"]["effective"]["wall_time_secs"],
-            120
-        );
-        assert_eq!(command["branch_prefix"], EVAL_BRANCH_PREFIX);
-        assert_eq!(command["pull_request_mode"], EVAL_PR_DRAFT_MODE);
-        assert_eq!(command["eval"]["isolation"]["tier"], "container");
-        assert_eq!(command["eval"]["isolation"]["runtime_kind"], "remote_host");
-        assert_eq!(
-            command["validation_commands"][0],
-            "cargo test -p harness-workflow eval_run"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn eval_run_prompt_preserves_required_draft_pr_constraints() {
-        let prompt = eval_case_additional_prompt(Some("Use the small implementation slice."));
-        assert!(prompt.contains("open only a draft pull request"));
-        assert!(prompt.contains("harness-eval/ branch prefix"));
-        assert!(prompt.contains("Use the small implementation slice."));
-    }
-
-    #[test]
-    fn eval_run_rejects_pending_cases_before_dispatch() {
-        let case = EvalBenchmarkCase {
-            case_id: "pending-case".to_string(),
-            repo: "owner/repo".to_string(),
-            issue: 42,
-            base_commit: "abcdef1".to_string(),
-            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
-            paths: Vec::new(),
-            risk: None,
-            evidence: Vec::new(),
-            resolution_prs: Vec::new(),
-            resolution_commits: Vec::new(),
-            commit_resolution: Some(crate::runtime::eval::manifest::EvalCommitResolution::Pending),
-            verdict: Some(crate::runtime::eval::manifest::EvalCaseVerdict::Pending),
-            timeout_secs: 120,
-            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
-                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
-                .expect("default resource limits should be valid"),
-            isolation: crate::runtime::eval::manifest::EvalIsolationProfile::default(),
-        };
-
-        let err =
-            validate_eval_case_replayable(&case).expect_err("pending case should not dispatch");
-        assert!(err.to_string().contains("commit_resolution is pending"));
-    }
-
-    #[test]
-    fn eval_cleanup_summary_requires_zero_remaining_resources() {
-        let mut summary = EvalRunCleanupSummary::new("run-1");
-        assert!(summary.is_clean());
-
-        summary.active_runtime_jobs = 1;
-        assert!(!summary.is_clean());
-
-        summary.active_runtime_jobs = 0;
-        summary.orphan_pull_requests = 1;
-        assert!(!summary.is_clean());
-    }
-
-    #[tokio::test]
-    async fn eval_cleanup_cancels_mid_run_workflow_without_runtime_orphans() -> anyhow::Result<()> {
-        if std::env::var_os("HARNESS_DATABASE_URL").is_none() {
-            return Ok(());
-        }
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime_store")).await?;
-        let case = EvalBenchmarkCase {
-            case_id: "owner/repo#42".to_string(),
-            repo: "owner/repo".to_string(),
-            issue: 42,
-            base_commit: "abcdef1".to_string(),
-            verify_commands: vec!["cargo test -p harness-workflow eval_cleanup".to_string()],
-            paths: Vec::new(),
-            risk: None,
-            evidence: Vec::new(),
-            resolution_prs: Vec::new(),
-            resolution_commits: Vec::new(),
-            commit_resolution: None,
-            verdict: None,
-            timeout_secs: 120,
-            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
-                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
-            isolation: EvalIsolationProfile::default(),
-        };
-        let outcome = enqueue_eval_case_workflow(
-            &store,
-            EvalCaseWorkflowInput {
-                eval_run_id: "run-cleanup",
-                case: &case,
-                project_id: dir.path().to_string_lossy().as_ref(),
-                task_id: "eval-task-1",
-                additional_prompt: None,
-            },
-        )
-        .await?;
-        assert_eq!(outcome.command_ids.len(), 1);
-        let _job = store
-            .enqueue_runtime_job_for_pending_command(
-                &outcome.command_ids[0],
-                RuntimeKind::CodexExec,
-                "codex",
-                json!({
-                    "activity": "implement_issue",
-                    "eval": {
-                        "eval_run_id": "run-cleanup",
-                        "case_id": case.case_id.clone(),
-                    }
-                }),
-                None,
-            )
-            .await?;
-
-        let summary = cleanup_cancelled_eval_run(
-            &store,
-            EvalRunCleanupInput {
-                eval_run_id: "run-cleanup",
-                cases: std::slice::from_ref(&case),
-                reason: "operator cancelled eval run",
-            },
-        )
-        .await?;
-
-        assert_eq!(summary.workflows_seen, 1);
-        assert_eq!(summary.workflows_cancelled, 1);
-        assert_eq!(summary.commands_cancelled, 1);
-        assert_eq!(summary.runtime_jobs_cancelled, 1);
-        assert!(summary.is_clean());
-
-        let workflow = match store.get_instance(&outcome.plan.workflow_id).await? {
-            Some(workflow) => workflow,
-            None => panic!("eval workflow should remain as terminal history"),
-        };
-        assert_eq!(workflow.state, "cancelled");
-        assert_eq!(
-            workflow.data["eval"]["cleanup"]["reason"],
-            "operator cancelled eval run"
-        );
-
-        let commands = store.commands_for(&outcome.plan.workflow_id).await?;
-        assert!(commands.iter().all(|command| {
-            matches!(
-                command.status,
-                WorkflowCommandStatus::Cancelled | WorkflowCommandStatus::HandledInline
-            )
-        }));
-        let jobs = store
-            .runtime_jobs_for_command(&outcome.command_ids[0])
-            .await?;
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].status, RuntimeJobStatus::Cancelled);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn eval_run_defers_without_required_container_availability() -> anyhow::Result<()> {
-        if std::env::var_os("HARNESS_DATABASE_URL").is_none() {
-            return Ok(());
-        }
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime_store")).await?;
-        let case = EvalBenchmarkCase {
-            case_id: "owner/repo#42".to_string(),
-            repo: "owner/repo".to_string(),
-            issue: 42,
-            base_commit: "abcdef1".to_string(),
-            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
-            paths: Vec::new(),
-            risk: None,
-            evidence: Vec::new(),
-            resolution_prs: Vec::new(),
-            resolution_commits: Vec::new(),
-            commit_resolution: None,
-            verdict: None,
-            timeout_secs: 120,
-            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
-                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
-            isolation: EvalIsolationProfile::default(),
-        };
-
-        let outcome = dispatch_eval_case_workflow(
-            &store,
-            eval_isolated_runtime_profile(&case),
-            EvalCaseWorkflowInput {
-                eval_run_id: "run-1",
-                case: &case,
-                project_id: dir.path().to_string_lossy().as_ref(),
-                task_id: "eval-task-1",
-                additional_prompt: None,
-            },
-        )
-        .await?;
-        assert_eq!(outcome.dispatched_jobs, 0);
-        assert_eq!(outcome.enqueue.command_ids.len(), 1);
-        let jobs = store
-            .runtime_jobs_for_command(&outcome.enqueue.command_ids[0])
-            .await?;
-        assert!(jobs.is_empty());
-        let command = store
-            .commands_for(&outcome.enqueue.plan.workflow_id)
-            .await?;
-        assert_eq!(command[0].status, WorkflowCommandStatus::Deferred);
-        let barrier = command[0]
-            .dispatch_barrier
-            .as_ref()
-            .expect("missing eval container availability should persist a barrier");
-        assert_eq!(barrier.reason_code.as_str(), "isolation_tier_unavailable");
-        assert_eq!(barrier.required_tier.as_deref(), Some("container"));
-        assert_eq!(barrier.trust_class.as_deref(), Some("non_collaborator"));
-        Ok(())
-    }
-
-    #[test]
-    fn eval_isolation_rejects_caller_runtime_profiles() -> anyhow::Result<()> {
-        let case = EvalBenchmarkCase {
-            case_id: "owner/repo#42".to_string(),
-            repo: "owner/repo".to_string(),
-            issue: 42,
-            base_commit: "abcdef1".to_string(),
-            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
-            paths: Vec::new(),
-            risk: None,
-            evidence: Vec::new(),
-            resolution_prs: Vec::new(),
-            resolution_commits: Vec::new(),
-            commit_resolution: None,
-            verdict: None,
-            timeout_secs: 120,
-            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
-                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
-            isolation: EvalIsolationProfile::default(),
-        };
-        let profile = RuntimeProfile::new("codex", RuntimeKind::CodexExec);
-
-        let error = validate_eval_runtime_profile(&profile, &case)
-            .expect_err("local eval runtime must be rejected");
-
-        assert!(error.to_string().contains("requires runtime kind"));
-        Ok(())
-    }
-
-    #[test]
-    fn eval_run_rejects_local_runtime_profile_for_resource_limited_cases() -> anyhow::Result<()> {
-        let case = EvalBenchmarkCase {
-            case_id: "owner/repo#42".to_string(),
-            repo: "owner/repo".to_string(),
-            issue: 42,
-            base_commit: "abcdef1".to_string(),
-            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
-            paths: Vec::new(),
-            risk: None,
-            evidence: Vec::new(),
-            resolution_prs: Vec::new(),
-            resolution_commits: Vec::new(),
-            commit_resolution: None,
-            verdict: None,
-            timeout_secs: 120,
-            resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
-                .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
-            isolation: EvalIsolationProfile::default(),
-        };
-
-        let err = ensure_eval_runtime_profile_supports_resource_limits(
-            &RuntimeProfile::new("codex", RuntimeKind::CodexExec),
-            EvalCaseWorkflowInput {
-                eval_run_id: "run-1",
-                case: &case,
-                project_id: "/repo",
-                task_id: "eval-task-1",
-                additional_prompt: None,
-            },
-        )
-        .expect_err("resource-limited evals should not dispatch to local profiles");
-
-        assert!(err
-            .to_string()
-            .contains("requires a remote_host runtime profile"));
-        Ok(())
-    }
-}
+#[path = "run_tests.rs"]
+mod tests;

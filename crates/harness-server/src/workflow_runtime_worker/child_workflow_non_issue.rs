@@ -2,10 +2,10 @@ use crate::http::AppState;
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     build_pr_feedback_inspect_decision, build_quality_gate_run_decision, ActivityArtifact,
-    ActivityErrorKind, ActivityResult, PrFeedbackInspectDecisionInput, QualityGateDecisionInput,
-    RuntimeJob, WorkflowChildStart, WorkflowCommandStatus, WorkflowDefinition, WorkflowInstance,
-    WorkflowSubject, WorkflowSubmissionDecisionTransition, PROMPT_TASK_DEFINITION_ID,
-    PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
+    ActivityErrorKind, ActivityResult, DataProvenance, PrFeedbackInspectDecisionInput,
+    QualityGateDecisionInput, RuntimeJob, WorkflowChildStart, WorkflowCommandStatus,
+    WorkflowDefinition, WorkflowInstance, WorkflowSubject, WorkflowSubmissionDecisionTransition,
+    PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -16,8 +16,8 @@ use super::child_workflow_replay::{
     decision_for_event, ensure_runtime_job_still_owns_lease,
 };
 use super::data_helpers::{
-    activity_name, merge_pr_feedback_child_data, optional_string, parse_pr_subject_key,
-    required_string, string_vec, PrFeedbackChildData,
+    activity_name, merge_pr_feedback_child_data, optional_string, optional_string_matrix_strict,
+    optional_string_vec_strict, parse_pr_subject_key, required_string, PrFeedbackChildData,
 };
 use super::workspace::{is_active_pr_feedback_inspect_command, is_pr_feedback_inspect_command};
 
@@ -137,6 +137,7 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         anyhow::bail!("workflow runtime store is unavailable");
     };
+    ensure_runtime_job_still_owns_lease(store, job).await?;
     let parent =
         parent.ok_or_else(|| anyhow::anyhow!("quality_gate child workflow requires a parent"))?;
     let project_id = parent
@@ -160,7 +161,47 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
     });
-    let validation_commands = string_vec(command, "validation_commands");
+    let validation_commands = match optional_string_vec_strict(command, "validation_commands")? {
+        Some(commands) if !commands.is_empty() => commands,
+        _ => match parent.data.pointer("/eval/verify_commands") {
+            Some(value) => optional_string_vec_strict(&json!({"commands": value}), "commands")?
+                .unwrap_or_default(),
+            None => Vec::new(),
+        },
+    };
+    let validation_commands_argv =
+        match optional_string_matrix_strict(command, "validation_commands_argv")? {
+            Some(commands) => Some(commands),
+            None => match parent.data.pointer("/eval/verify_commands_argv") {
+                Some(value) => {
+                    optional_string_matrix_strict(&json!({"commands": value}), "commands")?
+                }
+                None => None,
+            },
+        };
+    let eval = harness_workflow::runtime::server_owned_eval_metadata(parent);
+    let expected_head_sha = if eval.is_some() {
+        let provenance = parent
+            .data_provenance
+            .as_ref()
+            .and_then(|value| value.provenance_for("/pr_head_sha"));
+        if provenance != Some(DataProvenance::External) {
+            anyhow::bail!("eval quality gate requires an externally verified PR head");
+        }
+        Some(
+            parent
+                .data
+                .get("pr_head_sha")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() == 40
+                        && value.chars().all(|character| character.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| anyhow::anyhow!("eval quality gate PR head is invalid"))?,
+        )
+    } else {
+        None
+    };
     let child_id = format!("{}::quality-gate:{}", parent.id, job.command_id);
     store
         .upsert_definition(&WorkflowDefinition::new(
@@ -194,7 +235,7 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
     } else if child.parent_workflow_id.is_none() {
         child.parent_workflow_id = Some(parent.id.clone());
     }
-    child.apply_data_writes([
+    let mut data_writes = vec![
         harness_workflow::runtime::WorkflowDataWrite::set(
             "project_id",
             json!(project_id),
@@ -245,7 +286,15 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
             json!(validation_commands),
             harness_workflow::runtime::DataProvenance::Agent,
         ),
-    ])?;
+    ];
+    if let Some(validation_commands_argv) = &validation_commands_argv {
+        data_writes.push(harness_workflow::runtime::WorkflowDataWrite::set(
+            "validation_commands_argv",
+            json!(validation_commands_argv),
+            harness_workflow::runtime::DataProvenance::Server,
+        ));
+    }
+    child.apply_data_writes(data_writes)?;
     let inherited_trust = inherit_author_trust_class(&mut child, &parent.data)?;
     if !child_started_by_command || !child_start_event_recorded {
         child = store
@@ -294,6 +343,9 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
             QualityGateDecisionInput {
                 reason: "Parent PR workflow requested a quality gate before ready_to_merge.",
                 validation_commands: &validation_commands,
+                validation_commands_argv: validation_commands_argv.as_deref().unwrap_or(&[]),
+                eval,
+                expected_head_sha,
             },
         );
         if let Some(record) = existing_record.as_ref().filter(|record| !record.accepted) {
@@ -470,6 +522,7 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             command_id: job.command_id.as_str(),
             remote_fact_hash,
             remote_fact_activity_at,
+            eval: harness_workflow::runtime::server_owned_eval_metadata(parent),
         },
     )?;
     let inherited_trust = inherit_author_trust_class(&mut child, &parent.data)?;

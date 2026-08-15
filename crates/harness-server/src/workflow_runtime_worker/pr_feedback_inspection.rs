@@ -1,6 +1,7 @@
 use crate::github_pr_snapshot::{
-    fetch_github_pr_snapshot, github_pr_snapshot_failure_result, pr_readiness_for_snapshot,
-    GitHubPrSnapshotArtifacts, GitHubPrSnapshotTarget,
+    eval_draft_snapshot_allows_validation, fetch_github_pr_snapshot,
+    github_pr_snapshot_failure_result, pr_readiness_for_snapshot, GitHubPrSnapshotArtifacts,
+    GitHubPrSnapshotTarget,
 };
 use crate::http::AppState;
 use harness_workflow::runtime::{
@@ -50,7 +51,15 @@ pub(super) async fn execute_pr_feedback_inspection(
                         readiness = readiness.as_str(),
                         "server-owned PR feedback inspection collected remote facts"
                     );
-                    artifacts.activity_result(&activity)
+                    if workflow
+                        .and_then(harness_workflow::runtime::server_owned_eval_metadata)
+                        .is_some()
+                        && eval_draft_snapshot_allows_validation(&artifacts.normalized_snapshot)
+                    {
+                        artifacts.eval_draft_validation_activity_result(&activity)
+                    } else {
+                        artifacts.activity_result(&activity)
+                    }
                 }
                 Err(error) => ActivityResult::failed(
                     activity,

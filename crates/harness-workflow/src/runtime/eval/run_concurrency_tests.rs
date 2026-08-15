@@ -1,4 +1,4 @@
-use super::manifest::{EvalBenchmarkCase, EvalIsolationProfile};
+use super::manifest::{EvalBenchmarkCase, EvalIsolationProfile, EvalVerifyCommandMode};
 use super::run::*;
 use crate::runtime::{DataProvenance, WorkflowCommandStatus, WorkflowRuntimeStore};
 use harness_core::db::resolve_database_url;
@@ -12,6 +12,7 @@ fn benchmark_case(case_id: &str) -> EvalBenchmarkCase {
         issue: 42,
         base_commit: "abcdef1".to_string(),
         verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
+        verify_command_mode: EvalVerifyCommandMode::Argv,
         paths: Vec::new(),
         risk: None,
         evidence: Vec::new(),
@@ -67,8 +68,11 @@ async fn eval_enqueue_does_not_return_a_plan_for_a_same_state_stale_snapshot() -
         project_id: project_id.as_ref(),
         task_id: "eval-stale-enqueue-task",
         additional_prompt: None,
+        timeout_secs: case.timeout_secs,
+        resource_limits: &case.resource_limits,
     };
-    let mut concurrent_instance = eval_case_initial_instance(input);
+    let verification_argv = input.case.verification_command_argv()?;
+    let mut concurrent_instance = eval_case_initial_instance(input, &verification_argv);
     concurrent_instance.version = concurrent_instance.version.saturating_add(1);
     concurrent_instance.set_data_field(
         "concurrent_marker",
@@ -126,6 +130,8 @@ async fn eval_cleanup_reloads_latest_instance_after_a_same_state_stale_transitio
             project_id: dir.path().to_string_lossy().as_ref(),
             task_id: "eval-stale-cleanup-task",
             additional_prompt: None,
+            timeout_secs: case.timeout_secs,
+            resource_limits: &case.resource_limits,
         },
     )
     .await?;
@@ -232,6 +238,8 @@ async fn eval_cleanup_reports_reload_failure_when_the_workflow_disappears() -> a
             project_id: dir.path().to_string_lossy().as_ref(),
             task_id: "eval-missing-cleanup-task",
             additional_prompt: None,
+            timeout_secs: case.timeout_secs,
+            resource_limits: &case.resource_limits,
         },
     )
     .await?;

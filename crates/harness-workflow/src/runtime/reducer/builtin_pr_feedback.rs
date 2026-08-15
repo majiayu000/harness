@@ -326,13 +326,42 @@ fn ready_snapshot_proves_pr_ready(instance: &WorkflowInstance, result: &Activity
                 && snapshot_has_pr_identity(instance, result, &artifact.artifact)
                 && snapshot_has_head_identity(&artifact.artifact)
                 && snapshot_has_observation_time(&artifact.artifact)
-                && snapshot_check_state_allows_ready(&artifact.artifact)
-                && snapshot_merge_state_allows_ready(&artifact.artifact)
-                && snapshot_review_state_allows_ready(&artifact.artifact)
-                && snapshot_draft_state_allows_ready(&artifact.artifact)
-                && snapshot_review_threads_allow_ready(&artifact.artifact)
-                && snapshot_review_threads_are_complete(&artifact.artifact)
+                && (snapshot_allows_production_readiness(&artifact.artifact)
+                    || snapshot_allows_eval_draft_validation(instance, &artifact.artifact))
         })
+}
+
+fn snapshot_allows_production_readiness(snapshot: &Value) -> bool {
+    snapshot_check_state_allows_ready(snapshot)
+        && snapshot_merge_state_allows_ready(snapshot)
+        && snapshot_review_state_allows_ready(snapshot)
+        && snapshot_draft_state_allows_ready(snapshot)
+        && snapshot_review_threads_allow_ready(snapshot)
+        && snapshot_review_threads_are_complete(snapshot)
+}
+
+fn snapshot_allows_eval_draft_validation(instance: &WorkflowInstance, snapshot: &Value) -> bool {
+    crate::runtime::eval::server_owned_eval_metadata(instance).is_some()
+        && string_field(snapshot, &["head_oid", "head_sha", "headOid", "headSha"])
+            .is_some_and(valid_git_oid)
+        && string_field_matches(snapshot, &["state"], &["OPEN"])
+        && matches!(
+            field_bool(snapshot, &["is_draft", "isDraft", "draft"]),
+            Some(true)
+        )
+        && expected_base_ref_matches(instance, snapshot)
+}
+
+fn valid_git_oid(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+fn expected_base_ref_matches(instance: &WorkflowInstance, snapshot: &Value) -> bool {
+    let Some(expected) = optional_data_string(instance, "expected_base_ref") else {
+        return true;
+    };
+    string_field(snapshot, &["base_ref", "baseRefName"])
+        .is_some_and(|observed| observed == expected)
 }
 
 fn snapshot_has_server_source(snapshot: &Value) -> bool {
