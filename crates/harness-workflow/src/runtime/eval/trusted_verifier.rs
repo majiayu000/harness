@@ -215,7 +215,7 @@ fn read_workspace_file(
             "{relative} resolves outside the candidate workspace"
         ));
     }
-    fs::read_to_string(&path).map_err(|error| format!("failed to read {relative}: {error}"))
+    fs::read_to_string(&resolved).map_err(|error| format!("failed to read {relative}: {error}"))
 }
 
 fn require_fragments(source: &str, required: &[String], errors: &mut Vec<String>) {

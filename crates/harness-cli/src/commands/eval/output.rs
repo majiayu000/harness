@@ -109,15 +109,17 @@ pub(super) fn rewrite_eval_report<T: serde::Serialize>(
 ) -> anyhow::Result<()> {
     let temporary = path.with_extension(format!("event-retry-{}.tmp", std::process::id()));
     let result = (|| -> anyhow::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .with_context(|| {
-                format!("failed to create temporary report {}", temporary.display())
-            })?;
-        file.write_all(&serde_json::to_vec_pretty(value)?)?;
-        file.sync_all()?;
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .with_context(|| {
+                    format!("failed to create temporary report {}", temporary.display())
+                })?;
+            file.write_all(&serde_json::to_vec_pretty(value)?)?;
+            file.sync_all()?;
+        }
         fs::rename(&temporary, path).with_context(|| {
             format!(
                 "failed to replace eval report {} with {}",
@@ -213,6 +215,21 @@ mod tests {
         drop(first);
         assert!(!path.exists());
         assert!(reserve_eval_output(&path).is_ok());
+    }
+
+    #[test]
+    fn report_rewrite_replaces_an_existing_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("report.json");
+        fs::write(&path, r#"{"state":"before"}"#).expect("initial report");
+
+        rewrite_eval_report(&path, &serde_json::json!({ "state": "after" }))
+            .expect("report rewrite");
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("rewritten report should be readable"))
+                .expect("rewritten report should be valid JSON");
+        assert_eq!(report["state"], "after");
     }
 
     #[test]

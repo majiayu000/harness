@@ -463,6 +463,13 @@ mod tests {
             validate_trusted_verifier_output(verifier, verifier.sha256(), &forged.to_string())
                 .is_err()
         );
+
+        forged["passed"] = json!(true);
+        forged["untrusted_extension"] = json!("ignored only by a permissive verifier");
+        assert!(
+            validate_trusted_verifier_output(verifier, verifier.sha256(), &forged.to_string())
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
