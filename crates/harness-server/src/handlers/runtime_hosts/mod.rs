@@ -1,20 +1,21 @@
 mod completion;
 pub use completion::complete_runtime_job_for_runtime_host;
 
-use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
+use crate::http::rest_contract::{ContractJson, LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use axum::{
     extract::{rejection::JsonRejection, State},
     http::StatusCode,
 };
 use chrono::{DateTime, Utc};
+use harness_protocol::rest::{ClaimRuntimeJobRequest, RuntimeHostClaimResponse};
 use harness_sandbox::{
     CappedResourceLimits, ResourceLimitReport, ResourceLimits, EVAL_RESOURCE_LIMITS_CAPABILITY,
 };
 use harness_workflow::runtime::{
     prepare_runtime_transcript, ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob,
-    RuntimeJobClaimDecision, RuntimeJobClaimGuard, RuntimeJobNotFoundError, RuntimeKind,
-    WorkflowRuntimeStore,
+    RuntimeJobClaimDecision, RuntimeJobClaimDeferOutcome, RuntimeJobClaimGuard,
+    RuntimeJobNotFoundError, WorkflowRuntimeStore,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -25,6 +26,12 @@ pub use lease::renew_runtime_job_lease_for_runtime_host;
 
 const RESOURCE_LIMIT_CAPABILITY_RETRY_DELAY_SECS: i64 = 30;
 
+type ClaimJson = ContractJson<RuntimeHostClaimResponse>;
+
+fn claim_json(value: serde_json::Value) -> ClaimJson {
+    ContractJson(RuntimeHostClaimResponse(value))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterRuntimeHostRequest {
     pub host_id: String,
@@ -33,13 +40,7 @@ pub struct RegisterRuntimeHostRequest {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CompleteRuntimeJobRequest {
-    pub lease_expires_at: DateTime<Utc>,
-    #[serde(default)]
-    pub lease_generation: Option<u64>,
-    pub result: ActivityResult,
-}
+pub use harness_protocol::rest::{CompleteRuntimeJobRequest, RuntimeHostExecutionEvidence};
 
 pub async fn list_runtime_hosts(
     State(state): State<Arc<AppState>>,
@@ -234,14 +235,14 @@ pub async fn deregister_runtime_host(
 pub async fn claim_runtime_job_for_runtime_host(
     State(state): State<Arc<AppState>>,
     Path(host_id): Path<String>,
-    payload: Result<Json<lease::ClaimRuntimeJobRequest>, JsonRejection>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let Json(req) = match payload {
+    payload: Result<ContractJson<ClaimRuntimeJobRequest>, JsonRejection>,
+) -> (StatusCode, ClaimJson) {
+    let ContractJson(req) = match payload {
         Ok(payload) => payload,
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid runtime job claim request" })),
+                claim_json(json!({ "error": "invalid runtime job claim request" })),
             )
         }
     };
@@ -249,26 +250,26 @@ pub async fn claim_runtime_job_for_runtime_host(
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("runtime host '{host_id}' is not registered") })),
+            claim_json(json!({ "error": format!("runtime host '{host_id}' is not registered") })),
         );
     }
     if !state.runtime_hosts.is_active(&host_id) {
         return (
             StatusCode::CONFLICT,
-            Json(json!({ "error": "runtime host is draining" })),
+            claim_json(json!({ "error": "runtime host is draining" })),
         );
     }
     let host_supports_eval_resource_limits =
         runtime_host_supports_eval_resource_limits(&state, &host_id);
     let store = match workflow_runtime_store(&state) {
         Ok(store) => store,
-        Err(response) => return response,
+        Err(response) => return (response.0, claim_json(response.1 .0)),
     };
     if let Some(project) = req.project.as_deref().map(str::trim) {
         if !project.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({
+                claim_json(json!({
                     "error": "project filtering is not supported for workflow runtime-job claims"
                 })),
             );
@@ -276,19 +277,19 @@ pub async fn claim_runtime_job_for_runtime_host(
     }
     let lease_expires_at = match lease::runtime_host_lease_expires_at(req.lease_secs.value()) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return (response.0, claim_json(response.1 .0)),
     };
 
     let mut job = match store
-        .claim_next_runtime_job_for_runtime_kind(
-            RuntimeKind::RemoteHost,
+        .claim_next_remote_host_runtime_job(
             &host_id,
             lease_expires_at,
+            host_supports_eval_resource_limits,
         )
         .await
     {
         Ok(Some(job)) => job,
-        Ok(None) => return (StatusCode::OK, Json(json!({ "claimed": false }))),
+        Ok(None) => return (StatusCode::OK, claim_json(json!({ "claimed": false }))),
         Err(e) => {
             tracing::error!(
                 host_id = %host_id,
@@ -297,7 +298,7 @@ pub async fn claim_runtime_job_for_runtime_host(
             );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to claim runtime job: {e}") })),
+                claim_json(json!({ "error": format!("failed to claim runtime job: {e}") })),
             );
         }
     };
@@ -312,7 +313,7 @@ pub async fn claim_runtime_job_for_runtime_host(
                 .defer_runtime_job_claim_if_owned(&job.id, &host_id, lease_expires_at, not_before)
                 .await
             {
-                Ok(Some(_)) => {
+                Ok(RuntimeJobClaimDeferOutcome::Deferred(_)) => {
                     if let Err(e) = store
                         .record_runtime_event(
                             &job.id,
@@ -332,15 +333,21 @@ pub async fn claim_runtime_job_for_runtime_host(
                             "runtime host claim defer succeeded but runtime event recording failed"
                         );
                     }
-                    return (StatusCode::OK, Json(json!({ "claimed": false })));
+                    return (StatusCode::OK, claim_json(json!({ "claimed": false })));
                 }
-                Ok(None) => {
+                Ok(RuntimeJobClaimDeferOutcome::CancellationRequested(cancelled)) => {
+                    return (
+                        StatusCode::OK,
+                        claim_json(runtime_host_claim(cancelled, lease_expires_at)),
+                    );
+                }
+                Ok(RuntimeJobClaimDeferOutcome::StaleLease) => {
                     tracing::warn!(
                         runtime_job_id = %job.id,
                         host_id = %host_id,
                         "runtime host claim defer ignored because the host no longer owns the lease"
                     );
-                    return (StatusCode::OK, Json(json!({ "claimed": false })));
+                    return (StatusCode::OK, claim_json(json!({ "claimed": false })));
                 }
                 Err(e) => {
                     tracing::error!(
@@ -351,7 +358,7 @@ pub async fn claim_runtime_job_for_runtime_host(
                     );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": format!("failed to defer runtime job: {e}") })),
+                        claim_json(json!({ "error": format!("failed to defer runtime job: {e}") })),
                     );
                 }
             }
@@ -369,7 +376,7 @@ pub async fn claim_runtime_job_for_runtime_host(
                     "runtime host lacks eval_resource_limits capability",
                 )
                 .await;
-                return (status, Json(response));
+                return (status, claim_json(response));
             }
             Some(resource_limits)
         }
@@ -425,15 +432,13 @@ pub async fn claim_runtime_job_for_runtime_host(
         .await;
     }
 
-    let runtime_job_id = job.id.clone();
-    let lease_generation = job.lease_generation;
     let credential_environment =
         match crate::eval_credentials::attach_runtime_host_eval_environment_policy(&mut job) {
             Ok(environment) => environment,
             Err(error) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(
+                    claim_json(
                         json!({ "error": format!("invalid eval credential environment: {error}") }),
                     ),
                 );
@@ -463,33 +468,29 @@ pub async fn claim_runtime_job_for_runtime_host(
                     );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": "failed to persist eval credential policy audit" })),
+                        claim_json(
+                            json!({ "error": "failed to persist eval credential policy audit" }),
+                        ),
                     );
                 }
             }
             Ok(None) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "runtime job command missing during claim" })),
+                    claim_json(json!({ "error": "runtime job command missing during claim" })),
                 );
             }
             Err(error) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
+                    claim_json(
                         json!({ "error": format!("failed to load runtime job command: {error}") }),
                     ),
                 );
             }
         }
     }
-    let mut response = json!({
-        "claimed": true,
-        "runtime_job": job,
-        "runtime_job_id": runtime_job_id,
-        "lease_expires_at": lease_expires_at,
-        "lease_generation": lease_generation,
-    });
+    let mut response = runtime_host_claim(job, lease_expires_at);
     if let Some(credential_environment) = credential_environment {
         response["credential_environment"] = json!(credential_environment.audit());
         response["credential_environment_variables"] = json!(credential_environment.variables());
@@ -497,7 +498,7 @@ pub async fn claim_runtime_job_for_runtime_host(
     if let Some(resource_limits) = resource_limits {
         response["resource_limits"] = json!(resource_limits);
     }
-    (StatusCode::OK, Json(response))
+    (StatusCode::OK, claim_json(response))
 }
 
 async fn defer_runtime_host_resource_limit_claim(
@@ -513,7 +514,7 @@ async fn defer_runtime_host_resource_limit_claim(
         .defer_runtime_job_claim_if_owned(&job.id, host_id, lease_expires_at, not_before)
         .await
     {
-        Ok(Some(deferred)) => {
+        Ok(RuntimeJobClaimDeferOutcome::Deferred(deferred)) => {
             if let Err(error) = store
                 .record_runtime_event(
                     &job.id,
@@ -548,7 +549,11 @@ async fn defer_runtime_host_resource_limit_claim(
                 }),
             )
         }
-        Ok(None) => {
+        Ok(RuntimeJobClaimDeferOutcome::CancellationRequested(cancelled)) => (
+            StatusCode::OK,
+            runtime_host_claim(cancelled, lease_expires_at),
+        ),
+        Ok(RuntimeJobClaimDeferOutcome::StaleLease) => {
             tracing::warn!(
                 runtime_job_id = %job.id,
                 host_id = %host_id,
@@ -571,6 +576,16 @@ async fn defer_runtime_host_resource_limit_claim(
     }
 }
 
+fn runtime_host_claim(job: RuntimeJob, lease_expires_at: DateTime<Utc>) -> Value {
+    json!({
+        "claimed": true,
+        "runtime_job_id": job.id,
+        "lease_generation": job.lease_generation,
+        "lease_expires_at": lease_expires_at,
+        "runtime_job": job,
+    })
+}
+
 async fn complete_runtime_host_preflight_failure(
     state: &Arc<AppState>,
     store: &WorkflowRuntimeStore,
@@ -578,7 +593,7 @@ async fn complete_runtime_host_preflight_failure(
     lease_expires_at: DateTime<Utc>,
     job: &RuntimeJob,
     result: ActivityResult,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> (StatusCode, ClaimJson) {
     let result_payload = match serde_json::to_value(&result) {
         Ok(value) => value,
         Err(error) => {
@@ -589,7 +604,7 @@ async fn complete_runtime_host_preflight_failure(
             );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "failed to serialize runtime job preflight result" })),
+                claim_json(json!({ "error": "failed to serialize runtime job preflight result" })),
             );
         }
     };
@@ -607,7 +622,7 @@ async fn complete_runtime_host_preflight_failure(
         Ok(None) => {
             return (
                 StatusCode::CONFLICT,
-                Json(json!({
+                claim_json(json!({
                     "claimed": false,
                     "error": "runtime job lease is not owned by this host"
                 })),
@@ -621,7 +636,7 @@ async fn complete_runtime_host_preflight_failure(
             );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
+                claim_json(
                     json!({ "error": format!("failed to complete runtime job preflight: {error}") }),
                 ),
             );
@@ -653,7 +668,7 @@ async fn complete_runtime_host_preflight_failure(
     }
     (
         StatusCode::OK,
-        Json(json!({
+        claim_json(json!({
             "claimed": false,
             "preflight_failed": true,
             "runtime_job_id": job.id,

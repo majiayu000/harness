@@ -2,7 +2,7 @@ use super::model::{
     ActivityResult, ActivityStatus, RuntimeJob, RuntimeKind, RuntimeProfile, WorkflowCommand,
     WorkflowCommandRecord, WorkflowInstance,
 };
-use super::store::WorkflowRuntimeStore;
+use super::store::{RuntimeJobClaimDeferOutcome, WorkflowRuntimeStore};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -97,7 +97,7 @@ impl<'a> RuntimeWorker<'a> {
             match claim_guard.before_execute(&job, Utc::now(), lease_expires_at) {
                 RuntimeJobClaimDecision::Proceed => {}
                 RuntimeJobClaimDecision::Defer { not_before, reason } => {
-                    let Some(_) = self
+                    let outcome = self
                         .store
                         .defer_runtime_job_claim_if_owned(
                             &job.id,
@@ -105,15 +105,16 @@ impl<'a> RuntimeWorker<'a> {
                             lease_expires_at,
                             not_before,
                         )
-                        .await?
-                    else {
+                        .await?;
+                    if !matches!(outcome, RuntimeJobClaimDeferOutcome::Deferred(_)) {
                         tracing::warn!(
                             runtime_job_id = %job.id,
                             owner = %self.owner,
-                            "runtime job claim defer ignored because the worker no longer owns the lease"
+                            ?outcome,
+                            "runtime job claim defer was not applied"
                         );
                         return Ok(None);
-                    };
+                    }
                     self.store
                         .record_runtime_event(
                             &job.id,

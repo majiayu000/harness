@@ -1,5 +1,6 @@
 use crate::http::AppState;
 use harness_workflow::runtime::{
+    completion_evidence::{server_validation_digest_passed, ARTIFACT_EVAL_BASE_CHECKOUT},
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivityStatus, RuntimeJob,
     QUALITY_GATE_ACTIVITY,
 };
@@ -30,18 +31,17 @@ pub(crate) async fn apply_remote_completion_evidence(
         result,
     )
     .await;
+    let result = super::completion_evidence_integration::apply_external_completion_evidence(
+        state,
+        job,
+        workflow.as_ref(),
+        result,
+    )
+    .await;
     if super::data_helpers::activity_name(job) != QUALITY_GATE_ACTIVITY
         || result.status != ActivityStatus::Succeeded
     {
-        return Ok(
-            super::completion_evidence_integration::apply_external_completion_evidence(
-                state,
-                job,
-                workflow.as_ref(),
-                result,
-            )
-            .await,
-        );
+        return Ok(result);
     }
 
     if !state
@@ -54,9 +54,20 @@ pub(crate) async fn apply_remote_completion_evidence(
         return Ok(result);
     }
 
-    Ok(remote_quality_gate_requires_revision_bound_verification(
-        result,
-    ))
+    let revision_bound = remote_quality_gate_has_revision_bound_verification(&result);
+    Ok(if revision_bound {
+        result
+    } else {
+        remote_quality_gate_requires_revision_bound_verification(result)
+    })
+}
+
+fn remote_quality_gate_has_revision_bound_verification(result: &ActivityResult) -> bool {
+    result
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.artifact_type == ARTIFACT_EVAL_BASE_CHECKOUT)
+        && server_validation_digest_passed(result)
 }
 
 fn remote_quality_gate_requires_revision_bound_verification(
@@ -94,5 +105,34 @@ mod tests {
                 && artifact.artifact["verified"] == false
                 && artifact.artifact["reason"] == "revision_bound_workspace_unavailable"
         }));
+    }
+
+    #[test]
+    fn remote_quality_gate_accepts_revision_bound_host_validation() {
+        let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "validated")
+            .with_artifact(ActivityArtifact::new(
+                ARTIFACT_EVAL_BASE_CHECKOUT,
+                json!({"requested_commit": "a", "observed_commit": "a"}),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                harness_workflow::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST,
+                json!({"commands": [{"command": "cargo check", "exit_code": 0}]}),
+            ));
+
+        assert!(remote_quality_gate_has_revision_bound_verification(&result));
+    }
+
+    #[test]
+    fn remote_quality_gate_rejects_validation_without_checkout_binding() {
+        let result =
+            ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "validated")
+                .with_artifact(ActivityArtifact::new(
+                harness_workflow::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST,
+                json!({"commands": [{"command": "cargo check", "exit_code": 0}]}),
+            ));
+
+        assert!(!remote_quality_gate_has_revision_bound_verification(
+            &result
+        ));
     }
 }

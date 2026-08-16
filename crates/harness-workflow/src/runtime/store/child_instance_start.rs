@@ -99,8 +99,8 @@ async fn validate_start_command_provenance_tx(
     command_id: &str,
     payload: &Value,
 ) -> anyhow::Result<()> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT workflow_id, data::text
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT workflow_id, data::text, status
          FROM workflow_commands
          WHERE id = $1
          FOR SHARE",
@@ -108,13 +108,24 @@ async fn validate_start_command_provenance_tx(
     .bind(command_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((parent_workflow_id, data)) = row else {
+    let Some((parent_workflow_id, data, command_status)) = row else {
         anyhow::bail!(
             "child workflow `{}` requires persisted StartChildWorkflow command `{}`",
             child.id,
             command_id
         );
     };
+    if !matches!(
+        command_status.as_str(),
+        "pending" | "dispatching" | "deferred" | "dispatched"
+    ) {
+        anyhow::bail!(
+            "child workflow `{}` command `{}` is no longer active ({})",
+            child.id,
+            command_id,
+            command_status
+        );
+    }
     let command = serde_json::from_str::<WorkflowCommand>(&data)?;
     if command.command_type != WorkflowCommandType::StartChildWorkflow {
         anyhow::bail!(
@@ -177,8 +188,8 @@ async fn validate_start_command_provenance_tx(
                 child.id
             )
         })?;
-    let runtime_job_command_id: Option<String> = sqlx::query_scalar(
-        "SELECT command_id
+    let runtime_job: Option<(String, String)> = sqlx::query_as(
+        "SELECT command_id, status
          FROM runtime_jobs
          WHERE id = $1
          FOR SHARE",
@@ -186,12 +197,27 @@ async fn validate_start_command_provenance_tx(
     .bind(runtime_job_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if runtime_job_command_id.as_deref() != Some(command_id) {
+    let Some((runtime_job_command_id, runtime_job_status)) = runtime_job else {
+        anyhow::bail!(
+            "child workflow `{}` runtime job `{}` does not exist",
+            child.id,
+            runtime_job_id
+        );
+    };
+    if runtime_job_command_id != command_id {
         anyhow::bail!(
             "child workflow `{}` runtime job `{}` does not belong to StartChildWorkflow command `{}`",
             child.id,
             runtime_job_id,
             command_id
+        );
+    }
+    if !matches!(runtime_job_status.as_str(), "pending" | "running") {
+        anyhow::bail!(
+            "child workflow `{}` runtime job `{}` is no longer active ({})",
+            child.id,
+            runtime_job_id,
+            runtime_job_status
         );
     }
     Ok(())
@@ -566,6 +592,57 @@ mod tests {
         );
         assert_eq!(store.events_for(&first.id).await?.len(), 1);
         assert!(store.get_instance(&first.id).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_start_command_cannot_create_a_late_child() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime")).await?;
+        let (command_id, runtime_job_id) = insert_parent_start_command(
+            &store,
+            "cancelled-child-parent",
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            "issue:1784",
+        )
+        .await?;
+        store
+            .cancel_command_and_unfinished_runtime_jobs(
+                &command_id,
+                "start_child_workflow",
+                "test cancellation",
+            )
+            .await?;
+        let child = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "discovered",
+            WorkflowSubject::new("issue", "issue:1784"),
+        )
+        .with_id("cancelled-late-child")
+        .with_parent("cancelled-child-parent");
+
+        let error = store
+            .ensure_child_workflow_started(WorkflowChildStart {
+                instance: &child,
+                command_id: &command_id,
+                source: "test",
+                payload: json!({
+                    "command_id": command_id,
+                    "runtime_job_id": runtime_job_id,
+                    "parent_workflow_id": "cancelled-child-parent",
+                    "definition_id": GITHUB_ISSUE_PR_DEFINITION_ID,
+                    "subject_key": "issue:1784",
+                }),
+            })
+            .await
+            .expect_err("cancelled work must not mint a late child");
+
+        assert!(error.to_string().contains("no longer active"));
+        assert!(store.get_instance(&child.id).await?.is_none());
         Ok(())
     }
 }

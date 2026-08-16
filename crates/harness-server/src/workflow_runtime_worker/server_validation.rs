@@ -8,8 +8,8 @@
 //! server digest never satisfies the gate.
 //!
 //! Commands come from `WORKFLOW.md` (repo-owned configuration) and are
-//! executed without a shell: the first whitespace token is the program, the
-//! rest are arguments.
+//! executed without a shell. Structured argv is authoritative; legacy command
+//! strings are parsed with shell quoting rules for compatibility.
 
 use harness_workflow::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST;
 use harness_workflow::runtime::{
@@ -34,15 +34,52 @@ pub(super) struct ServerValidationFailure {
     pub error_kind: ActivityErrorKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ValidationCommandSpec {
+    display: String,
+    argv: Vec<String>,
+}
+
+impl ValidationCommandSpec {
+    pub(super) fn from_argv(argv: Vec<String>) -> Result<Self, String> {
+        if argv.is_empty() {
+            return Err("validation command argv must not be empty".to_string());
+        }
+        if argv[0].is_empty() {
+            return Err("validation command program must not be empty".to_string());
+        }
+        let display = shlex::try_join(argv.iter().map(String::as_str))
+            .map_err(|error| format!("validation command argv cannot be represented: {error}"))?;
+        Ok(Self { display, argv })
+    }
+
+    pub(super) fn from_legacy_string(command: &str) -> Result<Self, String> {
+        let command = command.trim();
+        let argv = shlex::split(command)
+            .ok_or_else(|| format!("validation command has invalid quoting: {command}"))?;
+        let mut spec = Self::from_argv(argv)?;
+        spec.display = command.to_string();
+        Ok(spec)
+    }
+
+    fn program(&self) -> &str {
+        &self.argv[0]
+    }
+
+    fn args(&self) -> &[String] {
+        &self.argv[1..]
+    }
+}
+
 /// Execute `commands` sequentially in `workspace_root`, stopping at the
 /// first failure. Every started command records an entry in the digest.
 pub(super) async fn run_validation_commands(
     workspace_root: &Path,
-    commands: &[String],
+    commands: &[ValidationCommandSpec],
     timeout: Duration,
     credential_environment: Option<&crate::eval_credentials::EvalCredentialEnvironment>,
 ) -> ServerValidationRun {
-    if commands.iter().all(|command| command.trim().is_empty()) {
+    if commands.is_empty() {
         let mut digest = json!({
             "commands": [],
             "cwd": workspace_root.display().to_string(),
@@ -66,10 +103,6 @@ pub(super) async fn run_validation_commands(
     let mut entries = Vec::new();
     let mut failure = None;
     for command in commands {
-        let command = command.trim();
-        if command.is_empty() {
-            continue;
-        }
         let remaining = timeout.saturating_sub(started.elapsed());
         let entry =
             run_single_command(workspace_root, command, remaining, credential_environment).await;
@@ -78,7 +111,7 @@ pub(super) async fn run_validation_commands(
         entries.push(entry);
         if failed {
             let last = entries.last().cloned().unwrap_or(Value::Null);
-            failure = Some(server_validation_failure_for_entry(command, &last));
+            failure = Some(server_validation_failure_for_entry(&command.display, &last));
             break;
         }
     }
@@ -118,19 +151,16 @@ fn server_validation_failure_for_entry(command: &str, entry: &Value) -> ServerVa
 
 async fn run_single_command(
     workspace_root: &Path,
-    command: &str,
+    command: &ValidationCommandSpec,
     timeout: Duration,
     credential_environment: Option<&crate::eval_credentials::EvalCredentialEnvironment>,
 ) -> Value {
     let started = Instant::now();
-    let mut parts = command.split_whitespace();
-    let Some(program) = parts.next() else {
-        return command_entry(command, workspace_root, None, "", 0, Some("empty command"));
-    };
-    let mut process = tokio::process::Command::new(program);
+    let mut process = tokio::process::Command::new(command.program());
     process
-        .args(parts)
+        .args(command.args())
         .current_dir(workspace_root)
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -181,7 +211,7 @@ async fn run_single_command(
 }
 
 fn command_entry(
-    command: &str,
+    command: &ValidationCommandSpec,
     cwd: &Path,
     exit_code: Option<i64>,
     output_sha256: &str,
@@ -189,7 +219,8 @@ fn command_entry(
     startup_error: Option<&str>,
 ) -> Value {
     let mut entry = json!({
-        "command": command,
+        "command": command.display,
+        "argv": command.argv,
         "cwd": cwd.display().to_string(),
         "duration_ms": duration_ms,
     });
@@ -242,12 +273,16 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
+    fn command_spec(command: &str) -> ValidationCommandSpec {
+        ValidationCommandSpec::from_legacy_string(command).expect("valid command")
+    }
+
     #[tokio::test]
     async fn passing_commands_record_digest_and_keep_result() {
         let dir = workspace();
         let run = run_validation_commands(
             dir.path(),
-            &["true".to_string(), "true".to_string()],
+            &[command_spec("true"), command_spec("true")],
             Duration::from_secs(30),
             None,
         )
@@ -308,7 +343,7 @@ test -n "$PATH" || exit 45
 
         let entry = run_single_command(
             dir.path(),
-            command,
+            &command_spec(command),
             Duration::from_secs(30),
             Some(&credential_environment),
         )
@@ -348,7 +383,7 @@ test -n "$PATH" || exit 45
         let dir = workspace();
         let run = run_validation_commands(
             dir.path(),
-            &["false".to_string(), "true".to_string()],
+            &[command_spec("false"), command_spec("true")],
             Duration::from_secs(30),
             None,
         )
@@ -369,9 +404,7 @@ test -n "$PATH" || exit 45
     #[tokio::test]
     async fn missing_commands_never_pass() {
         let dir = workspace();
-        let run =
-            run_validation_commands(dir.path(), &[" ".to_string()], Duration::from_secs(5), None)
-                .await;
+        let run = run_validation_commands(dir.path(), &[], Duration::from_secs(5), None).await;
         let failure = run.failure.as_ref().expect("missing commands must fail");
         assert!(failure.error.contains("validation_commands_missing"));
         let result = apply_server_validation(
@@ -388,7 +421,7 @@ test -n "$PATH" || exit 45
         let dir = workspace();
         let run = run_validation_commands(
             dir.path(),
-            &["definitely-not-a-real-binary-gh1766".to_string()],
+            &[command_spec("definitely-not-a-real-binary-gh1766")],
             Duration::from_secs(5),
             None,
         )
@@ -409,7 +442,7 @@ test -n "$PATH" || exit 45
         let dir = workspace();
         let run = run_validation_commands(
             dir.path(),
-            &["sleep 5".to_string()],
+            &[command_spec("sleep 5")],
             Duration::from_millis(100),
             None,
         )
@@ -418,6 +451,30 @@ test -n "$PATH" || exit 45
         assert_eq!(
             std::mem::discriminant(&failure.error_kind),
             std::mem::discriminant(&ActivityErrorKind::Timeout)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_terminates_the_spawned_validation_process() {
+        let dir = workspace();
+        let marker = dir.path().join("leaked-process-marker");
+        let command = ValidationCommandSpec::from_argv(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 1; touch \"$1\"".to_string(),
+            "validation-timeout-test".to_string(),
+            marker.display().to_string(),
+        ])
+        .expect("valid command");
+
+        let run =
+            run_validation_commands(dir.path(), &[command], Duration::from_millis(50), None).await;
+        assert!(run.failure.is_some());
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            !marker.exists(),
+            "timed-out validation process must be killed"
         );
     }
 }

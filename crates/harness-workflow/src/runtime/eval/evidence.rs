@@ -1,11 +1,16 @@
 use super::attestation::EvalAttestationSummary;
+#[cfg(test)]
+use super::evidence_usage::usage_snapshot_from_event;
+use super::evidence_usage::usage_snapshots;
+#[cfg(test)]
+use super::model::Confidence;
 use super::model::{
-    Confidence, QualitySnapshot, RuntimeErrorKind, RuntimeJobSnapshot, RuntimeSnapshot,
-    UsageSnapshot,
+    QualitySnapshot, RuntimeArtifactSnapshot, RuntimeErrorKind, RuntimeJobSnapshot,
+    RuntimeSnapshot, UsageSnapshot,
 };
 use crate::runtime::{
     ActivityErrorKind, ActivityResult, RuntimeEvent, RuntimeJob, RuntimeJobStatus,
-    WorkflowCommandRecord, WorkflowInstance, WorkflowRuntimeStore, QUALITY_GATE_ACTIVITY,
+    WorkflowCommandRecord, WorkflowInstance, QUALITY_GATE_ACTIVITY,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -18,6 +23,10 @@ pub enum EvalEvidenceStatus {
     Passed,
     Failed,
     Skipped,
+    TimedOut,
+    DispatchFailed,
+    EvidenceIncomplete,
+    BudgetExhausted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -71,41 +80,6 @@ pub struct EvalIsolationEvidence {
     pub cleanup_status: Option<String>,
 }
 
-pub async fn collect_eval_case_evidence(
-    store: &WorkflowRuntimeStore,
-    eval_run_id: &str,
-    case_id: &str,
-    workflow_id: &str,
-) -> anyhow::Result<EvalCaseEvidence> {
-    let workflow = store.get_instance(workflow_id).await?;
-    let commands = store.commands_for(workflow_id).await?;
-    let command_ids = commands
-        .iter()
-        .map(|command| command.id.clone())
-        .collect::<Vec<_>>();
-    let jobs_by_command = store.runtime_jobs_for_commands(&command_ids).await?;
-    let runtime_jobs = command_ids
-        .iter()
-        .filter_map(|command_id| jobs_by_command.get(command_id))
-        .flatten()
-        .cloned()
-        .collect::<Vec<_>>();
-    let runtime_job_ids = runtime_jobs
-        .iter()
-        .map(|job| job.id.clone())
-        .collect::<Vec<_>>();
-    let events_by_job = store.runtime_events_for_jobs(&runtime_job_ids).await?;
-
-    Ok(collect_eval_case_evidence_from_records(
-        eval_run_id,
-        case_id,
-        workflow.as_ref(),
-        &commands,
-        &runtime_jobs,
-        &events_by_job,
-    ))
-}
-
 pub fn collect_eval_case_evidence_from_records(
     eval_run_id: &str,
     case_id: &str,
@@ -154,7 +128,7 @@ pub fn collect_eval_case_evidence_from_records(
     }) {
         missing_evidence.push("terminal_runtime_state".to_string());
     }
-    let usage = usage_snapshots(workflow_id.as_deref(), runtime_events);
+    let usage = usage_snapshots(workflow_id.as_deref(), runtime_events, runtime_jobs);
     if usage.is_empty() {
         missing_evidence.push("usage".to_string());
     }
@@ -292,10 +266,27 @@ fn isolation_evidence(
             .get("cleanup_required")
             .and_then(Value::as_bool)
             .unwrap_or(true),
-        cleanup_status: workflow
-            .and_then(|workflow| workflow.data.pointer("/eval/cleanup/status"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        cleanup_status: implementation_job
+            .and_then(activity_result_from_job)
+            .and_then(|result| {
+                result.artifacts.into_iter().find(|artifact| {
+                    artifact.artifact_type
+                        == crate::runtime::completion_evidence::ARTIFACT_EVAL_ISOLATION_CLEANUP
+                })
+            })
+            .and_then(|artifact| {
+                artifact
+                    .artifact
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                workflow
+                    .and_then(|workflow| workflow.data.pointer("/eval/cleanup/status"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            }),
     })
 }
 
@@ -362,7 +353,7 @@ fn validate_isolation_evidence(isolation: &EvalIsolationEvidence) -> Vec<String>
     if isolation.lifecycle.as_deref() != Some("ephemeral") {
         missing.push("isolation_lifecycle".to_string());
     }
-    if isolation.cleanup_required && isolation.cleanup_status.is_none() {
+    if isolation.cleanup_required && isolation.cleanup_status.as_deref() != Some("cleaned") {
         missing.push("isolation_cleanup".to_string());
     }
     missing
@@ -410,6 +401,19 @@ fn runtime_job_snapshot(job: &RuntimeJob) -> RuntimeJobSnapshot {
             .as_ref()
             .map(|result| result.artifacts.len() as u64)
             .unwrap_or(0),
+        artifacts: result
+            .as_ref()
+            .map(|result| {
+                result
+                    .artifacts
+                    .iter()
+                    .map(|artifact| RuntimeArtifactSnapshot {
+                        artifact_type: artifact.artifact_type.clone(),
+                        artifact: artifact.artifact.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         terminal_state: runtime_job_terminal_state(job),
         error_kind: result
             .as_ref()
@@ -417,7 +421,7 @@ fn runtime_job_snapshot(job: &RuntimeJob) -> RuntimeJobSnapshot {
     }
 }
 
-fn activity_result_from_job(job: &RuntimeJob) -> Option<ActivityResult> {
+pub(super) fn activity_result_from_job(job: &RuntimeJob) -> Option<ActivityResult> {
     job.output
         .as_ref()
         .and_then(|output| serde_json::from_value(output.clone()).ok())
@@ -451,93 +455,6 @@ fn runtime_error_kind(kind: ActivityErrorKind) -> RuntimeErrorKind {
         ActivityErrorKind::ExternalDependency => RuntimeErrorKind::ExternalDependency,
         ActivityErrorKind::Unknown => RuntimeErrorKind::Unknown,
     }
-}
-
-fn usage_snapshots(
-    workflow_id: Option<&str>,
-    runtime_events: &BTreeMap<String, Vec<RuntimeEvent>>,
-) -> Vec<UsageSnapshot> {
-    let mut usage = Vec::new();
-    for (runtime_job_id, events) in runtime_events {
-        for event in events {
-            if !matches!(
-                event.event_type.as_str(),
-                "UsageRecorded" | "TokenUsageRecorded"
-            ) {
-                continue;
-            }
-            let snapshot = usage_snapshot_from_event(workflow_id, runtime_job_id, &event.event);
-            if usage_snapshot_has_measurement(&snapshot) {
-                usage.push(snapshot);
-            }
-        }
-    }
-    usage
-}
-
-fn usage_snapshot_from_event(
-    workflow_id: Option<&str>,
-    runtime_job_id: &str,
-    event: &Value,
-) -> UsageSnapshot {
-    let payload = event.get("usage").unwrap_or(event);
-    let input_tokens = first_u64_field(payload, &["input_tokens", "input"]);
-    let output_tokens = first_u64_field(payload, &["output_tokens", "output"]);
-    let cached_input_tokens = first_u64_field(
-        payload,
-        &[
-            "cached_input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-        ],
-    );
-    let total_tokens = first_u64_field(payload, &["total_tokens"]).or_else(|| {
-        (input_tokens.is_some() || output_tokens.is_some()).then(|| {
-            input_tokens
-                .unwrap_or(0)
-                .saturating_add(output_tokens.unwrap_or(0))
-        })
-    });
-    let cost_usd_micros = first_u64_field(payload, &["cost_usd_micros"]);
-    UsageSnapshot {
-        agent_invocation_id: payload
-            .get("agent_invocation_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        runtime_job_id: Some(runtime_job_id.to_string()),
-        workflow_id: workflow_id.map(ToOwned::to_owned),
-        model: payload
-            .get("model")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        reasoning_effort: payload
-            .get("reasoning_effort")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        total_tokens,
-        cost_usd_micros,
-        token_confidence: Confidence::Observed,
-        cost_confidence: if cost_usd_micros.is_some() {
-            Confidence::Estimated
-        } else {
-            Confidence::Unknown
-        },
-    }
-}
-
-fn first_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| value.get(*key)?.as_u64())
-}
-
-fn usage_snapshot_has_measurement(snapshot: &UsageSnapshot) -> bool {
-    snapshot.input_tokens.is_some()
-        || snapshot.output_tokens.is_some()
-        || snapshot.cached_input_tokens.is_some()
-        || snapshot.total_tokens.is_some()
-        || snapshot.cost_usd_micros.is_some()
 }
 
 #[cfg(test)]

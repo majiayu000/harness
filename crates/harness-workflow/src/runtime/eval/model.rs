@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,9 +106,17 @@ pub struct RuntimeJobSnapshot {
     #[serde(default)]
     pub activity: Option<String>,
     pub artifact_count: u64,
+    #[serde(default)]
+    pub artifacts: Vec<RuntimeArtifactSnapshot>,
     pub terminal_state: Option<String>,
     #[serde(default)]
     pub error_kind: Option<RuntimeErrorKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeArtifactSnapshot {
+    pub artifact_type: String,
+    pub artifact: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

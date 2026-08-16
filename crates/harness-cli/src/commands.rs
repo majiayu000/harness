@@ -877,7 +877,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
 
         Command::Eval { cmd } => {
-            eval::run(cmd).await?;
+            eval::run(cmd, &config).await?;
         }
 
         Command::Plan { cmd } => {

@@ -109,7 +109,7 @@ pub use prompt_payloads::PromptPayloadIntegrityError;
 pub use recovery::{
     WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
 };
-pub use runtime_job_state::WorkflowCancellationCleanupOutcome;
+pub use runtime_job_state::{RuntimeJobClaimDeferOutcome, WorkflowCancellationCleanupOutcome};
 pub use runtime_usage::{
     cost_usd_from_micros, cost_usd_to_micros, RuntimeAgentTelemetry, RuntimeUsageMetrics,
     RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,
@@ -129,6 +129,7 @@ use transaction_helpers::{
     load_or_insert_initial_instance_tx, runtime_job_for_command_tx, select_instance_for_update_tx,
 };
 pub(super) use transaction_helpers::{enum_str, insert_event_tx, to_jsonb_string};
+#[derive(Clone)]
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
     /// Hard workflow budget ceiling policy (GH-1770 spec §4.4), applied when a

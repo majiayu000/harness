@@ -420,6 +420,7 @@ fn perfect_input() -> PrRepairEvalInput {
                 state: "completed".to_string(),
                 activity: Some("implement_issue".to_string()),
                 artifact_count: 1,
+                artifacts: Vec::new(),
                 terminal_state: Some("succeeded".to_string()),
                 error_kind: None,
             }],
@@ -453,6 +454,7 @@ fn failed_job(id: &str, error_kind: RuntimeErrorKind) -> RuntimeJobSnapshot {
         state: "failed".to_string(),
         activity: Some("implement_issue".to_string()),
         artifact_count: 1,
+        artifacts: Vec::new(),
         terminal_state: Some("failed".to_string()),
         error_kind: Some(error_kind),
     }

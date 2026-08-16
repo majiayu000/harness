@@ -376,11 +376,15 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         )
         .await?;
     let validation_commands = vec!["cargo check".to_string()];
+    let validation_commands_argv = vec![vec!["cargo".to_string(), "check".to_string()]];
     let output = harness_workflow::runtime::build_quality_gate_run_decision(
         &child,
         harness_workflow::runtime::QualityGateDecisionInput {
             reason: "test quality replay",
             validation_commands: &validation_commands,
+            validation_commands_argv: &validation_commands_argv,
+            eval: None,
+            expected_head_sha: None,
         },
     );
     let record = harness_workflow::runtime::WorkflowDecisionRecord::accepted(

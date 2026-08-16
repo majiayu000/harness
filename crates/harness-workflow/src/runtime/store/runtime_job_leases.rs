@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeJobLeaseRenewalRejection {
+    CancellationRequested,
     Expired,
     HostDraining,
     InvalidDuration,
@@ -24,6 +25,7 @@ pub enum RuntimeJobLeaseRenewalRejection {
 impl RuntimeJobLeaseRenewalRejection {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::CancellationRequested => "cancellation_requested",
             Self::Expired => "expired",
             Self::HostDraining => "host_draining",
             Self::InvalidDuration => "invalid_duration",
@@ -87,6 +89,23 @@ impl WorkflowRuntimeStore {
         &self,
         request: RuntimeJobLeaseRenewalRequest<'_>,
     ) -> anyhow::Result<RuntimeJobLeaseRenewalOutcome> {
+        self.update_remote_host_runtime_job_lease(request, false)
+            .await
+    }
+
+    pub async fn reserve_cancelled_remote_host_runtime_job_completion(
+        &self,
+        request: RuntimeJobLeaseRenewalRequest<'_>,
+    ) -> anyhow::Result<RuntimeJobLeaseRenewalOutcome> {
+        self.update_remote_host_runtime_job_lease(request, true)
+            .await
+    }
+
+    async fn update_remote_host_runtime_job_lease(
+        &self,
+        request: RuntimeJobLeaseRenewalRequest<'_>,
+        cancellation_ack: bool,
+    ) -> anyhow::Result<RuntimeJobLeaseRenewalOutcome> {
         let mut tx = self.pool.begin().await?;
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
@@ -109,7 +128,12 @@ impl WorkflowRuntimeStore {
         .execute(&mut *tx)
         .await?;
 
-        let rejection = if !request.owner_active {
+        let cancellation_requested = job.input.get("cancellation_requested").is_some();
+        let rejection = if cancellation_requested && !cancellation_ack {
+            Some(RuntimeJobLeaseRenewalRejection::CancellationRequested)
+        } else if cancellation_ack && !cancellation_requested {
+            Some(RuntimeJobLeaseRenewalRejection::InvariantViolation)
+        } else if !request.owner_active {
             Some(RuntimeJobLeaseRenewalRejection::HostDraining)
         } else if job.status != RuntimeJobStatus::Running {
             Some(RuntimeJobLeaseRenewalRejection::WrongState)
@@ -120,7 +144,7 @@ impl WorkflowRuntimeStore {
         } else {
             match job.lease.as_ref() {
                 None => Some(RuntimeJobLeaseRenewalRejection::Revoked),
-                Some(lease) if lease.expires_at <= request.now => {
+                Some(lease) if lease.expires_at <= request.now && !cancellation_ack => {
                     Some(RuntimeJobLeaseRenewalRejection::Expired)
                 }
                 Some(lease) if lease.owner != request.owner => {
@@ -319,8 +343,12 @@ impl WorkflowRuntimeStore {
         .bind(owner)
         .fetch_all(&mut *tx)
         .await?;
+        let mut revoked = 0;
         for (runtime_job_id, data) in &rows {
             let mut job: RuntimeJob = serde_json::from_str(data)?;
+            if job.input.get("cancellation_requested").is_some() {
+                continue;
+            }
             let previous_expires_at = job.lease.as_ref().map(|lease| lease.expires_at);
             job.status = RuntimeJobStatus::Pending;
             job.lease = None;
@@ -352,9 +380,10 @@ impl WorkflowRuntimeStore {
                 }),
             )
             .await?;
+            revoked += 1;
         }
         tx.commit().await?;
-        Ok(rows.len())
+        Ok(revoked)
     }
 
     pub async fn count_remote_host_runtime_job_leases(&self, owner: &str) -> anyhow::Result<i64> {
@@ -484,6 +513,7 @@ mod tests {
     #[test]
     fn runtime_store_remote_host_lease_rejection_codes_are_closed_and_sanitized() {
         let reasons = [
+            RuntimeJobLeaseRenewalRejection::CancellationRequested,
             RuntimeJobLeaseRenewalRejection::Expired,
             RuntimeJobLeaseRenewalRejection::HostDraining,
             RuntimeJobLeaseRenewalRejection::InvalidDuration,
@@ -497,7 +527,7 @@ mod tests {
             RuntimeJobLeaseRenewalRejection::WrongState,
         ];
         let codes: Vec<&str> = reasons.into_iter().map(|reason| reason.as_str()).collect();
-        assert_eq!(codes.len(), 11);
+        assert_eq!(codes.len(), 12);
         assert!(codes.iter().all(|code| !code.contains("host-")));
     }
 }

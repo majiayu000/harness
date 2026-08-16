@@ -522,3 +522,28 @@ fn github_graphql_error_is_failed_external_dependency() {
         SERVER_PR_SNAPSHOT_ERROR_ARTIFACT
     );
 }
+
+#[test]
+fn eval_draft_activity_result_requests_evaluator_validation() {
+    let snapshot = json!({
+        "snapshot_source": "server_github_graphql",
+        "state": "OPEN",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "head_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "is_draft": true,
+        "expected_base_ref": "main",
+        "base_ref": "main",
+    });
+    assert!(eval_draft_snapshot_allows_validation(&snapshot));
+    let artifacts = GitHubPrSnapshotArtifacts {
+        raw_pr: snapshot.clone(),
+        normalized_snapshot: snapshot,
+    };
+
+    let result = artifacts.eval_draft_validation_activity_result("inspect_pr_feedback");
+
+    assert_eq!(result.signals.len(), 1);
+    assert_eq!(result.signals[0].signal_type, "PrReadyToMerge");
+    assert!(result.summary.contains("eval draft"));
+}

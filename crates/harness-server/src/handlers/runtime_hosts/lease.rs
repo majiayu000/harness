@@ -1,4 +1,4 @@
-use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
+use crate::http::rest_contract::{ContractJson, LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use crate::runtime_hosts::RuntimeHostLifecycle;
 use axum::{
@@ -6,60 +6,33 @@ use axum::{
     http::StatusCode,
 };
 use chrono::{DateTime, TimeDelta, Utc};
+use harness_protocol::rest::{RenewRuntimeJobLeaseRequest, RuntimeHostLeaseResponse};
 use harness_workflow::runtime::store::runtime_job_leases::{
     postgres_timestamp_ceil, RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRejection,
     RuntimeJobLeaseRenewalRequest,
 };
-use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+#[cfg(test)]
 use uuid::Uuid;
 
-#[derive(Debug, Default)]
-pub struct OptionalLeaseSecs(Option<u64>);
+type LeaseJson = ContractJson<RuntimeHostLeaseResponse>;
 
-impl OptionalLeaseSecs {
-    pub(super) fn value(&self) -> Option<u64> {
-        self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for OptionalLeaseSecs {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        u64::deserialize(deserializer).map(|value| Self(Some(value)))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ClaimRuntimeJobRequest {
-    #[serde(default)]
-    pub lease_secs: OptionalLeaseSecs,
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RenewRuntimeJobLeaseRequest {
-    pub lease_generation: u64,
-    pub lease_expires_at: DateTime<Utc>,
-    pub renewal_id: Uuid,
-    #[serde(default)]
-    lease_secs: OptionalLeaseSecs,
+fn lease_json(value: serde_json::Value) -> LeaseJson {
+    ContractJson(RuntimeHostLeaseResponse(value))
 }
 
 pub async fn renew_runtime_job_lease_for_runtime_host(
     State(state): State<Arc<AppState>>,
     Path((host_id, runtime_job_id)): Path<(String, String)>,
-    payload: Result<Json<RenewRuntimeJobLeaseRequest>, JsonRejection>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let Json(req) = match payload {
+    payload: Result<ContractJson<RenewRuntimeJobLeaseRequest>, JsonRejection>,
+) -> (StatusCode, LeaseJson) {
+    let ContractJson(req) = match payload {
         Ok(payload) => payload,
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid lease renewal request" })),
+                lease_json(json!({ "error": "invalid lease renewal request" })),
             )
         }
     };
@@ -74,17 +47,20 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
         None => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({ "error": "runtime host not found" })),
+                lease_json(json!({ "error": "runtime host not found" })),
             )
         }
     };
     let lease_secs = match validated_runtime_host_lease_secs(req.lease_secs.value()) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return (response.0, lease_json(response.1 .0)),
     };
     let store = match state.workflow_runtime_store() {
         Ok(store) => store.clone(),
-        Err(error) => return error.into_status_json(),
+        Err(error) => {
+            let response = error.into_status_json();
+            return (response.0, lease_json(response.1 .0));
+        }
     };
     let outcome = store
         .renew_remote_host_runtime_job_lease(RuntimeJobLeaseRenewalRequest {
@@ -121,7 +97,7 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
             replayed,
         }) => (
             StatusCode::OK,
-            Json(json!({
+            lease_json(json!({
                 "renewed": true,
                 "runtime_job_id": runtime_job_id,
                 "lease_generation": lease_generation,
@@ -129,10 +105,16 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
                 "replayed": replayed,
             })),
         ),
-        Ok(RuntimeJobLeaseRenewalOutcome::LeaseLost { .. }) => lease_lost_response(),
+        Ok(RuntimeJobLeaseRenewalOutcome::LeaseLost {
+            reason: RuntimeJobLeaseRenewalRejection::CancellationRequested,
+        }) => cancellation_requested_response(),
+        Ok(RuntimeJobLeaseRenewalOutcome::LeaseLost { .. }) => {
+            let response = lease_lost_response();
+            (response.0, lease_json(response.1 .0))
+        }
         Ok(RuntimeJobLeaseRenewalOutcome::NotFound) => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "runtime job not found" })),
+            lease_json(json!({ "error": "runtime job not found" })),
         ),
         Err(error) => {
             tracing::error!(
@@ -141,9 +123,22 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
                 error = %error,
                 "runtime host lease renewal failed"
             );
-            workflow_store_unavailable_response()
+            let response = workflow_store_unavailable_response();
+            (response.0, lease_json(response.1 .0))
         }
     }
+}
+
+fn cancellation_requested_response() -> (StatusCode, LeaseJson) {
+    (
+        StatusCode::CONFLICT,
+        lease_json(json!({
+            "error": "runtime job cancellation was requested",
+            "error_code": "lease_lost",
+            "must_stop": true,
+            "cleanup_ack_required": true,
+        })),
+    )
 }
 
 pub(super) fn runtime_host_lease_expires_at(
@@ -258,5 +253,14 @@ mod tests {
             body.0,
             json!({ "error_code": "lease_lost", "must_stop": true })
         );
+    }
+
+    #[test]
+    fn runtime_job_cancellation_response_requires_cleanup_acknowledgement() {
+        let (status, body) = cancellation_requested_response();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0 .0["error_code"], "lease_lost");
+        assert_eq!(body.0 .0["must_stop"], true);
+        assert_eq!(body.0 .0["cleanup_ack_required"], true);
     }
 }

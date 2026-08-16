@@ -1,5 +1,110 @@
 use super::*;
 
+fn eval_draft_snapshot_artifact() -> ActivityArtifact {
+    let mut artifact = ready_snapshot_artifact();
+    artifact.artifact["state"] = json!("OPEN");
+    artifact.artifact["head_oid"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    artifact.artifact["is_draft"] = json!(true);
+    artifact.artifact["review_decision"] = json!("REVIEW_REQUIRED");
+    artifact.artifact["status_check_rollup_state"] = json!("PENDING");
+    artifact.artifact["merge_state_status"] = json!("UNKNOWN");
+    artifact
+}
+
+#[test]
+fn server_owned_eval_draft_snapshot_passes_quality_gate() -> anyhow::Result<()> {
+    let mut instance = pr_workflow_state("awaiting_feedback");
+    instance.set_data_field(
+        "eval",
+        json!({"eval_run_id": "run-1", "case_id": "case-1"}),
+        DataProvenance::Server,
+    )?;
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned eval draft snapshot is ready for evaluator validation.",
+    )
+    .with_artifact(eval_draft_snapshot_artifact())
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+
+    let decision = reduce_runtime_job_completed(&instance, &event_for_result(result))?
+        .expect("eval draft snapshot should start its quality gate");
+
+    assert_eq!(decision.decision, "start_quality_gate");
+    assert_eq!(decision.next_state, "quality_gate_pending");
+
+    instance.state = decision.next_state;
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({ "validation": "passed" }),
+        ))
+        .with_validation(ValidationRecord::new("cargo check", "passed"))
+        .with_artifact(server_validation_digest_ok(&["cargo check"]));
+    let decision = reduce_runtime_job_completed(&instance, &event_for_result(result))?
+        .expect("passing eval quality gate should make the draft ready");
+
+    assert_eq!(decision.decision, "quality_gate_passed");
+    assert_eq!(decision.next_state, "ready_to_merge");
+    Ok(())
+}
+
+#[test]
+fn server_owned_eval_draft_snapshot_fails_quality_gate() -> anyhow::Result<()> {
+    let mut instance = pr_workflow_state("awaiting_feedback");
+    instance.set_data_field(
+        "eval",
+        json!({"eval_run_id": "run-1", "case_id": "case-1"}),
+        DataProvenance::Server,
+    )?;
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned eval draft snapshot is ready for evaluator validation.",
+    )
+    .with_artifact(eval_draft_snapshot_artifact())
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let decision = reduce_runtime_job_completed(&instance, &event_for_result(result))?
+        .expect("eval draft snapshot should start its quality gate");
+
+    instance.state = decision.next_state;
+    let result = ActivityResult::failed(
+        QUALITY_GATE_ACTIVITY,
+        "Validation failed.",
+        "cargo check exited with status 1",
+    )
+    .with_error_kind(ActivityErrorKind::Fatal);
+    let decision = reduce_runtime_job_completed(&instance, &event_for_result(result))?
+        .expect("failing eval quality gate should fail the workflow");
+
+    assert_eq!(decision.decision, "fail_after_runtime_activity");
+    assert_eq!(decision.next_state, "failed");
+    Ok(())
+}
+
+#[test]
+fn ordinary_draft_snapshot_cannot_bypass_production_readiness() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let result =
+        ActivityResult::succeeded(PR_FEEDBACK_INSPECT_ACTIVITY, "Draft PR claimed readiness.")
+            .with_artifact(eval_draft_snapshot_artifact())
+            .with_signal(ActivitySignal::new(
+                "PrReadyToMerge",
+                json!({ "pr_number": 77 }),
+            ));
+
+    let decision = reduce_runtime_job_completed(&instance, &event_for_result(result))
+        .expect("event should parse")
+        .expect("ordinary draft readiness should be blocked");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+}
+
 #[test]
 fn ready_to_merge_signal_with_current_pr_snapshot_starts_quality_gate() {
     let instance = pr_workflow_state("awaiting_feedback");
