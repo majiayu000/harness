@@ -455,24 +455,40 @@ fn eval_report_diff_preserves_exit_zero_without_gate_flags() {
         &sample_eval_manifest(),
         "baseline",
         3,
-        vec![case_evidence(
-            "case-pass",
-            EvalEvidenceStatus::Passed,
-            vec![usage_snapshot(100, 40)],
-            Vec::new(),
-        )],
+        vec![
+            case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Passed,
+                vec![usage_snapshot(100, 40)],
+                Vec::new(),
+            ),
+            case_evidence(
+                "case-fail",
+                EvalEvidenceStatus::Failed,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
     )
     .unwrap_or_else(|error| panic!("baseline report should build: {error}"));
     let candidate = eval_report_from_evidence(
         &sample_eval_manifest(),
         "candidate",
         3,
-        vec![case_evidence(
-            "case-pass",
-            EvalEvidenceStatus::Failed,
-            vec![usage_snapshot(80, 30)],
-            Vec::new(),
-        )],
+        vec![
+            case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Failed,
+                vec![usage_snapshot(80, 30)],
+                Vec::new(),
+            ),
+            case_evidence(
+                "case-fail",
+                EvalEvidenceStatus::Failed,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
     )
     .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
     write_report(&baseline_path, &baseline);
