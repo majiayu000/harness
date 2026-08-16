@@ -1,19 +1,60 @@
 use super::{
     cancel_eval_workflow_family, cleanup_cancelled_eval_run, collect_eval_case_evidence,
-    enqueue_eval_case_workflow, eval_report_from_evidence, finalize_eval_case_cleanup,
-    EvalAttestationSummary, EvalBenchmarkCase, EvalBenchmarkManifest, EvalCaseEvidence,
-    EvalEvidenceStatus, EvalRunCleanupInput, EvalRunReport,
+    enqueue_eval_case_workflow, eval_report_effective_outcome, eval_report_from_evidence,
+    finalize_eval_case_cleanup, EvalAttestationSummary, EvalBenchmarkCase, EvalBenchmarkManifest,
+    EvalCaseEvidence, EvalEvidenceStatus, EvalRunCleanupInput, EvalRunOutcome, EvalRunReport,
 };
 use crate::runtime::{
     RuntimeJob, RuntimeJobStatus, WorkflowCommandStatus, WorkflowInstance, WorkflowRuntimeStore,
 };
-use harness_core::types::{Decision, Event, SessionId};
 use harness_observe::event_store::EventStore;
+#[cfg(test)]
 use serde_json::json;
 use std::time::{Duration, Instant};
 
+mod events;
+mod usage_ceiling;
+
+use events::emit_eval_events;
+use usage_ceiling::suite_usage_exhaustion_reason;
+pub use usage_ceiling::EvalUsageCeiling;
+
 pub const DEFAULT_EVAL_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_EVAL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+pub struct EvalEventPersistenceError {
+    source: anyhow::Error,
+    report: EvalRunReport,
+}
+
+impl EvalEventPersistenceError {
+    pub fn new(source: anyhow::Error, mut report: EvalRunReport) -> Self {
+        let current = eval_report_effective_outcome(&report);
+        report.outcome = Some(EvalRunOutcome::with_event_persistence_failure(current));
+        Self { source, report }
+    }
+
+    pub fn report(&self) -> &EvalRunReport {
+        &self.report
+    }
+}
+
+impl std::fmt::Display for EvalEventPersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "failed to persist required eval outcome events: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for EvalEventPersistenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvalExecuteConfig {
@@ -23,6 +64,7 @@ pub struct EvalExecuteConfig {
     pub poll_interval: Duration,
     pub dispatch_timeout: Duration,
     pub case_timeout_override: Option<Duration>,
+    pub suite_usage_ceiling: Option<EvalUsageCeiling>,
     pub additional_prompt: Option<String>,
 }
 
@@ -35,6 +77,7 @@ impl EvalExecuteConfig {
             poll_interval: DEFAULT_EVAL_POLL_INTERVAL,
             dispatch_timeout: DEFAULT_EVAL_DISPATCH_TIMEOUT,
             case_timeout_override: None,
+            suite_usage_ceiling: None,
             additional_prompt: None,
         }
     }
@@ -57,6 +100,9 @@ impl EvalExecuteConfig {
             .is_some_and(|timeout| timeout.is_zero())
         {
             anyhow::bail!("eval execute case_timeout_override must be greater than zero");
+        }
+        if let Some(ceiling) = &self.suite_usage_ceiling {
+            ceiling.validate()?;
         }
         Ok(())
     }
@@ -157,12 +203,27 @@ pub async fn execute_manifest_with_cancellation(
 ) -> anyhow::Result<EvalRunReport> {
     config.validate()?;
     let mut evidence = Vec::new();
+    let mut budget_exhausted = false;
 
     for case in &manifest.cases {
         if *cancellation.borrow() {
             break;
         }
         if case.replay_blocker().is_some() {
+            continue;
+        }
+        if let Some(reason) =
+            suite_usage_exhaustion_reason(config.suite_usage_ceiling.as_ref(), &evidence)
+        {
+            budget_exhausted = true;
+            evidence.push(synthetic_failure_evidence(
+                &config.run_id,
+                &case.case_id,
+                None,
+                EvalEvidenceStatus::BudgetExhausted,
+                "suite_usage_ceiling_exceeded",
+                Some(reason),
+            ));
             continue;
         }
 
@@ -363,16 +424,44 @@ pub async fn execute_manifest_with_cancellation(
             }
         }
         evidence.push(case_evidence);
+        if suite_usage_exhaustion_reason(config.suite_usage_ceiling.as_ref(), &evidence).is_some() {
+            budget_exhausted = true;
+        }
         if was_cancelled {
             break;
         }
     }
 
-    let report = eval_report_from_evidence(manifest, config.run_id, config.k, evidence)?;
+    let mut report = eval_report_from_evidence(manifest, config.run_id, config.k, evidence)?;
+    if budget_exhausted {
+        report.outcome = Some(EvalRunOutcome::BudgetExhausted);
+    }
     if let Err(error) = emit_eval_events(observe, &report).await {
-        tracing::error!(run_id = %report.run_id, %error, "eval report event persistence failed");
+        return Err(EvalEventPersistenceError::new(error, report).into());
     }
     Ok(report)
+}
+
+pub async fn retry_eval_report_events(
+    observe: &EventStore,
+    report: &EvalRunReport,
+) -> anyhow::Result<EvalRunReport> {
+    let Some(outcome) = report.outcome else {
+        anyhow::bail!("eval report does not have an event persistence failure");
+    };
+    if !outcome.has_event_persistence_failure() {
+        anyhow::bail!("eval report does not have an event persistence failure");
+    }
+    let recovered = report_after_event_retry(report, outcome);
+    emit_eval_events(observe, &recovered).await?;
+    Ok(recovered)
+}
+
+fn report_after_event_retry(report: &EvalRunReport, outcome: EvalRunOutcome) -> EvalRunReport {
+    let mut recovered = report.clone();
+    recovered.outcome = outcome.after_event_retry();
+    recovered.outcome = eval_report_effective_outcome(&recovered);
+    recovered
 }
 
 async fn wait_for_eval_case_dispatch(
@@ -581,71 +670,6 @@ fn push_missing_evidence(evidence: &mut EvalCaseEvidence, key: &str) {
 
 fn eval_case_task_id(eval_run_id: &str, case_id: &str) -> String {
     format!("eval-run:{eval_run_id}:{case_id}")
-}
-
-async fn emit_eval_events(observe: &EventStore, report: &EvalRunReport) -> anyhow::Result<()> {
-    let session = SessionId::from_str(&format!("eval:{}", report.run_id));
-    let mut events = Vec::with_capacity(report.cases.len() + 1);
-    for case in &report.cases {
-        let mut event = Event::new(
-            session.clone(),
-            "eval_case_scored",
-            "harness_eval",
-            if case.passed {
-                Decision::Pass
-            } else {
-                Decision::Block
-            },
-        );
-        event.reason = Some(format!("{} status {:?}", case.case_id, case.status));
-        event.content = Some(serde_json::to_string(&json!({
-            "suite": &report.suite,
-            "run_id": &report.run_id,
-            "case_id": &case.case_id,
-            "repo": &case.repo,
-            "issue": case.issue,
-            "status": case.status,
-            "passed": case.passed,
-            "grade": case.final_grade,
-            "failed_gates": case.failed_hard_gates.iter().map(|gate| format!("{:?}", gate.name)).collect::<Vec<_>>(),
-            "total_tokens": case.total_tokens,
-            "cost_usd_micros": case.cost_usd_micros,
-            "workflow_id": &case.workflow_id,
-            "terminal_state": &case.terminal_state,
-        }))?);
-        events.push(event);
-    }
-
-    let mut run_event = Event::new(
-        session,
-        "eval_run_completed",
-        "harness_eval",
-        Decision::Complete,
-    );
-    run_event.reason = Some(format!(
-        "{} completed with {} passed, {} failed, {} infra failed",
-        report.run_id,
-        report.metrics.passed_cases,
-        report.metrics.failed_cases,
-        report.metrics.infra_failed_cases
-    ));
-    run_event.content = Some(serde_json::to_string(&json!({
-        "suite": &report.suite,
-        "run_id": &report.run_id,
-        "k": report.k,
-        "pass_at_1": report.metrics.pass_at_1,
-        "pass_to_k": report.metrics.pass_to_k,
-        "passed_cases": report.metrics.passed_cases,
-        "failed_cases": report.metrics.failed_cases,
-        "infra_failed_cases": report.metrics.infra_failed_cases,
-        "total_cases": report.metrics.total_cases,
-        "total_tokens": report.metrics.total_tokens,
-        "total_cost_usd_micros": report.metrics.total_cost_usd_micros,
-    }))?);
-    events.push(run_event);
-
-    observe.log_many(&events).await?;
-    Ok(())
 }
 
 #[cfg(test)]

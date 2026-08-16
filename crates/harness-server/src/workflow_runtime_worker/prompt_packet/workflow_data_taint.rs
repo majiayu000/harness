@@ -47,6 +47,7 @@ fn render_workflow_data(
     job_input: &Value,
 ) -> anyhow::Result<RenderedWorkflowData> {
     let mut data = workflow.data.clone();
+    super::command_input_taint::redact_trusted_eval_verifier_control(&mut data);
     super::remove_duplicated_command_field(&mut data, job_input, "additional_prompt");
     let mut degradation = Vec::new();
     let rendered = match &workflow.data_provenance {
@@ -293,4 +294,36 @@ pub(super) fn append_continuation_context_prompt(prompt: &mut String, prompt_pac
     prompt.push_str(&format!(
         "\nContinuation context:\n```external-data\n{preamble}\nAttempt: {attempt}\nPrevious external state:\n{previous_state}\nPrevious attempt summary:\n{previous_summary}\n```\n"
     ));
+}
+
+#[cfg(test)]
+mod trusted_verifier_tests {
+    use super::*;
+    use harness_workflow::runtime::WorkflowSubject;
+
+    #[test]
+    fn quality_gate_child_prompt_omits_trusted_verifier_control() -> anyhow::Result<()> {
+        let marker = "gh1454_ci_contract_v1";
+        let workflow = WorkflowInstance::new(
+            "quality_gate",
+            1,
+            "checking",
+            WorkflowSubject::new("quality_gate", "pr:1"),
+        )
+        .with_server_data(json!({
+            "validation_commands_argv": [[
+                "harness", "eval", "verify-trusted", marker,
+                "--workspace", ".", "--verifier-sha256", "digest"
+            ]],
+            "project_id": "/repo"
+        }));
+
+        let prompt = workflow_prompt_value(&workflow, &json!({}))?;
+        let serialized = serde_json::to_string(&prompt)?;
+
+        assert!(!serialized.contains(marker));
+        assert!(!serialized.contains("verify-trusted"));
+        assert!(!serialized.contains("--verifier-sha256"));
+        Ok(())
+    }
 }

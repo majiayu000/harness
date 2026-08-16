@@ -5,6 +5,10 @@ use super::super::manifest::{
 use super::super::model::RuntimeSnapshot;
 use super::super::EvalCaseEvidence;
 use super::*;
+use crate::runtime::{
+    parse_benchmark_manifest_str, EvalQualityGateEvidence, EvalTrustedVerifier,
+    EvalValidationCommandEvidence,
+};
 
 #[test]
 fn historical_replay_manifest_pending_case_stays_pending_without_evidence() {
@@ -21,6 +25,7 @@ fn historical_replay_manifest_pending_case_stays_pending_without_evidence() {
         report.cases[0].missing_evidence,
         vec!["commit_resolution is pending"]
     );
+    assert_eq!(report.outcome, Some(EvalRunOutcome::Incomplete));
 }
 
 #[test]
@@ -44,6 +49,7 @@ fn eval_report_scores_only_explicit_cases_and_skips_missing_evidence() {
     assert_eq!(report.metrics.failed_cases, 0);
     assert_eq!(report.metrics.skipped_cases, 1);
     assert_eq!(report.metrics.pass_at_1, 1.0);
+    assert_eq!(report.outcome, Some(EvalRunOutcome::Incomplete));
 
     let missing = report
         .cases
@@ -117,7 +123,6 @@ fn eval_execute_infrastructure_statuses_are_not_scored() {
     for status in [
         EvalEvidenceStatus::DispatchFailed,
         EvalEvidenceStatus::EvidenceIncomplete,
-        EvalEvidenceStatus::BudgetExhausted,
     ] {
         let report = eval_report_from_evidence(
             &manifest(&["case-fail"]),
@@ -136,7 +141,179 @@ fn eval_execute_infrastructure_statuses_are_not_scored() {
         assert_eq!(report.metrics.scored_cases, 0);
         assert_eq!(report.metrics.failed_cases, 0);
         assert_eq!(report.metrics.infra_failed_cases, 1);
+        assert_eq!(report.outcome, Some(EvalRunOutcome::Incomplete));
     }
+}
+
+#[test]
+fn eval_budget_exhaustion_has_an_explicit_non_scored_status() {
+    let report = eval_report_from_evidence(
+        &manifest(&["case-budget"]),
+        "candidate",
+        1,
+        vec![evidence(
+            "case-budget",
+            EvalEvidenceStatus::BudgetExhausted,
+            vec!["suite_usage_ceiling_exceeded".to_string()],
+            None,
+        )],
+    )
+    .expect("report should build");
+
+    assert_eq!(report.cases[0].status, EvalReportCaseStatus::InfraFailed);
+    assert_eq!(
+        report.cases[0].outcome,
+        Some(EvalReportCaseOutcome::BudgetExhausted)
+    );
+    assert_eq!(report.metrics.scored_cases, 0);
+    assert_eq!(report.metrics.failed_cases, 0);
+    assert_eq!(report.metrics.infra_failed_cases, 1);
+    assert_eq!(report.outcome, Some(EvalRunOutcome::BudgetExhausted));
+}
+
+#[test]
+fn budget_report_remains_readable_by_legacy_case_status_consumers() {
+    #[derive(serde::Deserialize)]
+    struct LegacyReport {
+        cases: Vec<LegacyCase>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyCase {
+        status: LegacyCaseStatus,
+    }
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyCaseStatus {
+        Pending,
+        Passed,
+        Failed,
+        Skipped,
+        InfraFailed,
+    }
+
+    let report = eval_report_from_evidence(
+        &manifest(&["case-budget"]),
+        "candidate",
+        1,
+        vec![evidence(
+            "case-budget",
+            EvalEvidenceStatus::BudgetExhausted,
+            vec!["suite_usage_ceiling_exceeded".to_string()],
+            None,
+        )],
+    )
+    .expect("report should build");
+    let legacy: LegacyReport =
+        serde_json::from_value(serde_json::to_value(report).expect("report should serialize"))
+            .expect("legacy consumer should ignore additive outcome fields");
+
+    assert_eq!(legacy.cases[0].status, LegacyCaseStatus::InfraFailed);
+}
+
+#[test]
+fn passed_then_budget_exhausted_run_is_explicitly_incomplete() {
+    let report = eval_report_from_evidence(
+        &manifest(&["case-pass", "case-budget"]),
+        "candidate",
+        1,
+        vec![
+            evidence("case-pass", EvalEvidenceStatus::Passed, Vec::new(), None),
+            evidence(
+                "case-budget",
+                EvalEvidenceStatus::BudgetExhausted,
+                vec!["suite_usage_ceiling_exceeded".to_string()],
+                None,
+            ),
+        ],
+    )
+    .expect("report should build");
+
+    assert_eq!(report.metrics.pass_at_1, 1.0);
+    assert_eq!(report.outcome, Some(EvalRunOutcome::BudgetExhausted));
+}
+
+#[test]
+fn effective_outcome_reconstructs_legacy_incomplete_reports() {
+    let report = report(
+        "legacy-incomplete",
+        vec![case("case-infra", EvalReportCaseStatus::InfraFailed)],
+    );
+
+    assert_eq!(report.outcome, None);
+    assert_eq!(
+        eval_report_effective_outcome(&report),
+        Some(EvalRunOutcome::Incomplete)
+    );
+}
+
+#[test]
+fn gh1454_report_and_diff_retain_verifier_provenance() {
+    let manifest = parse_benchmark_manifest_str(
+        r#"
+suite = "trusted"
+
+[[cases]]
+case_id = "gh1454-scoped-ci-jobs"
+repo = "majiayu000/harness"
+issue = 1454
+base_commit = "9c0099ad458e82fd377fd20a8e288a46722762ef"
+"#,
+    )
+    .expect("trusted manifest should parse");
+    let verifier = EvalTrustedVerifier::Gh1454CiContractV1;
+    let mut case_evidence = evidence(
+        "gh1454-scoped-ci-jobs",
+        EvalEvidenceStatus::Passed,
+        vec![],
+        None,
+    );
+    case_evidence.quality_gate = Some(EvalQualityGateEvidence {
+        command_id: Some("command-1".to_string()),
+        runtime_job_id: Some("job-1".to_string()),
+        status: "succeeded".to_string(),
+        validation_passed: true,
+        validation_commands: Vec::new(),
+        validation_evidence: vec![EvalValidationCommandEvidence {
+            command: "harness eval verify-trusted".to_string(),
+            argv: verifier.validation_argv(),
+            exit_code: Some(0),
+            output_sha256: Some("a".repeat(64)),
+            duration_ms: Some(10),
+            verifier_id: Some(verifier.id().to_string()),
+            verifier_sha256: Some(verifier.sha256().to_string()),
+        }],
+    });
+
+    let candidate = eval_report_from_evidence(&manifest, "candidate", 1, vec![case_evidence])
+        .expect("report should build");
+    let baseline = eval_report_dry_run(&manifest, "baseline", 1).expect("baseline should build");
+    let diff = diff_eval_run_reports(&baseline, &candidate);
+
+    assert_eq!(
+        candidate.cases[0].verification_evidence[0]
+            .verifier_sha256
+            .as_deref(),
+        Some(verifier.sha256())
+    );
+    assert_eq!(
+        diff.transitions[0].candidate_verification_evidence[0]
+            .output_sha256
+            .as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+
+    let mut old_json = serde_json::to_value(&candidate).expect("report should serialize");
+    old_json
+        .as_object_mut()
+        .expect("report object")
+        .remove("outcome");
+    old_json["cases"][0]
+        .as_object_mut()
+        .expect("case object")
+        .remove("verification_evidence");
+    let old_report: EvalRunReport =
+        serde_json::from_value(old_json).expect("older report should remain readable");
+    assert!(old_report.cases[0].verification_evidence.is_empty());
 }
 
 #[test]
@@ -368,6 +545,7 @@ fn report(run_id: &str, cases: Vec<EvalReportCase>) -> EvalRunReport {
         suite: "harness-core".to_string(),
         k: 3,
         metrics: metrics_for_cases(3, &cases),
+        outcome: None,
         cases,
     }
 }
@@ -381,9 +559,11 @@ fn case(case_id: &str, status: EvalReportCaseStatus) -> EvalReportCase {
         base_commit: format!("base-{case_id}"),
         source_commit: format!("source-{case_id}"),
         verify_commands: vec![format!("cargo test {case_id}")],
+        verification_evidence: Vec::new(),
         attestation_trust: EvalAttestationTrust::Unsigned,
         attestation_decision: None,
         status,
+        outcome: None,
         passed: status == EvalReportCaseStatus::Passed,
         explicit_evidence,
         final_grade: None,

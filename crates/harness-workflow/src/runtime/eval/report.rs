@@ -2,9 +2,14 @@ use super::attestation::{EvalAttestationDecision, EvalAttestationTrust};
 use super::evidence::{EvalCaseEvidence, EvalEvidenceStatus};
 use super::manifest::EvalBenchmarkManifest;
 use super::model::{EvalGrade, GateStatus, HardGateName, QualitySnapshot};
+use super::verification_evidence::EvalValidationCommandEvidence;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, fmt};
+
+mod outcome;
+use outcome::inferred_run_outcome;
+pub use outcome::{eval_report_effective_outcome, EvalReportCaseOutcome, EvalRunOutcome};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvalRunReport {
@@ -12,6 +17,8 @@ pub struct EvalRunReport {
     pub suite: String,
     pub k: u32,
     pub metrics: EvalReportMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<EvalRunOutcome>,
     pub cases: Vec<EvalReportCase>,
 }
 
@@ -42,7 +49,11 @@ pub struct EvalReportCase {
     #[serde(default)]
     pub source_commit: String,
     pub verify_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_evidence: Vec<EvalValidationCommandEvidence>,
     pub status: EvalReportCaseStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<EvalReportCaseOutcome>,
     pub passed: bool,
     #[serde(default)]
     pub attestation_trust: EvalAttestationTrust,
@@ -96,6 +107,10 @@ pub struct EvalRunReportDiff {
     pub candidate_run_id: String,
     pub suite: String,
     pub k: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_outcome: Option<EvalRunOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_outcome: Option<EvalRunOutcome>,
     pub delta: EvalReportMetricDelta,
     #[serde(default)]
     pub transition_counts: EvalCaseTransitionCounts,
@@ -136,6 +151,10 @@ pub struct EvalCaseTransition {
     pub baseline_verify_commands: Vec<String>,
     #[serde(default)]
     pub candidate_verify_commands: Vec<String>,
+    #[serde(default)]
+    pub baseline_verification_evidence: Vec<EvalValidationCommandEvidence>,
+    #[serde(default)]
+    pub candidate_verification_evidence: Vec<EvalValidationCommandEvidence>,
     #[serde(default)]
     pub baseline_terminal_state: Option<String>,
     #[serde(default)]
@@ -221,7 +240,9 @@ pub fn eval_report_dry_run(
             base_commit: case.base_commit.clone(),
             source_commit: case.base_commit.clone(),
             verify_commands: case.verify_commands.clone(),
+            verification_evidence: Vec::new(),
             status: EvalReportCaseStatus::Pending,
+            outcome: None,
             passed: false,
             attestation_trust: EvalAttestationTrust::Unsigned,
             attestation_decision: None,
@@ -285,7 +306,9 @@ pub fn eval_report_from_evidence(
                 base_commit: case.base_commit.clone(),
                 source_commit: case.base_commit.clone(),
                 verify_commands: case.verify_commands.clone(),
+                verification_evidence: Vec::new(),
                 status: EvalReportCaseStatus::Pending,
+                outcome: None,
                 passed: false,
                 attestation_trust: EvalAttestationTrust::Unsigned,
                 attestation_decision: None,
@@ -306,7 +329,9 @@ pub fn eval_report_from_evidence(
                 base_commit: case.base_commit.clone(),
                 source_commit: case.base_commit.clone(),
                 verify_commands: case.verify_commands.clone(),
+                verification_evidence: Vec::new(),
                 status: EvalReportCaseStatus::Skipped,
+                outcome: None,
                 passed: false,
                 attestation_trust: EvalAttestationTrust::Unsigned,
                 attestation_decision: None,
@@ -367,6 +392,12 @@ pub fn diff_eval_run_reports(
                 candidate_verify_commands: candidate_case
                     .map(|case| case.verify_commands.clone())
                     .unwrap_or_default(),
+                baseline_verification_evidence: baseline_case
+                    .map(|case| case.verification_evidence.clone())
+                    .unwrap_or_default(),
+                candidate_verification_evidence: candidate_case
+                    .map(|case| case.verification_evidence.clone())
+                    .unwrap_or_default(),
                 baseline_terminal_state: baseline_case.and_then(|case| case.terminal_state.clone()),
                 candidate_terminal_state: candidate_case
                     .and_then(|case| case.terminal_state.clone()),
@@ -386,6 +417,8 @@ pub fn diff_eval_run_reports(
         candidate_run_id: candidate.run_id.clone(),
         suite: candidate.suite.clone(),
         k: candidate.k,
+        baseline_outcome: eval_report_effective_outcome(baseline),
+        candidate_outcome: eval_report_effective_outcome(candidate),
         delta: EvalReportMetricDelta {
             pass_at_1_delta: candidate.metrics.pass_at_1 - baseline.metrics.pass_at_1,
             pass_to_k_delta: candidate.metrics.pass_to_k - baseline.metrics.pass_to_k,
@@ -408,9 +441,16 @@ fn report_case_from_evidence(
     let (total_tokens, cost_usd_micros) = evidence_usage_totals(&evidence);
     let passed = evidence.status == EvalEvidenceStatus::Passed;
     let status = evidence_case_status(&evidence, passed);
+    let outcome = (evidence.status == EvalEvidenceStatus::BudgetExhausted)
+        .then_some(EvalReportCaseOutcome::BudgetExhausted);
     let terminal_state = evidence_terminal_state(&evidence);
     let infrastructure_status = evidence_infrastructure_status(&evidence, status);
     let (final_grade, failed_hard_gates) = quality_summary(evidence.quality.as_ref());
+    let verification_evidence = evidence
+        .quality_gate
+        .as_ref()
+        .map(|quality_gate| quality_gate.validation_evidence.clone())
+        .unwrap_or_default();
     EvalReportCase {
         case_id: case.case_id.clone(),
         repo: case.repo.clone(),
@@ -418,7 +458,9 @@ fn report_case_from_evidence(
         base_commit: case.base_commit.clone(),
         source_commit: case.base_commit.clone(),
         verify_commands: case.verify_commands.clone(),
+        verification_evidence,
         status,
+        outcome,
         passed,
         attestation_trust: evidence.attestation.trust(),
         attestation_decision: evidence.attestation.decision(),
@@ -459,11 +501,12 @@ fn evidence_case_status(evidence: &EvalCaseEvidence, passed: bool) -> EvalReport
     if evidence.status == EvalEvidenceStatus::Skipped {
         return EvalReportCaseStatus::Skipped;
     }
+    if evidence.status == EvalEvidenceStatus::BudgetExhausted {
+        return EvalReportCaseStatus::InfraFailed;
+    }
     if matches!(
         evidence.status,
-        EvalEvidenceStatus::DispatchFailed
-            | EvalEvidenceStatus::EvidenceIncomplete
-            | EvalEvidenceStatus::BudgetExhausted
+        EvalEvidenceStatus::DispatchFailed | EvalEvidenceStatus::EvidenceIncomplete
     ) {
         return EvalReportCaseStatus::InfraFailed;
     }
@@ -527,11 +570,14 @@ fn report_from_cases(
     k: u32,
     cases: Vec<EvalReportCase>,
 ) -> EvalRunReport {
+    let metrics = metrics_for_cases(k, &cases);
+    let outcome = inferred_run_outcome(&cases, &metrics);
     EvalRunReport {
         run_id: run_id.into(),
         suite: manifest.suite.clone(),
         k,
-        metrics: metrics_for_cases(k, &cases),
+        metrics,
+        outcome,
         cases,
     }
 }
@@ -566,7 +612,7 @@ fn metrics_for_cases(k: u32, cases: &[EvalReportCase]) -> EvalReportMetrics {
         .count() as u64;
     let infra_failed_cases = cases
         .iter()
-        .filter(|case| case.status == EvalReportCaseStatus::InfraFailed)
+        .filter(|case| matches!(case.status, EvalReportCaseStatus::InfraFailed))
         .count() as u64;
     let pass_at_1 = if scored_cases == 0 {
         0.0

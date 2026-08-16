@@ -20,10 +20,12 @@ pub(super) struct RenderedCommandInput {
 /// is partitioned by its actual origin so prior agent output cannot masquerade
 /// as user or remote-system input on the next turn.
 pub(super) fn render_command_input(input: &Value) -> anyhow::Result<RenderedCommandInput> {
-    let mut trusted = input.clone();
+    let mut sanitized = input.clone();
+    redact_trusted_eval_verifier_control(&mut sanitized);
+    let mut trusted = sanitized.clone();
     let mut agent_pointers = Vec::new();
     let mut external_pointers = Vec::new();
-    collect_tainted_pointers("", input, &mut agent_pointers, &mut external_pointers);
+    collect_tainted_pointers("", &sanitized, &mut agent_pointers, &mut external_pointers);
     let agent_fields =
         take_fenced_pointers(&mut trusted, agent_pointers, CommandInputOrigin::Agent)?;
     let external_fields = take_fenced_pointers(
@@ -40,6 +42,59 @@ pub(super) fn render_command_input(input: &Value) -> anyhow::Result<RenderedComm
         })
     });
     Ok(RenderedCommandInput { trusted, untrusted })
+}
+
+pub(super) fn redact_trusted_eval_verifier_control(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            let has_direct_trusted_verifier = object
+                .get("validation_commands_argv")
+                .is_some_and(contains_trusted_verifier_command);
+            let has_trusted_verifier =
+                object
+                    .get("eval")
+                    .and_then(Value::as_object)
+                    .is_some_and(|eval| {
+                        eval.get("verify_commands")
+                            .and_then(Value::as_array)
+                            .is_some_and(Vec::is_empty)
+                            && eval
+                                .get("verify_commands_argv")
+                                .is_some_and(contains_trusted_verifier_command)
+                    });
+            if has_trusted_verifier {
+                if let Some(eval) = object.get_mut("eval").and_then(Value::as_object_mut) {
+                    eval.remove("verify_commands_argv");
+                    eval.remove("trusted_verifier");
+                }
+                object.remove("validation_commands_argv");
+            }
+            if has_direct_trusted_verifier {
+                object.remove("validation_commands_argv");
+            }
+            for child in object.values_mut() {
+                redact_trusted_eval_verifier_control(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                redact_trusted_eval_verifier_control(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn contains_trusted_verifier_command(value: &Value) -> bool {
+    value.as_array().is_some_and(|commands| {
+        commands.iter().any(|command| {
+            command.as_array().is_some_and(|arguments| {
+                arguments
+                    .iter()
+                    .any(|argument| argument.as_str() == Some("verify-trusted"))
+            })
+        })
+    })
 }
 
 fn collect_tainted_pointers(
@@ -332,5 +387,51 @@ mod tests {
             .pointer("/external_fields/command/validation_commands")
             .and_then(Value::as_str)
             .is_some_and(|value| value.contains(control_text)));
+    }
+
+    #[test]
+    fn trusted_verifier_control_is_absent_from_agent_prompt_input() {
+        let marker = "gh1454_ci_contract_v1";
+        let rendered = render_command_input(&json!({
+            "activity": "implement_issue",
+            "command": {
+                "eval": {
+                    "verify_commands": [],
+                    "verify_commands_argv": [[
+                        "harness", "eval", "verify-trusted", marker,
+                        "--verifier-sha256", "digest"
+                    ]],
+                    "timeout_secs": 900
+                },
+                "validation_commands_argv": [[
+                    "harness", "eval", "verify-trusted", marker,
+                    "--verifier-sha256", "digest"
+                ]]
+            }
+        }))
+        .expect("partition");
+
+        let serialized = serde_json::to_string(&json!({
+            "trusted": rendered.trusted,
+            "untrusted": rendered.untrusted,
+        }))
+        .expect("rendered input should serialize");
+        assert!(!serialized.contains(marker));
+        assert!(!serialized.contains("--verifier-sha256"));
+    }
+
+    #[test]
+    fn direct_quality_gate_verifier_control_is_redacted() {
+        let mut input = json!({
+            "validation_commands_argv": [[
+                "harness", "eval", "verify-trusted", "gh1454_ci_contract_v1",
+                "--workspace", ".", "--verifier-sha256", "digest"
+            ]],
+            "status": "checking"
+        });
+
+        redact_trusted_eval_verifier_control(&mut input);
+
+        assert_eq!(input, json!({"status": "checking"}));
     }
 }

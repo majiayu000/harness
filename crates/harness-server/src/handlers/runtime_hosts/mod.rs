@@ -15,7 +15,7 @@ use harness_sandbox::{
 use harness_workflow::runtime::{
     prepare_runtime_transcript, ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob,
     RuntimeJobClaimDecision, RuntimeJobClaimDeferOutcome, RuntimeJobClaimGuard,
-    RuntimeJobNotFoundError, WorkflowRuntimeStore,
+    RuntimeJobNotFoundError, WorkflowRuntimeStore, TRUSTED_EVAL_VERIFIER_V1_CAPABILITY,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -261,6 +261,8 @@ pub async fn claim_runtime_job_for_runtime_host(
     }
     let host_supports_eval_resource_limits =
         runtime_host_supports_eval_resource_limits(&state, &host_id);
+    let host_supports_trusted_eval_verifier =
+        runtime_host_supports_capability(&state, &host_id, TRUSTED_EVAL_VERIFIER_V1_CAPABILITY);
     let store = match workflow_runtime_store(&state) {
         Ok(store) => store,
         Err(response) => return (response.0, claim_json(response.1 .0)),
@@ -285,6 +287,7 @@ pub async fn claim_runtime_job_for_runtime_host(
             &host_id,
             lease_expires_at,
             host_supports_eval_resource_limits,
+            host_supports_trusted_eval_verifier,
         )
         .await
     {
@@ -680,10 +683,14 @@ async fn complete_runtime_host_preflight_failure(
 }
 
 fn runtime_host_supports_eval_resource_limits(state: &Arc<AppState>, host_id: &str) -> bool {
+    runtime_host_supports_capability(state, host_id, EVAL_RESOURCE_LIMITS_CAPABILITY)
+}
+
+fn runtime_host_supports_capability(state: &Arc<AppState>, host_id: &str, required: &str) -> bool {
     state.runtime_hosts.hosts.get(host_id).is_some_and(|host| {
         host.capabilities
             .iter()
-            .any(|capability| capability == EVAL_RESOURCE_LIMITS_CAPABILITY)
+            .any(|capability| capability == required)
     })
 }
 

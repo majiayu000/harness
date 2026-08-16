@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::EvalTrustedVerifier;
 
 fn manifest_with(command_mode: Option<&str>, command: &str) -> String {
     let mode = command_mode
@@ -43,4 +44,44 @@ fn explicit_shell_mode_produces_a_governed_shell_argv() {
             "cargo test && cargo clippy".to_string(),
         ]]
     );
+}
+
+#[test]
+fn trusted_verifier_replaces_agent_visible_verify_commands() {
+    let input = r#"
+suite = "trusted-verifier"
+
+[[cases]]
+case_id = "gh1454-scoped-ci-jobs"
+repo = "majiayu000/harness"
+issue = 1454
+base_commit = "9c0099ad458e82fd377fd20a8e288a46722762ef"
+"#;
+    let manifest = parse_benchmark_manifest_str(input).expect("trusted verifier should parse");
+    let case = &manifest.cases[0];
+
+    assert!(case.verify_commands.is_empty());
+    assert_eq!(
+        case.verification_command_argv()
+            .expect("trusted verifier should produce governed argv"),
+        vec![EvalTrustedVerifier::Gh1454CiContractV1.validation_argv()]
+    );
+}
+
+#[test]
+fn trusted_verifier_rejects_agent_visible_verify_commands() {
+    let input = r#"
+suite = "trusted-verifier"
+
+[[cases]]
+case_id = "gh1454-scoped-ci-jobs"
+repo = "majiayu000/harness"
+issue = 1454
+base_commit = "9c0099ad458e82fd377fd20a8e288a46722762ef"
+verify_commands = ["python3 inspect_the_contract.py"]
+"#;
+    let error = parse_benchmark_manifest_str(input)
+        .expect_err("trusted verifier must not share its contract with the agent");
+
+    assert!(error.to_string().contains("cannot expose verify_commands"));
 }

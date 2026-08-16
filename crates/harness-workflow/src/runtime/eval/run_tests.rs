@@ -1,6 +1,6 @@
 use super::super::EvalVerifyCommandMode;
 use super::*;
-use crate::runtime::{RuntimeKind, WorkflowRuntimeStore};
+use crate::runtime::{EvalTrustedVerifier, RuntimeKind, WorkflowRuntimeStore};
 
 #[test]
 fn eval_run_plan_marks_issue_submission_for_draft_prs() -> anyhow::Result<()> {
@@ -93,6 +93,71 @@ fn eval_run_plan_marks_issue_submission_for_draft_prs() -> anyhow::Result<()> {
     assert_eq!(
         command["validation_commands_argv"][0],
         json!(["cargo", "test", "-p", "harness-workflow", "eval_run"])
+    );
+    Ok(())
+}
+
+#[test]
+fn eval_run_keeps_trusted_verifier_out_of_agent_visible_commands() -> anyhow::Result<()> {
+    let case = EvalBenchmarkCase {
+        case_id: "gh1454-scoped-ci-jobs".to_string(),
+        repo: "majiayu000/harness".to_string(),
+        issue: 1454,
+        base_commit: "9c0099ad458e82fd377fd20a8e288a46722762ef".to_string(),
+        verify_commands: Vec::new(),
+        verify_command_mode: EvalVerifyCommandMode::Argv,
+        paths: Vec::new(),
+        risk: None,
+        evidence: Vec::new(),
+        resolution_prs: Vec::new(),
+        resolution_commits: Vec::new(),
+        commit_resolution: None,
+        verdict: None,
+        timeout_secs: 120,
+        resource_limits: harness_sandbox::ResourceLimits::evaluation_defaults(120)
+            .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())?,
+        isolation: EvalIsolationProfile::default(),
+    };
+    let input = EvalCaseWorkflowInput {
+        eval_run_id: "run-trusted",
+        case: &case,
+        project_id: "/repo",
+        task_id: "eval-task-trusted",
+        additional_prompt: None,
+        timeout_secs: case.timeout_secs,
+        resource_limits: &case.resource_limits,
+    };
+    let verification_argv = case.verification_command_argv()?;
+
+    let initial = eval_case_initial_instance(input, &verification_argv);
+    assert_eq!(initial.data["eval"]["verify_commands"], json!([]));
+    assert_eq!(
+        initial.data["eval"]["verify_commands_argv"],
+        json!([EvalTrustedVerifier::Gh1454CiContractV1.validation_argv()])
+    );
+
+    let output = build_issue_submission_decision(
+        &initial,
+        IssueSubmissionDecisionInput {
+            task_id: "eval-task-trusted",
+            repo: Some("majiayu000/harness"),
+            issue_number: 1454,
+            labels: &[],
+            force_execute: true,
+            additional_prompt: Some(EVAL_CASE_DEFAULT_ADDITIONAL_PROMPT),
+            depends_on: &[],
+            dependencies_blocked: false,
+            remote_fact_hash: None,
+            submission_mode: SubmissionMode::Immediate,
+            candidate_fanout: None,
+        },
+    );
+    let decision = with_eval_command_metadata(output.decision, input, &verification_argv);
+    let command = &decision.commands[0].command;
+    assert_eq!(command["validation_commands"], json!([]));
+    assert_eq!(
+        command["validation_commands_argv"],
+        json!([EvalTrustedVerifier::Gh1454CiContractV1.validation_argv()])
     );
     Ok(())
 }

@@ -21,6 +21,8 @@ pub mod run;
 mod run_concurrency_tests;
 pub mod scoring;
 mod transition_outcome;
+mod trusted_verifier;
+mod verification_evidence;
 
 pub use attestation::{
     classify_eval_run_attestation, eval_run_attestation_payload_digest,
@@ -37,8 +39,9 @@ pub use evidence::{
 };
 pub use evidence_collection::collect_eval_case_evidence;
 pub use execute::{
-    execute_manifest, execute_manifest_with_cancellation, EvalExecuteConfig,
-    DEFAULT_EVAL_DISPATCH_TIMEOUT, DEFAULT_EVAL_POLL_INTERVAL,
+    execute_manifest, execute_manifest_with_cancellation, retry_eval_report_events,
+    EvalEventPersistenceError, EvalExecuteConfig, EvalUsageCeiling, DEFAULT_EVAL_DISPATCH_TIMEOUT,
+    DEFAULT_EVAL_POLL_INTERVAL,
 };
 pub use historical_replay::{
     historical_replay_command_digest, parse_historical_replay_cohort_str,
@@ -56,11 +59,11 @@ pub use manifest::{
     DEFAULT_EVAL_ISOLATION_RUNTIME_PROFILE, DEFAULT_EVAL_ISOLATION_SANDBOX,
 };
 pub use report::{
-    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
-    EvalCaseInfrastructureStatus, EvalCaseTransition, EvalCaseTransitionCounts,
-    EvalCaseTransitionKind, EvalReportCase, EvalReportCaseStatus, EvalReportError,
-    EvalReportFailedGate, EvalReportMetricDelta, EvalReportMetrics, EvalRunReport,
-    EvalRunReportDiff,
+    diff_eval_run_reports, eval_report_dry_run, eval_report_effective_outcome,
+    eval_report_from_evidence, EvalCaseInfrastructureStatus, EvalCaseTransition,
+    EvalCaseTransitionCounts, EvalCaseTransitionKind, EvalReportCase, EvalReportCaseOutcome,
+    EvalReportCaseStatus, EvalReportError, EvalReportFailedGate, EvalReportMetricDelta,
+    EvalReportMetrics, EvalRunOutcome, EvalRunReport, EvalRunReportDiff,
 };
 pub use run::{
     cleanup_cancelled_eval_run, enqueue_eval_case_workflow, eval_isolated_runtime_profile,
@@ -68,3 +71,8 @@ pub use run::{
     EvalRunCleanupSummary, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
 };
 pub use scoring::{score_pr_repair_eval, ScoringError};
+pub use trusted_verifier::{
+    execute_trusted_eval_verifier, EvalTrustedVerifier, GH1454_CI_CONTRACT_V1_SHA256,
+    TRUSTED_EVAL_VERIFIER_V1_CAPABILITY,
+};
+pub use verification_evidence::EvalValidationCommandEvidence;

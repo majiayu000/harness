@@ -12,8 +12,15 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
-        self.claim_next_runtime_job_matching(Some(runtime_kind), None, owner, expires_at, true)
-            .await
+        self.claim_next_runtime_job_matching(
+            Some(runtime_kind),
+            None,
+            owner,
+            expires_at,
+            true,
+            true,
+        )
+        .await
     }
 
     pub async fn claim_next_remote_host_runtime_job(
@@ -21,6 +28,7 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: DateTime<Utc>,
         supports_eval_resource_limits: bool,
+        supports_trusted_eval_verifier: bool,
     ) -> anyhow::Result<Option<RuntimeJob>> {
         self.claim_next_runtime_job_matching(
             Some(RuntimeKind::RemoteHost),
@@ -28,6 +36,7 @@ impl WorkflowRuntimeStore {
             owner,
             expires_at,
             supports_eval_resource_limits,
+            supports_trusted_eval_verifier,
         )
         .await
     }
@@ -38,8 +47,15 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
-        self.claim_next_runtime_job_matching(None, Some(runtime_kind), owner, expires_at, true)
-            .await
+        self.claim_next_runtime_job_matching(
+            None,
+            Some(runtime_kind),
+            owner,
+            expires_at,
+            true,
+            true,
+        )
+        .await
     }
 
     async fn claim_next_runtime_job_matching(
@@ -49,6 +65,7 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: DateTime<Utc>,
         supports_eval_resource_limits: bool,
+        supports_trusted_eval_verifier: bool,
     ) -> anyhow::Result<Option<RuntimeJob>> {
         let records_remote_host_audit = only_runtime_kind == Some(RuntimeKind::RemoteHost);
         let only_runtime_kind = only_runtime_kind
@@ -84,6 +101,21 @@ impl WorkflowRuntimeStore {
                      AND job.data #> '{input,command,eval}' IS NULL
                  )
              )
+             AND (
+                 $4::boolean
+                 OR NOT (
+                     COALESCE(
+                         (job.data #> '{input,eval,required_runtime_host_capabilities}')
+                             ? 'trusted_eval_verifier_v1',
+                         false
+                     )
+                     OR COALESCE(
+                         (job.data #> '{input,command,eval,required_runtime_host_capabilities}')
+                             ? 'trusted_eval_verifier_v1',
+                         false
+                     )
+                 )
+             )
              ORDER BY
                  CASE
                      WHEN COALESCE(job.data #>> '{input,activity}', '') IN (
@@ -101,6 +133,7 @@ impl WorkflowRuntimeStore {
         .bind(only_runtime_kind.as_deref())
         .bind(excluded_runtime_kind.as_deref())
         .bind(supports_eval_resource_limits)
+        .bind(supports_trusted_eval_verifier)
         .fetch_optional(&mut *tx)
         .await?;
 
