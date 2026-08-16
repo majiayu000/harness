@@ -8,6 +8,7 @@ use super::model::{
     QualitySnapshot, RuntimeArtifactSnapshot, RuntimeErrorKind, RuntimeJobSnapshot,
     RuntimeSnapshot, UsageSnapshot,
 };
+use super::verification_evidence::{validation_command_evidence, EvalValidationCommandEvidence};
 use crate::runtime::{
     ActivityErrorKind, ActivityResult, RuntimeEvent, RuntimeJob, RuntimeJobStatus,
     WorkflowCommandRecord, WorkflowInstance, QUALITY_GATE_ACTIVITY,
@@ -64,6 +65,8 @@ pub struct EvalQualityGateEvidence {
     pub status: String,
     pub validation_passed: bool,
     pub validation_commands: Vec<String>,
+    #[serde(default)]
+    pub validation_evidence: Vec<EvalValidationCommandEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +239,7 @@ fn quality_gate_evidence(
         status: eval_runtime_job_status(job.status).to_string(),
         validation_passed,
         validation_commands,
+        validation_evidence: validation_command_evidence(result.as_ref()),
     })
 }
 

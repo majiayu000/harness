@@ -290,6 +290,61 @@ async fn runtime_job_claim_endpoint_includes_eval_credential_environment_policy(
 }
 
 #[tokio::test]
+async fn trusted_eval_job_is_claimed_only_by_a_capable_runtime_host() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host_with_capabilities(&app, "host-limited", vec!["eval_resource_limits"]).await?;
+    register_host_with_capabilities(
+        &app,
+        "host-trusted",
+        vec!["eval_resource_limits", "trusted_eval_verifier_v1"],
+    )
+    .await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "command-trusted-eval",
+        RuntimeKind::RemoteHost,
+        "eval-isolated-runtime-host",
+        json!({
+            "activity": "run_quality_gate",
+            "command": {
+                "eval": {
+                    "eval_run_id": "run-1",
+                    "case_id": "gh1454-scoped-ci-jobs",
+                    "timeout_secs": 45,
+                    "required_runtime_host_capabilities": [
+                        "eval_resource_limits",
+                        "trusted_eval_verifier_v1"
+                    ]
+                }
+            }
+        }),
+    )
+    .await?;
+
+    let limited = post_json(
+        &app,
+        "/api/runtime-hosts/host-limited/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    assert_eq!(limited["claimed"], false);
+
+    let trusted = post_json(
+        &app,
+        "/api/runtime-hosts/host-trusted/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    assert_eq!(trusted["claimed"], true);
+    assert_eq!(trusted["runtime_job_id"], job.id);
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_claim_endpoint_hydrates_verified_exact_replay_transcript() -> anyhow::Result<()>
 {
     let dir = tempfile::tempdir()?;

@@ -4,11 +4,12 @@ use harness_core::config::HarnessConfig;
 use harness_observe::event_store::EventStore;
 use harness_workflow::runtime::eval::model::EvalGrade;
 use harness_workflow::runtime::{
-    diff_eval_run_reports, eval_report_dry_run, eval_report_from_evidence,
-    execute_manifest_with_cancellation, parse_benchmark_manifest_str, EvalAttestationDecision,
-    EvalAttestationTrust, EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseInfrastructureStatus,
-    EvalCaseTransition, EvalCaseTransitionKind, EvalExecuteConfig, EvalReportCaseStatus,
-    EvalRunReport, EvalRunReportDiff, WorkflowRuntimeStore,
+    diff_eval_run_reports, eval_report_dry_run, eval_report_effective_outcome,
+    eval_report_from_evidence, execute_manifest_with_cancellation, execute_trusted_eval_verifier,
+    parse_benchmark_manifest_str, EvalAttestationDecision, EvalAttestationTrust,
+    EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseInfrastructureStatus, EvalCaseTransition,
+    EvalCaseTransitionKind, EvalExecuteConfig, EvalReportCaseStatus, EvalRunReport,
+    EvalRunReportDiff, EvalTrustedVerifier, EvalUsageCeiling, WorkflowRuntimeStore,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -16,8 +17,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod event_retry;
+mod execution_outcome;
 mod output;
-use output::{default_run_id, reserve_eval_output};
+use event_retry::{retry_eval_events, EvalRetryEventsArgs};
+use execution_outcome::{execution_result, EvalExecutionOutcome};
+use output::{
+    default_run_id, eval_report_output_path, render_verification_evidence,
+    render_verification_transition, reserve_eval_output, reserve_eval_run,
+};
 
 const PASS_DROP_EPSILON: f64 = 1e-9;
 
@@ -27,6 +35,10 @@ pub enum EvalCommand {
     Run(EvalRunArgs),
     /// Compare two saved eval run reports
     Diff(EvalDiffArgs),
+    /// Run a versioned evaluator-owned verifier against a candidate workspace
+    VerifyTrusted(EvalTrustedVerifierArgs),
+    /// Retry durable observe-event emission for an incomplete eval report
+    RetryEvents(EvalRetryEventsArgs),
 }
 
 #[derive(Args)]
@@ -58,6 +70,12 @@ pub struct EvalRunArgs {
     /// Maximum time to wait for the server dispatcher to create a runtime job
     #[arg(long, default_value_t = 30)]
     pub dispatch_timeout_secs: u64,
+    /// Stop dispatching new cases after the suite reaches this token total
+    #[arg(long, requires = "execute")]
+    pub max_total_tokens: Option<u64>,
+    /// Stop dispatching new cases after the suite reaches this cost in USD micros
+    #[arg(long, requires = "execute")]
+    pub max_cost_usd_micros: Option<u64>,
     /// Print JSON instead of the compact text report
     #[arg(long)]
     pub json: bool,
@@ -86,11 +104,35 @@ pub struct EvalDiffArgs {
     pub output: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub struct EvalTrustedVerifierArgs {
+    /// Versioned evaluator-owned verifier identifier
+    pub verifier: String,
+    /// Candidate workspace to inspect without modifying it
+    #[arg(long)]
+    pub workspace: PathBuf,
+    /// Expected verifier asset digest bound into evaluator evidence
+    #[arg(long)]
+    pub verifier_sha256: String,
+}
+
 pub async fn run(cmd: EvalCommand, config: &HarnessConfig) -> anyhow::Result<()> {
     match cmd {
         EvalCommand::Run(args) => run_eval_report(args, config).await,
         EvalCommand::Diff(args) => diff_eval_reports(args),
+        EvalCommand::VerifyTrusted(args) => run_trusted_verifier(args),
+        EvalCommand::RetryEvents(args) => retry_eval_events(args, config).await,
     }
+}
+
+fn run_trusted_verifier(args: EvalTrustedVerifierArgs) -> anyhow::Result<()> {
+    let verifier = args
+        .verifier
+        .parse::<EvalTrustedVerifier>()
+        .map_err(anyhow::Error::msg)?;
+    let output = execute_trusted_eval_verifier(verifier, &args.workspace, &args.verifier_sha256)?;
+    print!("{output}");
+    Ok(())
 }
 
 async fn run_eval_report(args: EvalRunArgs, config: &HarnessConfig) -> anyhow::Result<()> {
@@ -112,14 +154,24 @@ async fn run_eval_report(args: EvalRunArgs, config: &HarnessConfig) -> anyhow::R
         None
     };
     let mut interrupted = false;
+    let mut budget_exhausted = false;
+    let mut incomplete = false;
+    let mut execution_failure = None;
     let report = if args.dry_run {
         eval_report_dry_run(&manifest, run_id, args.k)?
     } else if let Some(evidence_path) = args.evidence.as_ref() {
         let evidence = read_evidence(evidence_path)?;
         eval_report_from_evidence(&manifest, run_id, args.k, evidence)?
     } else if args.execute {
-        let outcome = execute_eval_report(&manifest, &run_id, args.k, &args, config).await?;
+        let report_path = output
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("eval execute output path is missing"))?;
+        let outcome =
+            execute_eval_report(&manifest, &run_id, args.k, &args, report_path, config).await?;
         interrupted = outcome.interrupted;
+        budget_exhausted = outcome.budget_exhausted;
+        incomplete = outcome.incomplete;
+        execution_failure = outcome.execution_failure;
         outcome.report
     } else {
         anyhow::bail!(
@@ -136,12 +188,16 @@ async fn run_eval_report(args: EvalRunArgs, config: &HarnessConfig) -> anyhow::R
     if interrupted {
         anyhow::bail!("eval execution was interrupted after writing its partial report");
     }
+    if let Some(error) = execution_failure {
+        anyhow::bail!("{error}; partial report was written");
+    }
+    if budget_exhausted {
+        anyhow::bail!("eval suite usage ceiling was reached after writing its partial report");
+    }
+    if incomplete {
+        anyhow::bail!("eval execution was incomplete after writing its partial report");
+    }
     Ok(())
-}
-
-struct EvalExecutionOutcome {
-    report: EvalRunReport,
-    interrupted: bool,
 }
 
 async fn execute_eval_report(
@@ -149,6 +205,7 @@ async fn execute_eval_report(
     run_id: &str,
     k: u32,
     args: &EvalRunArgs,
+    report_path: &Path,
     config: &HarnessConfig,
 ) -> anyhow::Result<EvalExecutionOutcome> {
     if args.poll_interval_ms == 0 {
@@ -159,6 +216,12 @@ async fn execute_eval_report(
     }
     if args.dispatch_timeout_secs == 0 {
         anyhow::bail!("--dispatch-timeout-secs must be greater than zero");
+    }
+    if args.max_total_tokens == Some(0) {
+        anyhow::bail!("--max-total-tokens must be greater than zero");
+    }
+    if args.max_cost_usd_micros == Some(0) {
+        anyhow::bail!("--max-cost-usd-micros must be greater than zero");
     }
     if config.server.database_url.is_none() {
         anyhow::bail!(
@@ -189,6 +252,10 @@ async fn execute_eval_report(
     )
     .await
     .context("failed to open observe event store for eval execution")?;
+    if let Err(error) = reserve_eval_run(&config.server.project_root, run_id, report_path) {
+        observe.shutdown().await;
+        return Err(error);
+    }
 
     let mut execute_config = EvalExecuteConfig::new(
         run_id,
@@ -198,6 +265,12 @@ async fn execute_eval_report(
     execute_config.poll_interval = Duration::from_millis(args.poll_interval_ms);
     execute_config.dispatch_timeout = Duration::from_secs(args.dispatch_timeout_secs);
     execute_config.case_timeout_override = args.case_timeout_secs.map(Duration::from_secs);
+    if args.max_total_tokens.is_some() || args.max_cost_usd_micros.is_some() {
+        execute_config.suite_usage_ceiling = Some(EvalUsageCeiling {
+            max_total_tokens: args.max_total_tokens,
+            max_cost_usd_micros: args.max_cost_usd_micros,
+        });
+    }
 
     let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
     let mut execution = Box::pin(execute_manifest_with_cancellation(
@@ -208,10 +281,7 @@ async fn execute_eval_report(
         cancellation_rx,
     ));
     let outcome = tokio::select! {
-        result = &mut execution => result.map(|report| EvalExecutionOutcome {
-            report,
-            interrupted: false,
-        }),
+        result = &mut execution => execution_result(result, false),
         signal = tokio::signal::ctrl_c() => {
             match signal {
                 Ok(()) => {
@@ -225,10 +295,8 @@ async fn execute_eval_report(
                             "eval execution completed while interruption was being delivered"
                         );
                     }
-                    execution.await.map(|report| EvalExecutionOutcome {
-                        report,
-                        interrupted: true,
-                    }).context("eval interruption cleanup failed")
+                    execution_result(execution.await, true)
+                        .context("eval interruption cleanup failed")
                 }
                 Err(error) => Err(error).context("failed to listen for eval execution interruption"),
             }
@@ -236,44 +304,6 @@ async fn execute_eval_report(
     };
     observe.shutdown().await;
     outcome
-}
-
-fn eval_report_output_path(
-    requested: Option<&PathBuf>,
-    execute: bool,
-    run_id: &str,
-) -> anyhow::Result<Option<PathBuf>> {
-    let output = requested
-        .cloned()
-        .or_else(|| execute.then(|| default_execute_output_path(run_id)));
-    if execute {
-        let existing = output
-            .as_ref()
-            .map(|path| {
-                path.try_exists().with_context(|| {
-                    format!("failed to inspect eval output path {}", path.display())
-                })
-            })
-            .transpose()?
-            .unwrap_or(false);
-        if existing {
-            let path = output
-                .as_ref()
-                .expect("existing output path should be present");
-            anyhow::bail!(
-                "eval execute report already exists at {}; choose a new --run-id or --output",
-                path.display()
-            );
-        }
-    }
-    Ok(output)
-}
-
-fn default_execute_output_path(run_id: &str) -> PathBuf {
-    PathBuf::from("artifacts")
-        .join("eval")
-        .join(run_id)
-        .join("report.json")
 }
 
 fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
@@ -369,6 +399,9 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
         "Eval report {} ({})\n",
         report.run_id, report.suite
     ));
+    if let Some(outcome) = report.outcome {
+        output.push_str(&format!("run_outcome: {outcome:?}\n"));
+    }
     output.push_str(&format!(
         "cases: total={} scored={} passed={} failed={} skipped={} pending={} infra_failed={}\n",
         metrics.total_cases,
@@ -414,6 +447,12 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
                 case.verify_commands.join(" && ")
             ));
         }
+        if !case.verification_evidence.is_empty() {
+            output.push_str(&format!(
+                "  verification: {}\n",
+                render_verification_evidence(&case.verification_evidence)
+            ));
+        }
         if !case.missing_evidence.is_empty() {
             output.push_str(&format!(
                 "  missing_evidence: {}\n",
@@ -444,6 +483,9 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
         "Eval diff {} -> {} ({})\n",
         diff.baseline_run_id, diff.candidate_run_id, diff.suite
     ));
+    if let Some(outcome) = diff.candidate_outcome {
+        output.push_str(&format!("candidate_run_outcome: {outcome:?}\n"));
+    }
     output.push_str(&format!(
         "pass@1 delta: {:+.4}  pass^{} delta: {:+.4}\n",
         diff.delta.pass_at_1_delta, diff.k, diff.delta.pass_to_k_delta
@@ -479,7 +521,7 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
             .map(|change| format!(" {change}"))
             .unwrap_or_default();
         output.push_str(&format!(
-            "- {} {} baseline_status={} candidate_status={} infra={} terminal={} source_commit={}{}\n",
+            "- {} {} baseline_status={} candidate_status={} infra={} terminal={} source_commit={} verification={}{}\n",
             transition.case_id,
             transition_kind_label(transition.transition),
             optional_case_status_label(transition.baseline_status),
@@ -495,6 +537,10 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
             format_optional_transition(
                 transition.baseline_source_commit.as_deref(),
                 transition.candidate_source_commit.as_deref()
+            ),
+            render_verification_transition(
+                &transition.baseline_verification_evidence,
+                &transition.candidate_verification_evidence
             ),
             attestation_change
         ));
@@ -645,6 +691,9 @@ fn eval_diff_regressions(
     args: &EvalDiffArgs,
 ) -> anyhow::Result<Vec<String>> {
     let mut regressions = Vec::new();
+    if let Some(outcome) = eval_report_effective_outcome(candidate) {
+        regressions.push(format!("candidate run is incomplete: {outcome:?}"));
+    }
     if let Some(max_pass_drop) = args.max_pass_drop {
         if !max_pass_drop.is_finite() || !(0.0..=1.0).contains(&max_pass_drop) {
             anyhow::bail!("--max-pass-drop must be between 0.0 and 1.0");

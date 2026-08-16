@@ -1,4 +1,5 @@
 use super::super::model::RuntimeKind;
+use super::trusted_verifier::trusted_verifier_for_case;
 use harness_core::config::isolation::IsolationTier;
 use harness_sandbox::{CappedResourceLimits, ResourceLimits};
 use serde::{Deserialize, Serialize};
@@ -111,7 +112,8 @@ impl EvalBenchmarkCase {
     }
 
     pub fn verification_command_argv(&self) -> Result<Vec<Vec<String>>, ManifestError> {
-        self.verify_commands
+        let mut commands = self
+            .verify_commands
             .iter()
             .map(|command| match self.verify_command_mode {
                 EvalVerifyCommandMode::Argv => shlex::split(command).ok_or_else(|| {
@@ -123,7 +125,13 @@ impl EvalBenchmarkCase {
                     command.to_string(),
                 ]),
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(verifier) =
+            trusted_verifier_for_case(&self.case_id, &self.repo, self.issue, &self.base_commit)
+        {
+            commands.push(verifier.validation_argv());
+        }
+        Ok(commands)
     }
 }
 
@@ -191,6 +199,7 @@ struct RawCase {
     repo: String,
     issue: u64,
     base_commit: String,
+    #[serde(default)]
     verify_commands: Vec<String>,
     #[serde(default)]
     verify_command_mode: EvalVerifyCommandMode,
@@ -251,8 +260,22 @@ fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, Manifes
         }
         let base_commit = non_empty(case.base_commit, "base_commit")?;
         validate_base_commit(&base_commit)?;
-        let verify_commands =
-            normalize_verify_commands(case.verify_commands, case.verify_command_mode, index)?;
+        let case_id = case
+            .case_id
+            .map(|id| non_empty(id, "case_id"))
+            .transpose()?
+            .unwrap_or_else(|| format!("{repo}#{}", case.issue));
+        let trusted_verifier = trusted_verifier_for_case(&case_id, &repo, case.issue, &base_commit);
+        if trusted_verifier.is_some() && !case.verify_commands.is_empty() {
+            return Err(ManifestError::new(format!(
+                "case {case_id} uses an evaluator-owned verifier and cannot expose verify_commands"
+            )));
+        }
+        let verify_commands = if trusted_verifier.is_some() {
+            Vec::new()
+        } else {
+            normalize_verify_commands(case.verify_commands, case.verify_command_mode, index)?
+        };
         let paths = normalize_paths(case.paths, index)?;
         let evidence = normalize_evidence(case.evidence, index)?;
         let resolution_prs = normalize_resolution_prs(case.resolution_prs, index)?;
@@ -278,11 +301,6 @@ fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, Manifes
             .overlay(case.resource_limits)
             .cap_by(operator_maxima)
             .map_err(|error| ManifestError::new(format!("invalid resource_limits: {error}")))?;
-        let case_id = case
-            .case_id
-            .map(|id| non_empty(id, "case_id"))
-            .transpose()?
-            .unwrap_or_else(|| format!("{repo}#{}", case.issue));
         if !seen_case_ids.insert(case_id.clone()) {
             return Err(ManifestError::new(format!(
                 "duplicate benchmark case_id: {case_id}"

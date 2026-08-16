@@ -77,6 +77,11 @@ pub async fn complete_runtime_job_for_runtime_host(
         let (status, body) = lease::lease_lost_response();
         return (status, completion_json(body.0));
     }
+    if !cancellation_ack {
+        if let Err(response) = validate_eval_host_capabilities(&state, &host_id, &job) {
+            return (StatusCode::BAD_REQUEST, completion_json(response));
+        }
+    }
     let result = match if cancellation_ack {
         attach_eval_cancellation_cleanup_evidence(result, execution_evidence)
     } else {
@@ -257,8 +262,10 @@ pub async fn complete_runtime_job_for_runtime_host(
     )
 }
 
+mod capabilities;
 mod evidence;
 mod reservation;
+use capabilities::validate_eval_host_capabilities;
 use evidence::{
     attach_eval_cancellation_cleanup_evidence, attach_eval_checkout_evidence,
     is_eval_cancellation_ack,

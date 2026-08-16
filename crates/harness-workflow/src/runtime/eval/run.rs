@@ -2,6 +2,7 @@ use super::{
     data::eval_cleanup_data,
     manifest::{EvalBenchmarkCase, EvalIsolationProfile},
     transition_outcome::accepted_transition_record,
+    trusted_verifier::{is_trusted_eval_verifier_argv, TRUSTED_EVAL_VERIFIER_V1_CAPABILITY},
 };
 use crate::runtime::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeJobStatus,
@@ -511,6 +512,7 @@ fn eval_case_submitted_data(
             "verify_commands_argv": verification_argv,
             "timeout_secs": input.timeout_secs,
             "resource_limits": input.resource_limits,
+            "required_runtime_host_capabilities": eval_required_runtime_host_capabilities(verification_argv),
             "branch_prefix": EVAL_BRANCH_PREFIX,
             "pull_request_mode": EVAL_PR_DRAFT_MODE,
             "isolation": eval_isolation_metadata(&input.case.isolation),
@@ -539,6 +541,7 @@ fn with_eval_command_metadata(
                 "verify_commands_argv": verification_argv,
                 "timeout_secs": input.timeout_secs,
                 "resource_limits": input.resource_limits,
+                "required_runtime_host_capabilities": eval_required_runtime_host_capabilities(verification_argv),
                 "branch_prefix": EVAL_BRANCH_PREFIX,
                 "pull_request_mode": EVAL_PR_DRAFT_MODE,
                 "isolation": eval_isolation_metadata(&input.case.isolation),
@@ -570,6 +573,17 @@ fn eval_isolation_metadata(isolation: &EvalIsolationProfile) -> Value {
         "lifecycle": isolation.lifecycle,
         "cleanup_required": isolation.cleanup_required,
     })
+}
+
+fn eval_required_runtime_host_capabilities(verification_argv: &[Vec<String>]) -> Vec<&'static str> {
+    let mut capabilities = vec![harness_sandbox::EVAL_RESOURCE_LIMITS_CAPABILITY];
+    if verification_argv
+        .iter()
+        .any(|argv| is_trusted_eval_verifier_argv(argv))
+    {
+        capabilities.push(TRUSTED_EVAL_VERIFIER_V1_CAPABILITY);
+    }
+    capabilities
 }
 
 fn eval_case_workflow_id(eval_run_id: &str, case_id: &str) -> String {

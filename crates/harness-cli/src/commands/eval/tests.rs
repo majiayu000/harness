@@ -80,6 +80,10 @@ fn eval_report_cli_parses_run_and_diff_commands() {
         "250",
         "--dispatch-timeout-secs",
         "12",
+        "--max-total-tokens",
+        "10000",
+        "--max-cost-usd-micros",
+        "500000",
     ])
     .unwrap_or_else(|error| panic!("eval execute command should parse: {error}"));
     match cli.command {
@@ -90,6 +94,8 @@ fn eval_report_cli_parses_run_and_diff_commands() {
             assert_eq!(args.case_timeout_secs, Some(30));
             assert_eq!(args.poll_interval_ms, 250);
             assert_eq!(args.dispatch_timeout_secs, 12);
+            assert_eq!(args.max_total_tokens, Some(10_000));
+            assert_eq!(args.max_cost_usd_micros, Some(500_000));
         }
         _ => panic!("expected eval run command"),
     }
@@ -118,6 +124,25 @@ fn eval_report_cli_parses_run_and_diff_commands() {
         }
         _ => panic!("expected eval diff command"),
     }
+}
+
+#[test]
+fn eval_usage_ceiling_requires_execute_mode() {
+    let error = match Cli::try_parse_from([
+        "harness",
+        "eval",
+        "run",
+        "--manifest",
+        "evals/benchmarks/harness-core.toml",
+        "--dry-run",
+        "--max-total-tokens",
+        "1000",
+    ]) {
+        Ok(_) => panic!("suite usage ceilings must only apply to live execution"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("--execute"));
 }
 
 #[test]
@@ -430,24 +455,40 @@ fn eval_report_diff_preserves_exit_zero_without_gate_flags() {
         &sample_eval_manifest(),
         "baseline",
         3,
-        vec![case_evidence(
-            "case-pass",
-            EvalEvidenceStatus::Passed,
-            vec![usage_snapshot(100, 40)],
-            Vec::new(),
-        )],
+        vec![
+            case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Passed,
+                vec![usage_snapshot(100, 40)],
+                Vec::new(),
+            ),
+            case_evidence(
+                "case-fail",
+                EvalEvidenceStatus::Failed,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
     )
     .unwrap_or_else(|error| panic!("baseline report should build: {error}"));
     let candidate = eval_report_from_evidence(
         &sample_eval_manifest(),
         "candidate",
         3,
-        vec![case_evidence(
-            "case-pass",
-            EvalEvidenceStatus::Failed,
-            vec![usage_snapshot(80, 30)],
-            Vec::new(),
-        )],
+        vec![
+            case_evidence(
+                "case-pass",
+                EvalEvidenceStatus::Failed,
+                vec![usage_snapshot(80, 30)],
+                Vec::new(),
+            ),
+            case_evidence(
+                "case-fail",
+                EvalEvidenceStatus::Failed,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
     )
     .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
     write_report(&baseline_path, &baseline);
@@ -650,6 +691,7 @@ fn case_evidence(
             status: "succeeded".to_string(),
             validation_passed: true,
             validation_commands: vec!["cargo test".to_string()],
+            validation_evidence: Vec::new(),
         }),
         quality: None,
         isolation: Some(EvalIsolationEvidence {
@@ -697,6 +739,7 @@ fn report_with_pass_count(run_id: &str, total_cases: u64, passed_cases: u64) -> 
                 base_commit: "b308b380".to_string(),
                 source_commit: "b308b380".to_string(),
                 verify_commands: vec!["cargo test".to_string()],
+                verification_evidence: Vec::new(),
                 attestation_trust: EvalAttestationTrust::Unsigned,
                 attestation_decision: None,
                 status: if passed {
@@ -704,6 +747,7 @@ fn report_with_pass_count(run_id: &str, total_cases: u64, passed_cases: u64) -> 
                 } else {
                     EvalReportCaseStatus::Failed
                 },
+                outcome: None,
                 passed,
                 explicit_evidence: true,
                 final_grade: None,
@@ -722,6 +766,7 @@ fn report_with_pass_count(run_id: &str, total_cases: u64, passed_cases: u64) -> 
         run_id: run_id.to_string(),
         suite: "harness-core".to_string(),
         k: 1,
+        outcome: None,
         metrics: EvalReportMetrics {
             total_cases,
             scored_cases: total_cases,
