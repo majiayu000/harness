@@ -1,11 +1,12 @@
 use super::{
     command_attempts::{insert_command_attempt_tx, AttemptReplacement},
+    definitions::terminal_state_for_instance_tx,
     enum_str, runtime_job_for_command_tx, to_jsonb_string, workflow_instance_from_persisted_json,
     ClaimedCommandTerminalOutcome, RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
 };
 use crate::runtime::{
     DispatchClaim, RuntimeJob, RuntimeKind, WorkflowCommand, WorkflowCommandStatus,
-    WorkflowDefinitionRegistry,
+    WorkflowDefinitionRegistry, WorkflowTerminalState,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -79,17 +80,17 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(ClaimedCommandTerminalOutcome::StaleClaim);
         }
-        let Some(workflow) = workflow
-            .filter(|workflow| workflow.is_terminal_with_registry(&self.definition_registry))
+        let Some(workflow) = workflow else {
+            tx.rollback().await?;
+            return Ok(ClaimedCommandTerminalOutcome::NotTerminal);
+        };
+        let Some(terminal_state) =
+            terminal_state_for_instance_tx(&mut tx, &self.definition_registry, &workflow).await?
         else {
             tx.rollback().await?;
             return Ok(ClaimedCommandTerminalOutcome::NotTerminal);
         };
-        let terminal_status = if workflow.state == "cancelled" {
-            WorkflowCommandStatus::Cancelled
-        } else {
-            WorkflowCommandStatus::Skipped
-        };
+        let terminal_status = terminal_command_status(terminal_state);
         let result = sqlx::query(
             "UPDATE workflow_commands
              SET status = $2, dispatch_owner = NULL,
@@ -236,15 +237,13 @@ pub(super) async fn enqueue_runtime_job_for_command(
             tx.rollback().await?;
             return Ok(RuntimeJobEnqueueOutcome::StaleClaim);
         }
-        if let Some(workflow) = workflow
-            .as_ref()
-            .filter(|workflow| workflow.is_terminal_with_registry(definition_registry))
-        {
-            let terminal_status = if workflow.state == "cancelled" {
-                WorkflowCommandStatus::Cancelled
-            } else {
-                WorkflowCommandStatus::Skipped
-            };
+        if let Some(terminal_state) = match workflow.as_ref() {
+            Some(workflow) => {
+                terminal_state_for_instance_tx(&mut tx, definition_registry, workflow).await?
+            }
+            None => None,
+        } {
+            let terminal_status = terminal_command_status(terminal_state);
             sqlx::query(
                 "UPDATE workflow_commands SET status = $2, dispatch_owner = NULL,
                     dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,
@@ -352,6 +351,17 @@ pub(super) async fn enqueue_runtime_job_for_command(
     }
     tx.commit().await?;
     Ok(RuntimeJobEnqueueOutcome::Enqueued(job))
+}
+
+pub(in crate::runtime) fn terminal_command_status(
+    terminal_state: WorkflowTerminalState,
+) -> WorkflowCommandStatus {
+    match terminal_state {
+        WorkflowTerminalState::Cancelled => WorkflowCommandStatus::Cancelled,
+        WorkflowTerminalState::Succeeded | WorkflowTerminalState::Failed => {
+            WorkflowCommandStatus::Skipped
+        }
+    }
 }
 
 fn exact_dispatch_claim(job: &RuntimeJob, owner: &str, generation: u64) -> bool {

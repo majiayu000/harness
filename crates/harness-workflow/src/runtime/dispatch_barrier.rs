@@ -325,15 +325,18 @@ impl super::store::WorkflowRuntimeStore {
             return Ok(DeferClaimedCommandOutcome::StaleClaim);
         }
 
-        if let Some(workflow) = workflow
-            .as_ref()
-            .filter(|workflow| workflow.is_terminal_with_registry(&self.definition_registry))
-        {
-            let terminal_status = if workflow.state == "cancelled" {
-                WorkflowCommandStatus::Cancelled
-            } else {
-                WorkflowCommandStatus::Skipped
-            };
+        if let Some(terminal_state) = match workflow.as_ref() {
+            Some(workflow) => {
+                super::store::terminal_state_for_instance_tx(
+                    &mut tx,
+                    &self.definition_registry,
+                    workflow,
+                )
+                .await?
+            }
+            None => None,
+        } {
+            let terminal_status = super::store::terminal_command_status(terminal_state);
             sqlx::query(
                 "UPDATE workflow_commands
                  SET status = $2, dispatch_owner = NULL,

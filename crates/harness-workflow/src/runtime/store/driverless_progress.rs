@@ -1,5 +1,5 @@
-use super::WorkflowRuntimeStore;
-use crate::runtime::{WorkflowDefinitionRegistry, WorkflowProgressMode};
+use super::{instance_helpers::progress_state_selector_rows, WorkflowRuntimeStore};
+use crate::runtime::WorkflowProgressMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverlessProgressProvenanceStatus {
@@ -45,15 +45,20 @@ impl WorkflowRuntimeStore {
         &self,
         limit: i64,
     ) -> anyhow::Result<Vec<DriverlessProgressInstance>> {
-        let (definition_ids, states) = command_driven_state_pairs(&self.definition_registry);
-        if definition_ids.is_empty() {
+        let selectors = progress_state_selector_rows(
+            &self.definition_registry,
+            WorkflowProgressMode::CommandDriven,
+        );
+        if selectors.definition_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         let limit = limit.clamp(1, 500);
         let rows: Vec<(String, String, String, i64, String)> = sqlx::query_as(
-            "WITH command_driven_states(definition_id, state) AS (
-                 SELECT * FROM unnest($1::text[], $2::text[])
+            "WITH command_driven_states(
+                     definition_id, definition_version, definition_hash, state
+                 ) AS (
+                 SELECT * FROM unnest($1::text[], $2::bigint[], $3::text[], $4::text[])
              ),
              candidates AS (
                  SELECT instance.id,
@@ -64,6 +69,16 @@ impl WorkflowRuntimeStore {
                  JOIN command_driven_states AS registered
                    ON registered.definition_id = instance.definition_id
                   AND registered.state = instance.state
+                  AND (
+                      (registered.definition_version IS NULL
+                       AND registered.definition_hash IS NULL)
+                      OR (
+                          registered.definition_version =
+                              (instance.data->>'definition_version')::bigint
+                          AND registered.definition_hash =
+                              instance.data->'data'->>'definition_hash'
+                      )
+                  )
              ),
              accepted_with_sequence AS (
                  SELECT decision.id AS decision_id,
@@ -151,10 +166,12 @@ impl WorkflowRuntimeStore {
                       )
                 )
              ORDER BY classified.updated_at ASC, classified.id ASC
-             LIMIT $3",
+             LIMIT $5",
         )
-        .bind(&definition_ids)
-        .bind(&states)
+        .bind(&selectors.definition_ids)
+        .bind(&selectors.definition_versions)
+        .bind(&selectors.definition_hashes)
+        .bind(&selectors.states)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -175,19 +192,4 @@ impl WorkflowRuntimeStore {
             )
             .collect()
     }
-}
-
-fn command_driven_state_pairs(registry: &WorkflowDefinitionRegistry) -> (Vec<String>, Vec<String>) {
-    let pairs: Vec<(String, String)> = registry
-        .known_definition_ids()
-        .into_iter()
-        .flat_map(|definition_id| {
-            registry
-                .states_for_definition(&definition_id)
-                .into_iter()
-                .filter(|state| state.progress_mode == Some(WorkflowProgressMode::CommandDriven))
-                .map(move |state| (definition_id.clone(), state.key.state.to_string()))
-        })
-        .collect();
-    pairs.into_iter().unzip()
 }

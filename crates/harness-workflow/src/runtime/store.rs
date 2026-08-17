@@ -93,12 +93,14 @@ mod transaction_helpers;
 mod transition_validation;
 pub use child_instance_start::{WorkflowChildStart, WorkflowChildStartOutcome};
 pub use command_facade::DispatchPoolSnapshot;
+pub(in crate::runtime) use command_store::terminal_command_status;
 pub use coverage_recovery::{
     WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
     WorkflowCoverageRecoveryTransition,
 };
 pub(in crate::runtime) use decision_provenance::insert_decision_record_once_tx;
 pub use decision_provenance::DecisionProvenanceConflict;
+pub(in crate::runtime) use definitions::terminal_state_for_instance_tx;
 pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};
 pub use evidence::{
     WorkflowRunEvidence, WorkflowRunEvidenceExport, WorkflowRunEvidenceInput,

@@ -4,6 +4,8 @@ mod declarative_pinning {
         DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
     };
     use harness_core::db::resolve_database_url;
+    use chrono::Utc;
+    use crate::runtime::store::RuntimeJobEnqueueOutcome;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -259,6 +261,112 @@ mod declarative_pinning {
         assert!(raw_registry
             .state_definition_for_instance(&raw_with_unrelated_hash, "done")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn driverless_progress_uses_exact_declarative_progress_pin() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let v1 = compiled(&policy_v1());
+        let v2 = compiled(&policy_v2());
+        let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+        registry.register_declarative_historical(v1.clone())?;
+        registry.register_declarative_current(v2.clone())?;
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
+            .await?
+            .with_definition_registry(registry.into_shared());
+        let historical = WorkflowInstance::new(
+            "docs_review",
+            v1.definition_version(),
+            "reviewing",
+            WorkflowSubject::new("document", "historical-driverless"),
+        )
+        .with_id("historical-driverless")
+        .with_server_data(json!({ "definition_hash": v1.definition_hash() }));
+        let current = WorkflowInstance::new(
+            "docs_review",
+            v2.definition_version(),
+            "reviewing",
+            WorkflowSubject::new("document", "current-external-wait"),
+        )
+        .with_id("current-external-wait")
+        .with_server_data(json!({ "definition_hash": v2.definition_hash() }));
+        store.force_upsert_lifecycle_state_for_test(&historical).await?;
+        store.force_upsert_lifecycle_state_for_test(&current).await?;
+
+        let rows = store.list_driverless_progress_instances(500).await?;
+        assert!(rows.iter().any(|row| row.workflow_id == historical.id));
+        assert!(!rows.iter().any(|row| row.workflow_id == current.id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claimed_enqueue_recognizes_persisted_only_cancelled_pin() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let mut historical_policy = policy_v1();
+        historical_policy.terminal.remove("cancelled");
+        historical_policy
+            .terminal
+            .insert("withdrawn".to_string(), "cancelled".to_string());
+        historical_policy
+            .states
+            .get_mut("reviewing")
+            .expect("fixture reviewing state should exist")
+            .on_signal
+            .insert("cancel".to_string(), "withdrawn".to_string());
+        let historical = compiled(&historical_policy);
+        let current = compiled(&policy_v2());
+        let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+        registry.register_declarative_current(current)?;
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
+            .await?
+            .with_definition_registry(registry.into_shared());
+        store
+            .persist_definition_version(&persisted_declarative_definition(&historical, None))
+            .await?;
+        let workflow = WorkflowInstance::new(
+            "docs_review",
+            historical.definition_version(),
+            "withdrawn",
+            WorkflowSubject::new("document", "persisted-terminal-dispatch"),
+        )
+        .with_id("persisted-terminal-dispatch")
+        .with_server_data(json!({ "definition_hash": historical.definition_hash() }));
+        store.force_upsert_lifecycle_state_for_test(&workflow).await?;
+        let command = WorkflowCommand::enqueue_activity("review", "persisted-terminal-command");
+        let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+        let claim = store
+            .claim_pending_commands("persisted-terminal-owner", Utc::now(), 10)
+            .await?
+            .into_iter()
+            .find(|record| record.id == command_id)
+            .expect("persisted-only terminal command should reach the transactional guard");
+
+        assert_eq!(
+            store
+                .enqueue_runtime_job_for_claimed_command(
+                    &command_id,
+                    DispatchClaim {
+                        owner: "persisted-terminal-owner",
+                        generation: claim.dispatch_claim_generation,
+                    },
+                    RuntimeKind::CodexJsonrpc,
+                    "codex-default",
+                    json!({ "activity": "review" }),
+                    None,
+                )
+                .await?,
+            RuntimeJobEnqueueOutcome::WorkflowTerminal {
+                status: WorkflowCommandStatus::Cancelled,
+            }
+        );
+        assert!(store.runtime_jobs_for_command(&command_id).await?.is_empty());
+        Ok(())
     }
 
     #[test]

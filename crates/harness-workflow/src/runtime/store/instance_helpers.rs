@@ -16,6 +16,37 @@ pub(super) struct TerminalStateSelectorRows {
     pub(super) states: Vec<String>,
 }
 
+pub(super) struct ProgressStateSelectorRows {
+    pub(super) definition_ids: Vec<String>,
+    pub(super) definition_versions: Vec<Option<i64>>,
+    pub(super) definition_hashes: Vec<Option<String>>,
+    pub(super) states: Vec<String>,
+}
+
+pub(super) fn progress_state_selector_rows(
+    registry: &WorkflowDefinitionRegistry,
+    progress_mode: crate::runtime::WorkflowProgressMode,
+) -> ProgressStateSelectorRows {
+    let mut definition_ids = Vec::new();
+    let mut definition_versions = Vec::new();
+    let mut definition_hashes = Vec::new();
+    let mut states = Vec::new();
+    for definition_id in registry.known_definition_ids() {
+        for selector in registry.progress_state_selectors(&definition_id, progress_mode) {
+            definition_ids.push(definition_id.clone());
+            definition_versions.push(selector.definition_version.map(i64::from));
+            definition_hashes.push(selector.definition_hash);
+            states.push(selector.state);
+        }
+    }
+    ProgressStateSelectorRows {
+        definition_ids,
+        definition_versions,
+        definition_hashes,
+        states,
+    }
+}
+
 pub(super) fn terminal_state_selector_rows(
     registry: &WorkflowDefinitionRegistry,
 ) -> TerminalStateSelectorRows {

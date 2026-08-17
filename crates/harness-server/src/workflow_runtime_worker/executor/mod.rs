@@ -79,7 +79,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 .workflow_runtime_store
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("workflow runtime store is unavailable"))?;
-            if workflow.is_terminal_with_registry(store.definition_registry()) {
+            if store.terminal_state_for_instance(workflow).await?.is_some() {
                 return Ok(ActivityResult::cancelled(
                     activity_name(&job),
                     format!(

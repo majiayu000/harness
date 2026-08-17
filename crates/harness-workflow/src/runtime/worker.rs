@@ -3,6 +3,7 @@ use super::model::{
     WorkflowCommandRecord, WorkflowInstance,
 };
 use super::store::{RuntimeJobClaimDeferOutcome, WorkflowRuntimeStore};
+use super::WorkflowTerminalState;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -229,18 +230,20 @@ impl<'a> RuntimeWorker<'a> {
         let Some(instance) = self.store.get_instance(workflow_id).await? else {
             return Ok(None);
         };
-        if !instance.is_terminal_with_registry(self.store.definition_registry()) {
+        let Some(terminal_state) = self.store.terminal_state_for_instance(&instance).await? else {
             return Ok(None);
-        }
+        };
         let activity = runtime_job_activity_name(job);
         let summary = format!(
             "Workflow {} was already terminal ({}) before runtime execution.",
             instance.id, instance.state
         );
-        let result = match instance.state.as_str() {
-            "cancelled" => ActivityResult::cancelled(activity, summary),
-            "failed" => ActivityResult::failed(activity, summary, "workflow already failed"),
-            _ => ActivityResult::succeeded(activity, summary),
+        let result = match terminal_state {
+            WorkflowTerminalState::Cancelled => ActivityResult::cancelled(activity, summary),
+            WorkflowTerminalState::Failed => {
+                ActivityResult::failed(activity, summary, "workflow already failed")
+            }
+            WorkflowTerminalState::Succeeded => ActivityResult::succeeded(activity, summary),
         };
         Ok(Some(result))
     }
