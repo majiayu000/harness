@@ -441,4 +441,215 @@ mod tests {
             "failed to resolve `harness exec` project root from current working directory"
         ));
     }
+
+    #[test]
+    fn sandbox_mode_parse_accepts_supported_values() {
+        assert_eq!(
+            ExecSandboxMode::parse("read-only").expect("read-only should parse"),
+            ExecSandboxMode::ReadOnly
+        );
+        assert_eq!(
+            ExecSandboxMode::parse("workspace-write").expect("workspace-write should parse"),
+            ExecSandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            ExecSandboxMode::parse("read-only-with-network")
+                .expect("read-only-with-network should parse"),
+            ExecSandboxMode::ReadOnlyWithNetwork
+        );
+        assert_eq!(
+            ExecSandboxMode::parse("danger-full-access").expect("danger-full-access should parse"),
+            ExecSandboxMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn sandbox_mode_parse_rejects_unknown_value() {
+        let error = ExecSandboxMode::parse("unsafe").expect_err("unsupported mode should fail");
+        assert!(error
+            .to_string()
+            .contains("unsupported sandbox mode `unsafe`"));
+    }
+
+    #[test]
+    fn normalize_allow_list_trims_and_drops_empty_entries() {
+        let values = vec![
+            "alice".to_string(),
+            "  bob  ".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+        ];
+        assert_eq!(normalize_allow_list(values), vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn exec_actor_filters_allow_matching_user_or_bot() {
+        let users = vec!["alice".to_string()];
+        let bots = vec!["dependabot[bot]".to_string()];
+
+        enforce_exec_actor_filters(Some("alice".to_string()), &users, &bots)
+            .expect("listed human user should pass");
+        enforce_exec_actor_filters(Some("dependabot[bot]".to_string()), &users, &bots)
+            .expect("listed bot should pass");
+    }
+
+    #[test]
+    fn exec_actor_filters_block_unlisted_actor() {
+        let users = vec!["alice".to_string()];
+        let bots = vec!["dependabot[bot]".to_string()];
+        let error = enforce_exec_actor_filters(Some("mallory".to_string()), &users, &bots)
+            .expect_err("unlisted actor should be rejected when allow lists are configured");
+
+        assert!(error
+            .to_string()
+            .contains("actor `mallory` is not allowed to run `harness exec`"));
+    }
+
+    #[test]
+    fn apply_sandbox_hint_prefixes_prompt() {
+        let prompt = "review this PR".to_string();
+        let hinted = apply_sandbox_hint(prompt.clone(), ExecSandboxMode::WorkspaceWrite);
+        assert!(hinted.contains("Sandbox mode requirement for this run: `workspace-write`."));
+        assert!(hinted.ends_with(&prompt));
+    }
+
+    #[test]
+    fn resolve_exec_output_path_accepts_nested_relative_path() {
+        let root = std::env::temp_dir().join("harness-cli-output-path-accept");
+        std::fs::create_dir_all(&root).expect("temp test root should be creatable");
+
+        let output = resolve_exec_output_path(&root, Path::new(".harness/final.txt"))
+            .expect("relative output file should resolve inside project root");
+
+        assert!(output.starts_with(root.canonicalize().expect("root should canonicalize")));
+        assert!(output.ends_with(Path::new(".harness/final.txt")));
+    }
+
+    #[test]
+    fn resolve_exec_output_path_rejects_parent_escape() {
+        let root = std::env::temp_dir().join("harness-cli-output-path-reject");
+        std::fs::create_dir_all(&root).expect("temp test root should be creatable");
+
+        let error = resolve_exec_output_path(&root, Path::new("../escape.txt"))
+            .expect_err("path traversal outside project root should fail");
+
+        assert!(error
+            .to_string()
+            .contains("`--output-file` must stay within project root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_exec_output_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = std::process::id();
+        let root =
+            std::env::temp_dir().join(format!("harness-cli-output-path-symlink-root-{suffix}"));
+        let outside =
+            std::env::temp_dir().join(format!("harness-cli-output-path-symlink-outside-{suffix}"));
+        let link = root.join("escape-link");
+
+        std::fs::create_dir_all(&root).expect("temp root should be creatable");
+        std::fs::create_dir_all(&outside).expect("outside dir should be creatable");
+        if link.exists() {
+            std::fs::remove_file(&link).expect("pre-existing symlink should be removable");
+        }
+        symlink(&outside, &link).expect("symlink should be creatable");
+
+        let error = resolve_exec_output_path(&root, Path::new("escape-link/evil.txt"))
+            .expect_err("symlink-based escape should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("`--output-file` must stay within project root"));
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn enforce_exec_privilege_policy_blocks_root_when_drop_sudo_enabled() {
+        let error = enforce_exec_privilege_policy_with(true, None, || true, || false, || None)
+            .expect_err("drop-sudo should reject execution when real UID indicates root");
+
+        assert!(error
+            .to_string()
+            .contains("refusing to run `harness exec` with elevated privileges"));
+    }
+
+    #[test]
+    fn enforce_exec_privilege_policy_allows_root_when_drop_sudo_disabled() {
+        enforce_exec_privilege_policy_with(false, None, || true, || false, || None)
+            .expect("drop-sudo=false should allow root execution when explicitly requested");
+    }
+
+    #[test]
+    fn enforce_exec_privilege_policy_blocks_sudo_environment() {
+        let error = enforce_exec_privilege_policy_with(true, None, || false, || true, || None)
+            .expect_err(
+                "drop-sudo should reject execution when sudo environment markers are present",
+            );
+
+        assert!(error
+            .to_string()
+            .contains("refusing to run `harness exec` with elevated privileges"));
+    }
+
+    #[test]
+    fn enforce_exec_privilege_policy_blocks_unexpected_user() {
+        let error = enforce_exec_privilege_policy_with(
+            false,
+            Some("runner"),
+            || false,
+            || false,
+            || Some("root".to_string()),
+        )
+        .expect_err("mismatched --unprivileged-user should fail");
+
+        assert!(error
+            .to_string()
+            .contains("`harness exec` must run as `runner`, current user is `root`"));
+    }
+
+    #[test]
+    fn enforce_exec_privilege_policy_allows_expected_user() {
+        enforce_exec_privilege_policy_with(
+            false,
+            Some("runner"),
+            || false,
+            || false,
+            || Some("runner".to_string()),
+        )
+        .expect("matching --unprivileged-user should pass");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_username_uses_real_uid_lookup() {
+        use std::ffi::CStr;
+
+        let uid = unsafe { libc::getuid() };
+        let passwd = unsafe { libc::getpwuid(uid) };
+        assert!(
+            !passwd.is_null(),
+            "getpwuid(getuid()) should resolve current user"
+        );
+
+        let username_ptr = unsafe { (*passwd).pw_name };
+        assert!(
+            !username_ptr.is_null(),
+            "passwd record should contain pw_name"
+        );
+
+        let expected = unsafe { CStr::from_ptr(username_ptr) }
+            .to_str()
+            .expect("pw_name should be valid UTF-8")
+            .trim()
+            .to_string();
+
+        let actual = current_username().expect("current_username should resolve via UID lookup");
+        assert_eq!(actual, expected);
+    }
 }

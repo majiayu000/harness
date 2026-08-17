@@ -1,3 +1,4 @@
+use clap::{Args, Subcommand};
 use harness_agents::{
     codex::{CodexAgent, CodexReviewRequest},
     output_parsing,
@@ -14,6 +15,57 @@ use harness_core::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
+
+#[derive(Args)]
+pub struct LoopArgs {
+    /// Seconds to wait between review rounds (for CI and review bots)
+    #[arg(long, default_value = "120")]
+    pub wait: u64,
+    /// Maximum number of review rounds
+    #[arg(long, default_value = "8")]
+    pub max_rounds: u32,
+    /// Project directory
+    #[arg(long, default_value = ".")]
+    pub project: PathBuf,
+}
+
+#[derive(Args)]
+pub struct ReviewArgs {
+    /// Review provider to run
+    #[arg(long, default_value = "codex_cli_review")]
+    pub provider: String,
+    /// Base ref for local PR diff review
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Project directory
+    #[arg(long, default_value = ".")]
+    pub project: PathBuf,
+}
+
+#[derive(Subcommand)]
+pub enum PrCommand {
+    /// Implement a GitHub issue, create a PR, then run the review loop
+    Fix {
+        /// GitHub issue number
+        issue: u64,
+        #[command(flatten)]
+        args: LoopArgs,
+    },
+    /// Run the review loop for an existing PR
+    Loop {
+        /// GitHub PR number
+        pr: u64,
+        #[command(flatten)]
+        args: LoopArgs,
+    },
+    /// Run a local review provider for an existing PR branch
+    Review {
+        /// GitHub PR number
+        pr: u64,
+        #[command(flatten)]
+        args: ReviewArgs,
+    },
+}
 
 const CODEX_CLI_REVIEW_PROVIDER_ID: &str = "codex_cli_review";
 const CODEX_REVIEW_PROCESS_SPAWN_CONTROL_ENV: [&str; 2] =
