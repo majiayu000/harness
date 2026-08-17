@@ -23,28 +23,59 @@ pub(super) struct ProgressStateSelectorRows {
     pub(super) states: Vec<String>,
 }
 
+impl ProgressStateSelectorRows {
+    pub(super) fn insert(
+        &mut self,
+        definition_id: String,
+        definition_version: Option<i64>,
+        definition_hash: Option<String>,
+        state: String,
+    ) {
+        let duplicate = self
+            .definition_ids
+            .iter()
+            .zip(&self.definition_versions)
+            .zip(&self.definition_hashes)
+            .zip(&self.states)
+            .any(
+                |(((registered_id, registered_version), registered_hash), registered_state)| {
+                    registered_id == &definition_id
+                        && registered_version == &definition_version
+                        && registered_hash == &definition_hash
+                        && registered_state == &state
+                },
+            );
+        if duplicate {
+            return;
+        }
+        self.definition_ids.push(definition_id);
+        self.definition_versions.push(definition_version);
+        self.definition_hashes.push(definition_hash);
+        self.states.push(state);
+    }
+}
+
 pub(super) fn progress_state_selector_rows(
     registry: &WorkflowDefinitionRegistry,
     progress_mode: crate::runtime::WorkflowProgressMode,
 ) -> ProgressStateSelectorRows {
-    let mut definition_ids = Vec::new();
-    let mut definition_versions = Vec::new();
-    let mut definition_hashes = Vec::new();
-    let mut states = Vec::new();
+    let mut rows = ProgressStateSelectorRows {
+        definition_ids: Vec::new(),
+        definition_versions: Vec::new(),
+        definition_hashes: Vec::new(),
+        states: Vec::new(),
+    };
     for definition_id in registry.known_definition_ids() {
         for selector in registry.progress_state_selectors(&definition_id, progress_mode) {
-            definition_ids.push(definition_id.clone());
-            definition_versions.push(selector.definition_version.map(i64::from));
-            definition_hashes.push(selector.definition_hash);
-            states.push(selector.state);
+            rows.insert(
+                definition_id.clone(),
+                selector.definition_version.map(i64::from),
+                selector.definition_hash,
+                selector.state,
+            );
         }
     }
-    ProgressStateSelectorRows {
-        definition_ids,
-        definition_versions,
-        definition_hashes,
-        states,
-    }
+    rows
 }
 
 pub(super) fn terminal_state_selector_rows(

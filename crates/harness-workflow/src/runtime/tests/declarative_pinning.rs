@@ -271,12 +271,14 @@ mod declarative_pinning {
         let v1 = compiled(&policy_v1());
         let v2 = compiled(&policy_v2());
         let mut registry = WorkflowDefinitionRegistry::new_for_tests();
-        registry.register_declarative_historical(v1.clone())?;
         registry.register_declarative_current(v2.clone())?;
         let dir = tempfile::tempdir()?;
         let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
             .await?
             .with_definition_registry(registry.into_shared());
+        store
+            .persist_definition_version(&persisted_declarative_definition(&v1, None))
+            .await?;
         let historical = WorkflowInstance::new(
             "docs_review",
             v1.definition_version(),

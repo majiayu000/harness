@@ -45,10 +45,24 @@ impl WorkflowRuntimeStore {
         &self,
         limit: i64,
     ) -> anyhow::Result<Vec<DriverlessProgressInstance>> {
-        let selectors = progress_state_selector_rows(
+        let mut selectors = progress_state_selector_rows(
             &self.definition_registry,
             WorkflowProgressMode::CommandDriven,
         );
+        for definition in self.list_persisted_declarative_definitions().await? {
+            for state in
+                definition.registered().states.iter().filter(|state| {
+                    state.progress_mode == Some(WorkflowProgressMode::CommandDriven)
+                })
+            {
+                selectors.insert(
+                    definition.registered().id.clone(),
+                    Some(i64::from(definition.definition_version())),
+                    Some(definition.definition_hash().to_string()),
+                    state.key.state.to_string(),
+                );
+            }
+        }
         if selectors.definition_ids.is_empty() {
             return Ok(Vec::new());
         }
