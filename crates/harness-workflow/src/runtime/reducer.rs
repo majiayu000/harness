@@ -20,7 +20,7 @@ use self::builtin_github_issue::{
     closed_issue_evidence_from_value,
 };
 pub(crate) use self::builtin_github_issue::{
-    pr_binding_verification_blocked_decision, verified_pr_binding_evidence,
+    pr_binding_verification_blocked_decision, verified_pr_binding_evidence_with_registry,
 };
 use self::declarative_completion::{
     definition_pin_blocked_decision, reduce_declarative_completion,
@@ -30,7 +30,7 @@ pub(crate) use self::support::{
     budget_exhausted_blocked_decision, invalid_agent_output_blocked_decision,
 };
 use super::model::{ActivityResult, WorkflowDecision, WorkflowEvent, WorkflowInstance};
-use super::state_registry::{resolve_declarative_definition, DeclarativeDefinitionResolution};
+use super::state_registry::{DeclarativeDefinitionResolution, WorkflowDefinitionRegistry};
 use serde_json::Value;
 
 pub const RUNTIME_JOB_COMPLETED_EVENT: &str = "RuntimeJobCompleted";
@@ -60,6 +60,18 @@ pub fn reduce_runtime_job_completed(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
 ) -> anyhow::Result<Option<WorkflowDecision>> {
+    reduce_runtime_job_completed_with_registry(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        instance,
+        event,
+    )
+}
+
+pub fn reduce_runtime_job_completed_with_registry(
+    registry: &WorkflowDefinitionRegistry,
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+) -> anyhow::Result<Option<WorkflowDecision>> {
     if event.event_type != RUNTIME_JOB_COMPLETED_EVENT {
         return Ok(None);
     }
@@ -69,9 +81,9 @@ pub fn reduce_runtime_job_completed(
             anyhow::anyhow!("RuntimeJobCompleted event missing activity_result")
         })?)?;
 
-    match resolve_declarative_definition(instance) {
+    match registry.resolve_declarative_definition(instance) {
         DeclarativeDefinitionResolution::Resolved(definition) => {
-            reduce_declarative_completion(&definition, instance, event, &result)
+            reduce_declarative_completion(registry, &definition, instance, event, &result)
         }
         DeclarativeDefinitionResolution::PinError(error) => Ok(Some(
             definition_pin_blocked_decision(instance, event, &result, error),

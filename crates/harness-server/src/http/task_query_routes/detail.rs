@@ -117,7 +117,10 @@ async fn runtime_task_response_by_handle(
         project_id,
         submission_handle,
         ..
-    } = RuntimeWorkflowProjection::from_workflow(&workflow);
+    } = RuntimeWorkflowProjection::from_workflow_with_registry(
+        store.definition_registry(),
+        &workflow,
+    );
     let external_id = runtime_external_id(task_kind, &workflow.data, issue);
     let submission_id = submission_handle
         .map(|handle| handle.0)
@@ -176,12 +179,13 @@ async fn runtime_task_response_by_handle(
 }
 
 pub(crate) fn proof_from_runtime_workflow(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     task_id: &harness_core::types::TaskId,
     workflow: &harness_workflow::runtime::WorkflowInstance,
     events: &[harness_workflow::runtime::WorkflowEvent],
     decisions: &[harness_workflow::runtime::WorkflowDecisionRecord],
 ) -> ProofOfWork {
-    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(registry, workflow);
     let status = projection.task_status;
     let pr_url = runtime_string_field(&workflow.data, "pr_url")
         .or_else(|| runtime_string_field(&workflow.data, "last_pr_url"));
@@ -290,7 +294,11 @@ async fn runtime_proof_by_handle(
     else {
         return Ok(RuntimeProofLookup::Missing);
     };
-    let status = RuntimeWorkflowProjection::from_workflow(&workflow).task_status;
+    let status = RuntimeWorkflowProjection::from_workflow_with_registry(
+        store.definition_registry(),
+        &workflow,
+    )
+    .task_status;
     if !status.is_terminal() {
         return Ok(RuntimeProofLookup::InFlight(status.as_ref().to_string()));
     }
@@ -299,6 +307,7 @@ async fn runtime_proof_by_handle(
     let proof_task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
         .unwrap_or_else(|| task_id.clone());
     Ok(RuntimeProofLookup::Terminal(proof_from_runtime_workflow(
+        store.definition_registry(),
         &proof_task_id,
         &workflow,
         &events,

@@ -107,38 +107,33 @@ impl HarnessServer {
 
     /// Start in stdio mode (JSON-RPC over stdin/stdout).
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
-        self.apply_completion_evidence_policy()?;
-        self.register_declarative_workflow_definitions()?;
         let state = crate::http::build_app_state(Arc::new(self)).await?;
-        harness_workflow::runtime::freeze_workflow_definition_registry();
         crate::stdio::serve(state).await
     }
 
     /// Start in HTTP + WebSocket mode.
     pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
-        self.apply_completion_evidence_policy()?;
-        self.register_declarative_workflow_definitions()?;
         crate::http::serve(self, addr).await
     }
 
-    fn apply_completion_evidence_policy(&self) -> anyhow::Result<()> {
+    pub(crate) fn configure_workflow_definition_registry(
+        &self,
+    ) -> anyhow::Result<harness_workflow::runtime::WorkflowDefinitionRegistry> {
+        let mut registry = harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins();
         let enforced = self.completion_evidence_enforced();
         if !enforced {
             tracing::warn!(
                 "deployment-wide workflow completion-evidence enforcement is disabled; terminal transitions accept agent-claimed results without server-verified evidence"
             );
         }
-        harness_workflow::runtime::apply_builtin_evidence_enforcement(enforced)
+        registry.apply_builtin_evidence_enforcement(enforced)?;
+        registry
+            .register_declarative_current_batch(self.load_declarative_workflow_definitions()?)?;
+        Ok(registry)
     }
 
     fn completion_evidence_enforced(&self) -> bool {
         self.config.workflow.completion_evidence_enforced
-    }
-
-    fn register_declarative_workflow_definitions(&self) -> anyhow::Result<()> {
-        harness_workflow::runtime::register_declarative_workflow_definitions(
-            self.load_declarative_workflow_definitions()?,
-        )
     }
 
     fn load_declarative_workflow_definitions(

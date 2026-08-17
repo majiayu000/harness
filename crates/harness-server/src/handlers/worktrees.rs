@@ -194,7 +194,12 @@ async fn runtime_projection_for_workflow_id(
     let Some(instance) = store.get_instance(workflow_id).await? else {
         return Ok(None);
     };
-    Ok(Some(RuntimeWorkflowProjection::from_workflow(&instance)))
+    Ok(Some(
+        RuntimeWorkflowProjection::from_workflow_with_registry(
+            store.definition_registry(),
+            &instance,
+        ),
+    ))
 }
 
 fn runtime_workflow_id_candidate(task: &TaskState) -> Option<String> {

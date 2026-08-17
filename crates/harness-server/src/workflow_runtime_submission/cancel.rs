@@ -1,9 +1,8 @@
 use harness_core::config::workflow::{WorkflowActivityPolicy, WorkflowDefinitionPolicy};
 use harness_workflow::runtime::{
-    build_declarative_definition, resolve_declarative_definition, DecisionValidator,
-    DeclarativeDefinitionResolution, WorkflowCancellationCleanupOutcome, WorkflowCommand,
-    WorkflowCommandType, WorkflowDecision, WorkflowInstance, WorkflowRuntimeStore,
-    WorkflowTerminalState, PROMPT_TASK_DEFINITION_ID,
+    build_declarative_definition, DecisionValidator, DeclarativeDefinitionResolution,
+    WorkflowCancellationCleanupOutcome, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
+    WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState, PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -86,8 +85,10 @@ async fn cancel_submission_instance(
     mut instance: WorkflowInstance,
     correlation_id: &str,
 ) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
-    if instance.is_terminal() {
-        if instance.terminal_state() == Some(WorkflowTerminalState::Cancelled) {
+    if instance.is_terminal_with_registry(store.definition_registry()) {
+        if instance.terminal_state_with_registry(store.definition_registry())
+            == Some(WorkflowTerminalState::Cancelled)
+        {
             let (decision_name, remove_prompt) = cancellation_cleanup_policy(&instance);
             finish_cancellation_cleanup(store, &mut instance, decision_name, remove_prompt).await?;
         }
@@ -232,8 +233,9 @@ async fn resolve_declarative_cancellation(
     store: &WorkflowRuntimeStore,
     instance: &WorkflowInstance,
 ) -> Result<Option<DeclarativeCancellation>, RuntimeSubmissionCancelError> {
-    if let DeclarativeDefinitionResolution::Resolved(definition) =
-        resolve_declarative_definition(instance)
+    if let DeclarativeDefinitionResolution::Resolved(definition) = store
+        .definition_registry()
+        .resolve_declarative_definition(instance)
     {
         let target_state = cancelled_state(definition.policy(), instance)?;
         return Ok(Some(DeclarativeCancellation {
@@ -246,6 +248,7 @@ async fn resolve_declarative_cancellation(
                 definition.definition_version(),
                 definition.definition_hash(),
                 definition.registered().allowlist.clone(),
+                definition.registered().states.clone(),
             ),
             missing_pin: false,
         }));
@@ -255,7 +258,7 @@ async fn resolve_declarative_cancellation(
         .get_definition(&instance.definition_id, instance.definition_version)
         .await?
     else {
-        return match resolve_declarative_definition(instance) {
+        return match store.definition_registry().resolve_declarative_definition(instance) {
             DeclarativeDefinitionResolution::PinError(error) => {
                 Err(RuntimeSubmissionCancelError::Store(anyhow::anyhow!(
                     "declarative workflow '{}' has an invalid definition pin and no persisted definition during cancellation: {error:?}",
@@ -321,6 +324,7 @@ async fn resolve_declarative_cancellation(
             definition.definition_version(),
             definition.definition_hash(),
             definition.registered().allowlist.clone(),
+            definition.registered().states.clone(),
         ),
         missing_pin: true,
     }))

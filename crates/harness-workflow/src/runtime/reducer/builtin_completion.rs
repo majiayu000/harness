@@ -10,7 +10,7 @@ use super::builtin_pr_feedback::{
     pr_feedback_child_decision_from_activity_result, pr_feedback_success_contract_error,
     pr_feedback_sweep_decision_from_activity_result,
 };
-use super::builtin_prompt_task::prompt_task_success_decision;
+use super::builtin_prompt_task::prompt_task_success_decision_with_registry;
 use super::builtin_quality_gate::{
     parent_quality_gate_pass_decision, quality_gate_activity_matches,
     quality_gate_success_contract_error, quality_gate_success_decision,
@@ -39,11 +39,12 @@ use crate::runtime::pr_feedback::{
 };
 use crate::runtime::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
 use crate::runtime::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
-use crate::runtime::state_registry::decision_validator_for_definition;
+use crate::runtime::state_registry::WorkflowDefinitionRegistry;
 use crate::runtime::validator::ValidationContext;
 use serde_json::json;
 
 pub(super) fn reduce_builtin_completion(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -58,7 +59,7 @@ pub(super) fn reduce_builtin_completion(
         return None;
     }
     let decision = match result.status {
-        ActivityStatus::Succeeded => reduce_success(instance, event, result),
+        ActivityStatus::Succeeded => reduce_success(registry, instance, event, result),
         ActivityStatus::Blocked | ActivityStatus::SucceededWithBlockers => {
             github_issue_closed_decision(instance, event, result)
                 .or_else(|| Some(runtime_blocked_decision(instance, event, result)))
@@ -96,6 +97,7 @@ pub(super) fn reduce_builtin_completion(
 }
 
 fn reduce_success(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -125,7 +127,7 @@ fn reduce_success(
     }
     if let Some(command) = event_workflow_command(event) {
         if let Some(decision) =
-            candidate_promotion_success_decision(instance, event, result, &command)
+            candidate_promotion_success_decision(registry, instance, event, result, &command)
         {
             return Some(decision.unwrap_or_else(|error| {
                 invalid_agent_output_blocked_decision(
@@ -165,19 +167,22 @@ fn reduce_success(
     if let Some(decision) = structured_decision
         .as_ref()
         .filter(|_| !pr_feedback_blocker_overrides_structured_ready)
-        .filter(|decision| structured_decision_validates(instance, event, result, decision))
+        .filter(|decision| {
+            structured_decision_validates(registry, instance, event, result, decision)
+        })
         .cloned()
     {
         return Some(decision);
     }
 
-    if let Some(decision) = parent_quality_gate_pass_decision(instance, event, result) {
+    if let Some(decision) = parent_quality_gate_pass_decision(registry, instance, event, result) {
         return Some(decision);
     }
 
     if quality_gate_activity_matches(instance, result) {
         if let Some(decision) = structured_decision.as_ref() {
-            let reason = if let Some(contract_reason) = quality_gate_success_contract_error(result)
+            let reason = if let Some(contract_reason) =
+                quality_gate_success_contract_error(registry, result)
             {
                 format!(
                     "runtime activity `{}` emitted workflow_decision `{}` for workflow `{}` in state `{}`, but {contract_reason}",
@@ -197,14 +202,14 @@ fn reduce_success(
                 instance, event, result, &reason,
             ));
         }
-        return quality_gate_success_decision(instance, event, result);
+        return quality_gate_success_decision(registry, instance, event, result);
     }
 
     if prompt_task_activity_matches(instance, result) {
-        return prompt_task_success_decision(instance, event, result);
+        return prompt_task_success_decision_with_registry(registry, instance, event, result);
     }
 
-    if let Some(decision) = bind_pr_from_activity_result(instance, event, result) {
+    if let Some(decision) = bind_pr_from_activity_result(registry, instance, event, result) {
         return Some(decision);
     }
 
@@ -230,7 +235,8 @@ fn reduce_success(
         ));
     }
 
-    if let Some(decision) = pr_feedback_child_decision_from_activity_result(instance, event, result)
+    if let Some(decision) =
+        pr_feedback_child_decision_from_activity_result(registry, instance, event, result)
     {
         return Some(decision);
     }
@@ -536,6 +542,7 @@ fn canonicalize_verified_pr_binding_commands(
 }
 
 fn structured_decision_validates(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -556,11 +563,12 @@ fn structured_decision_validates(
     }
     if quality_gate_activity_matches(instance, result)
         && decision.next_state == "passed"
-        && quality_gate_success_contract_error(result).is_some()
+        && quality_gate_success_contract_error(registry, result).is_some()
     {
         return false;
     }
-    let Some(validator) = decision_validator_for_definition(&instance.definition_id) else {
+    let Some(validator) = registry.decision_validator_for_definition(&instance.definition_id)
+    else {
         return true;
     };
     validator

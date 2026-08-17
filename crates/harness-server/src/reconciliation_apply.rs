@@ -12,7 +12,9 @@ pub(super) async fn apply_runtime_workflow_transition(
     let Some(instance) = runtime_store.get_instance(&candidate.workflow_id).await? else {
         return Ok(false);
     };
-    if instance.is_terminal() || instance.state != candidate.state {
+    if instance.is_terminal_with_registry(runtime_store.definition_registry())
+        || instance.state != candidate.state
+    {
         return Ok(false);
     }
     apply_loaded_runtime_workflow_transition(

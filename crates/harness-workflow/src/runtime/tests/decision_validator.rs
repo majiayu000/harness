@@ -523,7 +523,8 @@ fn empty_and_omitted_commands_share_progress_rejection() {
 
 #[test]
 fn wait_and_inline_commands_do_not_drive_progress() {
-    let validator = DecisionValidator::new(
+    let validator = DecisionValidator::for_definition(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
         super::validator::TransitionAllowlist::default().allow(
             "implementing",
             "implementing",
@@ -534,6 +535,8 @@ fn wait_and_inline_commands_do_not_drive_progress() {
                 WorkflowCommandType::RequestOperatorAttention,
             ],
         ),
+        crate::runtime::WorkflowDefinitionRegistry::with_builtins()
+            .states_for_definition(GITHUB_ISSUE_PR_DEFINITION_ID),
     );
     let cases = [
         WorkflowCommand::wait("still waiting", "non-driver:wait"),

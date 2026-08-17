@@ -3,8 +3,8 @@ use crate::test_helpers;
 use axum::{body::to_bytes, routing::get, Router};
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
-    RuntimeKind, WorkflowCommand, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
+    RuntimeKind, WorkflowCommand, WorkflowDefinitionRegistry, WorkflowRuntimeStore,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 
 fn workflow(state: &str, data: Value) -> WorkflowInstance {
@@ -54,7 +54,7 @@ fn runtime_workflow_counts_reconcile_execution_review_and_terminal_states() {
         workflow("done", json!({})),
     ];
 
-    let counts = runtime_workflow_counts(&workflows);
+    let counts = runtime_workflow_counts(&WorkflowDefinitionRegistry::with_builtins(), &workflows);
 
     assert_eq!(counts.running, 7);
     assert_eq!(counts.pending, 2);
@@ -93,7 +93,11 @@ fn workflow_sample_truncation_preserves_operator_action_and_failed_states() {
     failed.updated_at = base - chrono::Duration::hours(2);
     workflows.push(failed);
 
-    truncate_workflow_sample(&mut workflows, 500);
+    truncate_workflow_sample(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &mut workflows,
+        500,
+    );
 
     assert!(workflows
         .iter()
@@ -134,7 +138,11 @@ fn workflow_sample_truncation_preserves_failed_reserve_before_operator_actions()
     failed.updated_at = base - chrono::Duration::hours(1);
     workflows.push(failed);
 
-    truncate_workflow_sample(&mut workflows, 500);
+    truncate_workflow_sample(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &mut workflows,
+        500,
+    );
 
     assert_eq!(workflows.len(), 500);
     assert!(workflows
@@ -149,7 +157,7 @@ fn grouped_failures_classifies_and_counts_github_fetch_failures() {
         github_fetch_failure("task-2", 2, "2026-06-12T00:05:00Z"),
     ];
 
-    let groups = grouped_failures(&failures, &[]);
+    let groups = grouped_failures(&WorkflowDefinitionRegistry::with_builtins(), &failures, &[]);
 
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].family, "github_fetch");
@@ -172,7 +180,11 @@ fn grouped_failures_includes_runtime_only_workflow_failures() {
     .with_id("quality-gate-workflow".to_string());
     failed_workflow.updated_at = Utc::now();
 
-    let groups = grouped_failures(&[], &[failed_workflow]);
+    let groups = grouped_failures(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &[],
+        &[failed_workflow],
+    );
 
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].message, "Quality gate execution failed.");
@@ -205,7 +217,11 @@ fn grouped_failures_deduplicates_workflow_failures_backed_by_task_rows() {
     .with_id("workflow-row".to_string());
     failed_workflow.updated_at = Utc::now();
 
-    let groups = grouped_failures(&failures, &[failed_workflow]);
+    let groups = grouped_failures(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &failures,
+        &[failed_workflow],
+    );
 
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].message, "Quality gate execution failed.");
@@ -340,7 +356,12 @@ fn operator_actions_link_evidence_to_current_legacy_task_id() {
     .with_id("ready-workflow".to_string());
     ready.updated_at = Utc::now();
 
-    let actions = operator_actions(&[ready], Utc::now(), &std::collections::HashMap::new());
+    let actions = operator_actions(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &[ready],
+        Utc::now(),
+        &std::collections::HashMap::new(),
+    );
 
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].task_id.as_deref(), Some("current-task"));
@@ -420,6 +441,7 @@ fn operator_monitor_actions_expose_structured_stop_metadata_and_eligibility() {
         },
     );
     let actions = operator_actions(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &[blocked, retryable_failed, configuration_failed, cancelled],
         Utc::now(),
         &stopped_eligibility,
@@ -504,7 +526,12 @@ fn operator_monitor_stuck_workflows_expose_structured_stop_metadata() {
             can_retry: false,
         },
     );
-    let stuck = stuck_workflows_from_instances(&[blocked], Utc::now(), &stopped_eligibility);
+    let stuck = stuck_workflows_from_instances(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &[blocked],
+        Utc::now(),
+        &stopped_eligibility,
+    );
     let row = serde_json::to_value(&stuck[0]).expect("stuck workflow should serialize");
 
     assert_eq!(row["workflow_id"], "stuck-blocked-workflow");
@@ -550,6 +577,7 @@ fn operator_monitor_stuck_workflows_expose_auto_recovery_fields() {
     .with_id("stuck-legacy-workflow".to_string());
 
     let stuck = stuck_workflows_from_instances(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &[classified, legacy],
         Utc::now(),
         &std::collections::HashMap::new(),
@@ -891,8 +919,9 @@ async fn attach_recovery_source_job(
 fn idle_workflows_are_inactive_for_source_activity() {
     let workflows = vec![workflow("idle", json!({ "source": "github" }))];
 
-    let counts = runtime_workflow_counts(&workflows);
-    let by_source = source_activity(&workflows, &[]);
+    let registry = WorkflowDefinitionRegistry::with_builtins();
+    let counts = runtime_workflow_counts(&registry, &workflows);
+    let by_source = source_activity(&registry, &workflows, &[]);
 
     assert_eq!(counts.pending, 0);
     assert_eq!(counts.running, 0);
@@ -1019,23 +1048,20 @@ async fn endpoint_includes_config_enabled_stuck_workflows() -> anyhow::Result<()
 }
 
 const DECLARATIVE_VISIBILITY_DEFINITION_ID: &str = "operator_monitor_visibility_flow";
-static REGISTER_DECLARATIVE_VISIBILITY_DEFINITION: std::sync::Once = std::sync::Once::new();
 
 /// Register a uniquely-named declarative definition into the process-global
 /// registry (GH-1609 fixture pattern, `Once`-guarded so it is idempotent across
 /// tests in this binary). It carries no built-in instances, so counting tests in
 /// sibling suites are unaffected.
-fn register_declarative_visibility_definition() {
-    REGISTER_DECLARATIVE_VISIBILITY_DEFINITION.call_once(|| {
-        let historical = declarative_visibility_definition("done", "failed");
-        let current = declarative_visibility_definition("completed", "rejected");
-        harness_workflow::runtime::register_historical_declarative_workflow_definitions([
-            historical,
-        ])
+fn declarative_visibility_registry() -> WorkflowDefinitionRegistry {
+    let mut registry = WorkflowDefinitionRegistry::with_builtins();
+    registry
+        .register_declarative_historical(declarative_visibility_definition("done", "failed"))
         .expect("historical visibility fixture definition should register");
-        harness_workflow::runtime::register_declarative_workflow_definitions([current])
-            .expect("visibility fixture definition should register");
-    });
+    registry
+        .register_declarative_current(declarative_visibility_definition("completed", "rejected"))
+        .expect("visibility fixture definition should register");
+    registry
 }
 
 fn declarative_visibility_definition(
@@ -1105,23 +1131,21 @@ fn declarative_visibility_definition(
 /// exercised locally.
 #[test]
 fn declarative_visibility_fixture_definition_is_valid() {
-    register_declarative_visibility_definition();
+    let registry = declarative_visibility_registry();
     assert!(
-        harness_workflow::runtime::current_declarative_workflow_definition(
-            DECLARATIVE_VISIBILITY_DEFINITION_ID
-        )
-        .is_some(),
+        registry
+            .current_declarative_definition(DECLARATIVE_VISIBILITY_DEFINITION_ID)
+            .is_some(),
         "visibility fixture definition should register"
     );
 }
 
 #[test]
 fn declarative_command_driven_state_counts_as_running() {
-    register_declarative_visibility_definition();
-    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
-        DECLARATIVE_VISIBILITY_DEFINITION_ID,
-    )
-    .expect("visibility fixture definition should be registered");
+    let registry = declarative_visibility_registry();
+    let definition = registry
+        .current_declarative_definition(DECLARATIVE_VISIBILITY_DEFINITION_ID)
+        .expect("visibility fixture definition should be registered");
     let workflow = WorkflowInstance::new(
         DECLARATIVE_VISIBILITY_DEFINITION_ID,
         definition.definition_version(),
@@ -1130,7 +1154,7 @@ fn declarative_command_driven_state_counts_as_running() {
     )
     .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
 
-    let counts = runtime_workflow_counts(&[workflow]);
+    let counts = runtime_workflow_counts(&registry, &[workflow]);
 
     assert_eq!(counts.running, 1);
     assert_eq!(counts.pending, 0);
@@ -1138,11 +1162,10 @@ fn declarative_command_driven_state_counts_as_running() {
 
 #[test]
 fn workflow_sample_truncation_preserves_declarative_failed_terminal() {
-    register_declarative_visibility_definition();
-    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
-        DECLARATIVE_VISIBILITY_DEFINITION_ID,
-    )
-    .expect("visibility fixture definition should be registered");
+    let registry = declarative_visibility_registry();
+    let definition = registry
+        .current_declarative_definition(DECLARATIVE_VISIBILITY_DEFINITION_ID)
+        .expect("visibility fixture definition should be registered");
     let failed = WorkflowInstance::new(
         DECLARATIVE_VISIBILITY_DEFINITION_ID,
         definition.definition_version(),
@@ -1162,7 +1185,7 @@ fn workflow_sample_truncation_preserves_declarative_failed_terminal() {
     active.updated_at = failed.updated_at + chrono::Duration::seconds(1);
     let mut workflows = vec![active, failed];
 
-    truncate_workflow_sample(&mut workflows, 1);
+    truncate_workflow_sample(&registry, &mut workflows, 1);
 
     assert_eq!(workflows.len(), 1);
     assert_eq!(workflows[0].id, "declarative-failed");
@@ -1170,11 +1193,10 @@ fn workflow_sample_truncation_preserves_declarative_failed_terminal() {
 
 #[test]
 fn declarative_failed_terminal_populates_failure_and_action_surfaces() {
-    register_declarative_visibility_definition();
-    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
-        DECLARATIVE_VISIBILITY_DEFINITION_ID,
-    )
-    .expect("visibility fixture definition should be registered");
+    let registry = declarative_visibility_registry();
+    let definition = registry
+        .current_declarative_definition(DECLARATIVE_VISIBILITY_DEFINITION_ID)
+        .expect("visibility fixture definition should be registered");
     let failed = WorkflowInstance::new(
         DECLARATIVE_VISIBILITY_DEFINITION_ID,
         definition.definition_version(),
@@ -1187,22 +1209,26 @@ fn declarative_failed_terminal_populates_failure_and_action_surfaces() {
         "failure_reason": "declarative review rejected"
     }));
 
-    let failures = grouped_failures(&[], std::slice::from_ref(&failed));
+    let failures = grouped_failures(&registry, &[], std::slice::from_ref(&failed));
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].message, "declarative review rejected");
 
-    let actions = operator_actions(&[failed], Utc::now(), &std::collections::HashMap::new());
+    let actions = operator_actions(
+        &registry,
+        &[failed],
+        Utc::now(),
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].kind, "failed");
 }
 
 #[test]
 fn declarative_operator_gate_uses_registry_progress_for_action_kind() {
-    register_declarative_visibility_definition();
-    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
-        DECLARATIVE_VISIBILITY_DEFINITION_ID,
-    )
-    .expect("visibility fixture definition should be registered");
+    let registry = declarative_visibility_registry();
+    let definition = registry
+        .current_declarative_definition(DECLARATIVE_VISIBILITY_DEFINITION_ID)
+        .expect("visibility fixture definition should be registered");
     let gate = WorkflowInstance::new(
         DECLARATIVE_VISIBILITY_DEFINITION_ID,
         definition.definition_version(),
@@ -1212,18 +1238,22 @@ fn declarative_operator_gate_uses_registry_progress_for_action_kind() {
     .with_id("declarative-manual-review")
     .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
 
-    let actions = operator_actions(&[gate], Utc::now(), &std::collections::HashMap::new());
+    let actions = operator_actions(
+        &registry,
+        &[gate],
+        Utc::now(),
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].kind, "blocked");
 }
 
 #[test]
 fn declarative_operator_gate_counts_as_blocked_activity() {
-    register_declarative_visibility_definition();
-    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
-        DECLARATIVE_VISIBILITY_DEFINITION_ID,
-    )
-    .expect("visibility fixture definition should be registered");
+    let registry = declarative_visibility_registry();
+    let definition = registry
+        .current_declarative_definition(DECLARATIVE_VISIBILITY_DEFINITION_ID)
+        .expect("visibility fixture definition should be registered");
     let gate = WorkflowInstance::new(
         DECLARATIVE_VISIBILITY_DEFINITION_ID,
         definition.definition_version(),
@@ -1235,11 +1265,11 @@ fn declarative_operator_gate_counts_as_blocked_activity() {
         "source": "github"
     }));
 
-    let counts = runtime_workflow_counts(std::slice::from_ref(&gate));
+    let counts = runtime_workflow_counts(&registry, std::slice::from_ref(&gate));
     assert_eq!(counts.blocked, 1);
     assert_eq!(counts.pending, 0);
 
-    let by_source = source_activity(&[gate], &[]);
+    let by_source = source_activity(&registry, &[gate], &[]);
     assert_eq!(by_source.len(), 1);
     assert_eq!(by_source[0].source, "github");
     assert_eq!(by_source[0].blocked, 1);
@@ -1251,18 +1281,18 @@ async fn declarative_operator_gate_sampling_uses_registry_progress() -> anyhow::
     if !test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    register_declarative_visibility_definition();
-    let definition = harness_workflow::runtime::current_declarative_workflow_definition(
-        DECLARATIVE_VISIBILITY_DEFINITION_ID,
-    )
-    .expect("visibility fixture definition should be registered");
+    let registry = declarative_visibility_registry();
+    let definition = registry
+        .current_declarative_definition(DECLARATIVE_VISIBILITY_DEFINITION_ID)
+        .expect("visibility fixture definition should be registered");
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-gate-progress-")?;
     let store = WorkflowRuntimeStore::open_with_database_url(
         &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
         Some(&test_helpers::test_database_url()?),
     )
-    .await?;
+    .await?
+    .with_definition_registry(registry.into_shared());
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &store,
         &WorkflowInstance::new(
@@ -1292,7 +1322,7 @@ async fn declarative_definition_instances_are_visible_in_operator_monitor() -> a
     if !test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    register_declarative_visibility_definition();
+    let registry = declarative_visibility_registry();
 
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-declarative-")?;
@@ -1300,7 +1330,8 @@ async fn declarative_definition_instances_are_visible_in_operator_monitor() -> a
         &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
         Some(&test_helpers::test_database_url()?),
     )
-    .await?;
+    .await?
+    .with_definition_registry(registry.into_shared());
 
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &store,
@@ -1335,7 +1366,7 @@ async fn declarative_terminal_queries_use_pinned_versions_and_outcomes() -> anyh
     if !test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    register_declarative_visibility_definition();
+    let registry = declarative_visibility_registry();
     let historical = declarative_visibility_definition("done", "failed");
     let current = declarative_visibility_definition("completed", "rejected");
 
@@ -1345,7 +1376,8 @@ async fn declarative_terminal_queries_use_pinned_versions_and_outcomes() -> anyh
         &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
         Some(&test_helpers::test_database_url()?),
     )
-    .await?;
+    .await?
+    .with_definition_registry(registry.into_shared());
     for (id, definition, state) in [
         ("historical-success", &historical, "done"),
         ("current-success", &current, "completed"),
@@ -1437,7 +1469,9 @@ async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result
         .execute(workflow_runtime_store.pool())
         .await?;
 
-    let definition_ids = crate::handlers::definition_ids::operator_definition_ids()?;
+    let definition_ids = crate::handlers::definition_ids::operator_definition_ids(
+        workflow_runtime_store.definition_registry(),
+    )?;
     let workflows =
         list_recent_failed_workflows(&workflow_runtime_store, &definition_ids, 1).await?;
 
@@ -1476,7 +1510,12 @@ async fn operator_action_age_uses_store_updated_at() -> anyhow::Result<()> {
         .await?;
 
     let workflows = list_runtime_workflows_from_store(&workflow_runtime_store).await?;
-    let actions = operator_actions(&workflows, Utc::now(), &std::collections::HashMap::new());
+    let actions = operator_actions(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &workflows,
+        Utc::now(),
+        &std::collections::HashMap::new(),
+    );
 
     let action = actions
         .iter()
@@ -1573,6 +1612,7 @@ fn workflow_backed_and_queued_tasks_are_not_counted_by_source() {
     queued_row.status = crate::task_runner::TaskStatus::Pending;
 
     let mut by_source = source_activity(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &[
             workflow(
                 "ready_to_merge",

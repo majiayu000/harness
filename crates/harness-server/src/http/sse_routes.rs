@@ -168,7 +168,7 @@ impl RuntimeSubmissionSseCursor {
             }
         }
 
-        if workflow.is_terminal() {
+        if stream_should_finish(self.store.definition_registry(), &workflow) {
             self.push_item(StreamItem::Done);
             self.finished = true;
         }
@@ -186,5 +186,45 @@ impl RuntimeSubmissionSseCursor {
                 tracing::warn!("runtime_submission_sse_stream: failed to serialize event: {error}")
             }
         }
+    }
+}
+
+fn stream_should_finish(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
+    workflow: &harness_workflow::runtime::WorkflowInstance,
+) -> bool {
+    workflow.is_terminal_with_registry(registry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_workflow::runtime::{
+        RegisteredWorkflowDefinition, TransitionAllowlist, WorkflowDefinitionRegistry,
+        WorkflowInstance, WorkflowStateDefinition, WorkflowSubject, WorkflowTerminalState,
+    };
+
+    #[test]
+    fn custom_terminal_definition_finishes_submission_stream() -> anyhow::Result<()> {
+        let definition_id = "sse_injected_terminal";
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry.register(RegisteredWorkflowDefinition::new(
+            definition_id,
+            vec![WorkflowStateDefinition::terminal(
+                definition_id,
+                "complete",
+                WorkflowTerminalState::Succeeded,
+            )],
+            TransitionAllowlist::default(),
+        ))?;
+        let workflow = WorkflowInstance::new(
+            definition_id,
+            1,
+            "complete",
+            WorkflowSubject::new("test", "sse-terminal"),
+        )
+        .with_id("sse-injected-terminal-workflow");
+        assert!(stream_should_finish(&registry, &workflow));
+        Ok(())
     }
 }

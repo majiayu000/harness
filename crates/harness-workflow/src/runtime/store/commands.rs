@@ -5,7 +5,7 @@ use super::{
 };
 use crate::runtime::{
     DispatchClaim, RuntimeJob, RuntimeKind, WorkflowCommand, WorkflowCommandStatus,
-    WorkflowInstance,
+    WorkflowDefinitionRegistry,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -79,7 +79,9 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(ClaimedCommandTerminalOutcome::StaleClaim);
         }
-        let Some(workflow) = workflow.filter(WorkflowInstance::is_terminal) else {
+        let Some(workflow) = workflow
+            .filter(|workflow| workflow.is_terminal_with_registry(&self.definition_registry))
+        else {
             tx.rollback().await?;
             return Ok(ClaimedCommandTerminalOutcome::NotTerminal);
         };
@@ -170,6 +172,7 @@ pub(super) async fn insert_or_reactivate_cancelled_tx(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn enqueue_runtime_job_for_command(
     pool: &PgPool,
+    definition_registry: &WorkflowDefinitionRegistry,
     command_id: &str,
     dispatch_claim: Option<DispatchClaim<'_>>,
     runtime_kind: RuntimeKind,
@@ -233,7 +236,10 @@ pub(super) async fn enqueue_runtime_job_for_command(
             tx.rollback().await?;
             return Ok(RuntimeJobEnqueueOutcome::StaleClaim);
         }
-        if let Some(workflow) = workflow.as_ref().filter(|workflow| workflow.is_terminal()) {
+        if let Some(workflow) = workflow
+            .as_ref()
+            .filter(|workflow| workflow.is_terminal_with_registry(definition_registry))
+        {
             let terminal_status = if workflow.state == "cancelled" {
                 WorkflowCommandStatus::Cancelled
             } else {

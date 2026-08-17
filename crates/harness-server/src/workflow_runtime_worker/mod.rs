@@ -255,18 +255,24 @@ pub(crate) async fn notify_runtime_submission_terminal_workflow(
     let Some(callback) = state.intake.completion_callback.as_ref() else {
         return Ok(false);
     };
-    let Some(task) = runtime_submission_completion_task(&instance, result)? else {
+    let Some(task) = runtime_submission_completion_task_with_registry(
+        store.definition_registry(),
+        &instance,
+        result,
+    )?
+    else {
         return Ok(false);
     };
     callback(task).await;
     Ok(true)
 }
 
-fn runtime_submission_completion_task(
+fn runtime_submission_completion_task_with_registry(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     result: Option<&ActivityResult>,
 ) -> anyhow::Result<Option<TaskState>> {
-    let projection = RuntimeWorkflowProjection::from_workflow(instance);
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(registry, instance);
     let status = projection.task_status;
     if !status.is_terminal() {
         return Ok(None);
@@ -315,6 +321,18 @@ fn runtime_submission_completion_task(
     };
     task.error = runtime_completion_error(&status, result);
     Ok(Some(task))
+}
+
+#[cfg(test)]
+fn runtime_submission_completion_task(
+    instance: &WorkflowInstance,
+    result: Option<&ActivityResult>,
+) -> anyhow::Result<Option<TaskState>> {
+    runtime_submission_completion_task_with_registry(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
+        instance,
+        result,
+    )
 }
 
 fn runtime_job_activity_result(job: &RuntimeJob) -> Option<ActivityResult> {
@@ -403,7 +421,10 @@ fn runtime_completion_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_workflow::runtime::WorkflowSubject;
+    use harness_workflow::runtime::{
+        RegisteredWorkflowDefinition, TransitionAllowlist, WorkflowDefinitionRegistry,
+        WorkflowStateDefinition, WorkflowSubject, WorkflowTerminalState,
+    };
     use serde_json::json;
 
     fn issue_instance(state: &str) -> WorkflowInstance {
@@ -568,6 +589,41 @@ mod tests {
         assert_eq!(task.source.as_deref(), Some("github"));
         assert_eq!(task.external_id.as_deref(), Some("42"));
         assert_eq!(task.repo.as_deref(), Some("owner/repo"));
+    }
+
+    #[test]
+    fn runtime_submission_completion_task_uses_injected_custom_terminal() -> anyhow::Result<()> {
+        let definition_id = "completion_callback_injected_terminal";
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry.register(RegisteredWorkflowDefinition::new(
+            definition_id,
+            vec![WorkflowStateDefinition::terminal(
+                definition_id,
+                "shipped",
+                WorkflowTerminalState::Succeeded,
+            )],
+            TransitionAllowlist::default(),
+        ))?;
+        let instance = WorkflowInstance::new(
+            definition_id,
+            1,
+            "shipped",
+            WorkflowSubject::new("declarative", "custom:42"),
+        )
+        .with_server_data(json!({
+            "task_id": "runtime-custom-42",
+            "project_id": "/tmp/project",
+            "prompt_summary": "custom workflow task",
+            "source": "dashboard",
+            "external_id": "custom:42",
+        }));
+
+        let task = runtime_submission_completion_task_with_registry(&registry, &instance, None)?
+            .ok_or_else(|| anyhow::anyhow!("custom terminal should produce a completion task"))?;
+
+        assert_eq!(task.id.as_str(), "runtime-custom-42");
+        assert_eq!(task.status, TaskStatus::Done);
+        Ok(())
     }
 
     #[test]

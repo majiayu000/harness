@@ -1,10 +1,9 @@
 use super::{
     commit_parent_attachment_instance_tx, commit_same_state_instance_tx, insert_event_tx,
-    insert_validated_canonical_initial_instance_tx,
-    instance_helpers::{otel_trace_context_from_data, terminal_state_pairs},
+    insert_validated_canonical_initial_instance_tx, instance_helpers::otel_trace_context_from_data,
     select_instance_for_update_tx, validate_instance_for_persistence,
-    workflow_instance_from_persisted_json, workflow_instance_from_row, RuntimeHistoryPruneSummary,
-    WorkflowInstancePage, WorkflowRuntimeStore,
+    workflow_instance_from_persisted_json, workflow_instance_from_row, WorkflowInstancePage,
+    WorkflowRuntimeStore,
 };
 use crate::runtime::model::WorkflowInstance;
 use crate::runtime::WorkflowOtelTraceContext;
@@ -14,86 +13,6 @@ use serde_json::json;
 /// Event recorded when a workflow row is created outside a decision
 /// transition, so no creation is eventless (GH-1864).
 pub const WORKFLOW_INSTANCE_CREATED_EVENT: &str = "WorkflowInstanceCreated";
-
-/// Shared candidate-selection CTE for retention: terminal workflow root
-/// families older than the cutoff that are not depended on by any live
-/// workflow. Both the dry-run count and the destructive prune use it so they
-/// can never diverge.
-const PRUNE_ELIGIBLE_ROOTS_CTE: &str = r#"WITH RECURSIVE terminal_states(definition_id, state) AS (
-                 SELECT * FROM unnest($1::text[], $2::text[])
-             ),
-             candidate_roots AS (
-                 SELECT root.id
-                 FROM workflow_instances AS root
-                 WHERE root.parent_workflow_id IS NULL
-                   AND root.updated_at < $3
-                   AND EXISTS (
-                       SELECT 1
-                       FROM terminal_states AS terminal
-                       WHERE terminal.definition_id = root.definition_id
-                         AND terminal.state = root.state
-                   )
-                 ORDER BY root.updated_at ASC, root.id ASC
-                 LIMIT $4
-             ),
-             family AS (
-                 SELECT root.id AS root_id,
-                        root.id,
-                        root.definition_id,
-                        root.state,
-                        root.updated_at
-                 FROM workflow_instances AS root
-                 JOIN candidate_roots ON candidate_roots.id = root.id
-                 UNION ALL
-                 SELECT family.root_id,
-                        child.id,
-                        child.definition_id,
-                        child.state,
-                        child.updated_at
-                 FROM workflow_instances AS child
-                 JOIN family ON child.parent_workflow_id = family.id
-             ),
-             eligible_roots AS (
-                 SELECT family.root_id
-                 FROM family
-                 GROUP BY family.root_id
-                 HAVING bool_and(family.updated_at < $3)
-                    AND bool_and(EXISTS (
-                        SELECT 1
-                        FROM terminal_states AS terminal
-                        WHERE terminal.definition_id = family.definition_id
-                          AND terminal.state = family.state
-                    ))
-                    AND bool_and(NOT EXISTS (
-                        SELECT 1
-                        FROM workflow_artifact_dependencies AS dependency
-                        JOIN workflow_instances AS dependent
-                          ON dependent.id = dependency.workflow_id
-                        LEFT JOIN workflow_artifacts AS artifact
-                          ON artifact.id = dependency.artifact_ref
-                        LEFT JOIN runtime_jobs AS producer_job
-                          ON producer_job.id = CASE
-                              WHEN dependency.artifact_ref LIKE 'runtime-transcript:%'
-                              THEN substr(dependency.artifact_ref, length('runtime-transcript:') + 1)
-                              ELSE NULL
-                          END
-                        LEFT JOIN workflow_commands AS producer_command
-                          ON producer_command.id = producer_job.command_id
-                        WHERE (
-                            artifact.workflow_id = family.id
-                            OR producer_job.id = family.id
-                            OR producer_command.workflow_id = family.id
-                            OR dependency.workflow_id = family.id
-                        )
-                          AND (NOT EXISTS (
-                              SELECT 1 FROM terminal_states AS dependent_terminal
-                              WHERE dependent_terminal.definition_id = dependent.definition_id
-                                AND dependent_terminal.state = dependent.state
-                          ) OR COALESCE(dependent.data->'data'->>'stop_reason_code',
-                              dependent.data->'data'->'last_stop'->>'stop_reason_code')
-                              = 'runtime_transcript_lost')
-                    ))
-             )"#;
 
 impl WorkflowRuntimeStore {
     /// Create a workflow at its canonical initial state if it does not exist.
@@ -467,139 +386,13 @@ impl WorkflowRuntimeStore {
         rows.into_iter()
             .map(|(data, updated_at)| workflow_instance_from_row(data, updated_at))
             .filter_map(|result| match result {
-                Ok(instance) if !instance.is_terminal() => Some(Ok(instance)),
+                Ok(instance) if !instance.is_terminal_with_registry(&self.definition_registry) => {
+                    Some(Ok(instance))
+                }
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
             .collect()
-    }
-
-    /// Count terminal workflow families eligible for retention pruning,
-    /// without deleting anything. Bounded by the same batch limit as
-    /// `prune_terminal_runtime_history` so dry-run reports match what the
-    /// next real pass would delete.
-    pub async fn count_terminal_history_candidates(
-        &self,
-        terminal_before: DateTime<Utc>,
-        batch_limit: i64,
-    ) -> anyhow::Result<u64> {
-        let batch_limit = batch_limit.clamp(1, 10_000);
-        let (terminal_definition_ids, terminal_states) = terminal_state_pairs();
-        if terminal_definition_ids.is_empty() {
-            return Ok(0);
-        }
-        let sql = format!("{PRUNE_ELIGIBLE_ROOTS_CTE} SELECT COUNT(*) FROM eligible_roots");
-        let (count,): (i64,) = sqlx::query_as(&sql)
-            .bind(&terminal_definition_ids)
-            .bind(&terminal_states)
-            .bind(terminal_before)
-            .bind(batch_limit)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(count.max(0) as u64)
-    }
-
-    pub async fn prune_terminal_runtime_history(
-        &self,
-        terminal_before: DateTime<Utc>,
-        batch_limit: i64,
-    ) -> anyhow::Result<RuntimeHistoryPruneSummary> {
-        let batch_limit = batch_limit.clamp(1, 10_000);
-        let (terminal_definition_ids, terminal_states) = terminal_state_pairs();
-        if terminal_definition_ids.is_empty() {
-            return Ok(RuntimeHistoryPruneSummary::default());
-        }
-
-        let rows: Vec<(String,)> = sqlx::query_as(&format!(
-            "{PRUNE_ELIGIBLE_ROOTS_CTE} SELECT family.id
-             FROM family
-             JOIN eligible_roots ON eligible_roots.root_id = family.root_id
-             ORDER BY family.root_id ASC, family.id ASC"
-        ))
-        .bind(&terminal_definition_ids)
-        .bind(&terminal_states)
-        .bind(terminal_before)
-        .bind(batch_limit)
-        .fetch_all(&self.pool)
-        .await?;
-        let workflow_ids: Vec<String> = rows.into_iter().map(|(id,)| id).collect();
-        if workflow_ids.is_empty() {
-            return Ok(RuntimeHistoryPruneSummary::default());
-        }
-
-        let mut summary = self
-            .runtime_history_counts_for_workflows(&workflow_ids)
-            .await?;
-        let result = sqlx::query("DELETE FROM workflow_instances WHERE id = ANY($1::text[])")
-            .bind(&workflow_ids)
-            .execute(&self.pool)
-            .await?;
-        summary.workflow_instances_deleted = result.rows_affected() as usize;
-        Ok(summary)
-    }
-
-    async fn runtime_history_counts_for_workflows(
-        &self,
-        workflow_ids: &[String],
-    ) -> anyhow::Result<RuntimeHistoryPruneSummary> {
-        let (workflow_instances,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM workflow_instances WHERE id = ANY($1::text[])")
-                .bind(workflow_ids)
-                .fetch_one(&self.pool)
-                .await?;
-        let (workflow_events,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM workflow_events WHERE workflow_id = ANY($1::text[])",
-        )
-        .bind(workflow_ids)
-        .fetch_one(&self.pool)
-        .await?;
-        let (workflow_decisions,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM workflow_decisions WHERE workflow_id = ANY($1::text[])",
-        )
-        .bind(workflow_ids)
-        .fetch_one(&self.pool)
-        .await?;
-        let (workflow_commands,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM workflow_commands WHERE workflow_id = ANY($1::text[])",
-        )
-        .bind(workflow_ids)
-        .fetch_one(&self.pool)
-        .await?;
-        let (runtime_jobs,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*)
-             FROM runtime_jobs AS job
-             JOIN workflow_commands AS command ON command.id = job.command_id
-             WHERE command.workflow_id = ANY($1::text[])",
-        )
-        .bind(workflow_ids)
-        .fetch_one(&self.pool)
-        .await?;
-        let (runtime_events,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*)
-             FROM runtime_events AS event
-             JOIN runtime_jobs AS job ON job.id = event.runtime_job_id
-             JOIN workflow_commands AS command ON command.id = job.command_id
-             WHERE command.workflow_id = ANY($1::text[])",
-        )
-        .bind(workflow_ids)
-        .fetch_one(&self.pool)
-        .await?;
-        let (workflow_artifacts,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM workflow_artifacts WHERE workflow_id = ANY($1::text[])",
-        )
-        .bind(workflow_ids)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(RuntimeHistoryPruneSummary {
-            workflow_instances_deleted: workflow_instances.max(0) as usize,
-            workflow_events_deleted: workflow_events.max(0) as usize,
-            workflow_decisions_deleted: workflow_decisions.max(0) as usize,
-            workflow_commands_deleted: workflow_commands.max(0) as usize,
-            runtime_jobs_deleted: runtime_jobs.max(0) as usize,
-            runtime_events_deleted: runtime_events.max(0) as usize,
-            workflow_artifacts_deleted: workflow_artifacts.max(0) as usize,
-        })
     }
 
     pub async fn touch_instance(&self, workflow_id: &str) -> anyhow::Result<()> {

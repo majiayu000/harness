@@ -48,6 +48,7 @@ fn build_packet(
     prompt_task_text: Option<&str>,
 ) -> Value {
     build_runtime_prompt_packet(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
         job,
         None,
         Path::new("/workspaces/job-1"),
@@ -524,6 +525,7 @@ fn prompt_task_text_is_digest_bound_without_becoming_context() {
     let mut missing_ref = runtime_job("implement_prompt");
     missing_ref.input = json!({ "activity": "implement_prompt" });
     let error = build_runtime_prompt_packet(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
         &missing_ref,
         None,
         Path::new("/workspaces/job-1"),
@@ -726,6 +728,7 @@ fn invalid_required_provenance_aborts_packet_construction() {
     };
     let profile = codex_profile();
     let error = build_runtime_prompt_packet(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/job-1"),

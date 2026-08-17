@@ -1,7 +1,5 @@
 use super::WorkflowRuntimeStore;
-use crate::runtime::state_registry::{
-    known_workflow_definition_ids, workflow_states_for_definition, WorkflowProgressMode,
-};
+use crate::runtime::{WorkflowDefinitionRegistry, WorkflowProgressMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverlessProgressProvenanceStatus {
@@ -47,7 +45,7 @@ impl WorkflowRuntimeStore {
         &self,
         limit: i64,
     ) -> anyhow::Result<Vec<DriverlessProgressInstance>> {
-        let (definition_ids, states) = command_driven_state_pairs();
+        let (definition_ids, states) = command_driven_state_pairs(&self.definition_registry);
         if definition_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -179,11 +177,13 @@ impl WorkflowRuntimeStore {
     }
 }
 
-fn command_driven_state_pairs() -> (Vec<String>, Vec<String>) {
-    let pairs: Vec<(String, String)> = known_workflow_definition_ids()
+fn command_driven_state_pairs(registry: &WorkflowDefinitionRegistry) -> (Vec<String>, Vec<String>) {
+    let pairs: Vec<(String, String)> = registry
+        .known_definition_ids()
         .into_iter()
         .flat_map(|definition_id| {
-            workflow_states_for_definition(&definition_id)
+            registry
+                .states_for_definition(&definition_id)
                 .into_iter()
                 .filter(|state| state.progress_mode == Some(WorkflowProgressMode::CommandDriven))
                 .map(move |state| (definition_id.clone(), state.key.state.to_string()))

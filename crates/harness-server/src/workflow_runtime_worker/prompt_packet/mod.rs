@@ -1,14 +1,13 @@
 use harness_core::config::workflow::WorkflowDocument;
 use harness_workflow::runtime::{
-    decision_validator_for_instance, ActivityArtifact, DecisionValidator,
-    RetrievedRepoMemoryRecord, RuntimeJob, RuntimeProfile, WorkflowInstance,
-    CANDIDATE_BRANCH_ARTIFACT, CANDIDATE_CLEANUP_ACTIVITY, CANDIDATE_PROMOTION_ACTIVITY,
-    ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT,
-    ISSUE_PLAN_READY_SIGNAL, ISSUE_STATE_ARTIFACT, PROMPT_TASK_DEFINITION_ID,
-    PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
-    PR_FEEDBACK_SNAPSHOT_ARTIFACT, QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL,
-    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
-    SERVER_PR_SNAPSHOT_ARTIFACT,
+    ActivityArtifact, DecisionValidator, RetrievedRepoMemoryRecord, RuntimeJob, RuntimeProfile,
+    WorkflowDefinitionRegistry, WorkflowInstance, CANDIDATE_BRANCH_ARTIFACT,
+    CANDIDATE_CLEANUP_ACTIVITY, CANDIDATE_PROMOTION_ACTIVITY, ISSUE_ALREADY_RESOLVED_SIGNAL,
+    ISSUE_CLOSED_SIGNAL, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL,
+    ISSUE_STATE_ARTIFACT, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_FEEDBACK_SNAPSHOT_ARTIFACT,
+    QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -60,6 +59,7 @@ impl From<anyhow::Error> for PromptPacketConfigurationError {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_runtime_prompt_packet(
+    registry: &WorkflowDefinitionRegistry,
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
     project_root: &Path,
@@ -109,7 +109,7 @@ pub(super) fn build_runtime_prompt_packet(
             "agent_executes_repository_and_github_work": true,
             "follow_project_instructions": true,
         },
-        "activity_result_schema": activity_result_schema(job, workflow),
+        "activity_result_schema": activity_result_schema_with_registry(registry, job, workflow),
         "required_structured_output": {
             "summary": "Concise final activity summary.",
             "changed_files": "Files changed by this runtime activity, if any.",
@@ -131,7 +131,7 @@ pub(super) fn build_runtime_prompt_packet(
         repo_memory,
         prompt_task_text,
     )?;
-    apply_activity_policy(&mut packet, job, workflow, workflow_document)?;
+    apply_activity_policy(registry, &mut packet, job, workflow, workflow_document)?;
     apply_candidate_submission_contract(&mut packet, job);
     if let Some(context) = prompt_continuation_context(workflow) {
         packet["continuation_context"] = context;
@@ -274,7 +274,20 @@ pub(super) fn build_runtime_job_prompt(
     prompt
 }
 
+#[cfg(test)]
 pub(super) fn activity_result_schema(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> Value {
+    activity_result_schema_with_registry(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        job,
+        workflow,
+    )
+}
+
+fn activity_result_schema_with_registry(
+    registry: &WorkflowDefinitionRegistry,
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
 ) -> Value {
@@ -285,7 +298,7 @@ pub(super) fn activity_result_schema(
     let activity_contract = activity_contract(workflow_definition, &activity);
     let transition_contract = activity_transition_contract(workflow_definition, &activity);
     let summary_contract = agent_summary_contract(workflow_definition, &activity);
-    let decision_contract = workflow_decision_contract(workflow);
+    let decision_contract = workflow_decision_contract(registry, workflow);
     let command_examples = workflow_decision_command_examples(workflow_definition, &activity);
     let mut schema = json!({
         "schema": "harness.runtime.activity_result.v1",
@@ -409,9 +422,15 @@ fn workflow_decision_command_examples(_workflow_definition: &str, _activity: &st
     json!([{"command_type":"enqueue_activity","dedupe_key":"<unique stable string for this command>","command":{"activity":"<next activity name>","note":"All activity-specific payload (repo, issue_number, signals, etc.) goes INSIDE this nested `command` Value. The outer object MUST have exactly the three fields: command_type, dedupe_key, command."}}])
 }
 
-fn workflow_decision_contract(workflow: Option<&WorkflowInstance>) -> Value {
+fn workflow_decision_contract(
+    registry: &WorkflowDefinitionRegistry,
+    workflow: Option<&WorkflowInstance>,
+) -> Value {
     workflow_decision_contract_with_resolver(workflow, |_| {
-        decision_validator_for_instance(workflow?).ok().flatten()
+        registry
+            .decision_validator_for_instance(workflow?)
+            .ok()
+            .flatten()
     })
 }
 
@@ -768,17 +787,14 @@ where
 }
 
 #[cfg(test)]
-#[path = "../prompt_packet_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "../prompt_packet_taint_tests.rs"]
-mod taint_tests;
-
+#[path = "../prompt_packet_activity_policy_tests.rs"]
+mod activity_policy_tests;
 #[cfg(test)]
 #[path = "../prompt_packet_pinning_tests.rs"]
 mod pinning_tests;
-
 #[cfg(test)]
-#[path = "../prompt_packet_activity_policy_tests.rs"]
-mod activity_policy_tests;
+#[path = "../prompt_packet_taint_tests.rs"]
+mod taint_tests;
+#[cfg(test)]
+#[path = "../prompt_packet_tests.rs"]
+mod tests;

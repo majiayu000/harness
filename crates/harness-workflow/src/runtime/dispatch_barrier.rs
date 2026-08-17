@@ -325,7 +325,10 @@ impl super::store::WorkflowRuntimeStore {
             return Ok(DeferClaimedCommandOutcome::StaleClaim);
         }
 
-        if let Some(workflow) = workflow.as_ref().filter(|workflow| workflow.is_terminal()) {
+        if let Some(workflow) = workflow
+            .as_ref()
+            .filter(|workflow| workflow.is_terminal_with_registry(&self.definition_registry))
+        {
             let terminal_status = if workflow.state == "cancelled" {
                 WorkflowCommandStatus::Cancelled
             } else {

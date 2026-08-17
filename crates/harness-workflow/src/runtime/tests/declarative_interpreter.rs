@@ -133,7 +133,11 @@ mod declarative_interpreter {
         event: &WorkflowEvent,
         result: &ActivityResult,
     ) -> WorkflowDecision {
-        reduce_declarative_completion(definition, instance, event, result)
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry
+            .register_declarative_current(definition.clone())
+            .expect("fixture definition should register");
+        reduce_declarative_completion(&registry, definition, instance, event, result)
             .expect("declarative reduction should not error")
             .expect("generic declarative reduction should produce a decision")
     }
@@ -354,13 +358,15 @@ mod declarative_interpreter {
     #[test]
     fn reducer_entry_uses_strict_custom_pinning_and_declarative_builtins() {
         let definition = definition_for(&policy());
-        register_declarative_workflow_definitions([definition.clone()])
-            .expect("fixture definition should register once");
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry
+            .register_declarative_current(definition.clone())
+            .expect("fixture definition should register");
         let instance = instance_for(&definition, "reviewing");
         let result = ActivityResult::succeeded("review", "reviewed")
             .with_artifact(ActivityArtifact::new("review_report", json!({})));
         let event = completion_event(&instance, "review", &result);
-        let decision = reduce_runtime_job_completed(&instance, &event)
+        let decision = reduce_runtime_job_completed_with_registry(&registry, &instance, &event)
             .expect("completion should reduce")
             .expect("declarative completion should produce a decision");
         assert_eq!(decision.next_state, "publishing");
@@ -372,7 +378,7 @@ mod declarative_interpreter {
             WorkflowSubject::new("document", "missing-hash"),
         );
         let missing_hash_event = completion_event(&missing_hash, "review", &result);
-        let pin_error = reduce_runtime_job_completed(&missing_hash, &missing_hash_event)
+        let pin_error = reduce_runtime_job_completed_with_registry(&registry, &missing_hash, &missing_hash_event)
             .expect("pin error should reduce")
             .expect("pin error should block");
         assert_eq!(pin_error.decision, "definition_version_missing");
@@ -382,7 +388,7 @@ mod declarative_interpreter {
             "definition_hash": "not-a-canonical-hash"
         }));
         let invalid_hash_event = completion_event(&invalid_hash, "review", &result);
-        let invalid_hash_decision = reduce_runtime_job_completed(&invalid_hash, &invalid_hash_event)
+        let invalid_hash_decision = reduce_runtime_job_completed_with_registry(&registry, &invalid_hash, &invalid_hash_event)
             .expect("invalid hash should reduce")
             .expect("invalid hash should block");
         assert_eq!(invalid_hash_decision.decision, "definition_version_missing");
@@ -401,7 +407,7 @@ mod declarative_interpreter {
             .with_server_data(json!({ "definition_hash": mismatched_hash }));
         let hash_mismatch_event = completion_event(&hash_mismatch, "review", &result);
         let hash_mismatch_decision =
-            reduce_runtime_job_completed(&hash_mismatch, &hash_mismatch_event)
+            reduce_runtime_job_completed_with_registry(&registry, &hash_mismatch, &hash_mismatch_event)
                 .expect("hash mismatch should reduce")
                 .expect("hash mismatch should block");
         assert_eq!(
@@ -419,7 +425,7 @@ mod declarative_interpreter {
         .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
         let missing_version_event = completion_event(&missing_version, "review", &result);
         let missing_version_decision =
-            reduce_runtime_job_completed(&missing_version, &missing_version_event)
+            reduce_runtime_job_completed_with_registry(&registry, &missing_version, &missing_version_event)
                 .expect("missing version should reduce")
                 .expect("missing version should block");
         assert_eq!(
@@ -429,7 +435,7 @@ mod declarative_interpreter {
         assert!(missing_version_decision.reason.contains("missing_version"));
 
         let builtin = issue_instance("replanning");
-        assert!(workflow_instance_is_declarative(&builtin));
+        assert!(registry.instance_is_declarative(&builtin));
         let builtin_result = ActivityResult::succeeded("replan_issue", "replanned");
         let builtin_event = WorkflowEvent::new(
             &builtin.id,
@@ -441,7 +447,7 @@ mod declarative_interpreter {
             "command_id": "builtin-command",
             "activity_result": builtin_result,
         }));
-        let builtin_decision = reduce_runtime_job_completed(&builtin, &builtin_event)
+        let builtin_decision = reduce_runtime_job_completed_with_registry(&registry, &builtin, &builtin_event)
             .expect("builtin completion should reduce")
             .expect("builtin declarative completion should produce a decision");
         assert_eq!(

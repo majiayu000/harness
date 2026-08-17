@@ -17,7 +17,7 @@ use super::runtime_usage::{
 use super::{insert_event_tx, RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 use crate::runtime::model::{ActivityResult, WorkflowDecision, WorkflowEvent, WorkflowInstance};
 use crate::runtime::reducer::budget_exhausted_blocked_decision;
-use crate::runtime::terminal_state::workflow_terminal_state_for_version;
+use crate::runtime::WorkflowDefinitionRegistry;
 use serde_json::json;
 
 /// Returns the replacement decision when the completed activity pushed the
@@ -26,12 +26,15 @@ use serde_json::json;
 pub(super) async fn budget_ceiling_blocked_decision(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     budget_policy: &RuntimeBudgetPolicy,
+    definition_registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
     decision: &WorkflowDecision,
 ) -> anyhow::Result<Option<WorkflowDecision>> {
-    if budget_policy.unlimited || !decision_schedules_more_work(instance, decision) {
+    if budget_policy.unlimited
+        || !decision_schedules_more_work(definition_registry, instance, decision)
+    {
         return Ok(None);
     }
     // Compare in integer micro-dollars, matching the dispatch gate: spend is
@@ -90,14 +93,19 @@ pub(super) async fn budget_ceiling_blocked_decision(
 /// The ceiling only preempts decisions that would keep the workflow running.
 /// A decision that already lands in a terminal state or in `blocked` needs no
 /// budget intervention — the workflow is stopping either way.
-fn decision_schedules_more_work(instance: &WorkflowInstance, decision: &WorkflowDecision) -> bool {
+fn decision_schedules_more_work(
+    definition_registry: &WorkflowDefinitionRegistry,
+    instance: &WorkflowInstance,
+    decision: &WorkflowDecision,
+) -> bool {
     if decision.next_state == "blocked" {
         return false;
     }
-    workflow_terminal_state_for_version(
-        &instance.definition_id,
-        instance.definition_version,
-        &decision.next_state,
-    )
-    .is_none()
+    definition_registry
+        .state_terminal_state_for_version(
+            &instance.definition_id,
+            instance.definition_version,
+            &decision.next_state,
+        )
+        .is_none()
 }

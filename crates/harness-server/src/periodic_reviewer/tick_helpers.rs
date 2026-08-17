@@ -166,7 +166,7 @@ pub(super) async fn poll_task_output(
             .await
         {
             Ok(Some(event)) => event,
-            Ok(None) if workflow.is_terminal() => {
+            Ok(None) if workflow.is_terminal_with_registry(store.definition_registry()) => {
                 tracing::error!(
                     task_id = %task_id,
                     workflow_id = %workflow.id,

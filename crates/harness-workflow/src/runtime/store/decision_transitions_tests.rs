@@ -458,7 +458,7 @@ async fn apply_decision_transition_with_validator_rejects_a_foreign_validator() 
     let cases = [
         (
             "another definition",
-            DecisionValidator::for_definition("prompt_task", permissive.clone()),
+            DecisionValidator::for_definition("prompt_task", permissive.clone(), Vec::new()),
         ),
         (
             "another version",
@@ -467,6 +467,7 @@ async fn apply_decision_transition_with_validator_rejects_a_foreign_validator() 
                 initial.definition_version.saturating_add(1),
                 &"a".repeat(64),
                 permissive.clone(),
+                Vec::new(),
             ),
         ),
         (
@@ -476,6 +477,7 @@ async fn apply_decision_transition_with_validator_rejects_a_foreign_validator() 
                 initial.definition_version,
                 &"a".repeat(64),
                 permissive.clone(),
+                Vec::new(),
             ),
         ),
         ("no definition", DecisionValidator::new(permissive.clone())),

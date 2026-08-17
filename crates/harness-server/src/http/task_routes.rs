@@ -62,7 +62,10 @@ pub(crate) async fn task_response_details(
     let submission_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
         .map(|task_id| task_id.0)
         .unwrap_or_else(|| task_id.as_str().to_string());
-    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(
+        store.definition_registry(),
+        &workflow,
+    );
     Ok(TaskResponseDetails {
         status: projection.task_status.as_ref().to_string(),
         workflow_state: workflow.state,

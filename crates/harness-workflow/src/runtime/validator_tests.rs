@@ -346,10 +346,12 @@ fn declared_evidence_gates_a_decision_and_enforcement_can_be_lifted() {
         json!({ "reason": "done" }),
     ));
 
-    let enforcing = DecisionValidator::new(
+    let enforcing = DecisionValidator::for_definition(
+        "prompt_task",
         TransitionAllowlist::default()
             .allow("implementing", "done", [WorkflowCommandType::MarkDone])
             .require_evidence("implementing", "done", ["prompt_completion_evidence"]),
+        WorkflowDefinitionRegistry::with_builtins().states_for_definition("prompt_task"),
     );
     let err = enforcing
         .validate(
@@ -375,11 +377,13 @@ fn declared_evidence_gates_a_decision_and_enforcement_can_be_lifted() {
         )
         .expect("decision carrying the declared evidence must be accepted");
 
-    let lifted = DecisionValidator::new(
+    let lifted = DecisionValidator::for_definition(
+        "prompt_task",
         TransitionAllowlist::default()
             .allow("implementing", "done", [WorkflowCommandType::MarkDone])
             .require_evidence("implementing", "done", ["prompt_completion_evidence"])
             .without_required_evidence(),
+        WorkflowDefinitionRegistry::with_builtins().states_for_definition("prompt_task"),
     );
     lifted
         .validate(

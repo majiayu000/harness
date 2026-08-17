@@ -1,10 +1,7 @@
 use super::{workflow_legacy_task_ids, workflow_source, TaskSummary, WorkflowInstance};
 use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
 use crate::task_runner::{SchedulerAuthorityState, TaskPhase, TaskStatus};
-use harness_workflow::runtime::{
-    declarative_workflow_definition_for_instance, workflow_state_definition_for_instance,
-    WorkflowProgressMode,
-};
+use harness_workflow::runtime::{WorkflowDefinitionRegistry, WorkflowProgressMode};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -45,10 +42,13 @@ enum WorkflowBucket {
     Other,
 }
 
-pub(super) fn runtime_workflow_counts(workflows: &[WorkflowInstance]) -> RuntimeWorkflowCounts {
+pub(super) fn runtime_workflow_counts(
+    registry: &WorkflowDefinitionRegistry,
+    workflows: &[WorkflowInstance],
+) -> RuntimeWorkflowCounts {
     let mut counts = RuntimeWorkflowCounts::default();
     for workflow in workflows {
-        match workflow_bucket(workflow) {
+        match workflow_bucket(registry, workflow) {
             WorkflowBucket::Pending => counts.pending += 1,
             WorkflowBucket::Running => counts.running += 1,
             WorkflowBucket::Review => counts.review += 1,
@@ -63,8 +63,11 @@ pub(super) fn runtime_workflow_counts(workflows: &[WorkflowInstance]) -> Runtime
     counts
 }
 
-fn workflow_bucket(workflow: &WorkflowInstance) -> WorkflowBucket {
-    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+fn workflow_bucket(
+    registry: &WorkflowDefinitionRegistry,
+    workflow: &WorkflowInstance,
+) -> WorkflowBucket {
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(registry, workflow);
     match projection.task_status {
         TaskStatus::Pending => return WorkflowBucket::Pending,
         TaskStatus::Failed => return WorkflowBucket::Failed,
@@ -75,8 +78,11 @@ fn workflow_bucket(workflow: &WorkflowInstance) -> WorkflowBucket {
     if workflow.state == "ready_to_merge" {
         return WorkflowBucket::ReadyToMerge;
     }
-    if declarative_workflow_definition_for_instance(workflow).is_some()
-        && workflow_state_definition_for_instance(workflow, &workflow.state)
+    if registry
+        .declarative_definition_for_instance(workflow)
+        .is_some()
+        && registry
+            .state_definition_for_instance(workflow, &workflow.state)
             .is_some_and(|state| state.progress_mode == Some(WorkflowProgressMode::OperatorGate))
     {
         return WorkflowBucket::Blocked;
@@ -95,13 +101,14 @@ fn workflow_bucket(workflow: &WorkflowInstance) -> WorkflowBucket {
 }
 
 pub(super) fn source_activity(
+    registry: &WorkflowDefinitionRegistry,
     workflows: &[WorkflowInstance],
     active_tasks: &[TaskSummary],
 ) -> Vec<SourceActivity> {
     let mut by_source: HashMap<String, SourceActivity> = HashMap::new();
     let workflow_task_ids = workflow_legacy_task_ids(workflows);
     for workflow in workflows {
-        add_workflow_source_activity(&mut by_source, workflow);
+        add_workflow_source_activity(registry, &mut by_source, workflow);
     }
     for task in active_tasks {
         if task.workflow.is_some() || workflow_task_ids.contains(task.id.as_str()) {
@@ -119,10 +126,11 @@ pub(super) fn source_activity(
 }
 
 fn add_workflow_source_activity(
+    registry: &WorkflowDefinitionRegistry,
     by_source: &mut HashMap<String, SourceActivity>,
     workflow: &WorkflowInstance,
 ) {
-    let bucket = workflow_bucket(workflow);
+    let bucket = workflow_bucket(registry, workflow);
     if matches!(bucket, WorkflowBucket::Done | WorkflowBucket::Other) {
         return;
     }

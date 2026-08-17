@@ -4,9 +4,10 @@
 //! information. These artifacts remain agent-authored claims: parsing them in
 //! the reducer does not upgrade their trust provenance.
 
+use crate::runtime::completion_evidence::transition_evidence_enforced_with_registry;
 use crate::runtime::model::{ActivityResult, WorkflowEvidence, EVIDENCE_PROMPT_COMPLETION};
 use crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID;
-use crate::runtime::state_registry::transition_requires_evidence;
+use crate::runtime::WorkflowDefinitionRegistry;
 use serde_json::Value;
 
 use super::PromptValidationReportEntry;
@@ -54,9 +55,10 @@ impl PromptCompletionEvidence {
 /// transition tables have had their requirements stripped too, so minting Done
 /// without evidence is consistent rather than a hole.
 pub(super) fn prompt_completion_evidence(
+    registry: &WorkflowDefinitionRegistry,
     result: &ActivityResult,
 ) -> Result<Option<PromptCompletionEvidence>, String> {
-    if !enforced() {
+    if !enforced(registry) {
         return Ok(None);
     }
     resolve_completion_evidence(result).map(Some)
@@ -64,8 +66,9 @@ pub(super) fn prompt_completion_evidence(
 
 /// The transition table is the authority: if it no longer demands the kind,
 /// the operator lifted the contract and the reducer must not block on it.
-fn enforced() -> bool {
-    transition_requires_evidence(
+fn enforced(registry: &WorkflowDefinitionRegistry) -> bool {
+    transition_evidence_enforced_with_registry(
+        registry,
         PROMPT_TASK_DEFINITION_ID,
         "implementing",
         "done",

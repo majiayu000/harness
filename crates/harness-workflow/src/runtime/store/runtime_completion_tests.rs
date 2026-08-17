@@ -135,7 +135,9 @@ async fn pin_error_safety_decision_persists_blocked_without_current_definition(
     let store = WorkflowRuntimeStore::open(&dir.path().join("pin-safety.db")).await?;
     let instance = pin_error_instance("pin-safety-accepted");
     assert!(matches!(
-        crate::runtime::state_registry::resolve_declarative_definition(&instance),
+        store
+            .definition_registry()
+            .resolve_declarative_definition(&instance),
         crate::runtime::state_registry::DeclarativeDefinitionResolution::PinError(
             crate::runtime::state_registry::DeclarativeDefinitionPinError::MissingVersion
         )
@@ -186,6 +188,7 @@ async fn pin_error_safety_decision_requires_explicit_context_override() -> anyho
     .await?;
     let record = persist_runtime_completion_decision_with_context_tx(
         &mut tx,
+        store.definition_registry(),
         instance.clone(),
         &event,
         pin_safety_decision(&instance),

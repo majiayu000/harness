@@ -288,6 +288,7 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
         command_store::enqueue_runtime_job_for_command(
             &self.pool,
+            &self.definition_registry,
             command_id,
             None,
             runtime_kind,
@@ -309,6 +310,7 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
         command_store::enqueue_runtime_job_for_command(
             &self.pool,
+            &self.definition_registry,
             command_id,
             Some(dispatch_claim),
             runtime_kind,

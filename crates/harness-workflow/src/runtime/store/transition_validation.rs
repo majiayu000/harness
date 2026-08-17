@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use super::runtime_completion::validator_for_instance;
 use crate::runtime::model::{WorkflowDecision, WorkflowInstance};
 use crate::runtime::validator::ValidationContext;
+use crate::runtime::WorkflowDefinitionRegistry;
 
 /// Result of validating a decision against the definition it targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,20 +29,27 @@ pub(super) enum TransitionValidation {
 /// is a rejection, not a pass. `current` must be the instance as loaded under
 /// the row lock, before the transition is applied.
 pub(super) fn validate_transition(
+    registry: &WorkflowDefinitionRegistry,
     current: &WorkflowInstance,
     decision: &WorkflowDecision,
     actor: &str,
     now: DateTime<Utc>,
 ) -> TransitionValidation {
-    validate_transition_with_context(current, decision, &ValidationContext::new(actor, now))
+    validate_transition_with_context(
+        registry,
+        current,
+        decision,
+        &ValidationContext::new(actor, now),
+    )
 }
 
 pub(super) fn validate_transition_with_context(
+    registry: &WorkflowDefinitionRegistry,
     current: &WorkflowInstance,
     decision: &WorkflowDecision,
     context: &ValidationContext,
 ) -> TransitionValidation {
-    match validator_for_instance(current) {
+    match validator_for_instance(registry, current) {
         Ok(Some(validator)) => match validator.validate(current, decision, context) {
             Ok(()) => TransitionValidation::Accepted,
             Err(error) => TransitionValidation::Rejected(error.to_string()),

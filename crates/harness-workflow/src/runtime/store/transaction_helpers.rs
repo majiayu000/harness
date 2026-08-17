@@ -31,6 +31,7 @@ pub(super) async fn runtime_job_for_command_tx(
 
 pub(super) async fn load_or_insert_initial_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    definition_registry: &WorkflowDefinitionRegistry,
     workflow_id: &str,
     expected_state: &str,
     create_if_missing: Option<&WorkflowInstance>,
@@ -53,7 +54,7 @@ pub(super) async fn load_or_insert_initial_instance_tx(
         return Ok(None);
     }
 
-    if insert_validated_observed_instance_tx(tx, initial_instance).await? {
+    if insert_validated_observed_instance_tx(tx, definition_registry, initial_instance).await? {
         return Ok(Some(initial_instance.clone()));
     }
 
@@ -142,6 +143,7 @@ pub(super) async fn insert_event_tx_with_id(
 
 pub(super) async fn insert_validated_observed_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    definition_registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<bool> {
     if instance.version != 0 {
@@ -151,7 +153,9 @@ pub(super) async fn insert_validated_observed_instance_tx(
             instance.version
         );
     }
-    if crate::runtime::workflow_state_definition_for_instance(instance, &instance.state).is_none()
+    if definition_registry
+        .state_definition_for_instance(instance, &instance.state)
+        .is_none()
         && !persisted_declarative_state_exists_tx(tx, instance).await?
     {
         anyhow::bail!(
@@ -386,6 +390,7 @@ pub(super) async fn commit_decision_instance_tx(
 
 pub(super) async fn commit_rejected_initial_failure_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &crate::runtime::WorkflowDefinitionRegistry,
     current: &WorkflowInstance,
     target: &WorkflowInstance,
     record: &WorkflowDecisionRecord,
@@ -405,7 +410,8 @@ pub(super) async fn commit_rejected_initial_failure_instance_tx(
         );
     }
     if current.version != 0
-        || target.terminal_state() != Some(crate::runtime::WorkflowTerminalState::Failed)
+        || target.terminal_state_with_registry(registry)
+            != Some(crate::runtime::WorkflowTerminalState::Failed)
     {
         anyhow::bail!(
             "rejected initial failure write requires a version-0 instance and failed target"

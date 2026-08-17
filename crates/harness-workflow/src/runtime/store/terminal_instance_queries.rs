@@ -1,8 +1,6 @@
 use super::{workflow_instance_from_row, WorkflowInstance, WorkflowRuntimeStore};
 use crate::runtime::state_registry::{
-    workflow_progress_state_selectors_for_definition,
-    workflow_terminal_state_selectors_for_definition, WorkflowProgressStateSelector,
-    WorkflowTerminalStateSelector,
+    WorkflowProgressStateSelector, WorkflowTerminalStateSelector,
 };
 use crate::runtime::{WorkflowProgressMode, WorkflowTerminalState};
 use chrono::{DateTime, Utc};
@@ -21,8 +19,9 @@ impl WorkflowRuntimeStore {
         progress_mode: WorkflowProgressMode,
         limit: i64,
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
-        let selectors =
-            workflow_progress_state_selectors_for_definition(definition_id, progress_mode);
+        let selectors = self
+            .definition_registry
+            .progress_state_selectors(definition_id, progress_mode);
         let query = progress_selector_query_parts(&selectors)?;
         if query.unversioned_states.is_empty() && query.versioned_states.is_empty() {
             return Ok(Vec::new());
@@ -64,7 +63,9 @@ impl WorkflowRuntimeStore {
         limit: i64,
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
         let limit = limit.clamp(1, 500);
-        let selectors = workflow_terminal_state_selectors_for_definition(definition_id)
+        let selectors = self
+            .definition_registry
+            .terminal_state_selectors(definition_id)
             .into_iter()
             .filter(|selector| selector.terminal_state == terminal_state)
             .collect::<Vec<_>>();
@@ -109,7 +110,9 @@ impl WorkflowRuntimeStore {
         limit: Option<i64>,
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
         let limit = limit.map(|value| value.clamp(1, 500));
-        let selectors = workflow_terminal_state_selectors_for_definition(definition_id);
+        let selectors = self
+            .definition_registry
+            .terminal_state_selectors(definition_id);
         let query = terminal_selector_query_parts(&selectors)?;
         let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
             "SELECT data::text, updated_at FROM workflow_instances

@@ -2,11 +2,10 @@ use super::*;
 use harness_core::config::workflow::{
     DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
 };
+use harness_workflow::runtime::WorkflowDefinitionRegistry;
 use std::collections::BTreeMap;
-use std::sync::Once;
 
 const PROJECT_DEFINITION_ID: &str = "project_binding_test_declarative";
-static REGISTER_PROJECT_DEFINITION: Once = Once::new();
 
 fn project_binding_policy() -> WorkflowDefinitionPolicy {
     WorkflowDefinitionPolicy {
@@ -40,18 +39,18 @@ fn project_binding_policy() -> WorkflowDefinitionPolicy {
     }
 }
 
-fn register_project_definition() {
-    REGISTER_PROJECT_DEFINITION.call_once(|| {
-        let definition = harness_workflow::runtime::build_declarative_definition(
-            &project_binding_policy(),
-            &BTreeMap::from([(
-                "perform_work".to_string(),
-                WorkflowActivityPolicy::default(),
-            )]),
-        )
-        .unwrap();
-        harness_workflow::runtime::register_declarative_workflow_definitions([definition]).unwrap();
-    });
+fn project_registry() -> WorkflowDefinitionRegistry {
+    let definition = harness_workflow::runtime::build_declarative_definition(
+        &project_binding_policy(),
+        &BTreeMap::from([(
+            "perform_work".to_string(),
+            WorkflowActivityPolicy::default(),
+        )]),
+    )
+    .unwrap();
+    let mut registry = WorkflowDefinitionRegistry::with_builtins();
+    registry.register_declarative_current(definition).unwrap();
+    registry
 }
 
 fn write_workflow(project_root: &std::path::Path, extra_route: &str) -> anyhow::Result<()> {
@@ -90,11 +89,14 @@ Project workflow.
 
 #[test]
 fn declarative_submission_instance_persists_runtime_retry_policy() -> anyhow::Result<()> {
-    register_project_definition();
+    let registry = project_registry();
     let project = tempfile::tempdir()?;
     write_workflow(project.path(), "")?;
-    let definition =
-        resolve_declarative_definition_for_project(project.path(), PROJECT_DEFINITION_ID)?;
+    let definition = resolve_declarative_definition_for_project(
+        &registry,
+        project.path(),
+        PROJECT_DEFINITION_ID,
+    )?;
     let task_id = TaskId::from_str("project-retry-policy");
     let ctx = DeclarativeSubmissionRuntimeContext {
         project_root: project.path(),
@@ -128,24 +130,30 @@ fn declarative_submission_instance_persists_runtime_retry_policy() -> anyhow::Re
 
 #[test]
 fn project_definition_resolution_requires_matching_effective_workflow() -> anyhow::Result<()> {
-    register_project_definition();
+    let registry = project_registry();
 
     let valid = tempfile::tempdir()?;
     write_workflow(valid.path(), "")?;
-    let resolved = resolve_declarative_definition_for_project(valid.path(), PROJECT_DEFINITION_ID)?;
+    let resolved =
+        resolve_declarative_definition_for_project(&registry, valid.path(), PROJECT_DEFINITION_ID)?;
     assert_eq!(resolved.policy().id, PROJECT_DEFINITION_ID);
 
     let missing = tempfile::tempdir()?;
-    let error = resolve_declarative_definition_for_project(missing.path(), PROJECT_DEFINITION_ID)
-        .unwrap_err();
+    let error = resolve_declarative_definition_for_project(
+        &registry,
+        missing.path(),
+        PROJECT_DEFINITION_ID,
+    )
+    .unwrap_err();
     assert!(error
         .to_string()
         .contains("does not declare workflow definition"));
 
     let stale = tempfile::tempdir()?;
     write_workflow(stale.path(), "      on_failure: failed")?;
-    let error = resolve_declarative_definition_for_project(stale.path(), PROJECT_DEFINITION_ID)
-        .unwrap_err();
+    let error =
+        resolve_declarative_definition_for_project(&registry, stale.path(), PROJECT_DEFINITION_ID)
+            .unwrap_err();
     assert!(error
         .to_string()
         .contains("does not match the registered startup version"));

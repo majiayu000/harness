@@ -147,6 +147,7 @@ impl WorkflowRuntimeStore {
         let validation_context =
             ValidationContext::new("reconciliation", chrono::Utc::now()).allow_terminal_reopen();
         match validate_transition_with_context(
+            &self.definition_registry,
             &validation_current,
             transition.decision,
             &validation_context,
@@ -158,7 +159,12 @@ impl WorkflowRuntimeStore {
             }
         }
         if current.is_none()
-            && !insert_validated_observed_instance_tx(&mut tx, &validation_current).await?
+            && !insert_validated_observed_instance_tx(
+                &mut tx,
+                &self.definition_registry,
+                &validation_current,
+            )
+            .await?
         {
             anyhow::bail!("coverage recovery lost its advisory-locked absent insert");
         }

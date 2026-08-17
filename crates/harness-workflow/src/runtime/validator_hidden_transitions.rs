@@ -31,7 +31,11 @@ impl DecisionValidator {
             [WorkflowCommandType::MarkDone],
         );
         self.validate_commands(&rule, decision, context)?;
-        validator_progress::validate_target_progress_contract(instance, decision)?;
+        validator_progress::validate_target_progress_contract(
+            self.state_definition(&decision.next_state),
+            instance,
+            decision,
+        )?;
         github_issue_pr_validation::validate_reconciliation_only_done(decision, context)?;
         Ok(true)
     }
@@ -83,7 +87,11 @@ impl DecisionValidator {
             coverage_recovery_allowed_commands(decision.next_state.as_str()),
         );
         self.validate_commands(&rule, decision, context)?;
-        validator_progress::validate_target_progress_contract(instance, decision)
+        validator_progress::validate_target_progress_contract(
+            self.state_definition(&decision.next_state),
+            instance,
+            decision,
+        )
     }
 }
 

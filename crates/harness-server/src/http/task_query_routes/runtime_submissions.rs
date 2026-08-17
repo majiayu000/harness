@@ -89,13 +89,19 @@ async fn append_runtime_definition_summaries(
             .await?;
         let fetched = workflows.len();
         let next_cursor = workflows.last().and_then(|workflow| {
-            RuntimeWorkflowProjection::from_workflow(workflow)
-                .submission_handle
-                .map(|task_id| (workflow.created_at, task_id.as_str().to_string()))
+            RuntimeWorkflowProjection::from_workflow_with_registry(
+                store.definition_registry(),
+                workflow,
+            )
+            .submission_handle
+            .map(|task_id| (workflow.created_at, task_id.as_str().to_string()))
         });
 
         for workflow in workflows {
-            let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+            let projection = RuntimeWorkflowProjection::from_workflow_with_registry(
+                store.definition_registry(),
+                &workflow,
+            );
             let Some(task_id) = projection.submission_handle.clone() else {
                 continue;
             };
@@ -106,7 +112,12 @@ async fn append_runtime_definition_summaries(
             if !listed_ids.insert(task_id.as_str().to_string()) {
                 continue;
             }
-            let summary = runtime_workflow_task_summary(workflow, task_id, task_kind);
+            let summary = runtime_workflow_task_summary(
+                store.definition_registry(),
+                workflow,
+                task_id,
+                task_kind,
+            );
             if filter.matches_summary(&summary) {
                 summaries.push(summary);
             }
@@ -150,11 +161,12 @@ pub(crate) fn runtime_submission_task_kind(
 }
 
 fn runtime_workflow_task_summary(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     workflow: harness_workflow::runtime::WorkflowInstance,
     task_id: harness_core::types::TaskId,
     task_kind: TaskKind,
 ) -> TaskSummary {
-    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(registry, &workflow);
     let status = projection.task_status.clone();
     let issue = workflow
         .data

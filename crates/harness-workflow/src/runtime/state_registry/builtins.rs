@@ -370,7 +370,7 @@ fn activity_policies(
 
 #[cfg(test)]
 mod tests {
-    use super::super::registry;
+    use super::super::WorkflowDefinitionRegistry;
     use crate::runtime::WorkflowCommandType;
     use std::collections::BTreeSet;
 
@@ -492,9 +492,7 @@ mod tests {
 
     #[test]
     fn github_issue_pr_builtin_preserves_the_transition_contract() {
-        let definition = registry()
-            .read()
-            .expect("workflow definition registry lock poisoned")
+        let definition = WorkflowDefinitionRegistry::with_builtins()
             .definition(crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID)
             .expect("github_issue_pr built-in must be registered");
         let derived: Vec<(Option<String>, String, BTreeSet<WorkflowCommandType>)> = definition

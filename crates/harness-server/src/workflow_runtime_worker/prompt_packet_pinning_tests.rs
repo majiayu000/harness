@@ -13,7 +13,10 @@ fn prompt_contract_fails_closed_for_missing_pinned_definition_history() {
     .with_server_data(json!({
         "definition_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }));
-    let contract = workflow_decision_contract(Some(&workflow));
+    let contract = workflow_decision_contract(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        Some(&workflow),
+    );
     assert_eq!(contract["available"], false);
 }
 
@@ -28,7 +31,10 @@ fn forged_pin_marker_never_intercepts_builtin_prompt_contract() {
     .with_server_data(json!({
         "definition_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }));
-    let contract = workflow_decision_contract(Some(&workflow));
+    let contract = workflow_decision_contract(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        Some(&workflow),
+    );
     assert_eq!(contract["available"], true);
     assert_eq!(contract["observed_state"], "discovered");
 }

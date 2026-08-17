@@ -73,7 +73,13 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
     pub(super) async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
         let workflow = super::job_context::workflow_for_job(self.state, &job).await?;
         if let Some(workflow) = workflow.as_ref() {
-            if workflow.is_terminal() {
+            let store = self
+                .state
+                .core
+                .workflow_runtime_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("workflow runtime store is unavailable"))?;
+            if workflow.is_terminal_with_registry(store.definition_registry()) {
                 return Ok(ActivityResult::cancelled(
                     activity_name(&job),
                     format!(
@@ -150,6 +156,12 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             )
             .await;
             let prompt_packet = build_runtime_prompt_packet(
+                self.state
+                    .core
+                    .workflow_runtime_store
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("workflow runtime store unavailable"))?
+                    .definition_registry(),
                 &job,
                 workflow.as_ref(),
                 &project_root,

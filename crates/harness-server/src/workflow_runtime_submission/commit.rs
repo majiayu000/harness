@@ -2,7 +2,7 @@ use super::{
     classify_submission_data, depends_on_strings, insert_author_trust_class, merge_last_decision,
     optional_string_field, string_field, IssueSubmissionRuntimeContext,
     PromptSubmissionRuntimeContext, WorkflowSubmissionRuntimeRecord,
-    EXECUTION_PATH_WORKFLOW_RUNTIME,
+    EXECUTION_PATH_WORKFLOW_RUNTIME, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
 };
 use super::{
     prompt_memory::{cache_prompt_submission_prompt, remove_prompt_submission_prompt},
@@ -18,6 +18,27 @@ use harness_workflow::runtime::{
 };
 use serde_json::json;
 
+pub(super) fn decision_validator_for_instance(
+    store: &WorkflowRuntimeStore,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<DecisionValidator> {
+    match instance.definition_id.as_str() {
+        GITHUB_ISSUE_PR_DEFINITION_ID => Ok(DecisionValidator::github_issue_pr()),
+        PROMPT_TASK_DEFINITION_ID => Ok(DecisionValidator::prompt_task()),
+        other => store
+            .definition_registry()
+            .decision_validator_for_instance(instance)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "workflow definition `{other}` has an invalid definition pin: {error:?}"
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!("workflow definition `{other}` cannot be committed by submission")
+            }),
+    }
+}
+
 pub(super) async fn apply_decision(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
@@ -26,7 +47,7 @@ pub(super) async fn apply_decision(
     ctx: &IssueSubmissionRuntimeContext<'_>,
     accepted_data: serde_json::Value,
 ) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
-    let validation_context = if instance.is_terminal() {
+    let validation_context = if instance.is_terminal_with_registry(store.definition_registry()) {
         ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
     } else {
         ValidationContext::new("workflow-policy", chrono::Utc::now())
@@ -154,7 +175,7 @@ pub(super) async fn apply_prompt_decision(
     execution_policy: &super::runtime_models::PromptExecutionPolicy,
     accepted_data: serde_json::Value,
 ) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
-    let validation_context = if instance.is_terminal() {
+    let validation_context = if instance.is_terminal_with_registry(store.definition_registry()) {
         ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
     } else {
         ValidationContext::new("workflow-policy", chrono::Utc::now())

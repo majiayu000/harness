@@ -209,6 +209,7 @@ pub fn deferred_candidate_result_decision(
 }
 
 pub fn candidate_promotion_success_decision(
+    registry: &crate::runtime::WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -226,11 +227,12 @@ pub fn candidate_promotion_success_decision(
         return None;
     }
     Some(candidate_promotion_success_decision_inner(
-        instance, event, result, command,
+        registry, instance, event, result, command,
     ))
 }
 
 fn candidate_promotion_success_decision_inner(
+    registry: &crate::runtime::WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -238,7 +240,9 @@ fn candidate_promotion_success_decision_inner(
 ) -> anyhow::Result<WorkflowDecision> {
     let (pr_number, pr_url) = pull_request_artifact(result)
         .ok_or_else(|| anyhow::anyhow!("promote_candidate_pr succeeded without pull_request"))?;
-    let binding = match super::reducer::verified_pr_binding_evidence(result, pr_number, &pr_url) {
+    let binding = match super::reducer::verified_pr_binding_evidence_with_registry(
+        registry, result, pr_number, &pr_url,
+    ) {
         Ok(binding) => binding,
         Err(reason) => {
             return Ok(super::reducer::pr_binding_verification_blocked_decision(
@@ -718,6 +722,7 @@ mod tests {
             ));
 
         let decision = candidate_promotion_success_decision_inner(
+            &crate::runtime::WorkflowDefinitionRegistry::with_builtins(),
             &issue_instance(),
             &event(command.clone()),
             &result,

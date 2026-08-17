@@ -79,7 +79,13 @@ impl WorkflowRuntimeStore {
         validation_actor: &str,
     ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
         self.apply_decision_transition_inner(transition, |current, decision, event| {
-            validate_transition(current, decision, validation_actor, event.created_at)
+            validate_transition(
+                &self.definition_registry,
+                current,
+                decision,
+                validation_actor,
+                event.created_at,
+            )
         })
         .await
     }
@@ -144,6 +150,7 @@ impl WorkflowRuntimeStore {
         let mut tx = self.pool.begin().await?;
         let Some(current) = load_or_insert_initial_instance_tx(
             &mut tx,
+            &self.definition_registry,
             &final_instance.id,
             transition.expected_state,
             transition.create_if_missing,
@@ -152,7 +159,9 @@ impl WorkflowRuntimeStore {
         else {
             return Ok(None);
         };
-        if current.is_terminal() || current.state != transition.expected_state {
+        if current.is_terminal_with_registry(&self.definition_registry)
+            || current.state != transition.expected_state
+        {
             return Ok(None);
         }
         if current.version.checked_add(1) != Some(final_instance.version) {
@@ -219,6 +228,7 @@ impl WorkflowRuntimeStore {
         let mut tx = self.pool.begin().await?;
         let Some(current) = load_or_insert_initial_instance_tx(
             &mut tx,
+            &self.definition_registry,
             &decision.workflow_id,
             transition.expected_state,
             transition.create_if_missing,
@@ -227,7 +237,9 @@ impl WorkflowRuntimeStore {
         else {
             return Ok(None);
         };
-        if current.is_terminal() || current.state != transition.expected_state {
+        if current.is_terminal_with_registry(&self.definition_registry)
+            || current.state != transition.expected_state
+        {
             return Ok(None);
         }
 
@@ -255,7 +267,11 @@ mod tests;
 #[cfg(test)]
 mod submission_guard_tests {
     use super::*;
-    use crate::runtime::{WorkflowCommand, WorkflowSubject, WorkflowSubmissionDecisionTransition};
+    use crate::runtime::{
+        RegisteredWorkflowDefinition, TransitionAllowlist, WorkflowCommand,
+        WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowStateDefinition, WorkflowSubject,
+        WorkflowSubmissionDecisionTransition, WorkflowTerminalState,
+    };
     use harness_core::db::resolve_database_url;
     use serde_json::json;
 
@@ -480,6 +496,79 @@ mod submission_guard_tests {
             assert!(store.decisions_for(&initial.id).await?.is_empty());
             assert!(store.commands_for(&initial.id).await?.is_empty());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_new_submission_uses_injected_failed_terminal_state() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let definition_id = "submission_rejection_injected_registry";
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry.register(RegisteredWorkflowDefinition::new(
+            definition_id,
+            vec![
+                WorkflowStateDefinition::active(
+                    definition_id,
+                    "queued",
+                    WorkflowProgressMode::ExternalWait,
+                ),
+                WorkflowStateDefinition::terminal(
+                    definition_id,
+                    "denied",
+                    WorkflowTerminalState::Failed,
+                ),
+            ],
+            TransitionAllowlist::default(),
+        ))?;
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("runtime"))
+            .await?
+            .with_definition_registry(registry.into_shared());
+        let initial = WorkflowInstance::new(
+            definition_id,
+            1,
+            "queued",
+            WorkflowSubject::new("test", "injected-rejection"),
+        )
+        .with_id("injected-rejected-submission");
+        let decision = WorkflowDecision::new(
+            &initial.id,
+            "queued",
+            "reject_submission",
+            "denied",
+            "submission policy rejected the request",
+        );
+        let mut final_instance = initial.clone();
+        final_instance.state = "denied".to_string();
+        final_instance.version = 1;
+
+        let outcome = store
+            .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
+                workflow_id: &initial.id,
+                expected_state: &initial.state,
+                expected_version: initial.version,
+                create_if_missing: Some(&initial),
+                event_id: None,
+                new_event_id: Some("injected-rejected-submission-event"),
+                event_type: "SubmissionRejected",
+                source: "workflow-runtime-test",
+                payload: json!({}),
+                decision: &decision,
+                existing_record: None,
+                rejection_reason: Some("rejected by policy"),
+                final_instance: Some(&final_instance),
+                command_status: WorkflowCommandStatus::Pending,
+                prompt_payload: None,
+            })
+            .await?
+            .expect("rejected submission should be committed atomically");
+
+        assert!(!outcome.record.accepted);
+        assert_eq!(store.get_instance(&initial.id).await?, Some(final_instance));
+        assert_eq!(store.events_for(&initial.id).await?.len(), 1);
+        assert_eq!(store.decisions_for(&initial.id).await?.len(), 1);
         Ok(())
     }
 }

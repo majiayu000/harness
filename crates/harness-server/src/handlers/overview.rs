@@ -484,7 +484,9 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
     let runtime_counts_available = state.core.workflow_runtime_store.is_some();
 
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-        match crate::handlers::definition_ids::active_count_definition_ids() {
+        match crate::handlers::definition_ids::active_count_definition_ids(
+            store.definition_registry(),
+        ) {
             Ok(definition_ids) => {
                 for definition_id in &definition_ids {
                     match store
@@ -493,7 +495,11 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
                     {
                         Ok(workflows) => {
                             for workflow in workflows {
-                                add_active_runtime_workflow(&mut counts, &workflow);
+                                add_active_runtime_workflow_with_registry(
+                                    store.definition_registry(),
+                                    &mut counts,
+                                    &workflow,
+                                );
                             }
                         }
                         Err(error) => {
@@ -523,11 +529,12 @@ pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskO
     counts
 }
 
-fn add_active_runtime_workflow(
+fn add_active_runtime_workflow_with_registry(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     counts: &mut ActiveTaskOverviewCounts,
     workflow: &harness_workflow::runtime::WorkflowInstance,
 ) -> bool {
-    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(registry, workflow);
     let Some(bucket) = projection.active_bucket() else {
         return false;
     };
@@ -537,6 +544,18 @@ fn add_active_runtime_workflow(
     };
     counts.add(projection.project_id.as_deref(), bucket);
     true
+}
+
+#[cfg(test)]
+fn add_active_runtime_workflow(
+    counts: &mut ActiveTaskOverviewCounts,
+    workflow: &harness_workflow::runtime::WorkflowInstance,
+) -> bool {
+    add_active_runtime_workflow_with_registry(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
+        counts,
+        workflow,
+    )
 }
 
 /// Top of the current hour (i.e. `HH:00:00Z`). Falls back to `now` on the

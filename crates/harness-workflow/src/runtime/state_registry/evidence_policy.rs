@@ -8,38 +8,8 @@
 //! rollback if agents have not yet caught up with the contract.
 
 use super::{
-    builtin_registered_definitions, registry, RegisteredWorkflowDefinition,
-    WorkflowDefinitionRegistry,
+    builtin_registered_definitions, RegisteredWorkflowDefinition, WorkflowDefinitionRegistry,
 };
-
-/// Apply the completion-evidence enforcement policy to the process-wide
-/// registry's built-in definitions. Must run before the registry is frozen.
-pub fn apply_builtin_evidence_enforcement(enforced: bool) -> anyhow::Result<()> {
-    registry()
-        .write()
-        .expect("workflow definition registry lock poisoned")
-        .apply_builtin_evidence_enforcement(enforced)
-}
-
-/// Whether the registered definition still demands `evidence_kind` for this
-/// transition.
-///
-/// Reducers refuse to build a claim-only terminal decision in the first place,
-/// so that the agent gets a precise reason instead of a bare rejection. They
-/// ask this rather than tracking enforcement separately: the transition table
-/// is the single authority, so the kill switch that strips a requirement lifts
-/// the reducer gate with it, and the two layers cannot drift apart.
-pub fn transition_requires_evidence(
-    definition_id: &str,
-    from_state: &str,
-    to_state: &str,
-    evidence_kind: &str,
-) -> bool {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .transition_requires_evidence(definition_id, from_state, to_state, evidence_kind)
-}
 
 impl WorkflowDefinitionRegistry {
     /// Whether `definition_id`'s rule for this transition declares
@@ -104,8 +74,9 @@ impl WorkflowDefinitionRegistry {
 mod tests {
     use super::super::{builtin_registered_definitions, WorkflowDefinitionRegistry};
     use crate::runtime::{
-        ValidationContext, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-        WorkflowDecisionRejectionKind, WorkflowInstance, WorkflowSubject,
+        reduce_runtime_job_completed_with_registry, ActivityResult, ValidationContext,
+        WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRejectionKind,
+        WorkflowEvent, WorkflowInstance, WorkflowSubject, RUNTIME_JOB_COMPLETED_EVENT,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -179,6 +150,42 @@ mod tests {
             "done",
             crate::runtime::model::EVIDENCE_PROMPT_COMPLETION,
         ));
+    }
+
+    #[test]
+    fn injected_policy_lifts_prompt_reducer_and_validator_together() {
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry
+            .apply_builtin_evidence_enforcement(false)
+            .expect("test policy should apply");
+        let instance = WorkflowInstance::new(
+            "prompt_task",
+            1,
+            "implementing",
+            WorkflowSubject::new("prompt", "task-no-evidence"),
+        );
+        let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime")
+            .with_payload(json!({
+                "activity_result": ActivityResult::succeeded(
+                    "implement_prompt",
+                    "completed without a validation artifact",
+                )
+            }));
+
+        let decision = reduce_runtime_job_completed_with_registry(&registry, &instance, &event)
+            .expect("completion should reduce")
+            .expect("completion should produce a decision");
+        assert_eq!(decision.next_state, "done");
+        registry
+            .decision_validator_for_instance(&instance)
+            .expect("built-in pin should resolve")
+            .expect("prompt validator should exist")
+            .validate(
+                &instance,
+                &decision,
+                &ValidationContext::new("runtime", Utc::now()),
+            )
+            .expect("disabled policy should accept the reducer decision");
     }
 
     #[test]

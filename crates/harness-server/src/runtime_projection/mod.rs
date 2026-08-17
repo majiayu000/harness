@@ -5,8 +5,8 @@ use crate::workflow_runtime_submission::{
     runtime_state::{SchedulerAuthorityState, TaskSchedulerState},
 };
 use harness_workflow::runtime::{
-    declarative_workflow_definition_for_instance, workflow_state_definition_for_instance,
-    WorkflowInstance, WorkflowProgressMode, WorkflowTerminalState, QUALITY_GATE_DEFINITION_ID,
+    WorkflowDefinitionRegistry, WorkflowInstance, WorkflowProgressMode, WorkflowTerminalState,
+    QUALITY_GATE_DEFINITION_ID,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -76,20 +76,30 @@ pub(crate) struct RuntimeStoppedActionEligibility {
 }
 
 impl RuntimeWorkflowProjection {
+    #[cfg(test)]
     pub(crate) fn from_workflow(workflow: &WorkflowInstance) -> Self {
-        Self::from_workflow_with_stopped_eligibility(
+        Self::from_workflow_with_registry(&WorkflowDefinitionRegistry::with_builtins(), workflow)
+    }
+
+    pub(crate) fn from_workflow_with_registry(
+        registry: &WorkflowDefinitionRegistry,
+        workflow: &WorkflowInstance,
+    ) -> Self {
+        Self::from_workflow_with_registry_and_stopped_eligibility(
+            registry,
             workflow,
             RuntimeStoppedActionEligibility::default(),
         )
     }
 
-    pub(crate) fn from_workflow_with_stopped_eligibility(
+    pub(crate) fn from_workflow_with_registry_and_stopped_eligibility(
+        registry: &WorkflowDefinitionRegistry,
         workflow: &WorkflowInstance,
         stopped_eligibility: RuntimeStoppedActionEligibility,
     ) -> Self {
-        let terminal_state = workflow.terminal_state();
+        let terminal_state = workflow.terminal_state_with_registry(registry);
         let task_status = workflow_state_to_task_status(workflow, terminal_state);
-        let scheduler = workflow_scheduler_state(workflow, &task_status, terminal_state);
+        let scheduler = workflow_scheduler_state(registry, workflow, &task_status, terminal_state);
         let active_bucket = workflow_active_bucket(
             &workflow.definition_id,
             &workflow.state,
@@ -105,8 +115,10 @@ impl RuntimeWorkflowProjection {
             project_id: runtime_string_field(&workflow.data, "project_id"),
             submission_handle: runtime_submission_handle(&workflow.data),
             legacy_dedupe_task_handle: legacy_dedupe_task_handle(&workflow.data),
-            stopped_state: RuntimeStoppedStateProjection::from_workflow(workflow)
-                .with_action_eligibility(stopped_eligibility),
+            stopped_state: RuntimeStoppedStateProjection::from_workflow_with_registry(
+                registry, workflow,
+            )
+            .with_action_eligibility(stopped_eligibility),
         }
     }
 
@@ -116,7 +128,10 @@ impl RuntimeWorkflowProjection {
 }
 
 impl RuntimeStoppedStateProjection {
-    pub(crate) fn from_workflow(workflow: &WorkflowInstance) -> Self {
+    pub(crate) fn from_workflow_with_registry(
+        registry: &WorkflowDefinitionRegistry,
+        workflow: &WorkflowInstance,
+    ) -> Self {
         let last_stop = structured_last_stop(&workflow.data);
         let error_kind = stopped_string_field(&workflow.data, "error_kind").or_else(|| {
             last_stop
@@ -162,7 +177,7 @@ impl RuntimeStoppedStateProjection {
                 .and_then(Value::as_bool),
             can_unblock: false,
             can_retry: false,
-            recovery_targets: stopped_actions::pinned_recovery_targets(workflow),
+            recovery_targets: stopped_actions::pinned_recovery_targets(registry, workflow),
             error_kind,
             last_stop,
         }
@@ -239,6 +254,7 @@ fn workflow_state_to_task_phase(
 }
 
 fn workflow_scheduler_state(
+    registry: &WorkflowDefinitionRegistry,
     workflow: &WorkflowInstance,
     status: &TaskStatus,
     terminal_state: Option<WorkflowTerminalState>,
@@ -251,10 +267,13 @@ fn workflow_scheduler_state(
     if workflow.definition_id == QUALITY_GATE_DEFINITION_ID && workflow.state == "pending" {
         return TaskSchedulerState::queued();
     }
-    if declarative_workflow_definition_for_instance(workflow).is_some() {
-        if let Some(progress_mode) =
-            workflow_state_definition_for_instance(workflow, &workflow.state)
-                .and_then(|state| state.progress_mode)
+    if registry
+        .declarative_definition_for_instance(workflow)
+        .is_some()
+    {
+        if let Some(progress_mode) = registry
+            .state_definition_for_instance(workflow, &workflow.state)
+            .and_then(|state| state.progress_mode)
         {
             return scheduler_state_for_progress_mode(progress_mode);
         }
@@ -284,7 +303,8 @@ fn workflow_scheduler_state(
         | "quality_gate_pending"
         | "ready_to_merge"
         | "blocked" => TaskSchedulerState::queued(),
-        _ => match workflow_state_definition_for_instance(workflow, &workflow.state)
+        _ => match registry
+            .state_definition_for_instance(workflow, &workflow.state)
             .and_then(|state| state.progress_mode)
         {
             Some(progress_mode) => scheduler_state_for_progress_mode(progress_mode),
@@ -341,7 +361,7 @@ fn workflow_active_bucket(
     }
 }
 
-fn runtime_submission_handle(data: &serde_json::Value) -> Option<TaskId> {
+pub(crate) fn runtime_submission_handle(data: &serde_json::Value) -> Option<TaskId> {
     trimmed_string_field(data, "submission_id")
         .or_else(|| first_string_array_field(data, "task_ids"))
         .or_else(|| trimmed_string_field(data, "task_id"))
@@ -364,7 +384,7 @@ fn structured_last_stop(data: &serde_json::Value) -> Option<Value> {
         .cloned()
 }
 
-fn legacy_dedupe_task_handle(data: &serde_json::Value) -> Option<TaskId> {
+pub(crate) fn legacy_dedupe_task_handle(data: &serde_json::Value) -> Option<TaskId> {
     trimmed_string_field(data, "task_id")
         .or_else(|| last_string_array_field(data, "task_ids"))
         .or_else(|| trimmed_string_field(data, "submission_id"))

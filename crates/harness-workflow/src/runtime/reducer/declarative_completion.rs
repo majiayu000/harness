@@ -13,17 +13,20 @@ use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
-use crate::runtime::state_registry::{DeclarativeDefinitionPinError, WorkflowTerminalState};
+use crate::runtime::state_registry::{
+    DeclarativeDefinitionPinError, WorkflowDefinitionRegistry, WorkflowTerminalState,
+};
 use harness_core::config::workflow::DeclaredProgressMode;
 use serde_json::json;
 
 pub(crate) fn reduce_declarative_completion(
+    registry: &WorkflowDefinitionRegistry,
     definition: &DeclarativeWorkflowDefinition,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> anyhow::Result<Option<WorkflowDecision>> {
-    if let Some(outcome) = reduce_builtin_completion(instance, event, result) {
+    if let Some(outcome) = reduce_builtin_completion(registry, instance, event, result) {
         return outcome;
     }
     Ok(Some(reduce_generic_declarative_completion(

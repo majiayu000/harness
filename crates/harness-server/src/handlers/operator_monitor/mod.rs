@@ -7,6 +7,7 @@
 
 mod activity;
 mod driverless_progress;
+mod failure_classification;
 mod response;
 mod sampling;
 
@@ -18,7 +19,9 @@ use crate::runtime_projection::{
 use crate::task_runner::{RecentFailureTask, SchedulerAuthorityState, TaskSummary};
 use activity::{runtime_workflow_counts, source_activity, RuntimeWorkflowCounts, SourceActivity};
 use chrono::{DateTime, Utc};
-use harness_workflow::runtime::{WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState};
+use harness_workflow::runtime::{
+    WorkflowDefinitionRegistry, WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState,
+};
 use sampling::{dedupe_workflows, list_operator_action_workflows, list_recent_failed_workflows};
 use serde::Serialize;
 use serde_json::Value;
@@ -27,6 +30,10 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use driverless_progress::{list_driverless_progress, DriverlessProgressEvidence};
+use failure_classification::{
+    classify_failure_family, earlier_timestamp, failure_next_action, failure_retryable,
+    failure_severity, later_timestamp, normalize_failure_message,
+};
 pub(crate) use response::{operator_monitor, OperatorMonitorResponse};
 
 /// A background loop whose last tick is older than this is reported stale and
@@ -192,7 +199,14 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         "degraded"
     };
 
-    let runtime_workflows = runtime_workflow_counts(&workflows);
+    let fallback_registry = WorkflowDefinitionRegistry::with_builtins();
+    let registry = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .map(|store| store.definition_registry())
+        .unwrap_or(&fallback_registry);
+    let runtime_workflows = runtime_workflow_counts(registry, &workflows);
     let workflow_legacy_task_ids = workflow_legacy_task_ids(&workflows);
     let stopped_eligibility = stopped_action_eligibility_for_workflows(
         state.core.workflow_runtime_store.as_deref(),
@@ -210,11 +224,12 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         dashboard_counts.global_failed,
         dashboard_counts.global_done,
     );
-    let by_source = source_activity(&workflows, &active_tasks);
-    let operator_actions = operator_actions(&workflows, generated_at, &stopped_eligibility);
+    let by_source = source_activity(registry, &workflows, &active_tasks);
+    let operator_actions =
+        operator_actions(registry, &workflows, generated_at, &stopped_eligibility);
     let stuck_workflows = list_stuck_workflows(state, generated_at).await?;
     let driverless_progress = list_driverless_progress(state).await?;
-    let failures = grouped_failures(&recent_failures, &workflows);
+    let failures = grouped_failures(registry, &recent_failures, &workflows);
     let capacity = state.concurrency.task_queue.global_limit() as u64;
     let local_live_worktrees = state
         .concurrency
@@ -314,6 +329,7 @@ async fn list_stuck_workflows(
     let stopped_eligibility =
         stopped_action_eligibility_for_workflows(Some(store), &workflows).await?;
     Ok(stuck_workflows_from_instances(
+        store.definition_registry(),
         &workflows,
         generated_at,
         &stopped_eligibility,
@@ -321,6 +337,7 @@ async fn list_stuck_workflows(
 }
 
 fn stuck_workflows_from_instances(
+    registry: &WorkflowDefinitionRegistry,
     workflows: &[WorkflowInstance],
     generated_at: DateTime<Utc>,
     stopped_eligibility: &HashMap<String, RuntimeStoppedActionEligibility>,
@@ -350,13 +367,15 @@ fn stuck_workflows_from_instances(
                 updated_at: workflow.updated_at.to_rfc3339(),
                 url: pr_url.or(issue_url),
                 source: workflow_source(workflow),
-                stopped_state: RuntimeStoppedStateProjection::from_workflow(workflow)
-                    .with_action_eligibility(
-                        stopped_eligibility
-                            .get(&workflow.id)
-                            .copied()
-                            .unwrap_or_default(),
-                    ),
+                stopped_state: RuntimeStoppedStateProjection::from_workflow_with_registry(
+                    registry, workflow,
+                )
+                .with_action_eligibility(
+                    stopped_eligibility
+                        .get(&workflow.id)
+                        .copied()
+                        .unwrap_or_default(),
+                ),
             }
         })
         .collect::<Vec<_>>();
@@ -375,7 +394,8 @@ async fn list_runtime_workflows_from_store(
     store: &WorkflowRuntimeStore,
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
     let sample_limit = WORKFLOW_SAMPLE_LIMIT as usize;
-    let definition_ids = crate::handlers::definition_ids::operator_definition_ids()?;
+    let definition_ids =
+        crate::handlers::definition_ids::operator_definition_ids(store.definition_registry())?;
     let mut workflows = list_operator_action_workflows(store, &definition_ids).await?;
     workflows.extend(list_recent_failed_workflows(store, &definition_ids, sample_limit).await?);
     for definition_id in &definition_ids {
@@ -390,18 +410,22 @@ async fn list_runtime_workflows_from_store(
         );
     }
     dedupe_workflows(&mut workflows);
-    truncate_workflow_sample(&mut workflows, sample_limit);
+    truncate_workflow_sample(store.definition_registry(), &mut workflows, sample_limit);
     Ok(workflows)
 }
 
-fn truncate_workflow_sample(workflows: &mut Vec<WorkflowInstance>, limit: usize) {
+fn truncate_workflow_sample(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
+    workflows: &mut Vec<WorkflowInstance>,
+    limit: usize,
+) {
     let mut operator_actions = Vec::new();
     let mut failed = Vec::new();
     let mut other = Vec::new();
     for workflow in workflows.drain(..) {
-        if workflow.terminal_state() == Some(WorkflowTerminalState::Failed) {
+        if workflow.terminal_state_with_registry(registry) == Some(WorkflowTerminalState::Failed) {
             failed.push(workflow);
-        } else if workflow_action_kind(&workflow).is_some() {
+        } else if workflow_action_kind(registry, &workflow).is_some() {
             operator_actions.push(workflow);
         } else {
             other.push(workflow);
@@ -457,8 +481,7 @@ fn workflow_legacy_task_ids(workflows: &[WorkflowInstance]) -> HashSet<String> {
     workflows
         .iter()
         .filter_map(|workflow| {
-            RuntimeWorkflowProjection::from_workflow(workflow)
-                .legacy_dedupe_task_handle
+            crate::runtime_projection::legacy_dedupe_task_handle(&workflow.data)
                 .map(|task_id| task_id.0)
         })
         .collect()
@@ -475,22 +498,25 @@ fn filter_workflow_backed_tasks(
 }
 
 fn operator_actions(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     workflows: &[WorkflowInstance],
     generated_at: DateTime<Utc>,
     stopped_eligibility: &HashMap<String, RuntimeStoppedActionEligibility>,
 ) -> Vec<OperatorAction> {
     let mut actions = Vec::new();
     for workflow in workflows {
-        let Some(kind) = workflow_action_kind(workflow) else {
+        let Some(kind) = workflow_action_kind(registry, workflow) else {
             continue;
         };
-        let projection = RuntimeWorkflowProjection::from_workflow_with_stopped_eligibility(
-            workflow,
-            stopped_eligibility
-                .get(&workflow.id)
-                .copied()
-                .unwrap_or_default(),
-        );
+        let projection =
+            RuntimeWorkflowProjection::from_workflow_with_registry_and_stopped_eligibility(
+                registry,
+                workflow,
+                stopped_eligibility
+                    .get(&workflow.id)
+                    .copied()
+                    .unwrap_or_default(),
+            );
         let next_action = workflow_next_action(kind, &projection.stopped_state);
         let task_id = projection
             .legacy_dedupe_task_handle
@@ -540,20 +566,24 @@ fn operator_actions(
     actions
 }
 
-fn workflow_action_kind(workflow: &WorkflowInstance) -> Option<&'static str> {
-    if workflow.terminal_state() == Some(WorkflowTerminalState::Failed) {
+fn workflow_action_kind(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
+    workflow: &WorkflowInstance,
+) -> Option<&'static str> {
+    if workflow.terminal_state_with_registry(registry) == Some(WorkflowTerminalState::Failed) {
         return Some("failed");
     }
-    if harness_workflow::runtime::declarative_workflow_definition_for_instance(workflow).is_some() {
-        return harness_workflow::runtime::workflow_state_definition_for_instance(
-            workflow,
-            &workflow.state,
-        )
-        .is_some_and(|state| {
-            state.progress_mode
-                == Some(harness_workflow::runtime::WorkflowProgressMode::OperatorGate)
-        })
-        .then_some("blocked");
+    if registry
+        .declarative_definition_for_instance(workflow)
+        .is_some()
+    {
+        return registry
+            .state_definition_for_instance(workflow, &workflow.state)
+            .is_some_and(|state| {
+                state.progress_mode
+                    == Some(harness_workflow::runtime::WorkflowProgressMode::OperatorGate)
+            })
+            .then_some("blocked");
     }
     match workflow.state.as_str() {
         "ready_to_merge" => Some("ready_to_merge"),
@@ -585,6 +615,7 @@ fn action_priority(kind: &str) -> u8 {
 }
 
 fn grouped_failures(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     failures: &[RecentFailureTask],
     workflows: &[WorkflowInstance],
 ) -> Vec<FailureGroup> {
@@ -601,10 +632,9 @@ fn grouped_failures(
             Some(failure.id.as_str().to_string()),
         );
     }
-    for workflow in workflows
-        .iter()
-        .filter(|workflow| workflow.terminal_state() == Some(WorkflowTerminalState::Failed))
-    {
+    for workflow in workflows.iter().filter(|workflow| {
+        workflow.terminal_state_with_registry(registry) == Some(WorkflowTerminalState::Failed)
+    }) {
         let workflow_task_ids = workflow_failure_task_ids(workflow);
         if workflow_task_ids
             .iter()
@@ -675,106 +705,24 @@ fn workflow_failure_message(workflow: &WorkflowInstance) -> String {
 }
 
 fn workflow_failure_id(workflow: &WorkflowInstance) -> String {
-    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
-    projection
-        .submission_handle
+    crate::runtime_projection::runtime_submission_handle(&workflow.data)
         .map(|task_id| task_id.as_str().to_string())
         .or_else(|| {
-            projection
-                .legacy_dedupe_task_handle
+            crate::runtime_projection::legacy_dedupe_task_handle(&workflow.data)
                 .map(|task_id| task_id.0)
         })
         .unwrap_or_else(|| workflow.id.clone())
 }
 
 fn workflow_failure_task_ids(workflow: &WorkflowInstance) -> HashSet<String> {
-    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
     let mut ids = HashSet::new();
-    if let Some(task_id) = projection.submission_handle {
+    if let Some(task_id) = crate::runtime_projection::runtime_submission_handle(&workflow.data) {
         ids.insert(task_id.as_str().to_string());
     }
-    if let Some(task_id) = projection.legacy_dedupe_task_handle {
+    if let Some(task_id) = crate::runtime_projection::legacy_dedupe_task_handle(&workflow.data) {
         ids.insert(task_id.0);
     }
     ids
-}
-
-fn classify_failure_family(message: &str) -> &'static str {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("ssl_error_syscall")
-        || lower.contains("failed to fetch")
-        || lower.contains("git fetch")
-        || lower.contains("github.com")
-    {
-        "github_fetch"
-    } else if lower.contains("timed out") || lower.contains("timeout") {
-        "timeout"
-    } else if lower.contains("rate limit") || lower.contains("secondary rate limit") {
-        "rate_limit"
-    } else if lower.contains("missing structured output")
-        || lower.contains("activity_result")
-        || lower.contains("structured activity")
-    {
-        "missing_structured_output"
-    } else if lower.contains("worktree") || lower.contains("workspace") {
-        "worktree_collision"
-    } else if lower.contains("agent turn") || lower.contains("agent failed") {
-        "agent_turn_failed"
-    } else {
-        "internal"
-    }
-}
-
-fn failure_severity(family: &str) -> &'static str {
-    match family {
-        "github_fetch" | "timeout" | "rate_limit" => "warn",
-        "missing_structured_output" | "worktree_collision" | "agent_turn_failed" => "error",
-        _ => "error",
-    }
-}
-
-fn failure_retryable(family: &str) -> bool {
-    matches!(family, "github_fetch" | "timeout" | "rate_limit")
-}
-
-fn failure_next_action(family: &str) -> &'static str {
-    match family {
-        "github_fetch" => "Retry after GitHub connectivity recovers",
-        "timeout" => "Retry or inspect the long-running turn",
-        "rate_limit" => "Wait for the rate limit window",
-        "missing_structured_output" => "Inspect agent output and prompt contract",
-        "worktree_collision" => "Inspect workspace ownership",
-        "agent_turn_failed" => "Inspect agent logs",
-        _ => "Inspect task logs",
-    }
-}
-
-fn normalize_failure_message(message: &str) -> String {
-    let first_line = message.lines().next().unwrap_or(message).trim();
-    let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() > 180 {
-        collapsed.chars().take(177).collect::<String>() + "..."
-    } else if collapsed.is_empty() {
-        "unknown failure".to_string()
-    } else {
-        collapsed
-    }
-}
-
-fn earlier_timestamp(current: Option<&str>, candidate: Option<&str>) -> Option<String> {
-    current
-        .into_iter()
-        .chain(candidate)
-        .min()
-        .map(str::to_string)
-}
-
-fn later_timestamp(current: Option<&str>, candidate: Option<&str>) -> Option<String> {
-    current
-        .into_iter()
-        .chain(candidate)
-        .max()
-        .map(str::to_string)
 }
 
 fn worktree_used_count(local_live_count: Option<u64>, card_count: usize) -> u64 {

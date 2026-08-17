@@ -215,7 +215,9 @@ mod declarative_pinning {
         assert!(registry
             .state_definition_for_instance(&missing_unmarked_version, "completed")
             .is_none());
-        assert!(workflow_definition_for_version(GITHUB_ISSUE_PR_DEFINITION_ID, u32::MAX).is_some());
+        assert!(WorkflowDefinitionRegistry::with_builtins()
+            .definition_for_version(GITHUB_ISSUE_PR_DEFINITION_ID, u32::MAX)
+            .is_some());
         let builtin_with_unrelated_hash = WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
             u32::MAX,
@@ -224,7 +226,8 @@ mod declarative_pinning {
         )
         .with_server_data(json!({ "definition_hash": "unrelated-business-metadata" }));
         assert_eq!(
-            workflow_state_definition_for_instance(&builtin_with_unrelated_hash, "done")
+            WorkflowDefinitionRegistry::with_builtins()
+                .state_definition_for_instance(&builtin_with_unrelated_hash, "done")
                 .and_then(|state| state.terminal_state),
             Some(WorkflowTerminalState::Succeeded),
         );

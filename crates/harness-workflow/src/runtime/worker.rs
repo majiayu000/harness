@@ -229,7 +229,7 @@ impl<'a> RuntimeWorker<'a> {
         let Some(instance) = self.store.get_instance(workflow_id).await? else {
             return Ok(None);
         };
-        if !instance.is_terminal() {
+        if !instance.is_terminal_with_registry(self.store.definition_registry()) {
             return Ok(None);
         }
         let activity = runtime_job_activity_name(job);
