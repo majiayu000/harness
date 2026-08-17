@@ -16,6 +16,7 @@ use super::{
 
 struct DeclarativeCancellation {
     target_state: String,
+    current_terminal_state: Option<WorkflowTerminalState>,
     validator: DecisionValidator,
     missing_pin: bool,
 }
@@ -82,17 +83,12 @@ pub(crate) async fn cancel_submission_by_workflow_id(
 
 async fn cancel_submission_instance(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     correlation_id: &str,
 ) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
-    if instance.is_terminal_with_registry(store.definition_registry()) {
-        if instance.terminal_state_with_registry(store.definition_registry())
-            == Some(WorkflowTerminalState::Cancelled)
-        {
-            let (decision_name, remove_prompt) = cancellation_cleanup_policy(&instance);
-            finish_cancellation_cleanup(store, &mut instance, decision_name, remove_prompt).await?;
-        }
-        return Ok(RuntimeSubmissionCancelOutcome::AlreadyTerminal(instance));
+    if let Some(terminal_state) = instance.terminal_state_with_registry(store.definition_registry())
+    {
+        return finish_terminal_cancellation(store, instance, terminal_state).await;
     }
     let is_prompt = instance.definition_id == PROMPT_TASK_DEFINITION_ID;
     let is_issue = instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID;
@@ -101,6 +97,12 @@ async fn cancel_submission_instance(
     } else {
         resolve_declarative_cancellation(store, &instance).await?
     };
+    if let Some(terminal_state) = declarative
+        .as_ref()
+        .and_then(|resolution| resolution.current_terminal_state)
+    {
+        return finish_terminal_cancellation(store, instance, terminal_state).await;
+    }
     let (event_type, decision_name, reason, command_prefix, target_state, remove_prompt) =
         if is_prompt {
             (
@@ -187,6 +189,18 @@ async fn cancel_submission_instance(
     Ok(RuntimeSubmissionCancelOutcome::Cancelled(cancelled))
 }
 
+async fn finish_terminal_cancellation(
+    store: &WorkflowRuntimeStore,
+    mut instance: WorkflowInstance,
+    terminal_state: WorkflowTerminalState,
+) -> Result<RuntimeSubmissionCancelOutcome, RuntimeSubmissionCancelError> {
+    if terminal_state == WorkflowTerminalState::Cancelled {
+        let (decision_name, remove_prompt) = cancellation_cleanup_policy(&instance);
+        finish_cancellation_cleanup(store, &mut instance, decision_name, remove_prompt).await?;
+    }
+    Ok(RuntimeSubmissionCancelOutcome::AlreadyTerminal(instance))
+}
+
 fn cancellation_cleanup_policy(instance: &WorkflowInstance) -> (&'static str, bool) {
     if instance.definition_id == PROMPT_TASK_DEFINITION_ID {
         ("cancel_prompt_submission", true)
@@ -240,6 +254,12 @@ async fn resolve_declarative_cancellation(
         let target_state = cancelled_state(definition.policy(), instance)?;
         return Ok(Some(DeclarativeCancellation {
             target_state,
+            current_terminal_state: definition
+                .registered()
+                .states
+                .iter()
+                .find(|state| state.key.state.as_ref() == instance.state)
+                .and_then(|state| state.terminal_state),
             // The pin resolved to this exact definition, so the validator
             // carries that identity and the store can re-verify at commit that
             // it still governs the row it locked (GH-1864).
@@ -316,6 +336,12 @@ async fn resolve_declarative_cancellation(
     }
     Ok(Some(DeclarativeCancellation {
         target_state: cancelled_state(&policy, instance)?,
+        current_terminal_state: definition
+            .registered()
+            .states
+            .iter()
+            .find(|state| state.key.state.as_ref() == instance.state)
+            .and_then(|state| state.terminal_state),
         // Rebuilt from the persisted snapshot, but only after its version and
         // content hash were checked against the instance pin above, so the
         // validator may claim that identity (GH-1864).
