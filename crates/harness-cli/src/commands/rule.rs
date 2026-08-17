@@ -1,5 +1,35 @@
-use super::{configured_rule_engine, RuleCommand};
+use clap::Subcommand;
 use harness_core::config::HarnessConfig;
+use std::path::PathBuf;
+
+#[derive(Subcommand)]
+pub enum RuleCommand {
+    /// Load rules for a project
+    Load {
+        /// Project directory
+        #[arg(default_value = ".")]
+        project: PathBuf,
+    },
+    /// Check project for violations
+    Check {
+        /// Project directory
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Automatically apply fix_pattern replacements for violations that have one
+        #[arg(long)]
+        auto_fix: bool,
+    },
+}
+
+pub(crate) fn configured_rule_engine(config: &HarnessConfig) -> harness_rules::engine::RuleEngine {
+    let mut engine = harness_rules::engine::RuleEngine::new();
+    engine.configure_sources(
+        config.rules.discovery_paths.clone(),
+        config.rules.builtin_path.clone(),
+        config.rules.requirements_path.clone(),
+    );
+    engine
+}
 
 pub async fn run(cmd: RuleCommand, config: &HarnessConfig) -> anyhow::Result<()> {
     match cmd {

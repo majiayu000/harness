@@ -1,4 +1,19 @@
-use super::PlanCommand;
+use clap::Subcommand;
+use std::path::PathBuf;
+
+#[derive(Subcommand)]
+pub enum PlanCommand {
+    /// Initialize a new ExecPlan from a spec
+    Init {
+        /// Path to spec file
+        spec: PathBuf,
+    },
+    /// Show ExecPlan status
+    Status {
+        /// Plan ID or file path
+        plan: String,
+    },
+}
 
 pub fn run(cmd: PlanCommand) -> anyhow::Result<()> {
     match cmd {

@@ -1,22 +1,12 @@
-#[cfg(feature = "server")]
-use chrono::{DateTime, NaiveDateTime, Utc};
-use clap::{ArgAction, Args, Parser, Subcommand};
-#[cfg(feature = "server")]
-use harness_server::server::RuntimeLogMetadata;
-#[cfg(feature = "server")]
-use std::cmp::Ordering;
-#[cfg(feature = "server")]
-use std::fs::OpenOptions;
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use tracing_subscriber::fmt::writer::MakeWriter;
+use clap::{ArgAction, Parser, Subcommand};
+use std::path::PathBuf;
 
+mod config;
 mod eval;
 mod exec;
 mod execpolicy;
 mod gc;
+mod logging;
 mod mcp_server;
 mod plan;
 mod pr;
@@ -32,11 +22,6 @@ mod server_cmds;
 mod skill;
 mod status;
 mod version;
-
-#[cfg(feature = "server")]
-const RUNTIME_LOG_PREFIX: &str = "harness-serve-";
-#[cfg(feature = "server")]
-const RUNTIME_LOG_SUFFIX: &str = ".log";
 
 #[derive(Parser)]
 #[command(name = "harness", about = "Harness — AI Code Agent Platform")]
@@ -112,38 +97,38 @@ pub enum Command {
     /// Direct GC commands; bypasses server auth, concurrency, and workflow event logging
     Gc {
         #[command(subcommand)]
-        cmd: GcCommand,
+        cmd: gc::GcCommand,
     },
 
     /// Direct rule commands; bypasses server auth/concurrency and may record scan events
     Rule {
         #[command(subcommand)]
-        cmd: RuleCommand,
+        cmd: rule::RuleCommand,
     },
 
     /// Starlark execpolicy commands
     #[command(name = "execpolicy")]
     ExecPolicy {
         #[command(subcommand)]
-        cmd: ExecPolicyCommand,
+        cmd: execpolicy::ExecPolicyCommand,
     },
 
     /// Direct skill commands; bypasses server auth, concurrency, and workflow event logging
     Skill {
         #[command(subcommand)]
-        cmd: SkillCommand,
+        cmd: skill::SkillCommand,
     },
 
     /// ExecPlan management
     Plan {
         #[command(subcommand)]
-        cmd: PlanCommand,
+        cmd: plan::PlanCommand,
     },
 
     /// PR orchestration — implement issue and manage PR review loop
     Pr {
         #[command(subcommand)]
-        cmd: PrCommand,
+        cmd: pr::PrCommand,
     },
 
     /// Eval run reports and version-to-version diffs
@@ -174,7 +159,7 @@ pub enum Command {
     /// Workflow runtime operator commands
     Runtime {
         #[command(subcommand)]
-        cmd: RuntimeCommand,
+        cmd: runtime::RuntimeCommand,
     },
 
     /// Reconcile harness task state against GitHub PR/issue state
@@ -189,577 +174,16 @@ pub enum Command {
     },
 }
 
-#[derive(Subcommand)]
-pub enum GcCommand {
-    /// Run GC agent
-    Run {
-        /// Project directory
-        project: Option<PathBuf>,
-    },
-    /// Show GC status
-    Status,
-    /// List pending drafts
-    Drafts { project: Option<PathBuf> },
-    /// Adopt a draft
-    Adopt { draft_id: String },
-    /// Reject a draft
-    Reject {
-        draft_id: String,
-        #[arg(long)]
-        reason: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum RuleCommand {
-    /// Load rules for a project
-    Load {
-        /// Project directory
-        #[arg(default_value = ".")]
-        project: PathBuf,
-    },
-    /// Check project for violations
-    Check {
-        /// Project directory
-        #[arg(default_value = ".")]
-        project: PathBuf,
-        /// Automatically apply fix_pattern replacements for violations that have one
-        #[arg(long)]
-        auto_fix: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum ExecPolicyCommand {
-    /// Check a command against Starlark policy rules
-    Check {
-        /// Paths to policy files (repeatable). Falls back to `rules.exec_policy_paths`.
-        #[arg(short = 'r', long = "rules", value_name = "PATH")]
-        rules: Vec<PathBuf>,
-        /// Optional requirements.toml path. Falls back to `rules.requirements_path` when omitted.
-        #[arg(long, value_name = "PATH")]
-        requirements: Option<PathBuf>,
-        /// Resolve absolute executables against basename rules.
-        #[arg(long)]
-        resolve_host_executables: bool,
-        /// Pretty-print JSON output.
-        #[arg(long)]
-        pretty: bool,
-        /// Command tokens to evaluate.
-        #[arg(
-            value_name = "COMMAND",
-            required = true,
-            trailing_var_arg = true,
-            allow_hyphen_values = true
-        )]
-        command: Vec<String>,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum SkillCommand {
-    /// List available skills
-    List {
-        #[arg(long)]
-        query: Option<String>,
-    },
-    /// Create a new skill
-    Create {
-        name: String,
-        #[arg(long)]
-        file: PathBuf,
-    },
-    /// Delete a skill
-    Delete { skill_id: String },
-}
-
-#[derive(Args)]
-pub struct LoopArgs {
-    /// Seconds to wait between review rounds (for CI and review bots)
-    #[arg(long, default_value = "120")]
-    pub wait: u64,
-    /// Maximum number of review rounds
-    #[arg(long, default_value = "8")]
-    pub max_rounds: u32,
-    /// Project directory
-    #[arg(long, default_value = ".")]
-    pub project: std::path::PathBuf,
-}
-
-#[derive(Args)]
-pub struct ReviewArgs {
-    /// Review provider to run
-    #[arg(long, default_value = "codex_cli_review")]
-    pub provider: String,
-    /// Base ref for local PR diff review
-    #[arg(long)]
-    pub base: Option<String>,
-    /// Project directory
-    #[arg(long, default_value = ".")]
-    pub project: std::path::PathBuf,
-}
-
-#[derive(Subcommand)]
-pub enum PrCommand {
-    /// Implement a GitHub issue, create a PR, then run the review loop
-    Fix {
-        /// GitHub issue number
-        issue: u64,
-        #[command(flatten)]
-        args: LoopArgs,
-    },
-    /// Run the review loop for an existing PR
-    Loop {
-        /// GitHub PR number
-        pr: u64,
-        #[command(flatten)]
-        args: LoopArgs,
-    },
-    /// Run a local review provider for an existing PR branch
-    Review {
-        /// GitHub PR number
-        pr: u64,
-        #[command(flatten)]
-        args: ReviewArgs,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum PlanCommand {
-    /// Initialize a new ExecPlan from a spec
-    Init {
-        /// Path to spec file
-        spec: PathBuf,
-    },
-    /// Show ExecPlan status
-    Status {
-        /// Plan ID or file path
-        plan: String,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum RuntimeCommand {
-    /// Circuit breaker operator commands
-    Breaker {
-        #[command(subcommand)]
-        cmd: RuntimeBreakerCommand,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum RuntimeBreakerCommand {
-    /// Reset the circuit breaker state for a runtime profile
-    Reset {
-        /// Runtime profile to reset
-        profile: String,
-        /// Server base URL. Defaults to server.http_addr from config.
-        #[arg(long)]
-        url: Option<String>,
-    },
-}
-
-pub(crate) fn configured_rule_engine(
-    config: &harness_core::config::HarnessConfig,
-) -> harness_rules::engine::RuleEngine {
-    let mut engine = harness_rules::engine::RuleEngine::new();
-    engine.configure_sources(
-        config.rules.discovery_paths.clone(),
-        config.rules.builtin_path.clone(),
-        config.rules.requirements_path.clone(),
-    );
-    engine
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ConfigSource {
-    Flag(PathBuf, bool),
-    Discovered(PathBuf, bool),
-    BuiltInDefaults,
-}
-
-impl ConfigSource {
-    /// Path of the loaded config file, if any (built-in defaults have none).
-    fn config_path(&self) -> Option<&Path> {
-        match self {
-            ConfigSource::Flag(path, _) | ConfigSource::Discovered(path, _) => Some(path.as_path()),
-            ConfigSource::BuiltInDefaults => None,
-        }
-    }
-
-    fn capability_profile_defaulted(&self) -> bool {
-        match self {
-            ConfigSource::Flag(_, defaulted) | ConfigSource::Discovered(_, defaulted) => *defaulted,
-            ConfigSource::BuiltInDefaults => true,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct TeeMakeWriter {
-    runtime_log_file: Option<Arc<Mutex<File>>>,
-}
-
-struct TeeWriter {
-    stderr: io::Stderr,
-    runtime_log_file: Option<Arc<Mutex<File>>>,
-}
-
-impl<'a> MakeWriter<'a> for TeeMakeWriter {
-    type Writer = TeeWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        TeeWriter {
-            stderr: io::stderr(),
-            runtime_log_file: self.runtime_log_file.clone(),
-        }
-    }
-}
-
-impl Write for TeeWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stderr.write_all(buf)?;
-        if let Some(file) = &self.runtime_log_file {
-            let mut guard = match file.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.write_all(buf)?;
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stderr.flush()?;
-        if let Some(file) = &self.runtime_log_file {
-            let mut guard = match file.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.flush()?;
-        }
-        Ok(())
-    }
-}
-
-struct LoggingBootstrap {
-    #[cfg(feature = "server")]
-    runtime_logs: RuntimeLogMetadata,
-    runtime_log_file: Option<Arc<Mutex<File>>>,
-    #[cfg(feature = "server")]
-    setup_warning: Option<String>,
-    #[cfg(feature = "server")]
-    retention_warnings: Vec<String>,
-}
-
-fn load_config(
-    config_path: Option<&Path>,
-) -> anyhow::Result<(harness_core::config::HarnessConfig, ConfigSource)> {
-    if let Some(config_path) = config_path {
-        let content = fs::read_to_string(config_path)?;
-        let mut config: harness_core::config::HarnessConfig = toml::from_str(&content)?;
-        let capability_profile_defaulted = capability_profile_defaulted(&content)?;
-        if let Some(dir) = config_path.parent() {
-            config.rebase_relative_paths(dir);
-        }
-        return Ok((
-            config,
-            ConfigSource::Flag(config_path.to_path_buf(), capability_profile_defaulted),
-        ));
-    }
-
-    if let Some(discovered) = harness_core::config::dirs::find_config_file() {
-        let content = fs::read_to_string(&discovered)?;
-        let mut config: harness_core::config::HarnessConfig = toml::from_str(&content)?;
-        let capability_profile_defaulted = capability_profile_defaulted(&content)?;
-        if let Some(dir) = discovered.parent() {
-            config.rebase_relative_paths(dir);
-        }
-        return Ok((
-            config,
-            ConfigSource::Discovered(discovered, capability_profile_defaulted),
-        ));
-    }
-
-    Ok((
-        harness_core::config::HarnessConfig::default(),
-        ConfigSource::BuiltInDefaults,
-    ))
-}
-
-fn capability_profile_defaulted(content: &str) -> anyhow::Result<bool> {
-    let document: toml::Value = toml::from_str(content)?;
-    Ok(document
-        .get("agents")
-        .and_then(|agents| agents.get("capability_profile"))
-        .is_none())
-}
-
-fn init_tracing(bootstrap: &LoggingBootstrap) -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
-            "%Y-%m-%dT%H:%M:%S%.3f%:z".to_string(),
-        ))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "harness=info,warn".into()),
-        )
-        .with_writer(TeeMakeWriter {
-            runtime_log_file: bootstrap.runtime_log_file.clone(),
-        })
-        .try_init()
-        .map_err(|error| anyhow::anyhow!("failed to initialize tracing subscriber: {error}"))
-}
-
-fn log_config_source(source: &ConfigSource) {
-    match source {
-        ConfigSource::Flag(path, _) => {
-            tracing::info!("config loaded from --config flag: {}", path.display());
-        }
-        ConfigSource::Discovered(path, _) => {
-            tracing::info!("config loaded from {}", path.display());
-        }
-        ConfigSource::BuiltInDefaults => {
-            tracing::warn!("no config file found, using built-in defaults");
-        }
-    }
-}
-
-fn prepare_logging(
-    command: &Command,
-    config: &harness_core::config::HarnessConfig,
-) -> LoggingBootstrap {
-    #[cfg(feature = "server")]
-    if matches!(command, Command::Serve { .. }) {
-        return prepare_runtime_logs(config, Utc::now());
-    }
-    #[cfg(not(feature = "server"))]
-    let _ = (command, config);
-    #[cfg(feature = "server")]
-    let _ = command;
-    LoggingBootstrap {
-        #[cfg(feature = "server")]
-        runtime_logs: RuntimeLogMetadata::disabled(
-            config.observe.log_retention_days,
-            config.observe.log_retention_max_files,
-        ),
-        runtime_log_file: None,
-        #[cfg(feature = "server")]
-        setup_warning: None,
-        #[cfg(feature = "server")]
-        retention_warnings: Vec::new(),
-    }
-}
-
-#[cfg(feature = "server")]
-fn prepare_runtime_logs(
-    config: &harness_core::config::HarnessConfig,
-    started_at: DateTime<Utc>,
-) -> LoggingBootstrap {
-    let retention_days = config.observe.log_retention_days;
-    let retention_max_files = config.observe.log_retention_max_files;
-    let log_path = runtime_log_path(&config.server.data_dir, started_at, std::process::id());
-    let path_hint = RuntimeLogMetadata::public_path_hint(&log_path);
-
-    match open_runtime_log_file(&log_path, retention_days, retention_max_files, started_at) {
-        Ok((file, retention_warnings)) => LoggingBootstrap {
-            runtime_logs: RuntimeLogMetadata::enabled(
-                log_path,
-                retention_days,
-                retention_max_files,
-            ),
-            runtime_log_file: Some(Arc::new(Mutex::new(file))),
-            setup_warning: None,
-            retention_warnings,
-        },
-        Err(error) => LoggingBootstrap {
-            runtime_logs: RuntimeLogMetadata::degraded(
-                Some(path_hint),
-                retention_days,
-                retention_max_files,
-            ),
-            runtime_log_file: None,
-            setup_warning: Some(error.to_string()),
-            retention_warnings: Vec::new(),
-        },
-    }
-}
-
-#[cfg(feature = "server")]
-fn runtime_log_path(data_dir: &Path, started_at: DateTime<Utc>, pid: u32) -> PathBuf {
-    data_dir.join("logs").join(format!(
-        "{RUNTIME_LOG_PREFIX}{}-pid{pid}{RUNTIME_LOG_SUFFIX}",
-        started_at.format("%Y%m%dT%H%M%SZ")
-    ))
-}
-
-#[cfg(feature = "server")]
-fn open_runtime_log_file(
-    log_path: &Path,
-    retention_days: u32,
-    retention_max_files: usize,
-    started_at: DateTime<Utc>,
-) -> io::Result<(File, Vec<String>)> {
-    let logs_dir = log_path
-        .parent()
-        .ok_or_else(|| io::Error::other("runtime log path missing parent directory"))?;
-    fs::create_dir_all(logs_dir)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
-    let retention_warnings = purge_stale_runtime_logs(
-        logs_dir,
-        retention_days,
-        retention_max_files,
-        started_at,
-        Some(log_path),
-    );
-    Ok((file, retention_warnings))
-}
-
-#[cfg(feature = "server")]
-fn purge_stale_runtime_logs(
-    logs_dir: &Path,
-    retention_days: u32,
-    retention_max_files: usize,
-    now: DateTime<Utc>,
-    protected_path: Option<&Path>,
-) -> Vec<String> {
-    purge_stale_runtime_logs_with(
-        logs_dir,
-        retention_days,
-        retention_max_files,
-        now,
-        protected_path,
-        |path| fs::remove_file(path),
-    )
-}
-
-#[cfg(feature = "server")]
-fn purge_stale_runtime_logs_with(
-    logs_dir: &Path,
-    retention_days: u32,
-    retention_max_files: usize,
-    now: DateTime<Utc>,
-    protected_path: Option<&Path>,
-    mut remove_file: impl FnMut(&Path) -> io::Result<()>,
-) -> Vec<String> {
-    if !logs_dir.exists() {
-        return Vec::new();
-    }
-
-    let mut warnings = Vec::new();
-    let mut retained = Vec::new();
-    let cutoff = now - chrono::Duration::days(i64::from(retention_days));
-    let entries = match fs::read_dir(logs_dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            warnings.push(format!(
-                "failed to scan runtime log directory {}: {error}",
-                logs_dir.display()
-            ));
-            return warnings;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                warnings.push(format!(
-                    "failed to read runtime log directory entry in {}: {error}",
-                    logs_dir.display()
-                ));
-                continue;
-            }
-        };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some((started_at, pid)) = parse_runtime_log_identity(file_name) else {
-            continue;
-        };
-        let is_protected = protected_path == Some(path.as_path());
-        if started_at < cutoff && !is_protected {
-            if let Err(error) = remove_file(&path) {
-                warnings.push(format!(
-                    "failed to delete stale runtime log {}: {error}",
-                    path.display()
-                ));
-            }
-        } else {
-            retained.push(RuntimeLogEntry {
-                started_at,
-                pid,
-                path,
-            });
-        }
-    }
-
-    if retention_max_files > 0 && retained.len() > retention_max_files {
-        retained.sort_by(|left, right| compare_runtime_logs(left, right, protected_path));
-        for entry in retained.iter().skip(retention_max_files) {
-            if let Err(error) = remove_file(&entry.path) {
-                warnings.push(format!(
-                    "failed to delete excess runtime log {}: {error}",
-                    entry.path.display()
-                ));
-            }
-        }
-    }
-
-    warnings
-}
-
-#[derive(Debug)]
-#[cfg(feature = "server")]
-struct RuntimeLogEntry {
-    started_at: DateTime<Utc>,
-    pid: u32,
-    path: PathBuf,
-}
-
-#[cfg(feature = "server")]
-fn compare_runtime_logs(
-    left: &RuntimeLogEntry,
-    right: &RuntimeLogEntry,
-    protected_path: Option<&Path>,
-) -> Ordering {
-    let left_protected = protected_path == Some(left.path.as_path());
-    let right_protected = protected_path == Some(right.path.as_path());
-    right_protected
-        .cmp(&left_protected)
-        .then_with(|| right.started_at.cmp(&left.started_at))
-        .then_with(|| right.pid.cmp(&left.pid))
-        .then_with(|| left.path.cmp(&right.path))
-}
-
-#[cfg(feature = "server")]
-fn parse_runtime_log_identity(file_name: &str) -> Option<(DateTime<Utc>, u32)> {
-    let trimmed = file_name
-        .strip_prefix(RUNTIME_LOG_PREFIX)?
-        .strip_suffix(RUNTIME_LOG_SUFFIX)?;
-    let (timestamp, pid) = trimmed.rsplit_once("-pid")?;
-    let pid = pid.parse().ok()?;
-    let naive = NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%SZ").ok()?;
-    Some((DateTime::from_naive_utc_and_offset(naive, Utc), pid))
-}
-
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
-    let (mut config, config_source) = load_config(cli.config.as_deref())?;
+    let (mut config, config_source) = config::load_config(cli.config.as_deref())?;
     // Apply env var overrides for all subcommands so that HARNESS_DATA_DIR,
     // HARNESS_PROJECT_ROOT, etc. are respected by gc, rule check, and skill
     // commands — not just `serve`.
     config.apply_env_overrides()?;
     harness_core::db::configure_pg_pool_from_server(&config.server);
-    let logging = prepare_logging(&cli.command, &config);
-    init_tracing(&logging)?;
-    log_config_source(&config_source);
+    let logging = logging::prepare_logging(&cli.command, &config);
+    logging::init_tracing(&logging)?;
+    config::log_config_source(&config_source);
     if config_source.capability_profile_defaulted() {
         tracing::warn!(
             effective_capability_profile = "standard",
@@ -774,25 +198,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         tracing::warn!(network_policy = "deny", "scoped CLI agents have no network access, including model-provider connectivity; configure exact provider hosts in isolation.network_allowlist and use container isolation for allowlisted Linux workloads");
     }
     server_cmds::log_runtime_log_status(&logging);
-
-    // Register the central base WORKFLOW.md (sibling of the loaded config file,
-    // e.g. config/WORKFLOW.md) as the single source of default workflow policy.
-    // Per-repo WORKFLOW.md files deep-merge on top of it field-by-field. The
-    // path is resolved to an absolute location so it does not depend on the
-    // server process's working directory.
-    if let Some(config_dir) = config_source.config_path().and_then(Path::parent) {
-        let base = config_dir.join("WORKFLOW.md");
-        if base.try_exists()? {
-            let base = std::fs::canonicalize(&base)?;
-            tracing::info!("central workflow base config: {}", base.display());
-            harness_core::config::workflow::set_workflow_base_path(base);
-        } else {
-            tracing::info!(
-                "no central workflow base config at {} (per-repo WORKFLOW.md only)",
-                base.display()
-            );
-        }
-    }
+    config::install_workflow_base(&config_source)?;
 
     match cli.command {
         Command::Serve {
@@ -865,13 +271,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
 
         Command::Pr { cmd } => match cmd {
-            PrCommand::Fix { issue, args } => {
+            pr::PrCommand::Fix { issue, args } => {
                 pr::fix(&config, issue, args.wait, args.max_rounds, args.project).await?;
             }
-            PrCommand::Loop { pr, args } => {
+            pr::PrCommand::Loop { pr, args } => {
                 pr::loop_pr(&config, pr, args.wait, args.max_rounds, args.project).await?;
             }
-            PrCommand::Review { pr, args } => {
+            pr::PrCommand::Review { pr, args } => {
                 pr::review(&config, pr, args.provider, args.base, args.project).await?;
             }
         },
@@ -912,235 +318,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::exec::{
-        apply_sandbox_hint, current_username, enforce_exec_actor_filters,
-        enforce_exec_privilege_policy_with, normalize_allow_list, resolve_exec_output_path,
-        ExecSandboxMode,
-    };
-    use std::path::Path;
-
-    #[test]
-    fn capability_profile_migration_warning_only_applies_when_field_is_absent() -> anyhow::Result<()>
-    {
-        assert!(capability_profile_defaulted(
-            "[agents]\ndefault_agent = \"auto\"\n"
-        )?);
-        assert!(!capability_profile_defaulted(
-            "[agents]\ncapability_profile = \"full\"\n"
-        )?);
-        Ok(())
-    }
-
-    #[test]
-    fn sandbox_mode_parse_accepts_supported_values() {
-        assert_eq!(
-            ExecSandboxMode::parse("read-only").expect("read-only should parse"),
-            ExecSandboxMode::ReadOnly
-        );
-        assert_eq!(
-            ExecSandboxMode::parse("workspace-write").expect("workspace-write should parse"),
-            ExecSandboxMode::WorkspaceWrite
-        );
-        assert_eq!(
-            ExecSandboxMode::parse("read-only-with-network")
-                .expect("read-only-with-network should parse"),
-            ExecSandboxMode::ReadOnlyWithNetwork
-        );
-        assert_eq!(
-            ExecSandboxMode::parse("danger-full-access").expect("danger-full-access should parse"),
-            ExecSandboxMode::DangerFullAccess
-        );
-    }
-
-    #[test]
-    fn sandbox_mode_parse_rejects_unknown_value() {
-        let error = ExecSandboxMode::parse("unsafe").expect_err("unsupported mode should fail");
-        assert!(error
-            .to_string()
-            .contains("unsupported sandbox mode `unsafe`"));
-    }
-
-    #[test]
-    fn normalize_allow_list_trims_and_drops_empty_entries() {
-        let values = vec![
-            "alice".to_string(),
-            "  bob  ".to_string(),
-            "".to_string(),
-            "   ".to_string(),
-        ];
-        assert_eq!(normalize_allow_list(values), vec!["alice", "bob"]);
-    }
-
-    #[test]
-    fn exec_actor_filters_allow_matching_user_or_bot() {
-        let users = vec!["alice".to_string()];
-        let bots = vec!["dependabot[bot]".to_string()];
-
-        enforce_exec_actor_filters(Some("alice".to_string()), &users, &bots)
-            .expect("listed human user should pass");
-        enforce_exec_actor_filters(Some("dependabot[bot]".to_string()), &users, &bots)
-            .expect("listed bot should pass");
-    }
-
-    #[test]
-    fn exec_actor_filters_block_unlisted_actor() {
-        let users = vec!["alice".to_string()];
-        let bots = vec!["dependabot[bot]".to_string()];
-        let error = enforce_exec_actor_filters(Some("mallory".to_string()), &users, &bots)
-            .expect_err("unlisted actor should be rejected when allow lists are configured");
-
-        assert!(error
-            .to_string()
-            .contains("actor `mallory` is not allowed to run `harness exec`"));
-    }
-
-    #[test]
-    fn apply_sandbox_hint_prefixes_prompt() {
-        let prompt = "review this PR".to_string();
-        let hinted = apply_sandbox_hint(prompt.clone(), ExecSandboxMode::WorkspaceWrite);
-        assert!(hinted.contains("Sandbox mode requirement for this run: `workspace-write`."));
-        assert!(hinted.ends_with(&prompt));
-    }
-
-    #[test]
-    fn resolve_exec_output_path_accepts_nested_relative_path() {
-        let root = std::env::temp_dir().join("harness-cli-output-path-accept");
-        std::fs::create_dir_all(&root).expect("temp test root should be creatable");
-
-        let output = resolve_exec_output_path(&root, Path::new(".harness/final.txt"))
-            .expect("relative output file should resolve inside project root");
-
-        assert!(output.starts_with(root.canonicalize().expect("root should canonicalize")));
-        assert!(output.ends_with(Path::new(".harness/final.txt")));
-    }
-
-    #[test]
-    fn resolve_exec_output_path_rejects_parent_escape() {
-        let root = std::env::temp_dir().join("harness-cli-output-path-reject");
-        std::fs::create_dir_all(&root).expect("temp test root should be creatable");
-
-        let error = resolve_exec_output_path(&root, Path::new("../escape.txt"))
-            .expect_err("path traversal outside project root should fail");
-
-        assert!(error
-            .to_string()
-            .contains("`--output-file` must stay within project root"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolve_exec_output_path_rejects_symlink_escape() {
-        use std::os::unix::fs::symlink;
-
-        let suffix = std::process::id();
-        let root =
-            std::env::temp_dir().join(format!("harness-cli-output-path-symlink-root-{suffix}"));
-        let outside =
-            std::env::temp_dir().join(format!("harness-cli-output-path-symlink-outside-{suffix}"));
-        let link = root.join("escape-link");
-
-        std::fs::create_dir_all(&root).expect("temp root should be creatable");
-        std::fs::create_dir_all(&outside).expect("outside dir should be creatable");
-        if link.exists() {
-            std::fs::remove_file(&link).expect("pre-existing symlink should be removable");
-        }
-        symlink(&outside, &link).expect("symlink should be creatable");
-
-        let error = resolve_exec_output_path(&root, Path::new("escape-link/evil.txt"))
-            .expect_err("symlink-based escape should be rejected");
-
-        assert!(error
-            .to_string()
-            .contains("`--output-file` must stay within project root"));
-
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&outside);
-    }
-
-    #[test]
-    fn enforce_exec_privilege_policy_blocks_root_when_drop_sudo_enabled() {
-        let error = enforce_exec_privilege_policy_with(true, None, || true, || false, || None)
-            .expect_err("drop-sudo should reject execution when real UID indicates root");
-
-        assert!(error
-            .to_string()
-            .contains("refusing to run `harness exec` with elevated privileges"));
-    }
-
-    #[test]
-    fn enforce_exec_privilege_policy_allows_root_when_drop_sudo_disabled() {
-        enforce_exec_privilege_policy_with(false, None, || true, || false, || None)
-            .expect("drop-sudo=false should allow root execution when explicitly requested");
-    }
-
-    #[test]
-    fn enforce_exec_privilege_policy_blocks_sudo_environment() {
-        let error = enforce_exec_privilege_policy_with(true, None, || false, || true, || None)
-            .expect_err(
-                "drop-sudo should reject execution when sudo environment markers are present",
-            );
-
-        assert!(error
-            .to_string()
-            .contains("refusing to run `harness exec` with elevated privileges"));
-    }
-
-    #[test]
-    fn enforce_exec_privilege_policy_blocks_unexpected_user() {
-        let error = enforce_exec_privilege_policy_with(
-            false,
-            Some("runner"),
-            || false,
-            || false,
-            || Some("root".to_string()),
-        )
-        .expect_err("mismatched --unprivileged-user should fail");
-
-        assert!(error
-            .to_string()
-            .contains("`harness exec` must run as `runner`, current user is `root`"));
-    }
-
-    #[test]
-    fn enforce_exec_privilege_policy_allows_expected_user() {
-        enforce_exec_privilege_policy_with(
-            false,
-            Some("runner"),
-            || false,
-            || false,
-            || Some("runner".to_string()),
-        )
-        .expect("matching --unprivileged-user should pass");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn current_username_uses_real_uid_lookup() {
-        use std::ffi::CStr;
-
-        let uid = unsafe { libc::getuid() };
-        let passwd = unsafe { libc::getpwuid(uid) };
-        assert!(
-            !passwd.is_null(),
-            "getpwuid(getuid()) should resolve current user"
-        );
-
-        let username_ptr = unsafe { (*passwd).pw_name };
-        assert!(
-            !username_ptr.is_null(),
-            "passwd record should contain pw_name"
-        );
-
-        let expected = unsafe { CStr::from_ptr(username_ptr) }
-            .to_str()
-            .expect("pw_name should be valid UTF-8")
-            .trim()
-            .to_string();
-
-        let actual = current_username().expect("current_username should resolve via UID lookup");
-        assert_eq!(actual, expected);
-    }
+    use crate::commands::execpolicy::ExecPolicyCommand;
+    use crate::commands::gc::GcCommand;
+    use crate::commands::pr::PrCommand;
+    use crate::commands::runtime::{RuntimeBreakerCommand, RuntimeCommand};
+    use clap::Parser;
 
     #[test]
     fn cli_parses_serve_with_defaults() {

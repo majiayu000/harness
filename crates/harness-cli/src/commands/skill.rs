@@ -1,5 +1,23 @@
-use super::SkillCommand;
+use clap::Subcommand;
 use harness_core::config::HarnessConfig;
+use std::path::PathBuf;
+
+#[derive(Subcommand)]
+pub enum SkillCommand {
+    /// List available skills
+    List {
+        #[arg(long)]
+        query: Option<String>,
+    },
+    /// Create a new skill
+    Create {
+        name: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Delete a skill
+    Delete { skill_id: String },
+}
 
 pub fn run(cmd: SkillCommand, config: &HarnessConfig) -> anyhow::Result<()> {
     match cmd {

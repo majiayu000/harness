@@ -1,3 +1,4 @@
+use clap::Subcommand;
 use harness_core::{
     config::misc::GcConfig,
     types::{Draft, DraftId, DraftStatus, EventFilters, Project, ProjectId},
@@ -6,8 +7,28 @@ use harness_gc::draft_store::DraftStore;
 use harness_gc::gc_agent::GcAgent;
 use harness_gc::signal_detector::SignalDetector;
 use harness_observe::event_store::EventStore;
+use std::path::PathBuf;
 
-use super::GcCommand;
+#[derive(Subcommand)]
+pub enum GcCommand {
+    /// Run GC agent
+    Run {
+        /// Project directory
+        project: Option<PathBuf>,
+    },
+    /// Show GC status
+    Status,
+    /// List pending drafts
+    Drafts { project: Option<PathBuf> },
+    /// Adopt a draft
+    Adopt { draft_id: String },
+    /// Reject a draft
+    Reject {
+        draft_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
 
 pub async fn run_gc(
     cmd: GcCommand,

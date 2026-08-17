@@ -1,7 +1,7 @@
 use harness_core::config::HarnessConfig;
 use std::path::PathBuf;
 
-use super::LoggingBootstrap;
+use super::logging::LoggingBootstrap;
 
 pub fn log_runtime_log_status(
     #[cfg_attr(not(feature = "server"), allow(unused_variables))] bootstrap: &LoggingBootstrap,
